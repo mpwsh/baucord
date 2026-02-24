@@ -115,7 +115,7 @@ impl ChatServer {
         config.client_channels_config.push(reliable.clone());
         config.server_channels_config.push(reliable);
 
-        config.available_bytes_per_tick = 300_000;
+        config.available_bytes_per_tick = 600_000;
         let voice = ChannelConfig {
             channel_id: channels.voice_channel_id,
             max_memory_usage_bytes: channels.voice_buffer_size_mb * 1024 * 1024,

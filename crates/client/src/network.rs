@@ -212,7 +212,7 @@ pub(crate) struct NetworkClient {
 impl NetworkClient {
     pub fn connect(server_addr: SocketAddr, username: String) -> Result<Self, String> {
         let mut connection_config = ConnectionConfig::default();
-        connection_config.available_bytes_per_tick = 300_000;
+        connection_config.available_bytes_per_tick = 600_000;
 
         connection_config.client_channels_config.clear();
         connection_config.server_channels_config.clear();
