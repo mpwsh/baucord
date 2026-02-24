@@ -2289,7 +2289,7 @@ dependencies = [
 [[package]]
 name = "scap"
 version = "0.1.0-beta.1"
-source = "git+https://github.com/CapSoftware/scap/#c03f15a4631f40cd8d2e36807befb83b314cfeb7"
+source = "git+https://github.com/mpwsh/scap/?branch=win-linux-fix#f65d8296cd7c8026e7f3403062b04396647f967b"
 dependencies = [
  "cidre",
  "cocoa",

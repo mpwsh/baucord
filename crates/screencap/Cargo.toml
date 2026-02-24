@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 
 [dependencies]
-scap = { git = "https://github.com/CapSoftware/scap/" }
+scap = { git = "https://github.com/mpwsh/scap/", branch = "win-linux-fix" }
 log = "0.4"
 thiserror = "2"
 # Windows static: vcpkg install ffmpeg[x264,gpl]:x64-windows-static-md
