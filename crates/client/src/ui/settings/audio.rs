@@ -6,8 +6,8 @@
 use crate::config::Settings;
 use crate::ui::messages::UiMessage;
 use fltk::{prelude::*, *};
-use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use ui::theme;
 use ui::widgets::{controls, labels, layout, meter};
 
@@ -42,7 +42,7 @@ pub fn build(
 ) -> group::Flex {
     let mut col = group::Flex::default()
         .with_pos(x, y)
-        .with_size(w, 600)
+        .with_size(w, 570)
         .column();
     col.set_spacing(4);
 
@@ -87,12 +87,7 @@ pub fn build(
 
     labels::field_label(&mut col, "Capture Level");
     let threshold_rc = std::rc::Rc::new(std::cell::RefCell::new(settings.audio.gate_threshold));
-    let vu_input = meter::gate(
-        &mut col,
-        denoised_level.clone(),
-        threshold_rc.clone(),
-        22,
-    );
+    let vu_input = meter::gate(&mut col, denoised_level.clone(), threshold_rc.clone(), 22);
 
     labels::field_label(&mut col, "Input Gain");
     let mut input_gain_slider = controls::slider(
@@ -121,18 +116,13 @@ pub fn build(
         &mut col,
         &format_sensitivity(settings.audio.gate_threshold as f64),
     );
-    labels::hint_label(
-        &mut col,
-        "Audio below the red line won't be transmitted",
-    );
+    labels::hint_label(&mut col, "Audio below the red line won't be transmitted");
 
     let mut test_mic_btn = controls::button("\u{1f3a4}  Test Microphone");
     col.fixed(&test_mic_btn, 30);
 
-    let test_mic_info = labels::hint_label(
-        &mut col,
-        "Listen to your own mic (others won't hear you)",
-    );
+    let test_mic_info =
+        labels::hint_label(&mut col, "Listen to your own mic (others won't hear you)");
 
     layout::separator(&mut col);
 

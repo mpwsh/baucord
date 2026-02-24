@@ -23,7 +23,7 @@ fn main() {
         use std::fs::File;
 
         let log_file = File::create("baucord.log").unwrap();
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .target(Target::Pipe(Box::new(log_file)))
             .init();
     }
@@ -36,4 +36,3 @@ fn main() {
     // Settings are already saved by this point.
     std::process::exit(0);
 }
-
