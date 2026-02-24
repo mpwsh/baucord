@@ -65,13 +65,18 @@ impl Quality {
         }
     }
 
-    /// Target bitrate in bits/sec. Tuned for screen content.
+    /// Target bitrate in bits/sec.
+    ///
+    /// Tuned for **screen content** (sharp text, hard edges, flat colors).
+    /// Screen content needs ~1.5–2× more bitrate than camera video at the
+    /// same resolution because DCT-based codecs spend more bits preserving
+    /// high-frequency detail (glyphs, 1px borders, UI elements).
     pub const fn bitrate(self) -> u32 {
         match self {
-            Self::HD30 => 1_500_000,
-            Self::HD60 => 2_500_000,
-            Self::FHD30 => 3_000_000,
-            Self::FHD60 => 4_500_000,
+            Self::HD30 => 2_500_000,
+            Self::HD60 => 3_500_000,
+            Self::FHD30 => 5_000_000,
+            Self::FHD60 => 7_000_000,
         }
     }
 

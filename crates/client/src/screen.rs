@@ -124,8 +124,10 @@ pub struct ScreenThreadHandle {
 
 impl ScreenThreadHandle {
     pub fn spawn(network_tx: Sender<NetworkControl>, wake: WakeFn) -> Self {
-        let (tx, control_rx) = bounded::<ScreenControl>(64);
-        let (event_tx, event_rx) = bounded::<ScreenEvent>(32);
+        // 256 slots: at 30fps inbound + outbound control messages, 64 was
+        // too tight and caused try_send drops during active streaming.
+        let (tx, control_rx) = bounded::<ScreenControl>(256);
+        let (event_tx, event_rx) = bounded::<ScreenEvent>(64);
         let shared = SharedScreenState::new();
 
         let shared_clone = shared.clone();
@@ -174,6 +176,11 @@ struct PeerStream {
     /// P-frames are silently dropped until the first keyframe arrives,
     /// preventing the "non-existing PPS 0 referenced" FFmpeg errors.
     got_keyframe: bool,
+    /// Last successfully processed sequence number for gap detection.
+    /// P-frames with seq gaps > 1 are dropped (unreliable channel may
+    /// lose or reorder packets, and H.264 decoders produce corruption
+    /// when reference frames are missing).
+    last_seq: Option<u32>,
 }
 
 // ── Thread loop ─────────────────────────────────────────────────────────
@@ -216,8 +223,9 @@ fn run_screen_loop(
             default(timeout) => {}
         }
 
-        // Drain queued control messages
-        for _ in 0..32 {
+        // Drain queued control messages — process ALL pending frames
+        // before capturing our own frame to minimize decode latency.
+        loop {
             match control_rx.try_recv() {
                 Ok(ctrl) => handle_control(
                     ctrl,
@@ -323,63 +331,17 @@ fn handle_control(
             height,
             data,
         } => {
-            let stream = peer_streams.entry(client_id).or_insert_with(|| {
-                // Lazily create decoder on first frame
-                let decoder = match create_decoder() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        error!("Failed to create decoder for peer {client_id}: {e}");
-                        // Return a placeholder — will fail on decode but won't panic
-                        create_decoder().expect("fallback decoder failed")
-                    }
-                };
-                info!("📺 Created decoder for peer {client_id} ({width}x{height})");
-                PeerStream {
-                    decoder,
-                    width,
-                    height,
-                    got_keyframe: false,
-                }
-            });
-
-            // Drop P-frames until we have a keyframe — decoder needs SPS/PPS
-            // from the first keyframe to initialize. Without this, FFmpeg logs
-            // "non-existing PPS 0 referenced" for every P-frame.
-            if !is_keyframe && !stream.got_keyframe {
-                // Silently skip — don't even feed to decoder
-                return;
-            }
-
-            if is_keyframe {
-                stream.got_keyframe = true;
-                info!("📺 Keyframe #{seq}: {} bytes", data.len());
-            }
-
-            let encoded = EncodedFrame {
-                data,
-                timestamp_ms: 0, // receiver doesn't need sender timestamps
+            decode_incoming_frame(
+                client_id,
+                seq,
                 is_keyframe,
-            };
-
-            match stream.decoder.decode(&encoded) {
-                Ok(Some(decoded)) => {
-                    event_tx
-                        .send(ScreenEvent::FrameReady {
-                            client_id,
-                            width: decoded.width,
-                            height: decoded.height,
-                            rgba: decoded.data,
-                        })
-                        .ok();
-                    wake();
-                }
-                Ok(None) => {
-                    // Decoder buffering, no frame yet
-                }
-                Err(e) => {
-                    warn!("Decode error for peer {client_id} seq {seq}: {e}");
-                }
-            }
+                width,
+                height,
+                data,
+                peer_streams,
+                event_tx,
+                wake,
+            );
         }
 
         ScreenControl::PeerStartedSharing {
@@ -407,6 +369,154 @@ fn handle_control(
 
         ScreenControl::Shutdown => {
             *running = false;
+        }
+    }
+}
+
+/// Decode an incoming video frame from a remote peer.
+///
+/// Key invariants:
+/// - P-frames are dropped until the first keyframe (decoder needs SPS/PPS).
+/// - On each keyframe, the decoder is **reset** (fresh instance) to prevent
+///   corruption from compounding across GOP boundaries. This is critical
+///   because the unreliable channel may lose P-frames, leaving the decoder
+///   in an inconsistent reference state.
+/// - P-frames with sequence gaps > 1 are dropped — the missing reference
+///   frame(s) would cause cascading visual corruption.
+fn decode_incoming_frame(
+    client_id: u64,
+    seq: u32,
+    is_keyframe: bool,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+    peer_streams: &mut HashMap<u64, PeerStream>,
+    event_tx: &Sender<ScreenEvent>,
+    wake: &WakeFn,
+) {
+    // On keyframe: reset the decoder to a clean state. This is the most
+    // important fix for visual corruption — a fresh decoder has no stale
+    // reference frames that could produce staircase/tearing artifacts.
+    if is_keyframe {
+        let decoder = match create_decoder() {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Failed to create decoder for peer {client_id}: {e}");
+                return;
+            }
+        };
+
+        let stream = peer_streams
+            .entry(client_id)
+            .and_modify(|s| {
+                s.decoder = decoder;
+                s.width = width;
+                s.height = height;
+                s.got_keyframe = true;
+                s.last_seq = Some(seq);
+            })
+            .or_insert_with(|| {
+                // Shouldn't happen (keyframe already created above via and_modify),
+                // but handles the first-ever frame for this peer.
+                info!("📺 Created decoder for peer {client_id} ({width}x{height})");
+                let fallback_decoder = create_decoder().expect("decoder creation failed");
+                PeerStream {
+                    decoder: fallback_decoder,
+                    width,
+                    height,
+                    got_keyframe: true,
+                    last_seq: Some(seq),
+                }
+            });
+
+        // Decode the keyframe
+        info!("📺 Keyframe #{seq} from peer {client_id}: {} bytes", data.len());
+
+        let encoded = EncodedFrame {
+            data,
+            timestamp_ms: 0,
+            is_keyframe: true,
+        };
+
+        match stream.decoder.decode(&encoded) {
+            Ok(Some(decoded)) => {
+                event_tx
+                    .send(ScreenEvent::FrameReady {
+                        client_id,
+                        width: decoded.width,
+                        height: decoded.height,
+                        rgba: decoded.data,
+                    })
+                    .ok();
+                wake();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("Decode error for keyframe from peer {client_id} seq {seq}: {e}");
+                // Keyframe decode failed — mark stream as needing a new keyframe
+                if let Some(stream) = peer_streams.get_mut(&client_id) {
+                    stream.got_keyframe = false;
+                }
+            }
+        }
+        return;
+    }
+
+    // P-frame path
+    let Some(stream) = peer_streams.get_mut(&client_id) else {
+        // No decoder yet — waiting for first keyframe
+        return;
+    };
+
+    if !stream.got_keyframe {
+        // Still waiting for a keyframe — silently drop
+        return;
+    }
+
+    // Sequence gap detection: if we missed P-frames, the decoder's
+    // reference state is inconsistent. Drop until next keyframe.
+    if let Some(last) = stream.last_seq {
+        let expected = last.wrapping_add(1);
+        if seq != expected {
+            // Gap detected — frames were lost on the unreliable channel.
+            // Continuing to decode would produce visual corruption.
+            if seq.wrapping_sub(last) > 1 {
+                warn!(
+                    "Seq gap for peer {client_id}: expected {expected}, got {seq} — \
+                     dropping until next keyframe"
+                );
+                stream.got_keyframe = false;
+                return;
+            }
+        }
+    }
+
+    stream.last_seq = Some(seq);
+
+    let encoded = EncodedFrame {
+        data,
+        timestamp_ms: 0,
+        is_keyframe: false,
+    };
+
+    match stream.decoder.decode(&encoded) {
+        Ok(Some(decoded)) => {
+            event_tx
+                .send(ScreenEvent::FrameReady {
+                    client_id,
+                    width: decoded.width,
+                    height: decoded.height,
+                    rgba: decoded.data,
+                })
+                .ok();
+            wake();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!("Decode error for peer {client_id} seq {seq}: {e}");
+            // Decode error likely means corrupted reference state —
+            // wait for the next keyframe to recover.
+            stream.got_keyframe = false;
         }
     }
 }

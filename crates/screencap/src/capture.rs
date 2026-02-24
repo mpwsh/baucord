@@ -1,6 +1,8 @@
 //! Screen capture via `xcap`.
 //!
-//! Captures a monitor's screen and optionally scales to the target resolution.
+//! Captures a monitor's screen at native resolution. Scaling to the
+//! target encoding resolution is handled by the encoder's swscale pass
+//! (combined with RGBA→YUV420P conversion in a single operation).
 //! Reuses internal buffers to avoid per-frame allocations.
 
 use std::time::Instant;
@@ -42,17 +44,19 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
         .collect())
 }
 
-/// Captures frames from a specific monitor.
+/// Captures frames from a specific monitor at native resolution.
 ///
-/// Reuses an internal scale buffer when the source resolution differs from the
-/// target quality preset, avoiding a fresh allocation every frame.
+/// No scaling is performed here — the encoder handles downscaling via
+/// swscale during colorspace conversion (RGBA→YUV420P + resize in one
+/// pass with bicubic filtering).
 pub struct ScreenCapturer {
     monitor: Monitor,
     quality: Quality,
     frame_count: u64,
     start_time: Instant,
-    /// Reusable buffer for scaled RGBA output. Empty when no scaling is needed.
-    scale_buf: Vec<u8>,
+    /// Reusable buffer for the raw RGBA capture. Avoids allocation per frame
+    /// when the caller returns the previous frame's buffer via `return_buffer()`.
+    reuse_buf: Vec<u8>,
 }
 
 impl ScreenCapturer {
@@ -81,7 +85,7 @@ impl ScreenCapturer {
             quality,
             frame_count: 0,
             start_time: Instant::now(),
-            scale_buf: Vec::new(),
+            reuse_buf: Vec::new(),
         })
     }
 
@@ -111,48 +115,32 @@ impl ScreenCapturer {
             quality,
             frame_count: 0,
             start_time: Instant::now(),
-            scale_buf: Vec::new(),
+            reuse_buf: Vec::new(),
         })
     }
 
-    /// Capture one frame, scaled to the quality preset's resolution.
+    /// Capture one frame at the monitor's native resolution.
     ///
-    /// Returns RGBA pixel data at the target width×height.
+    /// Returns RGBA pixel data at the **source** resolution (not the
+    /// target quality resolution). The encoder is responsible for
+    /// downscaling during the RGBA→YUV420P conversion pass.
     pub fn capture(&mut self) -> Result<Frame, CaptureError> {
         let image = self
             .monitor
             .capture_image()
             .map_err(|e| CaptureError::Capture(e.to_string()))?;
 
-        let target_w = self.quality.width();
-        let target_h = self.quality.height();
-        let src_w = image.width();
-        let src_h = image.height();
-
+        let width = image.width();
+        let height = image.height();
         let timestamp_ms = self.start_time.elapsed().as_millis() as u64;
         self.frame_count += 1;
 
-        let data = if src_w == target_w && src_h == target_h {
-            // No scaling needed — take ownership of the image buffer directly
-            image.into_raw()
-        } else {
-            let src = image.into_raw();
-            scale_rgba_into(
-                &src,
-                src_w,
-                src_h,
-                target_w,
-                target_h,
-                &mut self.scale_buf,
-            );
-            // Move the buffer out, replace with empty Vec (no allocation)
-            std::mem::take(&mut self.scale_buf)
-        };
+        let data = image.into_raw();
 
         Ok(Frame {
             data,
-            width: target_w,
-            height: target_h,
+            width,
+            height,
             timestamp_ms,
         })
     }
@@ -160,11 +148,11 @@ impl ScreenCapturer {
     /// Return the previously used RGBA buffer for reuse by the next capture.
     ///
     /// Call this after you're done with the [`Frame`] to avoid allocating a new
-    /// scale buffer on the next `capture()` call. Not required — just an
+    /// buffer on the next `capture()` call. Not required — just an
     /// optimization when you own the frame and are done with it.
     pub fn return_buffer(&mut self, mut buf: Vec<u8>) {
         buf.clear();
-        self.scale_buf = buf;
+        self.reuse_buf = buf;
     }
 
     pub fn quality(&self) -> Quality {
@@ -173,30 +161,5 @@ impl ScreenCapturer {
 
     pub fn frame_count(&self) -> u64 {
         self.frame_count
-    }
-}
-
-/// Nearest-neighbor scale RGBA into a caller-provided buffer.
-///
-/// Resizes `dst` to fit `dst_w × dst_h × 4` bytes, reusing existing capacity.
-fn scale_rgba_into(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-    dst: &mut Vec<u8>,
-) {
-    let dst_size = (dst_w * dst_h * 4) as usize;
-    dst.resize(dst_size, 0);
-
-    for y in 0..dst_h {
-        let src_y = (y as u64 * src_h as u64 / dst_h as u64) as u32;
-        for x in 0..dst_w {
-            let src_x = (x as u64 * src_w as u64 / dst_w as u64) as u32;
-            let si = ((src_y * src_w + src_x) * 4) as usize;
-            let di = ((y * dst_w + x) * 4) as usize;
-            dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
-        }
     }
 }

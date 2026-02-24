@@ -1,12 +1,13 @@
 // ui/sidebar.rs
 //
 // The user list updates incrementally: a full rebuild only happens when
-// users join or leave. Speaking indicators, mute state, and volume badges
-// are updated in-place on existing widgets, preserving scroll position.
+// users join or leave. Speaking indicators, mute state, volume badges,
+// and "Live" badges are updated in-place on existing widgets, preserving
+// scroll position.
 
 use fltk::{enums::Font, image::SvgImage, prelude::*, *};
 use renet::ClientId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::app::UserState;
 use crate::ui::messages::UiMessage;
@@ -32,9 +33,11 @@ struct UserRow {
     container: group::Flex,
     indicator: frame::Frame,
     name_label: frame::Frame,
-    /// Icon frame between name and `…` button — shows muted/deafened SVG.
+    /// Icon frame between name and action button — shows muted/deafened SVG.
     /// `None` for our own row (we never see our own broadcast).
     status_icon: Option<frame::Frame>,
+    /// The `…` / `Live` button. `None` for our own row.
+    action_btn: Option<button::Button>,
     is_us: bool,
 }
 
@@ -50,9 +53,13 @@ pub struct Sidebar {
     latency_label: frame::Frame,
     mute_btn: button::Button,
     deafen_btn: button::Button,
+    share_btn: button::Button,
 
     /// Live user row widgets, keyed by client ID for in-place updates.
     user_rows: Vec<UserRow>,
+
+    /// Set of client IDs currently sharing — passed in from App on each update.
+    active_sharers: HashSet<ClientId>,
 
     /// Currently open per-user audio popup (if any).
     audio_popup: Option<window::Window>,
@@ -118,6 +125,10 @@ impl Sidebar {
 
         audio_row.end();
 
+        // Share Screen button — full width, toggles to "Stop Sharing"
+        let mut share_btn = controls::button("Share Screen");
+        sidebar.fixed(&share_btn, 35);
+
         // Settings button
         let mut settings_btn = controls::button("Settings");
         sidebar.fixed(&settings_btn, 35);
@@ -128,7 +139,8 @@ impl Sidebar {
 
         sidebar.end();
 
-        // Callbacks
+        // ── Callbacks ───────────────────────────────────────────────
+
         let s = sender;
         mute_btn.clone().set_callback(move |_| {
             s.send(UiMessage::ToggleMute);
@@ -137,6 +149,15 @@ impl Sidebar {
         let s = sender;
         deafen_btn.clone().set_callback(move |_| {
             s.send(UiMessage::ToggleDeafen);
+        });
+
+        let s = sender;
+        share_btn.clone().set_callback(move |_| {
+            // The callback always sends StartShareScreen. App checks whether
+            // we're already sharing and sends StopShareScreen instead.
+            // This avoids capturing mutable state in the closure — the App
+            // is the authority on sharing state.
+            s.send(UiMessage::StartShareScreen);
         });
 
         let s = sender;
@@ -159,13 +180,34 @@ impl Sidebar {
             latency_label,
             mute_btn,
             deafen_btn,
+            share_btn,
             user_rows: Vec::new(),
+            active_sharers: HashSet::new(),
             audio_popup: None,
         }
     }
 
     pub fn create_ui(&mut self) -> group::Flex {
         self.group.clone()
+    }
+
+    /// Update the set of active sharers. Called from App whenever
+    /// ScreenShareStarted/Stopped arrives.
+    pub fn set_active_sharers(&mut self, sharers: &HashMap<ClientId, (u32, u32)>) {
+        self.active_sharers = sharers.keys().copied().collect();
+    }
+
+    /// Update the share button to reflect current sharing state.
+    pub fn set_share_state(&mut self, is_sharing: bool) {
+        if is_sharing {
+            self.share_btn.set_label("Stop Sharing");
+            self.share_btn.set_color(theme::DANGER);
+            self.share_btn.set_label_color(enums::Color::White);
+        } else {
+            self.share_btn.set_label("Share Screen");
+            self.share_btn.set_color(theme::BG_TERTIARY);
+            self.share_btn.set_label_color(theme::TEXT_PRIMARY);
+        }
     }
 
     fn close_audio_popup(&mut self) {
@@ -180,6 +222,7 @@ impl Sidebar {
         username: &str,
         current_volume: f32,
         is_muted: bool,
+        is_sharing: bool,
         click_x: i32,
         click_y: i32,
     ) {
@@ -187,7 +230,8 @@ impl Sidebar {
 
         let sender = self.sender;
         let popup_w = 200;
-        let popup_h = 130;
+        // Taller popup when "Watch Stream" is shown
+        let popup_h = if is_sharing { 165 } else { 130 };
 
         // Position above the click point
         let x = click_x;
@@ -203,6 +247,24 @@ impl Sidebar {
         let mut col = group::Flex::default_fill().column();
         col.set_margins(12, 8, 12, 8);
         col.set_spacing(4);
+
+        // ── "Watch Stream" button (only if peer is sharing) ─────────
+        if is_sharing {
+            let mut watch_btn = controls::accent_button("Watch Stream", theme::ACCENT);
+            col.fixed(&watch_btn, 26);
+
+            let mut wind_watch = wind.clone();
+            watch_btn.set_callback(move |_| {
+                sender.send(UiMessage::WatchPeer { client_id });
+                wind_watch.hide();
+            });
+
+            // Separator
+            let mut sep_watch = frame::Frame::default();
+            sep_watch.set_frame(enums::FrameType::FlatBox);
+            sep_watch.set_color(theme::BG_TERTIARY);
+            col.fixed(&sep_watch, 1);
+        }
 
         // User Volume header
         let mut vol_header = frame::Frame::default()
@@ -345,11 +407,13 @@ impl Sidebar {
         click_x: i32,
         click_y: i32,
     ) {
+        let is_sharing = self.active_sharers.contains(&client_id);
         self.open_audio_popup(
             client_id,
             username,
             current_volume,
             is_muted,
+            is_sharing,
             click_x,
             click_y,
         );
@@ -417,7 +481,8 @@ impl Sidebar {
         self.group.redraw();
     }
 
-    /// In-place update — only changes labels, colors, and icons, preserving layout and scroll.
+    /// In-place update — only changes labels, colors, icons, and Live badges,
+    /// preserving layout and scroll.
     fn refresh_user_rows(&mut self, users: &HashMap<ClientId, UserState>) {
         for row in &mut self.user_rows {
             let Some(state) = users.get(&row.client_id) else {
@@ -480,6 +545,27 @@ impl Sidebar {
                     icon_frame.set_image(None::<SvgImage>);
                 }
                 icon_frame.redraw();
+            }
+
+            // "Live" badge vs "…" button for non-self users
+            if let Some(btn) = &mut row.action_btn {
+                let is_sharing = self.active_sharers.contains(&row.client_id);
+                if is_sharing {
+                    // Always-visible red "Live" badge
+                    btn.set_label("Live");
+                    btn.set_label_size(11);
+                    btn.set_label_font(Font::HelveticaBold);
+                    btn.set_color(theme::DANGER);
+                    btn.set_label_color(enums::Color::White);
+                } else {
+                    // Revert to hidden "…" (colors match parent, revealed on hover)
+                    btn.set_label("\u{2026}");
+                    btn.set_label_size(16);
+                    btn.set_label_font(Font::Helvetica);
+                    btn.set_color(row.container.color());
+                    btn.set_label_color(row.container.color());
+                }
+                btn.redraw();
             }
         }
 
@@ -552,7 +638,6 @@ impl Sidebar {
         name_label.set_label_size(13);
 
         // Status icon frame — shows self-muted/deafened SVG.
-        // Sits between the name label and the `…` button (or end of row for self).
         let mut icon_frm = frame::Frame::default();
         user_item.fixed(&icon_frm, 18);
 
@@ -568,16 +653,30 @@ impl Sidebar {
 
         let status_icon = Some(icon_frm);
 
-        // [...] button + hover effect for non-self users
+        // Action button: "…" / "Live" for non-self users
+        let mut action_btn_handle = None;
+
         if !is_us {
-            // Button is always in the layout but "invisible" by default —
-            // its label and background match the row. On hover we reveal it.
-            let mut options_btn = button::Button::default().with_label("\u{2026}");
+            let is_sharing = self.active_sharers.contains(&client_id);
+
+            let mut options_btn = button::Button::default();
             options_btn.set_frame(enums::FrameType::FlatBox);
-            options_btn.set_color(theme::BG_SECONDARY);
-            options_btn.set_label_color(theme::BG_SECONDARY); // hidden: label matches bg
-            options_btn.set_label_size(16);
-            user_item.fixed(&options_btn, 24);
+            user_item.fixed(&options_btn, 32);
+
+            if is_sharing {
+                // Start as visible "Live" badge
+                options_btn.set_label("Live");
+                options_btn.set_label_size(11);
+                options_btn.set_label_font(Font::HelveticaBold);
+                options_btn.set_color(theme::DANGER);
+                options_btn.set_label_color(enums::Color::White);
+            } else {
+                // Start as hidden "…" (matches parent bg)
+                options_btn.set_label("\u{2026}");
+                options_btn.set_label_size(16);
+                options_btn.set_color(theme::BG_SECONDARY);
+                options_btn.set_label_color(theme::BG_SECONDARY);
+            }
 
             let sender = self.sender;
             let username = state.username.clone();
@@ -592,8 +691,12 @@ impl Sidebar {
                 });
             });
 
-            // Hover state: reveal button + tint background
-            // Right-click on the row also opens the popup
+            action_btn_handle = Some(options_btn.clone());
+
+            // Hover state: reveal "…" button + tint background.
+            // When the button is "Live", it's already visible — hover just
+            // tints the row background.
+            // Right-click on the row also opens the popup.
             let mut btn_clone = options_btn.clone();
             let mut container = user_item.clone();
             let base_color = user_item.color();
@@ -605,14 +708,22 @@ impl Sidebar {
             let client_id_rc = client_id;
             let username_rc = state.username.clone();
 
+            // Track whether this user is sharing via the button label.
+            // The refresh pass updates the label to "Live" or "…", so
+            // the hover handler reads it to decide visibility behavior.
             user_item.handle(move |w, ev| {
                 match ev {
                     enums::Event::Enter | enums::Event::Move => {
                         if !*hovering.borrow() {
                             *hovering.borrow_mut() = true;
-                            btn_clone.set_label_color(theme::TEXT_PRIMARY);
-                            btn_clone.set_color(hover_color);
-                            btn_clone.redraw();
+
+                            // Only reveal "…" if not already "Live"
+                            let is_live = btn_clone.label() == "Live";
+                            if !is_live {
+                                btn_clone.set_label_color(theme::TEXT_PRIMARY);
+                                btn_clone.set_color(hover_color);
+                                btn_clone.redraw();
+                            }
                             container.set_color(hover_color);
                             container.redraw();
                         }
@@ -625,15 +736,19 @@ impl Sidebar {
                         let wy = w.y();
                         if mx < wx || mx > wx + w.w() || my < wy || my > wy + w.h() {
                             *hovering.borrow_mut() = false;
-                            btn_clone.set_label_color(base_color);
-                            btn_clone.set_color(base_color);
-                            btn_clone.redraw();
+
+                            let is_live = btn_clone.label() == "Live";
+                            if !is_live {
+                                btn_clone.set_label_color(base_color);
+                                btn_clone.set_color(base_color);
+                                btn_clone.redraw();
+                            }
                             container.set_color(base_color);
                             container.redraw();
                         }
                         true
                     }
-                    // Right-click also opens audio popup
+                    // Right-click also opens the popup
                     enums::Event::Push if app::event_button() == 3 => {
                         sender_rc.send(UiMessage::OpenUserAudioPopup {
                             client_id: client_id_rc,
@@ -657,6 +772,7 @@ impl Sidebar {
             indicator,
             name_label,
             status_icon,
+            action_btn: action_btn_handle,
             is_us,
         });
     }
@@ -707,6 +823,8 @@ impl Sidebar {
         self.user_list_pack.clear();
         self.user_rows.clear();
         self.user_count_label.set_label("Users: 0");
+        self.active_sharers.clear();
+        self.set_share_state(false);
     }
 
     pub fn set_mute_state(&mut self, muted: bool) {

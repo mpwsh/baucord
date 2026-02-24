@@ -46,10 +46,23 @@ pub enum UiMessage {
         username: String,
     },
 
-    // ── Screen share viewer ─────────────────────────────────────────
+    // ── Screen share ────────────────────────────────────────────────
+    /// User clicked "Share Screen" — start capturing.
+    StartShareScreen,
+    /// User clicked "Stop Sharing" — stop capturing.
+    StopShareScreen,
+    /// User clicked "Watch Stream" on a peer's context menu.
+    WatchPeer { client_id: ClientId },
     /// User closed a viewer window — unsubscribe from that peer's stream.
-    UnwatchPeer {
-        client_id: u64,
+    UnwatchPeer { client_id: u64 },
+
+    // ── Per-user audio popup ────────────────────────────────────────
+    /// Open the per-user context menu (volume, mute, watch stream).
+    OpenUserAudioPopup {
+        client_id: ClientId,
+        username: String,
+        click_x: i32,
+        click_y: i32,
     },
 
     // ── Settings window ─────────────────────────────────────────────
@@ -57,14 +70,6 @@ pub enum UiMessage {
     SaveSettings,
     ResetSettings,
     SettingsWindowClosed,
-
-    // ── Per-user audio popup ────────────────────────────────────────
-    OpenUserAudioPopup {
-        client_id: ClientId,
-        username: String,
-        click_x: i32,
-        click_y: i32,
-    },
 
     // ── Device management ───────────────────────────────────────────
     SetInputDevice(Option<String>),

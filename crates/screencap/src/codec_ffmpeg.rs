@@ -3,6 +3,17 @@
 //! Tries hardware encoders in priority order, falls back to libx264.
 //! Reuses FFmpeg frame objects and output buffers across calls.
 //!
+//! # Scaling architecture
+//!
+//! The encoder accepts frames at **any** input resolution (typically the
+//! monitor's native resolution) and scales to the target encoding
+//! resolution during the RGBA→YUV420P colorspace conversion. This is a
+//! single swscale pass with bicubic filtering — no separate prescale step.
+//!
+//! This gives significantly sharper output for screen content vs the
+//! previous nearest-neighbor prescale, especially for text at non-native
+//! resolutions (e.g. 1080p monitor → 720p encode).
+//!
 //! # System requirements
 //!
 //! - **Windows (static):** `vcpkg install ffmpeg[x264,gpl]:x64-windows-static-md`
@@ -26,19 +37,29 @@ use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder
 
 /// Hardware-accelerated (or software fallback) H.264 encoder via FFmpeg.
 ///
-/// Reuses the RGBA input frame, YUV working frame, and output packet buffer
-/// across encode calls — the only per-frame allocation is the final `EncodedFrame::data`
-/// which must be owned by the caller anyway.
+/// Accepts RGBA input at any resolution and downscales + converts to
+/// YUV420P in a single swscale pass. The swscale context is created
+/// lazily on the first `encode()` call (when the source resolution is
+/// known) and recreated if the source resolution changes mid-stream.
 pub struct FfmpegEncoder {
     encoder: ffmpeg::encoder::Video,
-    sws_ctx: SwsContext,
     quality: Quality,
     frame_count: i64,
     keyframe_interval: i64,
     force_next_keyframe: bool,
-    /// Reusable FFmpeg frame for RGBA input — avoids alloc per encode.
-    rgba_frame: VideoFrame,
-    /// Reusable FFmpeg frame for YUV420P — fed to encoder.
+
+    // ── Scaling state (lazily initialized) ───────────────────────────
+    /// swscale context: RGBA(src_w×src_h) → YUV420P(target_w×target_h).
+    /// Created on first frame, recreated if source resolution changes.
+    sws_ctx: Option<SwsContext>,
+    /// Source resolution the current sws_ctx was built for.
+    sws_src_w: u32,
+    sws_src_h: u32,
+    /// Reusable FFmpeg frame for RGBA input (source resolution).
+    /// Recreated when source resolution changes.
+    rgba_frame: Option<VideoFrame>,
+
+    /// Reusable FFmpeg frame for YUV420P — fed to encoder (target resolution).
     yuv_frame: VideoFrame,
     /// Reusable packet for receiving encoder output.
     pkt: Packet,
@@ -51,6 +72,9 @@ const ENCODER_PRIORITY: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libx2
 
 impl FfmpegEncoder {
     /// Create an encoder. Tries hardware encoders first, falls back to libx264.
+    ///
+    /// The swscale context is **not** created here — it's lazily initialized
+    /// on the first `encode()` call when the source resolution is known.
     pub fn new(quality: Quality) -> Result<Self, CodecError> {
         ffmpeg::init().map_err(|e| CodecError::EncoderInit(e.to_string()))?;
 
@@ -62,7 +86,9 @@ impl FfmpegEncoder {
             .map_err(|e| CodecError::EncoderInit(e.to_string()))?;
 
         let target_bitrate = quality.bitrate() as usize;
-        let max_bitrate = target_bitrate * 2;
+        // Peak bitrate: 1.5× target gives keyframes room to breathe
+        // without allowing unconstrained spikes.
+        let max_bitrate = target_bitrate * 3 / 2;
 
         ctx.set_width(quality.width());
         ctx.set_height(quality.height());
@@ -81,18 +107,6 @@ impl FfmpegEncoder {
 
         log::info!("Using FFmpeg encoder: {enc_name}");
 
-        let sws_ctx = SwsContext::get(
-            Pixel::RGBA,
-            quality.width(),
-            quality.height(),
-            Pixel::YUV420P,
-            quality.width(),
-            quality.height(),
-            Flags::FAST_BILINEAR,
-        )
-        .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
-
-        let rgba_frame = VideoFrame::new(Pixel::RGBA, quality.width(), quality.height());
         let mut yuv_frame = VideoFrame::new(Pixel::YUV420P, quality.width(), quality.height());
         yuv_frame.set_format(Pixel::YUV420P);
 
@@ -102,26 +116,103 @@ impl FfmpegEncoder {
 
         Ok(Self {
             encoder,
-            sws_ctx,
             quality,
             frame_count: 0,
             keyframe_interval: (quality.fps() * 2) as i64,
             force_next_keyframe: false,
-            rgba_frame,
+            sws_ctx: None,
+            sws_src_w: 0,
+            sws_src_h: 0,
+            rgba_frame: None,
             yuv_frame,
             pkt: Packet::empty(),
             out_buf,
         })
     }
 
-    /// Encode one RGBA frame.
-    pub fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame, CodecError> {
-        // Copy RGBA data into reusable FFmpeg frame (stride-aware)
-        fill_rgba_frame(&mut self.rgba_frame, &frame.data, frame.width, frame.height);
+    /// Ensure the swscale context matches the input frame dimensions.
+    ///
+    /// Creates the context on first call; recreates if source resolution
+    /// changes (e.g. monitor switch, DPI change).
+    fn ensure_sws(&mut self, src_w: u32, src_h: u32) -> Result<(), CodecError> {
+        if self.sws_ctx.is_some() && self.sws_src_w == src_w && self.sws_src_h == src_h {
+            return Ok(());
+        }
 
-        // RGBA → YUV420P via FFmpeg's optimized swscale
-        self.sws_ctx
-            .run(&self.rgba_frame, &mut self.yuv_frame)
+        let dst_w = self.quality.width();
+        let dst_h = self.quality.height();
+
+        // Use BICUBIC for downscaling — much sharper than FAST_BILINEAR for
+        // screen content (text, UI elements, hard edges). The CPU cost is
+        // negligible since swscale is SIMD-optimized and we're doing the
+        // colorspace conversion anyway.
+        let flags = if src_w == dst_w && src_h == dst_h {
+            // No resize needed — skip the expensive filter, just convert colorspace
+            Flags::FAST_BILINEAR
+        } else {
+            Flags::BICUBIC
+        };
+
+        let sws = SwsContext::get(
+            Pixel::RGBA,
+            src_w,
+            src_h,
+            Pixel::YUV420P,
+            dst_w,
+            dst_h,
+            flags,
+        )
+        .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
+
+        if self.sws_src_w != 0 {
+            log::info!(
+                "swscale: source resolution changed {}x{} → {}x{}, target {}x{}",
+                self.sws_src_w,
+                self.sws_src_h,
+                src_w,
+                src_h,
+                dst_w,
+                dst_h,
+            );
+        } else {
+            log::info!(
+                "swscale: {}x{} → {}x{} ({})",
+                src_w,
+                src_h,
+                dst_w,
+                dst_h,
+                if src_w == dst_w && src_h == dst_h {
+                    "colorspace only"
+                } else {
+                    "bicubic downscale + colorspace"
+                },
+            );
+        }
+
+        self.sws_ctx = Some(sws);
+        self.sws_src_w = src_w;
+        self.sws_src_h = src_h;
+        self.rgba_frame = Some(VideoFrame::new(Pixel::RGBA, src_w, src_h));
+
+        Ok(())
+    }
+
+    /// Encode one RGBA frame.
+    ///
+    /// The input frame can be at **any** resolution — the encoder scales
+    /// to the target quality resolution during colorspace conversion.
+    pub fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame, CodecError> {
+        // Ensure swscale matches this frame's resolution
+        self.ensure_sws(frame.width, frame.height)?;
+
+        let rgba_frame = self.rgba_frame.as_mut().expect("ensure_sws sets this");
+
+        // Copy RGBA data into reusable FFmpeg frame (stride-aware)
+        fill_rgba_frame(rgba_frame, &frame.data, frame.width, frame.height);
+
+        // RGBA(src) → YUV420P(target) via swscale: resize + colorspace in one pass
+        let sws = self.sws_ctx.as_mut().expect("ensure_sws sets this");
+        sws.run(rgba_frame, &mut self.yuv_frame)
             .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
 
         self.yuv_frame.set_pts(Some(self.frame_count));
@@ -347,49 +438,68 @@ fn find_encoder() -> Result<(ffmpeg::Codec, &'static str), CodecError> {
     Err(CodecError::NoEncoder(ENCODER_PRIORITY.join(", ")))
 }
 
-/// Build codec-specific option dictionaries for low-latency encoding.
+/// Build codec-specific option dictionaries for screen-share encoding.
 ///
-/// VBV (Video Buffering Verifier) settings constrain peak bitrate so keyframes
-/// don't spike to hundreds of KB. The buffer size is set to 1 second of video
-/// at the max bitrate — this gives the encoder enough room for quality keyframes
-/// while preventing unconstrained spikes.
+/// Key design decisions for libx264:
+///
+/// - **`veryfast` preset** (not `ultrafast`): Re-enables adaptive quantization,
+///   better motion estimation refinement, and trellis. This is the single biggest
+///   quality lever — `ultrafast` disables almost all quality tools and produces
+///   visibly worse output at the same bitrate. At 720p30 the CPU cost of
+///   `veryfast` is modest (~15-20% more than `ultrafast`).
+///
+/// - **`high` profile**: Enables CABAC entropy coding + 8×8 DCT transforms,
+///   giving ~15-20% better compression vs baseline. Since we control both
+///   encoder and decoder, compatibility is not a concern. B-frames are
+///   disabled via `max_b_frames(0)` on the context, so High profile only
+///   adds coding efficiency without latency.
+///
+/// - **`zerolatency` tune**: Disables lookahead and frame reordering. Adds
+///   some quality cost but keeps per-frame encode latency minimal for
+///   real-time screen sharing.
+///
+/// VBV (Video Buffering Verifier) constrains peak bitrate for real-time
+/// transport. Buffer is 1 second at target bitrate — tight enough for
+/// responsive rate control on scene changes, with enough room for keyframes.
 fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
     let mut opts = Dictionary::new();
 
-    // VBV buffer size: 1 second at max bitrate (2× target) gives the encoder
-    // room for occasional peaks without letting keyframes blow up.
-    let vbv_bufsize = quality.bitrate() * 2;
+    let target = quality.bitrate();
+    // VBV buffer: 1 second at target bitrate.
+    let vbv_bufsize = target;
+    // Peak rate: 1.5× target — enough for keyframe bursts without
+    // overwhelming the network or protocol buffer budget.
+    let maxrate = target * 3 / 2;
 
     match name {
         "libx264" => {
-            opts.set("preset", "ultrafast");
+            // veryfast: best quality/speed tradeoff for real-time screen content.
+            // Enables AQ, trellis, and better ME vs ultrafast.
+            opts.set("preset", "veryfast");
             opts.set("tune", "zerolatency");
-            // Constrained VBV: caps peak bitrate so keyframes stay manageable.
-            // Without this, libx264 ultrafast produces 200-300KB keyframes at 720p.
-            opts.set("maxrate", &format!("{}", quality.bitrate() * 2));
+            opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
-            // Constrained Baseline profile: no B-frames, no CABAC — lowest
-            // decode complexity and most compatible across devices.
-            opts.set("profile", "baseline");
+            // High profile: CABAC + 8x8 DCT for maximum coding efficiency.
+            opts.set("profile", "high");
         }
         "h264_nvenc" => {
             opts.set("preset", "p1");
             opts.set("tune", "ull");
             opts.set("rc", "cbr");
             opts.set("zerolatency", "1");
-            opts.set("maxrate", &format!("{}", quality.bitrate() * 2));
+            opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
         }
         "h264_qsv" => {
             opts.set("preset", "veryfast");
             opts.set("low_power", "1");
-            opts.set("maxrate", &format!("{}", quality.bitrate() * 2));
+            opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
         }
         "h264_amf" => {
             opts.set("usage", "ultralowlatency");
             opts.set("quality", "speed");
-            opts.set("maxrate", &format!("{}", quality.bitrate() * 2));
+            opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
         }
         _ => {}
