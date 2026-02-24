@@ -296,12 +296,10 @@ impl VideoRelay {
         reliable_video_channel_id: u8,
     ) {
         let clients: Vec<ClientId> = server.clients_id();
-        let mut received_this_tick = 0u32;
 
         for inbound_channel in [reliable_video_channel_id, video_channel_id] {
             for client_id in &clients {
                 while let Some(message) = server.receive_message(*client_id, inbound_channel) {
-                    received_this_tick += 1;
                     self.relay_video_packet(
                         server,
                         *client_id,
@@ -312,13 +310,6 @@ impl VideoRelay {
                     );
                 }
             }
-        }
-
-        if received_this_tick > 0 {
-            log::info!(
-                "📺 relay: received {received_this_tick} video frames this tick, fwd total: {}",
-                self.stats.packets_forwarded
-            );
         }
     }
 

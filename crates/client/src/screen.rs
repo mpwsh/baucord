@@ -339,11 +339,6 @@ fn handle_control(
             height,
             data,
         } => {
-            static RX_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let c = RX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if c % 60 == 0 {
-                log::info!("📺 Screen thread received {c} IncomingVideoFrame");
-            }
             decode_incoming_frame(
                 client_id,
                 seq,
@@ -513,11 +508,6 @@ fn decode_incoming_frame(
 
     match stream.decoder.decode(&encoded) {
         Ok(Some(decoded)) => {
-            static SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let c = SEND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if c % 60 == 0 {
-                log::info!("📺 Screen thread sent {c} FrameReady events");
-            }
             event_tx
                 .send(ScreenEvent::FrameReady {
                     client_id,
