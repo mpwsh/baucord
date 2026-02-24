@@ -3,25 +3,16 @@ name = "screencap"
 version = "0.2.0"
 edition = "2021"
 
-[features]
-default = ["openh264-codec"]
-openh264-codec = ["openh264"]
-ffmpeg-codec = ["ffmpeg-next"]
-
 [dependencies]
 xcap = { git = "https://github.com/nashaofu/xcap" }
 log = "0.4"
 thiserror = "2"
-
-# openh264 backend (default — lightweight, zero system deps)
-openh264 = { git = "https://github.com/ralfbiedert/openh264-rs", features = ["source"], optional = true }
-
-# ffmpeg backend (opt-in — fast, needs ffmpeg libs installed)
 # Windows static: vcpkg install ffmpeg[x264,gpl]:x64-windows-static-md
 #                 set VCPKG_ROOT=C:\path\to\vcpkg
 # Linux:          apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 # macOS:          brew install ffmpeg
-ffmpeg-next = { version = "8", optional = true }
+ffmpeg-next = "8"
 
 [dev-dependencies]
 env_logger = "0.11"
+

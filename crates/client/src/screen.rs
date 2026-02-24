@@ -5,10 +5,8 @@
 //
 // Sender side: capture → encode → NetworkControl::SendVideoFrame
 // Receiver side: incoming H.264 frames → per-peer VideoDecoder → RGBA for display
-//
-// This module has NO dependency on any UI toolkit.
 
-use crossbeam_channel::{Receiver, Sender, bounded, select};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,11 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use log::{error, info, warn};
+use log::{info, warn};
 
 use screencap::capture::{MonitorInfo, ScreenCapturer};
 use screencap::{
-    CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder, VideoEncoder,
+    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
+    codec::{FfmpegDecoder, FfmpegEncoder},
 };
 
 use crate::network::NetworkControl;
@@ -200,38 +199,59 @@ fn run_screen_loop(
     let mut next_capture = Instant::now();
 
     while running {
-        // Determine how long we can block waiting for messages
         let now = Instant::now();
-        let timeout = if let Some(state) = &capture {
-            // Sharing: wake at next capture time
-            next_capture.saturating_duration_since(now)
-        } else if !peer_streams.is_empty() {
-            // Actively viewing: block on channel, wake immediately on message
-            Duration::from_millis(50)
-        } else {
-            // Idle
-            Duration::from_millis(100)
-        };
 
-        // Block until message or timeout
-        match control_rx.recv_timeout(timeout) {
-            Ok(ctrl) => handle_control(
-                ctrl,
-                &mut capture,
-                &mut peer_streams,
-                &event_tx,
-                &network_tx,
-                &shared,
-                &wake,
-                &mut running,
-            ),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
+        let is_viewing = !peer_streams.is_empty();
+        let is_capturing = capture.is_some();
 
-        // Drain ALL pending messages (critical for video throughput)
-        loop {
-            match control_rx.try_recv() {
+        if is_capturing {
+            // ── Sharing mode ────────────────────────────────────────
+            // Use frame-interval timeout so we wake at capture time,
+            // but also wake immediately on any incoming message.
+            let time_to_capture = next_capture.saturating_duration_since(now);
+
+            match control_rx.recv_timeout(time_to_capture) {
+                Ok(ctrl) => handle_control(
+                    ctrl,
+                    &mut capture,
+                    &mut peer_streams,
+                    &event_tx,
+                    &network_tx,
+                    &shared,
+                    &wake,
+                    &mut running,
+                ),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+
+            // Drain all pending
+            while let Ok(ctrl) = control_rx.try_recv() {
+                handle_control(
+                    ctrl,
+                    &mut capture,
+                    &mut peer_streams,
+                    &event_tx,
+                    &network_tx,
+                    &shared,
+                    &wake,
+                    &mut running,
+                );
+            }
+
+            // Capture if due
+            if let Some(state) = &mut capture {
+                if Instant::now() >= next_capture {
+                    capture_and_encode(state, &event_tx, &network_tx, &shared);
+                    next_capture = Instant::now() + state.quality.frame_duration();
+                }
+            }
+        } else if is_viewing {
+            // ── Viewing mode (no capture) ───────────────────────────
+            // Block on channel with NO timeout — wake instantly when
+            // a frame arrives. This is the key to hitting 60fps: the
+            // OS scheduler doesn't get a chance to delay us.
+            match control_rx.recv() {
                 Ok(ctrl) => handle_control(
                     ctrl,
                     &mut capture,
@@ -244,14 +264,38 @@ fn run_screen_loop(
                 ),
                 Err(_) => break,
             }
-        }
 
-        // Capture if it's time
-        if let Some(state) = &mut capture {
-            let now = Instant::now();
-            if now >= next_capture {
-                capture_and_encode(state, &event_tx, &network_tx, &shared);
-                next_capture = now + state.quality.frame_duration();
+            // Drain all pending — if multiple frames queued up,
+            // process them all before yielding. This prevents
+            // frame buildup in the channel.
+            while let Ok(ctrl) = control_rx.try_recv() {
+                handle_control(
+                    ctrl,
+                    &mut capture,
+                    &mut peer_streams,
+                    &event_tx,
+                    &network_tx,
+                    &shared,
+                    &wake,
+                    &mut running,
+                );
+            }
+        } else {
+            // ── Idle mode ───────────────────────────────────────────
+            // Nothing active — sleep until a control message arrives.
+            match control_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ctrl) => handle_control(
+                    ctrl,
+                    &mut capture,
+                    &mut peer_streams,
+                    &event_tx,
+                    &network_tx,
+                    &shared,
+                    &wake,
+                    &mut running,
+                ),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
             }
         }
     }
@@ -595,7 +639,7 @@ fn capture_and_encode(
 /// Create the best available video encoder.
 fn create_encoder(quality: Quality) -> Result<Box<dyn VideoEncoder + Send>, CodecError> {
     {
-        match screencap::codec_ffmpeg::FfmpegEncoder::new(quality) {
+        match FfmpegEncoder::new(quality) {
             Ok(enc) => {
                 info!("📺 Using FFmpeg encoder: {}", enc.encoder_name());
                 return Ok(Box::new(enc));
@@ -614,7 +658,7 @@ fn create_encoder(quality: Quality) -> Result<Box<dyn VideoEncoder + Send>, Code
 
 /// Create the best available video decoder.
 fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
-    match screencap::codec_ffmpeg::FfmpegDecoder::new() {
+    match FfmpegDecoder::new() {
         Ok(dec) => return Ok(Box::new(dec)),
         Err(e) => {
             warn!("FFmpeg decoder unavailable: {e}, trying openh264");

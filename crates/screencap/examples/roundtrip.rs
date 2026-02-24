@@ -19,33 +19,19 @@ fn main() {
 
     let num_frames = 60u32;
 
-    #[cfg(feature = "ffmpeg-codec")]
     let backend = "ffmpeg";
-    #[cfg(all(feature = "openh264-codec", not(feature = "ffmpeg-codec")))]
-    let backend = "openh264";
-    #[cfg(not(any(feature = "openh264-codec", feature = "ffmpeg-codec")))]
-    compile_error!("Enable either openh264-codec or ffmpeg-codec feature");
-
-    println!("Roundtrip benchmark: {} — {} frames [{}]", quality, num_frames, backend);
+    println!(
+        "Roundtrip benchmark: {} — {} frames [{}]",
+        quality, num_frames, backend
+    );
 
     let mut capturer = ScreenCapturer::primary(quality).expect("Failed to create capturer");
 
-    #[cfg(feature = "ffmpeg-codec")]
     let (mut encoder, mut decoder) = {
-        let enc = screencap::codec_ffmpeg::FfmpegEncoder::new(quality)
-            .expect("Failed to create ffmpeg encoder");
+        let enc =
+            screencap::codec::FfmpegEncoder::new(quality).expect("Failed to create ffmpeg encoder");
         println!("  Encoder: {}", enc.encoder_name());
-        let dec = screencap::codec_ffmpeg::FfmpegDecoder::new()
-            .expect("Failed to create ffmpeg decoder");
-        (enc, dec)
-    };
-
-    #[cfg(all(feature = "openh264-codec", not(feature = "ffmpeg-codec")))]
-    let (mut encoder, mut decoder) = {
-        let enc = screencap::codec::H264Encoder::new(quality)
-            .expect("Failed to create openh264 encoder");
-        let dec = screencap::codec::H264Decoder::new()
-            .expect("Failed to create openh264 decoder");
+        let dec = screencap::codec::FfmpegDecoder::new().expect("Failed to create ffmpeg decoder");
         (enc, dec)
     };
 
@@ -93,9 +79,21 @@ fn main() {
     println!("  Avg capture:  {:?}", avg_capture);
     println!("  Avg encode:   {:?}", avg_encode);
     println!("  Avg decode:   {:?}", avg_decode);
-    println!("  Avg frame:    {} bytes ({:.1} KB)", avg_frame_bytes, avg_frame_bytes as f64 / 1024.0);
-    println!("  Total bytes:  {} ({:.2} MB)", total_bytes, total_bytes as f64 / 1_048_576.0);
-    println!("  Avg bitrate:  {:.2} Mbps", total_bytes as f64 * 8.0 / (num_frames as f64 / quality.fps() as f64) / 1_000_000.0);
+    println!(
+        "  Avg frame:    {} bytes ({:.1} KB)",
+        avg_frame_bytes,
+        avg_frame_bytes as f64 / 1024.0
+    );
+    println!(
+        "  Total bytes:  {} ({:.2} MB)",
+        total_bytes,
+        total_bytes as f64 / 1_048_576.0
+    );
+    println!(
+        "  Avg bitrate:  {:.2} Mbps",
+        total_bytes as f64 * 8.0 / (num_frames as f64 / quality.fps() as f64) / 1_000_000.0
+    );
     println!("  Max pipeline FPS: {:.1}", max_fps);
     println!("  Decoded:      {}/{}", decoded_count, num_frames);
 }
+

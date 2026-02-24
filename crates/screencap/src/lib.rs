@@ -1,7 +1,6 @@
 //! screencap — Lightweight screen capture + H.264 encode/decode wrapper.
 //!
 //! Built on `xcap` (screen capture) with pluggable codec backends:
-//! - `openh264-codec` (default) — zero system deps, software-only
 //! - `ffmpeg-codec` — fast, hardware-accelerated, needs FFmpeg installed
 //!
 //! # Architecture
@@ -19,11 +18,7 @@
 pub mod capture;
 pub mod color;
 
-#[cfg(feature = "openh264-codec")]
 pub mod codec;
-
-#[cfg(feature = "ffmpeg-codec")]
-pub mod codec_ffmpeg;
 
 use std::fmt;
 
@@ -205,3 +200,4 @@ pub trait VideoDecoder {
     /// Optional — callers that don't recycle buffers can ignore this.
     fn return_buffer(&mut self, _buf: Vec<u8>) {}
 }
+
