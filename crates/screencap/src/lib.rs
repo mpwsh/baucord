@@ -1,6 +1,6 @@
 //! screencap — Lightweight screen capture + H.264 encode/decode wrapper.
 //!
-//! Built on `xcap` (screen capture) with pluggable codec backends:
+//! Built on `scap` (native streaming screen capture) with pluggable codec backends:
 //! - `ffmpeg-codec` — fast, hardware-accelerated, needs FFmpeg installed
 //!
 //! # Architecture
@@ -14,6 +14,12 @@
 //!                    │ Decoder │     │ RGBA frame  │ ──▶ display
 //!                    └─────────┘     └────────────┘
 //! ```
+//!
+//! # Pixel formats
+//!
+//! The capturer delivers **BGRA** frames (native to ScreenCaptureKit, DXGI,
+//! and PipeWire). The encoder accepts BGRA and converts to YUV420P via
+//! swscale. The decoder outputs **RGBA** for display.
 
 pub mod capture;
 pub mod color;
@@ -85,6 +91,11 @@ impl Quality {
         self.width() as usize * self.height() as usize
     }
 
+    /// Byte count for one BGRA frame at this resolution.
+    pub const fn bgra_size(self) -> usize {
+        self.pixel_count() * 4
+    }
+
     /// Byte count for one RGBA frame at this resolution.
     pub const fn rgba_size(self) -> usize {
         self.pixel_count() * 4
@@ -109,13 +120,35 @@ impl fmt::Display for Quality {
     }
 }
 
+impl From<Quality> for u8 {
+    fn from(q: Quality) -> u8 {
+        match q {
+            Quality::HD30 => 0,
+            Quality::HD60 => 1,
+            Quality::FHD30 => 2,
+            Quality::FHD60 => 3,
+        }
+    }
+}
+
+impl From<u8> for Quality {
+    fn from(v: u8) -> Self {
+        match v {
+            1 => Self::HD60,
+            2 => Self::FHD30,
+            3 => Self::FHD60,
+            _ => Self::HD30,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Frame types
 // ---------------------------------------------------------------------------
 
-/// An RGBA frame ready for encoding or display.
+/// A BGRA frame from the capturer, or RGBA frame for display.
 ///
-/// Not `Clone` by design — RGBA buffers are large (3.7 MB at 1080p).
+/// Not `Clone` by design — pixel buffers are large (3.7 MB at 1080p).
 /// Pass by reference or transfer ownership explicitly.
 pub struct Frame {
     pub data: Vec<u8>,
@@ -148,10 +181,14 @@ pub struct DecodedFrame {
 /// Errors from screen capture operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
+    #[error("screen capture is not supported on this platform")]
+    NotSupported,
     #[error("failed to enumerate monitors: {0}")]
     MonitorList(String),
     #[error("monitor index {0} not found")]
     MonitorNotFound(usize),
+    #[error("capturer initialization failed: {0}")]
+    InitFailed(String),
     #[error("capture failed: {0}")]
     Capture(String),
 }
@@ -177,7 +214,7 @@ pub enum CodecError {
 // Codec traits — allows swapping backends generically
 // ---------------------------------------------------------------------------
 
-/// Encoder that converts RGBA frames into H.264 bitstream.
+/// Encoder that converts BGRA/RGBA frames into H.264 bitstream.
 pub trait VideoEncoder {
     fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame, CodecError>;
     fn quality(&self) -> Quality;
@@ -200,4 +237,3 @@ pub trait VideoDecoder {
     /// Optional — callers that don't recycle buffers can ignore this.
     fn return_buffer(&mut self, _buf: Vec<u8>) {}
 }
-

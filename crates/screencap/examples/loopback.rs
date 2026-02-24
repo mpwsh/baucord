@@ -5,6 +5,19 @@ use screencap::Quality;
 fn main() {
     env_logger::init();
 
+    // macOS requires screen recording permission via ScreenCaptureKit.
+    if !screencap::capture::is_supported() {
+        eprintln!("Platform not supported");
+        std::process::exit(1);
+    }
+    if !screencap::capture::has_permission() {
+        eprintln!("Screen recording permission not granted — requesting...");
+        if !screencap::capture::request_permission() {
+            eprintln!("Permission denied. Grant in System Settings → Privacy → Screen Recording, then restart.");
+            std::process::exit(1);
+        }
+    }
+
     let quality = Quality::HD30;
     println!("Loopback test: capture 5 frames, encode, decode, save last as BMP");
 

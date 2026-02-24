@@ -5,14 +5,13 @@
 //!
 //! # Scaling architecture
 //!
-//! The encoder accepts frames at **any** input resolution (typically the
-//! monitor's native resolution) and scales to the target encoding
-//! resolution during the RGBA→YUV420P colorspace conversion. This is a
-//! single swscale pass with bicubic filtering — no separate prescale step.
+//! The encoder accepts frames at **any** input resolution and scales to the
+//! target encoding resolution during the BGRA→YUV420P colorspace conversion.
+//! This is a single swscale pass with bicubic filtering — no separate
+//! prescale step.
 //!
-//! This gives significantly sharper output for screen content vs the
-//! previous nearest-neighbor prescale, especially for text at non-native
-//! resolutions (e.g. 1080p monitor → 720p encode).
+//! Note: `scap` delivers **BGRA** on all platforms (ScreenCaptureKit, DXGI,
+//! PipeWire). The decoder still outputs **RGBA** for display.
 //!
 //! # System requirements
 //!
@@ -49,13 +48,13 @@ pub struct FfmpegEncoder {
     force_next_keyframe: bool,
 
     // ── Scaling state (lazily initialized) ───────────────────────────
-    /// swscale context: RGBA(src_w×src_h) → YUV420P(target_w×target_h).
+    /// swscale context: BGRA(src_w×src_h) → YUV420P(target_w×target_h).
     /// Created on first frame, recreated if source resolution changes.
     sws_ctx: Option<SwsContext>,
     /// Source resolution the current sws_ctx was built for.
     sws_src_w: u32,
     sws_src_h: u32,
-    /// Reusable FFmpeg frame for RGBA input (source resolution).
+    /// Reusable FFmpeg frame for BGRA input (source resolution).
     /// Recreated when source resolution changes.
     rgba_frame: Option<VideoFrame>,
 
@@ -155,7 +154,7 @@ impl FfmpegEncoder {
         };
 
         let sws = SwsContext::get(
-            Pixel::RGBA,
+            Pixel::BGRA,
             src_w,
             src_h,
             Pixel::YUV420P,
@@ -193,12 +192,12 @@ impl FfmpegEncoder {
         self.sws_ctx = Some(sws);
         self.sws_src_w = src_w;
         self.sws_src_h = src_h;
-        self.rgba_frame = Some(VideoFrame::new(Pixel::RGBA, src_w, src_h));
+        self.rgba_frame = Some(VideoFrame::new(Pixel::BGRA, src_w, src_h));
 
         Ok(())
     }
 
-    /// Encode one RGBA frame.
+    /// Encode one BGRA frame.
     ///
     /// The input frame can be at **any** resolution — the encoder scales
     /// to the target quality resolution during colorspace conversion.
@@ -208,10 +207,10 @@ impl FfmpegEncoder {
 
         let rgba_frame = self.rgba_frame.as_mut().expect("ensure_sws sets this");
 
-        // Copy RGBA data into reusable FFmpeg frame (stride-aware)
+        // Copy BGRA data into reusable FFmpeg frame (stride-aware)
         fill_rgba_frame(rgba_frame, &frame.data, frame.width, frame.height);
 
-        // RGBA(src) → YUV420P(target) via swscale: resize + colorspace in one pass
+        // BGRA(src) → YUV420P(target) via swscale: resize + colorspace in one pass
         let sws = self.sws_ctx.as_mut().expect("ensure_sws sets this");
         sws.run(rgba_frame, &mut self.yuv_frame)
             .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
@@ -508,8 +507,8 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
     opts
 }
 
-/// Copy RGBA pixel data into an ffmpeg VideoFrame (stride-aware).
-fn fill_rgba_frame(frame: &mut VideoFrame, rgba: &[u8], width: u32, height: u32) {
+/// Copy BGRA pixel data into an ffmpeg VideoFrame (stride-aware).
+fn fill_rgba_frame(frame: &mut VideoFrame, bgra: &[u8], width: u32, height: u32) {
     let stride = frame.stride(0);
     let dst = frame.data_mut(0);
     let row_bytes = width as usize * 4;
@@ -518,6 +517,6 @@ fn fill_rgba_frame(frame: &mut VideoFrame, rgba: &[u8], width: u32, height: u32)
         let src_start = row * row_bytes;
         let dst_start = row * stride;
         dst[dst_start..dst_start + row_bytes]
-            .copy_from_slice(&rgba[src_start..src_start + row_bytes]);
+            .copy_from_slice(&bgra[src_start..src_start + row_bytes]);
     }
 }

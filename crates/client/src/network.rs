@@ -7,7 +7,7 @@
 // All wire protocol types come from the shared `protocol` crate.
 
 use bincode::Options;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use log::warn;
 use renet::{ChannelConfig, ClientId, ConnectionConfig, RenetClient, SendType};
 use renet_netcode::{ClientAuthentication, NETCODE_USER_DATA_BYTES, NetcodeClientTransport};
@@ -21,10 +21,9 @@ use core::AudioPacket;
 use protocol::{
     ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL,
     RELIABLE_VIDEO_BUFFER_BYTES, RELIABLE_VIDEO_CHANNEL, ServerMessage, VIDEO_BUFFER_BYTES,
-    VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VIDEO_PROTOCOL_VERSION, VOICE_BATCH_THRESHOLD,
-    VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET,
-    VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoHeader, VoiceHeader, pack_video_frame,
-    parse_video_header, video_payload,
+    VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL,
+    VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION,
+    VideoHeader, VoiceHeader, pack_video_frame, parse_video_header, video_payload,
 };
 
 use crate::screen::ScreenControl;
@@ -205,16 +204,11 @@ pub(crate) struct NetworkClient {
     // Speaking status throttle
     last_speaking_sent: bool,
     last_speaking_instant: Instant,
-    speaking_cache: HashMap<ClientId, (bool, Instant)>,
     last_rtt_check: Instant,
 }
 
 impl NetworkClient {
     pub fn connect(server_addr: SocketAddr, username: String) -> Result<Self, String> {
-        let mut connection_config = ConnectionConfig::default();
-        connection_config.client_channels_config.clear();
-        connection_config.server_channels_config.clear();
-
         let reliable = ChannelConfig {
             channel_id: RELIABLE_CHANNEL,
             max_memory_usage_bytes: RELIABLE_BUFFER_BYTES,
@@ -243,28 +237,23 @@ impl NetworkClient {
             },
         };
 
-        connection_config
-            .client_channels_config
-            .push(reliable.clone());
-        connection_config.server_channels_config.push(reliable);
-        connection_config.client_channels_config.push(voice.clone());
-        connection_config.server_channels_config.push(voice);
-        connection_config.client_channels_config.push(video.clone());
-        connection_config.server_channels_config.push(video);
-        connection_config
-            .client_channels_config
-            .push(reliable_video.clone());
-        connection_config
-            .server_channels_config
-            .push(reliable_video);
+        let channels = vec![reliable, voice, video, reliable_video];
+
+        let connection_config = ConnectionConfig {
+            available_bytes_per_tick: 60_000,
+            server_channels_config: channels.clone(),
+            client_channels_config: channels,
+        };
 
         let client = RenetClient::new(connection_config);
+
         let socket =
             UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind socket: {e}"))?;
 
         let current_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| format!("System time error: {e}"))?;
+
         let client_id = current_time.as_millis() as u64;
 
         let authentication = ClientAuthentication::Unsecure {
@@ -287,7 +276,6 @@ impl NetworkClient {
             expected_seqs: HashMap::new(),
             last_speaking_sent: false,
             last_speaking_instant: Instant::now() - Duration::from_secs(5),
-            speaking_cache: HashMap::new(),
             last_rtt_check: Instant::now(),
         })
     }
@@ -954,14 +942,18 @@ fn run_network_loop(
                         height,
                         data,
                     } => {
-                        let _ = screen_tx.try_send(ScreenControl::IncomingVideoFrame {
+                        if let Err(e) = screen_tx.try_send(ScreenControl::IncomingVideoFrame {
                             client_id,
                             seq,
                             is_keyframe,
                             width,
                             height,
                             data,
-                        });
+                        }) {
+                            log::warn!(
+                                "📺 Screen channel full, dropped frame seq={seq} keyframe={is_keyframe}"
+                            );
+                        }
                     }
 
                     // Screen share signaling → screen thread + app
@@ -971,7 +963,7 @@ fn run_network_loop(
                         height,
                     } => {
                         let _ = screen_tx.try_send(ScreenControl::PeerStartedSharing {
-                            client_id: client_id.into(),
+                            client_id,
                             width,
                             height,
                         });
@@ -983,9 +975,7 @@ fn run_network_loop(
                         wake();
                     }
                     NetworkMessage::ScreenShareStopped { client_id } => {
-                        let _ = screen_tx.try_send(ScreenControl::PeerStoppedSharing {
-                            client_id: client_id.into(),
-                        });
+                        let _ = screen_tx.try_send(ScreenControl::PeerStoppedSharing { client_id });
                         let _ = msg_tx.try_send(NetworkMessage::ScreenShareStopped { client_id });
                         wake();
                     }

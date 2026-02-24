@@ -20,7 +20,7 @@ use crate::{
     config::{BindableAction, Settings, peer_key},
     hotkeys::HotkeyManager,
     network::{NetworkControl, NetworkMessage, NetworkThreadHandle},
-    screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
+    screen::{Quality, ScreenControl, ScreenEvent, ScreenThreadHandle},
     ui::{chat::Chat, messages::UiMessage, sidebar::Sidebar, viewer::ViewerWindow},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
 };
@@ -440,7 +440,7 @@ impl App {
                     self.screen
                         .tx
                         .send(ScreenControl::StartSharing {
-                            quality: screencap::Quality::HD60,
+                            quality: screencap::Quality::HD30,
                             monitor_index: 0,
                         })
                         .ok();
@@ -448,15 +448,20 @@ impl App {
             }
             UiMessage::UpdateStreamStats => {
                 if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+                    let quality = Quality::from(self.screen.shared.quality.load(Ordering::Relaxed));
+                    let label = quality.to_string();
                     let frame_bytes = self.screen.shared.last_frame_bytes.load(Ordering::Relaxed);
                     let encode_us = self.screen.shared.last_encode_us.load(Ordering::Relaxed);
                     let avg_kb = frame_bytes as f32 / 1024.0;
                     let encode_ms = encode_us as f32 / 1000.0;
                     if let Some(sidebar) = &mut self.sidebar {
-                        sidebar.update_stream_stats(Some(("720p 60fps", avg_kb, encode_ms)));
+                        sidebar.update_stream_stats(Some((
+                            &quality.to_string(),
+                            avg_kb,
+                            encode_ms,
+                        )));
                     }
                 } else {
-                    // Not sharing anymore — hide stats, timer won't re-arm
                     if let Some(sidebar) = &mut self.sidebar {
                         sidebar.update_stream_stats(None);
                     }

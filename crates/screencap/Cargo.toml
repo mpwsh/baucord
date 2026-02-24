@@ -1,10 +1,10 @@
 [package]
 name = "screencap"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
-xcap = { git = "https://github.com/nashaofu/xcap" }
+scap = { git = "https://github.com/CapSoftware/scap/" }
 log = "0.4"
 thiserror = "2"
 # Windows static: vcpkg install ffmpeg[x264,gpl]:x64-windows-static-md
@@ -15,4 +15,3 @@ ffmpeg-next = "8"
 
 [dev-dependencies]
 env_logger = "0.11"
-

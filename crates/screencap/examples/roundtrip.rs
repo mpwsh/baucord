@@ -5,6 +5,19 @@ use std::time::Instant;
 fn main() {
     env_logger::init();
 
+    // macOS requires screen recording permission via ScreenCaptureKit.
+    if !screencap::capture::is_supported() {
+        eprintln!("Platform not supported");
+        std::process::exit(1);
+    }
+    if !screencap::capture::has_permission() {
+        eprintln!("Screen recording permission not granted — requesting...");
+        if !screencap::capture::request_permission() {
+            eprintln!("Permission denied. Grant in System Settings → Privacy → Screen Recording, then restart.");
+            std::process::exit(1);
+        }
+    }
+
     let quality = match std::env::args().nth(1).as_deref() {
         Some("hd30") => Quality::HD30,
         Some("hd60") => Quality::HD60,
@@ -96,4 +109,3 @@ fn main() {
     println!("  Max pipeline FPS: {:.1}", max_fps);
     println!("  Decoded:      {}/{}", decoded_count, num_frames);
 }
-

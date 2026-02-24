@@ -13,10 +13,7 @@ use ui::widgets::{controls, style};
 ///
 /// Returns the window handle and error frame so App can track them
 /// (hide on successful connect, show validation errors).
-pub fn show(
-    sender: app::Sender<UiMessage>,
-    settings: &Settings,
-) -> (window::Window, frame::Frame) {
+pub fn show(sender: app::Sender<UiMessage>, settings: &Settings) -> (window::Window, frame::Frame) {
     let (cx, cy) = settings.center_child(600, 480);
     let mut wind = window::Window::default()
         .with_size(600, 480)
@@ -115,3 +112,4 @@ pub fn show(
 
     (wind, error_frame)
 }
+

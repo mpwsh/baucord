@@ -100,11 +100,6 @@ impl ChatServer {
     }
 
     fn create_connection_config(channels: &ChannelSettings) -> ConnectionConfig {
-        let mut config = ConnectionConfig::default();
-
-        config.client_channels_config.clear();
-        config.server_channels_config.clear();
-
         let reliable = ChannelConfig {
             channel_id: channels.reliable_channel_id,
             max_memory_usage_bytes: RELIABLE_BUFFER_BYTES,
@@ -112,24 +107,18 @@ impl ChatServer {
                 resend_time: Duration::from_millis(200),
             },
         };
-        config.client_channels_config.push(reliable.clone());
-        config.server_channels_config.push(reliable);
 
         let voice = ChannelConfig {
             channel_id: channels.voice_channel_id,
             max_memory_usage_bytes: channels.voice_buffer_size_mb * 1024 * 1024,
             send_type: SendType::Unreliable,
         };
-        config.client_channels_config.push(voice.clone());
-        config.server_channels_config.push(voice);
 
         let video = ChannelConfig {
             channel_id: channels.video_channel_id,
             max_memory_usage_bytes: channels.video_buffer_size_mb * 1024 * 1024,
             send_type: SendType::Unreliable,
         };
-        config.client_channels_config.push(video.clone());
-        config.server_channels_config.push(video);
 
         let reliable_video = ChannelConfig {
             channel_id: channels.reliable_video_channel_id,
@@ -138,10 +127,14 @@ impl ChatServer {
                 resend_time: Duration::from_millis(200),
             },
         };
-        config.client_channels_config.push(reliable_video.clone());
-        config.server_channels_config.push(reliable_video);
 
-        config
+        let channels = vec![reliable, voice, video, reliable_video];
+
+        ConnectionConfig {
+            available_bytes_per_tick: 60_000,
+            server_channels_config: channels.clone(),
+            client_channels_config: channels,
+        }
     }
 
     /// Drive one tick of the server: receive, process, send.

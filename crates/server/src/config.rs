@@ -39,6 +39,14 @@ pub struct ChannelSettings {
     pub reliable_video_channel_id: u8,
     #[serde(default = "default_reliable_video_buffer_size_mb")]
     pub reliable_video_buffer_size_mb: usize,
+    /// Max bytes renet can send per tick per client.
+    /// At 60 ticks/sec, 300_000 = ~18 MB/s (enough for HD60 video).
+    #[serde(default = "default_bytes_per_tick")]
+    pub bytes_per_tick: u64,
+}
+
+fn default_bytes_per_tick() -> u64 {
+    300_000
 }
 
 fn default_video_channel_id() -> u8 {
@@ -108,6 +116,7 @@ impl Default for Config {
                 reliable_video_channel_id: protocol::RELIABLE_VIDEO_CHANNEL,
                 reliable_video_buffer_size_mb: protocol::RELIABLE_VIDEO_BUFFER_BYTES
                     / (1024 * 1024),
+                bytes_per_tick: 300_000,
             },
             logging: LoggingSettings {
                 level: "info".to_string(),

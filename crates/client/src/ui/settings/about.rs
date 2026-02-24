@@ -7,11 +7,11 @@ use ui::widgets::labels;
 pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
     let mut col = group::Flex::default()
         .with_pos(x, y)
-        .with_size(w, 600)
+        .with_size(w, 700)
         .column();
     col.set_spacing(4);
 
-    labels::section_header(&mut col, "\u{2139}", "ABOUT");
+    labels::section_header(&mut col, ">", "ABOUT");
 
     let version = env!("CARGO_PKG_VERSION");
     let mut ver_label = frame::Frame::default()
@@ -56,25 +56,25 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
 
     separator(&mut col);
 
-    labels::section_header(&mut col, "\u{1f6e0}", "BUILT WITH");
+    labels::section_header(&mut col, ">", "BUILT WITH");
 
     let techs: &[(&str, &str)] = &[
-        ("Rust — Programming Language", "https://rust-lang.org"),
-        ("FLTK — User Interface", "https://www.fltk.org/"),
-        ("Renet — Networking", "https://github.com/lucaspoffo/renet"),
+        ("Rust - Programming Language", "https://rust-lang.org"),
+        ("FLTK - User Interface", "https://www.fltk.org/"),
+        ("Renet - Networking", "https://github.com/lucaspoffo/renet"),
         (
-            "FFmpeg — Video Encoding/Decoding",
+            "FFmpeg - Video Encoding/Decoding",
             "https://www.ffmpeg.org/",
         ),
-        ("Xcap — Screen capture", "https://github.com/nashaofu/xcap"),
-        ("CPAL — Audio I/O", "https://github.com/RustAudio/cpal"),
-        ("Opus — Audio Codec", "https://opus-codec.org/"),
+        ("Xcap - Screen capture", "https://github.com/nashaofu/xcap"),
+        ("CPAL - Audio I/O", "https://github.com/RustAudio/cpal"),
+        ("Opus - Audio Codec", "https://opus-codec.org/"),
         (
-            "RNNoise — Noise Suppression",
+            "RNNoise - Noise Suppression",
             "https://jmvalin.ca/demo/rnnoise/",
         ),
         (
-            "Rubato — Audio Resampling",
+            "Rubato - Audio Resampling",
             "https://github.com/HEnquist/rubato",
         ),
     ];
@@ -136,4 +136,3 @@ fn spacer(col: &mut group::Flex, h: i32) {
     let s = frame::Frame::default();
     col.fixed(&s, h);
 }
-

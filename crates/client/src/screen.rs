@@ -10,14 +10,15 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+
 use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
 use screencap::capture::{MonitorInfo, ScreenCapturer};
-use screencap::{
+pub use screencap::{
     CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
     codec::{FfmpegDecoder, FfmpegEncoder},
 };
@@ -100,6 +101,8 @@ pub struct SharedScreenState {
     pub last_encode_us: Arc<AtomicU32>,
     /// Capture time of the last frame in microseconds.
     pub last_capture_us: Arc<AtomicU32>,
+    /// Current quality preset (stored as u8, mapped from Quality enum).
+    pub quality: Arc<AtomicU8>,
 }
 
 impl SharedScreenState {
@@ -110,6 +113,7 @@ impl SharedScreenState {
             last_frame_bytes: Arc::new(AtomicU32::new(0)),
             last_encode_us: Arc::new(AtomicU32::new(0)),
             last_capture_us: Arc::new(AtomicU32::new(0)),
+            quality: Arc::new(AtomicU8::new(0)),
         }
     }
 }
@@ -206,8 +210,6 @@ fn run_screen_loop(
 
         if is_capturing {
             // ── Sharing mode ────────────────────────────────────────
-            // Use frame-interval timeout so we wake at capture time,
-            // but also wake immediately on any incoming message.
             let time_to_capture = next_capture.saturating_duration_since(now);
 
             match control_rx.recv_timeout(time_to_capture) {
@@ -224,33 +226,10 @@ fn run_screen_loop(
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
-
-            // Drain all pending
-            while let Ok(ctrl) = control_rx.try_recv() {
-                handle_control(
-                    ctrl,
-                    &mut capture,
-                    &mut peer_streams,
-                    &event_tx,
-                    &network_tx,
-                    &shared,
-                    &wake,
-                    &mut running,
-                );
-            }
-
-            // Capture if due
-            if let Some(state) = &mut capture {
-                if Instant::now() >= next_capture {
-                    capture_and_encode(state, &event_tx, &network_tx, &shared);
-                    next_capture = Instant::now() + state.quality.frame_duration();
-                }
-            }
         } else if is_viewing {
-            // ── Viewing mode (no capture) ───────────────────────────
-            // Block on channel with NO timeout — wake instantly when
-            // a frame arrives. This is the key to hitting 60fps: the
-            // OS scheduler doesn't get a chance to delay us.
+            // ── Viewing mode ────────────────────────────────────────
+            // Block on channel — wake INSTANTLY when a frame arrives.
+            // No timeout = no scheduler delay = full framerate.
             match control_rx.recv() {
                 Ok(ctrl) => handle_control(
                     ctrl,
@@ -264,25 +243,8 @@ fn run_screen_loop(
                 ),
                 Err(_) => break,
             }
-
-            // Drain all pending — if multiple frames queued up,
-            // process them all before yielding. This prevents
-            // frame buildup in the channel.
-            while let Ok(ctrl) = control_rx.try_recv() {
-                handle_control(
-                    ctrl,
-                    &mut capture,
-                    &mut peer_streams,
-                    &event_tx,
-                    &network_tx,
-                    &shared,
-                    &wake,
-                    &mut running,
-                );
-            }
         } else {
             // ── Idle mode ───────────────────────────────────────────
-            // Nothing active — sleep until a control message arrives.
             match control_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(ctrl) => handle_control(
                     ctrl,
@@ -296,6 +258,28 @@ fn run_screen_loop(
                 ),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
+            }
+        }
+
+        // Drain ALL pending messages
+        while let Ok(ctrl) = control_rx.try_recv() {
+            handle_control(
+                ctrl,
+                &mut capture,
+                &mut peer_streams,
+                &event_tx,
+                &network_tx,
+                &shared,
+                &wake,
+                &mut running,
+            );
+        }
+
+        // Capture if it's time
+        if let Some(state) = &mut capture {
+            if Instant::now() >= next_capture {
+                capture_and_encode(state, &event_tx, &network_tx, &shared);
+                next_capture = Instant::now() + state.quality.frame_duration();
             }
         }
     }
@@ -589,6 +573,10 @@ fn capture_and_encode(
         }
     };
     let capture_us = t0.elapsed().as_micros() as u32;
+    let capture_ms = capture_us as f32 / 1000.0;
+    if capture_ms > 20.0 {
+        log::warn!("Slow capture: {capture_ms:.1}ms");
+    }
 
     // Encode
     let t1 = Instant::now();
