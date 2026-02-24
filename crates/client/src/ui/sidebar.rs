@@ -34,9 +34,9 @@ struct UserRow {
     indicator: frame::Frame,
     name_label: frame::Frame,
     /// Icon frame between name and action button — shows muted/deafened SVG.
-    /// `None` for our own row (we never see our own broadcast).
     status_icon: Option<frame::Frame>,
-    /// The `…` / `Live` button. `None` for our own row.
+    /// The `…` / `Live` button. For self rows this only shows "Live"
+    /// (no "…" menu). For other users it shows "…" on hover or "Live".
     action_btn: Option<button::Button>,
     is_us: bool,
 }
@@ -49,6 +49,7 @@ pub struct Sidebar {
     user_count_label: frame::Frame,
     user_list_scroll: group::Scroll,
     user_list_pack: group::Pack,
+    stream_stats_label: frame::Frame,
     connection_status: frame::Frame,
     latency_label: frame::Frame,
     mute_btn: button::Button,
@@ -94,6 +95,15 @@ impl Sidebar {
 
         user_list_scroll.end();
         user_list_scroll.resizable(&user_list_pack);
+
+        // ── Stream stats line (hidden when not streaming) ─────────────
+        let mut stream_stats_label = frame::Frame::default()
+            .with_label("")
+            .with_align(enums::Align::Left | enums::Align::Inside);
+        sidebar.fixed(&stream_stats_label, 0); // 0 height = hidden
+        stream_stats_label.set_label_color(theme::TEXT_MUTED);
+        stream_stats_label.set_label_size(10);
+        stream_stats_label.hide();
 
         // ── Connection status panel ─────────────────────────────────
         let mut status_col = group::Flex::default().column();
@@ -153,10 +163,6 @@ impl Sidebar {
 
         let s = sender;
         share_btn.clone().set_callback(move |_| {
-            // The callback always sends StartShareScreen. App checks whether
-            // we're already sharing and sends StopShareScreen instead.
-            // This avoids capturing mutable state in the closure — the App
-            // is the authority on sharing state.
             s.send(UiMessage::StartShareScreen);
         });
 
@@ -176,6 +182,7 @@ impl Sidebar {
             user_count_label,
             user_list_scroll,
             user_list_pack,
+            stream_stats_label,
             connection_status,
             latency_label,
             mute_btn,
@@ -210,6 +217,37 @@ impl Sidebar {
         }
     }
 
+    /// Update the stream stats line shown above the connection status.
+    ///
+    /// Call this on a timer (e.g. every second) while we're sharing.
+    /// Pass `None` to hide the stats (when sharing stops).
+    ///
+    /// `resolution` — e.g. "720p30"
+    /// `avg_frame_kb` — average encoded frame size in KB
+    /// `encode_ms` — average encode time in milliseconds
+    pub fn update_stream_stats(&mut self, stats: Option<(&str, f32, f32)>) {
+        match stats {
+            Some((resolution, avg_kb, encode_ms)) => {
+                let label = format!(
+                    "  Stream: {resolution} | {avg_kb:.0}KB | {encode_ms:.1}ms enc"
+                );
+                self.stream_stats_label.set_label(&label);
+                if !self.stream_stats_label.visible() {
+                    self.stream_stats_label.show();
+                    self.group.fixed(&self.stream_stats_label, 16);
+                    self.group.layout();
+                }
+            }
+            None => {
+                if self.stream_stats_label.visible() {
+                    self.stream_stats_label.hide();
+                    self.group.fixed(&self.stream_stats_label, 0);
+                    self.group.layout();
+                }
+            }
+        }
+    }
+
     fn close_audio_popup(&mut self) {
         if let Some(mut w) = self.audio_popup.take() {
             w.hide();
@@ -230,10 +268,8 @@ impl Sidebar {
 
         let sender = self.sender;
         let popup_w = 200;
-        // Taller popup when "Watch Stream" is shown
         let popup_h = if is_sharing { 165 } else { 130 };
 
-        // Position above the click point
         let x = click_x;
         let y = click_y.saturating_sub(popup_h);
 
@@ -248,7 +284,6 @@ impl Sidebar {
         col.set_margins(12, 8, 12, 8);
         col.set_spacing(4);
 
-        // ── "Watch Stream" button (only if peer is sharing) ─────────
         if is_sharing {
             let mut watch_btn = controls::accent_button("Watch Stream", theme::ACCENT);
             col.fixed(&watch_btn, 26);
@@ -259,14 +294,12 @@ impl Sidebar {
                 wind_watch.hide();
             });
 
-            // Separator
             let mut sep_watch = frame::Frame::default();
             sep_watch.set_frame(enums::FrameType::FlatBox);
             sep_watch.set_color(theme::BG_TERTIARY);
             col.fixed(&sep_watch, 1);
         }
 
-        // User Volume header
         let mut vol_header = frame::Frame::default()
             .with_label("User Volume")
             .with_align(enums::Align::Left | enums::Align::Inside);
@@ -275,7 +308,6 @@ impl Sidebar {
         vol_header.set_label_font(enums::Font::HelveticaBold);
         col.fixed(&vol_header, 18);
 
-        // Slider + percentage
         let mut slider_row = group::Flex::default().row();
         slider_row.set_spacing(6);
         col.fixed(&slider_row, 22);
@@ -295,13 +327,11 @@ impl Sidebar {
 
         slider_row.end();
 
-        // Separator
         let mut sep = frame::Frame::default();
         sep.set_frame(enums::FrameType::FlatBox);
         sep.set_color(theme::BG_TERTIARY);
         col.fixed(&sep, 1);
 
-        // Mute / Unmute button
         let mute_label = if is_muted { "Unmute" } else { "Mute" };
         let mut mute_btn = if is_muted {
             controls::accent_button(mute_label, theme::DANGER)
@@ -310,13 +340,11 @@ impl Sidebar {
         };
         col.fixed(&mute_btn, 26);
 
-        // Separator
         let mut sep2 = frame::Frame::default();
         sep2.set_frame(enums::FrameType::FlatBox);
         sep2.set_color(theme::BG_TERTIARY);
         col.fixed(&sep2, 1);
 
-        // Reset button
         let mut reset_btn = controls::button("Reset Audio");
         col.fixed(&reset_btn, 26);
 
@@ -326,14 +354,12 @@ impl Sidebar {
 
         // ── Callbacks ───────────────────────────────────────────────
 
-        // Slider — update label live while dragging
         let mut pct_lbl = pct_label.clone();
         slider.set_callback(move |s| {
             let vol = s.value() as f32;
             pct_lbl.set_label(&format!("{}%", (vol * 100.0) as i32));
         });
 
-        // Slider — on mouse release, commit volume and close
         let username_slide = username.to_string();
         let mut wind_slide = wind.clone();
         let slider_release = slider.clone();
@@ -352,7 +378,6 @@ impl Sidebar {
             }
         });
 
-        // Mute / Unmute — toggle and close
         let username_mute = username.to_string();
         let mut wind_mute = wind.clone();
         mute_btn.set_callback(move |_| {
@@ -364,7 +389,6 @@ impl Sidebar {
             wind_mute.hide();
         });
 
-        // Reset — reset audio and close
         let username_reset = username.to_string();
         let mut wind_reset = wind.clone();
         reset_btn.set_callback(move |_| {
@@ -375,7 +399,6 @@ impl Sidebar {
             wind_reset.hide();
         });
 
-        // Click outside (Unfocus) — save slider if changed, close
         let username_close = username.to_string();
         let slider_close = slider.clone();
         wind.handle(move |w, ev| {
@@ -427,7 +450,6 @@ impl Sidebar {
         self.user_count_label
             .set_label(&format!("Users: {}", users.len()));
 
-        // Check if the user set changed (join/leave)
         let mut current_ids: Vec<ClientId> = users.keys().copied().collect();
         current_ids.sort();
         let mut existing_ids: Vec<ClientId> = self.user_rows.iter().map(|r| r.client_id).collect();
@@ -531,7 +553,9 @@ impl Sidebar {
                 row.container.set_color(theme::BG_SECONDARY);
             }
 
-            // Remote user self-muted / self-deafened icon
+            // Mute/deafen icon — works for both self and remote users.
+            // For self: is_self_muted/is_self_deafened should be set by the app
+            // from local state. For remote: comes from broadcast AudioState.
             if let Some(icon_frame) = &mut row.status_icon {
                 if state.is_self_deafened {
                     if let Some(img) = svg_icon(SVG_SELF_DEAFENED, 14) {
@@ -547,18 +571,22 @@ impl Sidebar {
                 icon_frame.redraw();
             }
 
-            // "Live" badge vs "…" button for non-self users
+            // "Live" badge — applies to both self and non-self rows now
             if let Some(btn) = &mut row.action_btn {
                 let is_sharing = self.active_sharers.contains(&row.client_id);
                 if is_sharing {
-                    // Always-visible red "Live" badge
                     btn.set_label("Live");
                     btn.set_label_size(11);
                     btn.set_label_font(Font::HelveticaBold);
                     btn.set_color(theme::DANGER);
                     btn.set_label_color(enums::Color::White);
+                } else if row.is_us {
+                    // Self row, not sharing — hide the badge entirely
+                    btn.set_label("");
+                    btn.set_color(theme::BG_SECONDARY);
+                    btn.set_label_color(theme::BG_SECONDARY);
                 } else {
-                    // Revert to hidden "…" (colors match parent, revealed on hover)
+                    // Remote row, not sharing — revert to hidden "…"
                     btn.set_label("\u{2026}");
                     btn.set_label_size(16);
                     btn.set_label_font(Font::Helvetica);
@@ -637,7 +665,7 @@ impl Sidebar {
         }
         name_label.set_label_size(13);
 
-        // Status icon frame — shows self-muted/deafened SVG.
+        // Status icon frame — shows self-muted/deafened SVG for all users.
         let mut icon_frm = frame::Frame::default();
         user_item.fixed(&icon_frm, 18);
 
@@ -653,31 +681,36 @@ impl Sidebar {
 
         let status_icon = Some(icon_frm);
 
-        // Action button: "…" / "Live" for non-self users
-        let mut action_btn_handle = None;
+        // Action button: "Live" badge for all users, "…" menu for non-self.
+        // Both self and non-self get the button so refresh_user_rows can
+        // toggle the "Live" badge uniformly.
+        let is_sharing = self.active_sharers.contains(&client_id);
+
+        let mut options_btn = button::Button::default();
+        options_btn.set_frame(enums::FrameType::FlatBox);
+        user_item.fixed(&options_btn, 32);
+
+        if is_sharing {
+            options_btn.set_label("Live");
+            options_btn.set_label_size(11);
+            options_btn.set_label_font(Font::HelveticaBold);
+            options_btn.set_color(theme::DANGER);
+            options_btn.set_label_color(enums::Color::White);
+        } else if is_us {
+            // Self, not sharing — empty invisible slot
+            options_btn.set_label("");
+            options_btn.set_color(theme::BG_SECONDARY);
+            options_btn.set_label_color(theme::BG_SECONDARY);
+        } else {
+            // Remote, not sharing — hidden "…" (matches parent bg)
+            options_btn.set_label("\u{2026}");
+            options_btn.set_label_size(16);
+            options_btn.set_color(theme::BG_SECONDARY);
+            options_btn.set_label_color(theme::BG_SECONDARY);
+        }
 
         if !is_us {
-            let is_sharing = self.active_sharers.contains(&client_id);
-
-            let mut options_btn = button::Button::default();
-            options_btn.set_frame(enums::FrameType::FlatBox);
-            user_item.fixed(&options_btn, 32);
-
-            if is_sharing {
-                // Start as visible "Live" badge
-                options_btn.set_label("Live");
-                options_btn.set_label_size(11);
-                options_btn.set_label_font(Font::HelveticaBold);
-                options_btn.set_color(theme::DANGER);
-                options_btn.set_label_color(enums::Color::White);
-            } else {
-                // Start as hidden "…" (matches parent bg)
-                options_btn.set_label("\u{2026}");
-                options_btn.set_label_size(16);
-                options_btn.set_color(theme::BG_SECONDARY);
-                options_btn.set_label_color(theme::BG_SECONDARY);
-            }
-
+            // Non-self: clicking opens audio popup
             let sender = self.sender;
             let username = state.username.clone();
             let client_id_copy = client_id;
@@ -691,12 +724,7 @@ impl Sidebar {
                 });
             });
 
-            action_btn_handle = Some(options_btn.clone());
-
-            // Hover state: reveal "…" button + tint background.
-            // When the button is "Live", it's already visible — hover just
-            // tints the row background.
-            // Right-click on the row also opens the popup.
+            // Hover: reveal "…" + tint row
             let mut btn_clone = options_btn.clone();
             let mut container = user_item.clone();
             let base_color = user_item.color();
@@ -708,16 +736,12 @@ impl Sidebar {
             let client_id_rc = client_id;
             let username_rc = state.username.clone();
 
-            // Track whether this user is sharing via the button label.
-            // The refresh pass updates the label to "Live" or "…", so
-            // the hover handler reads it to decide visibility behavior.
             user_item.handle(move |w, ev| {
                 match ev {
                     enums::Event::Enter | enums::Event::Move => {
                         if !*hovering.borrow() {
                             *hovering.borrow_mut() = true;
 
-                            // Only reveal "…" if not already "Live"
                             let is_live = btn_clone.label() == "Live";
                             if !is_live {
                                 btn_clone.set_label_color(theme::TEXT_PRIMARY);
@@ -748,7 +772,6 @@ impl Sidebar {
                         }
                         true
                     }
-                    // Right-click also opens the popup
                     enums::Event::Push if app::event_button() == 3 => {
                         sender_rc.send(UiMessage::OpenUserAudioPopup {
                             client_id: client_id_rc,
@@ -762,6 +785,8 @@ impl Sidebar {
                 }
             });
         }
+
+        let action_btn_handle = Some(options_btn);
 
         user_item.end();
         self.user_list_pack.add(&user_item);
@@ -825,6 +850,7 @@ impl Sidebar {
         self.user_count_label.set_label("Users: 0");
         self.active_sharers.clear();
         self.set_share_state(false);
+        self.update_stream_stats(None);
     }
 
     pub fn set_mute_state(&mut self, muted: bool) {

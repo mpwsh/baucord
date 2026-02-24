@@ -279,24 +279,24 @@ impl App {
             ScreenEvent::Error(e) => {
                 self.show_error(&format!("Screen share: {e}"));
             }
-            ScreenEvent::FrameReady {
-                client_id,
-                width,
-                height,
-                rgba,
-            } => {
-                if let Some(viewer) = self.viewer_windows.get_mut(&client_id) {
-                    viewer.update_frame(rgba, width, height);
-                } else {
-                    // First frame — open a viewer window
-                    let username = self.username_for_u64(client_id);
-                    let mut viewer =
-                        ViewerWindow::new(client_id, &username, width, height, self.sender);
-                    viewer.update_frame(rgba, width, height);
-                    self.viewer_windows.insert(client_id, viewer);
-                    info!("📺 Opened viewer for {username} ({width}x{height})");
-                }
-            }
+           ScreenEvent::FrameReady {
+    client_id,
+    width,
+    height,
+    rgba,
+    frame_bytes,
+} => {
+    if let Some(viewer) = self.viewer_windows.get_mut(&client_id) {
+        viewer.update_frame(rgba, width, height, frame_bytes);
+    } else {
+        let username = self.username_for_u64(client_id);
+        let mut viewer =
+            ViewerWindow::new(client_id, &username, width, height, self.sender);
+        viewer.update_frame(rgba, width, height, frame_bytes);
+        self.viewer_windows.insert(client_id, viewer);
+        info!("📺 Opened viewer for {username} ({width}x{height})");
+    }
+} 
             ScreenEvent::PeerStartedSharing {
                 client_id,
                 width,
@@ -425,7 +425,7 @@ impl App {
                     self.screen
                         .tx
                         .send(ScreenControl::StartSharing {
-                            quality: screencap::Quality::HD30,
+                            quality: screencap::Quality::HD60,
                             monitor_index: 0,
                         })
                         .ok();

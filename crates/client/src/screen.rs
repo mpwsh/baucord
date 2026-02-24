@@ -74,6 +74,8 @@ pub enum ScreenEvent {
         /// RGBA pixel data. Callers should process this promptly — the
         /// screen thread will keep producing frames.
         rgba: Vec<u8>,
+        /// Size of the encoded H.264 frame in bytes (before decode).
+        frame_bytes: usize,
     },
     /// A remote peer started sharing (so UI can show "Watch" button).
     PeerStartedSharing {
@@ -446,6 +448,7 @@ fn decode_incoming_frame(
                         width: decoded.width,
                         height: decoded.height,
                         rgba: decoded.data,
+                        frame_bytes: encoded.data.len(),
                     })
                     .ok();
                 wake();
@@ -507,6 +510,8 @@ fn decode_incoming_frame(
                     width: decoded.width,
                     height: decoded.height,
                     rgba: decoded.data,
+                    frame_bytes: encoded.data.len(),
+
                 })
                 .ok();
             wake();
