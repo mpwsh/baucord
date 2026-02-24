@@ -64,6 +64,11 @@ pub struct Sidebar {
 
     /// Currently open per-user audio popup (if any).
     audio_popup: Option<window::Window>,
+
+    /// Local mute/deafen state — used to show icons on our own user row.
+    /// Updated by set_mute_state() / set_deafen_state().
+    local_muted: bool,
+    local_deafened: bool,
 }
 
 impl Sidebar {
@@ -191,6 +196,8 @@ impl Sidebar {
             user_rows: Vec::new(),
             active_sharers: HashSet::new(),
             audio_popup: None,
+            local_muted: false,
+            local_deafened: false,
         }
     }
 
@@ -553,15 +560,20 @@ impl Sidebar {
                 row.container.set_color(theme::BG_SECONDARY);
             }
 
-            // Mute/deafen icon — works for both self and remote users.
-            // For self: is_self_muted/is_self_deafened should be set by the app
-            // from local state. For remote: comes from broadcast AudioState.
+            // Mute/deafen icon — for self rows use local state (which is
+            // always up to date), for remote rows use broadcast state.
             if let Some(icon_frame) = &mut row.status_icon {
-                if state.is_self_deafened {
+                let (show_deafened, show_muted) = if row.is_us {
+                    (self.local_deafened, self.local_muted)
+                } else {
+                    (state.is_self_deafened, state.is_self_muted)
+                };
+
+                if show_deafened {
                     if let Some(img) = svg_icon(SVG_SELF_DEAFENED, 14) {
                         icon_frame.set_image(Some(img));
                     }
-                } else if state.is_self_muted {
+                } else if show_muted {
                     if let Some(img) = svg_icon(SVG_SELF_MUTED, 14) {
                         icon_frame.set_image(Some(img));
                     }
@@ -666,14 +678,21 @@ impl Sidebar {
         name_label.set_label_size(13);
 
         // Status icon frame — shows self-muted/deafened SVG for all users.
+        // For self: use local_muted/local_deafened. For remote: use broadcast state.
         let mut icon_frm = frame::Frame::default();
         user_item.fixed(&icon_frm, 18);
 
-        if state.is_self_deafened {
+        let (show_deafened, show_muted) = if is_us {
+            (self.local_deafened, self.local_muted)
+        } else {
+            (state.is_self_deafened, state.is_self_muted)
+        };
+
+        if show_deafened {
             if let Some(img) = svg_icon(SVG_SELF_DEAFENED, 14) {
                 icon_frm.set_image(Some(img));
             }
-        } else if state.is_self_muted {
+        } else if show_muted {
             if let Some(img) = svg_icon(SVG_SELF_MUTED, 14) {
                 icon_frm.set_image(Some(img));
             }
@@ -854,6 +873,7 @@ impl Sidebar {
     }
 
     pub fn set_mute_state(&mut self, muted: bool) {
+        self.local_muted = muted;
         if muted {
             self.mute_btn.set_label("Unmute");
             self.mute_btn.set_color(theme::DANGER);
@@ -863,9 +883,11 @@ impl Sidebar {
             self.mute_btn.set_color(theme::BG_TERTIARY);
             self.mute_btn.set_label_color(theme::TEXT_PRIMARY);
         }
+        self.update_self_status_icon();
     }
 
     pub fn set_deafen_state(&mut self, deafened: bool) {
+        self.local_deafened = deafened;
         if deafened {
             self.deafen_btn.set_label("Undeafen");
             self.deafen_btn.set_color(theme::WARNING);
@@ -874,6 +896,31 @@ impl Sidebar {
             self.deafen_btn.set_label("Deafen");
             self.deafen_btn.set_color(theme::BG_TERTIARY);
             self.deafen_btn.set_label_color(theme::TEXT_PRIMARY);
+        }
+        self.update_self_status_icon();
+    }
+
+    /// Update the mute/deafen icon on our own user row from local state.
+    fn update_self_status_icon(&mut self) {
+        for row in &mut self.user_rows {
+            if !row.is_us {
+                continue;
+            }
+            if let Some(icon_frame) = &mut row.status_icon {
+                if self.local_deafened {
+                    if let Some(img) = svg_icon(SVG_SELF_DEAFENED, 14) {
+                        icon_frame.set_image(Some(img));
+                    }
+                } else if self.local_muted {
+                    if let Some(img) = svg_icon(SVG_SELF_MUTED, 14) {
+                        icon_frame.set_image(Some(img));
+                    }
+                } else {
+                    icon_frame.set_image(None::<SvgImage>);
+                }
+                icon_frame.redraw();
+            }
+            break;
         }
     }
 }

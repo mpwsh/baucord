@@ -396,43 +396,29 @@ fn decode_incoming_frame(
     event_tx: &Sender<ScreenEvent>,
     wake: &WakeFn,
 ) {
-    // On keyframe: reset the decoder to a clean state. This is the most
-    // important fix for visual corruption — a fresh decoder has no stale
-    // reference frames that could produce staircase/tearing artifacts.
     if is_keyframe {
-        let decoder = match create_decoder() {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to create decoder for peer {client_id}: {e}");
-                return;
+        let stream = peer_streams.entry(client_id).or_insert_with(|| {
+            // First keyframe from this peer — create decoder
+            info!("📺 Created decoder for peer {client_id} ({width}x{height})");
+            let decoder = create_decoder().expect("decoder creation failed");
+            PeerStream {
+                decoder,
+                width,
+                height,
+                got_keyframe: false,
+                last_seq: None,
             }
-        };
+        });
 
-        let stream = peer_streams
-            .entry(client_id)
-            .and_modify(|s| {
-                s.decoder = decoder;
-                s.width = width;
-                s.height = height;
-                s.got_keyframe = true;
-                s.last_seq = Some(seq);
-            })
-            .or_insert_with(|| {
-                // Shouldn't happen (keyframe already created above via and_modify),
-                // but handles the first-ever frame for this peer.
-                info!("📺 Created decoder for peer {client_id} ({width}x{height})");
-                let fallback_decoder = create_decoder().expect("decoder creation failed");
-                PeerStream {
-                    decoder: fallback_decoder,
-                    width,
-                    height,
-                    got_keyframe: true,
-                    last_seq: Some(seq),
-                }
-            });
+        stream.width = width;
+        stream.height = height;
+        stream.got_keyframe = true;
+        stream.last_seq = Some(seq);
 
-        // Decode the keyframe
-        info!("📺 Keyframe #{seq} from peer {client_id}: {} bytes", data.len());
+        info!(
+            "📺 Keyframe #{seq} from peer {client_id}: {} bytes",
+            data.len()
+        );
 
         let encoded = EncodedFrame {
             data,
@@ -456,10 +442,7 @@ fn decode_incoming_frame(
             Ok(None) => {}
             Err(e) => {
                 warn!("Decode error for keyframe from peer {client_id} seq {seq}: {e}");
-                // Keyframe decode failed — mark stream as needing a new keyframe
-                if let Some(stream) = peer_streams.get_mut(&client_id) {
-                    stream.got_keyframe = false;
-                }
+                stream.got_keyframe = false;
             }
         }
         return;
@@ -476,21 +459,31 @@ fn decode_incoming_frame(
         return;
     }
 
-    // Sequence gap detection: if we missed P-frames, the decoder's
-    // reference state is inconsistent. Drop until next keyframe.
+    // Sequence gap detection: small gaps (1-3 frames) are tolerated —
+    // the decoder may produce minor artifacts but recovers at next
+    // keyframe. Large gaps indicate serious packet loss; reset to
+    // avoid compounding corruption.
     if let Some(last) = stream.last_seq {
-        let expected = last.wrapping_add(1);
-        if seq != expected {
-            // Gap detected — frames were lost on the unreliable channel.
-            // Continuing to decode would produce visual corruption.
-            if seq.wrapping_sub(last) > 1 {
+        let gap = seq.wrapping_sub(last);
+        if gap > 1 && gap < 1000 {
+            // Gap detected
+            if gap > 5 {
+                // Large gap — decoder state is too stale, wait for keyframe
                 warn!(
-                    "Seq gap for peer {client_id}: expected {expected}, got {seq} — \
-                     dropping until next keyframe"
+                    "Large seq gap for peer {client_id}: expected {}, got {seq} (gap={gap}) — \
+                 dropping until next keyframe",
+                    last.wrapping_add(1)
                 );
                 stream.got_keyframe = false;
                 return;
             }
+            // Small gap (2-5 frames) — log but let the decoder try.
+            // Worst case: minor artifacts until next keyframe.
+            warn!(
+                "Seq gap for peer {client_id}: expected {}, got {seq} (gap={gap}) — \
+             continuing (minor artifacts possible)",
+                last.wrapping_add(1)
+            );
         }
     }
 
@@ -511,7 +504,6 @@ fn decode_incoming_frame(
                     height: decoded.height,
                     rgba: decoded.data,
                     frame_bytes: encoded.data.len(),
-
                 })
                 .ok();
             wake();

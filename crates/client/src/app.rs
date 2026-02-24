@@ -266,6 +266,12 @@ impl App {
                 if let Some(sidebar) = &mut self.sidebar {
                     sidebar.set_share_state(true);
                 }
+                // Start 1-second stream stats timer
+                let sender = self.sender;
+                app::add_timeout3(1.0, move |handle| {
+                    sender.send(UiMessage::UpdateStreamStats);
+                    app::repeat_timeout3(1.0, handle);
+                });
             }
             ScreenEvent::SharingStopped => {
                 info!("📺 Screen share stopped");
@@ -279,24 +285,24 @@ impl App {
             ScreenEvent::Error(e) => {
                 self.show_error(&format!("Screen share: {e}"));
             }
-           ScreenEvent::FrameReady {
-    client_id,
-    width,
-    height,
-    rgba,
-    frame_bytes,
-} => {
-    if let Some(viewer) = self.viewer_windows.get_mut(&client_id) {
-        viewer.update_frame(rgba, width, height, frame_bytes);
-    } else {
-        let username = self.username_for_u64(client_id);
-        let mut viewer =
-            ViewerWindow::new(client_id, &username, width, height, self.sender);
-        viewer.update_frame(rgba, width, height, frame_bytes);
-        self.viewer_windows.insert(client_id, viewer);
-        info!("📺 Opened viewer for {username} ({width}x{height})");
-    }
-} 
+            ScreenEvent::FrameReady {
+                client_id,
+                width,
+                height,
+                rgba,
+                frame_bytes,
+            } => {
+                if let Some(viewer) = self.viewer_windows.get_mut(&client_id) {
+                    viewer.update_frame(rgba, width, height, frame_bytes);
+                } else {
+                    let username = self.username_for_u64(client_id);
+                    let mut viewer =
+                        ViewerWindow::new(client_id, &username, width, height, self.sender);
+                    viewer.update_frame(rgba, width, height, frame_bytes);
+                    self.viewer_windows.insert(client_id, viewer);
+                    info!("📺 Opened viewer for {username} ({width}x{height})");
+                }
+            }
             ScreenEvent::PeerStartedSharing {
                 client_id,
                 width,
@@ -429,6 +435,22 @@ impl App {
                             monitor_index: 0,
                         })
                         .ok();
+                }
+            }
+            UiMessage::UpdateStreamStats => {
+                if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+                    let frame_bytes = self.screen.shared.last_frame_bytes.load(Ordering::Relaxed);
+                    let encode_us = self.screen.shared.last_encode_us.load(Ordering::Relaxed);
+                    let avg_kb = frame_bytes as f32 / 1024.0;
+                    let encode_ms = encode_us as f32 / 1000.0;
+                    if let Some(sidebar) = &mut self.sidebar {
+                        sidebar.update_stream_stats(Some(("720p60", avg_kb, encode_ms)));
+                    }
+                } else {
+                    // Not sharing anymore — hide stats, timer won't re-arm
+                    if let Some(sidebar) = &mut self.sidebar {
+                        sidebar.update_stream_stats(None);
+                    }
                 }
             }
             UiMessage::StopShareScreen => {

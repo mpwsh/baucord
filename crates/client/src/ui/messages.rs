@@ -92,6 +92,7 @@ pub enum UiMessage {
     OpenUpdateAndQuit(String),
 
     // ── UI updates ──────────────────────────────────────────────────
+    UpdateStreamStats,
     ShowError(String),
     ClearError,
 

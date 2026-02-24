@@ -97,7 +97,8 @@ impl FfmpegEncoder {
         ctx.set_frame_rate(Some(Rational(quality.fps() as i32, 1)));
         ctx.set_bit_rate(target_bitrate);
         ctx.set_max_bit_rate(max_bitrate);
-        ctx.set_gop(quality.fps() * 2);
+        //ctx.set_gop(quality.fps() * 2);
+        ctx.set_gop(quality.fps());
         ctx.set_max_b_frames(0);
 
         let opts = codec_options(enc_name, quality);
@@ -118,7 +119,8 @@ impl FfmpegEncoder {
             encoder,
             quality,
             frame_count: 0,
-            keyframe_interval: (quality.fps() * 2) as i64,
+           // keyframe_interval: (quality.fps() * 2) as i64,
+            keyframe_interval: quality.fps() as i64,
             force_next_keyframe: false,
             sws_ctx: None,
             sws_src_w: 0,
