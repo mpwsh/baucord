@@ -7,10 +7,10 @@
 // All wire protocol types come from the shared `protocol` crate.
 
 use bincode::Options;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use log::warn;
 use renet::{ChannelConfig, ClientId, ConnectionConfig, RenetClient, SendType};
-use renet_netcode::{ClientAuthentication, NETCODE_USER_DATA_BYTES, NetcodeClientTransport};
+use renet_netcode::{ClientAuthentication, NetcodeClientTransport, NETCODE_USER_DATA_BYTES};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::thread;
@@ -19,12 +19,11 @@ use std::time::{Duration, Instant, SystemTime};
 use core::AudioPacket;
 
 use protocol::{
-    ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL,
-    RELIABLE_VIDEO_BUFFER_BYTES, RELIABLE_VIDEO_CHANNEL, ServerMessage, VIDEO_BUFFER_BYTES,
-    VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VIDEO_PROTOCOL_VERSION, VOICE_BATCH_THRESHOLD,
-    VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET,
-    VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoHeader, VoiceHeader, pack_video_frame,
-    parse_video_header, video_payload,
+    pack_video_frame, parse_video_header, video_payload, ClientMessage, ServerMessage, VideoHeader,
+    VoiceHeader, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL, RELIABLE_VIDEO_BUFFER_BYTES,
+    RELIABLE_VIDEO_CHANNEL, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VIDEO_MTU_BUDGET,
+    VIDEO_PROTOCOL_VERSION, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL,
+    VOICE_MAX_FRAMES_PER_PACKET, VOICE_MAX_FRAME_SIZE, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION,
 };
 
 use crate::screen::ScreenControl;
@@ -212,8 +211,6 @@ pub(crate) struct NetworkClient {
 impl NetworkClient {
     pub fn connect(server_addr: SocketAddr, username: String) -> Result<Self, String> {
         let mut connection_config = ConnectionConfig::default();
-        connection_config.available_bytes_per_tick = 600_000;
-
         connection_config.client_channels_config.clear();
         connection_config.server_channels_config.clear();
 

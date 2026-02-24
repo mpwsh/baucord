@@ -197,36 +197,39 @@ fn run_screen_loop(
     let mut capture: Option<CaptureState> = None;
     let mut peer_streams: HashMap<u64, PeerStream> = HashMap::new();
     let mut running = true;
+    let mut next_capture = Instant::now();
 
     while running {
-        // If we're actively capturing, use frame_duration as timeout.
-        // Otherwise, block until a control message arrives.
-        let timeout = capture
-            .as_ref()
-            .map(|c| c.quality.frame_duration())
-            .unwrap_or(Duration::from_millis(100));
+        // Determine how long we can block waiting for messages
+        let now = Instant::now();
+        let timeout = if let Some(state) = &capture {
+            // Sharing: wake at next capture time
+            next_capture.saturating_duration_since(now)
+        } else if !peer_streams.is_empty() {
+            // Actively viewing: block on channel, wake immediately on message
+            Duration::from_millis(50)
+        } else {
+            // Idle
+            Duration::from_millis(100)
+        };
 
-        select! {
-            recv(control_rx) -> msg => {
-                match msg {
-                    Ok(ctrl) => handle_control(
-                        ctrl,
-                        &mut capture,
-                        &mut peer_streams,
-                        &event_tx,
-                        &network_tx,
-                        &shared,
-                        &wake,
-                        &mut running,
-                    ),
-                    Err(_) => { running = false; }
-                }
-            }
-            default(timeout) => {}
+        // Block until message or timeout
+        match control_rx.recv_timeout(timeout) {
+            Ok(ctrl) => handle_control(
+                ctrl,
+                &mut capture,
+                &mut peer_streams,
+                &event_tx,
+                &network_tx,
+                &shared,
+                &wake,
+                &mut running,
+            ),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Drain queued control messages — process ALL pending frames
-        // before capturing our own frame to minimize decode latency.
+        // Drain ALL pending messages (critical for video throughput)
         loop {
             match control_rx.try_recv() {
                 Ok(ctrl) => handle_control(
@@ -243,13 +246,16 @@ fn run_screen_loop(
             }
         }
 
-        // Capture + encode one frame if sharing
+        // Capture if it's time
         if let Some(state) = &mut capture {
-            capture_and_encode(state, &event_tx, &network_tx, &shared);
+            let now = Instant::now();
+            if now >= next_capture {
+                capture_and_encode(state, &event_tx, &network_tx, &shared);
+                next_capture = now + state.quality.frame_duration();
+            }
         }
     }
 
-    // Clean up
     shared.is_sharing.store(false, Ordering::Relaxed);
     info!("📺 Screen thread stopped");
 }

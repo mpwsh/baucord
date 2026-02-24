@@ -456,7 +456,7 @@ impl App {
                     let avg_kb = frame_bytes as f32 / 1024.0;
                     let encode_ms = encode_us as f32 / 1000.0;
                     if let Some(sidebar) = &mut self.sidebar {
-                        sidebar.update_stream_stats(Some(("720p60", avg_kb, encode_ms)));
+                        sidebar.update_stream_stats(Some(("720p30", avg_kb, encode_ms)));
                     }
                 } else {
                     // Not sharing anymore — hide stats, timer won't re-arm

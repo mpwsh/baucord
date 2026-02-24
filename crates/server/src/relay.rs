@@ -120,7 +120,7 @@ impl VoiceRelay {
         }
 
         // Client ID mismatch is informational only — transport guarantees sender
-        if hdr_client_id != u64::from(client_id) {
+        if hdr_client_id != client_id {
             debug!("Header client_id {hdr_client_id} != sender {client_id} (stale session?)",);
         }
 
@@ -296,13 +296,12 @@ impl VideoRelay {
         reliable_video_channel_id: u8,
     ) {
         let clients: Vec<ClientId> = server.clients_id();
+        let mut received_this_tick = 0u32;
 
-        // Process both channels with the same validation + relay logic.
-        // The inbound channel tells us nothing about keyframe status —
-        // we read the flag from the header and choose the outbound channel.
         for inbound_channel in [reliable_video_channel_id, video_channel_id] {
             for client_id in &clients {
                 while let Some(message) = server.receive_message(*client_id, inbound_channel) {
+                    received_this_tick += 1;
                     self.relay_video_packet(
                         server,
                         *client_id,
@@ -313,6 +312,13 @@ impl VideoRelay {
                     );
                 }
             }
+        }
+
+        if received_this_tick > 0 {
+            log::info!(
+                "📺 relay: received {received_this_tick} video frames this tick, fwd total: {}",
+                self.stats.packets_forwarded
+            );
         }
     }
 
