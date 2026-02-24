@@ -212,6 +212,8 @@ pub(crate) struct NetworkClient {
 impl NetworkClient {
     pub fn connect(server_addr: SocketAddr, username: String) -> Result<Self, String> {
         let mut connection_config = ConnectionConfig::default();
+        connection_config.available_bytes_per_tick = 300_000;
+
         connection_config.client_channels_config.clear();
         connection_config.server_channels_config.clear();
 
@@ -519,13 +521,15 @@ impl NetworkClient {
     // ── Video channels ──────────────────────────────────────────────
 
     fn process_video_messages(&mut self) {
-        // Read from both channels — same wire format, different transport.
-        // Keyframes arrive on RELIABLE_VIDEO_CHANNEL (guaranteed delivery),
-        // P-frames arrive on VIDEO_CHANNEL (unreliable, low latency).
+        let mut this_tick = 0u32;
         for channel in [RELIABLE_VIDEO_CHANNEL, VIDEO_CHANNEL] {
             while let Some(message) = self.client.receive_message(channel) {
+                this_tick += 1;
                 self.process_video_packet(&message);
             }
+        }
+        if this_tick > 0 {
+            log::info!("📺 video this tick: {this_tick}");
         }
     }
 

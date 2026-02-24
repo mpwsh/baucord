@@ -129,7 +129,7 @@ impl ScreenThreadHandle {
         // 256 slots: at 30fps inbound + outbound control messages, 64 was
         // too tight and caused try_send drops during active streaming.
         let (tx, control_rx) = bounded::<ScreenControl>(256);
-        let (event_tx, event_rx) = bounded::<ScreenEvent>(64);
+        let (event_tx, event_rx) = bounded::<ScreenEvent>(256);
         let shared = SharedScreenState::new();
 
         let shared_clone = shared.clone();
@@ -333,6 +333,11 @@ fn handle_control(
             height,
             data,
         } => {
+            static RX_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let c = RX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c % 60 == 0 {
+                log::info!("📺 Screen thread received {c} IncomingVideoFrame");
+            }
             decode_incoming_frame(
                 client_id,
                 seq,
@@ -426,8 +431,13 @@ fn decode_incoming_frame(
             is_keyframe: true,
         };
 
+        let t0 = std::time::Instant::now();
         match stream.decoder.decode(&encoded) {
             Ok(Some(decoded)) => {
+                let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                if decode_ms > 10.0 {
+                    log::warn!("Slow decode: {decode_ms:.1}ms for seq {seq}");
+                }
                 event_tx
                     .send(ScreenEvent::FrameReady {
                         client_id,
@@ -497,6 +507,11 @@ fn decode_incoming_frame(
 
     match stream.decoder.decode(&encoded) {
         Ok(Some(decoded)) => {
+            static SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let c = SEND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c % 60 == 0 {
+                log::info!("📺 Screen thread sent {c} FrameReady events");
+            }
             event_tx
                 .send(ScreenEvent::FrameReady {
                     client_id,

@@ -209,7 +209,7 @@ impl App {
             }
 
             // Screen events (bounded drain)
-            for _ in 0..32 {
+            for _ in 0..64 {
                 match self.screen.event_rx.try_recv() {
                     Ok(evt) => {
                         self.handle_screen_event(evt);
@@ -292,6 +292,18 @@ impl App {
                 rgba,
                 frame_bytes,
             } => {
+                use std::time::Instant;
+                static LAST: std::sync::OnceLock<std::sync::Mutex<Instant>> =
+                    std::sync::OnceLock::new();
+                let mut last = LAST
+                    .get_or_init(|| std::sync::Mutex::new(Instant::now()))
+                    .lock()
+                    .unwrap();
+                let delta = last.elapsed();
+                if delta.as_millis() > 20 {
+                    log::warn!("FrameReady gap: {}ms", delta.as_millis());
+                }
+                *last = Instant::now();
                 if let Some(viewer) = self.viewer_windows.get_mut(&client_id) {
                     viewer.update_frame(rgba, width, height, frame_bytes);
                 } else {
