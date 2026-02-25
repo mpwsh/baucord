@@ -12,8 +12,9 @@ channels:
   voice_buffer_size_mb: 5
   video_channel_id: 4
   video_buffer_size_mb: 10
+  bytes_per_tick: 300000
 logging:
-  level: info
+  level: debug
   stats_interval_secs: 30
 authentication:
   enabled: false

@@ -45,6 +45,7 @@ pub enum ScreenControl {
         width: u32,
         height: u32,
         data: Vec<u8>,
+        enqueued_at: Instant,
     },
     /// A remote peer started sharing — prepare a decoder.
     PeerStartedSharing {
@@ -76,6 +77,10 @@ pub enum ScreenEvent {
         rgba: Vec<u8>,
         /// Size of the encoded H.264 frame in bytes (before decode).
         frame_bytes: usize,
+        seq: u32,
+        is_keyframe: bool,
+        enqueued_at: Instant,
+        decoded_at: Instant,
     },
     /// A remote peer started sharing (so UI can show "Watch" button).
     PeerStartedSharing {
@@ -276,10 +281,26 @@ fn run_screen_loop(
         }
 
         // Capture if it's time
+        // AFTER (fix + logging):
         if let Some(state) = &mut capture {
             if Instant::now() >= next_capture {
+                let cap_start = Instant::now();
                 capture_and_encode(state, &event_tx, &network_tx, &shared);
-                next_capture = Instant::now() + state.quality.frame_duration();
+                let cap_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
+
+                // FIX: advance from previous target, not from now
+                next_capture += state.quality.frame_duration();
+
+                // If we fell behind, skip to now (don't burst)
+                if next_capture < Instant::now() {
+                    next_capture = Instant::now();
+                }
+
+                log::info!(
+                    "📊 ENCODE seq={} {cap_ms:.1}ms (budget {:.1}ms)",
+                    state.seq,
+                    state.quality.frame_duration().as_secs_f32() * 1000.0
+                );
             }
         }
     }
@@ -366,6 +387,7 @@ fn handle_control(
             width,
             height,
             data,
+            enqueued_at,
         } => {
             decode_incoming_frame(
                 client_id,
@@ -374,6 +396,7 @@ fn handle_control(
                 width,
                 height,
                 data,
+                enqueued_at,
                 peer_streams,
                 event_tx,
                 wake,
@@ -426,6 +449,7 @@ fn decode_incoming_frame(
     width: u32,
     height: u32,
     data: Vec<u8>,
+    enqueued_at: Instant,
     peer_streams: &mut HashMap<u64, PeerStream>,
     event_tx: &Sender<ScreenEvent>,
     wake: &WakeFn,
@@ -464,6 +488,7 @@ fn decode_incoming_frame(
         match stream.decoder.decode(&encoded) {
             Ok(Some(decoded)) => {
                 let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                let decoded_at = Instant::now();
                 if decode_ms > 10.0 {
                     log::warn!("Slow decode: {decode_ms:.1}ms for seq {seq}");
                 }
@@ -474,6 +499,10 @@ fn decode_incoming_frame(
                         height: decoded.height,
                         rgba: decoded.data,
                         frame_bytes: encoded.data.len(),
+                        seq,
+                        is_keyframe,
+                        enqueued_at,
+                        decoded_at,
                     })
                     .ok();
                 wake();
@@ -536,6 +565,7 @@ fn decode_incoming_frame(
 
     match stream.decoder.decode(&encoded) {
         Ok(Some(decoded)) => {
+            let decoded_at = Instant::now();
             event_tx
                 .send(ScreenEvent::FrameReady {
                     client_id,
@@ -543,6 +573,10 @@ fn decode_incoming_frame(
                     height: decoded.height,
                     rgba: decoded.data,
                     frame_bytes: encoded.data.len(),
+                    seq,
+                    is_keyframe: false,
+                    enqueued_at,
+                    decoded_at,
                 })
                 .ok();
             wake();

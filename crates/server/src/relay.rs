@@ -392,6 +392,14 @@ impl VideoRelay {
 
         self.stats.packets_forwarded += 1;
         self.stats.bytes_relayed += msg_len as u64 * sent_count;
+        log::debug!(
+            "📊 relay seq={} {}frame {} bytes → {} subs (total_fwd={})",
+            hdr.seq,
+            if is_keyframe { "key" } else { "p-" },
+            msg_len,
+            sent_count,
+            self.stats.packets_forwarded,
+        );
     }
 
     #[allow(clippy::cast_precision_loss)]

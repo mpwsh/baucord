@@ -128,12 +128,12 @@ impl ChatServer {
             },
         };
 
-        let channels = vec![reliable, voice, video, reliable_video];
+        let configs = vec![reliable, voice, video, reliable_video];
 
         ConnectionConfig {
-            available_bytes_per_tick: 60_000,
-            server_channels_config: channels.clone(),
-            client_channels_config: channels,
+            available_bytes_per_tick: channels.bytes_per_tick,
+            server_channels_config: configs.clone(),
+            client_channels_config: configs,
         }
     }
 
