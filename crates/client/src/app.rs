@@ -465,7 +465,7 @@ impl App {
                     self.screen
                         .tx
                         .send(ScreenControl::StartSharing {
-                            quality: screencap::Quality::HD30,
+                            quality: screencap::Quality::HD60,
                             monitor_index: 0,
                         })
                         .ok();

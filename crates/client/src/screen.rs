@@ -280,28 +280,26 @@ fn run_screen_loop(
             );
         }
 
-        // Capture if it's time
-        // AFTER (fix + logging):
-        if let Some(state) = &mut capture {
-            if Instant::now() >= next_capture {
-                let cap_start = Instant::now();
-                capture_and_encode(state, &event_tx, &network_tx, &shared);
-                let cap_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
+        if let Some(state) = &mut capture
+            && Instant::now() >= next_capture
+        {
+            let cap_start = Instant::now();
+            capture_and_encode(state, &event_tx, &network_tx, &shared);
+            let cap_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
 
-                // FIX: advance from previous target, not from now
-                next_capture += state.quality.frame_duration();
+            // FIX: advance from previous target, not from now
+            next_capture += state.quality.frame_duration();
 
-                // If we fell behind, skip to now (don't burst)
-                if next_capture < Instant::now() {
-                    next_capture = Instant::now();
-                }
-
-                log::info!(
-                    "📊 ENCODE seq={} {cap_ms:.1}ms (budget {:.1}ms)",
-                    state.seq,
-                    state.quality.frame_duration().as_secs_f32() * 1000.0
-                );
+            // If we fell behind, skip to now (don't burst)
+            if next_capture < Instant::now() {
+                next_capture = Instant::now();
             }
+
+            log::info!(
+                "📊 ENCODE seq={} {cap_ms:.1}ms (budget {:.1}ms)",
+                state.seq,
+                state.quality.frame_duration().as_secs_f32() * 1000.0
+            );
         }
     }
 
