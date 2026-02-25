@@ -38,7 +38,7 @@
 //! voice chat.
 
 use crate::stats::AudioStats;
-use crate::{FRAME_SIZE, OPUS_SAMPLE_RATE};
+use crate::OPUS_SAMPLE_RATE;
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};

@@ -13,14 +13,14 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
-use screencap::capture::{MonitorInfo, ScreenCapturer};
+use screencap::capture::ScreenCapturer;
 pub use screencap::{
     CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
     codec::{FfmpegDecoder, FfmpegEncoder},
@@ -123,8 +123,6 @@ pub struct SharedScreenState {
     pub last_encode_us: Arc<AtomicU32>,
     /// Capture time of the last frame in microseconds.
     pub last_capture_us: Arc<AtomicU32>,
-    /// Current quality preset (stored as u8, mapped from Quality enum).
-    pub quality: Arc<AtomicU8>,
 }
 
 impl SharedScreenState {
@@ -135,7 +133,6 @@ impl SharedScreenState {
             last_frame_bytes: Arc::new(AtomicU32::new(0)),
             last_encode_us: Arc::new(AtomicU32::new(0)),
             last_capture_us: Arc::new(AtomicU32::new(0)),
-            quality: Arc::new(AtomicU8::new(0)),
         }
     }
 }
@@ -325,7 +322,7 @@ fn run_screen_loop(
             && Instant::now() >= next_capture
         {
             let cap_start = Instant::now();
-            capture_and_encode(state, &event_tx, &network_tx, &shared);
+            capture_and_encode(state, &network_tx, &shared);
             let cap_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
 
             // Drain system audio packets and send to network
@@ -359,7 +356,7 @@ fn run_screen_loop(
     shared.is_sharing.store(false, Ordering::Relaxed);
     info!("📺 Screen thread stopped");
 }
-
+#[allow(clippy::too_many_arguments)]
 fn handle_control(
     ctrl: ScreenControl,
     capture: &mut Option<CaptureState>,
@@ -508,18 +505,18 @@ fn handle_control(
         }
 
         ScreenControl::SetStreamVolume { client_id, volume } => {
-            if let Some(stream) = peer_streams.get(&client_id) {
-                if let Some(ref audio) = stream.stream_audio {
-                    audio.set_volume(volume);
-                }
+            if let Some(stream) = peer_streams.get(&client_id)
+                && let Some(ref audio) = stream.stream_audio
+            {
+                audio.set_volume(volume);
             }
         }
 
         ScreenControl::MuteStream { client_id, muted } => {
-            if let Some(stream) = peer_streams.get(&client_id) {
-                if let Some(ref audio) = stream.stream_audio {
-                    audio.set_muted(muted);
-                }
+            if let Some(stream) = peer_streams.get(&client_id)
+                && let Some(ref audio) = stream.stream_audio
+            {
+                audio.set_muted(muted);
             }
         }
 
@@ -539,6 +536,7 @@ fn handle_control(
 ///   in an inconsistent reference state.
 /// - P-frames with sequence gaps > 1 are dropped — the missing reference
 ///   frame(s) would cause cascading visual corruption.
+#[allow(clippy::too_many_arguments)]
 fn decode_incoming_frame(
     client_id: u64,
     seq: u32,
@@ -691,7 +689,6 @@ fn decode_incoming_frame(
 
 fn capture_and_encode(
     state: &mut CaptureState,
-    event_tx: &Sender<ScreenEvent>,
     network_tx: &Sender<NetworkControl>,
     shared: &SharedScreenState,
 ) {
@@ -828,26 +825,4 @@ fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
     Err(CodecError::DecoderInit(
         "no codec features enabled".to_string(),
     ))
-}
-
-/// Map a resolution back to the closest Quality preset.
-fn quality_from_resolution(width: u32, height: u32) -> Quality {
-    match (width, height) {
-        (1920, 1080) => Quality::FHD30,
-        (1280, 720) => Quality::HD30,
-        _ => {
-            if width > 1280 {
-                Quality::FHD30
-            } else {
-                Quality::HD30
-            }
-        }
-    }
-}
-
-// ── Public helpers ──────────────────────────────────────────────────────
-
-/// List available monitors for the UI's monitor picker.
-pub fn list_monitors() -> Result<Vec<MonitorInfo>, screencap::CaptureError> {
-    screencap::capture::list_monitors()
 }

@@ -1,3 +1,11 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_lossless,
+    clippy::too_many_lines,
+    clippy::doc_markdown
+)]
 //! FLTK blit stress test — measures maximum achievable FPS for 720p RGBA frames.
 //!
 //! Tests three rendering strategies to find the fastest path:
@@ -288,13 +296,13 @@ fn main() {
         0.001
     };
 
-    let pixels_pump = pixels.clone();
-    let fps_pump = fps_counter.clone();
-    let frame_pump = frame_num.clone();
-    let strategy_pump = strategy.clone();
-    let mut canvas_pump = canvas.clone();
-    let mut stats_pump = stats_label.clone();
-    let mut wind_pump = wind.clone();
+    let pixels_pump = pixels;
+    let fps_pump = fps_counter;
+    let frame_pump = frame_num;
+    let strategy_pump = strategy;
+    let mut canvas_pump = canvas;
+    let mut stats_pump = stats_label;
+    let mut wind_pump = wind;
 
     app::add_timeout3(interval, move |handle| {
         // Generate a new fake frame

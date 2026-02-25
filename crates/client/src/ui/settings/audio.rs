@@ -28,6 +28,7 @@ fn format_sensitivity(value: f64) -> String {
 /// `w` — available width (scroll width minus scrollbar).
 ///
 /// Returns a Flex column; the height is determined by content.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     sender: app::Sender<UiMessage>,
     settings: &Settings,

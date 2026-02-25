@@ -218,7 +218,7 @@ impl Drop for StreamDecoder {
 /// - `device_name`: output device (or `None` for system default)
 /// - `volume`: initial playback volume (0.0–2.0)
 /// - `voice_energy`: shared atomic from voice output for echo ducking
-///    (`None` to disable voice cancellation)
+/// - (`None` to disable voice cancellation)
 pub fn spawn(
     device_name: Option<&str>,
     volume: f32,

@@ -74,23 +74,6 @@ impl PeerBuffer {
     }
 }
 
-/// Result of pushing a packet, telling the caller what recovery is needed.
-#[derive(Debug)]
-pub enum PushResult {
-    /// Packet was in order, no recovery needed.
-    Ok,
-    /// Packet arrived but we detected `gap_count` missing frames before it.
-    /// The caller should generate PLC/FEC frames for the gap, then push
-    /// those samples via `push_decoded_audio` before pushing this packet's audio.
-    Gap { gap_count: usize },
-    /// Packet was late (behind what we've already played). Dropped.
-    Late,
-    /// Sequence jumped too far — peer buffer was reset.
-    Reset,
-    /// Peer is locally muted, packet ignored.
-    Muted,
-}
-
 pub struct AdaptiveJitterBuffer {
     sample_rate: usize,
     target_samples: usize,
@@ -233,20 +216,6 @@ impl AdaptiveJitterBuffer {
         }
     }
 
-    /// Legacy entry point: push decoded audio without metadata.
-    ///
-    /// Used for loopback and other paths where we don't have packet metadata.
-    /// Does NOT update jitter estimation (no arrival time available).
-    pub fn push_decoded_audio(&mut self, peer_id: u64, samples: Vec<f32>) {
-        let peer = self.buffers.entry(peer_id).or_insert_with(PeerBuffer::new);
-        peer.samples.extend(samples);
-
-        let hard_cap = self.max_samples * 3;
-        while peer.samples.len() > hard_cap {
-            peer.samples.pop_front();
-        }
-    }
-
     /// Pull exactly `n` mixed samples, filling with silence if needed.
     ///
     /// Always mixes whatever audio is available for each peer (no hard gate).
@@ -280,13 +249,10 @@ impl AdaptiveJitterBuffer {
 
             // Drain samples into temp buffer and apply volume
             let available = peer.samples.len().min(n);
-            for i in 0..n {
-                peer_buf[i] = if i < available {
-                    peer.samples.pop_front().unwrap_or(0.0) * peer_settings.volume
-                } else {
-                    0.0
-                };
+            for slot in peer_buf[..available].iter_mut() {
+                *slot = peer.samples.pop_front().unwrap_or(0.0) * peer_settings.volume;
             }
+            peer_buf[available..n].fill(0.0);
 
             // Apply per-peer limiter (hearing protection)
             peer.limiter.process(&mut peer_buf[..available]);
@@ -449,14 +415,6 @@ impl AdaptiveJitterBuffer {
             .sum::<f32>()
             / self.buffers.len() as f32;
         (avg * 1000.0) / self.sample_rate as f32
-    }
-
-    /// Number of active (non-empty) peer buffers.
-    pub fn active_peers(&self) -> usize {
-        self.buffers
-            .values()
-            .filter(|p| !p.samples.is_empty())
-            .count()
     }
 
     /// Current target depth in milliseconds (for stats).

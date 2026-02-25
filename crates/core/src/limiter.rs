@@ -58,7 +58,11 @@ pub struct Limiter {
     /// Envelope release coefficient (per-sample).
     env_release_coeff: f32,
 }
-
+impl Default for Limiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Limiter {
     /// Create a new limiter with default voice-chat tuning.
     ///

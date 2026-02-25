@@ -20,7 +20,7 @@ use crate::{
     config::{BindableAction, Settings, peer_key},
     hotkeys::HotkeyManager,
     network::{NetworkControl, NetworkMessage, NetworkThreadHandle},
-    screen::{Quality, ScreenControl, ScreenEvent, ScreenThreadHandle},
+    screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     ui::{chat::Chat, messages::UiMessage, sidebar::Sidebar, viewer::ViewerWindow},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
 };
@@ -175,17 +175,14 @@ impl App {
                 }
             }
             for action in hotkey_actions {
+                if !self.connected {
+                    continue;
+                }
                 match action {
-                    BindableAction::ToggleMute => {
-                        if self.connected {
-                            self.handle_toggle_mute();
-                        }
-                    }
-                    BindableAction::ToggleDeafen => {
-                        if self.connected {
-                            self.handle_toggle_deafen();
-                        }
-                    }
+                    BindableAction::ToggleMute => self.handle_toggle_mute(),
+                    BindableAction::ToggleDeafen => self.handle_toggle_deafen(),
+                    BindableAction::ToggleScreenShare => self.handle_toggle_screenshare(),
+                    BindableAction::PushToTalk => {}
                 }
             }
 
@@ -331,13 +328,6 @@ impl App {
                     if blit_ms > 5.0 {
                         log::warn!("📊 Slow blit: {blit_ms:.1}ms for seq {seq}");
                     }
-                } else {
-                    let username = self.username_for_u64(client_id);
-                    let mut viewer =
-                        ViewerWindow::new(client_id, &username, width, height, self.sender);
-                    viewer.update_frame(rgba, width, height, frame_bytes);
-                    self.viewer_windows.insert(client_id, viewer);
-                    info!("📺 Opened viewer for {username} ({width}x{height})");
                 }
             }
             ScreenEvent::PeerStartedSharing {
@@ -401,11 +391,7 @@ impl App {
             } => {
                 self.handle_user_left(client_id, username);
             }
-            NetworkMessage::TextMessage {
-                client_id: _,
-                username,
-                text,
-            } => {
+            NetworkMessage::TextMessage { username, text } => {
                 if let Some(chat) = &mut self.chat {
                     chat.handle_text_message(username, text);
                 }
@@ -432,7 +418,6 @@ impl App {
                 self.update_user_list();
             }
             NetworkMessage::VoiceData { .. } => {}
-            NetworkMessage::UiUpdate => {}
             NetworkMessage::LatencyUpdate { rtt_ms } => {
                 if let Some(sidebar) = &mut self.sidebar {
                     let audio_ms = self.voice.shared.jitter_buffer_ms.load(Ordering::Relaxed);
@@ -464,7 +449,7 @@ impl App {
     fn handle_ui_message(&mut self, msg: UiMessage) {
         match msg {
             // ── Screen share buttons ────────────────────────────────
-            UiMessage::StartShareScreen => {
+            UiMessage::ToggleScreenShare => {
                 if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
                     // Button is in "Stop Sharing" state — stop.
                     self.screen.tx.send(ScreenControl::StopSharing).ok();
@@ -492,18 +477,14 @@ impl App {
                     sidebar.update_stream_stats(None);
                 }
             }
-            UiMessage::StopShareScreen => {
-                if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                    self.screen.tx.send(ScreenControl::StopSharing).ok();
-                }
-            }
             UiMessage::WatchPeer { client_id } => {
                 let raw_id = client_id;
-                // Don't open duplicate viewer windows
                 if self.viewer_windows.contains_key(&raw_id) {
                     return;
                 }
                 let username = self.get_username(client_id);
+                let viewer = ViewerWindow::new(raw_id, &username, 1280, 720, self.sender);
+                self.viewer_windows.insert(raw_id, viewer);
                 self.network
                     .tx
                     .send(NetworkControl::SubscribeScreen { target_id: raw_id })
@@ -511,8 +492,9 @@ impl App {
                 self.show_chat_system(&format!("Watching {username}'s screen..."));
             }
             UiMessage::UnwatchPeer { client_id } => {
-                // User closed a viewer window — unsubscribe from stream
-                self.viewer_windows.remove(&client_id);
+                if let Some(mut viewer) = self.viewer_windows.remove(&client_id) {
+                    viewer.close();
+                }
                 self.network
                     .tx
                     .send(NetworkControl::UnsubscribeScreen {
@@ -672,11 +654,10 @@ impl App {
                 self.dismiss_update_flow_and_connect();
             }
             UiMessage::OpenUpdateAndQuit(path) => {
-                // Open the containing folder so the user can drag/drop
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    if let Err(e) = open::that(parent) {
-                        warn!("Failed to open folder: {e}");
-                    }
+                if let Some(parent) = std::path::Path::new(&path).parent()
+                    && let Err(e) = open::that(parent)
+                {
+                    warn!("Failed to open folder: {e}");
                 }
                 // Open the zip itself in the system zip handler
                 if let Err(e) = open::that(&path) {
@@ -739,7 +720,7 @@ impl App {
     fn username_for_u64(&self, raw_id: u64) -> String {
         self.users
             .iter()
-            .find(|&(&id, _)| u64::from(id) == raw_id)
+            .find(|&(&id, _)| id == raw_id)
             .map(|(_, u)| u.username.clone())
             .unwrap_or_else(|| format!("User#{raw_id}"))
     }
@@ -879,8 +860,7 @@ impl App {
         self.sync_sharers_to_sidebar();
 
         // Close viewer if we were watching this user
-        let raw_id = u64::from(client_id);
-        if let Some(mut viewer) = self.viewer_windows.remove(&raw_id) {
+        if let Some(mut viewer) = self.viewer_windows.remove(&client_id) {
             viewer.close();
         }
 
@@ -929,6 +909,24 @@ impl App {
 
         if let Some(sidebar) = &mut self.sidebar {
             sidebar.set_deafen_state(self.is_deafened);
+        }
+    }
+    fn handle_toggle_screenshare(&mut self) {
+        if self
+            .screen
+            .shared
+            .is_sharing
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.screen.tx.send(ScreenControl::StopSharing).ok();
+        } else {
+            self.screen
+                .tx
+                .send(ScreenControl::StartSharing {
+                    quality: screencap::Quality::HD60,
+                    monitor_index: 0,
+                })
+                .ok();
         }
     }
 

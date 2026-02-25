@@ -40,7 +40,6 @@ pub struct ChannelSettings {
     #[serde(default = "default_reliable_video_buffer_size_mb")]
     pub reliable_video_buffer_size_mb: usize,
     /// Max bytes renet can send per tick per client.
-    /// At 60 ticks/sec, 300_000 = ~18 MB/s (enough for HD60 video).
     #[serde(default = "default_bytes_per_tick")]
     pub bytes_per_tick: u64,
 }

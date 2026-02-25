@@ -219,7 +219,7 @@ impl AudioOutput {
 
         Ok(stream)
     }
-
+    #[allow(clippy::too_many_arguments)]
     fn spawn_worker(
         mut ring_producer: Producer<f32>,
         decoder_rx: Receiver<DecodedFrame>,
@@ -425,4 +425,3 @@ impl Drop for AudioOutput {
         }
     }
 }
-

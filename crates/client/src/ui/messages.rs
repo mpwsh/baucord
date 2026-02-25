@@ -48,19 +48,27 @@ pub enum UiMessage {
 
     // ── Screen share ────────────────────────────────────────────────
     /// User clicked "Share Screen" — start capturing.
-    StartShareScreen,
-    /// User clicked "Stop Sharing" — stop capturing.
-    StopShareScreen,
+    ToggleScreenShare,
     /// User clicked "Watch Stream" on a peer's context menu.
-    WatchPeer { client_id: ClientId },
+    WatchPeer {
+        client_id: ClientId,
+    },
     /// User closed a viewer window — unsubscribe from that peer's stream.
-    UnwatchPeer { client_id: u64 },
+    UnwatchPeer {
+        client_id: u64,
+    },
 
     // ── Stream audio controls ───────────────────────────────────────
     /// Viewer volume slider changed.
-    SetStreamVolume { client_id: u64, volume: f32 },
+    SetStreamVolume {
+        client_id: u64,
+        volume: f32,
+    },
     /// Viewer mute button toggled.
-    MuteStream { client_id: u64, muted: bool },
+    MuteStream {
+        client_id: u64,
+        muted: bool,
+    },
 
     // ── Per-user audio popup ────────────────────────────────────────
     /// Open the per-user context menu (volume, mute, watch stream).
@@ -111,3 +119,4 @@ pub enum UiMessage {
     // ── Application lifecycle ───────────────────────────────────────
     Shutdown,
 }
+

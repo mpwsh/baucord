@@ -167,7 +167,7 @@ impl Sidebar {
 
         let s = sender;
         share_btn.clone().set_callback(move |_| {
-            s.send(UiMessage::StartShareScreen);
+            s.send(UiMessage::ToggleScreenShare);
         });
 
         let s = sender;
@@ -258,7 +258,7 @@ impl Sidebar {
             w.hide();
         }
     }
-
+    #[allow(clippy::too_many_arguments)]
     fn open_audio_popup(
         &mut self,
         client_id: ClientId,
@@ -689,10 +689,8 @@ impl Sidebar {
             if let Some(img) = svg_icon(SVG_SELF_DEAFENED, 14) {
                 icon_frm.set_image(Some(img));
             }
-        } else if show_muted {
-            if let Some(img) = svg_icon(SVG_SELF_MUTED, 14) {
-                icon_frm.set_image(Some(img));
-            }
+        } else if show_muted && let Some(img) = svg_icon(SVG_SELF_MUTED, 14) {
+            icon_frm.set_image(Some(img));
         }
 
         let status_icon = Some(icon_frm);
@@ -919,4 +917,3 @@ impl Sidebar {
         }
     }
 }
-

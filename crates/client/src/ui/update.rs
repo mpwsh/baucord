@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use fltk::{prelude::*, *};
-use log::{info, warn};
+use log::info;
 
 use crate::ui::messages::UiMessage;
 use crate::ui::splash;
@@ -427,4 +427,3 @@ fn download_zip(
 
     Ok(dest)
 }
-

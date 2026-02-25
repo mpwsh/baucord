@@ -46,6 +46,7 @@ impl Tab {
 pub struct SettingsWindow;
 
 impl SettingsWindow {
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         sender: app::Sender<UiMessage>,
         settings: Settings,

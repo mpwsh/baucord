@@ -48,7 +48,11 @@ pub struct VoiceCanceller {
     /// Controls attack/release speed. ~5ms at 48kHz.
     smooth_coeff: f32,
 }
-
+impl Default for VoiceCanceller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl VoiceCanceller {
     pub fn new() -> Self {
         Self {

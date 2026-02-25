@@ -58,11 +58,6 @@ impl VADProcessor {
         }
     }
 
-    /// Get a handle to the speaking state for reading from other threads.
-    pub fn speaking_handle(&self) -> Arc<AtomicBool> {
-        self.is_speaking.clone()
-    }
-
     /// Classify whether a frame contains speech. Returns `true` if speech detected.
     ///
     /// Only call this on frames that already passed the energy gate —
@@ -82,12 +77,9 @@ impl VADProcessor {
         while self.accum_48k.len() >= SAMPLES_48K_PER_FRAME {
             // Downsample 48k → 16k by averaging groups of 3
             let mut frame_16k = [0.0f32; EARSHOT_FRAME_16K];
-            for i in 0..EARSHOT_FRAME_16K {
-                let base = i * 3;
-                let avg =
-                    (self.accum_48k[base] + self.accum_48k[base + 1] + self.accum_48k[base + 2])
-                        / 3.0;
-                frame_16k[i] = avg.clamp(-1.0, 1.0);
+            for (sample, chunk) in frame_16k.iter_mut().zip(self.accum_48k.chunks(3)) {
+                let avg = (chunk[0] + chunk[1] + chunk[2]) / 3.0;
+                *sample = avg.clamp(-1.0, 1.0);
             }
             self.accum_48k.drain(..SAMPLES_48K_PER_FRAME);
 

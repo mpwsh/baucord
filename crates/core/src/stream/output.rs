@@ -97,7 +97,7 @@ impl StreamAudioOutput {
     /// - `device_name`: output device (or `None` for default)
     /// - `volume`: initial playback volume (0.0–2.0)
     /// - `voice_energy`: shared atomic from voice output for cancellation
-    ///    (`None` to disable voice cancellation)
+    /// - (`None` to disable voice cancellation)
     pub fn new(
         device_name: Option<&str>,
         volume: f32,
@@ -297,7 +297,7 @@ impl StreamAudioOutput {
     }
 
     // ── Worker thread ───────────────────────────────────────────────────
-
+    #[allow(clippy::too_many_arguments)]
     fn spawn_worker(
         mut ring_producer: Producer<f32>,
         frame_rx: Receiver<StreamAudioFrame>,

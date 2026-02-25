@@ -20,13 +20,12 @@ use core::AudioPacket;
 
 use protocol::{
     ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL,
-    RELIABLE_VIDEO_BUFFER_BYTES, RELIABLE_VIDEO_CHANNEL, ServerMessage,
-    SYSTEM_AUDIO_BUFFER_BYTES, SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET,
-    VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VOICE_BATCH_THRESHOLD,
-    VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET,
-    VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoHeader, VoiceHeader,
-    pack_system_audio, pack_video_frame, parse_system_audio_header, parse_video_header,
-    system_audio_payload, video_payload,
+    RELIABLE_VIDEO_BUFFER_BYTES, RELIABLE_VIDEO_CHANNEL, SYSTEM_AUDIO_BUFFER_BYTES,
+    SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET, ServerMessage, VIDEO_BUFFER_BYTES,
+    VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL,
+    VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION,
+    VideoHeader, VoiceHeader, pack_system_audio, pack_video_frame, parse_system_audio_header,
+    parse_video_header, system_audio_payload, video_payload,
 };
 
 use crate::screen::ScreenControl;
@@ -52,7 +51,6 @@ pub enum NetworkMessage {
         username: String,
     },
     TextMessage {
-        client_id: ClientId,
         username: String,
         text: String,
     },
@@ -75,8 +73,6 @@ pub enum NetworkMessage {
     LatencyUpdate {
         rtt_ms: f64,
     },
-    /// Periodic UI refresh tick.
-    UiUpdate,
 
     // ── Screen share events ─────────────────────────────────────────
     /// A remote user started sharing their screen.
@@ -255,7 +251,7 @@ impl NetworkClient {
         let channels = vec![reliable, voice, video, reliable_video, system_audio];
 
         let connection_config = ConnectionConfig {
-            available_bytes_per_tick: 60_000,
+            available_bytes_per_tick: 120_000,
             server_channels_config: channels.clone(),
             client_channels_config: channels,
         };
@@ -389,7 +385,6 @@ impl NetworkClient {
                         .unwrap_or_else(|| format!("User{}", msg.client_id));
 
                     self.message_queue.push(NetworkMessage::TextMessage {
-                        client_id: msg.client_id,
                         username,
                         text: msg.text,
                     });
@@ -682,7 +677,10 @@ impl NetworkClient {
     ) {
         let buf = pack_system_audio(our_client_id, seq, channels, duration_ms, opus_data);
         if buf.len() > SYSTEM_AUDIO_MTU_BUDGET {
-            warn!("System audio packet too large: {} bytes, dropping", buf.len());
+            warn!(
+                "System audio packet too large: {} bytes, dropping",
+                buf.len()
+            );
             return;
         }
         self.client.send_message(SYSTEM_AUDIO_CHANNEL, buf);
@@ -746,10 +744,6 @@ impl NetworkClient {
 
     pub fn client_id(&self) -> u64 {
         self.transport.client_id()
-    }
-
-    pub fn get_users(&self) -> &HashMap<ClientId, String> {
-        &self.usernames
     }
 }
 
@@ -960,13 +954,7 @@ fn run_network_loop(
                         data,
                     } => {
                         if let Some(c) = &mut client {
-                            c.send_system_audio(
-                                c.client_id(),
-                                seq,
-                                channels,
-                                duration_ms,
-                                &data,
-                            );
+                            c.send_system_audio(c.client_id(), seq, channels, duration_ms, &data);
                         }
                     }
                     NetworkControl::SubscribeScreen { target_id } => {
@@ -1031,7 +1019,7 @@ fn run_network_loop(
                             enqueued_at: std::time::Instant::now(),
                         }) {
                             log::warn!(
-                                "📺 Screen channel full, dropped frame seq={seq} keyframe={is_keyframe}"
+                                "📺 Screen channel full, dropped frame seq={seq} keyframe={is_keyframe} - {e}"
                             );
                         }
                     }

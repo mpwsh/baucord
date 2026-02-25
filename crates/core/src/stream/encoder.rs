@@ -14,7 +14,7 @@
 //! Owns the Opus encoder exclusively — no shared mutex needed.
 
 use crossbeam_channel::{Receiver, Sender};
-use log::{error, info, warn};
+use log::{error, info};
 use opus::{Application, Bitrate, Channels, Encoder};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -120,6 +120,10 @@ impl StreamEncoderWorker {
         }
     }
 
+    #[expect(
+        clippy::needless_return,
+        reason = "explicit return exits the thread loop"
+    )]
     fn encode_frame(&mut self, frame: &[f32]) {
         // Opus encode_float for stereo expects interleaved samples with
         // frame_size = samples per channel (960 for 20 ms at 48 kHz).

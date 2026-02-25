@@ -9,9 +9,9 @@ use renet::{ClientId, RenetServer};
 use std::collections::{HashMap, HashSet};
 
 use protocol::{
-    SYSTEM_AUDIO_MTU_BUDGET, SYSTEM_AUDIO_PROTOCOL_VERSION, SystemAudioHeader, VIDEO_MTU_BUDGET,
-    VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION,
-    VideoHeader, VoiceHeader, parse_system_audio_header, parse_video_header,
+    SYSTEM_AUDIO_MTU_BUDGET, SystemAudioHeader, VIDEO_MTU_BUDGET, VOICE_MAX_FRAME_SIZE,
+    VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoHeader,
+    VoiceHeader, parse_system_audio_header, parse_video_header,
 };
 
 // ════════════════════════════════════════════════════════════════════════

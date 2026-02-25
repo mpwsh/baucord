@@ -10,9 +10,6 @@
 // A single-row toolbar at the bottom provides:
 //   [ ----o--- volume | Mute | Stop Watching |       720p 24fps 12KB ]
 //
-// Volume and Mute are dummy placeholders for now — they'll control the
-// stream's audio channel once that's wired up.
-//
 // Closing the window sends an unsubscribe message so the server stops
 // forwarding frames.
 
@@ -66,7 +63,6 @@ impl FpsCounter {
 
 /// State for a single viewer window.
 pub struct ViewerWindow {
-    pub client_id: u64,
     pub width: u32,
     pub height: u32,
     wind: window::Window,
@@ -77,14 +73,14 @@ pub struct ViewerWindow {
     frame_count: u64,
     /// FPS counter — updated on each frame, displayed in toolbar.
     fps: FpsCounter,
-    /// Last encoded frame size in bytes (for stats display).
-    last_frame_bytes: usize,
     /// Stats label in the toolbar (right-aligned).
     stats_label: frame::Frame,
-    /// Volume slider (dummy for now).
-    volume_slider: valuator::HorNiceSlider,
-    /// Mute button (dummy for now).
-    mute_btn: button::Button,
+    /// Total bytes received (encoded) across all frames.
+    total_bytes: u64,
+    /// Ring buffer of recent frame sizes for smoothed throughput display.
+    recent_frame_bytes: [u64; 10],
+    /// Write index into the ring buffer.
+    ring_idx: usize,
 }
 
 impl ViewerWindow {
@@ -162,7 +158,7 @@ impl ViewerWindow {
         toolbar.fixed(&sep1, 1);
 
         // Mute button
-        let mut mute_btn = controls::button("Mute");
+        let mute_btn = controls::button("Mute");
         toolbar.fixed(&mute_btn, 50);
 
         // Separator
@@ -278,7 +274,7 @@ impl ViewerWindow {
             if is_stream_muted {
                 mute_clone.set_label("Unmute");
                 mute_clone.set_color(theme::DANGER);
-                mute_clone.set_label_color(enums::Color::White);
+                mute_clone.set_label_color(theme::BUTTON_TEXT);
             } else {
                 mute_clone.set_label("Mute");
                 mute_clone.set_color(theme::BG_TERTIARY);
@@ -297,7 +293,6 @@ impl ViewerWindow {
         });
 
         Self {
-            client_id,
             width,
             height,
             wind,
@@ -305,10 +300,10 @@ impl ViewerWindow {
             pixels,
             frame_count: 0,
             fps: FpsCounter::new(),
-            last_frame_bytes: 0,
+            total_bytes: 0,
+            recent_frame_bytes: [0; 10],
+            ring_idx: 0,
             stats_label,
-            volume_slider,
-            mute_btn,
         }
     }
 
@@ -350,21 +345,24 @@ impl ViewerWindow {
         }
 
         self.frame_count += 1;
-        self.last_frame_bytes = frame_bytes;
+        self.total_bytes += frame_bytes as u64;
+        self.recent_frame_bytes[self.ring_idx] = frame_bytes as u64;
+        self.ring_idx = (self.ring_idx + 1) % self.recent_frame_bytes.len();
 
-        // Update FPS + stats label
         let fps = self.fps.tick();
-        let kb = frame_bytes as f32 / 1024.0;
-        let res = format!("{}p", height);
-        self.stats_label
-            .set_label(&format!("{res} {fps}fps {kb:.0}KB"));
+        if self.fps.frames_this_second == 1 {
+            let avg_frame_kb = self.recent_frame_bytes.iter().sum::<u64>() as f32
+                / self.recent_frame_bytes.len() as f32
+                / 1024.0;
+            let throughput_kbps = avg_frame_kb * fps as f32;
+            let total_mb = self.total_bytes as f32 / (1024.0 * 1024.0);
+            let res = format!("{}p", height);
+            self.stats_label.set_label(&format!(
+                "{res} {fps}fps {throughput_kbps:.0}KB/s {total_mb:.1}MB"
+            ));
+        }
 
         self.canvas.redraw();
-    }
-
-    /// Returns true if the window has been closed by the user.
-    pub fn is_closed(&self) -> bool {
-        !self.wind.shown()
     }
 
     /// Close the window programmatically (e.g. peer stopped sharing).

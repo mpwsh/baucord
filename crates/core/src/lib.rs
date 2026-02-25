@@ -281,7 +281,7 @@ impl VoiceChat {
     }
 
     pub fn is_muted(&self) -> bool {
-        self.input.as_ref().map_or(false, |i| i.is_muted())
+        self.input.as_ref().is_some_and(|i| i.is_muted())
     }
 
     /// Deafen: silences all incoming audio without decoding.

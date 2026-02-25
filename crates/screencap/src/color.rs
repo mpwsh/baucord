@@ -65,6 +65,7 @@ pub fn rgba_to_yuv420(rgba: &[u8], w: usize, h: usize, yuv: &mut [u8]) {
 /// - R = Y + 359*(V-128) + 128 >> 8
 /// - G = Y -  88*(U-128) - 183*(V-128) + 128 >> 8
 /// - B = Y + 454*(U-128) + 128 >> 8
+#[allow(clippy::too_many_arguments)]
 pub fn yuv420_to_rgba(
     y_data: &[u8],
     u_data: &[u8],
@@ -119,15 +120,30 @@ mod tests {
             &yuv[..w * h],
             &yuv[w * h..w * h + 1],
             &yuv[w * h + 1..],
-            w, 1, 1,
-            w, h,
+            w,
+            1,
+            1,
+            w,
+            h,
             &mut rgba_out,
         );
 
         // Check first pixel within tolerance
-        assert!((rgba_out[0] as i32 - 255).unsigned_abs() <= 2, "R={}", rgba_out[0]);
-        assert!((rgba_out[1] as i32).unsigned_abs() <= 2, "G={}", rgba_out[1]);
-        assert!((rgba_out[2] as i32).unsigned_abs() <= 2, "B={}", rgba_out[2]);
+        assert!(
+            (rgba_out[0] as i32 - 255).unsigned_abs() <= 2,
+            "R={}",
+            rgba_out[0]
+        );
+        assert!(
+            (rgba_out[1] as i32).unsigned_abs() <= 2,
+            "G={}",
+            rgba_out[1]
+        );
+        assert!(
+            (rgba_out[2] as i32).unsigned_abs() <= 2,
+            "B={}",
+            rgba_out[2]
+        );
         assert_eq!(rgba_out[3], 255);
     }
 
@@ -135,7 +151,7 @@ mod tests {
     fn roundtrip_solid_white_preserves_color() {
         let w = 2;
         let h = 2;
-        let rgba_in: Vec<u8> = vec![255, 255, 255, 255].repeat(4);
+        let rgba_in: Vec<u8> = [255, 255, 255, 255].repeat(4);
         let mut yuv = vec![0u8; w * h * 3 / 2];
         rgba_to_yuv420(&rgba_in, w, h, &mut yuv);
 
@@ -144,16 +160,18 @@ mod tests {
             &yuv[..w * h],
             &yuv[w * h..w * h + 1],
             &yuv[w * h + 1..],
-            w, 1, 1,
-            w, h,
+            w,
+            1,
+            1,
+            w,
+            h,
             &mut rgba_out,
         );
 
-        for ch in 0..3 {
+        for (ch, &val) in rgba_out.iter().enumerate().take(3) {
             assert!(
-                (rgba_out[ch] as i32 - 255).unsigned_abs() <= 2,
-                "channel {ch} = {}",
-                rgba_out[ch]
+                (val as i32 - 255).unsigned_abs() <= 2,
+                "channel {ch} = {val}",
             );
         }
     }

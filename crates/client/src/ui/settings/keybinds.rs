@@ -361,4 +361,3 @@ fn fltk_key_to_code_string(key: enums::Key) -> Option<String> {
 
     None
 }
-

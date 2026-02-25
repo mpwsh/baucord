@@ -14,6 +14,7 @@ use fltk::{button, enums, group, menu, prelude::*, valuator};
 ///
 /// Returned without a fixed height — the caller is responsible for
 /// placing it in the layout (e.g. `col.fixed(&btn, 28)`).
+#[must_use]
 pub fn button(label: &str) -> button::Button {
     let mut btn = button::Button::default().with_label(label);
     btn.set_frame(enums::FrameType::FlatBox);
@@ -26,6 +27,7 @@ pub fn button(label: &str) -> button::Button {
 /// Accent-coloured button for primary actions ("Save", "Send", etc.).
 ///
 /// Like [`button`], returned without a fixed height.
+#[must_use]
 pub fn accent_button(label: &str, color: enums::Color) -> button::Button {
     let mut btn = button::Button::default().with_label(label);
     btn.set_color(color);
@@ -105,4 +107,3 @@ pub fn populate_dropdown(
 
     choice.set_value(selected);
 }
-

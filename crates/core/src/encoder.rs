@@ -82,7 +82,10 @@ impl EncoderWorker {
 
         info!("🎤 Encoder thread stopped");
     }
-
+    #[expect(
+        clippy::needless_return,
+        reason = "explicit return exits the thread loop"
+    )]
     fn encode_frame(&mut self, samples: &[f32]) {
         let t0 = Instant::now();
 

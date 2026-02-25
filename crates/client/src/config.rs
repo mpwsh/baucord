@@ -22,18 +22,23 @@ pub fn peer_key(username: &str) -> String {
 pub enum BindableAction {
     ToggleMute,
     ToggleDeafen,
+    ToggleScreenShare,
+    PushToTalk,
 }
 
 impl BindableAction {
     pub const ALL: &'static [BindableAction] = &[
         BindableAction::ToggleMute,
         BindableAction::ToggleDeafen,
+        BindableAction::ToggleScreenShare,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
             BindableAction::ToggleMute => "Toggle Mute",
             BindableAction::ToggleDeafen => "Toggle Deafen",
+            BindableAction::ToggleScreenShare => "Toggle Screen Share",
+            BindableAction::PushToTalk => "Push to talk",
         }
     }
 }
@@ -48,15 +53,30 @@ pub struct KeybindEntry {
 
 impl KeybindEntry {
     pub fn parse(&self) -> Option<ParsedKeybind> {
-        parse_bind(&self.bind)
-    }
+        if self.bind.is_empty() {
+            return None;
+        }
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut code: Option<String> = None;
 
-    pub fn is_empty(&self) -> bool {
-        self.bind.is_empty()
-    }
+        for part in self.bind.split('+') {
+            let part = part.trim();
+            match part.to_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "alt" => alt = true,
+                "shift" => shift = true,
+                _ => code = Some(part.to_string()),
+            }
+        }
 
-    pub fn display(&self) -> &str {
-        if self.bind.is_empty() { "Not set" } else { &self.bind }
+        Some(ParsedKeybind {
+            ctrl,
+            alt,
+            shift,
+            code: code?,
+        })
     }
 }
 
@@ -67,48 +87,26 @@ pub struct ParsedKeybind {
     pub code: String,
 }
 
-pub fn parse_bind(s: &str) -> Option<ParsedKeybind> {
-    if s.is_empty() {
-        return None;
-    }
-    let mut ctrl = false;
-    let mut alt = false;
-    let mut shift = false;
-    let mut code: Option<String> = None;
-
-    for part in s.split('+') {
-        let part = part.trim();
-        match part.to_lowercase().as_str() {
-            "ctrl" | "control" => ctrl = true,
-            "alt" => alt = true,
-            "shift" => shift = true,
-            _ => code = Some(part.to_string()),
-        }
-    }
-
-    Some(ParsedKeybind { ctrl, alt, shift, code: code? })
-}
-
 pub fn build_bind_string(ctrl: bool, alt: bool, shift: bool, code: &str) -> String {
     let mut parts = Vec::new();
-    if ctrl { parts.push("Ctrl"); }
-    if alt { parts.push("Alt"); }
-    if shift { parts.push("Shift"); }
+    if ctrl {
+        parts.push("Ctrl");
+    }
+    if alt {
+        parts.push("Alt");
+    }
+    if shift {
+        parts.push("Shift");
+    }
     parts.push(code);
     parts.join("+")
 }
 
 // ── Settings sub-sections ───────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserSettings {
     pub nickname: String,
-}
-
-impl Default for UserSettings {
-    fn default() -> Self {
-        Self { nickname: String::new() }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +116,9 @@ pub struct ServerSettings {
 
 impl Default for ServerSettings {
     fn default() -> Self {
-        Self { address: "64.176.16.18:5000".to_string() }
+        Self {
+            address: "64.176.16.18:5000".to_string(),
+        }
     }
 }
 
@@ -130,7 +130,10 @@ pub struct AudioInputSettings {
 
 impl Default for AudioInputSettings {
     fn default() -> Self {
-        Self { device: None, gain: 1.0 }
+        Self {
+            device: None,
+            gain: 1.0,
+        }
     }
 }
 
@@ -142,7 +145,10 @@ pub struct AudioOutputSettings {
 
 impl Default for AudioOutputSettings {
     fn default() -> Self {
-        Self { device: None, gain: 1.0 }
+        Self {
+            device: None,
+            gain: 1.0,
+        }
     }
 }
 
@@ -173,14 +179,29 @@ pub struct WindowSettings {
 
 impl Default for WindowSettings {
     fn default() -> Self {
-        Self { width: 1000, height: 700, x: None, y: None }
+        Self {
+            width: 1000,
+            height: 700,
+            x: None,
+            y: None,
+        }
     }
 }
 
 fn default_keybinds() -> Vec<KeybindEntry> {
     vec![
-        KeybindEntry { action: BindableAction::ToggleMute, bind: "Ctrl+Shift+KeyM".to_string() },
-        KeybindEntry { action: BindableAction::ToggleDeafen, bind: "Ctrl+Shift+KeyD".to_string() },
+        KeybindEntry {
+            action: BindableAction::ToggleMute,
+            bind: "Ctrl+Shift+KeyM".to_string(),
+        },
+        KeybindEntry {
+            action: BindableAction::ToggleDeafen,
+            bind: "Ctrl+Shift+KeyD".to_string(),
+        },
+        KeybindEntry {
+            action: BindableAction::ToggleScreenShare,
+            bind: "F9".to_string(),
+        },
     ]
 }
 
@@ -227,13 +248,12 @@ impl Settings {
 
     pub fn load() -> Self {
         let path = Self::get_settings_path();
-        if path.exists() {
-            if let Ok(contents) = fs::read_to_string(&path) {
-                if let Ok(settings) = serde_json::from_str(&contents) {
-                    info!("Loaded settings from {:?}", path);
-                    return settings;
-                }
-            }
+        if path.exists()
+            && let Ok(contents) = fs::read_to_string(&path)
+            && let Ok(settings) = serde_json::from_str(&contents)
+        {
+            info!("Loaded settings from {:?}", path);
+            return settings;
         }
         info!("Using default settings");
         Settings::default()
@@ -271,20 +291,6 @@ impl Settings {
             entry.bind = bind;
         } else {
             self.keybinds.push(KeybindEntry { action, bind });
-        }
-    }
-
-    /// Compute centered position for a child window of given size,
-    /// relative to the saved main window geometry (fallback: screen center).
-    pub fn center_child(&self, child_w: i32, child_h: i32) -> (i32, i32) {
-        if let (Some(wx), Some(wy)) = (self.window.x, self.window.y) {
-            (
-                wx + (self.window.width - child_w) / 2,
-                wy + (self.window.height - child_h) / 2,
-            )
-        } else {
-            let (sw, sh) = fltk::app::screen_size();
-            ((sw as i32 - child_w) / 2, (sh as i32 - child_h) / 2)
         }
     }
 }

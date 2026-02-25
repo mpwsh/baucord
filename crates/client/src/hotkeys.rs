@@ -25,8 +25,7 @@ impl HotkeyManager {
             Err(e) => {
                 warn!("Failed to create global hotkey manager: {e}");
                 return Self {
-                    manager: GlobalHotKeyManager::new()
-                        .expect("GlobalHotKeyManager failed twice"),
+                    manager: GlobalHotKeyManager::new().expect("GlobalHotKeyManager failed twice"),
                     bindings: HashMap::new(),
                 };
             }
@@ -47,26 +46,29 @@ impl HotkeyManager {
 
     /// Poll for hotkey press events. Ignores releases.
     pub fn poll(&self) -> Option<BindableAction> {
-        if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if event.state() == HotKeyState::Pressed {
-                if let Some(&action) = self.bindings.get(&event.id()) {
-                    return Some(action);
-                }
-            }
+        if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv()
+            && event.state() == HotKeyState::Pressed
+            && let Some(&action) = self.bindings.get(&event.id())
+        {
+            return Some(action);
         }
         None
     }
 
     fn register_all(&mut self, settings: &Settings) {
         for entry in &settings.keybinds {
-            if entry.is_empty() {
+            if entry.bind.is_empty() {
                 continue;
             }
 
             let parsed = match entry.parse() {
                 Some(p) => p,
                 None => {
-                    warn!("Invalid keybind '{}' for {}", entry.bind, entry.action.label());
+                    warn!(
+                        "Invalid keybind '{}' for {}",
+                        entry.bind,
+                        entry.action.label()
+                    );
                     continue;
                 }
             };
@@ -76,7 +78,9 @@ impl HotkeyManager {
                 Err(_) => {
                     warn!(
                         "Unknown key code '{}' in '{}' for {}",
-                        parsed.code, entry.bind, entry.action.label()
+                        parsed.code,
+                        entry.bind,
+                        entry.action.label()
                     );
                     continue;
                 }

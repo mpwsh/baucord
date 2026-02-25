@@ -12,7 +12,7 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
         .with_size(w, 500)
         .column();
     col.set_spacing(4);
-    
+
     labels::section_header(&mut col, "\u{2139}", "CREDITS");
 
     // ── Super beta testers (gold) ───────────────────────────────
@@ -23,9 +23,7 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
     col.fixed(&super_header, 24);
     super_header.set_label_size(13);
 
-    let super_testers = vec![
-        "empe",
-    ];
+    let super_testers = vec!["empe"];
 
     for name in &super_testers {
         let mut f = frame::Frame::default()
@@ -49,14 +47,15 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
         "Cholo",
         "willybal",
         "Nachovsky",
-        "Naqel",
+        "naqel",
         "Nicky21",
         "oveer",
         "Patitutitu",
+        "piksel",
         "Pin0",
         "Scryer",
     ];
-    testers.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    testers.sort_unstable_by_key(|t| t.to_lowercase());
 
     let mut i = 0;
     while i < testers.len() {

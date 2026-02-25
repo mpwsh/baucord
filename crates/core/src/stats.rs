@@ -67,7 +67,11 @@ pub struct AudioStats {
     // ── Timing ──────────────────────────────────────────────────────────
     pub start_time: Instant,
 }
-
+impl Default for AudioStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl AudioStats {
     pub fn new() -> Self {
         Self {
@@ -188,3 +192,4 @@ impl AudioStats {
         )
     }
 }
+

@@ -294,18 +294,16 @@ pub fn spawn_pool(
 
     // Worker threads
     let mut workers = Vec::with_capacity(DECODER_WORKERS);
-    for i in 0..DECODER_WORKERS {
-        let rx = worker_rxs[i].take().unwrap();
+    for (i, slot) in worker_rxs.iter_mut().enumerate() {
+        let rx = slot.take().unwrap();
         let tx = decoded_tx.clone();
         let stats = stats.clone();
         let stop = should_stop.clone();
         let removed = removed_peers.clone();
-
         let handle = std::thread::spawn(move || {
             let mut worker = DecoderWorker::new(i, rx, tx, stats, stop, removed);
             worker.run();
         });
-
         workers.push(handle);
     }
 
