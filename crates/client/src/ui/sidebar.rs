@@ -115,14 +115,13 @@ impl Sidebar {
         status_col.set_spacing(2);
         sidebar.fixed(&status_col, 50);
 
-        let mut connection_status = frame::Frame::default().with_label("\u{25cf} Connected");
+        let mut connection_status = frame::Frame::default().with_label("Connecting ...");
         status_col.fixed(&connection_status, 20);
-        connection_status.set_label_color(theme::SUCCESS);
+        connection_status.set_label_color(theme::CYAN);
         connection_status.set_label_size(12);
         connection_status.set_align(enums::Align::Left | enums::Align::Inside);
 
-        let mut latency_label =
-            frame::Frame::default().with_label("  \u{1f50a} --ms  \u{1f310} --ms");
+        let mut latency_label = frame::Frame::default().with_label(" ");
         status_col.fixed(&latency_label, 16);
         latency_label.set_label_color(theme::TEXT_MUTED);
         latency_label.set_label_size(10);
@@ -141,7 +140,7 @@ impl Sidebar {
         audio_row.end();
 
         // Share Screen button — full width, toggles to "Stop Sharing"
-        let mut share_btn = controls::button("Share Screen");
+        let share_btn = controls::button("Share Screen");
         sidebar.fixed(&share_btn, 35);
 
         // Settings button
@@ -216,7 +215,7 @@ impl Sidebar {
         if is_sharing {
             self.share_btn.set_label("Stop Sharing");
             self.share_btn.set_color(theme::DANGER);
-            self.share_btn.set_label_color(enums::Color::White);
+            self.share_btn.set_label_color(theme::BUTTON_TEXT);
         } else {
             self.share_btn.set_label("Share Screen");
             self.share_btn.set_color(theme::BG_TERTIARY);
@@ -235,9 +234,8 @@ impl Sidebar {
     pub fn update_stream_stats(&mut self, stats: Option<(&str, f32, f32)>) {
         match stats {
             Some((resolution, avg_kb, encode_ms)) => {
-                let label = format!(
-                    "  Stream: {resolution} | {avg_kb:.0}KB | {encode_ms:.1}ms enc"
-                );
+                let label =
+                    format!("  Stream: {resolution} | {avg_kb:.0}KB | {encode_ms:.1}ms enc");
                 self.stream_stats_label.set_label(&label);
                 if !self.stream_stats_label.visible() {
                     self.stream_stats_label.show();
@@ -291,22 +289,6 @@ impl Sidebar {
         col.set_margins(12, 8, 12, 8);
         col.set_spacing(4);
 
-        if is_sharing {
-            let mut watch_btn = controls::accent_button("Watch Stream", theme::ACCENT);
-            col.fixed(&watch_btn, 26);
-
-            let mut wind_watch = wind.clone();
-            watch_btn.set_callback(move |_| {
-                sender.send(UiMessage::WatchPeer { client_id });
-                wind_watch.hide();
-            });
-
-            let mut sep_watch = frame::Frame::default();
-            sep_watch.set_frame(enums::FrameType::FlatBox);
-            sep_watch.set_color(theme::BG_TERTIARY);
-            col.fixed(&sep_watch, 1);
-        }
-
         let mut vol_header = frame::Frame::default()
             .with_label("User Volume")
             .with_align(enums::Align::Left | enums::Align::Inside);
@@ -355,6 +337,21 @@ impl Sidebar {
         let mut reset_btn = controls::button("Reset Audio");
         col.fixed(&reset_btn, 26);
 
+        if is_sharing {
+            let mut watch_btn = controls::accent_button("Watch Stream", theme::ACCENT);
+            col.fixed(&watch_btn, 26);
+
+            let mut wind_watch = wind.clone();
+            watch_btn.set_callback(move |_| {
+                sender.send(UiMessage::WatchPeer { client_id });
+                wind_watch.hide();
+            });
+
+            let mut sep_watch = frame::Frame::default();
+            sep_watch.set_frame(enums::FrameType::FlatBox);
+            sep_watch.set_color(theme::BG_TERTIARY);
+            col.fixed(&sep_watch, 1);
+        }
         col.end();
         wind.end();
         wind.show();
@@ -591,7 +588,7 @@ impl Sidebar {
                     btn.set_label_size(11);
                     btn.set_label_font(Font::HelveticaBold);
                     btn.set_color(theme::DANGER);
-                    btn.set_label_color(enums::Color::White);
+                    btn.set_label_color(theme::BUTTON_TEXT);
                 } else if row.is_us {
                     // Self row, not sharing — hide the badge entirely
                     btn.set_label("");
@@ -755,53 +752,51 @@ impl Sidebar {
             let client_id_rc = client_id;
             let username_rc = state.username.clone();
 
-            user_item.handle(move |w, ev| {
-                match ev {
-                    enums::Event::Enter | enums::Event::Move => {
-                        if !*hovering.borrow() {
-                            *hovering.borrow_mut() = true;
+            user_item.handle(move |w, ev| match ev {
+                enums::Event::Enter | enums::Event::Move => {
+                    if !*hovering.borrow() {
+                        *hovering.borrow_mut() = true;
 
-                            let is_live = btn_clone.label() == "Live";
-                            if !is_live {
-                                btn_clone.set_label_color(theme::TEXT_PRIMARY);
-                                btn_clone.set_color(hover_color);
-                                btn_clone.redraw();
-                            }
-                            container.set_color(hover_color);
-                            container.redraw();
+                        let is_live = btn_clone.label() == "Live";
+                        if !is_live {
+                            btn_clone.set_label_color(theme::TEXT_PRIMARY);
+                            btn_clone.set_color(hover_color);
+                            btn_clone.redraw();
                         }
-                        true
+                        container.set_color(hover_color);
+                        container.redraw();
                     }
-                    enums::Event::Leave => {
-                        let mx = app::event_x();
-                        let my = app::event_y();
-                        let wx = w.x();
-                        let wy = w.y();
-                        if mx < wx || mx > wx + w.w() || my < wy || my > wy + w.h() {
-                            *hovering.borrow_mut() = false;
-
-                            let is_live = btn_clone.label() == "Live";
-                            if !is_live {
-                                btn_clone.set_label_color(base_color);
-                                btn_clone.set_color(base_color);
-                                btn_clone.redraw();
-                            }
-                            container.set_color(base_color);
-                            container.redraw();
-                        }
-                        true
-                    }
-                    enums::Event::Push if app::event_button() == 3 => {
-                        sender_rc.send(UiMessage::OpenUserAudioPopup {
-                            client_id: client_id_rc,
-                            username: username_rc.clone(),
-                            click_x: app::event_x_root(),
-                            click_y: app::event_y_root(),
-                        });
-                        true
-                    }
-                    _ => false,
+                    true
                 }
+                enums::Event::Leave => {
+                    let mx = app::event_x();
+                    let my = app::event_y();
+                    let wx = w.x();
+                    let wy = w.y();
+                    if mx < wx || mx > wx + w.w() || my < wy || my > wy + w.h() {
+                        *hovering.borrow_mut() = false;
+
+                        let is_live = btn_clone.label() == "Live";
+                        if !is_live {
+                            btn_clone.set_label_color(base_color);
+                            btn_clone.set_color(base_color);
+                            btn_clone.redraw();
+                        }
+                        container.set_color(base_color);
+                        container.redraw();
+                    }
+                    true
+                }
+                enums::Event::Push if app::event_button() == 3 => {
+                    sender_rc.send(UiMessage::OpenUserAudioPopup {
+                        client_id: client_id_rc,
+                        username: username_rc.clone(),
+                        click_x: app::event_x_root(),
+                        click_y: app::event_y_root(),
+                    });
+                    true
+                }
+                _ => false,
             });
         }
 
@@ -924,3 +919,4 @@ impl Sidebar {
         }
     }
 }
+

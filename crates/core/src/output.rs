@@ -15,7 +15,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, SupportedStreamConfig};
 use crossbeam_channel::Receiver;
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
-use log::{error, info};
+use log::{debug, error};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Async, Resampler};
 use std::collections::HashMap;
@@ -76,8 +76,8 @@ impl AudioOutput {
 
         let sample_rate = device_config.sample_rate().0;
 
-        info!(
-            "🔊 Output device: {} @ {}Hz, {}ch, {:?}",
+        debug!(
+            "Output device: {} @ {}Hz, {}ch, {:?}",
             device.name().unwrap_or_else(|_| "Unknown".into()),
             sample_rate,
             device_config.channels(),
@@ -121,9 +121,11 @@ impl AudioOutput {
         let format = self.device_config.sample_format();
 
         // Start producer worker BEFORE the stream so it's ready when callbacks arrive
-        if let (Some(ring_producer), Some(decoder_rx), Some(sound_rx)) =
-            (self.ring_producer.take(), self.decoder_rx.take(), self.sound_rx.take())
-        {
+        if let (Some(ring_producer), Some(decoder_rx), Some(sound_rx)) = (
+            self.ring_producer.take(),
+            self.decoder_rx.take(),
+            self.sound_rx.take(),
+        ) {
             let handle = Self::spawn_worker(
                 ring_producer,
                 decoder_rx,
@@ -263,8 +265,8 @@ impl AudioOutput {
             let mut hop_buf = vec![0.0f32; HOP];
             let mut next_tick = Instant::now();
 
-            info!(
-                "🔊 Output worker started (device {}Hz, resample={})",
+            debug!(
+                "Output worker started (device {}Hz, resample={})",
                 device_sample_rate, needs_resample
             );
 
@@ -272,13 +274,8 @@ impl AudioOutput {
                 // Drain ALL decoded audio into jitter buffer.
                 // At 30+ peers, each 10ms tick can produce 30 frames —
                 // the old batch(16) cap caused permanent starvation.
-                loop {
-                    match decoder_rx.try_recv() {
-                        Ok(frame) => {
-                            jitter_buffer.push_frame(frame);
-                        }
-                        Err(_) => break,
-                    }
+                while let Ok(frame) = decoder_rx.try_recv() {
+                    jitter_buffer.push_frame(frame);
                 }
 
                 // Check for new notification sounds (latest wins)
@@ -286,7 +283,7 @@ impl AudioOutput {
                     let samples = sound_bank.get(sound);
                     if !samples.is_empty() {
                         playing = Some((samples.to_vec(), 0));
-                        info!("🔔 Playing notification: {sound:?}");
+                        log::debug!("Playing notification: {sound:?}");
                     }
                 }
 
@@ -411,7 +408,7 @@ impl AudioOutput {
                 }
             }
 
-            info!("🔊 Output worker stopped");
+            debug!("Output worker stopped");
         })
     }
 }
@@ -428,3 +425,4 @@ impl Drop for AudioOutput {
         }
     }
 }
+

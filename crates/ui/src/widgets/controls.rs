@@ -29,7 +29,8 @@ pub fn button(label: &str) -> button::Button {
 pub fn accent_button(label: &str, color: enums::Color) -> button::Button {
     let mut btn = button::Button::default().with_label(label);
     btn.set_color(color);
-    btn.set_label_color(enums::Color::White);
+    btn.set_label_color(theme::BUTTON_TEXT);
+    btn.set_selection_color(color);
     btn.set_frame(enums::FrameType::FlatBox);
     btn.set_label_size(11);
     btn
@@ -104,3 +105,4 @@ pub fn populate_dropdown(
 
     choice.set_value(selected);
 }
+

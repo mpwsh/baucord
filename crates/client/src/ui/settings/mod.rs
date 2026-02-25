@@ -224,11 +224,10 @@ fn style_nav_buttons(buttons: &[button::Button], active: usize) {
         let mut b = btn.clone();
         if i == active {
             b.set_color(theme::ACCENT);
-            b.set_label_color(enums::Color::White);
+            b.set_label_color(theme::BUTTON_TEXT);
         } else {
             b.set_color(theme::SURFACE);
             b.set_label_color(theme::TEXT_SECONDARY);
         }
     }
 }
-

@@ -37,27 +37,6 @@ pub enum Quality {
     /// 1920×1080 @ 60 FPS — best quality, needs hardware encoder.
     FHD60,
 }
-impl From<Quality> for u8 {
-    fn from(q: Quality) -> u8 {
-        match q {
-            Quality::HD30 => 0,
-            Quality::HD60 => 1,
-            Quality::FHD30 => 2,
-            Quality::FHD60 => 3,
-        }
-    }
-}
-
-impl From<u8> for Quality {
-    fn from(v: u8) -> Self {
-        match v {
-            1 => Self::HD60,
-            2 => Self::FHD30,
-            3 => Self::FHD60,
-            _ => Self::HD30,
-        }
-    }
-}
 
 impl Quality {
     pub const fn width(self) -> u32 {

@@ -8,7 +8,7 @@
 //! 2. Add a variant to [`SoundType`]
 //! 3. Add a line in [`SoundBank::new`]
 
-use log::{info, warn};
+use log::{debug, warn};
 use std::io::Cursor;
 
 use crate::OPUS_SAMPLE_RATE;
@@ -39,7 +39,11 @@ pub struct SoundBank {
     leave: Vec<f32>,
     chat: Vec<f32>,
 }
-
+impl Default for SoundBank {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl SoundBank {
     /// Decode all embedded sounds. Call once at startup.
     pub fn new() -> Self {
@@ -81,8 +85,8 @@ fn decode_wav(name: &str, data: &[u8]) -> Vec<f32> {
     let channels = spec.channels as usize;
     let source_rate = spec.sample_rate;
 
-    info!(
-        "🔔 Loading {name}.wav: {}Hz {}ch {}bit {:?}",
+    debug!(
+        "Loading {name}.wav: {}Hz {}ch {}bit {:?}",
         source_rate, channels, spec.bits_per_sample, spec.sample_format,
     );
 
@@ -103,8 +107,8 @@ fn decode_wav(name: &str, data: &[u8]) -> Vec<f32> {
         mono
     };
 
-    info!(
-        "🔔 {name}.wav: {} samples ({:.0}ms)",
+    debug!(
+        "{name}.wav: {} samples ({:.0}ms)",
         resampled.len(),
         resampled.len() as f32 / OPUS_SAMPLE_RATE as f32 * 1000.0,
     );
@@ -125,10 +129,7 @@ fn read_samples_f32(mut reader: hound::WavReader<Cursor<&[u8]>>) -> Vec<f32> {
                 .map(|s| s as f32 / max_val)
                 .collect()
         }
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .filter_map(|s| s.ok())
-            .collect(),
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
     }
 }
 
@@ -169,11 +170,12 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
         output.push(sample);
     }
 
-    info!(
-        "🔔 Resampled: {from_rate}Hz → {to_rate}Hz ({} → {} samples)",
+    debug!(
+        "Resampled: {from_rate}Hz → {to_rate}Hz ({} → {} samples)",
         samples.len(),
         output.len(),
     );
 
     output
 }
+

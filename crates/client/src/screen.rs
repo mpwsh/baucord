@@ -348,7 +348,7 @@ fn run_screen_loop(
                 next_capture = Instant::now();
             }
 
-            log::info!(
+            log::debug!(
                 "📊 ENCODE seq={} {cap_ms:.1}ms (budget {:.1}ms)",
                 state.seq,
                 state.quality.frame_duration().as_secs_f32() * 1000.0
@@ -707,7 +707,7 @@ fn capture_and_encode(
     let capture_us = t0.elapsed().as_micros() as u32;
     let capture_ms = capture_us as f32 / 1000.0;
     if capture_ms > 20.0 {
-        log::warn!("Slow capture: {capture_ms:.1}ms");
+        log::debug!("Slow capture: {capture_ms:.1}ms");
     }
 
     // Encode
@@ -722,7 +722,7 @@ fn capture_and_encode(
         }
     };
     if encoded.is_keyframe {
-        info!(
+        log::debug!(
             "📺 Sent keyframe #{}: {} bytes",
             state.seq,
             encoded.data.len()

@@ -12,7 +12,7 @@
 //! ```
 
 use fltk::{app, enums};
-use fltk_theme::{color_themes, ColorTheme, SchemeType, WidgetScheme};
+use fltk_theme::{ColorTheme, SchemeType, WidgetScheme, color_themes};
 
 // ── Backgrounds ─────────────────────────────────────────────────────────
 
@@ -56,6 +56,9 @@ pub const BORDER: enums::Color = enums::Color::from_rgb(16, 16, 20);
 /// Dim fill for inactive bars and separators.
 pub const SUBTLE: enums::Color = enums::Color::from_rgb(44, 44, 52);
 
+/// Dim fill for inactive bars and separators.
+pub const BUTTON_TEXT: enums::Color = enums::Color::from_rgb(255, 255, 255);
+
 /// Apply the full theme.  Call once, right after `app::App::default()`.
 pub fn apply() {
     app::set_visible_focus(false);
@@ -67,3 +70,4 @@ pub fn apply() {
     // well in both dark and light palettes.
     WidgetScheme::new(SchemeType::Fleet1).apply();
 }
+

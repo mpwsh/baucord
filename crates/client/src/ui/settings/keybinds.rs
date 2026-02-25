@@ -72,8 +72,8 @@ fn global_key_handler(ev: enums::Event) -> bool {
 
     // Capture the key combination
     let state = app::event_state();
-    let ctrl = state.contains(enums::EventState::Ctrl)
-        || state.contains(enums::EventState::Command);
+    let ctrl =
+        state.contains(enums::EventState::Ctrl) || state.contains(enums::EventState::Command);
     let shift = state.contains(enums::EventState::Shift);
     let alt = state.contains(enums::EventState::Alt);
 
@@ -163,11 +163,15 @@ pub fn build(
         }
 
         // Check for cancel
-        let cancelled = CANCELLED.lock().ok().map(|mut g| {
-            let v = *g;
-            *g = false;
-            v
-        }).unwrap_or(false);
+        let cancelled = CANCELLED
+            .lock()
+            .ok()
+            .map(|mut g| {
+                let v = *g;
+                *g = false;
+                v
+            })
+            .unwrap_or(false);
         if cancelled {
             for row in rows_poll.borrow().iter() {
                 let mut btn = row.button.clone();
@@ -357,3 +361,4 @@ fn fltk_key_to_code_string(key: enums::Key) -> Option<String> {
 
     None
 }
+

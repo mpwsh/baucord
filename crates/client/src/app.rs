@@ -92,7 +92,7 @@ impl App {
 
         // Wake callback — worker threads call this to nudge the FLTK event loop.
         // This is the ONLY place fltk::app::awake is referenced for worker threads.
-        let wake: crate::voice::WakeFn = Arc::new(|| fltk::app::awake());
+        let wake: crate::voice::WakeFn = Arc::new(fltk::app::awake);
 
         // Spawn threads via their handles.
         // Network needs voice_tx to route incoming voice packets,
@@ -304,7 +304,6 @@ impl App {
                 let app_drain_at = Instant::now();
                 let net_to_screen_ms =
                     decoded_at.duration_since(enqueued_at).as_secs_f32() * 1000.0;
-                let decode_done_ms = net_to_screen_ms; // decode is within that window
                 let screen_to_app_ms =
                     app_drain_at.duration_since(decoded_at).as_secs_f32() * 1000.0;
                 let total_ms = app_drain_at.duration_since(enqueued_at).as_secs_f32() * 1000.0;
@@ -312,7 +311,7 @@ impl App {
                 let frame_type = if is_keyframe { "K" } else { "P" };
 
                 // Log every frame — filter with RUST_LOG=info or grep for 📊
-                log::info!(
+                log::debug!(
                     "📊 [seq={seq} {frame_type} {:.0}KB] net→decode: {net_to_screen_ms:.1}ms | \
                     decode→app: {screen_to_app_ms:.1}ms | total: {total_ms:.1}ms",
                     frame_bytes as f64 / 1024.0,
@@ -482,22 +481,15 @@ impl App {
             }
             UiMessage::UpdateStreamStats => {
                 if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                    let quality = Quality::from(self.screen.shared.quality.load(Ordering::Relaxed));
                     let frame_bytes = self.screen.shared.last_frame_bytes.load(Ordering::Relaxed);
                     let encode_us = self.screen.shared.last_encode_us.load(Ordering::Relaxed);
                     let avg_kb = frame_bytes as f32 / 1024.0;
                     let encode_ms = encode_us as f32 / 1000.0;
                     if let Some(sidebar) = &mut self.sidebar {
-                        sidebar.update_stream_stats(Some((
-                            &quality.to_string(),
-                            avg_kb,
-                            encode_ms,
-                        )));
+                        sidebar.update_stream_stats(Some(("720p 60fps", avg_kb, encode_ms)));
                     }
-                } else {
-                    if let Some(sidebar) = &mut self.sidebar {
-                        sidebar.update_stream_stats(None);
-                    }
+                } else if let Some(sidebar) = &mut self.sidebar {
+                    sidebar.update_stream_stats(None);
                 }
             }
             UiMessage::StopShareScreen => {
@@ -506,7 +498,7 @@ impl App {
                 }
             }
             UiMessage::WatchPeer { client_id } => {
-                let raw_id = u64::from(client_id);
+                let raw_id = client_id;
                 // Don't open duplicate viewer windows
                 if self.viewer_windows.contains_key(&raw_id) {
                     return;
@@ -1125,6 +1117,14 @@ impl App {
         let mut wind = window::Window::default()
             .with_size(self.settings.window.width, self.settings.window.height)
             .with_label("baucord");
+        if let (Some(x), Some(y)) = (self.settings.window.x, self.settings.window.y) {
+            wind.set_pos(x, y);
+        } else {
+            let (sw, sh) = app::screen_size();
+            let cx = (sw as i32 - self.settings.window.width) / 2;
+            let cy = (sh as i32 - self.settings.window.height) / 2;
+            wind.set_pos(cx, cy);
+        }
         wind.make_resizable(true);
         wind.set_color(theme::BG_PRIMARY);
         crate::ui::set_window_icon(&mut wind);

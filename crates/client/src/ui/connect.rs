@@ -13,15 +13,16 @@ use ui::widgets::{controls, style};
 ///
 /// Returns the window handle and error frame so App can track them
 /// (hide on successful connect, show validation errors).
-pub fn show(
-    sender: app::Sender<UiMessage>,
-    settings: &Settings,
-) -> (window::Window, frame::Frame) {
-    let (cx, cy) = settings.center_child(600, 480);
+pub fn show(sender: app::Sender<UiMessage>, settings: &Settings) -> (window::Window, frame::Frame) {
+    let w = 500;
+    let h = 400;
+    let (screen_w, screen_h) = app::screen_size();
+
     let mut wind = window::Window::default()
-        .with_size(600, 480)
-        .with_pos(cx, cy)
+        .with_size(w, h)
+        .with_pos(((screen_w as i32) - w) / 2, ((screen_h as i32) - h) / 2)
         .with_label("Connect");
+    wind.set_border(false);
     wind.make_resizable(false);
     wind.set_color(theme::BG_PRIMARY);
     super::set_window_icon(&mut wind);
@@ -84,12 +85,44 @@ pub fn show(
     // ── Connect button ───────────────────────────────────────────────
 
     let mut connect_btn = controls::accent_button("Connect", theme::ACCENT);
-    col.fixed(&connect_btn, 40);
 
+    col.fixed(&connect_btn, 40);
     col.end();
+    // ── Close button (top-right corner) ──────────────────────────────
+    let mut close_btn = controls::button("✕");
+    close_btn.set_pos(w - 35, 5);
+    close_btn.resize(w - 35, 5, 30, 25);
+    close_btn.set_label_size(14);
+
+    let s = sender;
+    close_btn.set_callback(move |_| {
+        s.send(UiMessage::Shutdown);
+    });
     wind.end();
     wind.show();
-
+    // -- handle
+    wind.handle(move |w, ev| {
+        use std::cell::Cell;
+        thread_local! {
+            static DRAG_X: Cell<i32> = const { Cell::new(0) };
+            static DRAG_Y: Cell<i32> = const { Cell::new(0) };
+        }
+        match ev {
+            enums::Event::Push => {
+                DRAG_X.set(app::event_x_root() - w.x());
+                DRAG_Y.set(app::event_y_root() - w.y());
+                true
+            }
+            enums::Event::Drag => {
+                w.set_pos(
+                    app::event_x_root() - DRAG_X.get(),
+                    app::event_y_root() - DRAG_Y.get(),
+                );
+                true
+            }
+            _ => false,
+        }
+    });
     // ── Callbacks ────────────────────────────────────────────────────
 
     let s = sender;
@@ -115,3 +148,4 @@ pub fn show(
 
     (wind, error_frame)
 }
+

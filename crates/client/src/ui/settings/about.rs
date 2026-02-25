@@ -2,7 +2,7 @@
 
 use fltk::{prelude::*, *};
 use ui::theme;
-use ui::widgets::labels;
+use ui::widgets::{controls, labels};
 
 pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
     let mut col = group::Flex::default()
@@ -40,11 +40,11 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
     path_label(&mut col, "Running from:", &exe_path);
     path_label(&mut col, "Config file:", &config_path);
 
-    let mut open_btn = button::Button::default().with_label("Open install folder");
+    let mut open_btn = controls::button("Open install folder");
     col.fixed(&open_btn, 26);
     open_btn.set_frame(enums::FrameType::FlatBox);
     open_btn.set_color(theme::BG_TERTIARY);
-    open_btn.set_label_color(theme::ACCENT);
+    open_btn.set_label_color(theme::BUTTON_TEXT);
     open_btn.set_label_size(11);
 
     let exe_for_btn = exe_path.clone();
