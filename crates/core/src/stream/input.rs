@@ -107,7 +107,7 @@ pub struct SystemAudioPacket {
 ///
 /// The `sample_rate()` method tells us what rate to expect so we
 /// can configure the resampler.
-trait SystemAudioBackend: Send {
+trait SystemAudioBackend {
     /// Start capturing. Spawns platform callbacks that push into the ring buffer.
     fn start(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 
