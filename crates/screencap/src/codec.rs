@@ -480,7 +480,8 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
             opts.set("tune", "zerolatency");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
-            // High profile: CABAC + 8x8 DCT for maximum coding efficiency.
+            opts.set("crf", "20");
+            opts.set("aq-mode", "3");
             opts.set("profile", "high");
         }
         "h264_nvenc" => {

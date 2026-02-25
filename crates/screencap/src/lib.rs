@@ -89,10 +89,10 @@ impl Quality {
     /// high-frequency detail (glyphs, 1px borders, UI elements).
     pub const fn bitrate(self) -> u32 {
         match self {
-            Self::HD30 => 2_500_000,
-            Self::HD60 => 3_500_000,
-            Self::FHD30 => 5_000_000,
-            Self::FHD60 => 7_000_000,
+            Self::HD30 => 3_500_000,
+            Self::HD60 => 4_500_000,
+            Self::FHD30 => 6_000_000,
+            Self::FHD60 => 8_000_000,
         }
     }
 
