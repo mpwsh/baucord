@@ -401,26 +401,25 @@ impl StreamAudioOutput {
 
                 // ── Feed resampler and push to ring ─────────────────────
                 if let Some(ref mut r) = resampler {
-                    let needed = r.input_frames_next();
-
-                    while accum_l.len() >= needed && accum_r.len() >= needed {
+                    loop {
+                        let needed = r.input_frames_next();
+                        if accum_l.len() < needed || accum_r.len() < needed {
+                            break;
+                        }
                         // Check ring capacity before processing
                         let current_fill = ring_capacity - ring_producer.slots();
                         if current_fill >= high_wm {
                             break; // ring is full enough
                         }
-
                         resampler_input[0].clear();
                         resampler_input[0].extend_from_slice(&accum_l[..needed]);
                         resampler_input[1].clear();
                         resampler_input[1].extend_from_slice(&accum_r[..needed]);
                         accum_l.drain(..needed);
                         accum_r.drain(..needed);
-
                         let expected = r.output_frames_next();
                         resampler_output[0].resize(expected, 0.0);
                         resampler_output[1].resize(expected, 0.0);
-
                         let in_adapter =
                             match SequentialSliceOfVecs::new(&resampler_input, 2, needed) {
                                 Ok(a) => a,
@@ -440,7 +439,6 @@ impl StreamAudioOutput {
                                 continue;
                             }
                         };
-
                         match r.process_into_buffer(&in_adapter, &mut out_adapter, None) {
                             Ok((_in_len, out_len)) => {
                                 // Push interleaved stereo into ring
