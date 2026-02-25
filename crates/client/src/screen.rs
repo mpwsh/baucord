@@ -150,7 +150,11 @@ pub struct ScreenThreadHandle {
 }
 
 impl ScreenThreadHandle {
-    pub fn spawn(network_tx: Sender<NetworkControl>, wake: WakeFn) -> Self {
+    pub fn spawn(
+        network_tx: Sender<NetworkControl>,
+        wake: WakeFn,
+        voice_energy: Arc<AtomicU32>,
+    ) -> Self {
         // 256 slots: at 30fps inbound + outbound control messages, 64 was
         // too tight and caused try_send drops during active streaming.
         let (tx, control_rx) = bounded::<ScreenControl>(256);
@@ -158,8 +162,16 @@ impl ScreenThreadHandle {
         let shared = SharedScreenState::new();
 
         let shared_clone = shared.clone();
+        let voice_energy_clone = voice_energy.clone();
         let join_handle = thread::spawn(move || {
-            run_screen_loop(control_rx, event_tx, network_tx, shared_clone, wake);
+            run_screen_loop(
+                control_rx,
+                event_tx,
+                network_tx,
+                shared_clone,
+                wake,
+                voice_energy_clone,
+            );
         });
 
         Self {
@@ -225,6 +237,7 @@ fn run_screen_loop(
     network_tx: Sender<NetworkControl>,
     shared: SharedScreenState,
     wake: WakeFn,
+    voice_energy: Arc<AtomicU32>,
 ) {
     let mut capture: Option<CaptureState> = None;
     let mut peer_streams: HashMap<u64, PeerStream> = HashMap::new();
@@ -251,6 +264,7 @@ fn run_screen_loop(
                     &shared,
                     &wake,
                     &mut running,
+                    &voice_energy,
                 ),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
@@ -269,6 +283,7 @@ fn run_screen_loop(
                     &shared,
                     &wake,
                     &mut running,
+                    &voice_energy,
                 ),
                 Err(_) => break,
             }
@@ -284,6 +299,7 @@ fn run_screen_loop(
                     &shared,
                     &wake,
                     &mut running,
+                    &voice_energy,
                 ),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
@@ -301,6 +317,7 @@ fn run_screen_loop(
                 &shared,
                 &wake,
                 &mut running,
+                &voice_energy,
             );
         }
 
@@ -352,6 +369,7 @@ fn handle_control(
     shared: &SharedScreenState,
     wake: &WakeFn,
     running: &mut bool,
+    voice_energy: &Arc<AtomicU32>,
 ) {
     match ctrl {
         ScreenControl::StartSharing {
@@ -486,7 +504,7 @@ fn handle_control(
             seq,
             data,
         } => {
-            decode_incoming_system_audio(client_id, seq, data, peer_streams);
+            decode_incoming_system_audio(client_id, seq, data, peer_streams, voice_energy);
         }
 
         ScreenControl::SetStreamVolume { client_id, volume } => {
@@ -746,6 +764,7 @@ fn decode_incoming_system_audio(
     seq: u32,
     data: Vec<u8>,
     peer_streams: &mut HashMap<u64, PeerStream>,
+    voice_energy: &Arc<AtomicU32>,
 ) {
     let Some(stream) = peer_streams.get_mut(&client_id) else {
         // No PeerStream yet — waiting for first video keyframe.
@@ -756,7 +775,7 @@ fn decode_incoming_system_audio(
 
     // Lazy-init the stream decoder + playback on first system audio packet.
     if stream.stream_audio.is_none() {
-        match stream_decoder::spawn(None, 1.0) {
+        match stream_decoder::spawn(None, 1.0, Some(voice_energy.clone())) {
             Ok(decoder) => {
                 info!("🔊🎬 Started stream audio decoder for peer {client_id}");
                 stream.stream_audio = Some(decoder);

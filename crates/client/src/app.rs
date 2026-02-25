@@ -107,7 +107,11 @@ impl App {
         );
 
         // After spawning voice, before spawning network:
-        let screen = ScreenThreadHandle::spawn(network_tx.clone(), wake.clone());
+        let screen = ScreenThreadHandle::spawn(
+            network_tx.clone(),
+            wake.clone(),
+            voice.shared.output_level.clone(),
+        );
 
         let network = NetworkThreadHandle::spawn(
             network_tx,

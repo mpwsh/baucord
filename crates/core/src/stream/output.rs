@@ -1,9 +1,9 @@
 //! Stereo audio playback for screen share system audio.
 //!
 //! Runs alongside the mono voice chat `AudioOutput` as a completely
-//! independent playback pipeline. Receives Opus-encoded stereo packets
-//! from the network, decodes them, resamples to the output device rate,
-//! and plays back through the default output device.
+//! independent playback pipeline. Receives decoded stereo frames,
+//! resamples to the output device rate, and plays back through the
+//! default output device.
 //!
 //! ## Why separate from AudioOutput?
 //!
@@ -13,17 +13,20 @@
 //! - No jitter buffer complexity needed — system audio is continuous,
 //!   not bursty like multi-peer voice chat
 //!
+//! ## Voice cancellation
+//!
+//! The stream audio typically contains a delayed copy of voice chat
+//! (captured by the streamer's loopback). The [`VoiceCanceller`] uses
+//! the viewer's own voice output energy to duck the stream during
+//! active speech, suppressing the echo while preserving game/music audio.
+//!
 //! ## Pipeline
 //!
 //! ```text
-//! Network → Opus decode (stereo) → ring buffer → resample → cpal playback
+//! Network → Opus decode (stereo) → voice cancel → ring buffer → resample → cpal playback
 //! ```
-//!
-//! The ring buffer holds interleaved stereo f32 at 48 kHz. The cpal
-//! callback reads stereo pairs and maps them to whatever channel layout
-//! the output device uses (stereo passthrough for 2ch, duplicate for
-//! surround, etc.)
 
+use crate::stream::cancel::VoiceCanceller;
 use crate::OPUS_SAMPLE_RATE;
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
@@ -31,7 +34,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, SupportedStreamConfig};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
-use log::{error, info, warn};
+use log::{error, info};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
@@ -59,28 +62,12 @@ pub struct StreamAudioFrame {
 ///
 /// Receives decoded stereo frames, buffers them, resamples to the
 /// output device rate, and plays through the default output device.
-///
-/// # Usage
-///
-/// ```rust,no_run
-/// let mut stream_out = StreamAudioOutput::new(None, 1.0)?;
-/// stream_out.start()?;
-///
-/// // From the network decode path:
-/// stream_out.push_frame(StreamAudioFrame {
-///     samples: decoded_stereo_interleaved,
-///     seq: packet_seq,
-/// });
-///
-/// // When screen sharing ends:
-/// drop(stream_out);
-/// ```
 pub struct StreamAudioOutput {
     device: Device,
     device_config: SupportedStreamConfig,
     stream: Option<Stream>,
 
-    /// Channel for receiving decoded stereo frames from the network thread.
+    /// Channel for receiving decoded stereo frames from the decoder thread.
     frame_tx: Sender<StreamAudioFrame>,
     frame_rx: Option<Receiver<StreamAudioFrame>>,
 
@@ -97,14 +84,25 @@ pub struct StreamAudioOutput {
     volume: Arc<AtomicU32>,
     /// Mute stream audio without stopping the pipeline.
     is_muted: Arc<AtomicBool>,
+
+    /// Voice output energy for voice cancellation (f32 bits, 0.0–1.0).
+    /// Read from the voice chat's `AudioStats::output_level`.
+    /// `None` if no voice reference is available (canceller disabled).
+    voice_energy: Option<Arc<AtomicU32>>,
 }
 
 impl StreamAudioOutput {
     /// Create a new stream audio output.
     ///
-    /// Uses the specified output device (or default if `None`).
-    /// Does not start playback — call `start()` when screen share begins.
-    pub fn new(device_name: Option<&str>, volume: f32) -> Result<Self, Box<dyn std::error::Error>> {
+    /// - `device_name`: output device (or `None` for default)
+    /// - `volume`: initial playback volume (0.0–2.0)
+    /// - `voice_energy`: shared atomic from voice output for cancellation
+    ///    (`None` to disable voice cancellation)
+    pub fn new(
+        device_name: Option<&str>,
+        volume: f32,
+        voice_energy: Option<Arc<AtomicU32>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
 
         let device = if let Some(name) = device_name {
@@ -132,13 +130,11 @@ impl StreamAudioOutput {
         );
 
         // Ring buffer: 100ms at device rate, stereo interleaved.
-        // Smaller than voice output (200ms) because stream audio is
-        // continuous with no multi-peer mixing complexity.
         let ring_size = ((sample_rate as usize) * 2 * 100) / 1000;
         let ring_size = ring_size.max(9600);
         let (ring_producer, ring_consumer) = RingBuffer::new(ring_size);
 
-        // Frame channel: network thread pushes decoded frames here
+        // Frame channel: decoder thread pushes decoded frames here
         let (frame_tx, frame_rx) = bounded::<StreamAudioFrame>(16);
 
         Ok(Self {
@@ -154,6 +150,7 @@ impl StreamAudioOutput {
             should_stop: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(volume.clamp(0.0, 2.0).to_bits())),
             is_muted: Arc::new(AtomicBool::new(false)),
+            voice_energy,
         })
     }
 
@@ -177,6 +174,7 @@ impl StreamAudioOutput {
                 sample_rate,
                 self.volume.clone(),
                 self.is_muted.clone(),
+                self.voice_energy.clone(),
             );
             self.worker_thread = Some(handle);
         }
@@ -195,9 +193,6 @@ impl StreamAudioOutput {
     }
 
     /// Push a decoded stereo frame for playback.
-    ///
-    /// Called from the network decode path. Non-blocking — drops the
-    /// frame if the internal buffer is full (consumer is behind).
     pub fn push_frame(&self, frame: StreamAudioFrame) {
         let _ = self.frame_tx.try_send(frame);
     }
@@ -212,7 +207,7 @@ impl StreamAudioOutput {
         f32::from_bits(self.volume.load(Ordering::Relaxed))
     }
 
-    /// Get a handle to the volume atomic for UI binding.
+    /// Get a handle to the volume atomic for external control.
     pub fn volume_handle(&self) -> Arc<AtomicU32> {
         self.volume.clone()
     }
@@ -225,12 +220,17 @@ impl StreamAudioOutput {
     pub fn is_muted(&self) -> bool {
         self.is_muted.load(Ordering::Relaxed)
     }
-    pub fn frame_sender(&self) -> Sender<StreamAudioFrame> {
-        self.frame_tx.clone()
-    }
 
+    /// Get a handle to the muted atomic for external control.
     pub fn muted_handle(&self) -> Arc<AtomicBool> {
         self.is_muted.clone()
+    }
+
+    /// Get a clone of the internal frame sender.
+    ///
+    /// Used by the stream decoder to push decoded frames directly.
+    pub fn frame_sender(&self) -> Sender<StreamAudioFrame> {
+        self.frame_tx.clone()
     }
 
     // ── cpal stream ─────────────────────────────────────────────────────
@@ -258,30 +258,22 @@ impl StreamAudioOutput {
         let stream = self.device.build_output_stream(
             &config,
             move |data: &mut [T], _: &_| {
-                // Ring buffer contains interleaved stereo at device sample rate.
-                // Map stereo pairs to the output device's channel layout.
                 let stereo_frames_needed = data.len() / ch;
 
                 for frame_idx in 0..stereo_frames_needed {
-                    // Pop a stereo pair (L, R) from the ring
                     let left = ring_consumer.pop().unwrap_or(0.0).clamp(-0.99, 0.99);
                     let right = ring_consumer.pop().unwrap_or(0.0).clamp(-0.99, 0.99);
 
                     let base = frame_idx * ch;
                     match ch {
                         1 => {
-                            // Mono output: mix L+R
                             data[base] = T::from_sample((left + right) * 0.5);
                         }
                         2 => {
-                            // Stereo: direct mapping
                             data[base] = T::from_sample(left);
                             data[base + 1] = T::from_sample(right);
                         }
                         _ => {
-                            // Surround / multi-channel: L on ch0, R on ch1,
-                            // silence on the rest. Good enough — proper
-                            // surround upmixing is a future concern.
                             data[base] = T::from_sample(left);
                             if base + 1 < data.len() {
                                 data[base + 1] = T::from_sample(right);
@@ -314,8 +306,12 @@ impl StreamAudioOutput {
         device_sample_rate: u32,
         volume: Arc<AtomicU32>,
         is_muted: Arc<AtomicBool>,
+        voice_energy: Option<Arc<AtomicU32>>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            // ── Voice canceller ─────────────────────────────────────────
+            let mut canceller = voice_energy.as_ref().map(|_| VoiceCanceller::new());
+
             // ── Resampler (stereo, 48kHz → device rate) ─────────────────
             let needs_resample = device_sample_rate != OPUS_SAMPLE_RATE;
             let mut resampler: Option<Async<f32>> = None;
@@ -351,13 +347,11 @@ impl StreamAudioOutput {
                     }
                     Err(e) => {
                         error!("Failed to create stream audio resampler: {e}");
-                        // Fall through — will play at wrong rate, better than silence
                     }
                 }
             }
 
             // ── Accumulator for interleaved stereo at 48kHz ─────────────
-            // We accumulate decoded frames and feed the resampler in chunks.
             let mut accum_l: Vec<f32> = Vec::with_capacity(4096);
             let mut accum_r: Vec<f32> = Vec::with_capacity(4096);
 
@@ -365,18 +359,29 @@ impl StreamAudioOutput {
             let mut next_tick = Instant::now();
 
             info!(
-                "🔊🎬 Stream audio worker started (device {}Hz, resample={})",
-                device_sample_rate, needs_resample
+                "🔊🎬 Stream audio worker started (device {}Hz, resample={}, voice_cancel={})",
+                device_sample_rate,
+                needs_resample,
+                voice_energy.is_some(),
             );
 
             while !should_stop.load(Ordering::Relaxed) {
-                // ── Drain decoded frames into accumulator ────────────────
-                let mut received = false;
-                while let Ok(frame) = frame_rx.try_recv() {
-                    received = true;
+                // ── Update voice canceller ───────────────────────────────
+                if let (Some(ref energy), Some(ref mut cancel)) = (&voice_energy, &mut canceller) {
+                    let rms = f32::from_bits(energy.load(Ordering::Relaxed));
+                    cancel.update_voice_energy(rms);
+                }
 
+                // ── Drain decoded frames into accumulator ────────────────
+                while let Ok(mut frame) = frame_rx.try_recv() {
                     if is_muted.load(Ordering::Relaxed) {
                         continue; // drain but discard
+                    }
+
+                    // Apply voice cancellation BEFORE volume (so the
+                    // canceller sees the raw signal, not user-scaled).
+                    if let Some(ref mut cancel) = canceller {
+                        cancel.process(&mut frame.samples);
                     }
 
                     // Apply volume
@@ -411,15 +416,18 @@ impl StreamAudioOutput {
                         if current_fill >= high_wm {
                             break; // ring is full enough
                         }
+
                         resampler_input[0].clear();
                         resampler_input[0].extend_from_slice(&accum_l[..needed]);
                         resampler_input[1].clear();
                         resampler_input[1].extend_from_slice(&accum_r[..needed]);
                         accum_l.drain(..needed);
                         accum_r.drain(..needed);
+
                         let expected = r.output_frames_next();
                         resampler_output[0].resize(expected, 0.0);
                         resampler_output[1].resize(expected, 0.0);
+
                         let in_adapter =
                             match SequentialSliceOfVecs::new(&resampler_input, 2, needed) {
                                 Ok(a) => a,
@@ -439,9 +447,9 @@ impl StreamAudioOutput {
                                 continue;
                             }
                         };
+
                         match r.process_into_buffer(&in_adapter, &mut out_adapter, None) {
                             Ok((_in_len, out_len)) => {
-                                // Push interleaved stereo into ring
                                 for i in 0..out_len {
                                     if ring_producer.push(resampler_output[0][i]).is_err() {
                                         break;
@@ -475,8 +483,6 @@ impl StreamAudioOutput {
                 }
 
                 // ── Pace at 5ms intervals ───────────────────────────────
-                // Faster than voice output (10ms) because we want to keep
-                // the ring buffer topped up for smooth stereo playback.
                 next_tick += Duration::from_millis(5);
                 let now = Instant::now();
                 if next_tick > now {
