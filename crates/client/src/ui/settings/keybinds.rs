@@ -333,6 +333,7 @@ fn fltk_key_to_code_string(key: enums::Key) -> Option<String> {
         enums::Key::Down => return Some("ArrowDown".into()),
         enums::Key::Left => return Some("ArrowLeft".into()),
         enums::Key::Right => return Some("ArrowRight".into()),
+        enums::Key::KPEnter => return Some("NumpadEnter".into()),
         _ => {}
     }
 
@@ -357,6 +358,21 @@ fn fltk_key_to_code_string(key: enums::Key) -> Option<String> {
             '`' => return Some("Backquote".into()),
             _ => {}
         }
+    }
+    let kp_base = enums::Key::KP.bits();
+    let kp_last = enums::Key::KPLast.bits();
+    if bits > kp_base && bits <= kp_last {
+        let kp_char = (bits - kp_base) as u8 as char;
+        let name = match kp_char {
+            '0'..='9' => format!("Numpad{kp_char}"),
+            '+' => "NumpadAdd".into(),
+            '-' => "NumpadSubtract".into(),
+            '*' => "NumpadMultiply".into(),
+            '/' => "NumpadDivide".into(),
+            '.' => "NumpadDecimal".into(),
+            _ => return None,
+        };
+        return Some(name);
     }
 
     None
