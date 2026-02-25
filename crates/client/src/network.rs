@@ -20,10 +20,13 @@ use core::AudioPacket;
 
 use protocol::{
     ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL,
-    RELIABLE_VIDEO_BUFFER_BYTES, RELIABLE_VIDEO_CHANNEL, ServerMessage, VIDEO_BUFFER_BYTES,
-    VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL,
-    VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION,
-    VideoHeader, VoiceHeader, pack_video_frame, parse_video_header, video_payload,
+    RELIABLE_VIDEO_BUFFER_BYTES, RELIABLE_VIDEO_CHANNEL, ServerMessage,
+    SYSTEM_AUDIO_BUFFER_BYTES, SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET,
+    VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VOICE_BATCH_THRESHOLD,
+    VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET,
+    VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoHeader, VoiceHeader,
+    pack_system_audio, pack_video_frame, parse_system_audio_header, parse_video_header,
+    system_audio_payload, video_payload,
 };
 
 use crate::screen::ScreenControl;
@@ -93,6 +96,12 @@ pub enum NetworkMessage {
         is_keyframe: bool,
         width: u32,
         height: u32,
+        data: Vec<u8>,
+    },
+    /// An inbound system audio packet (routed to screen thread, not app).
+    SystemAudioData {
+        client_id: u64,
+        seq: u32,
         data: Vec<u8>,
     },
 }
@@ -237,7 +246,13 @@ impl NetworkClient {
             },
         };
 
-        let channels = vec![reliable, voice, video, reliable_video];
+        let system_audio = ChannelConfig {
+            channel_id: SYSTEM_AUDIO_CHANNEL,
+            max_memory_usage_bytes: SYSTEM_AUDIO_BUFFER_BYTES,
+            send_type: SendType::Unreliable,
+        };
+
+        let channels = vec![reliable, voice, video, reliable_video, system_audio];
 
         let connection_config = ConnectionConfig {
             available_bytes_per_tick: 60_000,
@@ -304,6 +319,7 @@ impl NetworkClient {
         self.process_reliable_messages();
         self.process_voice_messages();
         self.process_video_messages();
+        self.process_system_audio_messages();
 
         if let Err(e) = self.transport.send_packets(&mut self.client) {
             self.message_queue
@@ -532,6 +548,29 @@ impl NetworkClient {
         });
     }
 
+    // ── System audio channel ────────────────────────────────────────
+
+    fn process_system_audio_messages(&mut self) {
+        while let Some(message) = self.client.receive_message(SYSTEM_AUDIO_CHANNEL) {
+            self.process_system_audio_packet(&message);
+        }
+    }
+
+    fn process_system_audio_packet(&mut self, message: &[u8]) {
+        let Some(hdr) = parse_system_audio_header(message) else {
+            return;
+        };
+        let Some(payload) = system_audio_payload(message) else {
+            return;
+        };
+
+        self.message_queue.push(NetworkMessage::SystemAudioData {
+            client_id: hdr.client_id,
+            seq: hdr.seq,
+            data: payload.to_vec(),
+        });
+    }
+
     // ── Outbound messages ───────────────────────────────────────────
 
     pub fn flush_voice_packet(&mut self) {
@@ -630,6 +669,23 @@ impl NetworkClient {
             VIDEO_CHANNEL
         };
         self.client.send_message(channel, buf);
+    }
+
+    /// Send an encoded system audio (Opus stereo) packet.
+    pub fn send_system_audio(
+        &mut self,
+        our_client_id: u64,
+        seq: u32,
+        channels: u8,
+        duration_ms: u16,
+        opus_data: &[u8],
+    ) {
+        let buf = pack_system_audio(our_client_id, seq, channels, duration_ms, opus_data);
+        if buf.len() > SYSTEM_AUDIO_MTU_BUDGET {
+            warn!("System audio packet too large: {} bytes, dropping", buf.len());
+            return;
+        }
+        self.client.send_message(SYSTEM_AUDIO_CHANNEL, buf);
     }
 
     /// Send screen share signaling on the reliable channel.
@@ -731,6 +787,13 @@ pub enum NetworkControl {
         is_keyframe: bool,
         width: u16,
         height: u16,
+        data: Vec<u8>,
+    },
+    /// Send an Opus stereo system audio packet on the system audio channel.
+    SendSystemAudio {
+        seq: u32,
+        channels: u8,
+        duration_ms: u16,
         data: Vec<u8>,
     },
     /// Subscribe to a remote user's screen share stream.
@@ -890,6 +953,22 @@ fn run_network_loop(
                             );
                         }
                     }
+                    NetworkControl::SendSystemAudio {
+                        seq,
+                        channels,
+                        duration_ms,
+                        data,
+                    } => {
+                        if let Some(c) = &mut client {
+                            c.send_system_audio(
+                                c.client_id(),
+                                seq,
+                                channels,
+                                duration_ms,
+                                &data,
+                            );
+                        }
+                    }
                     NetworkControl::SubscribeScreen { target_id } => {
                         if let Some(c) = &mut client {
                             c.send_subscribe_screen(target_id);
@@ -955,6 +1034,19 @@ fn run_network_loop(
                                 "📺 Screen channel full, dropped frame seq={seq} keyframe={is_keyframe}"
                             );
                         }
+                    }
+
+                    // System audio → screen thread (hot path, bypass app)
+                    NetworkMessage::SystemAudioData {
+                        client_id,
+                        seq,
+                        data,
+                    } => {
+                        let _ = screen_tx.try_send(ScreenControl::IncomingSystemAudio {
+                            client_id,
+                            seq,
+                            data,
+                        });
                     }
 
                     // Screen share signaling → screen thread + app

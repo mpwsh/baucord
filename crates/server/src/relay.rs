@@ -9,8 +9,9 @@ use renet::{ClientId, RenetServer};
 use std::collections::{HashMap, HashSet};
 
 use protocol::{
-    VIDEO_MTU_BUDGET, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET,
-    VOICE_PROTOCOL_VERSION, VideoHeader, VoiceHeader, parse_video_header,
+    SYSTEM_AUDIO_MTU_BUDGET, SYSTEM_AUDIO_PROTOCOL_VERSION, SystemAudioHeader, VIDEO_MTU_BUDGET,
+    VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION,
+    VideoHeader, VoiceHeader, parse_system_audio_header, parse_video_header,
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -207,6 +208,14 @@ pub struct VideoStats {
     pub packets_dropped_not_sharing: u64,
     pub keyframes_relayed: u64,
     pub bytes_relayed: u64,
+    // System audio stats
+    pub sys_audio_received: u64,
+    pub sys_audio_forwarded: u64,
+    pub sys_audio_dropped_malformed: u64,
+    pub sys_audio_dropped_oversize: u64,
+    pub sys_audio_dropped_not_sharing: u64,
+    pub sys_audio_dropped_no_subscribers: u64,
+    pub sys_audio_bytes_relayed: u64,
 }
 
 pub struct VideoRelay {
@@ -402,10 +411,99 @@ impl VideoRelay {
         );
     }
 
+    // ── System audio relay (called every tick) ──────────────────────
+
+    /// Read system audio packets from all clients on the system audio
+    /// channel and forward to the same subscribers as video.
+    pub fn process_system_audio(&mut self, server: &mut RenetServer, system_audio_channel_id: u8) {
+        let clients: Vec<ClientId> = server.clients_id();
+
+        for client_id in &clients {
+            while let Some(message) = server.receive_message(*client_id, system_audio_channel_id) {
+                self.relay_system_audio_packet(
+                    server,
+                    *client_id,
+                    message,
+                    system_audio_channel_id,
+                );
+            }
+        }
+    }
+
+    fn relay_system_audio_packet(
+        &mut self,
+        server: &mut RenetServer,
+        client_id: ClientId,
+        message: bytes::Bytes,
+        system_audio_channel_id: u8,
+    ) {
+        self.stats.sys_audio_received += 1;
+
+        // Validate header size
+        if message.len() < SystemAudioHeader::SIZE {
+            self.stats.sys_audio_dropped_malformed += 1;
+            return;
+        }
+
+        if message.len() > SYSTEM_AUDIO_MTU_BUDGET {
+            self.stats.sys_audio_dropped_oversize += 1;
+            warn!(
+                "Dropping oversize system audio packet: {} bytes from {client_id}",
+                message.len(),
+            );
+            return;
+        }
+
+        let Some(hdr) = parse_system_audio_header(&message) else {
+            self.stats.sys_audio_dropped_malformed += 1;
+            return;
+        };
+
+        // Verify payload length matches header
+        if SystemAudioHeader::SIZE + hdr.data_len as usize > message.len() {
+            self.stats.sys_audio_dropped_malformed += 1;
+            return;
+        }
+
+        // Only relay if sender is actually sharing
+        if !self.sharers.contains_key(&client_id) {
+            self.stats.sys_audio_dropped_not_sharing += 1;
+            return;
+        }
+
+        // Get subscriber list (same as video)
+        let Some(subs) = self.subscribers.get(&client_id) else {
+            self.stats.sys_audio_dropped_no_subscribers += 1;
+            return;
+        };
+
+        if subs.is_empty() {
+            self.stats.sys_audio_dropped_no_subscribers += 1;
+            return;
+        }
+
+        // Forward to each subscriber on the same unreliable channel
+        let msg_len = message.len();
+        let mut sent_count = 0u64;
+
+        for viewer_id in subs {
+            if server.is_connected(*viewer_id) {
+                server.send_message(*viewer_id, system_audio_channel_id, message.clone());
+                sent_count += 1;
+            }
+        }
+
+        self.stats.sys_audio_forwarded += 1;
+        self.stats.sys_audio_bytes_relayed += msg_len as u64 * sent_count;
+    }
+
     #[allow(clippy::cast_precision_loss)]
     pub fn print_stats(&self) {
-        if self.stats.packets_received == 0 && self.sharers.is_empty() {
-            return; // don't print video stats if never used
+        if self.stats.packets_received == 0
+            && self.stats.sys_audio_received == 0
+            && self.sharers.is_empty()
+        {
+            return; // don't print stats if never used
         }
 
         info!(
@@ -425,5 +523,27 @@ impl VideoRelay {
             self.sharers.len(),
             self.subscribers.values().map(|s| s.len()).sum::<usize>(),
         );
+
+        if self.stats.sys_audio_received > 0 {
+            info!(
+                "System audio — RX: {}, FWD: {}, relayed: {:.2} MB",
+                self.stats.sys_audio_received,
+                self.stats.sys_audio_forwarded,
+                self.stats.sys_audio_bytes_relayed as f64 / 1_048_576.0,
+            );
+            let dropped = self.stats.sys_audio_dropped_malformed
+                + self.stats.sys_audio_dropped_oversize
+                + self.stats.sys_audio_dropped_not_sharing
+                + self.stats.sys_audio_dropped_no_subscribers;
+            if dropped > 0 {
+                info!(
+                    "System audio drops — no subs: {}, not sharing: {}, malformed: {}, oversize: {}",
+                    self.stats.sys_audio_dropped_no_subscribers,
+                    self.stats.sys_audio_dropped_not_sharing,
+                    self.stats.sys_audio_dropped_malformed,
+                    self.stats.sys_audio_dropped_oversize,
+                );
+            }
+        }
     }
 }

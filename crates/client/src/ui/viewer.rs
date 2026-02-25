@@ -264,10 +264,18 @@ impl ViewerWindow {
             }
         });
 
-        // Mute — dummy toggle for now (visual only)
+        // Mute — toggle stream audio mute
         let mut mute_clone = mute_btn.clone();
+        let cid_mute = client_id;
+        let s_mute = sender;
+        let mut is_stream_muted = false;
         mute_btn.clone().set_callback(move |_| {
-            if mute_clone.label() == "Mute" {
+            is_stream_muted = !is_stream_muted;
+            s_mute.send(UiMessage::MuteStream {
+                client_id: cid_mute,
+                muted: is_stream_muted,
+            });
+            if is_stream_muted {
                 mute_clone.set_label("Unmute");
                 mute_clone.set_color(theme::DANGER);
                 mute_clone.set_label_color(enums::Color::White);
@@ -278,9 +286,14 @@ impl ViewerWindow {
             }
         });
 
-        // Volume — dummy for now (no audio channel yet)
-        volume_slider.set_callback(move |_s| {
-            // Will send UiMessage::SetViewerVolume once audio is wired
+        // Volume — stream audio volume control
+        let cid_vol = client_id;
+        let s_vol = sender;
+        volume_slider.set_callback(move |s| {
+            s_vol.send(UiMessage::SetStreamVolume {
+                client_id: cid_vol,
+                volume: s.value() as f32,
+            });
         });
 
         Self {

@@ -5,6 +5,9 @@
 //
 // Sender side: capture → encode → NetworkControl::SendVideoFrame
 // Receiver side: incoming H.264 frames → per-peer VideoDecoder → RGBA for display
+//
+// System audio: incoming Opus stereo packets are delegated to
+// `core::stream::decoder` — screen.rs never touches Opus directly.
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 
@@ -25,6 +28,10 @@ pub use screencap::{
 
 use crate::network::NetworkControl;
 use crate::voice::WakeFn;
+
+use core::stats::AudioStats;
+use core::stream::decoder::{self as stream_decoder, StreamAudioPacket, StreamDecoder};
+use core::stream::input::SystemAudioCapture;
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -55,6 +62,16 @@ pub enum ScreenControl {
     },
     /// A remote peer stopped sharing — drop their decoder.
     PeerStoppedSharing { client_id: u64 },
+    /// An encoded system audio packet arrived from the network for a remote peer.
+    IncomingSystemAudio {
+        client_id: u64,
+        seq: u32,
+        data: Vec<u8>,
+    },
+    /// Set the stream audio volume for a peer's viewer.
+    SetStreamVolume { client_id: u64, volume: f32 },
+    /// Mute/unmute the stream audio for a peer's viewer.
+    MuteStream { client_id: u64, muted: bool },
     /// Clean shutdown.
     Shutdown,
 }
@@ -174,6 +191,9 @@ struct CaptureState {
     encoder: Box<dyn VideoEncoder + Send>,
     quality: Quality,
     seq: u32,
+    /// System audio capture — started alongside video, sends Opus stereo
+    /// packets to the network. `None` if platform doesn't support it.
+    system_audio: Option<SystemAudioCapture>,
 }
 
 // ── Decoder state for incoming streams ──────────────────────────────────
@@ -191,6 +211,10 @@ struct PeerStream {
     /// lose or reorder packets, and H.264 decoders produce corruption
     /// when reference frames are missing).
     last_seq: Option<u32>,
+    /// Stream audio decoder + playback pipeline for this peer.
+    /// Lazy-initialized on the first system audio packet.
+    /// Owned by the core library — screen.rs just feeds it raw Opus bytes.
+    stream_audio: Option<StreamDecoder>,
 }
 
 // ── Thread loop ─────────────────────────────────────────────────────────
@@ -287,6 +311,18 @@ fn run_screen_loop(
             capture_and_encode(state, &event_tx, &network_tx, &shared);
             let cap_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
 
+            // Drain system audio packets and send to network
+            if let Some(ref sys_audio) = state.system_audio {
+                for pkt in sys_audio.drain_packets() {
+                    let _ = network_tx.try_send(NetworkControl::SendSystemAudio {
+                        seq: pkt.seq,
+                        channels: pkt.channels,
+                        duration_ms: pkt.duration_ms as u16,
+                        data: pkt.data,
+                    });
+                }
+            }
+
             // FIX: advance from previous target, not from now
             next_capture += state.quality.frame_duration();
 
@@ -348,11 +384,30 @@ fn handle_control(
 
             info!("📺 Screen share started: {quality}, monitor {monitor_index}");
 
+            // Start system audio capture (best-effort — non-fatal if unsupported)
+            let system_audio = match SystemAudioCapture::new(Arc::new(AudioStats::new())) {
+                Ok(mut cap) => match cap.start() {
+                    Ok(()) => {
+                        info!("🔊🎤 System audio capture started for screen share");
+                        Some(cap)
+                    }
+                    Err(e) => {
+                        warn!("🔊 System audio capture failed to start: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!("🔊 System audio capture not available: {e}");
+                    None
+                }
+            };
+
             *capture = Some(CaptureState {
                 capturer,
                 encoder,
                 quality,
                 seq: 0,
+                system_audio,
             });
 
             shared.is_sharing.store(true, Ordering::Relaxed);
@@ -417,11 +472,37 @@ fn handle_control(
         }
 
         ScreenControl::PeerStoppedSharing { client_id } => {
+            // Dropping the PeerStream also drops StreamDecoder,
+            // which stops the decode thread + playback pipeline.
             peer_streams.remove(&client_id);
             event_tx
                 .send(ScreenEvent::PeerStoppedSharing { client_id })
                 .ok();
             wake();
+        }
+
+        ScreenControl::IncomingSystemAudio {
+            client_id,
+            seq,
+            data,
+        } => {
+            decode_incoming_system_audio(client_id, seq, data, peer_streams);
+        }
+
+        ScreenControl::SetStreamVolume { client_id, volume } => {
+            if let Some(stream) = peer_streams.get(&client_id) {
+                if let Some(ref audio) = stream.stream_audio {
+                    audio.set_volume(volume);
+                }
+            }
+        }
+
+        ScreenControl::MuteStream { client_id, muted } => {
+            if let Some(stream) = peer_streams.get(&client_id) {
+                if let Some(ref audio) = stream.stream_audio {
+                    audio.set_muted(muted);
+                }
+            }
         }
 
         ScreenControl::Shutdown => {
@@ -463,6 +544,7 @@ fn decode_incoming_frame(
                 height,
                 got_keyframe: false,
                 last_seq: None,
+                stream_audio: None,
             }
         });
 
@@ -652,6 +734,44 @@ fn capture_and_encode(
 
     // Return capture buffer for reuse
     state.capturer.return_buffer(frame.data);
+}
+
+/// Decode an incoming system audio (Opus stereo) packet from a remote peer.
+///
+/// Lazy-initializes the stream decoder on the first packet. The Opus
+/// decoder, PLC, and playback pipeline all live in `core::stream::decoder`
+/// — this function just creates the handle and feeds it raw bytes.
+fn decode_incoming_system_audio(
+    client_id: u64,
+    seq: u32,
+    data: Vec<u8>,
+    peer_streams: &mut HashMap<u64, PeerStream>,
+) {
+    let Some(stream) = peer_streams.get_mut(&client_id) else {
+        // No PeerStream yet — waiting for first video keyframe.
+        // System audio packets that arrive before the first keyframe
+        // are silently dropped.
+        return;
+    };
+
+    // Lazy-init the stream decoder + playback on first system audio packet.
+    if stream.stream_audio.is_none() {
+        match stream_decoder::spawn(None, 1.0) {
+            Ok(decoder) => {
+                info!("🔊🎬 Started stream audio decoder for peer {client_id}");
+                stream.stream_audio = Some(decoder);
+            }
+            Err(e) => {
+                warn!("Failed to create stream audio decoder for peer {client_id}: {e}");
+                return;
+            }
+        }
+    }
+
+    // Feed the raw Opus packet — core library handles decode + PLC + playback.
+    if let Some(ref audio) = stream.stream_audio {
+        audio.send(StreamAudioPacket { data, seq });
+    }
 }
 
 // ── Encoder/decoder factory ─────────────────────────────────────────────

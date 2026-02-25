@@ -1,6 +1,6 @@
 [package]
 name = "core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "core components for baucord"
 
@@ -54,3 +54,4 @@ path = "examples/latency.rs"
 [[example]]
 name = "sounds"
 path = "examples/play.rs"
+

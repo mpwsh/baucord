@@ -24,6 +24,11 @@ pub const VOICE_CHANNEL: u8 = 3;
 pub const VIDEO_CHANNEL: u8 = 4;
 pub const RELIABLE_VIDEO_CHANNEL: u8 = 5; // keyframes only (reliable)
 
+/// Unreliable channel for system audio (Opus stereo) during screen share.
+/// Separate from voice so subscriber routing can mirror the video stream,
+/// and so deafening voice chat doesn't kill stream audio.
+pub const SYSTEM_AUDIO_CHANNEL: u8 = 6;
+
 // ── Buffer sizes ────────────────────────────────────────────────────────
 
 /// Default memory budget for the reliable channel (bytes).
@@ -37,3 +42,10 @@ pub const VOICE_BUFFER_BYTES: usize = 5 * 1024 * 1024; // 5 MB
 /// buffers fragments until reassembly completes.
 pub const VIDEO_BUFFER_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 pub const RELIABLE_VIDEO_BUFFER_BYTES: usize = 5 * 1024 * 1024; // 5 MB
+
+/// Default memory budget for the system audio channel (bytes).
+///
+/// System audio is ~16 KB/s (320-byte Opus frames × 50 packets/sec).
+/// 512 KB gives ~32 seconds of buffering — more than enough for renet's
+/// internal bookkeeping on an unreliable channel.
+pub const SYSTEM_AUDIO_BUFFER_BYTES: usize = 512 * 1024; // 512 KB

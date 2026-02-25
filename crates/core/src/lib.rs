@@ -26,7 +26,8 @@ mod output;
 mod packet;
 mod resampler;
 pub mod sounds;
-mod stats;
+pub mod stats;
+pub mod stream;
 mod vad;
 
 pub use config::{PeerAudioSettings, VoiceChatConfig};

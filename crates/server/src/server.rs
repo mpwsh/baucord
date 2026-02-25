@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
 
-use protocol::{ChatMessage, ClientMessage, RELIABLE_BUFFER_BYTES, ServerMessage};
+use protocol::{
+    ChatMessage, ClientMessage, RELIABLE_BUFFER_BYTES, SYSTEM_AUDIO_BUFFER_BYTES, ServerMessage,
+};
 
 use crate::config::{ChannelSettings, Config};
 use crate::relay::{VideoRelay, VoiceRelay};
@@ -128,7 +130,13 @@ impl ChatServer {
             },
         };
 
-        let configs = vec![reliable, voice, video, reliable_video];
+        let system_audio = ChannelConfig {
+            channel_id: protocol::SYSTEM_AUDIO_CHANNEL,
+            max_memory_usage_bytes: SYSTEM_AUDIO_BUFFER_BYTES,
+            send_type: SendType::Unreliable,
+        };
+
+        let configs = vec![reliable, voice, video, reliable_video, system_audio];
 
         ConnectionConfig {
             available_bytes_per_tick: channels.bytes_per_tick,
@@ -158,6 +166,8 @@ impl ChatServer {
             self.config.channels.video_channel_id,
             self.config.channels.reliable_video_channel_id,
         );
+        self.video
+            .process_system_audio(&mut self.server, protocol::SYSTEM_AUDIO_CHANNEL);
 
         self.transport.send_packets(&mut self.server);
 

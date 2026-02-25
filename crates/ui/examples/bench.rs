@@ -354,4 +354,3 @@ fn main() {
 
     app.run().expect("FLTK event loop failed");
 }
-
