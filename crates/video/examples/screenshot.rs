@@ -4,7 +4,7 @@
 //! cargo run --example screenshot
 //! ```
 
-use screencap::{Quality, capture::ScreenCapturer};
+use video::{Quality, capture::ScreenCapturer};
 use std::time::Instant;
 
 fn main() {

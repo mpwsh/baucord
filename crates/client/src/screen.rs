@@ -26,15 +26,14 @@ use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
-use screencap::buffer::{BufferedPacket, VideoJitterBuffer};
-use screencap::capture::ScreenCapturer;
-pub use screencap::{
+use video::{
     CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
+    buffer::{BufferedPacket, VideoJitterBuffer},
+    capture::ScreenCapturer,
     codec::{FfmpegDecoder, FfmpegEncoder},
 };
 
-use crate::network::NetworkControl;
-use crate::voice::WakeFn;
+use crate::{network::NetworkControl, voice::WakeFn};
 
 use audio::{
     stats::AudioStats,

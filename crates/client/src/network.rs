@@ -19,13 +19,14 @@ use std::time::{Duration, Instant, SystemTime};
 use audio::AudioPacket;
 
 use protocol::{
-    ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL,
+    ChunkReassembler, ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL,
     RELIABLE_VIDEO_BUFFER_BYTES, RELIABLE_VIDEO_CHANNEL, SYSTEM_AUDIO_BUFFER_BYTES,
     SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET, ServerMessage, VIDEO_BUFFER_BYTES,
-    VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL,
-    VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION,
-    VideoHeader, VoiceHeader, pack_system_audio, pack_video_frame, parse_system_audio_header,
-    parse_video_header, system_audio_payload, video_payload,
+    VIDEO_CHANNEL, VIDEO_MTU_BUDGET, VOICE_BATCH_THRESHOLD,
+    VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET,
+    VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoHeader, VoiceHeader, chunk_frame,
+    pack_system_audio, pack_video_frame, parse_system_audio_header, parse_video_header,
+    system_audio_payload, video_payload,
 };
 
 use crate::screen::ScreenControl;
@@ -202,6 +203,7 @@ pub(crate) struct NetworkClient {
     message_queue: Vec<NetworkMessage>,
     last_updated: Instant,
     voice_bundler: VoiceBundler,
+    reassembler: ChunkReassembler,
 
     // Reorder tracking for received voice packets
     expected_seqs: HashMap<u64, u32>,
@@ -288,6 +290,7 @@ impl NetworkClient {
             last_speaking_sent: false,
             last_speaking_instant: Instant::now() - Duration::from_secs(5),
             last_rtt_check: Instant::now(),
+            reassembler: ChunkReassembler::new(),
         })
     }
 
@@ -518,9 +521,22 @@ impl NetworkClient {
     // ── Video channels ──────────────────────────────────────────────
 
     fn process_video_messages(&mut self) {
-        for channel in [RELIABLE_VIDEO_CHANNEL, VIDEO_CHANNEL] {
-            while let Some(message) = self.client.receive_message(channel) {
-                self.process_video_packet(&message);
+        // Reliable channel: keyframes use existing VideoHeader format
+        while let Some(message) = self.client.receive_message(RELIABLE_VIDEO_CHANNEL) {
+            self.process_video_packet(&message);
+        }
+
+        // Unreliable channel: chunks → reassemble → VideoFrame
+        while let Some(message) = self.client.receive_message(VIDEO_CHANNEL) {
+            if let Some(frame) = self.reassembler.push_chunk(&message) {
+                self.message_queue.push(NetworkMessage::VideoFrame {
+                    client_id: frame.client_id,
+                    seq: frame.seq,
+                    is_keyframe: frame.is_keyframe,
+                    width: frame.width as u32,
+                    height: frame.height as u32,
+                    data: frame.data,
+                });
             }
         }
     }
@@ -937,14 +953,18 @@ fn run_network_loop(
                         data,
                     } => {
                         if let Some(c) = &mut client {
-                            c.send_video_frame(
-                                c.client_id(),
-                                seq,
-                                is_keyframe,
-                                width,
-                                height,
-                                &data,
-                            );
+                            if is_keyframe {
+                                // Keyframes: reliable channel, old format (guaranteed delivery,
+                                // fragmentation loss doesn't matter because it retransmits)
+                                c.send_video_frame(c.client_id(), seq, true, width, height, &data);
+                            } else {
+                                // P-frames: chunk and send on unreliable channel
+                                let chunks =
+                                    chunk_frame(c.client_id(), seq, false, width, height, &data);
+                                for chunk in chunks {
+                                    c.client.send_message(VIDEO_CHANNEL, chunk);
+                                }
+                            }
                         }
                     }
                     NetworkControl::SendSystemAudio {

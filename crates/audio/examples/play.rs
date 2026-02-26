@@ -9,7 +9,7 @@
 use std::thread;
 use std::time::Duration;
 
-use core::{SoundType, VoiceChat, VoiceChatConfig};
+use audio::{SoundType, VoiceChat, VoiceChatConfig};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))

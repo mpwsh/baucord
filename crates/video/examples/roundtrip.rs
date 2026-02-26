@@ -1,5 +1,4 @@
-use screencap::capture::ScreenCapturer;
-use screencap::Quality;
+use video::{ Quality, capture::ScreenCapturer};
 use std::time::Instant;
 
 fn main() {
@@ -29,9 +28,9 @@ fn main() {
 
     let (mut encoder, mut decoder) = {
         let enc =
-            screencap::codec::FfmpegEncoder::new(quality).expect("Failed to create ffmpeg encoder");
+            video::codec::FfmpegEncoder::new(quality).expect("Failed to create ffmpeg encoder");
         println!("  Encoder: {}", enc.encoder_name());
-        let dec = screencap::codec::FfmpegDecoder::new().expect("Failed to create ffmpeg decoder");
+        let dec = video::codec::FfmpegDecoder::new().expect("Failed to create ffmpeg decoder");
         (enc, dec)
     };
 

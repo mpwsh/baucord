@@ -9,12 +9,14 @@
 //! cargo run --release --example pipeline_bench -- fhd30 5 1920x1200
 //! ```
 
-use screencap::capture::ScreenCapturer;
-use screencap::codec::{FfmpegDecoder, FfmpegEncoder};
-use screencap::{EncodedFrame, Quality};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use video::{
+    capture::ScreenCapturer,
+    codec::{FfmpegDecoder, FfmpegEncoder},
+    EncodedFrame, Quality,
+};
 
 // ---------------------------------------------------------------------------
 // Stage timings — one per frame

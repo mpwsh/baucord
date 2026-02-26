@@ -16,7 +16,7 @@
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use core::{AudioStats, VoiceChat, VoiceChatConfig};
+use audio::{AudioStats, VoiceChat, VoiceChatConfig};
 
 // ── Tuning constants ────────────────────────────────────────────────────
 

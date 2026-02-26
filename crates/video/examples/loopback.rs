@@ -1,6 +1,6 @@
-use screencap::capture::ScreenCapturer;
-use screencap::codec::{FfmpegDecoder, FfmpegEncoder};
-use screencap::Quality;
+use video::capture::ScreenCapturer;
+use video::codec::{FfmpegDecoder, FfmpegEncoder};
+use video::Quality;
 
 fn main() {
     env_logger::init();

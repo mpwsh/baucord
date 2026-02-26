@@ -19,7 +19,6 @@ pub mod buffer;
 pub mod capture;
 pub mod codec;
 pub mod color;
-pub mod chunk;
 
 use std::fmt;
 

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use fltk::{app, enums, frame, group, prelude::*, window};
 use log::error;
 
-use core::{VoiceChat, VoiceChatConfig};
+use audio::{VoiceChat, VoiceChatConfig};
 use ui::theme;
 use ui::widgets::{controls, labels, layout, meter};
 

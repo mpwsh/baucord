@@ -1,7 +1,5 @@
-use screencap::capture::ScreenCapturer;
-use screencap::codec::FfmpegEncoder;
-use screencap::Quality;
 use std::time::{Duration, Instant};
+use video::{capture::ScreenCapturer, codec::FfmpegEncoder, Quality};
 
 fn main() {
     env_logger::init();
