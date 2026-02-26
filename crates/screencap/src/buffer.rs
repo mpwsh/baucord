@@ -98,6 +98,12 @@ pub struct VideoJitterBuffer {
     /// Maximum packets to hold before evicting. Safety valve against
     /// runaway growth from stalled decoders or network bursts.
     max_depth: u32,
+
+    /// Whether playback has started (first keyframe delivered).
+    /// Once true, stays true for the lifetime of the stream — we never
+    /// re-gate on buffer depth after the initial fill. Recovery from
+    /// gaps is handled by skipping to the next keyframe, not by pausing
+    /// playback to refill.
     playing: bool,
 
     /// Diagnostics.
@@ -146,9 +152,10 @@ impl VideoJitterBuffer {
     /// be fast. Insertion into the BTreeMap is O(log n) with n typically
     /// < 10 packets. No decoding happens here.
     ///
-    /// Keyframes trigger a reset: all older packets are discarded and
-    /// `next_seq` is set to the keyframe's sequence number. This ensures
-    /// the decoder always starts from a clean state.
+    /// Keyframes trigger a reset only when they represent a genuine stream
+    /// recovery (large forward jump in sequence numbers). Regular in-sequence
+    /// keyframes at GOP boundaries are inserted normally without disrupting
+    /// playback — they're just another packet in the buffer.
     pub fn push(&mut self, packet: BufferedPacket) {
         self.stats.packets_received += 1;
 
@@ -164,10 +171,24 @@ impl VideoJitterBuffer {
         if packet.is_keyframe {
             let kf_seq = packet.seq;
 
-            // Only reset if this keyframe is a forward jump (stream recovery).
-            // Normal in-sequence keyframes (every GOP) should NOT purge the buffer.
+            // Determine if this keyframe represents a stream recovery
+            // (significant forward jump) vs a regular GOP keyframe.
+            //
+            // A keyframe is "recovery" only if it jumps far ahead of where
+            // we expect to be. The threshold accounts for normal buffer depth:
+            // packets in the buffer are naturally ahead of next_seq by up to
+            // target_depth packets. A regular GOP keyframe at seq N+30 when
+            // next_seq is N+18 (12 packets buffered) is NOT recovery — it's
+            // just the next keyframe sitting in the buffer as expected.
+            //
+            // We use 2× target_depth as the threshold: anything within that
+            // range is normal buffer operation. Beyond it means real packet
+            // loss or a stream reset.
             let is_recovery = match self.next_seq {
-                Some(next) => is_seq_before(next, kf_seq) && kf_seq.wrapping_sub(next) > 1,
+                Some(next) => {
+                    let gap = kf_seq.wrapping_sub(next);
+                    is_seq_before(next, kf_seq) && gap > self.target_depth * 2 + 1
+                }
                 None => true, // first keyframe ever — always prime
             };
 
@@ -175,7 +196,11 @@ impl VideoJitterBuffer {
                 self.pending.retain(|&seq, _| !is_seq_before(seq, kf_seq));
                 self.next_seq = Some(kf_seq);
                 self.stats.keyframe_resets += 1;
-                self.playing = false; // re-prime after recovery
+                // NOTE: we do NOT reset self.playing here. Once playback has
+                // started, recovery should be seamless — we have a keyframe
+                // ready, so there's no reason to pause and wait for the buffer
+                // to refill. The keyframe will be released immediately by
+                // pull_next() (keyframes bypass depth gating).
             }
 
             if !self.primed {
@@ -217,8 +242,14 @@ impl VideoJitterBuffer {
     ///
     /// Returns `None` if:
     /// - The buffer hasn't been primed (no keyframe yet)
-    /// - The buffer depth hasn't reached the target (still filling)
+    /// - The buffer is in initial fill and hasn't reached target depth
     /// - The next expected packet hasn't arrived yet
+    ///
+    /// The depth gate only applies during the initial fill (before the
+    /// first packet is ever released). Once `playing` is true, packets
+    /// are released as soon as they're available in sequence. This
+    /// prevents the old bug where every GOP keyframe would re-trigger
+    /// the depth gate and freeze playback for hundreds of milliseconds.
     ///
     /// When a gap is detected (expected seq missing but later packets
     /// exist), the buffer skips forward to the next available keyframe
@@ -232,9 +263,9 @@ impl VideoJitterBuffer {
 
         // Check if the next expected packet is available
         if self.pending.contains_key(&next) {
-            // Before releasing, check if we have enough buffer depth.
-            // Skip this check for keyframes — always release immediately
-            // so the decoder can start/recover ASAP.
+            // Depth gating: only applies during initial fill (!playing).
+            // Keyframes always bypass — release immediately so the decoder
+            // can start/recover ASAP.
             let is_keyframe = self
                 .pending
                 .get(&next)
@@ -249,7 +280,7 @@ impl VideoJitterBuffer {
             self.next_seq = Some(next.wrapping_add(1));
             self.stats.packets_delivered += 1;
             self.stats.current_depth = self.pending.len();
-            self.playing = true; // we've started — don't re-gate
+            self.playing = true;
             return Some(packet);
         }
 
@@ -324,6 +355,7 @@ impl VideoJitterBuffer {
         self.pending.clear();
         self.next_seq = None;
         self.primed = false;
+        self.playing = false;
         self.stats.current_depth = 0;
     }
 }
@@ -407,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn target_depth_delays_release() {
+    fn target_depth_delays_initial_release() {
         // 100ms at 30fps ≈ 3 packets
         let mut buf = VideoJitterBuffer::new(100, 30);
 
@@ -416,7 +448,7 @@ mod tests {
         let pkt = buf.pull_next().unwrap();
         assert_eq!(pkt.seq, 0);
 
-        // Delta frames respect depth check
+        // Delta frames respect depth check (during initial fill)
         buf.push(make_packet(1, false));
         assert!(buf.pull_next().is_none(), "depth 1 < target ~3");
 
@@ -430,14 +462,109 @@ mod tests {
     }
 
     #[test]
-    fn keyframe_resets_buffer_state() {
+    fn regular_keyframe_does_not_reset_playing() {
+        // Simulate a full GOP cycle to ensure regular keyframes don't
+        // trigger recovery or re-gate on buffer depth.
+        let mut buf = VideoJitterBuffer::new(100, 30); // target = 3 packets
+
+        // Initial keyframe + fill to start playing
+        buf.push(make_packet(0, true));
+        let _ = buf.pull_next(); // delivers keyframe, playing = true
+
+        buf.push(make_packet(1, false));
+        buf.push(make_packet(2, false));
+        buf.push(make_packet(3, false));
+        // Drain initial fill
+        assert_eq!(buf.pull_next().unwrap().seq, 1);
+        assert_eq!(buf.pull_next().unwrap().seq, 2);
+        assert_eq!(buf.pull_next().unwrap().seq, 3);
+
+        // Simulate steady-state: packets arrive and are consumed, buffer
+        // holds ~3 packets ahead of next_seq.
+        for seq in 4..30u32 {
+            buf.push(make_packet(seq, false));
+            let _ = buf.pull_next();
+        }
+
+        // Regular GOP keyframe arrives at seq 30 while next_seq is ~27-29.
+        // This MUST NOT trigger recovery or reset playing.
+        let resets_before = buf.stats.keyframe_resets;
+        buf.push(make_packet(30, true));
+
+        assert_eq!(
+            buf.stats.keyframe_resets, resets_before,
+            "regular keyframe should not trigger recovery reset"
+        );
+
+        // Next pull should still work immediately (no re-gating)
+        // Drain up to the keyframe
+        while let Some(pkt) = buf.pull_next() {
+            if pkt.seq == 30 {
+                assert!(pkt.is_keyframe);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_recovery_keyframe_does_trigger_reset() {
+        let mut buf = VideoJitterBuffer::new(100, 30); // target = 3 packets
+
+        // Start playing
+        buf.push(make_packet(0, true));
+        let _ = buf.pull_next(); // playing = true
+
+        // Large forward jump: seq 0 → seq 100 (gap of 100, well beyond 2*3+1=7)
+        buf.push(make_packet(100, true));
+        assert_eq!(
+            buf.stats.keyframe_resets, 1,
+            "large jump should trigger recovery"
+        );
+
+        // Recovery keyframe should be immediately available (no re-gating
+        // since playing stays true)
+        let pkt = buf.pull_next().unwrap();
+        assert_eq!(pkt.seq, 100);
+        assert!(pkt.is_keyframe);
+    }
+
+    #[test]
+    fn recovery_does_not_regate_on_depth() {
+        // This is the critical regression test: after recovery, the buffer
+        // should NOT wait for target_depth packets before releasing.
+        let mut buf = VideoJitterBuffer::new(100, 30); // target = 3 packets
+
+        // Start playing
+        buf.push(make_packet(0, true));
+        let _ = buf.pull_next(); // playing = true, next_seq = 1
+
+        // Packets 1-3 keep things going
+        buf.push(make_packet(1, false));
+        let _ = buf.pull_next();
+        buf.push(make_packet(2, false));
+        let _ = buf.pull_next();
+
+        // Big gap: recovery keyframe at 50
+        buf.push(make_packet(50, true));
+        let pkt = buf.pull_next().unwrap();
+        assert_eq!(pkt.seq, 50, "recovery keyframe should release immediately");
+
+        // Delta frame after recovery should also release immediately
+        // (playing is still true, no depth gate)
+        buf.push(make_packet(51, false));
+        let pkt = buf.pull_next().unwrap();
+        assert_eq!(pkt.seq, 51, "post-recovery delta should release without waiting for depth");
+    }
+
+    #[test]
+    fn keyframe_resets_buffer_on_large_gap() {
         let mut buf = VideoJitterBuffer::new(0, 30);
 
         buf.push(make_packet(0, true));
         buf.push(make_packet(1, false));
         buf.push(make_packet(2, false));
 
-        // New keyframe arrives — old packets should be purged
+        // Large forward jump — old packets should be purged
         buf.push(make_packet(10, true));
 
         // Packets 0-2 should be gone, next should be 10

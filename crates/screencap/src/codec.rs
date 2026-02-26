@@ -64,6 +64,7 @@ pub struct FfmpegEncoder {
     /// Reusable packet for receiving encoder output.
     pkt: Packet,
     /// Reusable buffer for collecting encoded NAL data.
+    /// Taken via `std::mem::take` each frame to avoid cloning.
     out_buf: Vec<u8>,
 }
 
@@ -229,7 +230,13 @@ impl FfmpegEncoder {
             .send_frame(&self.yuv_frame)
             .map_err(|e| CodecError::Encode(e.to_string()))?;
 
-        // Collect output packets into reusable buffer
+        // Collect output packets into reusable buffer.
+        // Re-initialize capacity from previous frame's size to avoid
+        // repeated small allocations after the take() below.
+        if self.out_buf.capacity() == 0 {
+            let estimated = self.quality.bitrate() as usize / self.quality.fps() as usize / 8;
+            self.out_buf.reserve(estimated * 2);
+        }
         self.out_buf.clear();
         let mut is_keyframe = false;
         while self.encoder.receive_packet(&mut self.pkt).is_ok() {
@@ -243,8 +250,11 @@ impl FfmpegEncoder {
 
         self.frame_count += 1;
 
+        // Transfer ownership instead of cloning — saves one allocation
+        // per frame (30-60 allocs/sec at typical frame rates). The buffer
+        // is re-allocated with capacity on the next encode() call above.
         Ok(EncodedFrame {
-            data: self.out_buf.clone(),
+            data: std::mem::take(&mut self.out_buf),
             timestamp_ms: frame.timestamp_ms,
             is_keyframe,
         })

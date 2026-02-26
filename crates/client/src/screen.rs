@@ -36,14 +36,20 @@ pub use screencap::{
 use crate::network::NetworkControl;
 use crate::voice::WakeFn;
 
-use audio::{stats::AudioStats,stream::{decoder::{self as stream_decoder, StreamAudioPacket, StreamDecoder}, input::SystemAudioCapture}};
+use audio::{
+    stats::AudioStats,
+    stream::{
+        decoder::{self as stream_decoder, StreamAudioPacket, StreamDecoder},
+        input::SystemAudioCapture,
+    },
+};
 
 /// Default jitter buffer depth for video streams (milliseconds).
 ///
 /// 80ms adds imperceptible latency while absorbing typical keyframe
 /// decode stalls (10-16ms) and minor network jitter. Users can adjust
 /// this at runtime via `ScreenControl::SetBufferDepth`.
-const DEFAULT_BUFFER_DEPTH_MS: u32 = 400;
+const DEFAULT_BUFFER_DEPTH_MS: u32 = 80;
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -626,13 +632,14 @@ fn handle_control(
             }
         }
 
-        ScreenControl::SetBufferDepth { client_id, depth_ms } => {
+        ScreenControl::SetBufferDepth {
+            client_id,
+            depth_ms,
+        } => {
             if let Some(stream) = peer_streams.get_mut(&client_id) {
                 let old = stream.jitter_buffer.target_depth_ms();
                 stream.jitter_buffer.set_target_depth_ms(depth_ms);
-                info!(
-                    "📺 Buffer depth for peer {client_id}: {old}ms → {depth_ms}ms"
-                );
+                info!("📺 Buffer depth for peer {client_id}: {old}ms → {depth_ms}ms");
             }
         }
 

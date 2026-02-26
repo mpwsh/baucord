@@ -162,7 +162,6 @@ impl App {
 
         let handles = crate::ui::splash::show(self.sender);
         self.splash_window = Some(handles.window);
-        
 
         while self.app.wait() {
             // UI messages
@@ -814,10 +813,10 @@ impl App {
         self.show_main_screen();
         self.setup_tray_icon();
         // Sentinel to keep FLTK alive in tray mode
-let mut _sentinel = window::Window::new(-10000, -10000, 1, 1, None);
-_sentinel.end();
-_sentinel.set_border(false);
-_sentinel.show();
+        let mut _sentinel = window::Window::new(-10000, -10000, 1, 1, None);
+        _sentinel.end();
+        _sentinel.set_border(false);
+        _sentinel.show();
 
         // Find our own client ID from the user list
         for (&id, name) in &users {
