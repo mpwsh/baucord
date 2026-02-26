@@ -12,6 +12,8 @@ use protocol::{
     SYSTEM_AUDIO_MTU_BUDGET, SystemAudioHeader, VIDEO_MTU_BUDGET, VOICE_MAX_FRAME_SIZE,
     VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoHeader,
     VoiceHeader, parse_system_audio_header, parse_video_header,
+    // New chunk imports
+    CHUNK_HEADER_SIZE, VIDEO_CHUNK_VERSION, parse_chunk_header,
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -208,6 +210,9 @@ pub struct VideoStats {
     pub packets_dropped_not_sharing: u64,
     pub keyframes_relayed: u64,
     pub bytes_relayed: u64,
+    // Chunk stats
+    pub chunks_received: u64,
+    pub chunks_forwarded: u64,
     // System audio stats
     pub sys_audio_received: u64,
     pub sys_audio_forwarded: u64,
@@ -296,8 +301,11 @@ impl VideoRelay {
     // ── Packet relay (called every tick) ────────────────────────────
 
     /// Read video packets from all clients on both video channels and
-    /// forward to subscribers. Keyframes are relayed on the reliable
-    /// channel, P-frames on the unreliable channel.
+    /// forward to subscribers.
+    ///
+    /// - Reliable channel: keyframes in old `VideoHeader` format.
+    /// - Unreliable channel: chunks in `VideoChunkHeader` format (small
+    ///   messages that don't trigger renet fragmentation).
     pub fn process(
         &mut self,
         server: &mut RenetServer,
@@ -306,30 +314,39 @@ impl VideoRelay {
     ) {
         let clients: Vec<ClientId> = server.clients_id();
 
-        for inbound_channel in [reliable_video_channel_id, video_channel_id] {
-            for client_id in &clients {
-                while let Some(message) = server.receive_message(*client_id, inbound_channel) {
-                    self.relay_video_packet(
-                        server,
-                        *client_id,
-                        message,
-                        &clients,
-                        video_channel_id,
-                        reliable_video_channel_id,
-                    );
-                }
+        // Reliable channel — keyframes in old VideoHeader format
+        for client_id in &clients {
+            while let Some(message) = server.receive_message(*client_id, reliable_video_channel_id)
+            {
+                self.relay_video_packet(
+                    server,
+                    *client_id,
+                    message,
+                    reliable_video_channel_id,
+                );
+            }
+        }
+
+        // Unreliable channel — chunks in VideoChunkHeader format
+        for client_id in &clients {
+            while let Some(message) = server.receive_message(*client_id, video_channel_id) {
+                self.relay_video_chunk(
+                    server,
+                    *client_id,
+                    message,
+                    video_channel_id,
+                );
             }
         }
     }
 
+    /// Relay a keyframe packet (old VideoHeader format) on the reliable channel.
     fn relay_video_packet(
         &mut self,
         server: &mut RenetServer,
         client_id: ClientId,
         message: bytes::Bytes,
-        _clients: &[ClientId],
-        video_channel_id: u8,
-        reliable_video_channel_id: u8,
+        outbound_channel: u8,
     ) {
         self.stats.packets_received += 1;
 
@@ -381,13 +398,6 @@ impl VideoRelay {
             self.stats.keyframes_relayed += 1;
         }
 
-        // Choose outbound channel: keyframes on reliable, P-frames on unreliable
-        let outbound_channel = if is_keyframe {
-            reliable_video_channel_id
-        } else {
-            video_channel_id
-        };
-
         // Forward to each subscriber
         let msg_len = message.len();
         let mut sent_count = 0u64;
@@ -409,6 +419,69 @@ impl VideoRelay {
             sent_count,
             self.stats.packets_forwarded,
         );
+    }
+
+    /// Relay a video chunk (VideoChunkHeader format) on the unreliable channel.
+    ///
+    /// Each chunk is a small (<1.2 KB) self-contained message — no renet
+    /// fragmentation. The server doesn't reassemble; it just validates the
+    /// header and forwards to subscribers. The client reassembles.
+    fn relay_video_chunk(
+        &mut self,
+        server: &mut RenetServer,
+        client_id: ClientId,
+        message: bytes::Bytes,
+        outbound_channel: u8,
+    ) {
+        self.stats.chunks_received += 1;
+
+        // Validate chunk header
+        if message.len() < CHUNK_HEADER_SIZE {
+            self.stats.packets_dropped_malformed += 1;
+            return;
+        }
+
+        let Some(hdr) = parse_chunk_header(&message) else {
+            self.stats.packets_dropped_malformed += 1;
+            return;
+        };
+
+        // Basic sanity: chunk_count > 0, chunk_idx < chunk_count
+        if hdr.chunk_count == 0 || hdr.chunk_idx >= hdr.chunk_count {
+            self.stats.packets_dropped_malformed += 1;
+            return;
+        }
+
+        // Only relay if sender is actually sharing
+        if !self.sharers.contains_key(&client_id) {
+            self.stats.packets_dropped_not_sharing += 1;
+            return;
+        }
+
+        // Get subscriber list
+        let Some(subs) = self.subscribers.get(&client_id) else {
+            self.stats.packets_dropped_no_subscribers += 1;
+            return;
+        };
+
+        if subs.is_empty() {
+            self.stats.packets_dropped_no_subscribers += 1;
+            return;
+        }
+
+        // Forward to each subscriber
+        let msg_len = message.len();
+        let mut sent_count = 0u64;
+
+        for viewer_id in subs {
+            if server.is_connected(*viewer_id) {
+                server.send_message(*viewer_id, outbound_channel, message.clone());
+                sent_count += 1;
+            }
+        }
+
+        self.stats.chunks_forwarded += 1;
+        self.stats.bytes_relayed += msg_len as u64 * sent_count;
     }
 
     // ── System audio relay (called every tick) ──────────────────────
@@ -500,6 +573,7 @@ impl VideoRelay {
     #[allow(clippy::cast_precision_loss)]
     pub fn print_stats(&self) {
         if self.stats.packets_received == 0
+            && self.stats.chunks_received == 0
             && self.stats.sys_audio_received == 0
             && self.sharers.is_empty()
         {
@@ -507,8 +581,12 @@ impl VideoRelay {
         }
 
         info!(
-            "Video packets — RX: {}, FWD: {}, keyframes: {}",
+            "Video — keyframe packets RX: {}, FWD: {}, keyframes: {}",
             self.stats.packets_received, self.stats.packets_forwarded, self.stats.keyframes_relayed,
+        );
+        info!(
+            "Video — chunks RX: {}, FWD: {}",
+            self.stats.chunks_received, self.stats.chunks_forwarded,
         );
         info!(
             "Video drops — no subs: {}, not sharing: {}, malformed: {}, oversize: {}",
