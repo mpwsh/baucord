@@ -566,7 +566,7 @@ fn handle_control(
                 let decoder = create_decoder().expect("decoder creation failed");
                 // Assume 30fps initially; will be refined when Quality is known.
                 // The buffer adapts well even if the FPS guess is off.
-                let jitter_buffer = VideoJitterBuffer::new(DEFAULT_BUFFER_DEPTH_MS, 30);
+                let jitter_buffer = VideoJitterBuffer::new(DEFAULT_BUFFER_DEPTH_MS, 60);
                 PeerStream {
                     decoder,
                     width,
