@@ -4,10 +4,10 @@ version = "0.1.10"
 edition = "2024"
 
 [dependencies]
-audio = { path = "../core", features = ["serde"] }
+audio = { path = "../audio", features = ["serde"] }
 ui = { path = "../ui" }
 protocol = { path = "../protocol" }
-screencap = { path = "../screencap" }
+video = { path = "../video" }
 fltk = { version = "1.5", features = ["fltk-bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
