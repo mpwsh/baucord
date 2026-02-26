@@ -2,7 +2,7 @@
 use renet::ClientId;
 
 /// Result of the background version check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VersionCheckResult {
     /// Remote version is newer.
     UpdateAvailable { remote_version: String },
@@ -10,7 +10,7 @@ pub enum VersionCheckResult {
     UpToDate,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiMessage {
     // ── Connection flow ─────────────────────────────────────────────
     Connect {
@@ -115,8 +115,16 @@ pub enum UiMessage {
         action: crate::config::BindableAction,
         bind: String,
     },
+    /// Viewer buffer depth slider changed.
+    SetBufferDepth {
+        client_id: u64,
+        depth_ms: u32,
+    },
+    /// User clicked "Show" in tray menu — restore the main window.
+    RestoreFromTray,
+    /// User clicked "Quit" in tray menu — actually shut down.
+    QuitFromTray,
 
     // ── Application lifecycle ───────────────────────────────────────
     Shutdown,
 }
-

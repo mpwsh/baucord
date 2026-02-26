@@ -17,8 +17,7 @@ pub const VIDEO_PROTOCOL_VERSION: u8 = 1;
 /// Maximum video packet size (header + H.264 data).
 /// Renet fragments internally, but we cap total size to prevent abuse.
 /// 128 KB accommodates even large keyframes at 1080p.
-/// Bumped to 512
-pub const VIDEO_MTU_BUDGET: usize = 512 * 1024;
+pub const VIDEO_MTU_BUDGET: usize = 300 * 1024;
 
 /// Fixed-layout header for video packets.
 ///

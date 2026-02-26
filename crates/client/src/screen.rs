@@ -4,7 +4,13 @@
 // control/event enums, shared state for UI.
 //
 // Sender side: capture → encode → NetworkControl::SendVideoFrame
-// Receiver side: incoming H.264 frames → per-peer VideoDecoder → RGBA for display
+// Receiver side: incoming H.264 frames → jitter buffer → per-peer VideoDecoder → RGBA for display
+//
+// The jitter buffer decouples packet receipt from decode. Without it,
+// keyframe decode stalls (10-16ms) block the channel drain loop, causing
+// `try_send` drops on the network thread and consistent sequence gaps
+// after every keyframe. With the buffer, packets are pushed in O(log n)
+// and the decoder pulls at its own pace.
 //
 // System audio: incoming Opus stereo packets are delegated to
 // `core::stream::decoder` — screen.rs never touches Opus directly.
@@ -20,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
+use screencap::buffer::{BufferedPacket, VideoJitterBuffer};
 use screencap::capture::ScreenCapturer;
 pub use screencap::{
     CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
@@ -29,9 +36,14 @@ pub use screencap::{
 use crate::network::NetworkControl;
 use crate::voice::WakeFn;
 
-use core::stats::AudioStats;
-use core::stream::decoder::{self as stream_decoder, StreamAudioPacket, StreamDecoder};
-use core::stream::input::SystemAudioCapture;
+use audio::{stats::AudioStats,stream::{decoder::{self as stream_decoder, StreamAudioPacket, StreamDecoder}, input::SystemAudioCapture}};
+
+/// Default jitter buffer depth for video streams (milliseconds).
+///
+/// 80ms adds imperceptible latency while absorbing typical keyframe
+/// decode stalls (10-16ms) and minor network jitter. Users can adjust
+/// this at runtime via `ScreenControl::SetBufferDepth`.
+const DEFAULT_BUFFER_DEPTH_MS: u32 = 400;
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -72,6 +84,9 @@ pub enum ScreenControl {
     SetStreamVolume { client_id: u64, volume: f32 },
     /// Mute/unmute the stream audio for a peer's viewer.
     MuteStream { client_id: u64, muted: bool },
+    /// Adjust the jitter buffer depth for a peer's stream (milliseconds).
+    /// Higher values add latency but absorb more jitter.
+    SetBufferDepth { client_id: u64, depth_ms: u32 },
     /// Clean shutdown.
     Shutdown,
 }
@@ -211,15 +226,9 @@ struct PeerStream {
     decoder: Box<dyn VideoDecoder + Send>,
     width: u32,
     height: u32,
-    /// Whether we've received at least one keyframe for this stream.
-    /// P-frames are silently dropped until the first keyframe arrives,
-    /// preventing the "non-existing PPS 0 referenced" FFmpeg errors.
-    got_keyframe: bool,
-    /// Last successfully processed sequence number for gap detection.
-    /// P-frames with seq gaps > 1 are dropped (unreliable channel may
-    /// lose or reorder packets, and H.264 decoders produce corruption
-    /// when reference frames are missing).
-    last_seq: Option<u32>,
+    /// Jitter buffer for this peer's video stream. Holds encoded packets
+    /// and releases them in sequence order at a controlled rate.
+    jitter_buffer: VideoJitterBuffer,
     /// Stream audio decoder + playback pipeline for this peer.
     /// Lazy-initialized on the first system audio packet.
     /// Owned by the core library — screen.rs just feeds it raw Opus bytes.
@@ -268,9 +277,11 @@ fn run_screen_loop(
             }
         } else if is_viewing {
             // ── Viewing mode ────────────────────────────────────────
-            // Block on channel — wake INSTANTLY when a frame arrives.
-            // No timeout = no scheduler delay = full framerate.
-            match control_rx.recv() {
+            // Use a short timeout instead of blocking recv() so we can
+            // drain the jitter buffer even when no new packets arrive.
+            // 4ms gives ~250Hz drain rate — fast enough for 60fps with
+            // headroom, while keeping CPU usage negligible.
+            match control_rx.recv_timeout(Duration::from_millis(4)) {
                 Ok(ctrl) => handle_control(
                     ctrl,
                     &mut capture,
@@ -282,6 +293,7 @@ fn run_screen_loop(
                     &mut running,
                     &voice_energy,
                 ),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
         } else {
@@ -303,7 +315,10 @@ fn run_screen_loop(
             }
         }
 
-        // Drain ALL pending messages
+        // Drain ALL pending control messages. This is critical: each
+        // IncomingVideoFrame now just pushes into the jitter buffer
+        // (nanoseconds), so we can drain hundreds of pending packets
+        // without blocking.
         while let Ok(ctrl) = control_rx.try_recv() {
             handle_control(
                 ctrl,
@@ -318,12 +333,17 @@ fn run_screen_loop(
             );
         }
 
+        // ── Drain jitter buffers → decode → emit ────────────────────
+        // Pull packets from each peer's jitter buffer and decode them.
+        // This runs AFTER the channel drain, so all newly arrived packets
+        // are in the buffer before we start decoding.
+        drain_and_decode(&mut peer_streams, &event_tx, &wake);
+
         if let Some(state) = &mut capture
             && Instant::now() >= next_capture
         {
             let cap_start = Instant::now();
             capture_and_encode(state, &network_tx, &shared);
-            let cap_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
 
             // Drain system audio packets and send to network
             if let Some(ref sys_audio) = state.system_audio {
@@ -345,6 +365,7 @@ fn run_screen_loop(
                 next_capture = Instant::now();
             }
 
+            let cap_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
             log::debug!(
                 "📊 ENCODE seq={} {cap_ms:.1}ms (budget {:.1}ms)",
                 state.seq,
@@ -356,6 +377,76 @@ fn run_screen_loop(
     shared.is_sharing.store(false, Ordering::Relaxed);
     info!("📺 Screen thread stopped");
 }
+
+/// Pull packets from each peer's jitter buffer and decode them.
+///
+/// This is the key change from the old architecture: decoding is now
+/// driven by the jitter buffer's readiness, not by packet arrival.
+/// The buffer absorbs decode-time jitter so keyframe stalls don't
+/// cause packet loss.
+fn drain_and_decode(
+    peer_streams: &mut HashMap<u64, PeerStream>,
+    event_tx: &Sender<ScreenEvent>,
+    wake: &WakeFn,
+) {
+    for (&client_id, stream) in peer_streams.iter_mut() {
+        while let Some(packet) = stream.jitter_buffer.pull_next() {
+            let seq = packet.seq;
+            let is_keyframe = packet.is_keyframe;
+            let enqueued_at = packet.arrival_time;
+            let frame_bytes = packet.data.len();
+
+            // Update stream dimensions from keyframes
+            if is_keyframe {
+                stream.width = packet.width;
+                stream.height = packet.height;
+                info!(
+                    "📺 Keyframe #{seq} from peer {client_id}: {frame_bytes} bytes \
+                     (buffer depth: {:.0}ms)",
+                    stream.jitter_buffer.depth_ms()
+                );
+            }
+
+            let encoded = EncodedFrame {
+                data: packet.data,
+                timestamp_ms: 0,
+                is_keyframe,
+            };
+
+            let t0 = Instant::now();
+            match stream.decoder.decode(&encoded) {
+                Ok(Some(decoded)) => {
+                    let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    let decoded_at = Instant::now();
+                    if decode_ms > 10.0 {
+                        log::warn!("Slow decode: {decode_ms:.1}ms for seq {seq}");
+                    }
+                    event_tx
+                        .send(ScreenEvent::FrameReady {
+                            client_id,
+                            width: decoded.width,
+                            height: decoded.height,
+                            rgba: decoded.data,
+                            frame_bytes,
+                            seq,
+                            is_keyframe,
+                            enqueued_at,
+                            decoded_at,
+                        })
+                        .ok();
+                    wake();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Decode error for peer {client_id} seq {seq}: {e}");
+                    // Decode error — the jitter buffer will recover at
+                    // the next keyframe via its gap detection logic.
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_control(
     ctrl: ScreenControl,
@@ -448,6 +539,10 @@ fn handle_control(
             }
         }
 
+        // ── Jitter buffer push (the critical change) ────────────────
+        // Previously this called decode_incoming_frame() which blocked
+        // on FFmpeg decode. Now it just pushes into the BTreeMap —
+        // nanoseconds instead of milliseconds.
         ScreenControl::IncomingVideoFrame {
             client_id,
             seq,
@@ -455,20 +550,31 @@ fn handle_control(
             width,
             height,
             data,
-            enqueued_at,
+            enqueued_at: _,
         } => {
-            decode_incoming_frame(
-                client_id,
+            let stream = peer_streams.entry(client_id).or_insert_with(|| {
+                info!("📺 Created decoder for peer {client_id} ({width}x{height})");
+                let decoder = create_decoder().expect("decoder creation failed");
+                // Assume 30fps initially; will be refined when Quality is known.
+                // The buffer adapts well even if the FPS guess is off.
+                let jitter_buffer = VideoJitterBuffer::new(DEFAULT_BUFFER_DEPTH_MS, 30);
+                PeerStream {
+                    decoder,
+                    width,
+                    height,
+                    jitter_buffer,
+                    stream_audio: None,
+                }
+            });
+
+            stream.jitter_buffer.push(BufferedPacket {
                 seq,
                 is_keyframe,
                 width,
                 height,
                 data,
-                enqueued_at,
-                peer_streams,
-                event_tx,
-                wake,
-            );
+                arrival_time: Instant::now(),
+            });
         }
 
         ScreenControl::PeerStartedSharing {
@@ -520,169 +626,18 @@ fn handle_control(
             }
         }
 
+        ScreenControl::SetBufferDepth { client_id, depth_ms } => {
+            if let Some(stream) = peer_streams.get_mut(&client_id) {
+                let old = stream.jitter_buffer.target_depth_ms();
+                stream.jitter_buffer.set_target_depth_ms(depth_ms);
+                info!(
+                    "📺 Buffer depth for peer {client_id}: {old}ms → {depth_ms}ms"
+                );
+            }
+        }
+
         ScreenControl::Shutdown => {
             *running = false;
-        }
-    }
-}
-
-/// Decode an incoming video frame from a remote peer.
-///
-/// Key invariants:
-/// - P-frames are dropped until the first keyframe (decoder needs SPS/PPS).
-/// - On each keyframe, the decoder is **reset** (fresh instance) to prevent
-///   corruption from compounding across GOP boundaries. This is critical
-///   because the unreliable channel may lose P-frames, leaving the decoder
-///   in an inconsistent reference state.
-/// - P-frames with sequence gaps > 1 are dropped — the missing reference
-///   frame(s) would cause cascading visual corruption.
-#[allow(clippy::too_many_arguments)]
-fn decode_incoming_frame(
-    client_id: u64,
-    seq: u32,
-    is_keyframe: bool,
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
-    enqueued_at: Instant,
-    peer_streams: &mut HashMap<u64, PeerStream>,
-    event_tx: &Sender<ScreenEvent>,
-    wake: &WakeFn,
-) {
-    if is_keyframe {
-        let stream = peer_streams.entry(client_id).or_insert_with(|| {
-            // First keyframe from this peer — create decoder
-            info!("📺 Created decoder for peer {client_id} ({width}x{height})");
-            let decoder = create_decoder().expect("decoder creation failed");
-            PeerStream {
-                decoder,
-                width,
-                height,
-                got_keyframe: false,
-                last_seq: None,
-                stream_audio: None,
-            }
-        });
-
-        stream.width = width;
-        stream.height = height;
-        stream.got_keyframe = true;
-        stream.last_seq = Some(seq);
-
-        info!(
-            "📺 Keyframe #{seq} from peer {client_id}: {} bytes",
-            data.len()
-        );
-
-        let encoded = EncodedFrame {
-            data,
-            timestamp_ms: 0,
-            is_keyframe: true,
-        };
-
-        let t0 = std::time::Instant::now();
-        match stream.decoder.decode(&encoded) {
-            Ok(Some(decoded)) => {
-                let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                let decoded_at = Instant::now();
-                if decode_ms > 10.0 {
-                    log::warn!("Slow decode: {decode_ms:.1}ms for seq {seq}");
-                }
-                event_tx
-                    .send(ScreenEvent::FrameReady {
-                        client_id,
-                        width: decoded.width,
-                        height: decoded.height,
-                        rgba: decoded.data,
-                        frame_bytes: encoded.data.len(),
-                        seq,
-                        is_keyframe,
-                        enqueued_at,
-                        decoded_at,
-                    })
-                    .ok();
-                wake();
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("Decode error for keyframe from peer {client_id} seq {seq}: {e}");
-                stream.got_keyframe = false;
-            }
-        }
-        return;
-    }
-
-    // P-frame path
-    let Some(stream) = peer_streams.get_mut(&client_id) else {
-        // No decoder yet — waiting for first keyframe
-        return;
-    };
-
-    if !stream.got_keyframe {
-        // Still waiting for a keyframe — silently drop
-        return;
-    }
-
-    // Sequence gap detection: small gaps (1-3 frames) are tolerated —
-    // the decoder may produce minor artifacts but recovers at next
-    // keyframe. Large gaps indicate serious packet loss; reset to
-    // avoid compounding corruption.
-    if let Some(last) = stream.last_seq {
-        let gap = seq.wrapping_sub(last);
-        if gap > 1 && gap < 1000 {
-            // Gap detected
-            if gap > 5 {
-                // Large gap — decoder state is too stale, wait for keyframe
-                warn!(
-                    "Large seq gap for peer {client_id}: expected {}, got {seq} (gap={gap}) — \
-                 dropping until next keyframe",
-                    last.wrapping_add(1)
-                );
-                stream.got_keyframe = false;
-                return;
-            }
-            // Small gap (2-5 frames) — log but let the decoder try.
-            // Worst case: minor artifacts until next keyframe.
-            warn!(
-                "Seq gap for peer {client_id}: expected {}, got {seq} (gap={gap}) — \
-             continuing (minor artifacts possible)",
-                last.wrapping_add(1)
-            );
-        }
-    }
-
-    stream.last_seq = Some(seq);
-
-    let encoded = EncodedFrame {
-        data,
-        timestamp_ms: 0,
-        is_keyframe: false,
-    };
-
-    match stream.decoder.decode(&encoded) {
-        Ok(Some(decoded)) => {
-            let decoded_at = Instant::now();
-            event_tx
-                .send(ScreenEvent::FrameReady {
-                    client_id,
-                    width: decoded.width,
-                    height: decoded.height,
-                    rgba: decoded.data,
-                    frame_bytes: encoded.data.len(),
-                    seq,
-                    is_keyframe: false,
-                    enqueued_at,
-                    decoded_at,
-                })
-                .ok();
-            wake();
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!("Decode error for peer {client_id} seq {seq}: {e}");
-            // Decode error likely means corrupted reference state —
-            // wait for the next keyframe to recover.
-            stream.got_keyframe = false;
         }
     }
 }

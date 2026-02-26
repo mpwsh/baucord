@@ -16,7 +16,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use core::AudioPacket;
+use audio::AudioPacket;
 
 use protocol::{
     ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL,

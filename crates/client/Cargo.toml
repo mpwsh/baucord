@@ -1,10 +1,10 @@
 [package]
 name = "client"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 
 [dependencies]
-core = { path = "../core", features = ["serde"] }
+audio = { path = "../core", features = ["serde"] }
 ui = { path = "../ui" }
 protocol = { path = "../protocol" }
 screencap = { path = "../screencap" }
@@ -21,6 +21,8 @@ crossbeam-channel = "0.5.15"
 ureq = "3.2.0"
 open = "5.3.3"
 global-hotkey = "0.7"
+trayicon = { git = "https://github.com/mpwsh/trayicon-rs" }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
 winresource = "0.1"

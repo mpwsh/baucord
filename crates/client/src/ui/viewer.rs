@@ -167,6 +167,28 @@ impl ViewerWindow {
         sep2.set_color(theme::SUBTLE);
         toolbar.fixed(&sep2, 1);
 
+        // Buffer depth slider (50-300ms)
+        let mut buffer_slider = valuator::HorNiceSlider::default();
+        buffer_slider.set_minimum(20.0);
+        buffer_slider.set_maximum(300.0);
+        buffer_slider.set_value(80.0); // matches DEFAULT_BUFFER_DEPTH_MS
+        buffer_slider.set_step(10.0, 1);
+        buffer_slider.set_color(theme::BG_TERTIARY);
+        buffer_slider.set_selection_color(theme::ACCENT);
+        toolbar.fixed(&buffer_slider, 100);
+
+        // Label for the slider
+        let mut buf_label = frame::Frame::default().with_label("80ms");
+        buf_label.set_label_color(theme::TEXT_MUTED);
+        buf_label.set_label_size(10);
+        toolbar.fixed(&buf_label, 40);
+
+        // Separator
+        let mut sep2 = frame::Frame::default();
+        sep2.set_frame(enums::FrameType::FlatBox);
+        sep2.set_color(theme::SUBTLE);
+        toolbar.fixed(&sep2, 1);
+
         // Stop Watching button
         let mut stop_btn = controls::button("Stop Watching");
         toolbar.fixed(&stop_btn, 90);
@@ -245,30 +267,38 @@ impl ViewerWindow {
         // ── Callbacks ────────────────────────────────────────────────
 
         // Stop Watching → unsubscribe + close window
-        let cid = client_id;
         let s = sender;
         stop_btn.set_callback(move |_| {
-            s.send(UiMessage::UnwatchPeer { client_id: cid });
+            s.send(UiMessage::UnwatchPeer { client_id });
+        });
+
+        let s_buf = sender;
+        let mut buf_label_clone = buf_label.clone();
+        buffer_slider.set_callback(move |s| {
+            let ms = s.value() as u32;
+            buf_label_clone.set_label(&format!("{ms}ms"));
+            s_buf.send(UiMessage::SetBufferDepth {
+                client_id,
+                depth_ms: ms,
+            });
         });
 
         // Window close → also unsubscribe
-        let cid = client_id;
         wind.set_callback(move |w| {
             if app::event() == enums::Event::Close {
-                sender.send(UiMessage::UnwatchPeer { client_id: cid });
+                sender.send(UiMessage::UnwatchPeer { client_id });
                 w.hide();
             }
         });
 
         // Mute — toggle stream audio mute
         let mut mute_clone = mute_btn.clone();
-        let cid_mute = client_id;
         let s_mute = sender;
         let mut is_stream_muted = false;
         mute_btn.clone().set_callback(move |_| {
             is_stream_muted = !is_stream_muted;
             s_mute.send(UiMessage::MuteStream {
-                client_id: cid_mute,
+                client_id,
                 muted: is_stream_muted,
             });
             if is_stream_muted {
@@ -283,11 +313,10 @@ impl ViewerWindow {
         });
 
         // Volume — stream audio volume control
-        let cid_vol = client_id;
         let s_vol = sender;
         volume_slider.set_callback(move |s| {
             s_vol.send(UiMessage::SetStreamVolume {
-                client_id: cid_vol,
+                client_id,
                 volume: s.value() as f32,
             });
         });

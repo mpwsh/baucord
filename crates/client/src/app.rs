@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use trayicon::{MenuBuilder, TrayIcon, TrayIconBuilder};
 
 use crate::{
     config::{BindableAction, Settings, peer_key},
@@ -24,8 +25,7 @@ use crate::{
     ui::{chat::Chat, messages::UiMessage, sidebar::Sidebar, viewer::ViewerWindow},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
 };
-use core::PeerAudioSettings;
-use core::SoundType;
+use audio::{PeerAudioSettings, SoundType};
 use ui::theme;
 
 // ── Public types ────────────────────────────────────────────────────────
@@ -79,6 +79,7 @@ pub struct App {
     error_frame: Option<frame::Frame>,
     settings_window_open: bool,
     hotkeys: Option<HotkeyManager>,
+    tray_icon: Option<TrayIcon<UiMessage>>,
 }
 
 impl App {
@@ -151,6 +152,7 @@ impl App {
             error_frame: None,
             settings_window_open: false,
             hotkeys: None,
+            tray_icon: None,
         }
     }
 
@@ -160,6 +162,7 @@ impl App {
 
         let handles = crate::ui::splash::show(self.sender);
         self.splash_window = Some(handles.window);
+        
 
         while self.app.wait() {
             // UI messages
@@ -464,6 +467,26 @@ impl App {
                         .ok();
                 }
             }
+            UiMessage::RestoreFromTray => {
+                if let Some(w) = &mut self.main_window {
+                    w.show();
+                }
+            }
+            UiMessage::QuitFromTray => {
+                self.app.quit(); // triggers shutdown() after loop exits
+            }
+            UiMessage::SetBufferDepth {
+                client_id,
+                depth_ms,
+            } => {
+                self.screen
+                    .tx
+                    .send(ScreenControl::SetBufferDepth {
+                        client_id,
+                        depth_ms,
+                    })
+                    .ok();
+            }
             UiMessage::UpdateStreamStats => {
                 if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
                     let frame_bytes = self.screen.shared.last_frame_bytes.load(Ordering::Relaxed);
@@ -754,6 +777,29 @@ impl App {
             frame.set_label("");
         }
     }
+    fn setup_tray_icon(&mut self) {
+        let icon_data: &'static [u8] = include_bytes!("../../../assets/icons/icon.ico");
+        let sender = self.sender;
+
+        let tray = TrayIconBuilder::new()
+            .sender(move |e: &UiMessage| {
+                sender.send(e.clone());
+                fltk::app::awake(); // nudge FLTK loop
+            })
+            .icon_from_buffer(icon_data)
+            .tooltip("baucord")
+            .on_click(UiMessage::RestoreFromTray)
+            .menu(
+                MenuBuilder::new()
+                    .item("Show", UiMessage::RestoreFromTray)
+                    .separator()
+                    .item("Quit", UiMessage::QuitFromTray),
+            )
+            .build()
+            .unwrap();
+
+        self.tray_icon = Some(tray);
+    }
 
     fn handle_init_client(
         &mut self,
@@ -766,6 +812,12 @@ impl App {
         }
 
         self.show_main_screen();
+        self.setup_tray_icon();
+        // Sentinel to keep FLTK alive in tray mode
+let mut _sentinel = window::Window::new(-10000, -10000, 1, 1, None);
+_sentinel.end();
+_sentinel.set_border(false);
+_sentinel.show();
 
         // Find our own client ID from the user list
         for (&id, name) in &users {
@@ -1146,11 +1198,19 @@ impl App {
         main_row.end();
         wind.end();
 
+        /*
         let sender = self.sender;
         wind.set_callback(move |w| {
             if app::event() == enums::Event::Close {
                 sender.send(UiMessage::Shutdown);
                 w.hide();
+            }
+        });*/
+        wind.set_callback(move |w| {
+            if app::event() == enums::Event::Close {
+                w.hide(); // Just hide — don't shutdown
+                // The FLTK app keeps running because other internal
+                // mechanisms (timers, awake) keep the loop alive.
             }
         });
 
@@ -1163,7 +1223,7 @@ impl App {
 
     fn show_settings_window(&mut self) {
         use crate::ui::settings::SettingsWindow;
-        use core::VoiceChat;
+        use audio::VoiceChat;
 
         let input_devices = VoiceChat::list_input_devices()
             .inspect_err(|e| warn!("Failed to list input devices: {e}"))
@@ -1268,6 +1328,7 @@ impl App {
             }
             let _ = done_tx.send(());
         });
+        self.tray_icon.take();
 
         match done_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(()) => info!("Shutdown complete"),

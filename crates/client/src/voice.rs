@@ -19,7 +19,7 @@ use log::info;
 
 use crate::config::Settings;
 use crate::network::NetworkControl;
-use core::{AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig};
+use audio::{AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig};
 
 /// A callback the worker thread invokes to wake the UI event loop.
 /// Injected at construction so this module never imports a UI crate.

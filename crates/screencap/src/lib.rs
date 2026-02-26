@@ -10,15 +10,15 @@
 //! │ Capture │ ──▶ │ Encoder │ ──▶ │ encoded bytes │ ──▶ network / file
 //! └─────────┘     └─────────┘     └──────────────┘
 //!
-//! network / file ──▶ ┌─────────┐ ──▶ ┌────────────┐
-//!                    │ Decoder │     │ RGBA frame  │ ──▶ display
-//!                    └─────────┘     └────────────┘
+//! network ──▶ ┌──────────────┐ ──▶ ┌─────────┐ ──▶ ┌────────────┐
+//!             │ JitterBuffer │     │ Decoder │     │ RGBA frame  │ ──▶ display
+//!             └──────────────┘     └─────────┘     └────────────┘
 //! ```
 
+pub mod buffer;
 pub mod capture;
-pub mod color;
-
 pub mod codec;
+pub mod color;
 
 use std::fmt;
 

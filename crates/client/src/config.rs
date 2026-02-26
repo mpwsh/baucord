@@ -6,7 +6,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-use core::PeerAudioSettings;
+use audio::PeerAudioSettings;
 
 /// Stable hash key for per-peer audio settings.
 pub fn peer_key(username: &str) -> String {
