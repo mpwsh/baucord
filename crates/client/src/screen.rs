@@ -402,8 +402,14 @@ fn drain_and_decode(
             let enqueued_at = packet.arrival_time;
             let frame_bytes = packet.data.len();
 
-            // Update stream dimensions from keyframes
             if is_keyframe {
+                // Flush decoder before every keyframe. Since we're only
+                // receiving keyframes right now (delta frames lost in
+                // transit), every keyframe is effectively a recovery point.
+                // Even when deltas start arriving, flushing on keyframes
+                // is cheap and guarantees no corruption carryover.
+                stream.decoder.flush();
+
                 stream.width = packet.width;
                 stream.height = packet.height;
                 info!(
@@ -445,8 +451,6 @@ fn drain_and_decode(
                 Ok(None) => {}
                 Err(e) => {
                     warn!("Decode error for peer {client_id} seq {seq}: {e}");
-                    // Decode error — the jitter buffer will recover at
-                    // the next keyframe via its gap detection logic.
                 }
             }
         }

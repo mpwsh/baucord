@@ -119,8 +119,8 @@ impl FfmpegEncoder {
             encoder,
             quality,
             frame_count: 0,
-            // keyframe_interval: (quality.fps() * 2) as i64,
-            keyframe_interval: quality.fps() as i64,
+            keyframe_interval: (quality.fps() * 2) as i64,
+            //keyframe_interval: quality.fps() as i64,
             force_next_keyframe: false,
             sws_ctx: None,
             sws_src_w: 0,
@@ -432,6 +432,15 @@ impl VideoDecoder for FfmpegDecoder {
 
     fn return_buffer(&mut self, buf: Vec<u8>) {
         self.return_buffer(buf);
+    }
+    fn flush(&mut self) {
+        // Calls avcodec_flush_buffers — clears internal reference frames
+        // so the next keyframe decodes from a clean state.
+        self.decoder.flush();
+        // Also drop the SWS context — the next keyframe might have
+        // different dimensions after a stream reset.
+        self.sws_ctx = None;
+        self.rgba_frame = None;
     }
 }
 

@@ -251,7 +251,7 @@ impl NetworkClient {
         let channels = vec![reliable, voice, video, reliable_video, system_audio];
 
         let connection_config = ConnectionConfig {
-            available_bytes_per_tick: 120_000,
+            available_bytes_per_tick: 300_000,
             server_channels_config: channels.clone(),
             client_channels_config: channels,
         };
