@@ -2,9 +2,9 @@ name: Build and Release
 on:
   release:
     types: [published]
-  push:
-    branches:
-      - "chunk"
+  #push:
+  #  branches:
+  #    - "chunk"
 jobs:
   build:
     strategy:
