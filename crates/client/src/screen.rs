@@ -18,8 +18,8 @@
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,7 +69,6 @@ pub enum ScreenControl {
         width: u32,
         height: u32,
         data: Vec<u8>,
-        enqueued_at: Instant,
     },
     /// A remote peer started sharing — prepare a decoder.
     PeerStartedSharing {
@@ -143,6 +142,8 @@ pub struct SharedScreenState {
     pub last_encode_us: Arc<AtomicU32>,
     /// Capture time of the last frame in microseconds.
     pub last_capture_us: Arc<AtomicU32>,
+    /// Selected quality by streamer
+    pub current_quality: Arc<Mutex<Option<Quality>>>,
 }
 
 impl SharedScreenState {
@@ -153,6 +154,7 @@ impl SharedScreenState {
             last_frame_bytes: Arc::new(AtomicU32::new(0)),
             last_encode_us: Arc::new(AtomicU32::new(0)),
             last_capture_us: Arc::new(AtomicU32::new(0)),
+            current_quality: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -542,6 +544,7 @@ fn handle_control(
             if capture.take().is_some() {
                 shared.is_sharing.store(false, Ordering::Relaxed);
                 let _ = network_tx.send(NetworkControl::ScreenShareStop);
+                *shared.current_quality.lock().unwrap() = None;
                 event_tx.send(ScreenEvent::SharingStopped).ok();
                 wake();
                 info!("📺 Screen share stopped");
@@ -559,7 +562,6 @@ fn handle_control(
             width,
             height,
             data,
-            enqueued_at: _,
         } => {
             let stream = peer_streams.entry(client_id).or_insert_with(|| {
                 info!("📺 Created decoder for peer {client_id} ({width}x{height})");

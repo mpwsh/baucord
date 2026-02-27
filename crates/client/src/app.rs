@@ -22,7 +22,7 @@ use crate::{
     hotkeys::HotkeyManager,
     network::{NetworkControl, NetworkMessage, NetworkThreadHandle},
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
-    ui::{chat::Chat, messages::UiMessage, sidebar::Sidebar, viewer::ViewerWindow},
+    ui::{chat::Chat, messages::UiMessage, screenshare, sidebar::Sidebar, viewer::ViewerWindow},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
 };
 use audio::{PeerAudioSettings, SoundType};
@@ -450,20 +450,24 @@ impl App {
 
     fn handle_ui_message(&mut self, msg: UiMessage) {
         match msg {
+            UiMessage::StartScreenShare {
+                quality,
+                monitor_index,
+            } => {
+                self.screen
+                    .tx
+                    .send(ScreenControl::StartSharing {
+                        quality,
+                        monitor_index,
+                    })
+                    .ok();
+            }
             // ── Screen share buttons ────────────────────────────────
             UiMessage::ToggleScreenShare => {
                 if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                    // Button is in "Stop Sharing" state — stop.
                     self.screen.tx.send(ScreenControl::StopSharing).ok();
-                } else {
-                    // Start sharing: primary monitor, 720p30.
-                    self.screen
-                        .tx
-                        .send(ScreenControl::StartSharing {
-                            quality: video::Quality::HD30,
-                            monitor_index: 0,
-                        })
-                        .ok();
+                } else if let Some(ref main_win) = self.main_window {
+                    screenshare::show(self.sender, main_win);
                 }
             }
             UiMessage::RestoreFromTray => {
@@ -492,11 +496,17 @@ impl App {
                     let encode_us = self.screen.shared.last_encode_us.load(Ordering::Relaxed);
                     let avg_kb = frame_bytes as f32 / 1024.0;
                     let encode_ms = encode_us as f32 / 1000.0;
+                    let quality_str = self
+                        .screen
+                        .shared
+                        .current_quality
+                        .lock()
+                        .unwrap()
+                        .map(|q| q.to_string())
+                        .unwrap_or_else(|| "Unknown".into());
                     if let Some(sidebar) = &mut self.sidebar {
-                        sidebar.update_stream_stats(Some(("720p 60fps", avg_kb, encode_ms)));
+                        sidebar.update_stream_stats(Some((&quality_str, avg_kb, encode_ms)));
                     }
-                } else if let Some(sidebar) = &mut self.sidebar {
-                    sidebar.update_stream_stats(None);
                 }
             }
             UiMessage::WatchPeer { client_id } => {
@@ -963,21 +973,10 @@ impl App {
         }
     }
     fn handle_toggle_screenshare(&mut self) {
-        if self
-            .screen
-            .shared
-            .is_sharing
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
             self.screen.tx.send(ScreenControl::StopSharing).ok();
-        } else {
-            self.screen
-                .tx
-                .send(ScreenControl::StartSharing {
-                    quality: video::Quality::HD30,
-                    monitor_index: 0,
-                })
-                .ok();
+        } else if let Some(ref main_win) = self.main_window {
+            screenshare::show(self.sender, main_win);
         }
     }
 
@@ -1076,9 +1075,11 @@ impl App {
 
     /// Shared teardown for both user-initiated and server-initiated disconnects.
     fn teardown_connection(&mut self) {
-          log::warn!("DIAG teardown_connection called, is_sharing={}, connected={}",
-        self.screen.shared.is_sharing.load(Ordering::Relaxed),
-        self.connected);
+        log::warn!(
+            "DIAG teardown_connection called, is_sharing={}, connected={}",
+            self.screen.shared.is_sharing.load(Ordering::Relaxed),
+            self.connected
+        );
         self.connected = false;
         self.is_testing_mic = false;
         self.voice.tx.send(VoiceControl::Stop).ok();

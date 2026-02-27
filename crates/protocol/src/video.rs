@@ -168,15 +168,15 @@ pub fn pack_video_frame(
         let payload = &data[start..end];
 
         let mut buf = Vec::with_capacity(VIDEO_HEADER_SIZE + payload.len());
-        buf.push(VIDEO_PROTOCOL_VERSION);                    // 0
-        buf.push(flags);                                     // 1
-        buf.push(i as u8);                                   // 2: chunk_idx
-        buf.push(chunk_count as u8);                         // 3: chunk_count
-        buf.extend_from_slice(&client_id.to_le_bytes());     // 4..12
-        buf.extend_from_slice(&seq.to_le_bytes());           // 12..16
-        buf.extend_from_slice(&width.to_le_bytes());         // 16..18
-        buf.extend_from_slice(&height.to_le_bytes());        // 18..20
-        buf.extend_from_slice(payload);                      // 20..
+        buf.push(VIDEO_PROTOCOL_VERSION); // 0
+        buf.push(flags); // 1
+        buf.push(i as u8); // 2: chunk_idx
+        buf.push(chunk_count as u8); // 3: chunk_count
+        buf.extend_from_slice(&client_id.to_le_bytes()); // 4..12
+        buf.extend_from_slice(&seq.to_le_bytes()); // 12..16
+        buf.extend_from_slice(&width.to_le_bytes()); // 16..18
+        buf.extend_from_slice(&height.to_le_bytes()); // 18..20
+        buf.extend_from_slice(payload); // 20..
 
         chunks.push(buf);
     }
@@ -534,3 +534,4 @@ mod tests {
         assert_eq!(hdr.chunk_count, 1);
     }
 }
+

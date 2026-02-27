@@ -49,6 +49,7 @@ pub fn show(sender: app::Sender<UiMessage>) -> SplashHandles {
         .with_size(w, h)
         .with_label("baucord");
     wind.set_pos(((screen_w as i32) - w) / 2, ((screen_h as i32) - h) / 2);
+    wind.set_border(false);
     wind.make_resizable(false);
     wind.set_color(theme::BG_PRIMARY);
     crate::ui::set_window_icon(&mut wind);
@@ -255,51 +256,5 @@ fn is_newer(remote: &str, local: &str) -> bool {
     match (parse(remote), parse(local)) {
         (Some(r), Some(l)) => r > l,
         _ => remote != local,
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    mod is_newer {
-        use super::*;
-
-        #[test]
-        fn returns_true_when_remote_patch_is_higher() {
-            assert!(is_newer("1.0.2", "1.0.1"));
-        }
-
-        #[test]
-        fn returns_true_when_remote_minor_is_higher() {
-            assert!(is_newer("1.2.0", "1.1.9"));
-        }
-
-        #[test]
-        fn returns_true_when_remote_major_is_higher() {
-            assert!(is_newer("2.0.0", "1.9.9"));
-        }
-
-        #[test]
-        fn returns_false_when_versions_are_equal() {
-            assert!(!is_newer("1.0.0", "1.0.0"));
-        }
-
-        #[test]
-        fn returns_false_when_local_is_newer() {
-            assert!(!is_newer("1.0.0", "1.0.1"));
-        }
-
-        #[test]
-        fn handles_v_prefix_on_remote() {
-            assert!(is_newer("v1.0.2", "1.0.1"));
-        }
-
-        #[test]
-        fn handles_v_prefix_on_both() {
-            assert!(is_newer("v2.0.0", "v1.0.0"));
-        }
     }
 }

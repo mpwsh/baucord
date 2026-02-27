@@ -19,7 +19,12 @@ use std::time::{Duration, Instant, SystemTime};
 use audio::AudioPacket;
 
 use protocol::{
-    ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL, SYSTEM_AUDIO_BUFFER_BYTES, SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET, ServerMessage, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoReassembler, VoiceHeader, pack_system_audio, pack_video_frame, parse_system_audio_header, system_audio_payload
+    ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL, SYSTEM_AUDIO_BUFFER_BYTES,
+    SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET, ServerMessage, VIDEO_BUFFER_BYTES,
+    VIDEO_CHANNEL, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE,
+    VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoReassembler,
+    VoiceHeader, pack_system_audio, pack_video_frame, parse_system_audio_header,
+    system_audio_payload,
 };
 
 use crate::screen::ScreenControl;
@@ -888,8 +893,14 @@ fn run_network_loop(
                         data,
                     } => {
                         if let Some(c) = &mut client {
-                            let chunks =
-                                pack_video_frame(c.client_id(), seq, is_keyframe, width, height, &data);
+                            let chunks = pack_video_frame(
+                                c.client_id(),
+                                seq,
+                                is_keyframe,
+                                width,
+                                height,
+                                &data,
+                            );
                             for chunk in chunks {
                                 c.client.send_message(VIDEO_CHANNEL, chunk);
                             }
@@ -964,7 +975,6 @@ fn run_network_loop(
                             width,
                             height,
                             data,
-                            enqueued_at: std::time::Instant::now(),
                         }) {
                             log::warn!(
                                 "📺 Screen channel full, dropped frame seq={seq} keyframe={is_keyframe} - {e}"

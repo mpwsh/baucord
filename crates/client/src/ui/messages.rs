@@ -49,6 +49,11 @@ pub enum UiMessage {
     // ── Screen share ────────────────────────────────────────────────
     /// User clicked "Share Screen" — start capturing.
     ToggleScreenShare,
+    /// User confirmed screen share settings from the popup.
+    StartScreenShare {
+        quality: video::Quality,
+        monitor_index: usize,
+    },
     /// User clicked "Watch Stream" on a peer's context menu.
     WatchPeer {
         client_id: ClientId,
