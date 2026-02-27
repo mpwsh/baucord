@@ -460,7 +460,7 @@ impl App {
                     self.screen
                         .tx
                         .send(ScreenControl::StartSharing {
-                            quality: video::Quality::HD60,
+                            quality: video::Quality::HD30,
                             monitor_index: 0,
                         })
                         .ok();
@@ -974,7 +974,7 @@ impl App {
             self.screen
                 .tx
                 .send(ScreenControl::StartSharing {
-                    quality: video::Quality::HD60,
+                    quality: video::Quality::HD30,
                     monitor_index: 0,
                 })
                 .ok();
@@ -1076,6 +1076,9 @@ impl App {
 
     /// Shared teardown for both user-initiated and server-initiated disconnects.
     fn teardown_connection(&mut self) {
+          log::warn!("DIAG teardown_connection called, is_sharing={}, connected={}",
+        self.screen.shared.is_sharing.load(Ordering::Relaxed),
+        self.connected);
         self.connected = false;
         self.is_testing_mic = false;
         self.voice.tx.send(VoiceControl::Stop).ok();
@@ -1105,6 +1108,7 @@ impl App {
     }
 
     fn handle_disconnect(&mut self) {
+        log::warn!("DIAG handle_disconnect (user-initiated)");
         self.network.tx.send(NetworkControl::Disconnect).ok();
 
         if let Some(chat) = &mut self.chat {

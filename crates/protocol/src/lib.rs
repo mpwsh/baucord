@@ -6,14 +6,12 @@
 
 pub mod audio;
 pub mod channels;
-pub mod chunk;
-pub mod messages;
 pub mod video;
+pub mod messages;
 pub mod voice;
 
 pub use audio::*;
 pub use channels::*;
-pub use chunk::*;
-pub use messages::*;
 pub use video::*;
+pub use messages::*;
 pub use voice::*;

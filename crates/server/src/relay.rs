@@ -9,11 +9,7 @@ use renet::{ClientId, RenetServer};
 use std::collections::{HashMap, HashSet};
 
 use protocol::{
-    SYSTEM_AUDIO_MTU_BUDGET, SystemAudioHeader, VIDEO_MTU_BUDGET, VOICE_MAX_FRAME_SIZE,
-    VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoHeader,
-    VoiceHeader, parse_system_audio_header, parse_video_header,
-    // New chunk imports
-    CHUNK_HEADER_SIZE, VIDEO_CHUNK_VERSION, parse_chunk_header,
+    SYSTEM_AUDIO_MTU_BUDGET, SystemAudioHeader, VIDEO_HEADER_SIZE, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VoiceHeader, parse_system_audio_header, parse_video_header
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -300,125 +296,15 @@ impl VideoRelay {
 
     // ── Packet relay (called every tick) ────────────────────────────
 
-    /// Read video packets from all clients on both video channels and
-    /// forward to subscribers.
-    ///
-    /// - Reliable channel: keyframes in old `VideoHeader` format.
-    /// - Unreliable channel: chunks in `VideoChunkHeader` format (small
-    ///   messages that don't trigger renet fragmentation).
-    pub fn process(
-        &mut self,
-        server: &mut RenetServer,
-        video_channel_id: u8,
-        reliable_video_channel_id: u8,
-    ) {
+    pub fn process(&mut self, server: &mut RenetServer, video_channel_id: u8) {
         let clients: Vec<ClientId> = server.clients_id();
 
-        // Reliable channel — keyframes in old VideoHeader format
-        for client_id in &clients {
-            while let Some(message) = server.receive_message(*client_id, reliable_video_channel_id)
-            {
-                self.relay_video_packet(
-                    server,
-                    *client_id,
-                    message,
-                    reliable_video_channel_id,
-                );
-            }
-        }
-
-        // Unreliable channel — chunks in VideoChunkHeader format
+        // All video arrives as chunks on the unreliable channel
         for client_id in &clients {
             while let Some(message) = server.receive_message(*client_id, video_channel_id) {
-                self.relay_video_chunk(
-                    server,
-                    *client_id,
-                    message,
-                    video_channel_id,
-                );
+                self.relay_video_chunk(server, *client_id, message, video_channel_id);
             }
         }
-    }
-
-    /// Relay a keyframe packet (old VideoHeader format) on the reliable channel.
-    fn relay_video_packet(
-        &mut self,
-        server: &mut RenetServer,
-        client_id: ClientId,
-        message: bytes::Bytes,
-        outbound_channel: u8,
-    ) {
-        self.stats.packets_received += 1;
-
-        // Validate
-        if message.len() < VideoHeader::SIZE {
-            self.stats.packets_dropped_malformed += 1;
-            return;
-        }
-
-        if message.len() > VIDEO_MTU_BUDGET {
-            self.stats.packets_dropped_oversize += 1;
-            warn!(
-                "Dropping oversize video packet: {} bytes from {client_id}",
-                message.len(),
-            );
-            return;
-        }
-
-        let Some(hdr) = parse_video_header(&message) else {
-            self.stats.packets_dropped_malformed += 1;
-            return;
-        };
-
-        // Verify payload length matches header
-        if VideoHeader::SIZE + hdr.data_len as usize > message.len() {
-            self.stats.packets_dropped_malformed += 1;
-            return;
-        }
-
-        // Only relay if sender is actually sharing
-        if !self.sharers.contains_key(&client_id) {
-            self.stats.packets_dropped_not_sharing += 1;
-            return;
-        }
-
-        // Get subscriber list
-        let Some(subs) = self.subscribers.get(&client_id) else {
-            self.stats.packets_dropped_no_subscribers += 1;
-            return;
-        };
-
-        if subs.is_empty() {
-            self.stats.packets_dropped_no_subscribers += 1;
-            return;
-        }
-
-        let is_keyframe = hdr.flags & VideoHeader::FLAG_KEYFRAME != 0;
-        if is_keyframe {
-            self.stats.keyframes_relayed += 1;
-        }
-
-        // Forward to each subscriber
-        let msg_len = message.len();
-        let mut sent_count = 0u64;
-
-        for viewer_id in subs {
-            if server.is_connected(*viewer_id) {
-                server.send_message(*viewer_id, outbound_channel, message.clone());
-                sent_count += 1;
-            }
-        }
-
-        self.stats.packets_forwarded += 1;
-        self.stats.bytes_relayed += msg_len as u64 * sent_count;
-        log::debug!(
-            "📊 relay seq={} {}frame {} bytes → {} subs (total_fwd={})",
-            hdr.seq,
-            if is_keyframe { "key" } else { "p-" },
-            msg_len,
-            sent_count,
-            self.stats.packets_forwarded,
-        );
     }
 
     /// Relay a video chunk (VideoChunkHeader format) on the unreliable channel.
@@ -436,12 +322,12 @@ impl VideoRelay {
         self.stats.chunks_received += 1;
 
         // Validate chunk header
-        if message.len() < CHUNK_HEADER_SIZE {
+        if message.len() < VIDEO_HEADER_SIZE {
             self.stats.packets_dropped_malformed += 1;
             return;
         }
 
-        let Some(hdr) = parse_chunk_header(&message) else {
+        let Some(hdr) = parse_video_header(&message) else {
             self.stats.packets_dropped_malformed += 1;
             return;
         };

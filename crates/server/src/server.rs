@@ -164,7 +164,6 @@ impl ChatServer {
         self.video.process(
             &mut self.server,
             self.config.channels.video_channel_id,
-            self.config.channels.reliable_video_channel_id,
         );
         self.video
             .process_system_audio(&mut self.server, protocol::SYSTEM_AUDIO_CHANNEL);
@@ -354,6 +353,7 @@ impl ChatServer {
             ClientMessage::UnsubscribeScreen { target_id } => {
                 self.video.unsubscribe(client_id, target_id);
             }
+            _ => log::info!("Got unknown message"),
         }
     }
 

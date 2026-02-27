@@ -52,6 +52,9 @@ pub enum ClientMessage {
     /// Unsubscribe from another user's screen share stream.
     /// The server will stop relaying their video frames to us.
     UnsubscribeScreen { target_id: u64 },
+
+    /// Request a keyframe from a specific sharer (viewer → server → sharer).
+    RequestKeyframe { target_id: u64 },
 }
 
 // ── Server → Client ─────────────────────────────────────────────────────
@@ -107,4 +110,6 @@ pub enum ServerMessage {
     /// A client stopped sharing their screen.
     /// Sent to all clients in the room.
     ScreenShareStopped { client_id: ClientId },
+    /// A viewer needs a keyframe from you.
+    KeyframeRequested { viewer_id: ClientId },
 }
