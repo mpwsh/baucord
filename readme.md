@@ -42,6 +42,23 @@ cargo run --bin client --release
 
 Enter a nickname and server address to connect.
 
+### server setup
+
+```
+sudo systemctl disable docker
+sudo systemctl disable containerd
+
+echo "net.core.rmem_max=8388608" | sudo tee -a /etc/sysctl.d/99-udp-tuning.conf
+echo "net.core.rmem_default=1048576" | sudo tee -a /etc/sysctl.d/99-udp-tuning.conf
+sudo sysctl --system
+
+sudo tee /etc/cloud/cloud.cfg.d/99-disable-hotplug.cfg <<EOF
+updates:
+  network:
+    when: []
+EOF
+```
+
 ## What Works
 
 - Voice transmission via VAD (automatic) or push-to-talk (configurable)
@@ -58,4 +75,3 @@ Enter a nickname and server address to connect.
 - No end-to-end encryption
 - Server is a relay with no authentication
 - Screen share viewer creates a new FFmpeg decoder per keyframe (stateless recovery, not optimal for bandwidth)
-
