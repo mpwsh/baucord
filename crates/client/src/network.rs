@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 use audio::AudioPacket;
 
 use protocol::{
-    ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL, RELIABLE_VIDEO_BUFFER_BYTES, RELIABLE_VIDEO_CHANNEL, SYSTEM_AUDIO_BUFFER_BYTES, SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET, ServerMessage, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoReassembler, VoiceHeader, pack_system_audio, pack_video_frame, parse_system_audio_header, system_audio_payload
+    ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL, SYSTEM_AUDIO_BUFFER_BYTES, SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET, ServerMessage, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE, VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoReassembler, VoiceHeader, pack_system_audio, pack_video_frame, parse_system_audio_header, system_audio_payload
 };
 
 use crate::screen::ScreenControl;
@@ -229,21 +229,13 @@ impl NetworkClient {
             send_type: SendType::Unreliable,
         };
 
-        let reliable_video = ChannelConfig {
-            channel_id: RELIABLE_VIDEO_CHANNEL,
-            max_memory_usage_bytes: RELIABLE_VIDEO_BUFFER_BYTES,
-            send_type: SendType::ReliableOrdered {
-                resend_time: Duration::from_millis(200),
-            },
-        };
-
         let system_audio = ChannelConfig {
             channel_id: SYSTEM_AUDIO_CHANNEL,
             max_memory_usage_bytes: SYSTEM_AUDIO_BUFFER_BYTES,
             send_type: SendType::Unreliable,
         };
 
-        let channels = vec![reliable, voice, video, reliable_video, system_audio];
+        let channels = vec![reliable, voice, video, system_audio];
 
         let connection_config = ConnectionConfig {
             available_bytes_per_tick: 300_000,

@@ -19,10 +19,10 @@ pub const RELIABLE_CHANNEL: u8 = 2;
 /// Low latency, no retransmit — late packets are useless for real-time audio.
 pub const VOICE_CHANNEL: u8 = 3;
 
-/// Unreliable channel for video (H.264) packets.
-/// Separate from voice so a large keyframe never delays audio delivery.
+/// Unreliable channel for video (H.264) chunks.
+/// All video — keyframes and P-frames — goes here as application-layer
+/// chunks. Lost keyframes are recovered via PLI on the reliable channel.
 pub const VIDEO_CHANNEL: u8 = 4;
-pub const RELIABLE_VIDEO_CHANNEL: u8 = 5; // keyframes only (reliable)
 
 /// Unreliable channel for system audio (Opus stereo) during screen share.
 /// Separate from voice so subscriber routing can mirror the video stream,
@@ -38,10 +38,7 @@ pub const RELIABLE_BUFFER_BYTES: usize = 1024 * 1024; // 1 MB
 pub const VOICE_BUFFER_BYTES: usize = 5 * 1024 * 1024; // 5 MB
 
 /// Default memory budget for the video channel (bytes).
-/// Larger than voice because H.264 keyframes can be 60+ KB and renet
-/// buffers fragments until reassembly completes.
 pub const VIDEO_BUFFER_BYTES: usize = 10 * 1024 * 1024; // 10 MB
-pub const RELIABLE_VIDEO_BUFFER_BYTES: usize = 5 * 1024 * 1024; // 5 MB
 
 /// Default memory budget for the system audio channel (bytes).
 ///
