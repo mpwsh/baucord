@@ -19,8 +19,6 @@ pub mod buffer;
 pub mod capture;
 pub mod codec;
 
-use std::fmt;
-
 /// Quality preset for screen sharing.
 ///
 /// Each variant encodes resolution, frame rate, and target bitrate tuned
@@ -204,4 +202,3 @@ pub trait VideoDecoder {
     /// the new one, producing horizontal tearing artifacts.
     fn flush(&mut self) {}
 }
-

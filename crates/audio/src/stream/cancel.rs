@@ -60,7 +60,7 @@ impl VoiceCanceller {
             current_gain: 1.0,
             target_gain: 1.0,
             silence_threshold: 0.005,              // ~-40 dBFS
-            min_gain: 0.00,                        // -16 dB duck during speech
+            min_gain: 0.25,                        // -16 dB duck during speech
             smooth_coeff: 1.0 / (48000.0 * 0.005), // 5ms attack/release
         }
     }
@@ -80,10 +80,7 @@ impl VoiceCanceller {
             // Fast attack — voice just started
             self.voice_energy = self.voice_energy * 0.3 + voice_rms * 0.7;
         } else {
-            // Slow release — hold duck after speech ends.
-            // 0.95 coefficient = ~100ms decay at 5ms tick rate.
-            // This covers the typical 50-200ms stream audio delay.
-            self.voice_energy = self.voice_energy * 0.995 + voice_rms * 0.005;
+            self.voice_energy = self.voice_energy * 0.9 + voice_rms * 0.1;
         }
 
         // Compute target gain from voice energy
