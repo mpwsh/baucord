@@ -38,6 +38,7 @@ pub enum NetworkMessage {
     Disconnected(String),
     InitClient {
         users: HashMap<ClientId, String>,
+        client_id: u64,
         server_name: String,
         greeting: String,
     },
@@ -198,6 +199,7 @@ pub(crate) struct NetworkClient {
     client: RenetClient,
     transport: NetcodeClientTransport,
     usernames: HashMap<ClientId, String>,
+    client_id: u64,
     message_queue: Vec<NetworkMessage>,
     last_updated: Instant,
     voice_bundler: VoiceBundler,
@@ -252,6 +254,13 @@ impl NetworkClient {
 
         let socket =
             UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind socket: {e}"))?;
+        let sock_ref = socket2::SockRef::from(&socket);
+        sock_ref
+            .set_send_buffer_size(protocol::UDP_SOCKET_BUFFER_BYTES)
+            .ok();
+        sock_ref
+            .set_recv_buffer_size(protocol::UDP_SOCKET_BUFFER_BYTES)
+            .ok();
 
         let current_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -273,6 +282,7 @@ impl NetworkClient {
             client,
             transport,
             usernames: HashMap::new(),
+            client_id,
             message_queue: vec![NetworkMessage::Connected],
             last_updated: Instant::now(),
             voice_bundler: VoiceBundler::new(),
@@ -313,10 +323,16 @@ impl NetworkClient {
         self.process_system_audio_messages();
 
         if let Err(e) = self.transport.send_packets(&mut self.client) {
-            self.message_queue
-                .push(NetworkMessage::Disconnected(format!(
-                    "Failed to send packets: {e}"
-                )));
+            let is_would_block =
+                e.to_string().contains("10035") || e.to_string().contains("WouldBlock");
+            if is_would_block {
+                log::debug!("send_packets: WouldBlock (OS buffer full), will retry next tick");
+            } else {
+                self.message_queue
+                    .push(NetworkMessage::Disconnected(format!(
+                        "Failed to send packets: {e}"
+                    )));
+            }
         }
 
         // Sample RTT every ~2 seconds
@@ -341,11 +357,14 @@ impl NetworkClient {
             match msg {
                 ServerMessage::InitClient {
                     usernames,
+                    client_id,
                     server_name,
                     greeting,
                 } => {
                     self.usernames = usernames.clone();
+                    self.client_id = client_id;
                     self.message_queue.push(NetworkMessage::InitClient {
+                        client_id,
                         users: usernames,
                         server_name,
                         greeting,

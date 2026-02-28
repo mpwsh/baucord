@@ -6,3 +6,5 @@ baucord.log
 diagnostics*.txt
 .DS_Store
 prompt.md
+baucord.log
+server.log

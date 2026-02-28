@@ -45,16 +45,26 @@ Enter a nickname and server address to connect.
 ### server setup
 
 ```
-sudo systemctl disable docker
-sudo systemctl disable containerd
-
-echo "net.core.wmem_max=7500000" | sudo tee -a /etc/sysctl.conf
-echo "net.core.wmem_default=7500000" | sudo tee -a /etc/sysctl.conf
-echo "net.core.rmem_max=8388608" | sudo tee -a /etc/sysctl.d/99-udp-tuning.conf
-echo "net.core.rmem_default=1048576" | sudo tee -a /etc/sysctl.d/99-udp-tuning.conf
-sudo sysctl --system
-
-sudo tee /etc/cloud/cloud.cfg.d/99-disable-hotplug.cfg <<EOF
+# ── UDP socket buffer tuning ─────────────────────────────────────────
+#
+# Linux defaults are ~208 KB for send and ~1 MB for receive.
+# Baucord relays video keyframes in bursts (~177 KB per keyframe per
+# viewer), so we need larger buffers to avoid silent packet drops
+# that cause netcode timeouts.
+#
+# 8 MB send/recv gives headroom for multiple concurrent streams.
+cat > /etc/sysctl.d/99-baucord-udp.conf <<EOF
+# Baucord — UDP socket buffer tuning for video relay
+net.core.wmem_max     = 8388608
+net.core.wmem_default = 8388608
+net.core.rmem_max     = 8388608
+net.core.rmem_default = 1048576
+EOF
+systemctl disable --now docker 2>/dev/null || true
+systemctl disable --now containerd 2>/dev/null || true
+# ── Disable cloud-init network hotplug ───────────────────────────────
+mkdir -p /etc/cloud/cloud.cfg.d
+cat > /etc/cloud/cloud.cfg.d/99-disable-hotplug.cfg <<EOF
 updates:
   network:
     when: []

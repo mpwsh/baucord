@@ -78,6 +78,7 @@ pub enum ServerMessage {
     /// Contains the current user list, server name, and greeting.
     InitClient {
         usernames: HashMap<ClientId, String>,
+        client_id: u64,
         server_name: String,
         greeting: String,
     },

@@ -55,5 +55,5 @@ pub const SYSTEM_AUDIO_BUFFER_BYTES: usize = 512 * 1024; // 512 KB
 /// OS send buffer fills, `send_to` fails silently and keepalive packets
 /// get dropped, causing netcode timeouts.
 ///
-/// 4 MB gives comfortable headroom for multiple keyframes in flight.
-pub const UDP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024; // 4 MB
+/// 8 MB gives comfortable headroom for multiple keyframes in flight.
+pub const UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024; // 8 MB

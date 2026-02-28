@@ -20,9 +20,23 @@ fn main() {
     #[cfg(not(debug_assertions))]
     {
         use env_logger::Target;
-        use std::fs::File;
+        use std::fs::{self, OpenOptions};
 
-        let log_file = File::create("baucord.log").unwrap();
+        let log_path = "baucord.log";
+
+        // Cap log file at 5 MB — truncate if over
+        if let Ok(meta) = fs::metadata(log_path) {
+            if meta.len() > 5 * 1024 * 1024 {
+                let _ = fs::write(log_path, b"");
+            }
+        }
+
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .unwrap();
+
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .target(Target::Pipe(Box::new(log_file)))
             .init();

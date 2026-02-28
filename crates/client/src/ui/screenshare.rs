@@ -53,7 +53,7 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
 
     let mut quality_choice = menu::Choice::default();
     quality_choice.add_choice("720p 30fps|720p 60fps|1080p 30fps|1080p 60fps");
-    quality_choice.set_value(2); // default FHD30
+    quality_choice.set_value(1); // default HD60
     col.fixed(&quality_choice, 30);
 
     // Spacer
@@ -73,8 +73,8 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
         let quality = match quality_choice.value() {
             0 => Quality::HD30,
             1 => Quality::HD60,
-            //2 => Quality::FHD30,
-            //3 => Quality::FHD60,
+            2 => Quality::FHD30,
+            3 => Quality::FHD60,
             _ => Quality::HD30,
         };
         sender.send(UiMessage::StartScreenShare {

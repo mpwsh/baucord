@@ -218,6 +218,7 @@ impl ChatServer {
         // Send init with the full user list to the new client
         let init_msg = ServerMessage::InitClient {
             usernames: self.usernames.clone(),
+            client_id,
             server_name: self.config.server.name.clone(),
             greeting: self.config.server.greeting_message.clone(),
         };

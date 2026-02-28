@@ -80,6 +80,7 @@ pub struct App {
     settings_window_open: bool,
     hotkeys: Option<HotkeyManager>,
     tray_icon: Option<TrayIcon<UiMessage>>,
+    sentinel_window: Option<window::Window>,
 }
 
 impl App {
@@ -153,6 +154,7 @@ impl App {
             settings_window_open: false,
             hotkeys: None,
             tray_icon: None,
+            sentinel_window: None,
         }
     }
 
@@ -383,10 +385,11 @@ impl App {
             }
             NetworkMessage::InitClient {
                 users,
+                client_id,
                 server_name,
                 greeting,
             } => {
-                self.handle_init_client(users, server_name, greeting);
+                self.handle_init_client(client_id, users, server_name, greeting);
             }
             NetworkMessage::UserJoined {
                 client_id,
@@ -807,6 +810,7 @@ impl App {
 
     fn handle_init_client(
         &mut self,
+        client_id: u64,
         users: HashMap<renet::ClientId, String>,
         server_name: String,
         greeting: String,
@@ -817,15 +821,15 @@ impl App {
 
         self.show_main_screen();
         self.setup_tray_icon();
-        // Sentinel to keep FLTK alive in tray mode
-        let mut _sentinel = window::Window::new(-10000, -10000, 1, 1, None);
-        _sentinel.end();
-        _sentinel.set_border(false);
-        _sentinel.show();
 
-        // Find our own client ID from the user list
+        let mut sentinel = window::Window::new(-10000, -10000, 1, 1, None);
+        sentinel.end();
+        sentinel.set_border(false);
+        sentinel.show();
+        self.sentinel_window = Some(sentinel);
+        
+        self.our_client_id = Some(client_id);
         for (&id, name) in &users {
-            let is_us = name == &self.settings.user.nickname;
             self.users.insert(
                 id,
                 UserState {
@@ -842,9 +846,6 @@ impl App {
                     is_self_deafened: false,
                 },
             );
-            if is_us {
-                self.our_client_id = Some(id);
-            }
         }
 
         // Start voice engine
@@ -1075,6 +1076,8 @@ impl App {
             self.screen.shared.is_sharing.load(Ordering::Relaxed),
             self.connected
         );
+           
+    log::warn!("DIAG: backtrace:\n{}", std::backtrace::Backtrace::force_capture());
         self.connected = false;
         self.is_testing_mic = false;
         self.voice.tx.send(VoiceControl::Stop).ok();
@@ -1116,6 +1119,8 @@ impl App {
     }
 
     fn handle_disconnect_event(&mut self, reason: &str) {
+            log::warn!("DIAG handle_disconnect_event reason=\"{reason}\"");
+
         if let Some(chat) = &mut self.chat {
             chat.handle_disconnected(reason.to_string());
         }

@@ -6,7 +6,10 @@ mod config;
 mod relay;
 mod server;
 use config::Config;
+use env_logger::{Builder, Target};
 use server::ChatServer;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -45,7 +48,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.server.port = port;
     }
 
-    env_logger::Builder::new()
+    let log_path = "server.log";
+
+    // Cap log file at 5 MB
+    if let Ok(meta) = fs::metadata(log_path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            let _ = fs::write(log_path, b"");
+        }
+    }
+
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let log_file = std::sync::Mutex::new(log_file);
+
+    Builder::new()
         .filter_level(
             config
                 .logging
@@ -53,6 +71,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()
                 .unwrap_or(log::LevelFilter::Info),
         )
+        .format(move |buf, record| {
+            let line = format!(
+                "[{} {} {}] {}\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.target(),
+                record.args()
+            );
+            // Write to stderr (terminal)
+            eprint!("{line}");
+            // Write to file
+            if let Ok(mut f) = log_file.lock() {
+                let _ = f.write_all(line.as_bytes());
+            }
+            Ok(())
+        })
         .init();
 
     info!("Starting {}", config.server.name);
