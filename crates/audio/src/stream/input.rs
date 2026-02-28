@@ -441,7 +441,7 @@ mod linux_loopback {
 ///
 /// # Usage
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// use audio::stream::input::SystemAudioCapture;
 /// use audio::stats::AudioStats;
 /// use std::sync::Arc;

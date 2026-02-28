@@ -55,6 +55,19 @@ pub struct VoiceChatConfig {
     ///
     /// Adjustable at runtime via [`VoiceChat::set_gate_threshold`](crate::VoiceChat::set_gate_threshold).
     pub gate_threshold: f32,
+    /// Enable dynamic range compression. Default: `true`.
+    ///
+    /// Tames loud peaks (shouts, mic bumps) so they don't sound harsh,
+    /// especially when multiple people talk at once.
+    pub compressor_enabled: bool,
+    /// Enable automatic gain control. Default: `true`.
+    /// When enabled, mic input is automatically normalized to a consistent
+    /// level regardless of mic sensitivity or distance.
+    pub agc_enabled: bool,
+
+    /// AGC target loudness (RMS, 0.01–0.5). Default: `0.10`.
+    /// Higher = louder output. 0.10 ≈ -20 dBFS, good for voice chat.
+    pub agc_target_rms: f32,
 }
 
 impl Default for VoiceChatConfig {
@@ -66,6 +79,9 @@ impl Default for VoiceChatConfig {
             input_gain: 1.0,
             output_gain: 0.4,
             gate_threshold: 0.012,
+            compressor_enabled: true,
+            agc_enabled: true, 
+            agc_target_rms: 0.10,
         }
     }
 }
@@ -90,4 +106,3 @@ impl Default for PeerAudioSettings {
         }
     }
 }
-

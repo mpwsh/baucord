@@ -4,10 +4,11 @@
 //! then resamples from 48 kHz to whatever the device wants.
 
 use crate::config::PeerAudioSettings;
-use crate::jitter_buffer::{AdaptiveJitterBuffer, DecodedFrame};
+use crate::processor::limiter::Limiter;
 use crate::resampler::build_output_resampler;
 use crate::sounds::{SoundBank, SoundType};
 use crate::stats::AudioStats;
+use crate::transport::jitter_buffer::{AdaptiveJitterBuffer, DecodedFrame};
 use crate::OPUS_SAMPLE_RATE;
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
@@ -85,7 +86,8 @@ impl AudioOutput {
         );
 
         // Ring buffer: 200ms at device rate, mono
-        let ring_size = ((sample_rate as usize) * 50) / 1000;
+        let ring_size = ((sample_rate as usize) * 200) / 1000;
+
         let ring_size = ring_size.max(9600);
         let (ring_producer, ring_consumer) = RingBuffer::new(ring_size);
 
@@ -263,13 +265,14 @@ impl AudioOutput {
             let high_wm = ring_capacity * 85 / 100;
             const HOP: usize = 480;
             let mut hop_buf = vec![0.0f32; HOP];
+            let mut resample_accum : Vec<f32> = Vec::with_capacity(2048);
+            let mut output_limiter = Limiter::new();
             let mut next_tick = Instant::now();
 
             debug!(
                 "Output worker started (device {}Hz, resample={})",
                 device_sample_rate, needs_resample
             );
-
             while !should_stop.load(Ordering::Relaxed) {
                 // Drain ALL decoded audio into jitter buffer.
                 // At 30+ peers, each 10ms tick can produce 30 frames —
@@ -331,55 +334,59 @@ impl AudioOutput {
                     // Apply master output gain (always — notifications
                     // need gain even when deafened).
                     let gain = f32::from_bits(output_gain.load(Ordering::Relaxed));
+                    output_limiter.process_samples(&mut hop_buf);
                     if (gain - 1.0).abs() > f32::EPSILON {
                         for s in hop_buf.iter_mut() {
                             *s = (*s * gain).clamp(-0.99, 0.99);
                         }
                     }
 
-                    // Resample 48 kHz → device rate, then push to ring
+
                     if let Some(ref mut r) = resampler {
-                        let needed = r.input_frames_next();
-                        resampler_input[0].clear();
-                        if hop_buf.len() >= needed {
-                            resampler_input[0].extend_from_slice(&hop_buf[..needed]);
-                        } else {
-                            resampler_input[0].extend_from_slice(&hop_buf);
-                            resampler_input[0].resize(needed, 0.0);
-                        }
+                        resample_accum.extend_from_slice(&hop_buf);
 
-                        let expected = r.output_frames_next();
-                        resampler_output[0].resize(expected, 0.0);
+                        while resample_accum.len() >= r.input_frames_next() {
+                            let needed = r.input_frames_next();
+                            resampler_input[0].clear();
+                            resampler_input[0].extend_from_slice(&resample_accum[..needed]);
+                            resample_accum.drain(..needed);
 
-                        let in_adapter =
-                            match SequentialSliceOfVecs::new(&resampler_input, 1, needed) {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    error!("Output resampler adapter error: {e}");
-                                    continue;
-                                }
-                            };
-                        let mut out_adapter = match SequentialSliceOfVecs::new_mut(
-                            &mut resampler_output,
-                            1,
-                            expected,
-                        ) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                error!("Output resampler output adapter error: {e}");
-                                continue;
-                            }
-                        };
+                            let expected = r.output_frames_next();
+                            resampler_output[0].resize(expected, 0.0);
 
-                        match r.process_into_buffer(&in_adapter, &mut out_adapter, None) {
-                            Ok((_in_len, _out_len)) => {
-                                for &s in &resampler_output[0][..expected] {
-                                    if ring_producer.push(s).is_err() {
+                            let in_adapter =
+                                match SequentialSliceOfVecs::new(&resampler_input, 1, needed) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        error!("Output resampler adapter error: {e}");
                                         break;
                                     }
+                                };
+                            let mut out_adapter = match SequentialSliceOfVecs::new_mut(
+                                &mut resampler_output,
+                                1,
+                                expected,
+                            ) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("Output resampler output adapter error: {e}");
+                                    break;
+                                }
+                            };
+
+                            match r.process_into_buffer(&in_adapter, &mut out_adapter, None) {
+                                Ok((_in_len, out_len)) => {
+                                    for &s in &resampler_output[0][..out_len] {
+                                        if ring_producer.push(s).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Output resampler error: {e}");
+                                    break;
                                 }
                             }
-                            Err(e) => error!("Output resampler error: {}", e),
                         }
                     } else {
                         for &s in &hop_buf {

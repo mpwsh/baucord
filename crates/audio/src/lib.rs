@@ -2,49 +2,58 @@
 //!
 //! Low-latency voice chat engine with noise suppression.
 //!
-//! Pipeline: capture → gain → resample → denoise → gate → VAD gate → Opus encode → network
-//!           network → Opus decode (+ FEC/PLC) → jitter buffer → gain → resample → playback
+//! ## Input pipeline (processor chain)
+//!
+//! ```text
+//! capture → resample → denoise → meter → gate → compressor → AGC → gain → clamp → meter → VAD → encode
+//! ```
+//!
+//! ## Output pipeline
+//!
+//! ```text
+//! network → decode (+ FEC/PLC) → jitter buffer → gain → resample → playback
+//! ```
 //!
 //! ## Device compatibility
+//!
 //! The engine accepts whatever sample rate and channel count the OS gives us
 //! via `default_input_config()` / `default_output_config()`. Bluetooth headphones,
 //! USB mics, audio interfaces — they all just work. We resample to 48 kHz internally.
 //!
 //! ## Scaling
-//! Decoding is parallelized across a worker pool (dispatched by peer SSRC),
+//!
+//! Decoding is parallelised across a worker pool (dispatched by peer SSRC),
 //! allowing 30+ simultaneous speakers without garbling or starvation.
 
 mod config;
 mod decoder;
-mod denoise;
 mod encoder;
-pub mod gate;
 mod input;
-mod jitter_buffer;
-pub mod limiter;
+mod input_config;
 mod output;
-mod packet;
+pub mod processor;
 mod resampler;
 pub mod sounds;
 pub mod stats;
 pub mod stream;
-mod vad;
+pub mod transport;
 
 pub use config::{PeerAudioSettings, VoiceChatConfig};
-pub use packet::AudioPacket;
 pub use sounds::SoundType;
 pub use stats::AudioStats;
+pub use transport::{jitter_buffer::DecodedFrame, packet::AudioPacket};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use log::{error,info};
+use log::{error, info};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use input::AudioInput;
-use jitter_buffer::DecodedFrame;
 use output::AudioOutput;
+
+use crate::input_config::InputConfig;
 
 /// Internal pipeline sample rate (Opus native).
 pub const OPUS_SAMPLE_RATE: u32 = 48_000;
@@ -65,39 +74,26 @@ const DEFAULT_MAX_PEERS: usize = 32;
 pub struct VoiceChat {
     input: Option<AudioInput>,
     output: Option<AudioOutput>,
-
-    // ── Channels (each side stored separately, owned by who uses it) ────
-    /// Input worker → encoder thread.
+    input_config: Arc<InputConfig>,
+    // ── Channels (each side stored separately, owned by who uses it) ─
     audio_to_encoder_tx: Sender<Vec<f32>>,
-
-    /// Encoder thread → external consumer (voice.rs polls this).
     encoder_to_network_rx: Receiver<AudioPacket>,
-
-    /// External → decoder dispatcher.
     network_to_decoder_tx: Sender<AudioPacket>,
-
-    /// Decoder workers → output worker (jitter buffer).
     decoder_to_audio_tx: Sender<DecodedFrame>,
     decoder_to_audio_rx: Receiver<DecodedFrame>,
-
-    /// Notification sounds → output worker.
     sound_tx: Sender<sounds::SoundType>,
     sound_rx: Option<Receiver<sounds::SoundType>>,
 
-    // ── Thread handles ──────────────────────────────────────────────────
+    // ── Thread handles ───────────────────────────────────────────────
     encoder_thread: Option<std::thread::JoinHandle<()>>,
     decoder_pool: Option<decoder::DecoderPool>,
-
-    /// Signal to stop all worker threads.
     should_stop: Arc<AtomicBool>,
 
-    // ── Shared state ────────────────────────────────────────────────────
+    // ── Shared state ─────────────────────────────────────────────────
     user_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
-    /// Peers marked for removal. Workers check this and drop their decoders.
     removed_peers: Arc<Mutex<HashSet<u64>>>,
     stats: Arc<AudioStats>,
     is_speaking: Arc<AtomicBool>,
-    loopback_enabled: Arc<AtomicBool>,
     output_gain: Arc<AtomicU32>,
     deafened: Arc<AtomicBool>,
 
@@ -134,6 +130,14 @@ impl VoiceChat {
             should_stop.clone(),
             removed_peers.clone(),
         );
+        let input_config = Arc::new(InputConfig::new(
+    config.noise_suppression,
+    config.input_gain,
+    config.gate_threshold,
+    true,  // compressor_enabled
+    true,  // agc_enabled
+    0.10,  // agc_target_rms
+));
 
         Ok(Self {
             input: None,
@@ -144,6 +148,7 @@ impl VoiceChat {
             decoder_to_audio_tx,
             decoder_to_audio_rx,
             sound_tx,
+            input_config,
             sound_rx: Some(sound_rx),
             encoder_thread: Some(encoder_thread),
             decoder_pool: Some(decoder_pool),
@@ -152,7 +157,6 @@ impl VoiceChat {
             removed_peers,
             stats,
             is_speaking: Arc::new(AtomicBool::new(false)),
-            loopback_enabled: Arc::new(AtomicBool::new(false)),
             output_gain,
             deafened,
             config,
@@ -175,12 +179,9 @@ impl VoiceChat {
             self.audio_to_encoder_tx.clone(),
             Some(loopback_tx),
             self.stats.clone(),
-            self.config.noise_suppression,
-            self.config.input_gain,
-            self.config.gate_threshold,
+            self.input_config.clone(),
         )?;
 
-        input.set_loopback(self.loopback_enabled.load(Ordering::Relaxed));
         input.start()?;
         self.is_speaking = input.speaking_handle();
         self.input = Some(input);
@@ -188,8 +189,6 @@ impl VoiceChat {
     }
 
     fn start_output(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Take the sound_rx if available, otherwise create a dummy one
-        // (covers the case where output is restarted after device swap).
         let sound_rx = self.sound_rx.take().unwrap_or_else(|| {
             let (_, rx) = bounded::<sounds::SoundType>(1);
             rx
@@ -212,11 +211,6 @@ impl VoiceChat {
 
     // ── Public API ───────────────────────────────────────────────────────
 
-    /// Play a notification sound through the output device.
-    ///
-    /// The sound is mixed into the output pipeline and respects the
-    /// master output gain. Works even when deafened.
-    /// No-op if the output isn't started yet.
     pub fn play_sound(&self, sound: SoundType) {
         let _ = self.sound_tx.try_send(sound);
     }
@@ -247,8 +241,6 @@ impl VoiceChat {
         }
     }
 
-    /// Register a peer. Decoder workers auto-create decoders on first packet,
-    /// so this just pre-populates default audio settings for the peer.
     pub fn add_peer(&self, peer_id: u64) {
         if let Ok(mut s) = self.user_settings.lock() {
             s.entry(peer_id).or_insert_with(PeerAudioSettings::default);
@@ -259,8 +251,6 @@ impl VoiceChat {
         info!("Peer {peer_id} added");
     }
 
-    /// Remove a peer. Signals the decoder worker that owns this peer's
-    /// decoder to drop it, and clears their audio settings.
     pub fn remove_peer(&self, peer_id: u64) {
         if let Ok(mut r) = self.removed_peers.lock() {
             r.insert(peer_id);
@@ -271,22 +261,72 @@ impl VoiceChat {
         info!("Peer {peer_id} removed");
     }
 
+    pub fn set_noise_suppression(&self, enabled: bool) {
+        self.input_config
+            .denoise_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_input_gain(&self, gain: f32) {
+        self.input_config
+            .input_gain
+            .store(gain.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_gate_threshold(&self, threshold: f32) {
+        self.input_config
+            .gate
+            .threshold
+            .store(threshold.clamp(0.001, 0.5).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_compressor_enabled(&self, enabled: bool) {
+        self.input_config
+            .compressor_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_compressor_threshold(&self, threshold_db: f32) {
+        self.input_config
+            .compressor
+            .threshold_db
+            .store(threshold_db.clamp(-60.0, 0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_compressor_ratio(&self, ratio: f32) {
+        self.input_config
+            .compressor
+            .ratio
+            .store(ratio.clamp(1.0, 20.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_agc_enabled(&self, enabled: bool) {
+        self.input_config
+            .agc_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_loopback(&self, enabled: bool) {
+        self.input_config
+            .loopback_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_loopback(&self) -> bool {
+        self.input_config.loopback_enabled.load(Ordering::Relaxed)
+    }
+
     pub fn set_muted(&self, muted: bool) {
-        if let Some(ref input) = self.input {
-            input.set_muted(muted);
-        }
+        self.input_config.muted.store(muted, Ordering::Relaxed);
         if muted {
             self.is_speaking.store(false, Ordering::Relaxed);
         }
     }
 
     pub fn is_muted(&self) -> bool {
-        self.input.as_ref().is_some_and(|i| i.is_muted())
+        self.input_config.muted.load(Ordering::Relaxed)
     }
 
-    /// Deafen: silences all incoming audio without decoding.
-    /// Unlike setting output gain to 0, this skips the decode/mix/resample
-    /// pipeline entirely, saving CPU.
     pub fn set_deafened(&self, deafened: bool) {
         self.deafened.store(deafened, Ordering::Relaxed);
     }
@@ -295,40 +335,9 @@ impl VoiceChat {
         self.deafened.load(Ordering::Relaxed)
     }
 
-    pub fn set_noise_suppression(&self, enabled: bool) {
-        if let Some(ref input) = self.input {
-            input.set_noise_suppression(enabled);
-        }
-    }
-
-    pub fn set_input_gain(&self, gain: f32) {
-        if let Some(ref input) = self.input {
-            input.set_input_gain(gain);
-        }
-    }
-
     pub fn set_output_gain(&self, gain: f32) {
         let clamped = gain.clamp(0.0, 2.0);
         self.output_gain.store(clamped.to_bits(), Ordering::Relaxed);
-    }
-
-    /// Set the noise gate threshold at runtime.
-    /// Values: 0.001–0.5 (RMS). See [`gate::NoiseGate::new`] for guidance.
-    pub fn set_gate_threshold(&self, threshold: f32) {
-        if let Some(ref input) = self.input {
-            input.set_gate_threshold(threshold);
-        }
-    }
-
-    pub fn set_loopback(&self, enabled: bool) {
-        self.loopback_enabled.store(enabled, Ordering::Relaxed);
-        if let Some(ref input) = self.input {
-            input.set_loopback(enabled);
-        }
-    }
-
-    pub fn is_loopback(&self) -> bool {
-        self.loopback_enabled.load(Ordering::Relaxed)
     }
 
     pub fn is_speaking(&self) -> bool {
@@ -348,8 +357,6 @@ impl VoiceChat {
         f32::from_bits(self.stats.output_level.load(Ordering::Relaxed))
     }
 
-    /// Get the post-denoise input level (0.0–1.0).
-    /// This is what the gate and VAD actually see. Use for threshold visualization.
     pub fn denoised_level(&self) -> f32 {
         f32::from_bits(self.stats.denoised_level.load(Ordering::Relaxed))
     }
@@ -368,7 +375,7 @@ impl VoiceChat {
         &mut self,
         device_name: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!("set_input_device called with: {:?}", device_name);
+        info!("set_input_device called with: {device_name:?}");
         self.input.take();
         self.config.input_device = device_name.map(String::from);
         match self.start_input() {
@@ -389,7 +396,6 @@ impl VoiceChat {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.output.take();
         self.config.output_device = device_name.map(String::from);
-        // Recreate sound channel so the new output worker gets a fresh rx.
         let (sound_tx, sound_rx) = bounded::<sounds::SoundType>(4);
         self.sound_tx = sound_tx;
         self.sound_rx = Some(sound_rx);
@@ -447,34 +453,23 @@ impl VoiceChat {
 
 impl Drop for VoiceChat {
     fn drop(&mut self) {
-        // Signal all threads to stop
         self.should_stop.store(true, Ordering::Release);
 
-        // Drop audio devices first — stops platform callbacks that push/pull
-        // from ring buffers, preventing deadlock during thread joins.
+        // Drop audio devices first — stops platform callbacks.
         self.input.take();
         self.output.take();
 
         // Drop channel senders to unblock threads blocked on recv().
-        // The encoder blocks on audio_to_encoder_rx.recv() — dropping
-        // the tx side causes recv() to return Err and the thread exits.
-        // Similarly for the decoder dispatcher.
-        drop(self.audio_to_encoder_tx.clone()); // clone first so we can still drop the original
-                                                // Actually: we need to replace these with dummy values or use Option.
-                                                // Simpler: just drop the fields that hold the sending ends.
-                                                // Since we can't easily "drop a field" in place, we swap with a disconnected channel.
         let (dead_tx, _) = crossbeam_channel::bounded::<Vec<f32>>(0);
         self.audio_to_encoder_tx = dead_tx;
 
         let (dead_tx, _) = crossbeam_channel::bounded::<AudioPacket>(0);
         self.network_to_decoder_tx = dead_tx;
 
-        // Join encoder thread (now unblocked because its rx is disconnected)
         if let Some(thread) = self.encoder_thread.take() {
             let _ = thread.join();
         }
 
-        // Join decoder pool
         if let Some(pool) = self.decoder_pool.take() {
             let _ = pool.dispatcher.join();
             for thread in pool.workers {

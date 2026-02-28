@@ -14,9 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::packet::AudioPacket;
-use crate::stats::AudioStats;
-use crate::{FRAME_SIZE, OPUS_BITRATE, OPUS_SAMPLE_RATE};
+use crate::{stats::AudioStats, transport::packet::AudioPacket, FRAME_SIZE, OPUS_BITRATE, OPUS_SAMPLE_RATE};
 
 /// Encoder thread state. Created once, runs until the input channel closes.
 struct EncoderWorker {

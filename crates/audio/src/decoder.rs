@@ -19,10 +19,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::jitter_buffer::DecodedFrame;
-use crate::packet::AudioPacket;
-use crate::stats::AudioStats;
-use crate::{FRAME_SIZE, OPUS_SAMPLE_RATE};
+use crate::{
+    stats::AudioStats,
+    transport::{jitter_buffer::DecodedFrame, packet::AudioPacket},
+    FRAME_SIZE, OPUS_SAMPLE_RATE,
+};
 
 /// Number of decoder worker threads.
 pub const DECODER_WORKERS: usize = 4;

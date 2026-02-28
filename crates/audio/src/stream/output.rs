@@ -26,7 +26,7 @@
 //! Network → Opus decode (stereo) → voice cancel → ring buffer → resample → cpal playback
 //! ```
 
-use crate::stream::cancel::VoiceCanceller;
+use crate::processor::{AudioProcessor,FrameContext, voice_cancel::VoiceCanceller};
 use crate::OPUS_SAMPLE_RATE;
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
@@ -122,7 +122,7 @@ impl StreamAudioOutput {
         let channels = device_config.channels();
 
         info!(
-            "🔊🎬 Stream audio output: {} @ {}Hz, {}ch, {:?}",
+            "Stream audio output: {} @ {}Hz, {}ch, {:?}",
             device.name().unwrap_or_else(|_| "Unknown".into()),
             sample_rate,
             channels,
@@ -366,22 +366,21 @@ impl StreamAudioOutput {
             );
 
             while !should_stop.load(Ordering::Relaxed) {
-                // ── Update voice canceller ───────────────────────────────
-                if let (Some(ref energy), Some(ref mut cancel)) = (&voice_energy, &mut canceller) {
-                    let rms = f32::from_bits(energy.load(Ordering::Relaxed));
-                    cancel.update_voice_energy(rms);
-                }
-
                 // ── Drain decoded frames into accumulator ────────────────
                 while let Ok(mut frame) = frame_rx.try_recv() {
                     if is_muted.load(Ordering::Relaxed) {
                         continue; // drain but discard
                     }
 
-                    // Apply voice cancellation BEFORE volume (so the
-                    // canceller sees the raw signal, not user-scaled).
-                    if let Some(ref mut cancel) = canceller {
-                        cancel.process(&mut frame.samples);
+                    if let (Some(ref energy_handle), Some(ref mut cancel)) =
+                        (&voice_energy, &mut canceller)
+                    {
+                        let mut ctx = FrameContext {
+                            voice_energy: f32::from_bits(energy_handle.load(Ordering::Relaxed)),
+                            channels: 2,
+                            ..FrameContext::default()
+                        };
+                        cancel.process(&mut frame.samples, &mut ctx);
                     }
 
                     // Apply volume
@@ -492,7 +491,7 @@ impl StreamAudioOutput {
                 }
             }
 
-            info!("🔊🎬 Stream audio worker stopped");
+            info!("Stream audio worker stopped");
         })
     }
 }
@@ -507,6 +506,6 @@ impl Drop for StreamAudioOutput {
         if let Some(thread) = self.worker_thread.take() {
             let _ = thread.join();
         }
-        info!("🔊🎬 Stream audio output dropped");
+        info!("Stream audio output dropped");
     }
 }

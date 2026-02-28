@@ -20,7 +20,7 @@
 //! - **Still mixes whatever is available** (no hard gate on target depth).
 
 use crate::config::PeerAudioSettings;
-use crate::limiter::Limiter;
+use crate::processor::limiter::Limiter;
 use crate::FRAME_SIZE;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -255,7 +255,7 @@ impl AdaptiveJitterBuffer {
             peer_buf[available..n].fill(0.0);
 
             // Apply per-peer limiter (hearing protection)
-            peer.limiter.process(&mut peer_buf[..available]);
+            peer.limiter.process_samples(&mut peer_buf[..available]);
 
             // Sum into output mix and track energy
             let mut peer_energy = 0.0f32;
