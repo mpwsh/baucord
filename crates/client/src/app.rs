@@ -81,6 +81,10 @@ pub struct App {
     hotkeys: Option<HotkeyManager>,
     tray_icon: Option<TrayIcon<UiMessage>>,
     sentinel_window: Option<window::Window>,
+
+    // Device hot-reload polling
+    last_input_devices: Vec<(String, bool)>,
+    last_output_devices: Vec<(String, bool)>,
 }
 
 impl App {
@@ -155,6 +159,8 @@ impl App {
             hotkeys: None,
             tray_icon: None,
             sentinel_window: None,
+            last_input_devices: Vec::new(),
+            last_output_devices: Vec::new(),
         }
     }
 
@@ -164,6 +170,24 @@ impl App {
 
         let handles = crate::ui::splash::show(self.sender);
         self.splash_window = Some(handles.window);
+
+        // Seed the initial device snapshot so the first poll has something to diff against.
+        self.last_input_devices = audio::VoiceChat::list_input_devices().unwrap_or_default();
+        self.last_output_devices = audio::VoiceChat::list_output_devices().unwrap_or_default();
+
+        // Start a repeating timer that polls for device changes every 2.5 s.
+        // The callback just enumerates devices and, if changed, sends a
+        // UiMessage so all the diffing logic stays in handle_ui_message.
+        let device_sender = self.sender;
+        app::add_timeout3(2.5, move |handle| {
+            let input = audio::VoiceChat::list_input_devices().unwrap_or_default();
+            let output = audio::VoiceChat::list_output_devices().unwrap_or_default();
+            device_sender.send(UiMessage::DevicesChanged {
+                input_devices: input,
+                output_devices: output,
+            });
+            app::repeat_timeout3(2.5, handle);
+        });
 
         while self.app.wait() {
             // UI messages
@@ -637,6 +661,13 @@ impl App {
                 self.voice.tx.send(VoiceControl::SetOutputDevice(d)).ok();
             }
 
+            UiMessage::DevicesChanged {
+                input_devices,
+                output_devices,
+            } => {
+                self.handle_devices_changed(input_devices, output_devices);
+            }
+
             // ── Update flow ─────────────────────────────────────────
             UiMessage::VersionCheckComplete(result) => {
                 use crate::ui::messages::VersionCheckResult;
@@ -744,6 +775,138 @@ impl App {
         if let Some(chat) = &mut self.chat {
             chat.handle_system_message(text.to_string());
         }
+    }
+
+    // ── Device hot-reload ───────────────────────────────────────────
+
+    /// Called by the 2.5 s polling timer whenever the device list or
+    /// default identity has changed.  Produces chat messages and, when
+    /// the active device has disappeared (or the system default changed
+    /// underneath us), re-triggers the stream rebuild on the voice thread.
+    fn handle_devices_changed(
+        &mut self,
+        new_input: Vec<(String, bool)>,
+        new_output: Vec<(String, bool)>,
+    ) {
+        // Collect owned names so we don't borrow self.last_*_devices as &str
+        // (which would conflict with &mut self for show_chat_system later).
+        let old_input_names: std::collections::HashSet<String> =
+            self.last_input_devices.iter().map(|(n, _)| n.clone()).collect();
+        let new_input_names: std::collections::HashSet<String> =
+            new_input.iter().map(|(n, _)| n.clone()).collect();
+
+        let old_output_names: std::collections::HashSet<String> =
+            self.last_output_devices.iter().map(|(n, _)| n.clone()).collect();
+        let new_output_names: std::collections::HashSet<String> =
+            new_output.iter().map(|(n, _)| n.clone()).collect();
+
+        let old_input_default = Self::default_device(&self.last_input_devices);
+        let old_output_default = Self::default_device(&self.last_output_devices);
+        let new_input_default = Self::default_device(&new_input);
+        let new_output_default = Self::default_device(&new_output);
+
+        // Nothing changed — early out.
+        if old_input_names == new_input_names
+            && old_output_names == new_output_names
+            && old_input_default == new_input_default
+            && old_output_default == new_output_default
+        {
+            return;
+        }
+
+        // ── Chat notifications ──────────────────────────────────────
+
+        for name in new_input_names.difference(&old_input_names) {
+            self.show_chat_system(&format!("\u{1f3a4} Microphone connected: {name}"));
+        }
+        for name in old_input_names.difference(&new_input_names) {
+            self.show_chat_system(&format!("\u{1f3a4} Microphone disconnected: {name}"));
+        }
+        for name in new_output_names.difference(&old_output_names) {
+            self.show_chat_system(&format!("\u{1f50a} Speaker connected: {name}"));
+        }
+        for name in old_output_names.difference(&new_output_names) {
+            self.show_chat_system(&format!("\u{1f50a} Speaker disconnected: {name}"));
+        }
+
+        // ── Input device: detect if a rebuild is needed ─────────────
+
+        let need_input_rebuild = if let Some(ref selected) = self.settings.audio.input.device {
+            !new_input_names.contains(selected)
+        } else {
+            old_input_default != new_input_default
+        };
+
+        if need_input_rebuild {
+            if self.settings.audio.input.device.is_some() {
+                self.show_chat_system(
+                    "\u{1f3a4} Input device lost \u{2014} switching to system default",
+                );
+            } else {
+                let new_default = new_input_default
+                    .as_deref()
+                    .unwrap_or("unknown device");
+                self.show_chat_system(&format!(
+                    "\u{1f3a4} Default input changed to: {new_default}"
+                ));
+            }
+            self.settings.audio.input.device = None;
+            self.voice
+                .tx
+                .send(VoiceControl::SetInputDevice(None))
+                .ok();
+        }
+
+        // ── Output device: same logic ───────────────────────────────
+
+        let need_output_rebuild = if let Some(ref selected) = self.settings.audio.output.device {
+            !new_output_names.contains(selected)
+        } else {
+            old_output_default != new_output_default
+        };
+
+        if need_output_rebuild {
+            if self.settings.audio.output.device.is_some() {
+                self.show_chat_system(
+                    "\u{1f50a} Output device lost \u{2014} switching to system default",
+                );
+            } else {
+                let new_default = new_output_default
+                    .as_deref()
+                    .unwrap_or("unknown device");
+                self.show_chat_system(&format!(
+                    "\u{1f50a} Default output changed to: {new_default}"
+                ));
+            }
+            self.settings.audio.output.device = None;
+            self.voice
+                .tx
+                .send(VoiceControl::SetOutputDevice(None))
+                .ok();
+
+            // WASAPI loopback captures from the default output device,
+            // so when that device changes the capture stream dies too.
+            // Restart it if a screen share is currently active.
+            if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+                self.screen
+                    .tx
+                    .send(crate::screen::ScreenControl::RestartSystemAudio)
+                    .ok();
+            }
+        }
+
+        // ── Update the snapshot ─────────────────────────────────────
+
+        self.last_input_devices = new_input;
+        self.last_output_devices = new_output;
+    }
+
+    /// Extract the name of whichever device is marked as the OS default.
+    fn default_device(devices: &[(String, bool)]) -> Option<String> {
+        devices
+            .iter()
+            .find(|(_, is_default)| *is_default)
+            .map(|(name, _)| name.clone())
     }
 
     /// Look up username by u64 client id (for screen thread events which use u64).

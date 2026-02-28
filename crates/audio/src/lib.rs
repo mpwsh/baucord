@@ -36,7 +36,7 @@ pub use sounds::SoundType;
 pub use stats::AudioStats;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use log::info;
+use log::{error,info};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -368,11 +368,19 @@ impl VoiceChat {
         &mut self,
         device_name: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        info!("set_input_device called with: {:?}", device_name);
         self.input.take();
         self.config.input_device = device_name.map(String::from);
-        self.start_input()?;
-        info!("Input device changed");
-        Ok(())
+        match self.start_input() {
+            Ok(()) => {
+                info!("Input device changed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                error!("start_input failed: {e}");
+                Err(e)
+            }
+        }
     }
 
     pub fn set_output_device(

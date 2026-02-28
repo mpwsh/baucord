@@ -94,6 +94,13 @@ pub enum UiMessage {
     SetInputDevice(Option<String>),
     SetOutputDevice(Option<String>),
 
+    /// Fired by the device-polling timer when the set of audio devices
+    /// (or the identity of the system default) has changed.
+    DevicesChanged {
+        input_devices: Vec<(String, bool)>,
+        output_devices: Vec<(String, bool)>,
+    },
+
     // ── Update flow ─────────────────────────────────────────────────
     /// Background version check finished.
     VersionCheckComplete(VersionCheckResult),

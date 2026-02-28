@@ -81,6 +81,10 @@ pub enum ScreenControl {
     SetStreamVolume { client_id: u64, volume: f32 },
     /// Mute/unmute the stream audio for a peer's viewer.
     MuteStream { client_id: u64, muted: bool },
+    /// Restart the system audio capture (e.g. after an output device change).
+    /// WASAPI loopback is bound to the default output device, so when that
+    /// device changes the capture stream dies and must be rebuilt.
+    RestartSystemAudio,
     /// Clean shutdown.
     Shutdown,
 }
@@ -627,6 +631,32 @@ fn handle_control(
                 && let Some(ref audio) = stream.stream_audio
             {
                 audio.set_muted(muted);
+            }
+        }
+
+        ScreenControl::RestartSystemAudio => {
+            if let Some(state) = capture {
+                // Stop the old capture (drops the dead WASAPI loopback stream)
+                if let Some(mut old) = state.system_audio.take() {
+                    old.stop();
+                    info!("🔊🎤 System audio capture stopped for device rebuild");
+                }
+
+                // Rebuild — best-effort, non-fatal
+                match SystemAudioCapture::new(Arc::new(AudioStats::new())) {
+                    Ok(mut cap) => match cap.start() {
+                        Ok(()) => {
+                            info!("🔊🎤 System audio capture restarted after device change");
+                            state.system_audio = Some(cap);
+                        }
+                        Err(e) => {
+                            warn!("🔊 System audio capture restart failed: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        warn!("🔊 System audio capture unavailable after device change: {e}");
+                    }
+                }
             }
         }
 
