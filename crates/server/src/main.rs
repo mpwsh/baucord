@@ -6,7 +6,7 @@ mod config;
 mod relay;
 mod server;
 use config::Config;
-use env_logger::{Builder, Target};
+use env_logger::Builder;
 use server::ChatServer;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()
                 .unwrap_or(log::LevelFilter::Info),
         )
-        .format(move |buf, record| {
+        .format(move |_, record| {
             let line = format!(
                 "[{} {} {}] {}\n",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),

@@ -5,5 +5,5 @@ edition = "2024"
 description = "Shared wire protocol types for baucord client and server."
 
 [dependencies]
-renet = "1.2.0"
+renet = "2.0"
 serde = { version = "1", features = ["derive"] }
