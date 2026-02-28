@@ -167,18 +167,6 @@ impl ViewerWindow {
         sep2.set_color(theme::SUBTLE);
         toolbar.fixed(&sep2, 1);
 
-        // Label for the slider
-        let mut buf_label = frame::Frame::default().with_label("80ms");
-        buf_label.set_label_color(theme::TEXT_MUTED);
-        buf_label.set_label_size(10);
-        toolbar.fixed(&buf_label, 40);
-
-        // Separator
-        let mut sep2 = frame::Frame::default();
-        sep2.set_frame(enums::FrameType::FlatBox);
-        sep2.set_color(theme::SUBTLE);
-        toolbar.fixed(&sep2, 1);
-
         // Stop Watching button
         let mut stop_btn = controls::button("Stop Watching");
         toolbar.fixed(&stop_btn, 90);
