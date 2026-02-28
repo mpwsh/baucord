@@ -26,7 +26,7 @@
 //! Network → Opus decode (stereo) → voice cancel → ring buffer → resample → cpal playback
 //! ```
 
-use crate::processor::{AudioProcessor,FrameContext, voice_cancel::VoiceCanceller};
+use crate::processor::{voice_cancel::VoiceCanceller, AudioProcessor, FrameContext};
 use crate::OPUS_SAMPLE_RATE;
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;

@@ -4,8 +4,8 @@
 //! cargo run --example screenshot
 //! ```
 
-use video::{Quality, capture::ScreenCapturer};
 use std::time::Instant;
+use video::{capture::ScreenCapturer, Quality};
 
 fn main() {
     env_logger::init();

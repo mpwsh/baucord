@@ -714,17 +714,10 @@ impl App {
             UiMessage::DownloadCancelled => {
                 self.dismiss_update_flow_and_connect();
             }
-            UiMessage::OpenUpdateAndQuit(path) => {
-                if let Some(parent) = std::path::Path::new(&path).parent()
-                    && let Err(e) = open::that(parent)
-                {
-                    warn!("Failed to open folder: {e}");
+            UiMessage::InstallUpdate(path) => {
+                if let Err(e) = crate::ui::update::extract_and_install(&path) {
+                    self.sender.send(UiMessage::ShowError(e));
                 }
-                // Open the zip itself in the system zip handler
-                if let Err(e) = open::that(&path) {
-                    warn!("Failed to open {path}: {e}");
-                }
-                self.app.quit();
             }
 
             UiMessage::ShowError(e) => {
@@ -790,13 +783,19 @@ impl App {
     ) {
         // Collect owned names so we don't borrow self.last_*_devices as &str
         // (which would conflict with &mut self for show_chat_system later).
-        let old_input_names: std::collections::HashSet<String> =
-            self.last_input_devices.iter().map(|(n, _)| n.clone()).collect();
+        let old_input_names: std::collections::HashSet<String> = self
+            .last_input_devices
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
         let new_input_names: std::collections::HashSet<String> =
             new_input.iter().map(|(n, _)| n.clone()).collect();
 
-        let old_output_names: std::collections::HashSet<String> =
-            self.last_output_devices.iter().map(|(n, _)| n.clone()).collect();
+        let old_output_names: std::collections::HashSet<String> = self
+            .last_output_devices
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
         let new_output_names: std::collections::HashSet<String> =
             new_output.iter().map(|(n, _)| n.clone()).collect();
 
@@ -843,18 +842,13 @@ impl App {
                     "\u{1f3a4} Input device lost \u{2014} switching to system default",
                 );
             } else {
-                let new_default = new_input_default
-                    .as_deref()
-                    .unwrap_or("unknown device");
+                let new_default = new_input_default.as_deref().unwrap_or("unknown device");
                 self.show_chat_system(&format!(
                     "\u{1f3a4} Default input changed to: {new_default}"
                 ));
             }
             self.settings.audio.input.device = None;
-            self.voice
-                .tx
-                .send(VoiceControl::SetInputDevice(None))
-                .ok();
+            self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
         }
 
         // ── Output device: same logic ───────────────────────────────
@@ -871,18 +865,13 @@ impl App {
                     "\u{1f50a} Output device lost \u{2014} switching to system default",
                 );
             } else {
-                let new_default = new_output_default
-                    .as_deref()
-                    .unwrap_or("unknown device");
+                let new_default = new_output_default.as_deref().unwrap_or("unknown device");
                 self.show_chat_system(&format!(
                     "\u{1f50a} Default output changed to: {new_default}"
                 ));
             }
             self.settings.audio.output.device = None;
-            self.voice
-                .tx
-                .send(VoiceControl::SetOutputDevice(None))
-                .ok();
+            self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
 
             // WASAPI loopback captures from the default output device,
             // so when that device changes the capture stream dies too.
@@ -990,7 +979,7 @@ impl App {
         sentinel.set_border(false);
         sentinel.show();
         self.sentinel_window = Some(sentinel);
-        
+
         self.our_client_id = Some(client_id);
         for (&id, name) in &users {
             self.users.insert(
@@ -1239,8 +1228,11 @@ impl App {
             self.screen.shared.is_sharing.load(Ordering::Relaxed),
             self.connected
         );
-           
-    log::warn!("DIAG: backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+
+        log::warn!(
+            "DIAG: backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
         self.connected = false;
         self.is_testing_mic = false;
         self.voice.tx.send(VoiceControl::Stop).ok();
@@ -1282,7 +1274,7 @@ impl App {
     }
 
     fn handle_disconnect_event(&mut self, reason: &str) {
-            log::warn!("DIAG handle_disconnect_event reason=\"{reason}\"");
+        log::warn!("DIAG handle_disconnect_event reason=\"{reason}\"");
 
         if let Some(chat) = &mut self.chat {
             chat.handle_disconnected(reason.to_string());

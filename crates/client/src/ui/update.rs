@@ -1,13 +1,16 @@
-// ui/update.rs — Download window with progress meter.
+// ui/update.rs — Download window with progress meter + in-place binary update.
 //
-// Downloads the platform zip to the directory next to the executable.
+// Downloads the platform zip to a temp location next to the executable,
+// extracts it, replaces the running binary via `self_replace`, copies
+// the companion executable, then relaunches.
+//
 // Progress is driven by an AtomicU32 (bit-cast f32, 0.0–1.0) — the
 // same pattern used by the audio VU meters. A timer redraws the meter
 // at 8 Hz.
 //
 // Cancellation uses an AtomicBool shared with the download thread.
-// On completion, "Open File" opens the zip and shuts down the app,
-// "Not Now" dismisses and continues to the connect screen.
+// On completion, "Install & Restart" performs the replacement and
+// relaunches; "Not Now" dismisses and continues to the connect screen.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -15,12 +18,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use fltk::{prelude::*, *};
-use log::info;
+use log::{error, info};
 
 use crate::ui::messages::UiMessage;
 use crate::ui::splash;
 use ui::theme;
 use ui::widgets::controls;
+
+/// The main executable filename inside the update zip.
+const MAIN_EXE: &str = "baucord.exe";
+
+/// The companion executable filename inside the update zip.
+const COMPANION_EXE: &str = "dedicated-server.exe";
 
 /// Show the download window and start downloading.
 ///
@@ -95,7 +104,7 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
     // Spacer
     frame::Frame::default();
 
-    // Button row — starts with Cancel, changes to Open File / Not Now
+    // Button row — starts with Cancel, changes on completion
     let mut button_row = group::Flex::default().row();
     col.fixed(&button_row, 40);
     button_row.set_spacing(15);
@@ -119,19 +128,17 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
     // ── Cancel callback ──────────────────────────────────────────────
 
     let cancelled_cb = cancelled.clone();
-    let s = sender;
     cancel_btn.set_callback(move |_| {
         cancelled_cb.store(true, Ordering::Relaxed);
-        s.send(UiMessage::DownloadCancelled);
+        sender.send(UiMessage::DownloadCancelled);
     });
 
     // Window close = cancel
     let cancelled_close = cancelled.clone();
-    let s = sender;
     wind.set_callback(move |w| {
         if app::event() == enums::Event::Close {
             cancelled_close.store(true, Ordering::Relaxed);
-            s.send(UiMessage::DownloadCancelled);
+            sender.send(UiMessage::DownloadCancelled);
             w.hide();
         }
     });
@@ -154,7 +161,6 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
 
     let progress_dl = progress.clone();
     let cancelled_dl = cancelled.clone();
-    let s = sender;
     let version = remote_version.to_string();
 
     std::thread::Builder::new()
@@ -163,15 +169,14 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
             let result = download_zip(&version, &progress_dl, &cancelled_dl);
             match result {
                 Ok(path) => {
-                    // Set to 100% before sending completion
                     progress_dl.store(1.0f32.to_bits(), Ordering::Relaxed);
-                    s.send(UiMessage::DownloadComplete(
+                    sender.send(UiMessage::DownloadComplete(
                         path.to_string_lossy().to_string(),
                     ));
                 }
                 Err(e) => {
                     if !cancelled_dl.load(Ordering::Relaxed) {
-                        s.send(UiMessage::DownloadFailed(e));
+                        sender.send(UiMessage::DownloadFailed(e));
                     }
                 }
             }
@@ -185,7 +190,7 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
 /// Show the "download complete" state as a new window.
 ///
 /// Hides the download window and creates a fresh one with
-/// Open File / Not Now buttons. Returns the new window handle.
+/// Install & Restart / Not Now buttons. Returns the new window handle.
 pub fn show_complete(
     sender: app::Sender<UiMessage>,
     path: &str,
@@ -217,7 +222,7 @@ pub fn show_complete(
     col.fixed(&title, 30);
 
     let mut info = frame::Frame::default()
-        .with_label("Close and extract the zip to update.")
+        .with_label("Ready to install. The app will restart automatically.")
         .with_align(enums::Align::Center | enums::Align::Inside);
     info.set_label_size(12);
     info.set_label_color(theme::TEXT_SECONDARY);
@@ -243,8 +248,8 @@ pub fn show_complete(
     let mut not_now_btn = controls::button("Not Now");
     button_row.fixed(&not_now_btn, 120);
 
-    let mut open_btn = controls::accent_button("Open File", theme::SUCCESS);
-    button_row.fixed(&open_btn, 120);
+    let mut install_btn = controls::accent_button("Install && Restart", theme::SUCCESS);
+    button_row.fixed(&install_btn, 160);
 
     frame::Frame::default();
 
@@ -255,21 +260,18 @@ pub fn show_complete(
 
     // ── Callbacks ────────────────────────────────────────────────────
 
-    let s = sender;
     not_now_btn.set_callback(move |_| {
-        s.send(UiMessage::SkipUpdate);
+        sender.send(UiMessage::SkipUpdate);
     });
 
-    let s = sender;
     let path_owned = path.to_string();
-    open_btn.set_callback(move |_| {
-        s.send(UiMessage::OpenUpdateAndQuit(path_owned.clone()));
+    install_btn.set_callback(move |_| {
+        sender.send(UiMessage::InstallUpdate(path_owned.clone()));
     });
 
-    let s = sender;
     wind.set_callback(move |w| {
         if app::event() == enums::Event::Close {
-            s.send(UiMessage::SkipUpdate);
+            sender.send(UiMessage::SkipUpdate);
             w.hide();
         }
     });
@@ -334,15 +336,13 @@ pub fn show_error(
     wind.end();
     wind.show();
 
-    let s = sender;
     continue_btn.set_callback(move |_| {
-        s.send(UiMessage::SkipUpdate);
+        sender.send(UiMessage::SkipUpdate);
     });
 
-    let s = sender;
     wind.set_callback(move |w| {
         if app::event() == enums::Event::Close {
-            s.send(UiMessage::SkipUpdate);
+            sender.send(UiMessage::SkipUpdate);
             w.hide();
         }
     });
@@ -364,14 +364,14 @@ fn download_zip(
 ) -> Result<PathBuf, String> {
     let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
     let url = splash::download_url(version);
     let filename = url.rsplit('/').next().unwrap_or("baucord-update.zip");
     let dest = exe_dir.join(filename);
 
-    info!("Downloading {} → {}", url, dest.display());
+    info!("Downloading {url} → {}", dest.display());
 
     let agent: ureq::Agent = ureq::config::Config::builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
@@ -383,7 +383,6 @@ fn download_zip(
         .call()
         .map_err(|e| format!("Download request failed: {e}"))?;
 
-    // Try to get content length for progress calculation
     let content_length: Option<u64> = resp
         .headers()
         .get("content-length")
@@ -399,7 +398,6 @@ fn download_zip(
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
-            // Clean up partial file
             drop(file);
             let _ = std::fs::remove_file(&dest);
             return Err("Download cancelled".into());
@@ -427,4 +425,125 @@ fn download_zip(
     info!("Download complete: {}", dest.display());
 
     Ok(dest)
+}
+
+// ── Install logic ───────────────────────────────────────────────────────
+
+/// Extract the downloaded zip, replace both executables, and relaunch.
+///
+/// This is called from the main thread when the user clicks
+/// "Install & Restart". It runs synchronously — the UI will briefly
+/// freeze, but the operation is fast (local file I/O only).
+///
+/// Steps:
+/// 1. Extract zip contents to a temp directory next to the exe.
+/// 2. `self_replace` the running binary (`baucord.exe`).
+/// 3. `fs::copy` the companion binary (`dedicated-server.exe`).
+/// 4. Clean up the zip and temp directory.
+/// 5. Spawn the new executable and exit.
+pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
+    let zip_path = PathBuf::from(zip_path);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let extract_dir = exe_dir.join(".baucord-update-staging");
+
+    // Clean up any previous failed staging
+    if extract_dir.exists() {
+        let _ = std::fs::remove_dir_all(&extract_dir);
+    }
+
+    extract_zip(&zip_path, &extract_dir)?;
+
+    // Locate the extracted main binary
+    let new_main_exe = extract_dir.join(MAIN_EXE);
+    if !new_main_exe.exists() {
+        cleanup_staging(&zip_path, &extract_dir);
+        return Err(format!("{MAIN_EXE} not found in update zip"));
+    }
+
+    // Replace the running executable via self_replace
+    self_replace::self_replace(&new_main_exe)
+        .map_err(|e| format!("Failed to replace {MAIN_EXE}: {e}"))?;
+
+    info!("Replaced {MAIN_EXE} via self_replace");
+
+    // Copy the companion executable (not locked — plain overwrite)
+    let new_companion = extract_dir.join(COMPANION_EXE);
+    if new_companion.exists() {
+        let dest_companion = exe_dir.join(COMPANION_EXE);
+        std::fs::copy(&new_companion, &dest_companion)
+            .map_err(|e| format!("Failed to copy {COMPANION_EXE}: {e}"))?;
+        info!("Copied {COMPANION_EXE}");
+    }
+
+    cleanup_staging(&zip_path, &extract_dir);
+
+    // Spawn the new binary and exit
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Failed to locate current exe: {e}"))?;
+
+    info!("Relaunching {}", current_exe.display());
+
+    std::process::Command::new(&current_exe)
+        .spawn()
+        .map_err(|e| format!("Failed to relaunch: {e}"))?;
+
+    // Give the new process a moment to start before we exit
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::process::exit(0);
+}
+
+/// Extract a zip file into the given directory.
+fn extract_zip(zip_path: &PathBuf, dest_dir: &PathBuf) -> Result<(), String> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed to open {}: {e}", zip_path.display()))?;
+
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip: {e}"))?;
+
+    std::fs::create_dir_all(dest_dir).map_err(|e| format!("Failed to create staging dir: {e}"))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed to read zip entry {i}: {e}"))?;
+
+        // Only extract files at the root level — skip directories and nested paths
+        let Some(name) = entry.enclosed_name().and_then(|p| {
+            if p.components().count() == 1 {
+                p.file_name().map(|n| n.to_os_string())
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+
+        if entry.is_dir() {
+            continue;
+        }
+
+        let out_path = dest_dir.join(&name);
+        let mut out_file = std::fs::File::create(&out_path)
+            .map_err(|e| format!("Failed to create {}: {e}", out_path.display()))?;
+
+        std::io::copy(&mut entry, &mut out_file)
+            .map_err(|e| format!("Failed to extract {}: {e}", out_path.display()))?;
+
+        info!("Extracted: {}", out_path.display());
+    }
+
+    Ok(())
+}
+
+/// Best-effort cleanup of the zip and staging directory.
+fn cleanup_staging(zip_path: &PathBuf, extract_dir: &PathBuf) {
+    if let Err(e) = std::fs::remove_dir_all(extract_dir) {
+        error!("Failed to clean staging dir: {e}");
+    }
+    if let Err(e) = std::fs::remove_file(zip_path) {
+        error!("Failed to clean zip file: {e}");
+    }
 }

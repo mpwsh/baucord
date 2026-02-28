@@ -34,7 +34,6 @@ pub const SYSTEM_AUDIO_CHANNEL: u8 = 6;
 /// Default memory budget for the reliable channel (bytes).
 pub const RELIABLE_BUFFER_BYTES: usize = 5 * 1024 * 1024; // 5 MB
 
-
 /// Default memory budget for the voice channel (bytes).
 pub const VOICE_BUFFER_BYTES: usize = 5 * 1024 * 1024; // 5 MB
 

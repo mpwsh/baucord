@@ -90,9 +90,15 @@ fn start_stat_timer(
         let s = vc_ref.stats();
 
         // Levels
-        levels.input.store(vc_ref.input_level().to_bits(), Ordering::Relaxed);
-        levels.output.store(vc_ref.output_level().to_bits(), Ordering::Relaxed);
-        levels.denoised.store(vc_ref.denoised_level().to_bits(), Ordering::Relaxed);
+        levels
+            .input
+            .store(vc_ref.input_level().to_bits(), Ordering::Relaxed);
+        levels
+            .output
+            .store(vc_ref.output_level().to_bits(), Ordering::Relaxed);
+        levels
+            .denoised
+            .store(vc_ref.denoised_level().to_bits(), Ordering::Relaxed);
         meters.input.redraw();
         meters.output.redraw();
         meters.gate.redraw();
@@ -102,7 +108,9 @@ fn start_stat_timer(
         if speaking != *prev_speak.borrow() {
             *prev_speak.borrow_mut() = speaking;
             if speaking {
-                stats.speaking.set_label("\u{1f7e2}  SPEAKING \u{2014} transmitting audio");
+                stats
+                    .speaking
+                    .set_label("\u{1f7e2}  SPEAKING \u{2014} transmitting audio");
                 stats.speaking.set_label_color(theme::SUCCESS);
             } else {
                 stats.speaking.set_label("\u{26ab}  Not transmitting");
@@ -155,7 +163,11 @@ fn start_stat_timer(
         *prev_sent.borrow_mut() = sent;
         let pps = delta as f32 * 8.0;
 
-        let pps_note = if pps < 0.1 && sent > 0 { "  (idle: VAD gating)" } else { "" };
+        let pps_note = if pps < 0.1 && sent > 0 {
+            "  (idle: VAD gating)"
+        } else {
+            ""
+        };
         stats.packets.set_label(&format!(
             "Packets: sent {sent} recv {recv} lost {lost}  |  {pps:.0} pkt/s{pps_note}",
         ));
@@ -169,17 +181,25 @@ fn start_stat_timer(
 
         let fec = s.fec_recoveries.load(Ordering::Relaxed);
         let plc = s.plc_frames.load(Ordering::Relaxed);
-        stats.recovery.set_label(&format!("FEC recoveries: {fec}  PLC frames: {plc}"));
+        stats
+            .recovery
+            .set_label(&format!("FEC recoveries: {fec}  PLC frames: {plc}"));
 
         let overruns = s.input_overruns.load(Ordering::Relaxed);
         let underruns = s.output_underruns.load(Ordering::Relaxed);
-        stats.buffers.set_label(&format!("Overruns: {overruns}  Underruns: {underruns}"));
+        stats
+            .buffers
+            .set_label(&format!("Overruns: {overruns}  Underruns: {underruns}"));
 
         let jitter_ms = s.jitter_buffer_occupancy_ms.load(Ordering::Relaxed);
-        stats.jitter.set_label(&format!("Jitter buffer: {jitter_ms} ms"));
+        stats
+            .jitter
+            .set_label(&format!("Jitter buffer: {jitter_ms} ms"));
 
         let uptime = s.start_time.elapsed().as_secs();
-        stats.uptime.set_label(&format!("Uptime: {}m {}s", uptime / 60, uptime % 60));
+        stats
+            .uptime
+            .set_label(&format!("Uptime: {}m {}s", uptime / 60, uptime % 60));
 
         stats.raw.set_label(&vc_ref.stats_summary());
 
@@ -269,8 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vu_output = meter::vu(&mut col, Arc::clone(&output_level), 22, theme::CYAN);
 
     labels::field_label(&mut col, "Master Volume");
-    let mut output_gain_slider =
-        controls::slider(&mut col, 0.0, 2.0, 1.0, 0.05, theme::CYAN);
+    let mut output_gain_slider = controls::slider(&mut col, 0.0, 2.0, 1.0, 0.05, theme::CYAN);
     let mut output_gain_lbl = labels::hint_label(&mut col, "Volume: 100%");
 
     layout::separator(&mut col);
@@ -361,7 +380,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vc_c = Rc::clone(&vc);
     input_choice.set_callback(move |c| {
         let idx = c.value() as usize;
-        let dev = if idx == 0 { None } else { input_devs.get(idx - 1).map(|(n, _)| n.as_str()) };
+        let dev = if idx == 0 {
+            None
+        } else {
+            input_devs.get(idx - 1).map(|(n, _)| n.as_str())
+        };
         if let Err(e) = vc_c.borrow_mut().set_input_device(dev) {
             error!("Input device error: {e}");
         }
@@ -371,7 +394,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vc_c = Rc::clone(&vc);
     output_choice.set_callback(move |c| {
         let idx = c.value() as usize;
-        let dev = if idx == 0 { None } else { output_devs.get(idx - 1).map(|(n, _)| n.as_str()) };
+        let dev = if idx == 0 {
+            None
+        } else {
+            output_devs.get(idx - 1).map(|(n, _)| n.as_str())
+        };
         if let Err(e) = vc_c.borrow_mut().set_output_device(dev) {
             error!("Output device error: {e}");
         }

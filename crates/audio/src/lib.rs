@@ -131,13 +131,13 @@ impl VoiceChat {
             removed_peers.clone(),
         );
         let input_config = Arc::new(InputConfig::new(
-    config.noise_suppression,
-    config.input_gain,
-    config.gate_threshold,
-    true,  // compressor_enabled
-    true,  // agc_enabled
-    0.10,  // agc_target_rms
-));
+            config.noise_suppression,
+            config.input_gain,
+            config.gate_threshold,
+            true, // compressor_enabled
+            true, // agc_enabled
+            0.10, // agc_target_rms
+        ));
 
         Ok(Self {
             input: None,

@@ -178,4 +178,3 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
     output
 }
-

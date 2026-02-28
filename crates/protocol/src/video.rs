@@ -534,4 +534,3 @@ mod tests {
         assert_eq!(hdr.chunk_count, 1);
     }
 }
-

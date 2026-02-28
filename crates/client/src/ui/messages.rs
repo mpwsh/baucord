@@ -114,8 +114,8 @@ pub enum UiMessage {
     DownloadFailed(String),
     /// User cancelled an in-progress download.
     DownloadCancelled,
-    /// User clicked "Open File" — open the zip and shut down.
-    OpenUpdateAndQuit(String),
+    /// User clicked "Install now" — open the zip and shut down.
+    InstallUpdate(String),
 
     // ── UI updates ──────────────────────────────────────────────────
     UpdateStreamStats,

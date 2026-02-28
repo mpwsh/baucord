@@ -70,4 +70,3 @@ pub fn apply() {
     // well in both dark and light palettes.
     WidgetScheme::new(SchemeType::Fleet1).apply();
 }
-

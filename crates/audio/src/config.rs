@@ -80,7 +80,7 @@ impl Default for VoiceChatConfig {
             output_gain: 0.4,
             gate_threshold: 0.012,
             compressor_enabled: true,
-            agc_enabled: true, 
+            agc_enabled: true,
             agc_target_rms: 0.10,
         }
     }

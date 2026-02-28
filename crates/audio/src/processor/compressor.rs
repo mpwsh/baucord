@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn quiet_signal_passes_through() {
-let knobs = Arc::new(Knobs {
+        let knobs = Arc::new(Knobs {
             threshold_db: AtomicU32::new((-10.0_f32).to_bits()),
             ratio: AtomicU32::new(4.0_f32.to_bits()),
             knee_db: AtomicU32::new(0.0_f32.to_bits()),
@@ -259,7 +259,7 @@ let knobs = Arc::new(Knobs {
 
     #[test]
     fn holds_gain_when_gate_closed() {
-let knobs = Arc::new(Knobs {
+        let knobs = Arc::new(Knobs {
             threshold_db: AtomicU32::new((-20.0_f32).to_bits()),
             ratio: AtomicU32::new(4.0_f32.to_bits()),
             knee_db: AtomicU32::new(0.0_f32.to_bits()),

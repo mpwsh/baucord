@@ -47,8 +47,8 @@ pub mod gain;
 pub mod gate;
 pub mod level_meter;
 pub mod limiter;
-pub mod voice_cancel;
 pub mod vad;
+pub mod voice_cancel;
 
 // ── Shared utilities ────────────────────────────────────────────────────
 
@@ -127,7 +127,7 @@ pub struct FrameContext {
     /// Post-pipeline RMS level (0.0–1.0, scaled for UI).
     /// What the encoder actually sees.
     pub pipeline_level: f32,
-     /// Voice output RMS energy (0.0–1.0).
+    /// Voice output RMS energy (0.0–1.0).
     /// Set by: stream output worker (from voice output stats atomic).
     /// Read by: `VoiceCanceller` for echo ducking.
     pub voice_energy: f32,
@@ -149,8 +149,7 @@ impl Default for FrameContext {
             agc_gain: 1.0,
             denoised_level: 0.0,
             pipeline_level: 0.0,
-                voice_energy: 0.0,
-
+            voice_energy: 0.0,
         }
     }
 }
@@ -209,11 +208,7 @@ impl ProcessorChain {
 
     /// Add a processor to the end of the chain.
     pub fn add(&mut self, processor: Box<dyn AudioProcessor>) -> &mut Self {
-        log::debug!(
-            "Chain '{}': added '{}'",
-            self.name,
-            processor.name()
-        );
+        log::debug!("Chain '{}': added '{}'", self.name, processor.name());
         self.processors.push(processor);
         self
     }

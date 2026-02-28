@@ -41,7 +41,6 @@ fn main() {
     vc.play_sound(SoundType::UserChat);
     thread::sleep(Duration::from_millis(500));
 
-
     println!("▶ Playing Leave sound...");
     vc.play_sound(SoundType::UserLeft);
     thread::sleep(Duration::from_secs(2));

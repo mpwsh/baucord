@@ -14,8 +14,17 @@
 //! HFP (8/16 kHz), USB mics (44.1/48/96 kHz), audio interfaces, etc.
 
 use crate::input_config::InputConfig;
-use crate::processor::{agc::AutoGainControl, clamp::ClampStage, compressor::Compressor, denoise::Denoiser, gain::GainStage,
-gate::NoiseGate, level_meter::{LevelMeter, MeterTarget}, vad::VadStage, FrameContext, ProcessorChain};
+use crate::processor::{
+    agc::AutoGainControl,
+    clamp::ClampStage,
+    compressor::Compressor,
+    denoise::Denoiser,
+    gain::GainStage,
+    gate::NoiseGate,
+    level_meter::{LevelMeter, MeterTarget},
+    vad::VadStage,
+    FrameContext, ProcessorChain,
+};
 use crate::resampler::build_input_resampler;
 use crate::stats::AudioStats;
 use crate::transport::jitter_buffer::DecodedFrame;
@@ -311,14 +320,13 @@ impl AudioInput {
                         let expected = r.output_frames_next();
                         resampler_output[0].resize(expected, 0.0);
 
-                        let in_adapter =
-                            match SequentialSliceOfVecs::new(&resampler_input, 1, n) {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    error!("Input resampler adapter error: {e}");
-                                    continue;
-                                }
-                            };
+                        let in_adapter = match SequentialSliceOfVecs::new(&resampler_input, 1, n) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                error!("Input resampler adapter error: {e}");
+                                continue;
+                            }
+                        };
                         let mut out_adapter = match SequentialSliceOfVecs::new_mut(
                             &mut resampler_output,
                             1,
@@ -367,9 +375,15 @@ impl AudioInput {
 
                     chain.process(&mut frame, &mut ctx);
 
-                    stats.denoise_active.store(ctx.denoise_enabled, Ordering::Relaxed);
-                    stats.denoised_level.store(ctx.denoised_level.to_bits(), Ordering::Relaxed);
-                    stats.pipeline_level.store(ctx.pipeline_level.to_bits(), Ordering::Relaxed);
+                    stats
+                        .denoise_active
+                        .store(ctx.denoise_enabled, Ordering::Relaxed);
+                    stats
+                        .denoised_level
+                        .store(ctx.denoised_level.to_bits(), Ordering::Relaxed);
+                    stats
+                        .pipeline_level
+                        .store(ctx.pipeline_level.to_bits(), Ordering::Relaxed);
                     stats.gate_active.store(ctx.gate_open, Ordering::Relaxed);
                     stats.vad_active.store(ctx.is_speech, Ordering::Relaxed);
 
@@ -408,7 +422,6 @@ impl AudioInput {
         }));
     }
 
-    
     pub fn input_level_handle(&self) -> Arc<AtomicU32> {
         self.input_level.clone()
     }
@@ -416,8 +429,6 @@ impl AudioInput {
     pub fn speaking_handle(&self) -> Arc<AtomicBool> {
         self.is_speaking.clone()
     }
-
-
 }
 
 impl Drop for AudioInput {

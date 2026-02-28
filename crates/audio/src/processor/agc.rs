@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use super::{compute_rms, AudioProcessor, FrameContext};
 
-
 /// Tuneable parameters for automatic gain control.
 ///
 /// Lives inside [`InputConfig`](crate::input_config::InputConfig).
@@ -83,7 +82,7 @@ impl AutoGainControl {
             release_coeff: 0.005,
             current_gain: 1.0,
         }
-    } 
+    }
 
     pub fn current_gain(&self) -> f32 {
         self.current_gain
@@ -170,9 +169,8 @@ mod tests {
 
     #[test]
     fn quiet_signal_is_boosted_toward_target_after_convergence() {
-
         let knobs = Arc::new(Knobs {
-                    target_rms: AtomicU32::new((0.10_f32).to_bits()),
+            target_rms: AtomicU32::new((0.10_f32).to_bits()),
         });
         let mut agc = AutoGainControl::new(knobs, 30.0);
         let template = sine_frame(0.01, 440.0);
@@ -195,10 +193,10 @@ mod tests {
 
     #[test]
     fn gain_holds_steady_when_gate_is_closed() {
-       let knobs = Arc::new(Knobs {
-                    target_rms: AtomicU32::new((0.10_f32).to_bits()),
+        let knobs = Arc::new(Knobs {
+            target_rms: AtomicU32::new((0.10_f32).to_bits()),
         });
-        let mut agc = AutoGainControl::new(knobs, 30.0); 
+        let mut agc = AutoGainControl::new(knobs, 30.0);
         let template = sine_frame(0.05, 300.0);
 
         let mut scratch = vec![0.0f32; 480];
@@ -223,7 +221,7 @@ mod tests {
     #[test]
     fn gain_does_not_exceed_max() {
         let knobs = Arc::new(Knobs {
-                    target_rms: AtomicU32::new((0.10_f32).to_bits()),
+            target_rms: AtomicU32::new((0.10_f32).to_bits()),
         });
         let mut agc = AutoGainControl::new(knobs, 20.0);
 
@@ -244,7 +242,7 @@ mod tests {
     #[test]
     fn attack_responds_faster_than_release() {
         let knobs = Arc::new(Knobs {
-                    target_rms: AtomicU32::new((0.10_f32).to_bits()),
+            target_rms: AtomicU32::new((0.10_f32).to_bits()),
         });
         let mut agc = AutoGainControl::new(knobs, 30.0);
         let quiet = sine_frame(0.02, 300.0);

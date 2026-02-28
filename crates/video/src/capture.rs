@@ -28,8 +28,7 @@ pub struct MonitorInfo {
 ///
 /// Returns [`CaptureError::MonitorList`] if the OS fails to enumerate monitors.
 pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
-    let monitors =
-        Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
+    let monitors = Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
 
     Ok(monitors
         .into_iter()
@@ -67,8 +66,7 @@ impl ScreenCapturer {
     /// Returns [`CaptureError::MonitorList`] if enumeration fails, or
     /// [`CaptureError::MonitorNotFound`] if the index is out of range.
     pub fn new(monitor_index: usize, quality: Quality) -> Result<Self, CaptureError> {
-        let monitors =
-            Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
+        let monitors = Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
 
         let monitor = monitors
             .into_iter()
@@ -91,8 +89,7 @@ impl ScreenCapturer {
 
     /// Create a capturer for the primary monitor.
     pub fn primary(quality: Quality) -> Result<Self, CaptureError> {
-        let monitors =
-            Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
+        let monitors = Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
 
         let primary_idx = monitors
             .iter()

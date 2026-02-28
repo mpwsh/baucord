@@ -174,12 +174,12 @@ impl VadStage {
     ) -> (bool, bool) {
         // Gate is authoritative: if closed, never detect speech.
         // RNNoise pre-filter: skip expensive earshot on clear non-speech.
-       let vad_says_speech = if !gate_open || rnnoise_vad_prob < 0.1 {
-    false
-} else {
-    let detected = self.run_earshot(samples);
-    self.update_cooldown(detected)
-}; 
+        let vad_says_speech = if !gate_open || rnnoise_vad_prob < 0.1 {
+            false
+        } else {
+            let detected = self.run_earshot(samples);
+            self.update_cooldown(detected)
+        };
 
         // Hold timer: keep "speaking" for VAD_HOLD_FRAMES after speech ends.
         if vad_says_speech {

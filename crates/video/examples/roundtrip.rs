@@ -1,5 +1,5 @@
-use video::{ Quality, capture::ScreenCapturer};
 use std::time::Instant;
+use video::{capture::ScreenCapturer, Quality};
 
 fn main() {
     env_logger::init();
@@ -95,4 +95,3 @@ fn main() {
     println!("  Max pipeline FPS: {:.1}", max_fps);
     println!("  Decoded:      {}/{}", decoded_count, num_frames);
 }
-

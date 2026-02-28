@@ -265,7 +265,7 @@ impl AudioOutput {
             let high_wm = ring_capacity * 85 / 100;
             const HOP: usize = 480;
             let mut hop_buf = vec![0.0f32; HOP];
-            let mut resample_accum : Vec<f32> = Vec::with_capacity(2048);
+            let mut resample_accum: Vec<f32> = Vec::with_capacity(2048);
             let mut output_limiter = Limiter::new();
             let mut next_tick = Instant::now();
 
@@ -340,7 +340,6 @@ impl AudioOutput {
                             *s = (*s * gain).clamp(-0.99, 0.99);
                         }
                     }
-
 
                     if let Some(ref mut r) = resampler {
                         resample_accum.extend_from_slice(&hop_buf);

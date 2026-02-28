@@ -344,14 +344,14 @@ fn run_voice_loop(
         if let Some(voice) = state.vc.as_ref() {
             // Forward encoded packets to network (or drain in test mode)
             if let Some(id) = state.our_client_id {
-               if !is_testing_mic.load(Ordering::Relaxed) {
-    for mut packet in voice.take_outgoing_packets() {
-        packet.header.ssrc = id;
-        let _ = network_tx.try_send(NetworkControl::SendVoicePacket(packet));
-    }
-} else {
-    while voice.outgoing_receiver().try_recv().is_ok() {}
-} 
+                if !is_testing_mic.load(Ordering::Relaxed) {
+                    for mut packet in voice.take_outgoing_packets() {
+                        packet.header.ssrc = id;
+                        let _ = network_tx.try_send(NetworkControl::SendVoicePacket(packet));
+                    }
+                } else {
+                    while voice.outgoing_receiver().try_recv().is_ok() {}
+                }
             }
 
             // Update shared levels for UI meters

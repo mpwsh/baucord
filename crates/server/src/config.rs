@@ -52,7 +52,6 @@ fn default_video_buffer_size_mb() -> usize {
     protocol::VIDEO_BUFFER_BYTES / (1024 * 1024)
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LoggingSettings {
     pub level: String,

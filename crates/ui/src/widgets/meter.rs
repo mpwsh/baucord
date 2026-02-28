@@ -11,8 +11,8 @@ use crate::theme;
 use fltk::{draw, enums, frame, group, prelude::*};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ── Shared constants ────────────────────────────────────────────────────
 
@@ -174,7 +174,12 @@ pub fn gate(
         let thr_x = frm.x() + BAR_INSET_X + (usable_w as f32 * thr_scaled) as i32;
         draw::set_draw_color(theme::DANGER);
         draw::set_line_style(draw::LineStyle::Solid, 2);
-        draw::draw_line(thr_x, frm.y() + BAR_INSET_X, thr_x, frm.y() + frm.h() - BAR_INSET_X);
+        draw::draw_line(
+            thr_x,
+            frm.y() + BAR_INSET_X,
+            thr_x,
+            frm.y() + frm.h() - BAR_INSET_X,
+        );
         draw::set_line_style(draw::LineStyle::Solid, 1);
 
         draw_border(frm);

@@ -148,4 +148,3 @@ pub fn show(sender: app::Sender<UiMessage>, settings: &Settings) -> (window::Win
 
     (wind, error_frame)
 }
-

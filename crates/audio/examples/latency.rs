@@ -14,9 +14,9 @@
 //    and prints the measured latency
 // 4. Wait 1–2 seconds between snaps for clean measurements
 
+use audio::{AudioStats, VoiceChat, VoiceChatConfig};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use audio::{AudioStats, VoiceChat, VoiceChatConfig};
 
 // ── Tuning constants ────────────────────────────────────────────────────
 
@@ -58,7 +58,9 @@ struct LatencyStats {
 
 impl LatencyStats {
     fn new() -> Self {
-        Self { samples: Vec::new() }
+        Self {
+            samples: Vec::new(),
+        }
     }
 
     fn push(&mut self, latency_ms: f64) {
@@ -141,8 +143,14 @@ fn run_measurement_loop(stats: &AudioStats) {
                     println!(
                         "  🎯 #{:<3} Latency: {:.1}ms  (in={:.3} out={:.3})  │  \
                          avg={:.1}ms  min={:.1}ms  max={:.1}ms  p50={:.1}ms  [n={}]",
-                        latency.count(), latency_ms, input_peak, output_lvl,
-                        latency.avg(), latency.min(), latency.max(), latency.p50(),
+                        latency.count(),
+                        latency_ms,
+                        input_peak,
+                        output_lvl,
+                        latency.avg(),
+                        latency.min(),
+                        latency.max(),
+                        latency.p50(),
                         latency.count(),
                     );
 
