@@ -10,20 +10,19 @@
 use crossbeam_channel::{Receiver, Sender};
 use log::{error, info};
 use opus::{Application, Bitrate, Channels, Encoder};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::{
-    stats::AudioStats, transport::packet::AudioPacket, FRAME_SIZE, OPUS_BITRATE, OPUS_SAMPLE_RATE,
-};
+use crate::{stats::AudioStats, transport::packet::AudioPacket, FRAME_SIZE, OPUS_BITRATE, OPUS_SAMPLE_RATE};
 
-/// Encoder thread state. Created once, runs until the input channel closes.
+/// Encoder thread state. Created once, runs until stopped.
 struct EncoderWorker {
     encoder: Encoder,
     rx: Receiver<Vec<f32>>,
     tx: Sender<AudioPacket>,
     stats: Arc<AudioStats>,
+    should_stop: Arc<AtomicBool>,
 
     seq: u32,
     ts_48k: u32,
@@ -38,6 +37,7 @@ impl EncoderWorker {
         rx: Receiver<Vec<f32>>,
         tx: Sender<AudioPacket>,
         stats: Arc<AudioStats>,
+        should_stop: Arc<AtomicBool>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut encoder = Encoder::new(OPUS_SAMPLE_RATE, Channels::Mono, Application::Voip)?;
 
@@ -57,6 +57,7 @@ impl EncoderWorker {
             rx,
             tx,
             stats,
+            should_stop,
             seq: 0,
             ts_48k: 0,
             scratch: vec![0u8; 256],
@@ -67,21 +68,44 @@ impl EncoderWorker {
     fn run(&mut self) {
         info!("🎤 Encoder thread started");
 
-        while let Ok(samples) = self.rx.recv() {
-            if samples.len() != FRAME_SIZE {
-                error!(
-                    "Encoder: expected {FRAME_SIZE} samples, got {}",
-                    samples.len()
-                );
-                continue;
+        // Use recv_timeout instead of blocking recv() so the encoder
+        // can check should_stop periodically. This prevents hangs
+        // during shutdown if a sender clone is still alive (e.g.,
+        // AudioInput's worker thread hasn't fully joined yet).
+        let timeout = Duration::from_millis(50);
+
+        loop {
+            if self.should_stop.load(Ordering::Relaxed) {
+                break;
             }
 
-            self.encode_frame(&samples);
-            self.maybe_update_fec();
+            match self.rx.recv_timeout(timeout) {
+                Ok(samples) => {
+                    if samples.len() != FRAME_SIZE {
+                        error!(
+                            "Encoder: expected {FRAME_SIZE} samples, got {}",
+                            samples.len()
+                        );
+                        continue;
+                    }
+
+                    self.encode_frame(&samples);
+                    self.maybe_update_fec();
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // No data — loop back and check should_stop.
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    // All senders dropped — exit cleanly.
+                    break;
+                }
+            }
         }
 
         info!("🎤 Encoder thread stopped");
     }
+
     #[expect(
         clippy::needless_return,
         reason = "explicit return exits the thread loop"
@@ -105,7 +129,11 @@ impl EncoderWorker {
                 self.ts_48k = self.ts_48k.wrapping_add(FRAME_SIZE as u32);
                 self.stats.record_packet_sent(size);
 
-                if self.tx.send(packet).is_err() {
+                if self.tx.try_send(packet).is_err() {
+                    // Output channel full or disconnected — drop the packet.
+                    // This prevents the encoder from blocking when nobody
+                    // is draining outgoing packets (e.g., during shutdown
+                    // or if the network layer is stalled).
                     return;
                 }
             }
@@ -140,13 +168,14 @@ impl EncoderWorker {
 
 /// Spawn the encoder thread. Returns the join handle.
 ///
-/// The thread runs until the `rx` channel is closed (all senders dropped).
+/// The thread runs until `should_stop` is set or the `rx` channel closes.
 pub fn spawn(
     rx: Receiver<Vec<f32>>,
     tx: Sender<AudioPacket>,
     stats: Arc<AudioStats>,
+    should_stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || match EncoderWorker::new(rx, tx, stats) {
+    std::thread::spawn(move || match EncoderWorker::new(rx, tx, stats, should_stop) {
         Ok(mut worker) => worker.run(),
         Err(e) => error!("Failed to create Opus encoder: {e}"),
     })

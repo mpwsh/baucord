@@ -435,8 +435,10 @@ impl Drop for AudioInput {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Relaxed);
         self.stream.take();
+        eprintln!("DEBUG: AudioInput joining worker...");
         if let Some(thread) = self.worker_thread.take() {
             let _ = thread.join();
         }
+        eprintln!("DEBUG: AudioInput worker joined");
     }
 }

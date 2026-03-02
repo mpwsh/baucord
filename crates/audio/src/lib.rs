@@ -12,6 +12,8 @@
 //!
 //! ```text
 //! network → decode (+ FEC/PLC) → jitter buffer → gain → resample → playback
+//!                                      ↓
+//!                              voice reference ring → echo canceller (stream capture)
 //! ```
 //!
 //! ## Device compatibility
@@ -54,6 +56,7 @@ use input::AudioInput;
 use output::AudioOutput;
 
 use crate::input_config::InputConfig;
+use crate::processor::echo_cancel::VoiceReferenceRing;
 
 /// Internal pipeline sample rate (Opus native).
 pub const OPUS_SAMPLE_RATE: u32 = 48_000;
@@ -96,6 +99,7 @@ pub struct VoiceChat {
     is_speaking: Arc<AtomicBool>,
     output_gain: Arc<AtomicU32>,
     deafened: Arc<AtomicBool>,
+    voice_reference: Arc<VoiceReferenceRing>,
 
     config: VoiceChatConfig,
 }
@@ -120,7 +124,7 @@ impl VoiceChat {
 
         // ── Spawn encoder thread ────────────────────────────────────
         let encoder_thread =
-            encoder::spawn(audio_to_encoder_rx, encoder_to_network_tx, stats.clone());
+            encoder::spawn(audio_to_encoder_rx, encoder_to_network_tx, stats.clone(), should_stop.clone());
 
         // ── Spawn decoder pool ──────────────────────────────────────
         let decoder_pool = decoder::spawn_pool(
@@ -130,6 +134,12 @@ impl VoiceChat {
             should_stop.clone(),
             removed_peers.clone(),
         );
+
+        // ── Voice reference ring (shared with output + stream capture) ──
+        let voice_reference = Arc::new(VoiceReferenceRing::new(
+            (OPUS_SAMPLE_RATE as usize * 200) / 1000, // 200ms at 48kHz = 9600 samples
+        ));
+
         let input_config = Arc::new(InputConfig::new(
             config.noise_suppression,
             config.input_gain,
@@ -156,6 +166,7 @@ impl VoiceChat {
             user_settings: Arc::new(Mutex::new(HashMap::new())),
             removed_peers,
             stats,
+            voice_reference,
             is_speaking: Arc::new(AtomicBool::new(false)),
             output_gain,
             deafened,
@@ -201,6 +212,7 @@ impl VoiceChat {
             self.user_settings.clone(),
             self.stats.clone(),
             self.config.output_gain,
+            self.voice_reference.clone(),
         )?;
         self.output_gain = output.output_gain_handle();
         self.deafened = output.deafened_handle();
@@ -210,6 +222,22 @@ impl VoiceChat {
     }
 
     // ── Public API ───────────────────────────────────────────────────────
+
+    /// Get a reference to the voice reference ring for stream capture.
+    ///
+    /// Pass this to [`SystemAudioCapture::new()`] so the echo canceller
+    /// can subtract voice audio from the system loopback before encoding.
+    ///
+    /// ```rust,ignore
+    /// let voice_chat = VoiceChat::new(config)?;
+    /// let mut capture = SystemAudioCapture::new(
+    ///     stats,
+    ///     Some(voice_chat.voice_reference()),
+    /// )?;
+    /// ```
+    pub fn voice_reference(&self) -> Arc<VoiceReferenceRing> {
+        self.voice_reference.clone()
+    }
 
     pub fn play_sound(&self, sound: SoundType) {
         let _ = self.sound_tx.try_send(sound);
@@ -453,23 +481,38 @@ impl VoiceChat {
 
 impl Drop for VoiceChat {
     fn drop(&mut self) {
+        // Signal all threads that check this flag.
         self.should_stop.store(true, Ordering::Release);
 
-        // Drop audio devices first — stops platform callbacks.
+        // Mute input so the worker stops producing frames immediately.
+        self.input_config.muted.store(true, Ordering::Release);
+
+        // Drop audio devices FIRST — this stops cpal callbacks and
+        // joins AudioInput/AudioOutput worker threads. The input worker
+        // uses try_send, so it won't block even if the channel is full.
+        // AudioInput::drop sets its own should_stop and joins its worker.
+        // AudioOutput::drop does the same.
         self.input.take();
         self.output.take();
 
-        // Drop channel senders to unblock threads blocked on recv().
+        // NOW disconnect all channels. With input/output gone, no one
+        // is sending into audio_to_encoder or network_to_decoder.
+        // Replacing the senders drops the last sender clone for each
+        // channel, which causes recv()/recv_timeout() to return
+        // Disconnected — unblocking the encoder and decoder threads.
         let (dead_tx, _) = crossbeam_channel::bounded::<Vec<f32>>(0);
         self.audio_to_encoder_tx = dead_tx;
 
         let (dead_tx, _) = crossbeam_channel::bounded::<AudioPacket>(0);
         self.network_to_decoder_tx = dead_tx;
 
+        // Join encoder thread — now unblocked because all senders are gone.
         if let Some(thread) = self.encoder_thread.take() {
             let _ = thread.join();
         }
 
+        // Join decoder pool — dispatcher unblocked because sender is gone.
+        // Workers unblocked because dispatcher dropped their senders.
         if let Some(pool) = self.decoder_pool.take() {
             let _ = pool.dispatcher.join();
             for thread in pool.workers {

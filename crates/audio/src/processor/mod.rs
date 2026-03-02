@@ -43,6 +43,7 @@ pub mod agc;
 pub mod clamp;
 pub mod compressor;
 pub mod denoise;
+pub mod echo_cancel;
 pub mod gain;
 pub mod gate;
 pub mod level_meter;

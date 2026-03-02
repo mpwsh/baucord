@@ -2,8 +2,16 @@
 //!
 //! Uses cpal's `default_output_config()` for maximum device compatibility,
 //! then resamples from 48 kHz to whatever the device wants.
+//!
+//! ## Voice reference ring
+//!
+//! After mixing peer audio via `pull_mixed()`, the raw hop buffer is
+//! pushed to a shared [`VoiceReferenceRing`]. This gives the echo
+//! canceller (used by stream capture and optionally mic input) a
+//! time-aligned reference of what was played through the speakers.
 
 use crate::config::PeerAudioSettings;
+use crate::processor::echo_cancel::VoiceReferenceRing;
 use crate::processor::limiter::Limiter;
 use crate::resampler::build_output_resampler;
 use crate::sounds::{SoundBank, SoundType};
@@ -47,6 +55,9 @@ pub struct AudioOutput {
     /// When true, the worker pushes silence instead of decoding/mixing.
     deafened: Arc<AtomicBool>,
 
+    // Echo cancellation reference
+    voice_reference: Arc<VoiceReferenceRing>,
+
     // Stats
     stats: Arc<AudioStats>,
 }
@@ -59,6 +70,7 @@ impl AudioOutput {
         peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
         stats: Arc<AudioStats>,
         output_gain: f32,
+        voice_reference: Arc<VoiceReferenceRing>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
 
@@ -103,6 +115,7 @@ impl AudioOutput {
             peer_settings,
             output_gain: Arc::new(AtomicU32::new(output_gain.to_bits())),
             deafened: Arc::new(AtomicBool::new(false)),
+            voice_reference,
             stats,
             decoder_rx: Some(decoder_rx),
             sound_rx: Some(sound_rx),
@@ -139,6 +152,7 @@ impl AudioOutput {
                 sample_rate,
                 self.output_gain.clone(),
                 self.deafened.clone(),
+                self.voice_reference.clone(),
             );
             self.worker_thread = Some(handle);
         }
@@ -233,6 +247,7 @@ impl AudioOutput {
         device_sample_rate: u32,
         output_gain: Arc<AtomicU32>,
         deafened: Arc<AtomicBool>,
+        voice_reference: Arc<VoiceReferenceRing>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let mut jitter_buffer =
@@ -315,6 +330,14 @@ impl AudioOutput {
                         jitter_buffer.pull_mixed(HOP, &mut hop_buf);
                     }
 
+                    // ── Push raw mix to voice reference ring ────────────
+                    // This happens BEFORE gain/limiting so the echo
+                    // canceller gets the unprocessed voice mix — matching
+                    // what the OS audio engine receives after our gain
+                    // stage (the canceller's delay estimator accounts
+                    // for the full pipeline delay anyway).
+                    voice_reference.push(&hop_buf);
+
                     // Mix notification sound into hop buffer (at 48 kHz,
                     // before gain so it respects the master volume).
                     // Notifications play even when deafened — you should
@@ -331,10 +354,9 @@ impl AudioOutput {
                         }
                     }
 
-                    // Apply master output gain (always — notifications
-                    // need gain even when deafened).
-                    let gain = f32::from_bits(output_gain.load(Ordering::Relaxed));
+                    // Apply limiter then master output gain
                     output_limiter.process_samples(&mut hop_buf);
+                    let gain = f32::from_bits(output_gain.load(Ordering::Relaxed));
                     if (gain - 1.0).abs() > f32::EPSILON {
                         for s in hop_buf.iter_mut() {
                             *s = (*s * gain).clamp(-0.99, 0.99);

@@ -234,8 +234,7 @@ impl Sidebar {
     pub fn update_stream_stats(&mut self, stats: Option<(&str, f32, f32)>) {
         match stats {
             Some((_, avg_kb, encode_ms)) => {
-                let label =
-                    format!("  Stream: 720p 30fps | {avg_kb:.0}KB | {encode_ms:.1}ms enc");
+                let label = format!("  Stream: 720p 30fps | {avg_kb:.0}KB | {encode_ms:.1}ms enc");
                 self.stream_stats_label.set_label(&label);
                 if !self.stream_stats_label.visible() {
                     self.stream_stats_label.show();

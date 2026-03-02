@@ -33,7 +33,7 @@ nnnoiseless = "0.5"
 
 earshot = { git = "https://github.com/mpwsh/earshot" }
 serde = { version = "1", features = ["derive"], optional = true }
-
+rustfft = "6.4.1"
 
 # Logging
 log = "0.4"
@@ -42,10 +42,18 @@ env_logger = "0.11"
 [dev-dependencies]
 fltk = { version = "1.5", features = ["fltk-bundled"] }
 ui = { path = "../ui" }
+hound = "3.5"
+
 
 [[example]]
 name = "stats"
 path = "examples/stats.rs"
+
+
+[[example]]
+name = "echo_cancel"
+path = "examples/echo_cancel.rs"
+
 
 [[example]]
 name = "latency_profile"

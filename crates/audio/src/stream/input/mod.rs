@@ -37,6 +37,8 @@
 //! to the screen share viewer's audio output rather than mixing with
 //! voice chat.
 
+use crate::processor::echo_cancel::{EchoCancelConfig, EchoCanceller, VoiceReferenceRing};
+use crate::processor::{AudioProcessor, FrameContext};
 use crate::stats::AudioStats;
 use crate::OPUS_SAMPLE_RATE;
 
@@ -482,6 +484,10 @@ pub struct SystemAudioCapture {
     /// Stats (shared with voice chat engine for unified reporting).
     stats: Arc<AudioStats>,
 
+    /// Voice reference ring for echo cancellation.
+    /// `None` if no voice reference is available (echo cancellation disabled).
+    voice_reference: Option<Arc<VoiceReferenceRing>>,
+
     /// Platform backend handle — kept alive to maintain capture stream.
     #[cfg(target_os = "windows")]
     backend: Option<wasapi_loopback::WasapiLoopback>,
@@ -494,8 +500,15 @@ pub struct SystemAudioCapture {
 impl SystemAudioCapture {
     /// Create a new system audio capturer.
     ///
+    /// - `stats`: shared audio statistics
+    /// - `voice_reference`: voice output ring for echo cancellation
+    ///   (`None` to disable — voices will remain in the stream)
+    ///
     /// Does not start capturing — call `start()` when screen sharing begins.
-    pub fn new(stats: Arc<AudioStats>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        stats: Arc<AudioStats>,
+        voice_reference: Option<Arc<VoiceReferenceRing>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // packet_rx is created as a placeholder — start() replaces it
         // with a real channel connected to the worker thread.
         let (_dead_tx, packet_rx) = bounded(1);
@@ -508,6 +521,7 @@ impl SystemAudioCapture {
             is_muted: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             stats,
+            voice_reference,
             backend: None,
         })
     }
@@ -549,6 +563,7 @@ impl SystemAudioCapture {
         let is_muted = self.is_muted.clone();
         let volume = self.volume.clone();
         let stats = self.stats.clone();
+        let voice_ref = self.voice_reference.clone();
 
         self.should_stop.store(false, Ordering::Relaxed);
 
@@ -560,6 +575,7 @@ impl SystemAudioCapture {
             volume,
             stats,
             device_sample_rate,
+            voice_ref,
         );
 
         self.worker_thread = Some(worker);
@@ -567,8 +583,8 @@ impl SystemAudioCapture {
         self.is_active.store(true, Ordering::Relaxed);
 
         info!(
-            "🔊🎤 System audio capture ready: {} @ {}Hz",
-            device_name, device_sample_rate
+            "🔊🎤 System audio capture ready: {} @ {}Hz (echo_cancel={})",
+            device_name, device_sample_rate, self.voice_reference.is_some(),
         );
 
         Ok(())
@@ -647,6 +663,7 @@ impl SystemAudioCapture {
         volume: Arc<AtomicU32>,
         stats: Arc<AudioStats>,
         device_sample_rate: u32,
+        voice_reference: Option<Arc<VoiceReferenceRing>>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             Self::worker_loop(
@@ -657,6 +674,7 @@ impl SystemAudioCapture {
                 volume,
                 stats,
                 device_sample_rate,
+                voice_reference,
             );
         })
     }
@@ -669,6 +687,7 @@ impl SystemAudioCapture {
         volume: Arc<AtomicU32>,
         _stats: Arc<AudioStats>,
         device_sample_rate: u32,
+        voice_reference: Option<Arc<VoiceReferenceRing>>,
     ) {
         // ── Opus encoder (stereo, music-optimized) ──────────────────────
         let mut encoder = match opus::Encoder::new(
@@ -692,6 +711,28 @@ impl SystemAudioCapture {
         if let Err(e) = encoder.set_dtx(false) {
             warn!("Failed to disable DTX for system audio: {e}");
         }
+
+        // ── Echo canceller (voice removal from stream) ──────────────────
+        // Process L and R channels separately through their own canceller.
+        let mut echo_cancel_l: Option<EchoCanceller> = None;
+        let mut echo_cancel_r: Option<EchoCanceller> = None;
+
+        if let Some(ref vr) = voice_reference {
+            echo_cancel_l = Some(EchoCanceller::new(
+                vr.clone(),
+                EchoCancelConfig::for_stream(),
+                OPUS_SAMPLE_RATE as usize,
+            ));
+            echo_cancel_r = Some(EchoCanceller::new(
+                vr.clone(),
+                EchoCancelConfig::for_stream(),
+                OPUS_SAMPLE_RATE as usize,
+            ));
+            info!("🔊🎤 Stream echo cancellation enabled");
+        }
+
+        let mut echo_scratch_l: Vec<f32> = Vec::with_capacity(SYSTEM_AUDIO_FRAME_SIZE);
+        let mut echo_scratch_r: Vec<f32> = Vec::with_capacity(SYSTEM_AUDIO_FRAME_SIZE);
 
         // ── Resampler (stereo, if device rate ≠ 48 kHz) ────────────────
         // rubato operates on deinterleaved channels: Vec<Vec<f32>> where
@@ -867,6 +908,32 @@ impl SystemAudioCapture {
 
             while accumulator.len() >= interleaved_frame_size {
                 let mut frame: Vec<f32> = accumulator.drain(..interleaved_frame_size).collect();
+
+                // ── Echo cancellation (remove voice from stream) ────────
+                // Deinterleave, process each channel, re-interleave.
+                if echo_cancel_l.is_some() {
+                    echo_scratch_l.clear();
+                    echo_scratch_r.clear();
+                    for pair in frame.chunks_exact(2) {
+                        echo_scratch_l.push(pair[0]);
+                        echo_scratch_r.push(pair[1]);
+                    }
+
+                    let mut ctx = FrameContext::default();
+
+                    if let Some(ref mut ec) = echo_cancel_l {
+                        ec.process(&mut echo_scratch_l, &mut ctx);
+                    }
+                    if let Some(ref mut ec) = echo_cancel_r {
+                        ec.process(&mut echo_scratch_r, &mut ctx);
+                    }
+
+                    // Re-interleave
+                    for i in 0..echo_scratch_l.len() {
+                        frame[i * 2] = echo_scratch_l[i];
+                        frame[i * 2 + 1] = echo_scratch_r[i];
+                    }
+                }
 
                 // ── Apply volume ────────────────────────────────────────
                 let vol = f32::from_bits(volume.load(Ordering::Relaxed));
