@@ -319,16 +319,23 @@ fn run_voice_loop(
     wake: WakeFn,
 ) {
     let mut state = VoiceLoopState::new();
+    let (_dead_tx, dead_rx) = bounded::<audio::AudioPacket>(1);
 
     while state.running {
-        // Block until a message arrives or 5ms timeout (for polling outgoing packets)
+        let outgoing = state.vc.as_ref().map(|v| v.outgoing_receiver());
         select! {
-            recv(control_rx) -> msg => {
-                match msg {
-                    Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
-                    Err(_) => { state.running = false; }
+            recv(control_rx) -> msg => match msg {
+                Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
+                Err(_) => { state.running = false; }
+            },
+            recv(outgoing.as_ref().unwrap_or(&dead_rx)) -> pkt => {
+                if let (Ok(mut packet), Some(id)) = (pkt, state.our_client_id) {
+                    if !is_testing_mic.load(Ordering::Relaxed) {
+                        packet.header.ssrc = id;
+                        let _ = network_tx.try_send(NetworkControl::SendVoicePacket(packet));
+                    }
                 }
-            }
+            },
             default(Duration::from_millis(5)) => {}
         }
 

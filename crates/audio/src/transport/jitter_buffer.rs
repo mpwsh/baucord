@@ -143,6 +143,8 @@ pub struct AdaptiveJitterBuffer {
     concealment_count: u32,
     /// Mid-stream underruns observed since last adapt() call.
     underrun_count: u32,
+    /// Last target value emitted to the debug log (ms).
+    last_logged_target_ms: f32,
 }
 
 impl AdaptiveJitterBuffer {
@@ -163,6 +165,7 @@ impl AdaptiveJitterBuffer {
             stable_ticks: 0,
             concealment_count: 0,
             underrun_count: 0,
+            last_logged_target_ms: initial_target_ms as f32,
         }
     }
 
@@ -214,9 +217,19 @@ impl AdaptiveJitterBuffer {
                 #[allow(clippy::cast_precision_loss)]
                 let expected_delta =
                     frame.timestamp.wrapping_sub(last_ts) as f32 / self.sample_rate as f32;
-                // Guard against clock weirdness (device switch, ts reset):
-                // ignore implausible samples instead of poisoning the EMA.
-                if expected_delta > 0.0 && expected_delta < 2.0 && arrival_delta < 2.0 {
+                // Only near-continuous packets inform the estimator.
+                // Inter-arrival jitter is defined on a flowing stream;
+                // with DTX the stream pauses (utterance gaps, ~400 ms
+                // silence refreshes), and an interval that spans a pause
+                // measures the pause, not the network. Those samples are
+                // pure noise, and via the EMA + the "jump target up
+                // immediately" rule, a few of them could park the target
+                // — and therefore the priming delay every utterance pays
+                // — far above what the network needs. Media-time
+                // continuity (expected_delta) is the right gate: delayed
+                // bursts of continuous speech still qualify, pauses of
+                // any kind never do.
+                if expected_delta > 0.0 && expected_delta <= 0.1 && arrival_delta < 0.5 {
                     let jitter_sample = (arrival_delta - expected_delta).abs();
 
                     // Asymmetric EMA:
@@ -304,8 +317,17 @@ impl AdaptiveJitterBuffer {
 
             // Priming: hold playout until the target cushion exists so a
             // late packet has time to arrive before its slot plays.
+            //
+            // Capped at 60 ms: priming is paid in start-of-speech latency
+            // (packets arrive in real time, so priming T ms delays the
+            // first audible sample by T ms). On a network that genuinely
+            // needs a deeper buffer than the cap, utterance starts may
+            // conceal briefly and re-prime — a better trade than every
+            // utterance on every network paying the worst case up front.
             if peer.priming {
-                if peer.samples.len() >= self.target_samples {
+                let prime_cap = (60 * self.sample_rate) / 1000;
+                let prime_target = self.target_samples.min(prime_cap);
+                if peer.samples.len() >= prime_target {
                     peer.priming = false;
                 } else {
                     continue;
@@ -478,6 +500,20 @@ impl AdaptiveJitterBuffer {
         self.target_samples = self
             .target_samples
             .clamp(self.min_samples, self.max_samples);
+
+        // Debug-log meaningful target moves — cheap field telemetry for
+        // exactly the "why is cold-start latency high" question.
+        let target_now = self.target_ms();
+        if (target_now - self.last_logged_target_ms).abs() >= 5.0 {
+            log::debug!(
+                "jitter target {:.1} ms -> {:.1} ms (conceal={}, underrun={})",
+                self.last_logged_target_ms,
+                target_now,
+                self.concealment_count,
+                self.underrun_count
+            );
+            self.last_logged_target_ms = target_now;
+        }
 
         // Reset event counters for next cycle
         self.concealment_count = 0;
