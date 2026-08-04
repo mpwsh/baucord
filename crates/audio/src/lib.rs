@@ -114,6 +114,9 @@ impl VoiceChat {
         let (decoder_to_audio_tx, decoder_to_audio_rx) = bounded(max_peers * 2);
         let (sound_tx, sound_rx) = bounded::<sounds::SoundType>(4);
 
+        // Build marker: lets a log capture prove which build is running.
+        log::info!("audio crate v0.4.2 [latency-patch r3] initializing");
+
         // ── Shared atomics (created once, passed to children) ───────
         let output_gain = Arc::new(AtomicU32::new(config.output_gain.to_bits()));
         let deafened = Arc::new(AtomicBool::new(false));
