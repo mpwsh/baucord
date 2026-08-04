@@ -74,6 +74,8 @@ pub struct StreamAudioOutput {
     ring_producer: Option<Producer<f32>>,
     ring_consumer: Option<Consumer<f32>>,
     ring_capacity: usize,
+    wake_tx: Option<Sender<()>>,
+    wake_rx: Option<Receiver<()>>,
 
     // Worker
     worker_thread: Option<thread::JoinHandle<()>>,
@@ -133,6 +135,8 @@ impl StreamAudioOutput {
         let ring_size = ((sample_rate as usize) * 2 * 100) / 1000;
         let ring_size = ring_size.max(9600);
         let (ring_producer, ring_consumer) = RingBuffer::new(ring_size);
+        // Wake latch: playback callback → worker ("ring space freed").
+        let (wake_tx, wake_rx) = bounded::<()>(1);
 
         // Frame channel: decoder thread pushes decoded frames here
         let (frame_tx, frame_rx) = bounded::<StreamAudioFrame>(16);
@@ -146,6 +150,8 @@ impl StreamAudioOutput {
             ring_producer: Some(ring_producer),
             ring_consumer: Some(ring_consumer),
             ring_capacity: ring_size,
+            wake_tx: Some(wake_tx),
+            wake_rx: Some(wake_rx),
             worker_thread: None,
             should_stop: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(volume.clamp(0.0, 2.0).to_bits())),
@@ -163,12 +169,15 @@ impl StreamAudioOutput {
         let format = self.device_config.sample_format();
 
         // Start worker thread BEFORE the cpal stream so it's ready to fill the ring
-        if let (Some(ring_producer), Some(frame_rx)) =
-            (self.ring_producer.take(), self.frame_rx.take())
-        {
+        if let (Some(ring_producer), Some(frame_rx), Some(wake_rx)) = (
+            self.ring_producer.take(),
+            self.frame_rx.take(),
+            self.wake_rx.take(),
+        ) {
             let handle = Self::spawn_worker(
                 ring_producer,
                 frame_rx,
+                wake_rx,
                 self.should_stop.clone(),
                 self.ring_capacity,
                 sample_rate,
@@ -253,6 +262,7 @@ impl StreamAudioOutput {
             .ring_consumer
             .take()
             .ok_or("Ring consumer already taken")?;
+        let wake_tx = self.wake_tx.take().ok_or("Wake sender already taken")?;
         let ch = channels as usize;
 
         let stream = self.device.build_output_stream(
@@ -286,6 +296,9 @@ impl StreamAudioOutput {
                         }
                     }
                 }
+
+                // Ring space just freed — wake the worker to refill.
+                let _ = wake_tx.try_send(());
             },
             move |err| {
                 error!("Stream audio output error: {err}");
@@ -301,6 +314,7 @@ impl StreamAudioOutput {
     fn spawn_worker(
         mut ring_producer: Producer<f32>,
         frame_rx: Receiver<StreamAudioFrame>,
+        wake_rx: Receiver<()>,
         should_stop: Arc<AtomicBool>,
         ring_capacity: usize,
         device_sample_rate: u32,
@@ -309,6 +323,9 @@ impl StreamAudioOutput {
         voice_energy: Option<Arc<AtomicU32>>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            // Audio-class scheduling (MMCSS "Pro Audio" on Windows).
+            let _mmcss = crate::platform::promote_current_thread();
+
             // ── Voice canceller ─────────────────────────────────────────
             let mut canceller = voice_energy.as_ref().map(|_| VoiceCanceller::new());
 
@@ -481,13 +498,20 @@ impl StreamAudioOutput {
                     }
                 }
 
-                // ── Pace at 5ms intervals ───────────────────────────────
-                next_tick += Duration::from_millis(5);
+                // ── Pace at 5 ms, but wake early when the device drains
+                // the ring (production above is gated on ring fill, so
+                // extra wakes are harmless). Replaces a bare sleep that
+                // Windows could stretch to 15+ ms.
                 let now = Instant::now();
-                if next_tick > now {
-                    thread::sleep(next_tick - now);
-                } else {
-                    next_tick = now;
+                if now >= next_tick {
+                    next_tick += Duration::from_millis(5);
+                    if next_tick <= now {
+                        next_tick = now + Duration::from_millis(5);
+                    }
+                }
+                let wait = next_tick.saturating_duration_since(Instant::now());
+                if !wait.is_zero() {
+                    crate::platform::wait_for_wake(&wake_rx, wait);
                 }
             }
 

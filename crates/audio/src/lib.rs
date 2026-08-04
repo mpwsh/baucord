@@ -27,6 +27,7 @@
 
 mod config;
 mod decoder;
+mod platform;
 mod encoder;
 mod input;
 mod input_config;
@@ -98,6 +99,8 @@ pub struct VoiceChat {
     deafened: Arc<AtomicBool>,
 
     config: VoiceChatConfig,
+    /// Holds the OS timer at 1 ms resolution for the session (Windows).
+    _timer_guard: platform::TimerResolutionGuard,
 }
 
 impl VoiceChat {
@@ -160,6 +163,7 @@ impl VoiceChat {
             output_gain,
             deafened,
             config,
+            _timer_guard: platform::TimerResolutionGuard::acquire(),
         })
     }
 

@@ -649,6 +649,11 @@ impl SystemAudioCapture {
         device_sample_rate: u32,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            // Audio-class scheduling (MMCSS "Pro Audio" on Windows).
+            // The capture side lives in platform backends; the worker's
+            // short sleeps also benefit from the process-wide 1 ms timer
+            // held by VoiceChat's TimerResolutionGuard.
+            let _mmcss = crate::platform::promote_current_thread();
             Self::worker_loop(
                 ring_consumer,
                 packet_tx,

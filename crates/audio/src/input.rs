@@ -33,7 +33,7 @@ use crate::FRAME_SIZE;
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
-use crossbeam_channel::{Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
 use log::{error, info};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -55,6 +55,10 @@ pub struct AudioInput {
 
     ring_producer: Option<Producer<f32>>,
     ring_consumer: Option<Consumer<f32>>,
+
+    /// Wake latch: capture callback → worker ("data available").
+    wake_tx: Option<Sender<()>>,
+    wake_rx: Option<Receiver<()>>,
 
     worker_thread: Option<thread::JoinHandle<()>>,
     should_stop: Arc<AtomicBool>,
@@ -105,6 +109,11 @@ impl AudioInput {
 
         let ring_size = ((sample_rate as usize) * 200) / 1000;
         let (ring_producer, ring_consumer) = RingBuffer::new(ring_size.max(9600));
+        // Wake latch: the capture callback pings this after pushing samples
+        // so the worker wakes on data instead of sleep-polling. (Windows
+        // quantizes short sleeps to the system timer — historically up to
+        // ~15.6 ms — so polling with sleep(1ms) was a hidden latency tax.)
+        let (wake_tx, wake_rx) = bounded::<()>(1);
 
         Ok(Self {
             device,
@@ -114,6 +123,8 @@ impl AudioInput {
             loopback_tx,
             ring_producer: Some(ring_producer),
             ring_consumer: Some(ring_consumer),
+            wake_tx: Some(wake_tx),
+            wake_rx: Some(wake_rx),
             worker_thread: None,
             should_stop: Arc::new(AtomicBool::new(false)),
             config,
@@ -155,13 +166,19 @@ impl AudioInput {
         let stream_config = StreamConfig {
             channels,
             sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
+            // ~10 ms when the device advertises a supported range;
+            // untouched (Default) when it doesn't. See platform.rs.
+            buffer_size: crate::platform::request_low_latency_buffer(
+                self.device_config.buffer_size(),
+                sample_rate,
+            ),
         };
 
         let mut ring_producer = self
             .ring_producer
             .take()
             .ok_or("Ring producer already taken")?;
+        let wake_tx = self.wake_tx.take().ok_or("Wake sender already taken")?;
         let config = self.config.clone();
         let stats = self.stats.clone();
         let stats_err = self.stats.clone();
@@ -181,7 +198,11 @@ impl AudioInput {
 
                 for frame in data.chunks(ch) {
                     let sum: f32 = frame.iter().map(|s| s.to_sample::<f32>()).sum();
-                    let mono = (sum / ch as f32).clamp(-0.98, 0.98);
+                    // No clamp here: f32 has headroom and the processing
+                    // chain (gate → comp → AGC → clamp stage) owns levels.
+                    // Clipping at capture destroyed the very peaks the
+                    // compressor exists to handle gracefully.
+                    let mono = sum / ch as f32;
 
                     rms_acc += mono * mono;
                     count += 1;
@@ -197,6 +218,9 @@ impl AudioInput {
                     let scaled = (rms * 3.0).clamp(0.0, 1.0);
                     input_level.store(scaled.to_bits(), Ordering::Relaxed);
                 }
+
+                // Data available — wake the worker (lock-free latch).
+                let _ = wake_tx.try_send(());
             },
             move |err| {
                 error!("Input stream error: {err}");
@@ -215,6 +239,7 @@ impl AudioInput {
             .ring_consumer
             .take()
             .expect("Ring consumer already taken");
+        let wake_rx = self.wake_rx.take().expect("Wake receiver already taken");
 
         let should_stop = self.should_stop.clone();
         let stats = self.stats.clone();
@@ -280,6 +305,11 @@ impl AudioInput {
             // timestamp so the jitter buffer's estimator sees real deltas).
             let mut loopback_ts: u32 = 0;
 
+            // Ask the OS for audio-class scheduling (MMCSS "Pro Audio"
+            // on Windows; no-op elsewhere). Keeps small buffers glitch-
+            // free under load.
+            let _mmcss = crate::platform::promote_current_thread();
+
             info!(
                 "🎤 Input worker started (device {}Hz, resample={})",
                 device_sample_rate, needs_resample
@@ -289,7 +319,7 @@ impl AudioInput {
                 if config.muted.load(Ordering::Relaxed) {
                     is_speaking_handle.store(false, Ordering::Relaxed);
                     while ring_consumer.pop().is_ok() {}
-                    thread::sleep(Duration::from_millis(10));
+                    crate::platform::wait_for_wake(&wake_rx, Duration::from_millis(10));
                     chain.reset();
                     continue;
                 }
@@ -312,7 +342,10 @@ impl AudioInput {
                 }
 
                 if n_read == 0 {
-                    thread::sleep(Duration::from_millis(1));
+                    // Block until the capture callback delivers more audio
+                    // (or a short timeout as a safety net) instead of
+                    // sleep-polling.
+                    crate::platform::wait_for_wake(&wake_rx, Duration::from_millis(5));
                     continue;
                 }
 
