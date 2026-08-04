@@ -1,23 +1,34 @@
-//! Parallel Opus decoder pool.
+//! Opus decoder thread with per-peer packet reordering.
 //!
-//! Architecture:
-//! - One **dispatcher** thread reads incoming packets and routes them
-//!   to workers by `ssrc % DECODER_WORKERS`.
-//! - Each **worker** thread owns its own `HashMap<u64, Decoder>` — no
-//!   shared mutex during decode operations.
-//! - All workers send decoded audio to a shared output channel for the
-//!   jitter buffer / mixer.
+//! A single worker thread owns one stateful Opus decoder per peer.
+//! Decoding a 10 ms mono Opus frame costs tens of microseconds, so one
+//! thread comfortably handles dozens of simultaneous streams; the earlier
+//! garbling under load came from decoder state being shared across peers,
+//! not from decode throughput, and per-peer decoders fix it without a
+//! dispatcher and worker pool.
 //!
-//! This eliminates the serialized single-decoder bottleneck that caused
-//! garbled audio at 15+ simultaneous peers.
+//! ## Reordering
+//!
+//! UDP reorders packets routinely — especially at 100 packets/sec — and a
+//! swap must not be treated as loss. When packet N+2 arrives before N+1,
+//! it is *held* (not concealed) for a short window:
+//!
+//! - If N+1 arrives next (the common case), both are decoded in order and
+//!   nothing was concealed. Zero added latency on in-order streams.
+//! - If more packets pile up behind the gap, or the held packet goes
+//!   stale (~30 ms), the missing frame is declared lost and recovered
+//!   with PLC/FEC, exactly as before.
+//!
+//! Concealment frames are emitted with interpolated timestamps so the
+//! jitter buffer's estimator stays clean.
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use log::{error, info, warn};
 use opus::{Channels, Decoder};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     stats::AudioStats,
@@ -25,291 +36,410 @@ use crate::{
     FRAME_SIZE, OPUS_SAMPLE_RATE,
 };
 
-/// Number of decoder worker threads.
-pub const DECODER_WORKERS: usize = 4;
+/// A packet this far behind the playhead is a true late arrival
+/// (its slot has already been emitted or concealed) and is dropped.
+const LATE_WINDOW: u32 = 10;
 
-// ── Decoder worker ──────────────────────────────────────────────────────
+/// Gaps wider than this reset the peer's decoder instead of concealing.
+const MAX_GAP: u32 = 20;
 
-/// Per-worker state. Owns decoders for the peers routed to this worker.
-struct DecoderWorker {
-    id: usize,
+/// Maximum out-of-order packets held per peer while waiting for a gap
+/// to fill. Once exceeded, the earliest gap is concealed. At 10 ms
+/// frames this bounds reorder-induced delay to ~30 ms during loss and
+/// adds zero delay on in-order streams.
+const MAX_REORDER_HOLD: usize = 3;
+
+/// A held packet older than this is flushed via concealment even if no
+/// newer packets arrive (covers a reorder right before a DTX pause).
+const REORDER_STALE: Duration = Duration::from_millis(30);
+
+// ── Per-peer state ──────────────────────────────────────────────────────
+
+struct PeerState {
+    decoder: Decoder,
+    /// Sequence number of the last emitted frame.
+    last_seq: u32,
+    started: bool,
+    /// Out-of-order packets waiting for the gap before them to fill.
+    /// Tiny (≤ MAX_REORDER_HOLD entries), so a Vec beats wrap-hostile
+    /// ordered maps.
+    pending: Vec<(AudioPacket, Instant)>,
+}
+
+impl PeerState {
+    fn new() -> Option<Self> {
+        match Decoder::new(OPUS_SAMPLE_RATE, Channels::Mono) {
+            Ok(d) => Some(Self {
+                decoder: d,
+                last_seq: 0,
+                started: false,
+                pending: Vec::new(),
+            }),
+            Err(e) => {
+                error!("Failed to create Opus decoder: {e}");
+                None
+            }
+        }
+    }
+}
+
+// ── Decoder thread ──────────────────────────────────────────────────────
+
+struct DecoderThread {
     rx: Receiver<AudioPacket>,
     tx: Sender<DecodedFrame>,
     stats: Arc<AudioStats>,
     should_stop: Arc<AtomicBool>,
     removed_peers: Arc<Mutex<HashSet<u64>>>,
 
-    decoders: HashMap<u64, Decoder>,
-    last_seq: HashMap<u64, u32>,
+    peers: HashMap<u64, PeerState>,
     frame_buffer: Vec<f32>,
 }
 
-impl DecoderWorker {
-    fn new(
-        id: usize,
-        rx: Receiver<AudioPacket>,
-        tx: Sender<DecodedFrame>,
-        stats: Arc<AudioStats>,
-        should_stop: Arc<AtomicBool>,
-        removed_peers: Arc<Mutex<HashSet<u64>>>,
-    ) -> Self {
-        Self {
-            id,
-            rx,
-            tx,
-            stats,
-            should_stop,
-            removed_peers,
-            decoders: HashMap::new(),
-            last_seq: HashMap::new(),
-            frame_buffer: vec![0.0f32; FRAME_SIZE * 2],
-        }
-    }
-
+impl DecoderThread {
     fn run(&mut self) {
-        info!("🔊 Decoder worker {} started", self.id);
+        info!("Decoder thread started");
 
-        while let Ok(packet) = self.rx.recv() {
-            if self.should_stop.load(Ordering::Relaxed) {
-                break;
+        while !self.should_stop.load(Ordering::Relaxed) {
+            match self.rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(packet) => {
+                    // Stamp arrival NOW — before any decode work. This is
+                    // the timing point the jitter estimator relies on.
+                    let arrival = Instant::now();
+                    self.handle_packet(packet, arrival);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            self.process_packet(packet);
+
+            self.flush_stale();
+            self.sweep_removed();
         }
 
-        info!("🔊 Decoder worker {} stopped", self.id);
+        info!("Decoder thread stopped");
     }
 
-    /// Process one incoming packet: gap recovery + decode.
-    ///
-    /// This is intentionally one method (not split into sub-methods) because
-    /// the Opus decoder is stateful — PLC, FEC, and normal decode must happen
-    /// in exact sequence on the same `&mut Decoder`. Splitting into methods
-    /// that each do `self.decoders.get_mut()` would fight the borrow checker
-    /// and risk reordering decoder state mutations.
-    fn process_packet(&mut self, packet: AudioPacket) {
-        // Stamp arrival time NOW — before any decode work.
-        // This is the critical timing point for jitter estimation.
-        let arrival_time = Instant::now();
+    fn handle_packet(&mut self, packet: AudioPacket, arrival: Instant) {
         let ssrc = packet.header.ssrc;
 
-        // ── Check if peer was removed ───────────────────────────────
-        {
-            let Ok(mut removed_set) = self.removed_peers.lock() else {
-                return;
-            };
-            if removed_set.contains(&ssrc) {
-                self.decoders.remove(&ssrc);
-                self.last_seq.remove(&ssrc);
-                removed_set.remove(&ssrc);
+        // ── Removed peer? Drop state and the packet. ────────────────
+        if let Ok(mut removed) = self.removed_peers.lock() {
+            if removed.remove(&ssrc) {
+                self.peers.remove(&ssrc);
                 return;
             }
         }
 
-        let curr = packet.header.seq;
-        let worker_id = self.id;
-
-        let decoder = self.decoders.entry(ssrc).or_insert_with(|| {
-            info!("Worker {worker_id}: adding decoder for peer {ssrc}");
-            match Decoder::new(OPUS_SAMPLE_RATE, Channels::Mono) {
-                Ok(d) => d,
-                Err(e) => {
-                    // This is extremely unlikely (Opus init failure) but we must
-                    // not panic on an audio thread. Create a decoder that will
-                    // produce silence via PLC on every call.
-                    error!("Failed to create decoder for peer {ssrc}: {e}");
-                    // Last resort — try once more. If this also fails, the
-                    // application has deeper problems.
-                    Decoder::new(OPUS_SAMPLE_RATE, Channels::Mono)
-                        .expect("Opus decoder init failed twice — cannot recover")
+        if !self.peers.contains_key(&ssrc) {
+            match PeerState::new() {
+                Some(state) => {
+                    info!("Adding decoder for peer {ssrc}");
+                    self.peers.insert(ssrc, state);
                 }
+                // Opus init failure is near-impossible; skip this packet
+                // and retry on the next one rather than panicking on an
+                // audio-adjacent thread.
+                None => return,
             }
-        });
+        }
+        let peer = self.peers.get_mut(&ssrc).expect("peer just inserted");
 
-        // ── Sequence gap detection & recovery ───────────────────────
-        let last = *self.last_seq.get(&ssrc).unwrap_or(&curr.wrapping_sub(1));
-        let expect = last.wrapping_add(1);
-        let ahead = curr.wrapping_sub(expect);
-        let behind = expect.wrapping_sub(curr);
+        let seq = packet.header.seq;
 
-        // Late packet — already played past this, drop it
-        if behind > 0 && behind <= 10 {
+        if !peer.started {
+            peer.started = true;
+            peer.last_seq = seq;
+            decode_and_emit(
+                peer,
+                &packet,
+                false,
+                false,
+                arrival,
+                &mut self.frame_buffer,
+                &self.tx,
+                &self.stats,
+            );
             return;
         }
 
-        // Gap detected — recover missing frames
-        if ahead > 0 && ahead <= 20 {
-            let gap = ahead.min(10) as usize;
-            self.stats
-                .packets_lost
-                .fetch_add(ahead as u64, Ordering::Relaxed);
+        let expected = peer.last_seq.wrapping_add(1);
+        let behind = expected.wrapping_sub(seq);
+        let ahead = seq.wrapping_sub(expected);
 
-            // PLC for frames 1..N-1
-            if gap > 1 {
-                for j in 0..(gap - 1) {
-                    match decoder.decode_float(&[], &mut self.frame_buffer, false) {
-                        Ok(n) => {
-                            let _ = self.tx.send(DecodedFrame {
-                                peer_id: ssrc,
-                                seq: expect.wrapping_add(j as u32),
-                                arrival_time,
-                                samples: self.frame_buffer[..n].to_vec(),
-                                is_concealment: true,
-                            });
-                            self.stats.plc_frames.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            warn!("PLC decode failed for peer {ssrc} gap frame {j}: {e}");
-                        }
-                    }
-                }
-            }
-
-            // FEC for the last missing frame
-            match decoder.decode_float(&packet.opus_data, &mut self.frame_buffer, true) {
-                Ok(n) => {
-                    let _ = self.tx.send(DecodedFrame {
-                        peer_id: ssrc,
-                        seq: curr.wrapping_sub(1),
-                        arrival_time,
-                        samples: self.frame_buffer[..n].to_vec(),
-                        is_concealment: true,
-                    });
-                    self.stats.fec_recoveries.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    if let Ok(n) = decoder.decode_float(&[], &mut self.frame_buffer, false) {
-                        let _ = self.tx.send(DecodedFrame {
-                            peer_id: ssrc,
-                            seq: curr.wrapping_sub(1),
-                            arrival_time,
-                            samples: self.frame_buffer[..n].to_vec(),
-                            is_concealment: true,
-                        });
-                        self.stats.plc_frames.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        } else if ahead > 20 {
-            warn!("Peer {ssrc} seq jumped by {ahead} — resetting decoder");
-            if let Ok(new_dec) = Decoder::new(OPUS_SAMPLE_RATE, Channels::Mono) {
-                *decoder = new_dec;
-            } else {
-                error!("Failed to reset decoder for peer {ssrc}");
-            }
+        // Late/duplicate: this slot has already been emitted or concealed.
+        if behind >= 1 && behind <= LATE_WINDOW + 1 {
+            self.stats.packets_late.fetch_add(1, Ordering::Relaxed);
+            return;
         }
 
-        // ── Decode current packet normally ──────────────────────────
-        let t0 = Instant::now();
-        match decoder.decode_float(&packet.opus_data, &mut self.frame_buffer, false) {
-            Ok(n) => {
-                self.stats
+        if ahead == 0 {
+            // In order — the common case.
+            peer.last_seq = seq;
+            decode_and_emit(
+                peer,
+                &packet,
+                false,
+                false,
+                arrival,
+                &mut self.frame_buffer,
+                &self.tx,
+                &self.stats,
+            );
+            flush_consecutive(peer, &mut self.frame_buffer, &self.tx, &self.stats);
+        } else if ahead <= MAX_GAP {
+            // Ahead of the playhead: hold it and wait briefly for the
+            // missing packet(s) — this is reordering until proven loss.
+            if !peer.pending.iter().any(|(p, _)| p.header.seq == seq) {
+                peer.pending.push((packet, arrival));
+            }
+            while peer.pending.len() > MAX_REORDER_HOLD {
+                conceal_to_earliest_pending(peer, &mut self.frame_buffer, &self.tx, &self.stats);
+                flush_consecutive(peer, &mut self.frame_buffer, &self.tx, &self.stats);
+            }
+        } else {
+            // Huge jump — stream restarted or long outage. Reset.
+            warn!("Peer {ssrc} seq jumped by {ahead} — resetting decoder");
+            match Decoder::new(OPUS_SAMPLE_RATE, Channels::Mono) {
+                Ok(d) => peer.decoder = d,
+                Err(e) => error!("Failed to reset decoder for peer {ssrc}: {e}"),
+            }
+            peer.pending.clear();
+            peer.last_seq = seq;
+            decode_and_emit(
+                peer,
+                &packet,
+                false,
+                false,
+                arrival,
+                &mut self.frame_buffer,
+                &self.tx,
+                &self.stats,
+            );
+        }
+    }
+
+    /// Flush held packets whose gap will clearly never fill (e.g. a
+    /// reorder right before the sender went silent via DTX).
+    fn flush_stale(&mut self) {
+        let now = Instant::now();
+        for peer in self.peers.values_mut() {
+            while peer
+                .pending
+                .iter()
+                .any(|(_, held)| now.duration_since(*held) > REORDER_STALE)
+            {
+                conceal_to_earliest_pending(peer, &mut self.frame_buffer, &self.tx, &self.stats);
+                flush_consecutive(peer, &mut self.frame_buffer, &self.tx, &self.stats);
+            }
+        }
+    }
+
+    /// Drop decoder state for peers removed via the API, even if no
+    /// further packet from them ever arrives.
+    fn sweep_removed(&mut self) {
+        let Ok(mut removed) = self.removed_peers.lock() else {
+            return;
+        };
+        if removed.is_empty() {
+            return;
+        }
+        removed.retain(|ssrc| self.peers.remove(ssrc).is_none());
+    }
+}
+
+// ── Decode helpers (free functions to keep peer/self borrows disjoint) ──
+
+/// Decode `packet` and emit the frame. `fec` requests in-band FEC decode
+/// (recovers the *previous* frame from this packet); `concealment` marks
+/// the emitted frame as synthetic for the jitter buffer.
+#[allow(clippy::too_many_arguments)]
+fn decode_and_emit(
+    peer: &mut PeerState,
+    packet: &AudioPacket,
+    fec: bool,
+    concealment: bool,
+    arrival: Instant,
+    buf: &mut Vec<f32>,
+    tx: &Sender<DecodedFrame>,
+    stats: &AudioStats,
+) {
+    let t0 = Instant::now();
+    match peer.decoder.decode_float(&packet.opus_data, buf, fec) {
+        Ok(n) => {
+            if !concealment {
+                stats
                     .last_decode_us
                     .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-                self.stats.record_packet_received(packet.opus_data.len());
-
-                if self
-                    .tx
-                    .send(DecodedFrame {
-                        peer_id: ssrc,
-                        seq: curr,
-                        arrival_time,
-                        samples: self.frame_buffer[..n].to_vec(),
-                        is_concealment: false,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                self.last_seq.insert(ssrc, curr);
+                stats.record_packet_received(packet.opus_data.len());
             }
-            Err(e) => {
-                error!("Decode error for peer {ssrc}: {e}");
-                self.stats.decode_errors.fetch_add(1, Ordering::Relaxed);
+            emit(
+                packet.header.ssrc,
+                packet.header.seq,
+                packet.header.timestamp,
+                arrival,
+                &buf[..n],
+                concealment,
+                tx,
+            );
+        }
+        Err(e) => {
+            error!("Decode error for peer {}: {e}", packet.header.ssrc);
+            stats.decode_errors.fetch_add(1, Ordering::Relaxed);
 
-                if let Ok(n) = decoder.decode_float(&[], &mut self.frame_buffer, false) {
-                    let _ = self.tx.send(DecodedFrame {
-                        peer_id: ssrc,
-                        seq: curr,
-                        arrival_time,
-                        samples: self.frame_buffer[..n].to_vec(),
-                        is_concealment: true,
-                    });
-                    self.stats.plc_frames.fetch_add(1, Ordering::Relaxed);
-                }
-                self.last_seq.insert(ssrc, curr);
+            // Corrupt payload — substitute PLC so the timeline stays intact.
+            if let Ok(n) = peer.decoder.decode_float(&[], buf, false) {
+                stats.plc_frames.fetch_add(1, Ordering::Relaxed);
+                emit(
+                    packet.header.ssrc,
+                    packet.header.seq,
+                    packet.header.timestamp,
+                    arrival,
+                    &buf[..n],
+                    true,
+                    tx,
+                );
             }
         }
+    }
+}
+
+fn emit(
+    peer_id: u64,
+    seq: u32,
+    timestamp: u32,
+    arrival_time: Instant,
+    samples: &[f32],
+    is_concealment: bool,
+    tx: &Sender<DecodedFrame>,
+) {
+    // try_send: if the output side is backed up, dropping a frame is the
+    // right real-time behavior — and it means shutdown can never block
+    // this thread inside a send.
+    let _ = tx.try_send(DecodedFrame {
+        peer_id,
+        seq,
+        timestamp,
+        arrival_time,
+        samples: samples.to_vec(),
+        is_concealment,
+    });
+}
+
+/// Give up on the gap in front of the earliest held packet: conceal the
+/// missing frames (PLC for all but the last, FEC from the held packet for
+/// the last), then decode the held packet itself and advance the playhead.
+fn conceal_to_earliest_pending(
+    peer: &mut PeerState,
+    buf: &mut Vec<f32>,
+    tx: &Sender<DecodedFrame>,
+    stats: &Arc<AudioStats>,
+) {
+    let expected = peer.last_seq.wrapping_add(1);
+
+    // Earliest pending = smallest wrapping distance from `expected`.
+    let Some(idx) = peer
+        .pending
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (p, _))| p.header.seq.wrapping_sub(expected))
+        .map(|(i, _)| i)
+    else {
+        return;
+    };
+    let (packet, arrival) = peer.pending.swap_remove(idx);
+
+    let gap = packet.header.seq.wrapping_sub(expected); // ≥ 1 missing frames
+    stats
+        .packets_lost
+        .fetch_add(u64::from(gap), Ordering::Relaxed);
+
+    // PLC for all missing frames except the one right before the held
+    // packet — that one can often be recovered exactly from in-band FEC.
+    for j in 0..gap.saturating_sub(1) {
+        match peer.decoder.decode_float(&[], buf, false) {
+            Ok(n) => {
+                stats.plc_frames.fetch_add(1, Ordering::Relaxed);
+                let seq = expected.wrapping_add(j);
+                let ts = packet
+                    .header
+                    .timestamp
+                    .wrapping_sub((gap - j) * FRAME_SIZE as u32);
+                emit(packet.header.ssrc, seq, ts, arrival, &buf[..n], true, tx);
+            }
+            Err(e) => warn!("PLC decode failed for peer {}: {e}", packet.header.ssrc),
+        }
+    }
+
+    // FEC recovery of the frame immediately before the held packet.
+    let fec_seq = packet.header.seq.wrapping_sub(1);
+    let fec_ts = packet.header.timestamp.wrapping_sub(FRAME_SIZE as u32);
+    match peer.decoder.decode_float(&packet.opus_data, buf, true) {
+        Ok(n) => {
+            stats.fec_recoveries.fetch_add(1, Ordering::Relaxed);
+            emit(packet.header.ssrc, fec_seq, fec_ts, arrival, &buf[..n], true, tx);
+        }
+        Err(_) => {
+            if let Ok(n) = peer.decoder.decode_float(&[], buf, false) {
+                stats.plc_frames.fetch_add(1, Ordering::Relaxed);
+                emit(packet.header.ssrc, fec_seq, fec_ts, arrival, &buf[..n], true, tx);
+            }
+        }
+    }
+
+    // Finally the held packet itself, in order.
+    peer.last_seq = packet.header.seq;
+    decode_and_emit(peer, &packet, false, false, arrival, buf, tx, stats);
+}
+
+/// Decode any held packets that are now consecutive with the playhead.
+fn flush_consecutive(
+    peer: &mut PeerState,
+    buf: &mut Vec<f32>,
+    tx: &Sender<DecodedFrame>,
+    stats: &Arc<AudioStats>,
+) {
+    loop {
+        let next = peer.last_seq.wrapping_add(1);
+        let Some(idx) = peer
+            .pending
+            .iter()
+            .position(|(p, _)| p.header.seq == next)
+        else {
+            return;
+        };
+        let (packet, arrival) = peer.pending.swap_remove(idx);
+        peer.last_seq = packet.header.seq;
+        decode_and_emit(peer, &packet, false, false, arrival, buf, tx, stats);
     }
 }
 
 // ── Public spawn function ───────────────────────────────────────────────
 
-/// Thread handles returned by [`spawn_pool`].
-pub struct DecoderPool {
-    pub dispatcher: std::thread::JoinHandle<()>,
-    pub workers: Vec<std::thread::JoinHandle<()>>,
-}
-
-/// Spawn the decoder dispatcher + worker pool.
+/// Spawn the decoder thread. Returns the join handle.
 ///
 /// - `network_rx`: incoming encoded packets from the network
 /// - `decoded_tx`: decoded frames sent to the output / jitter buffer
 /// - `stats`: shared audio statistics
-/// - `should_stop`: signal to shut down all threads
+/// - `should_stop`: signal to shut down (checked every ≤10 ms, so shutdown
+///   cannot hang even while the application still holds sender clones)
 /// - `removed_peers`: peers marked for decoder cleanup
-pub fn spawn_pool(
+pub fn spawn(
     network_rx: Receiver<AudioPacket>,
     decoded_tx: Sender<DecodedFrame>,
     stats: Arc<AudioStats>,
     should_stop: Arc<AtomicBool>,
     removed_peers: Arc<Mutex<HashSet<u64>>>,
-) -> DecoderPool {
-    // Per-worker channels
-    let mut worker_txs: Vec<Sender<AudioPacket>> = Vec::with_capacity(DECODER_WORKERS);
-    let mut worker_rxs: Vec<Option<Receiver<AudioPacket>>> = Vec::with_capacity(DECODER_WORKERS);
-
-    for _ in 0..DECODER_WORKERS {
-        let (tx, rx) = bounded::<AudioPacket>(32);
-        worker_txs.push(tx);
-        worker_rxs.push(Some(rx));
-    }
-
-    // Dispatcher thread (lightweight: just routes by ssrc)
-    let dispatcher_txs = worker_txs;
-    let dispatcher_stop = should_stop.clone();
-    let dispatcher = std::thread::spawn(move || {
-        info!("🔊 Decoder dispatcher started ({DECODER_WORKERS} workers)");
-
-        while let Ok(packet) = network_rx.recv() {
-            if dispatcher_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let worker_idx = (packet.header.ssrc as usize) % DECODER_WORKERS;
-            // try_send: if a worker is backed up, drop the packet rather
-            // than blocking the dispatcher (which would stall ALL peers).
-            let _ = dispatcher_txs[worker_idx].try_send(packet);
-        }
-
-        info!("🔊 Decoder dispatcher stopped");
-    });
-
-    // Worker threads
-    let mut workers = Vec::with_capacity(DECODER_WORKERS);
-    for (i, slot) in worker_rxs.iter_mut().enumerate() {
-        let rx = slot.take().unwrap();
-        let tx = decoded_tx.clone();
-        let stats = stats.clone();
-        let stop = should_stop.clone();
-        let removed = removed_peers.clone();
-        let handle = std::thread::spawn(move || {
-            let mut worker = DecoderWorker::new(i, rx, tx, stats, stop, removed);
-            worker.run();
-        });
-        workers.push(handle);
-    }
-
-    DecoderPool {
-        dispatcher,
-        workers,
-    }
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut thread = DecoderThread {
+            rx: network_rx,
+            tx: decoded_tx,
+            stats,
+            should_stop,
+            removed_peers,
+            peers: HashMap::new(),
+            frame_buffer: vec![0.0f32; FRAME_SIZE * 2],
+        };
+        thread.run();
+    })
 }

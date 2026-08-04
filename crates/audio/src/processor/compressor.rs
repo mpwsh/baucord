@@ -80,9 +80,18 @@ impl Compressor {
             return 1.0;
         }
 
-        // Gate closed → hold current gain, don't adapt to silence.
+        // Gate closed → hold current gain, don't adapt to silence — but
+        // still APPLY the held gain. The gate's Closing fade is not "open",
+        // and skipping the multiply here made the fade tail jump up by the
+        // full compression amount (an audible level step on every release).
         if !gate_open {
-            return self.current_gain;
+            let g = self.current_gain;
+            if (g - 1.0).abs() > f32::EPSILON {
+                for s in samples.iter_mut() {
+                    *s *= g;
+                }
+            }
+            return g;
         }
 
         let threshold_db = f32::from_bits(self.knobs.threshold_db.load(Ordering::Relaxed));

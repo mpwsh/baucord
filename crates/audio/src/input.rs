@@ -255,7 +255,7 @@ impl AudioInput {
                 } else {
                     crate::resampler::frames_for_ms(device_sample_rate, 10)
                 };
-                match build_input_resampler(device_sample_rate, chunk) {
+                match build_input_resampler(device_sample_rate, chunk, 1) {
                     Ok(r) => {
                         resampler_input = vec![Vec::with_capacity(r.input_frames_next())];
                         resampler_output = vec![vec![0.0f32; r.output_frames_max()]];
@@ -270,7 +270,15 @@ impl AudioInput {
 
             let mut read_buf = vec![0.0f32; 4096];
             let mut accumulator = Vec::with_capacity(FRAME_SIZE * 2);
-            let mut consecutive_silence = 0usize;
+            // Monotonic sequence number for loopback frames. Without this the
+            // jitter buffer sees every loopback frame as `seq: 0`, decides
+            // each one is a late duplicate, and pumps up its adaptive target
+            // over time — adding 100+ ms of latency to what should be the
+            // fastest path in the pipeline.
+            let mut loopback_seq: u32 = 0;
+            // 48 kHz media clock for loopback frames (mirrors the encoder's
+            // timestamp so the jitter buffer's estimator sees real deltas).
+            let mut loopback_ts: u32 = 0;
 
             info!(
                 "🎤 Input worker started (device {}Hz, resample={})",
@@ -391,31 +399,29 @@ impl AudioInput {
                         if let Some(ref tx) = loopback_tx {
                             let _ = tx.try_send(DecodedFrame {
                                 peer_id: LOOPBACK_SSRC,
-                                seq: 0,
+                                seq: loopback_seq,
+                                timestamp: loopback_ts,
                                 arrival_time: Instant::now(),
                                 samples: frame.clone(),
                                 is_concealment: false,
                             });
+                            loopback_seq = loopback_seq.wrapping_add(1);
                         }
                     }
 
-                    let should_send = ctx.is_speech || ctx.fade_out_active;
-
-                    if should_send {
-                        consecutive_silence = 0;
-                        match encoder_tx.try_send(frame) {
-                            Ok(()) => {}
-                            Err(TrySendError::Full(f)) => {
-                                thread::yield_now();
-                                let _ = encoder_tx.try_send(f);
-                            }
-                            Err(TrySendError::Disconnected(_)) => return,
+                    // Every frame goes to the encoder: the gate has already
+                    // zeroed non-speech, and Opus DTX (in the encoder thread)
+                    // decides what actually hits the wire. Gating transmission
+                    // here used to clip word onsets (earshot needs 16 ms of
+                    // audio before its first speech decision) and starve DTX.
+                    loopback_ts = loopback_ts.wrapping_add(FRAME_SIZE as u32);
+                    match encoder_tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(f)) => {
+                            thread::yield_now();
+                            let _ = encoder_tx.try_send(f);
                         }
-                    } else {
-                        consecutive_silence += 1;
-                        if consecutive_silence > 10 {
-                            is_speaking_handle.store(false, Ordering::Relaxed);
-                        }
+                        Err(TrySendError::Disconnected(_)) => return,
                     }
                 }
             }

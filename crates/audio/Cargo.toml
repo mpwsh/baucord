@@ -1,6 +1,6 @@
 [package]
 name = "audio"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "audio components for baucord"
 
@@ -22,7 +22,7 @@ rtrb = "0.3"
 crossbeam-channel = "0.5"
 
 # Opus codec
-opus = { git = "https://github.com/SpaceManiac/opus-rs" }
+opus = { git = "https://github.com/mpwsh/opus-rs" }
 
 # Resampling
 rubato = "1.0.1"
@@ -54,4 +54,3 @@ path = "examples/latency.rs"
 [[example]]
 name = "sounds"
 path = "examples/play.rs"
-

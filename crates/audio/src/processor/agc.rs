@@ -99,17 +99,33 @@ impl AutoGainControl {
         reason = "frame length ≤ 960 samples, well within f32 precision"
     )]
     fn process_inner(&mut self, samples: &mut [f32], gate_open: bool) -> f32 {
-        // Gate closed → hold gain, don't adapt to silence.
+        // Gate closed → hold gain, don't adapt to silence — but still
+        // APPLY the held gain, otherwise the gate's Closing fade tail
+        // (which reaches this stage un-gained) steps down/up in level
+        // relative to the boosted speech right before it.
         if !gate_open {
-            return self.current_gain;
+            let g = self.current_gain;
+            if (g - 1.0).abs() > f32::EPSILON {
+                for s in samples.iter_mut() {
+                    *s *= g;
+                }
+            }
+            return g;
         }
 
         let target = f32::from_bits(self.knobs.target_rms.load(Ordering::Relaxed));
         let rms = compute_rms(samples);
 
-        // Skip near-silence that snuck past the gate (e.g., hold period).
+        // Near-silence that snuck past the gate (e.g., hold period):
+        // hold the gain, apply it, don't adapt.
         if rms < 0.001 {
-            return self.current_gain;
+            let g = self.current_gain;
+            if (g - 1.0).abs() > f32::EPSILON {
+                for s in samples.iter_mut() {
+                    *s *= g;
+                }
+            }
+            return g;
         }
 
         let desired_gain = (target / rms).clamp(self.min_gain, self.max_gain);

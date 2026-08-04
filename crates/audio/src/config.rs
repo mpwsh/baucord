@@ -36,7 +36,7 @@ pub struct VoiceChatConfig {
     /// Adjustable at runtime via [`VoiceChat::set_output_gain`](crate::VoiceChat::set_output_gain).
     pub output_gain: f32,
 
-    /// Noise gate / activation threshold (RMS, 0.001–0.5). Default: `0.020`.
+    /// Noise gate / activation threshold (RMS, 0.001–0.5). Default: `0.012`.
     ///
     /// This is the **primary voice activation control**. Audio below this
     /// level is silenced and never transmitted. When the gate is closed,

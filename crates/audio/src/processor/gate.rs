@@ -48,7 +48,7 @@ enum GateState {
 
 /// Number of samples for fade-in/fade-out transitions.
 /// 256 samples at 48 kHz ≈ 5.2ms — inaudible but eliminates clicks.
-const FADE_SAMPLES: usize = 256;
+const FADE_SAMPLES: usize = 384;
 
 /// Real-time noise gate processor.
 ///

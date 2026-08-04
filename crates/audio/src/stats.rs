@@ -13,6 +13,10 @@ pub struct AudioStats {
     pub packets_sent: AtomicU64,
     pub packets_received: AtomicU64,
     pub packets_lost: AtomicU64,
+    /// Packets that arrived after their slot was already played/concealed.
+    pub packets_late: AtomicU64,
+    /// Outgoing packets dropped because the app wasn't draining them.
+    pub outgoing_dropped: AtomicU64,
 
     // ── Codec stats ─────────────────────────────────────────────────────
     pub encode_errors: AtomicU64,
@@ -78,6 +82,8 @@ impl AudioStats {
             packets_sent: AtomicU64::new(0),
             packets_received: AtomicU64::new(0),
             packets_lost: AtomicU64::new(0),
+            packets_late: AtomicU64::new(0),
+            outgoing_dropped: AtomicU64::new(0),
             encode_errors: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
             fec_recoveries: AtomicU64::new(0),

@@ -86,7 +86,7 @@ pub struct VoiceChat {
 
     // ── Thread handles ───────────────────────────────────────────────
     encoder_thread: Option<std::thread::JoinHandle<()>>,
-    decoder_pool: Option<decoder::DecoderPool>,
+    decoder_thread: Option<std::thread::JoinHandle<()>>,
     should_stop: Arc<AtomicBool>,
 
     // ── Shared state ─────────────────────────────────────────────────
@@ -122,8 +122,8 @@ impl VoiceChat {
         let encoder_thread =
             encoder::spawn(audio_to_encoder_rx, encoder_to_network_tx, stats.clone());
 
-        // ── Spawn decoder pool ──────────────────────────────────────
-        let decoder_pool = decoder::spawn_pool(
+        // ── Spawn decoder thread ────────────────────────────────────
+        let decoder_thread = decoder::spawn(
             network_to_decoder_rx,
             decoder_to_audio_tx.clone(),
             stats.clone(),
@@ -134,9 +134,9 @@ impl VoiceChat {
             config.noise_suppression,
             config.input_gain,
             config.gate_threshold,
-            true, // compressor_enabled
-            true, // agc_enabled
-            0.10, // agc_target_rms
+            config.compressor_enabled,
+            config.agc_enabled,
+            config.agc_target_rms,
         ));
 
         Ok(Self {
@@ -151,7 +151,7 @@ impl VoiceChat {
             input_config,
             sound_rx: Some(sound_rx),
             encoder_thread: Some(encoder_thread),
-            decoder_pool: Some(decoder_pool),
+            decoder_thread: Some(decoder_thread),
             should_stop,
             user_settings: Arc::new(Mutex::new(HashMap::new())),
             removed_peers,
@@ -470,11 +470,11 @@ impl Drop for VoiceChat {
             let _ = thread.join();
         }
 
-        if let Some(pool) = self.decoder_pool.take() {
-            let _ = pool.dispatcher.join();
-            for thread in pool.workers {
-                let _ = thread.join();
-            }
+        // Decoder thread checks `should_stop` every ≤10 ms and only ever
+        // try_sends, so this join cannot hang even if the application still
+        // holds `incoming_sender()` clones.
+        if let Some(thread) = self.decoder_thread.take() {
+            let _ = thread.join();
         }
     }
 }

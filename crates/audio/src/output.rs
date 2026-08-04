@@ -252,7 +252,7 @@ impl AudioOutput {
 
             if needs_resample {
                 let chunk = crate::resampler::frames_for_ms(device_sample_rate, 10);
-                match build_output_resampler(device_sample_rate, chunk) {
+                match build_output_resampler(device_sample_rate, chunk, 1) {
                     Ok(r) => {
                         resampler_input = vec![Vec::with_capacity(r.input_frames_next() + 64)];
                         resampler_output = vec![vec![0.0f32; chunk * 2]];
@@ -323,7 +323,9 @@ impl AudioOutput {
                         let remaining = samples.len() - *cursor;
                         let to_mix = remaining.min(HOP);
                         for i in 0..to_mix {
-                            hop_buf[i] = (hop_buf[i] + samples[*cursor + i]).clamp(-0.99, 0.99);
+                            // No clamp here: the limiter downstream is the
+                            // one place that controls the summed level.
+                            hop_buf[i] += samples[*cursor + i];
                         }
                         *cursor += to_mix;
                         if *cursor >= samples.len() {
@@ -333,13 +335,17 @@ impl AudioOutput {
 
                     // Apply master output gain (always — notifications
                     // need gain even when deafened).
+                    // Gain BEFORE the limiter: the limiter must see the
+                    // level the listener will hear, otherwise a gain > 1
+                    // re-amplifies the limited signal straight into a hard
+                    // clip and the "limiter" audibly does nothing.
                     let gain = f32::from_bits(output_gain.load(Ordering::Relaxed));
-                    output_limiter.process_samples(&mut hop_buf);
                     if (gain - 1.0).abs() > f32::EPSILON {
                         for s in hop_buf.iter_mut() {
-                            *s = (*s * gain).clamp(-0.99, 0.99);
+                            *s *= gain;
                         }
                     }
+                    output_limiter.process_samples(&mut hop_buf);
 
                     if let Some(ref mut r) = resampler {
                         resample_accum.extend_from_slice(&hop_buf);
