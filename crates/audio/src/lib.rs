@@ -115,7 +115,7 @@ impl VoiceChat {
         let (sound_tx, sound_rx) = bounded::<sounds::SoundType>(4);
 
         // Build marker: lets a log capture prove which build is running.
-        log::info!("audio crate v0.4.2 [latency-patch r3] initializing");
+        log::info!("audio crate [latency-patch r8] initializing");
 
         // ── Shared atomics (created once, passed to children) ───────
         let output_gain = Arc::new(AtomicU32::new(config.output_gain.to_bits()));
@@ -504,5 +504,121 @@ impl Drop for VoiceChat {
         if let Some(thread) = self.decoder_thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use std::time::Duration as StdDuration;
+
+    /// Prove the receive path works with no audio devices: packets fed via
+    /// the public API must reach the decoder and register in stats.
+    /// Mirrors exactly what client/voice.rs does with incoming packets.
+    #[test]
+    fn receive_path_processes_packets_headless() {
+        let vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
+
+        // Real Opus payloads (the decoder rejects garbage)
+        let mut enc = opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip)
+            .expect("encoder");
+        let pcm: Vec<f32> = (0..FRAME_SIZE)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 0.5)
+            .collect();
+        let mut buf = vec![0u8; 512];
+
+        for seq in 0..20u32 {
+            let n = enc.encode_float(&pcm, &mut buf).expect("encode");
+            let pkt = AudioPacket::new(seq, seq * FRAME_SIZE as u32, 42, buf[..n].to_vec());
+            vc.receive_packet(pkt);
+            std::thread::sleep(StdDuration::from_millis(2));
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+
+        let received = vc
+            .stats()
+            .packets_received
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(received >= 15, "decoder only processed {received}/20 packets");
+
+        // outgoing_receiver must be a live owned clone usable in select!
+        let rx = vc.outgoing_receiver();
+        assert!(rx.try_recv().is_err()); // empty, but connected
+    }
+}
+
+#[cfg(test)]
+mod voice_loop_repro {
+    use super::*;
+    use crossbeam_channel::{bounded as cb_bounded, select};
+    use std::time::Duration as StdDuration;
+
+    enum Ctrl {
+        Incoming(AudioPacket),
+        Shutdown,
+    }
+
+    /// Replicates client/voice.rs's select loop shape (post-fix) against a
+    /// real VoiceChat: per-iteration outgoing clone, three-arm select with
+    /// dead-channel fallback, control drain, take_outgoing_packets poll.
+    #[test]
+    fn voice_loop_select_shape_processes_incoming() {
+        let (ctrl_tx, ctrl_rx) = cb_bounded::<Ctrl>(64);
+        let (stats_tx, stats_rx) = cb_bounded(1);
+        let loop_thread = std::thread::spawn(move || {
+            // VoiceChat is !Send (cpal streams) — created on the loop
+            // thread, exactly like client/voice.rs does.
+            let vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
+            stats_tx.send(vc.stats.clone()).unwrap();
+            let (_dead_tx, dead_rx) = cb_bounded::<AudioPacket>(1);
+            let mut forwarded = 0u32;
+            let mut running = true;
+            while running {
+                let outgoing = Some(vc.outgoing_receiver());
+                select! {
+                    recv(ctrl_rx) -> msg => match msg {
+                        Ok(Ctrl::Incoming(p)) => vc.receive_packet(p),
+                        Ok(Ctrl::Shutdown) | Err(_) => running = false,
+                    },
+                    recv(outgoing.as_ref().unwrap_or(&dead_rx)) -> pkt => {
+                        if pkt.is_ok() { forwarded += 1; }
+                    },
+                    default(StdDuration::from_millis(5)) => {}
+                }
+                for _ in 0..32 {
+                    match ctrl_rx.try_recv() {
+                        Ok(Ctrl::Incoming(p)) => vc.receive_packet(p),
+                        Ok(Ctrl::Shutdown) => running = false,
+                        Err(_) => break,
+                    }
+                }
+                let _ = vc.take_outgoing_packets();
+                let _ = vc.input_level();
+                let _ = vc.is_speaking();
+            }
+            forwarded
+        });
+
+        let mut enc = opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip)
+            .expect("encoder");
+        let pcm: Vec<f32> = (0..FRAME_SIZE)
+            .map(|i| (i as f32 * 330.0 * std::f32::consts::TAU / 48000.0).sin() * 0.4)
+            .collect();
+        let mut buf = vec![0u8; 512];
+        for seq in 0..30u32 {
+            let n = enc.encode_float(&pcm, &mut buf).expect("encode");
+            let pkt = AudioPacket::new(seq, seq * FRAME_SIZE as u32, 7, buf[..n].to_vec());
+            ctrl_tx.send(Ctrl::Incoming(pkt)).unwrap();
+            std::thread::sleep(StdDuration::from_millis(2));
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+        ctrl_tx.send(Ctrl::Shutdown).unwrap();
+        let _forwarded = loop_thread.join().expect("loop thread must not panic or hang");
+
+        let stats = stats_rx.recv().expect("stats from loop thread");
+        let received = stats
+            .packets_received
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(received >= 25, "loop only processed {received}/30 incoming packets");
     }
 }

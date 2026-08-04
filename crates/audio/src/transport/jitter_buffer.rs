@@ -145,6 +145,13 @@ pub struct AdaptiveJitterBuffer {
     underrun_count: u32,
     /// Last target value emitted to the debug log (ms).
     last_logged_target_ms: f32,
+    /// Decaying memory of underrun-corrected depth. The drain path will
+    /// not descend below this, so the buffer stops repeatedly draining
+    /// into a depth that just failed. Field log showed a steady cycle of
+    /// drain-to-9ms → real micro-stall → +10 ms → drain-to-9ms again,
+    /// each puncture an audible gap. Decays ~40% per 10 s, so old trouble
+    /// stops mattering on the same timescale users forget it.
+    underrun_floor_ms: f32,
 }
 
 impl AdaptiveJitterBuffer {
@@ -166,6 +173,7 @@ impl AdaptiveJitterBuffer {
             concealment_count: 0,
             underrun_count: 0,
             last_logged_target_ms: initial_target_ms as f32,
+            underrun_floor_ms: 0.0,
         }
     }
 
@@ -204,7 +212,42 @@ impl AdaptiveJitterBuffer {
 
         if frame.is_concealment {
             self.concealment_count += 1;
+            // Concealment around a dry spell is packet loss, and the
+            // concealment counter already charges the target for it —
+            // don't let the next real frame double-charge it as an
+            // underrun.
+            peer.dry_at = None;
         } else {
+            // ── Deferred underrun classification ────────────────────
+            // Runs before last_ts is updated so we can compare against
+            // the previous frame's media clock. Two stories end a dry
+            // spell, and the timestamp tells them apart:
+            //
+            //   Delivery stall: the sender never paused — timestamps are
+            //   contiguous with what we already played, the packets were
+            //   just late. THAT is an underrun; the target must grow.
+            //
+            //   Sender pause (DTX): media time jumped by ≈ the wall gap
+            //   because the clock ran while nothing was sent. Normal.
+            //
+            // Wall-time alone can't tell these apart: the gate transmits
+            // through the first 200 ms of every pause, so a natural
+            // 250–320 ms inter-phrase pause yields a 50–120 ms packet gap
+            // — which a wall-clock-only classifier scores as starvation
+            // on every other sentence (field log: underrun=1 every few
+            // seconds of clean-LAN speech, ratcheting the target +10 ms
+            // each time).
+            if let Some(dry_time) = peer.dry_at.take() {
+                #[allow(clippy::cast_precision_loss)]
+                let media_gap = peer
+                    .last_ts
+                    .map(|lt| frame.timestamp.wrapping_sub(lt) as f32 / self.sample_rate as f32);
+                let delivery_resumed_fast = dry_time.elapsed() < UNDERRUN_CONFIRM_WINDOW;
+                if delivery_resumed_fast && media_gap.is_some_and(|g| g <= 0.1) {
+                    self.underrun_count += 1;
+                }
+            }
+
             // ── Jitter estimation (real packets only) ────────────────
             // Compare how much later the packet arrived vs. how much
             // later its media clock says it should be. DTX pauses move
@@ -232,29 +275,30 @@ impl AdaptiveJitterBuffer {
                 if expected_delta > 0.0 && expected_delta <= 0.1 && arrival_delta < 0.5 {
                     let jitter_sample = (arrival_delta - expected_delta).abs();
 
-                    // Asymmetric EMA:
-                    // - Rising (spike): fast attack, coeff 0.3
-                    // - Falling (stable): slow release, coeff 0.02
-                    let coeff = if jitter_sample > peer.jitter_estimate {
-                        0.3
+                    // Winsorize: one genuine outlier (a sender stall
+                    // delivering 300 ms of frames in a burst is media-
+                    // continuous and correctly passes the gate above) must
+                    // raise the estimate, not replace it. Field log showed
+                    // a single burst + 0.3 attack slamming the estimate
+                    // ~20× in one sample, parking the target at its 200 ms
+                    // ceiling with zero concealments or underruns.
+                    let capped = jitter_sample.min(peer.jitter_estimate * 3.0 + 0.005);
+
+                    // Asymmetric EMA, RFC 3550-strength gain on the way up
+                    // (1/16 per sample: a real shift still dominates within
+                    // ~20 packets = 200 ms of speech), gentler on the way
+                    // down so the estimate outlives short calm stretches.
+                    let coeff = if capped > peer.jitter_estimate {
+                        0.0625
                     } else {
                         0.02
                     };
                     peer.jitter_estimate =
-                        peer.jitter_estimate * (1.0 - coeff) + jitter_sample * coeff;
+                        peer.jitter_estimate * (1.0 - coeff) + capped * coeff;
                 }
             }
             peer.last_arrival = Some(frame.arrival_time);
             peer.last_ts = Some(frame.timestamp);
-        }
-
-        // ── Deferred underrun classification ────────────────────────
-        // Audio resuming shortly after the buffer ran dry means the
-        // stream never actually paused — we were starved by the network.
-        if let Some(dry_time) = peer.dry_at.take() {
-            if dry_time.elapsed() < UNDERRUN_CONFIRM_WINDOW {
-                self.underrun_count += 1;
-            }
         }
 
         // ── Push audio ───────────────────────────────────────────────
@@ -431,6 +475,19 @@ impl AdaptiveJitterBuffer {
         self.buffers
             .retain(|_, p| !p.samples.is_empty() || p.last_push.elapsed() < PEER_IDLE_TIMEOUT);
 
+        // Decay idle jitter estimates. During DTX silence no samples
+        // arrive, so without this a spiked estimate freezes at its peak
+        // and keeps re-hoisting the target after every drain (the
+        // 160↔200 ms sawtooth seen in the field with zero underruns).
+        // ~0.99 per 10 ms tick ≈ estimate thirds every second of silence.
+        for p in self.buffers.values_mut() {
+            if let Some(last) = p.last_arrival {
+                if last.elapsed() > Duration::from_secs(1) {
+                    p.jitter_estimate = (p.jitter_estimate * 0.99).max(0.001);
+                }
+            }
+        }
+
         if self.buffers.is_empty() {
             return;
         }
@@ -458,6 +515,9 @@ impl AdaptiveJitterBuffer {
         // ── Health-based adjustment ─────────────────────────────────
         let had_problems = self.concealment_count > 0 || self.underrun_count > 0;
 
+        // Decay the underrun floor: recent trouble matters, old doesn't.
+        self.underrun_floor_ms = (self.underrun_floor_ms * 0.9995).max(0.0);
+
         if had_problems {
             // Problems detected — increase target, scaled by severity.
             // Underruns are weighted 2× because they mean audio was
@@ -469,6 +529,11 @@ impl AdaptiveJitterBuffer {
             let new_target_ms = (current_ms + bump_ms).min(self.max_ms());
             self.target_samples = self.ms_to_samples(new_target_ms);
             self.stable_ticks = 0;
+            // Underruns teach the floor: don't drain back below ~3/4 of
+            // the depth that an actual starvation event pushed us to.
+            if self.underrun_count > 0 {
+                self.underrun_floor_ms = self.underrun_floor_ms.max(new_target_ms * 0.75);
+            }
         } else {
             // No problems — count stable ticks and slowly drain toward
             // the jitter-based target (which itself is slowly decreasing
@@ -482,7 +547,9 @@ impl AdaptiveJitterBuffer {
             if self.stable_ticks > 200 {
                 let current_ms = self.target_ms();
                 // Drain toward the jitter-based target, but never below min.
-                let floor_ms = jitter_target_ms.max(self.min_ms());
+                let floor_ms = jitter_target_ms
+                    .max(self.min_ms())
+                    .max(self.underrun_floor_ms);
                 let new_target_ms = (current_ms - 0.2).max(floor_ms);
                 self.target_samples = self.ms_to_samples(new_target_ms);
             }
@@ -506,11 +573,12 @@ impl AdaptiveJitterBuffer {
         let target_now = self.target_ms();
         if (target_now - self.last_logged_target_ms).abs() >= 5.0 {
             log::debug!(
-                "jitter target {:.1} ms -> {:.1} ms (conceal={}, underrun={})",
+                "jitter target {:.1} ms -> {:.1} ms (conceal={}, underrun={}, floor={:.1})",
                 self.last_logged_target_ms,
                 target_now,
                 self.concealment_count,
-                self.underrun_count
+                self.underrun_count,
+                self.underrun_floor_ms
             );
             self.last_logged_target_ms = target_now;
         }
