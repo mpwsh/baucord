@@ -69,6 +69,24 @@ pub struct DecodedFrame {
 /// tax landed on exactly the moments listeners notice.)
 const UNDERRUN_CONFIRM_WINDOW: Duration = Duration::from_millis(120);
 
+/// Samples of linear fade-in applied when a peer resumes after priming
+/// (~3 ms at 48 kHz). Softens the resume edge of an underrun/pause.
+const RESUME_FADE_SAMPLES: usize = 144;
+
+/// Media-continuity bound for confirming an underrun, in seconds.
+///
+/// A genuine delivery stall means the sender kept transmitting: every
+/// frame exists, so the frame that ends the dry spell is media-adjacent
+/// to the last one received — a gap of ONE frame (10 ms). A DTX pause
+/// tail looks different: Opus needs ~100 ms of silence before it starts
+/// withholding, so by the time frames are actually missing, the media
+/// gap at speech resume is several frames wide. Two frames + margin
+/// separates the signatures. (The earlier 100 ms bound let the withheld
+/// tail of every ~250–500 ms speech pause count as an underrun — both
+/// clients logged the same rhythmic false positives against each other's
+/// streams on a clean LAN.)
+const UNDERRUN_MEDIA_CONTIGUITY_S: f32 = 0.025;
+
 /// Peers with no pushed audio for this long are pruned.
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -98,6 +116,11 @@ struct PeerBuffer {
     /// Set when the buffer runs dry while playing; resolved on the next
     /// push (recent → underrun, stale → pause). See UNDERRUN_CONFIRM_WINDOW.
     dry_at: Option<Instant>,
+    /// Last sample this peer contributed to the mix — the starting point
+    /// for the synthesized decay tail when the buffer runs dry.
+    last_sample: f32,
+    /// Remaining fade-in samples after resuming from priming.
+    fade_in_remaining: usize,
     /// Per-peer output limiter — protects listeners from loud transients
     /// from one peer without ducking everyone else in the mix.
     limiter: Limiter,
@@ -115,6 +138,8 @@ impl PeerBuffer {
             priming: true,
             playing: false,
             dry_at: None,
+            last_sample: 0.0,
+            fade_in_remaining: 0,
             limiter: Limiter::new(),
         }
     }
@@ -243,7 +268,9 @@ impl AdaptiveJitterBuffer {
                     .last_ts
                     .map(|lt| frame.timestamp.wrapping_sub(lt) as f32 / self.sample_rate as f32);
                 let delivery_resumed_fast = dry_time.elapsed() < UNDERRUN_CONFIRM_WINDOW;
-                if delivery_resumed_fast && media_gap.is_some_and(|g| g <= 0.1) {
+                if delivery_resumed_fast
+                    && media_gap.is_some_and(|g| g <= UNDERRUN_MEDIA_CONTIGUITY_S)
+                {
                     self.underrun_count += 1;
                 }
             }
@@ -352,6 +379,17 @@ impl AdaptiveJitterBuffer {
                 // next push classify it. Either way, rebuild the cushion
                 // before playing again.
                 if peer.playing {
+                    // Soften the cut: an instant step from the last sample
+                    // to silence is a broadband click — the "pop" reported
+                    // in the field on every underrun. Synthesize a ~2 ms
+                    // exponential decay tail from where the audio stopped.
+                    let mut tail = peer.last_sample;
+                    for slot in out.iter_mut().take(96) {
+                        tail *= 0.95;
+                        *slot += tail;
+                    }
+                    peer.last_sample = 0.0;
+
                     peer.dry_at = Some(now);
                     peer.priming = true;
                     peer.playing = false;
@@ -373,6 +411,8 @@ impl AdaptiveJitterBuffer {
                 let prime_target = self.target_samples.min(prime_cap);
                 if peer.samples.len() >= prime_target {
                     peer.priming = false;
+                    // Soften the resume edge to match the softened cut.
+                    peer.fade_in_remaining = RESUME_FADE_SAMPLES;
                 } else {
                     continue;
                 }
@@ -389,6 +429,18 @@ impl AdaptiveJitterBuffer {
 
             // Apply per-peer limiter (hearing protection)
             peer.limiter.process_samples(&mut self.scratch[..available]);
+
+            // Linear fade-in over the first ~3 ms after resuming playout.
+            if peer.fade_in_remaining > 0 {
+                let n_fade = peer.fade_in_remaining.min(available);
+                let done = RESUME_FADE_SAMPLES - peer.fade_in_remaining;
+                #[allow(clippy::cast_precision_loss)]
+                for (i, s) in self.scratch[..n_fade].iter_mut().enumerate() {
+                    *s *= (done + i + 1) as f32 / RESUME_FADE_SAMPLES as f32;
+                }
+                peer.fade_in_remaining -= n_fade;
+            }
+            peer.last_sample = self.scratch[available - 1];
 
             // Sum into output mix and track energy
             let mut peer_energy = 0.0f32;

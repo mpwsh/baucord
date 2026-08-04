@@ -115,7 +115,7 @@ impl VoiceChat {
         let (sound_tx, sound_rx) = bounded::<sounds::SoundType>(4);
 
         // Build marker: lets a log capture prove which build is running.
-        log::info!("audio crate [latency-patch r8] initializing");
+        log::info!("audio crate [latency-patch r11] initializing");
 
         // ── Shared atomics (created once, passed to children) ───────
         let output_gain = Arc::new(AtomicU32::new(config.output_gain.to_bits()));
@@ -433,6 +433,24 @@ impl VoiceChat {
     }
 
     pub fn list_input_devices() -> Result<Vec<(String, bool)>, Box<dyn std::error::Error>> {
+        // Real enumeration is expensive (per-device property queries via
+        // CoreAudio/WASAPI) and callers are known to poll this from UI
+        // timers every couple of seconds — a plausible periodic staller
+        // for the audio path, and definite log spam. Cache for 10 s:
+        // callers can poll as fast as they like, the OS gets asked ~4×
+        // less often, and a hot-plugged device shows up within 10 s.
+        // (If the periodic receive-side underruns thin out after this
+        // change, enumeration stalls were indeed the cause.)
+        static CACHE: Mutex<Option<(std::time::Instant, Vec<(String, bool)>)>> =
+            Mutex::new(None);
+        if let Ok(cache) = CACHE.lock() {
+            if let Some((at, list)) = cache.as_ref() {
+                if at.elapsed() < std::time::Duration::from_secs(10) {
+                    return Ok(list.clone());
+                }
+            }
+        }
+
         let host = cpal::default_host();
         let default_name = host.default_input_device().and_then(|d| d.name().ok());
         let mut devices = Vec::new();
@@ -452,10 +470,24 @@ impl VoiceChat {
             }
         }
         info!("Found {} input devices", devices.len());
+        if let Ok(mut cache) = CACHE.lock() {
+            *cache = Some((std::time::Instant::now(), devices.clone()));
+        }
         Ok(devices)
     }
 
     pub fn list_output_devices() -> Result<Vec<(String, bool)>, Box<dyn std::error::Error>> {
+        // Same 10 s cache as list_input_devices — see the note there.
+        static CACHE: Mutex<Option<(std::time::Instant, Vec<(String, bool)>)>> =
+            Mutex::new(None);
+        if let Ok(cache) = CACHE.lock() {
+            if let Some((at, list)) = cache.as_ref() {
+                if at.elapsed() < std::time::Duration::from_secs(10) {
+                    return Ok(list.clone());
+                }
+            }
+        }
+
         let host = cpal::default_host();
         let default_name = host.default_output_device().and_then(|d| d.name().ok());
         let mut devices = Vec::new();
@@ -475,6 +507,9 @@ impl VoiceChat {
             }
         }
         info!("Found {} output devices", devices.len());
+        if let Ok(mut cache) = CACHE.lock() {
+            *cache = Some((std::time::Instant::now(), devices.clone()));
+        }
         Ok(devices)
     }
 }
