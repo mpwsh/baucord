@@ -54,9 +54,20 @@ pub struct DecodedFrame {
     pub is_concealment: bool,
 }
 
-/// A peer that has been pushing audio this recently and then runs dry is
-/// counted as a genuine underrun (network late) rather than a DTX pause.
-const UNDERRUN_RECENCY: Duration = Duration::from_millis(40);
+/// Deferred underrun classification: a peer that ran dry and then receives
+/// audio again within this window was genuinely starved mid-stream (the
+/// sender never stopped talking — packets were just late). If nothing
+/// arrives for longer than this, the dry spell was a DTX pause, which is
+/// normal and must NOT inflate the buffer target. The encoder's gate holds
+/// transmission for 200 ms past speech, so real pauses always produce gaps
+/// well beyond this window.
+///
+/// (v0.7.1: the previous heuristic — "dry within 40 ms of the last push" —
+/// classified *every DTX utterance end* as an underrun, ratcheting the
+/// target up ~10 ms per speech pause until it parked near 45 ms even on a
+/// clean LAN. Since utterance-start latency equals the priming target, that
+/// tax landed on exactly the moments listeners notice.)
+const UNDERRUN_CONFIRM_WINDOW: Duration = Duration::from_millis(120);
 
 /// Peers with no pushed audio for this long are pruned.
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -84,6 +95,9 @@ struct PeerBuffer {
     /// Whether the peer contributed audio on the previous pull (used to
     /// distinguish mid-stream underruns from DTX pauses).
     playing: bool,
+    /// Set when the buffer runs dry while playing; resolved on the next
+    /// push (recent → underrun, stale → pause). See UNDERRUN_CONFIRM_WINDOW.
+    dry_at: Option<Instant>,
     /// Per-peer output limiter — protects listeners from loud transients
     /// from one peer without ducking everyone else in the mix.
     limiter: Limiter,
@@ -100,6 +114,7 @@ impl PeerBuffer {
             excess_ticks: 0,
             priming: true,
             playing: false,
+            dry_at: None,
             limiter: Limiter::new(),
         }
     }
@@ -220,6 +235,15 @@ impl AdaptiveJitterBuffer {
             peer.last_ts = Some(frame.timestamp);
         }
 
+        // ── Deferred underrun classification ────────────────────────
+        // Audio resuming shortly after the buffer ran dry means the
+        // stream never actually paused — we were starved by the network.
+        if let Some(dry_time) = peer.dry_at.take() {
+            if dry_time.elapsed() < UNDERRUN_CONFIRM_WINDOW {
+                self.underrun_count += 1;
+            }
+        }
+
         // ── Push audio ───────────────────────────────────────────────
         peer.samples.extend(frame.samples);
         peer.last_push = Instant::now();
@@ -265,14 +289,13 @@ impl AdaptiveJitterBuffer {
             }
 
             if peer.samples.is_empty() {
-                // Ran dry. If audio was flowing moments ago this is a
-                // genuine underrun (packets late) — count it and rebuild
-                // the cushion. If nothing has arrived for a while it's a
-                // DTX pause, which is normal.
+                // Ran dry. Whether this was a genuine underrun (packets
+                // late mid-stream) or a normal DTX pause can only be told
+                // by what happens next, so record the moment and let the
+                // next push classify it. Either way, rebuild the cushion
+                // before playing again.
                 if peer.playing {
-                    if now.duration_since(peer.last_push) < UNDERRUN_RECENCY {
-                        self.underrun_count += 1;
-                    }
+                    peer.dry_at = Some(now);
                     peer.priming = true;
                     peer.playing = false;
                 }

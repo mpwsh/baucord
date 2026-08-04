@@ -320,8 +320,13 @@ impl AudioOutput {
                 // By filling multiple hops per tick when the ring is low, we
                 // absorb OS scheduler jitter and clock drift without underruns.
                 //
-                // Target: 30ms of audio in the ring at device sample rate.
-                let target_fill = (device_sample_rate as usize * 30) / 1000;
+                // Target: 20ms of audio in the ring at device sample rate.
+                // (Was 30 ms when the worker paced itself with raw sleeps
+                // that Windows could stretch to 15+ ms; with event-driven
+                // wakeups + MMCSS the refill loop reacts within a device
+                // period, so two periods of cushion suffice. Shrink further
+                // only after output_underruns stays flat in the field.)
+                let target_fill = (device_sample_rate as usize * 20) / 1000;
                 let max_hops_per_tick = 6; // cap to stay responsive
 
                 for _ in 0..max_hops_per_tick {
