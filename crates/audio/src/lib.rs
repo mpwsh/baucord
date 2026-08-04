@@ -174,8 +174,29 @@ impl VoiceChat {
     ///
     /// Encoder and decoder threads are already running from `new()`.
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.start_input()?;
-        self.start_output()?;
+        // Output first, and don't let a missing microphone abort playback:
+        // a user with no capture device should still hear the room. (Field
+        // incident: a machine with zero enabled recording endpoints went
+        // completely silent because input was started first and `?` bailed
+        // before output ever came up.)
+        let output_result = self.start_output();
+        let input_result = self.start_input();
+
+        if let Err(e) = &output_result {
+            log::error!("Voice output failed to start: {e}");
+        }
+        if let Err(e) = &input_result {
+            log::error!(
+                "Voice input failed to start (playback {}): {e}",
+                if output_result.is_ok() { "is still running" } else { "also failed" }
+            );
+        }
+
+        // Report the first failure, but note: callers that get an Err while
+        // output started successfully can keep this instance alive and hear
+        // peers — dropping it on input failure silences everything.
+        output_result?;
+        input_result?;
         Ok(())
     }
 
