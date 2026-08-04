@@ -106,10 +106,28 @@ pub fn promote_current_thread() -> Option<MmcssGuard> {
 
 /// Pick a cpal buffer size: request ~10 ms when the device advertises a
 /// supported range (clamped into that range), otherwise keep the backend
-/// default. 10 ms matches the WASAPI shared-mode engine period and typical
-/// device defaults, so this only trims *generous* defaults — it never asks
-/// the driver for something it hasn't promised, and backends that report
-/// `Unknown` (e.g. WASAPI in current cpal) are left untouched.
+/// default.
+///
+/// **Windows always gets `Default`.** cpal's WASAPI backend fabricates
+/// `Range { 0, u32::MAX }` whenever `GetBufferSizeLimits` fails — which is
+/// every normal (non-offload) audio stack — so an "advertised range" there
+/// is not a promise. It then feeds the requested duration straight into
+/// `IAudioClient::Initialize` with no aligned-size retry, so a rejected
+/// duration doesn't degrade gracefully: it kills stream creation entirely
+/// (observed in the field as total silence). `Default` already means the
+/// ~10 ms shared-mode engine period on Windows; going lower is
+/// IAudioClient3 territory, not this knob.
+#[cfg(windows)]
+pub fn request_low_latency_buffer(
+    _supported: &SupportedBufferSize,
+    _sample_rate: u32,
+) -> BufferSize {
+    BufferSize::Default
+}
+
+/// See the Windows variant above for why this is per-platform. CoreAudio
+/// and ALSA report genuine ranges and honor in-range fixed sizes.
+#[cfg(not(windows))]
 pub fn request_low_latency_buffer(supported: &SupportedBufferSize, sample_rate: u32) -> BufferSize {
     let desired = sample_rate / 100; // 10 ms of frames
     match supported {
