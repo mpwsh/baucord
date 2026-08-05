@@ -5,6 +5,7 @@
 //! validates, and forwards to the appropriate recipients.
 
 use log::{debug, info, warn};
+use std::time::{Duration, Instant};
 use renet::{ClientId, RenetServer};
 use std::collections::{HashMap, HashSet};
 
@@ -207,6 +208,8 @@ pub struct VideoStats {
     pub packets_dropped_oversize: u64,
     pub packets_dropped_not_sharing: u64,
     pub keyframes_relayed: u64,
+    pub keyframe_requests_forwarded: u64,
+    pub keyframe_requests_suppressed: u64,
     pub bytes_relayed: u64,
     // Chunk stats
     pub chunks_received: u64,
@@ -226,14 +229,27 @@ pub struct VideoRelay {
     sharers: HashMap<ClientId, (u32, u32)>,
     /// Subscription map: streamer_id → set of viewer client_ids.
     subscribers: HashMap<ClientId, HashSet<ClientId>>,
+    /// Last time a keyframe request was forwarded to each sharer.
+    ///
+    /// Per-sharer server-side rate limit: viewers self-limit to one
+    /// request per 700 ms, but N viewers could still multiply that by N.
+    /// Requests suppressed here are harmless — the IDR produced for the
+    /// request that *did* pass serves every viewer of that stream.
+    keyframe_request_gate: HashMap<ClientId, Instant>,
     pub stats: VideoStats,
 }
+
+/// Minimum spacing between keyframe requests forwarded to one sharer.
+/// Kept below the client-side cooldown (700 ms) so a single viewer is
+/// never throttled by the server, only stampedes are.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(300);
 
 impl VideoRelay {
     pub fn new() -> Self {
         Self {
             sharers: HashMap::new(),
             subscribers: HashMap::new(),
+            keyframe_request_gate: HashMap::new(),
             stats: VideoStats::default(),
         }
     }
@@ -252,6 +268,7 @@ impl VideoRelay {
         info!("Screen share stopped: {client_id}");
         self.sharers.remove(&client_id);
         self.subscribers.remove(&client_id);
+        self.keyframe_request_gate.remove(&client_id);
     }
 
     /// A viewer wants to watch a streamer.
@@ -278,6 +295,7 @@ impl VideoRelay {
         let was_sharing = self.sharers.remove(&client_id).is_some();
         if was_sharing {
             self.subscribers.remove(&client_id);
+            self.keyframe_request_gate.remove(&client_id);
         }
 
         // Remove them as a viewer from everyone else
@@ -289,6 +307,33 @@ impl VideoRelay {
     /// Returns true if the client is currently sharing.
     pub fn is_sharing(&self, client_id: ClientId) -> bool {
         self.sharers.contains_key(&client_id)
+    }
+
+    /// Returns true if `viewer` is subscribed to `streamer`'s stream.
+    pub fn is_subscribed(&self, viewer: ClientId, streamer: ClientId) -> bool {
+        self.subscribers
+            .get(&streamer)
+            .is_some_and(|subs| subs.contains(&viewer))
+    }
+
+    /// Rate-gate keyframe requests toward `streamer`.
+    ///
+    /// Returns true (and arms the gate) if enough time has passed since
+    /// the last forwarded request; the caller then forwards it. Counted
+    /// either way in stats.
+    pub fn allow_keyframe_request(&mut self, streamer: ClientId) -> bool {
+        let now = Instant::now();
+        let allowed = self
+            .keyframe_request_gate
+            .get(&streamer)
+            .is_none_or(|last| now.duration_since(*last) >= KEYFRAME_REQUEST_MIN_INTERVAL);
+        if allowed {
+            self.keyframe_request_gate.insert(streamer, now);
+            self.stats.keyframe_requests_forwarded += 1;
+        } else {
+            self.stats.keyframe_requests_suppressed += 1;
+        }
+        allowed
     }
 
     /// Returns the set of active sharers (for sending state to newly connected clients).
@@ -489,6 +534,12 @@ impl VideoRelay {
             self.sharers.len(),
             self.subscribers.values().map(|s| s.len()).sum::<usize>(),
         );
+        if self.stats.keyframe_requests_forwarded + self.stats.keyframe_requests_suppressed > 0 {
+            info!(
+                "Keyframe requests — forwarded: {}, rate-limited: {}",
+                self.stats.keyframe_requests_forwarded, self.stats.keyframe_requests_suppressed,
+            );
+        }
 
         if self.stats.sys_audio_received > 0 {
             info!(

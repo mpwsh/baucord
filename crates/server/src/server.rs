@@ -398,11 +398,47 @@ impl ChatServer {
             }
             ClientMessage::SubscribeScreen { target_id } => {
                 self.video.subscribe(client_id, target_id);
+
+                // Kick the sharer for an IDR so the new viewer gets a
+                // first picture in one RTT instead of waiting out the
+                // keyframe interval (up to 2 s). Goes through the same
+                // rate gate as explicit requests: if a keyframe was just
+                // requested, that IDR serves this viewer too.
+                if self.video.is_subscribed(client_id, target_id)
+                    && self.video.allow_keyframe_request(target_id)
+                {
+                    self.send_keyframe_request(target_id, client_id, reliable);
+                }
             }
             ClientMessage::UnsubscribeScreen { target_id } => {
                 self.video.unsubscribe(client_id, target_id);
             }
-            _ => log::info!("Got unknown message"),
+            ClientMessage::RequestKeyframe { target_id } => {
+                // Only honor requests from clients actually subscribed to
+                // that stream (which also implies target_id is sharing),
+                // so a misbehaving client can't force arbitrary encoders
+                // to spam IDRs. Rate-gated per sharer on top of the
+                // viewer's own 700 ms self-limit.
+                if self.video.is_subscribed(client_id, target_id)
+                    && self.video.allow_keyframe_request(target_id)
+                {
+                    self.send_keyframe_request(target_id, client_id, reliable);
+                }
+            }
+            // No catch-all: the match is exhaustive on purpose, so a new
+            // ClientMessage variant is a compile error here (a reminder
+            // to handle it) instead of a silent log line. Unknown wire
+            // data never reaches this match — it fails bincode
+            // deserialization and is skipped.
+        }
+    }
+
+    /// Forward a keyframe request to `sharer` on behalf of `viewer`.
+    fn send_keyframe_request(&mut self, sharer: ClientId, viewer: ClientId, reliable: u8) {
+        log::debug!("Forwarding keyframe request: viewer {viewer} → sharer {sharer}");
+        let msg = ServerMessage::KeyframeRequested { viewer_id: viewer };
+        if let Some(encoded) = encode_message(&msg) {
+            self.server.send_message(sharer, reliable, encoded);
         }
     }
 

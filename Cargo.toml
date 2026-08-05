@@ -47,4 +47,3 @@ opt-level = 1
 # and unoptimized audio/codec code is unusably slow.
 [profile.dev.package."*"]
 opt-level = 3
-

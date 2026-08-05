@@ -479,6 +479,11 @@ impl App {
                 // network loop. They should never arrive here, but if they do
                 // we silently ignore them.
             }
+            NetworkMessage::KeyframeRequested { .. } => {
+                // Keyframe requests are routed directly to the screen thread
+                // by the network loop (→ ScreenControl::ForceKeyframe). Like
+                // VideoFrame, they should never arrive here.
+            }
         }
     }
 
