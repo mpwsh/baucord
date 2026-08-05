@@ -121,7 +121,9 @@ fn style_action_btn(
         btn.set_label("Live");
         btn.set_label_size(11);
         btn.set_label_font(Font::HelveticaBold);
-        btn.set_color(theme::ACCENT);
+        // Red, not accent: with a blue accent a blue "Live" reads
+        // wrong, and red no longer collides with the accent color.
+        btn.set_color(theme::DANGER);
         btn.set_label_color(theme::BUTTON_TEXT);
     } else if is_us {
         btn.set_label("");
