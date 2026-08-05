@@ -138,4 +138,7 @@ pub enum UiMessage {
     MainWindowClose,
     /// Explicit quit — the Quit button on the connect view.
     Shutdown,
+    /// Deferred voice-engine stop after a disconnect, so the leave
+    /// sound can finish before the output stream is torn down.
+    StopVoiceAfterDisconnect,
 }

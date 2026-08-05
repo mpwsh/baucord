@@ -811,6 +811,14 @@ impl App {
                 // after the event loop exits in run().
                 self.app.quit();
             }
+            UiMessage::StopVoiceAfterDisconnect => {
+                // Deferred from teardown_connection so the leave sound
+                // can finish. Skip if we're already in a new session or
+                // a mic test — their engine must keep running.
+                if !self.connected && !self.is_testing_mic {
+                    self.voice.tx.send(VoiceControl::Stop).ok();
+                }
+            }
         }
     }
 
@@ -1286,7 +1294,24 @@ impl App {
     fn teardown_connection(&mut self) {
         self.connected = false;
         self.is_testing_mic = false;
-        self.voice.tx.send(VoiceControl::Stop).ok();
+        // Also clear the shared flag the voice loop reads — leaving it
+        // set (disconnect during a mic test) kept the loop gating
+        // outgoing audio after the next connect.
+        self.is_testing_mic_shared.store(false, Ordering::Relaxed);
+
+        // Play the leave sound for ourselves too. The server's UserLeft
+        // broadcast (which triggers it for everyone else) is never sent
+        // to the leaver — and stopping the engine immediately would cut
+        // the sound off, so the Stop is deferred. Its handler skips the
+        // Stop if a new session or mic test started in the meantime.
+        self.voice
+            .tx
+            .send(VoiceControl::PlaySound(SoundType::UserLeft))
+            .ok();
+        let sender = self.sender;
+        app::add_timeout3(0.9, move |_| {
+            sender.send(UiMessage::StopVoiceAfterDisconnect);
+        });
 
         // Stop our screen share if active
         if self.screen.shared.is_sharing.load(Ordering::Relaxed) {

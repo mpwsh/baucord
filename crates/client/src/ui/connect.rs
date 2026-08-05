@@ -60,6 +60,14 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     subtitle.set_label_color(theme::TEXT_SECONDARY);
     col.fixed(&subtitle, 20);
 
+    // ── Error display ────────────────────────────────────────────────
+    // Validation and disconnect reasons, right under the tagline.
+
+    let mut error_frame = frame::Frame::default().with_align(enums::Align::Center);
+    error_frame.set_label_color(theme::DANGER);
+    error_frame.set_label_size(12);
+    col.fixed(&error_frame, 25);
+
     // ── Nickname ─────────────────────────────────────────────────────
 
     let mut nick_frame = frame::Frame::default()
@@ -87,13 +95,6 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     addr_input.set_value(&settings.server.address);
     style::style_input(&mut addr_input);
     col.fixed(&addr_input, 35);
-
-    // ── Error display ────────────────────────────────────────────────
-
-    let mut error_frame = frame::Frame::default().with_align(enums::Align::Center);
-    error_frame.set_label_color(theme::DANGER);
-    error_frame.set_label_size(12);
-    col.fixed(&error_frame, 25);
 
     // ── Connect button ───────────────────────────────────────────────
 
