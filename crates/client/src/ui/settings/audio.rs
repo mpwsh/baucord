@@ -7,7 +7,7 @@ use crate::config::Settings;
 use crate::ui::messages::UiMessage;
 use fltk::{prelude::*, *};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicU32;
 use ui::theme;
 use ui::widgets::{controls, labels, layout, meter};
 
@@ -36,7 +36,6 @@ pub fn build(
     output_devices: Vec<(String, bool)>,
     output_level: Arc<AtomicU32>,
     denoised_level: Arc<AtomicU32>,
-    _speaking: Arc<AtomicBool>,
     x: i32,
     y: i32,
     w: i32,
@@ -140,7 +139,7 @@ pub fn build(
         2.0,
         settings.audio.output.gain as f64,
         0.05,
-        theme::CYAN,
+        theme::ACCENT,
     );
     let output_gain_lbl = labels::hint_label(
         &mut col,
@@ -201,8 +200,8 @@ pub fn build(
 
         if is_testing {
             btn.set_label("\u{1f534}  Stop Testing");
-            btn.set_color(theme::DANGER);
-            btn.set_label_color(enums::Color::White);
+            btn.set_color(theme::ACCENT_HOVER);
+            btn.set_label_color(theme::BUTTON_TEXT);
             info_lbl.set_label("Listening to your mic... others can't hear you");
             info_lbl.set_label_color(theme::WARNING);
         } else {
@@ -230,8 +229,14 @@ pub fn build(
 
     let mut vu_in_t = vu_input.clone();
     let mut vu_out_t = vu_output.clone();
+    let alive_probe = vu_input.clone();
 
     app::add_timeout3(0.125, move |handle| {
+        // Stop when the settings window closes — repeating forever would
+        // leak one 8 Hz timer per settings-open.
+        if !alive_probe.window().map(|w| w.visible()).unwrap_or(false) {
+            return;
+        }
         vu_in_t.redraw();
         vu_out_t.redraw();
         app::repeat_timeout3(0.125, handle);

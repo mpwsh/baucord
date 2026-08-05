@@ -1,6 +1,12 @@
-// ui/connect.rs — Connection screen (nickname + server address).
+// ui/connect.rs — Connection view (nickname + server address).
 //
 // Pure UI construction — all logic routes through UiMessages back to App.
+//
+// Since the single-window migration this builds a *view* (a Group hosted
+// in the main window's Wizard) rather than its own window: a fixed-size
+// form kept centered by flexible spacers, so it stays centered at any
+// window size. The old borderless window, its drag-to-move handler and
+// its custom ✕ button are gone — the real titlebar does that job now.
 
 use fltk::{prelude::*, *};
 
@@ -9,26 +15,29 @@ use crate::ui::messages::UiMessage;
 use ui::theme;
 use ui::widgets::{controls, style};
 
-/// Build and show the connection screen.
-///
-/// Returns the window handle and error frame so App can track them
-/// (hide on successful connect, show validation errors).
-pub fn show(sender: app::Sender<UiMessage>, settings: &Settings) -> (window::Window, frame::Frame) {
-    let w = 500;
-    let h = 400;
-    let (screen_w, screen_h) = app::screen_size();
+/// Fixed size of the centered connect form.
+/// FORM_H = sum of fixed child heights (245) + 7 gaps × 15 spacing.
+const FORM_W: i32 = 380;
+const FORM_H: i32 = 350;
 
-    let mut wind = window::Window::default()
-        .with_size(w, h)
-        .with_pos(((screen_w as i32) - w) / 2, ((screen_h as i32) - h) / 2)
-        .with_label("Connect");
-    wind.set_border(false);
-    wind.make_resizable(false);
-    wind.set_color(theme::BG_PRIMARY);
-    super::set_window_icon(&mut wind);
+/// Build the connect view into the current group (the main window's
+/// Wizard). Returns the view group and the error frame so App can
+/// switch views and show validation/connection errors.
+pub fn build_view(
+    sender: app::Sender<UiMessage>,
+    settings: &Settings,
+) -> (group::Group, frame::Frame) {
+    let view = group::Group::default_fill();
 
-    let mut col = group::Flex::default_fill().column();
-    col.set_margins(20, 20, 20, 20);
+    // Flexible spacer frames on all four sides center the form.
+    let mut outer = group::Flex::default_fill().column();
+    frame::Frame::default(); // top spacer
+    let mut mid = group::Flex::default().row();
+    outer.fixed(&mid, FORM_H);
+    frame::Frame::default(); // left spacer
+
+    let mut col = group::Flex::default().column();
+    mid.fixed(&col, FORM_W);
     col.set_spacing(15);
 
     // ── Title ────────────────────────────────────────────────────────
@@ -85,44 +94,17 @@ pub fn show(sender: app::Sender<UiMessage>, settings: &Settings) -> (window::Win
     // ── Connect button ───────────────────────────────────────────────
 
     let mut connect_btn = controls::accent_button("Connect", theme::ACCENT);
-
     col.fixed(&connect_btn, 40);
-    col.end();
-    // ── Close button (top-right corner) ──────────────────────────────
-    let mut close_btn = controls::button("✕");
-    close_btn.set_pos(w - 35, 5);
-    close_btn.resize(w - 35, 5, 30, 25);
-    close_btn.set_label_size(14);
 
-    let s = sender;
-    close_btn.set_callback(move |_| {
-        s.send(UiMessage::Shutdown);
-    });
-    wind.end();
-    wind.show();
-    // -- handle
-    wind.handle(move |w, ev| {
-        use std::cell::Cell;
-        thread_local! {
-            static DRAG_X: Cell<i32> = const { Cell::new(0) };
-            static DRAG_Y: Cell<i32> = const { Cell::new(0) };
-        }
-        match ev {
-            enums::Event::Push => {
-                DRAG_X.set(app::event_x_root() - w.x());
-                DRAG_Y.set(app::event_y_root() - w.y());
-                true
-            }
-            enums::Event::Drag => {
-                w.set_pos(
-                    app::event_x_root() - DRAG_X.get(),
-                    app::event_y_root() - DRAG_Y.get(),
-                );
-                true
-            }
-            _ => false,
-        }
-    });
+    col.end();
+
+    frame::Frame::default(); // right spacer
+    mid.end();
+    frame::Frame::default(); // bottom spacer
+    outer.end();
+
+    view.end();
+
     // ── Callbacks ────────────────────────────────────────────────────
 
     let s = sender;
@@ -136,15 +118,5 @@ pub fn show(sender: app::Sender<UiMessage>, settings: &Settings) -> (window::Win
         }
     });
 
-    // Window close → clean shutdown (don't let FLTK silently hide
-    // the window while worker threads are still running).
-    let s = sender;
-    wind.set_callback(move |w| {
-        if app::event() == enums::Event::Close {
-            s.send(UiMessage::Shutdown);
-            w.hide();
-        }
-    });
-
-    (wind, error_frame)
+    (view, error_frame)
 }

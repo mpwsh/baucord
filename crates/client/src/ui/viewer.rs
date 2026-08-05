@@ -65,6 +65,9 @@ impl FpsCounter {
 pub struct ViewerWindow {
     pub width: u32,
     pub height: u32,
+    /// Peer's display name — kept here so title updates don't have to
+    /// parse it back out of the window label.
+    username: String,
     wind: window::Window,
     canvas: frame::Frame,
     /// Shared pixel buffer — written by update_frame(), read by the draw callback.
@@ -291,6 +294,7 @@ impl ViewerWindow {
         Self {
             width,
             height,
+            username: username.to_string(),
             wind,
             canvas,
             pixels,
@@ -333,12 +337,8 @@ impl ViewerWindow {
             self.height = height;
 
             // Update title bar to reflect new resolution
-            let title = self.wind.label();
-            if let Some(name_end) = title.find("'s screen") {
-                let username = &title[..name_end];
-                self.wind
-                    .set_label(&format!("{username}'s screen ({width}x{height})"));
-            }
+            self.wind
+                .set_label(&format!("{}'s screen ({width}x{height})", self.username));
         }
 
         // Swap in the new pixel data + dimensions

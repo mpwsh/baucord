@@ -27,11 +27,11 @@
 
 mod config;
 mod decoder;
-mod platform;
 mod encoder;
 mod input;
 mod input_config;
 mod output;
+mod platform;
 pub mod processor;
 mod resampler;
 pub mod sounds;
@@ -45,7 +45,7 @@ pub use stats::AudioStats;
 pub use transport::{jitter_buffer::DecodedFrame, packet::AudioPacket};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use log::{error, info};
+use log::{debug, error, info};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -113,9 +113,6 @@ impl VoiceChat {
         let (network_to_decoder_tx, network_to_decoder_rx) = bounded(max_peers * 4);
         let (decoder_to_audio_tx, decoder_to_audio_rx) = bounded(max_peers * 2);
         let (sound_tx, sound_rx) = bounded::<sounds::SoundType>(4);
-
-        // Build marker: lets a log capture prove which build is running.
-        log::info!("audio crate [latency-patch r11] initializing");
 
         // ── Shared atomics (created once, passed to children) ───────
         let output_gain = Arc::new(AtomicU32::new(config.output_gain.to_bits()));
@@ -188,7 +185,11 @@ impl VoiceChat {
         if let Err(e) = &input_result {
             log::error!(
                 "Voice input failed to start (playback {}): {e}",
-                if output_result.is_ok() { "is still running" } else { "also failed" }
+                if output_result.is_ok() {
+                    "is still running"
+                } else {
+                    "also failed"
+                }
             );
         }
 
@@ -441,8 +442,7 @@ impl VoiceChat {
         // less often, and a hot-plugged device shows up within 10 s.
         // (If the periodic receive-side underruns thin out after this
         // change, enumeration stalls were indeed the cause.)
-        static CACHE: Mutex<Option<(std::time::Instant, Vec<(String, bool)>)>> =
-            Mutex::new(None);
+        static CACHE: Mutex<Option<(std::time::Instant, Vec<(String, bool)>)>> = Mutex::new(None);
         if let Ok(cache) = CACHE.lock() {
             if let Some((at, list)) = cache.as_ref() {
                 if at.elapsed() < std::time::Duration::from_secs(10) {
@@ -458,7 +458,7 @@ impl VoiceChat {
             if let Ok(name) = device.name() {
                 let is_default = default_name.as_deref() == Some(&name);
                 if let Ok(cfg) = device.default_input_config() {
-                    info!(
+                    debug!(
                         "  Input device: \"{name}\" {}Hz {}ch {:?}{}",
                         cfg.sample_rate().0,
                         cfg.channels(),
@@ -469,7 +469,7 @@ impl VoiceChat {
                 devices.push((name, is_default));
             }
         }
-        info!("Found {} input devices", devices.len());
+        debug!("Found {} input devices", devices.len());
         if let Ok(mut cache) = CACHE.lock() {
             *cache = Some((std::time::Instant::now(), devices.clone()));
         }
@@ -478,8 +478,7 @@ impl VoiceChat {
 
     pub fn list_output_devices() -> Result<Vec<(String, bool)>, Box<dyn std::error::Error>> {
         // Same 10 s cache as list_input_devices — see the note there.
-        static CACHE: Mutex<Option<(std::time::Instant, Vec<(String, bool)>)>> =
-            Mutex::new(None);
+        static CACHE: Mutex<Option<(std::time::Instant, Vec<(String, bool)>)>> = Mutex::new(None);
         if let Ok(cache) = CACHE.lock() {
             if let Some((at, list)) = cache.as_ref() {
                 if at.elapsed() < std::time::Duration::from_secs(10) {
@@ -495,7 +494,7 @@ impl VoiceChat {
             if let Ok(name) = device.name() {
                 let is_default = default_name.as_deref() == Some(&name);
                 if let Ok(cfg) = device.default_output_config() {
-                    info!(
+                    debug!(
                         "  Output device: \"{name}\" {}Hz {}ch {:?}{}",
                         cfg.sample_rate().0,
                         cfg.channels(),
@@ -574,7 +573,10 @@ mod headless_tests {
             .stats()
             .packets_received
             .load(std::sync::atomic::Ordering::Relaxed);
-        assert!(received >= 15, "decoder only processed {received}/20 packets");
+        assert!(
+            received >= 15,
+            "decoder only processed {received}/20 packets"
+        );
 
         // outgoing_receiver must be a live owned clone usable in select!
         let rx = vc.outgoing_receiver();
@@ -648,12 +650,17 @@ mod voice_loop_repro {
         }
         std::thread::sleep(StdDuration::from_millis(100));
         ctrl_tx.send(Ctrl::Shutdown).unwrap();
-        let _forwarded = loop_thread.join().expect("loop thread must not panic or hang");
+        let _forwarded = loop_thread
+            .join()
+            .expect("loop thread must not panic or hang");
 
         let stats = stats_rx.recv().expect("stats from loop thread");
         let received = stats
             .packets_received
             .load(std::sync::atomic::Ordering::Relaxed);
-        assert!(received >= 25, "loop only processed {received}/30 incoming packets");
+        assert!(
+            received >= 25,
+            "loop only processed {received}/30 incoming packets"
+        );
     }
 }

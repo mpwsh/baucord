@@ -34,7 +34,6 @@ use ui::theme;
 pub struct UserState {
     pub username: String,
     pub is_speaking: bool,
-    pub last_activity: Instant,
     pub audio_settings: PeerAudioSettings,
     /// Remote user's self-reported mute state (distinct from local per-user mute).
     pub is_self_muted: bool,
@@ -68,12 +67,20 @@ pub struct App {
     /// Updated when ScreenShareStarted/Stopped arrives from network.
     active_sharers: HashMap<renet::ClientId, (u32, u32)>,
     viewer_windows: HashMap<u64, ViewerWindow>,
+    /// True while the 1-second stream-stats timer is scheduled. Prevents
+    /// starting a second timer on every share start.
+    stream_stats_timer_active: Arc<AtomicBool>,
 
     // UI
     splash_window: Option<window::Window>,
     update_window: Option<window::Window>,
-    connection_window: Option<window::Window>,
+    /// The single application window. Hosts a Wizard with two views:
+    /// the connect form and the main (sidebar + chat) screen.
     main_window: Option<window::Window>,
+    wizard: Option<group::Wizard>,
+    connect_view: Option<group::Group>,
+    /// Container for the main screen; content is rebuilt per connection.
+    main_view: Option<group::Group>,
     sidebar: Option<Sidebar>,
     chat: Option<Chat>,
     error_frame: Option<frame::Frame>,
@@ -148,10 +155,13 @@ impl App {
             is_testing_mic_shared,
             active_sharers: HashMap::new(),
             viewer_windows: HashMap::new(),
+            stream_stats_timer_active: Arc::new(AtomicBool::new(false)),
             splash_window: None,
             update_window: None,
-            connection_window: None,
             main_window: None,
+            wizard: None,
+            connect_view: None,
+            main_view: None,
             sidebar: None,
             chat: None,
             error_frame: None,
@@ -278,7 +288,6 @@ impl App {
                     && let Some(user) = self.users.get_mut(&id)
                 {
                     user.is_speaking = speaking;
-                    user.last_activity = Instant::now();
                 }
                 self.update_user_list();
             }
@@ -295,12 +304,22 @@ impl App {
                 if let Some(sidebar) = &mut self.sidebar {
                     sidebar.set_share_state(true);
                 }
-                // Start 1-second stream stats timer
-                let sender = self.sender;
-                app::add_timeout3(1.0, move |handle| {
-                    sender.send(UiMessage::UpdateStreamStats);
-                    app::repeat_timeout3(1.0, handle);
-                });
+                // Start the 1-second stream stats timer once. It stops
+                // itself when sharing ends; the guard prevents stacking a
+                // new repeating timer on every share start.
+                if !self.stream_stats_timer_active.swap(true, Ordering::Relaxed) {
+                    let sender = self.sender;
+                    let timer_active = self.stream_stats_timer_active.clone();
+                    let is_sharing = self.screen.shared.is_sharing.clone();
+                    app::add_timeout3(1.0, move |handle| {
+                        if is_sharing.load(Ordering::Relaxed) {
+                            sender.send(UiMessage::UpdateStreamStats);
+                            app::repeat_timeout3(1.0, handle);
+                        } else {
+                            timer_active.store(false, Ordering::Relaxed);
+                        }
+                    });
+                }
             }
             ScreenEvent::SharingStopped => {
                 info!("📺 Screen share stopped");
@@ -309,6 +328,9 @@ impl App {
                 }
                 if let Some(sidebar) = &mut self.sidebar {
                     sidebar.set_share_state(false);
+                    // Clear the stats line — it used to keep showing the
+                    // last sample after the share ended.
+                    sidebar.update_stream_stats(None);
                 }
             }
             ScreenEvent::Error(e) => {
@@ -328,7 +350,6 @@ impl App {
                 buffer_target_ms,
                 buffer_jitter_ms,
             } => {
-                use std::time::Instant;
                 let app_drain_at = Instant::now();
                 let net_to_screen_ms =
                     decoded_at.duration_since(enqueued_at).as_secs_f32() * 1000.0;
@@ -370,14 +391,14 @@ impl App {
                 width,
                 height,
             } => {
-                let username = self.username_for_u64(client_id);
+                let username = self.get_username(client_id);
                 info!("📺 {username} started sharing ({width}x{height})");
                 if let Some(chat) = &mut self.chat {
                     chat.handle_system_message(format!("{username} started sharing their screen"));
                 }
             }
             ScreenEvent::PeerStoppedSharing { client_id } => {
-                let username = self.username_for_u64(client_id);
+                let username = self.get_username(client_id);
                 info!("📺 {username} stopped sharing");
                 if let Some(chat) = &mut self.chat {
                     chat.handle_system_message(format!("{username} stopped sharing their screen"));
@@ -438,7 +459,6 @@ impl App {
             } => {
                 if let Some(user) = self.users.get_mut(&client_id) {
                     user.is_speaking = is_speaking;
-                    user.last_activity = Instant::now();
                 }
                 self.update_user_list();
             }
@@ -560,7 +580,7 @@ impl App {
                         target_id: client_id,
                     })
                     .ok();
-                let username = self.username_for_u64(client_id);
+                let username = self.get_username(client_id);
                 self.show_chat_system(&format!("Stopped watching {username}."));
             }
 
@@ -656,6 +676,28 @@ impl App {
             }
             UiMessage::ResetSettings => {
                 self.settings.reset();
+                // Push the defaults to the running subsystems so behavior
+                // matches the file immediately — previously only the file
+                // changed while the voice engine kept the old values.
+                self.voice
+                    .tx
+                    .send(VoiceControl::SetGateThreshold(
+                        self.settings.audio.gate_threshold,
+                    ))
+                    .ok();
+                self.voice
+                    .tx
+                    .send(VoiceControl::SetInputGain(self.settings.audio.input.gain))
+                    .ok();
+                self.voice
+                    .tx
+                    .send(VoiceControl::SetOutputGain(self.settings.audio.output.gain))
+                    .ok();
+                self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
+                self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
+                if let Some(ref mut hotkeys) = self.hotkeys {
+                    hotkeys.update(&self.settings);
+                }
             }
             UiMessage::SetInputDevice(d) => {
                 self.settings.audio.input.device = d.clone();
@@ -746,10 +788,17 @@ impl App {
                     hotkeys.update(&self.settings);
                 }
             }
-            UiMessage::Shutdown => {
-                // Just quit FLTK — actual cleanup happens after the event
-                // loop exits in run(), which calls shutdown().
-                self.app.quit();
+            UiMessage::MainWindowClose => {
+                // Hide to tray only once the tray infrastructure exists
+                // (tray icon + sentinel are created on connect). From the
+                // connect view, closing the window quits the app.
+                if self.connected && self.sentinel_window.is_some() {
+                    if let Some(w) = &mut self.main_window {
+                        w.hide();
+                    }
+                } else {
+                    self.app.quit();
+                }
             }
         }
     }
@@ -903,15 +952,6 @@ impl App {
             .map(|(name, _)| name.clone())
     }
 
-    /// Look up username by u64 client id (for screen thread events which use u64).
-    fn username_for_u64(&self, raw_id: u64) -> String {
-        self.users
-            .iter()
-            .find(|&(&id, _)| id == raw_id)
-            .map(|(_, u)| u.username.clone())
-            .unwrap_or_else(|| format!("User#{raw_id}"))
-    }
-
     // ════════════════════════════════════════════════════════════════════
     //  CONNECTION HANDLERS
     // ════════════════════════════════════════════════════════════════════
@@ -972,18 +1012,21 @@ impl App {
         server_name: String,
         greeting: String,
     ) {
-        if let Some(mut w) = self.connection_window.take() {
-            w.hide();
-        }
-
         self.show_main_screen();
         self.setup_tray_icon();
 
-        let mut sentinel = window::Window::new(-10000, -10000, 1, 1, None);
-        sentinel.end();
-        sentinel.set_border(false);
-        sentinel.show();
-        self.sentinel_window = Some(sentinel);
+        // Invisible off-screen sentinel window. FLTK's event loop exits
+        // when no windows are shown; this keeps it alive while the main
+        // window is hidden to the tray. Do not remove without replacing
+        // that mechanism (e.g. fltk::app::program_should_quit).
+        // Created once — reconnects used to stack a new one per session.
+        if self.sentinel_window.is_none() {
+            let mut sentinel = window::Window::new(-10000, -10000, 1, 1, None);
+            sentinel.end();
+            sentinel.set_border(false);
+            sentinel.show();
+            self.sentinel_window = Some(sentinel);
+        }
 
         self.our_client_id = Some(client_id);
         for (&id, name) in &users {
@@ -992,7 +1035,6 @@ impl App {
                 UserState {
                     username: name.clone(),
                     is_speaking: false,
-                    last_activity: Instant::now(),
                     audio_settings: self
                         .settings
                         .peer_settings
@@ -1050,7 +1092,6 @@ impl App {
             UserState {
                 username: username.clone(),
                 is_speaking: false,
-                last_activity: Instant::now(),
                 audio_settings: audio,
                 is_self_muted: false,
                 is_self_deafened: false,
@@ -1134,11 +1175,17 @@ impl App {
     }
 
     fn handle_test_microphone(&mut self, enabled: bool) {
+        // Capture this BEFORE flipping is_testing_mic — the old code
+        // checked afterwards, which made the "start the engine for a mic
+        // test while disconnected" branch unreachable, so Start was
+        // never sent and the test silently did nothing.
+        let voice_already_running = self.connected || self.is_testing_mic;
+
         self.is_testing_mic = enabled;
         self.is_testing_mic_shared.store(enabled, Ordering::Relaxed);
 
         if enabled {
-            if self.vc_is_none() {
+            if !voice_already_running {
                 self.voice
                     .tx
                     .send(VoiceControl::Start {
@@ -1154,10 +1201,6 @@ impl App {
                 self.voice.tx.send(VoiceControl::Stop).ok();
             }
         }
-    }
-
-    fn vc_is_none(&self) -> bool {
-        !self.connected && !self.is_testing_mic
     }
 
     fn handle_mute_user(&mut self, client_id: renet::ClientId, username: String, muted: bool) {
@@ -1228,16 +1271,6 @@ impl App {
 
     /// Shared teardown for both user-initiated and server-initiated disconnects.
     fn teardown_connection(&mut self) {
-        log::warn!(
-            "DIAG teardown_connection called, is_sharing={}, connected={}",
-            self.screen.shared.is_sharing.load(Ordering::Relaxed),
-            self.connected
-        );
-
-        log::warn!(
-            "DIAG: backtrace:\n{}",
-            std::backtrace::Backtrace::force_capture()
-        );
         self.connected = false;
         self.is_testing_mic = false;
         self.voice.tx.send(VoiceControl::Stop).ok();
@@ -1261,13 +1294,12 @@ impl App {
         self.is_muted = false;
         self.is_deafened = false;
 
-        if let Some(mut w) = self.main_window.take() {
-            w.hide();
-        }
+        // The window itself persists — callers switch the Wizard back
+        // to the connect view (handle_disconnect / handle_disconnect_event
+        // both call show_connection_screen right after this).
     }
 
     fn handle_disconnect(&mut self) {
-        log::warn!("DIAG handle_disconnect (user-initiated)");
         self.network.tx.send(NetworkControl::Disconnect).ok();
 
         if let Some(chat) = &mut self.chat {
@@ -1279,8 +1311,6 @@ impl App {
     }
 
     fn handle_disconnect_event(&mut self, reason: &str) {
-        log::warn!("DIAG handle_disconnect_event reason=\"{reason}\"");
-
         if let Some(chat) = &mut self.chat {
             chat.handle_disconnected(reason.to_string());
         }
@@ -1295,14 +1325,11 @@ impl App {
     // ════════════════════════════════════════════════════════════════════
 
     fn update_user_list(&mut self) {
-        let timeout = Duration::from_millis(500);
-        let now = Instant::now();
-        for user in self.users.values_mut() {
-            if user.is_speaking && now.duration_since(user.last_activity) > timeout {
-                user.is_speaking = false;
-            }
-        }
-
+        // Speaking state is purely edge-triggered now. The old 500 ms
+        // "stale speaking" timeout here cleared the light mid-speech for
+        // anyone talking longer than 500 ms (events only arrive on
+        // transitions, so last_activity never refreshed) — the light then
+        // stayed off until their next stop/start edge.
         if let Some(sidebar) = &mut self.sidebar {
             sidebar.update_users(&self.users, self.our_client_id);
         }
@@ -1316,18 +1343,29 @@ impl App {
         if let Some(mut w) = self.update_window.take() {
             w.hide();
         }
-        if self.connection_window.is_none() {
-            self.show_connection_screen();
-        }
+        self.show_connection_screen();
     }
 
     fn show_connection_screen(&mut self) {
-        let (wind, error_frame) = crate::ui::connect::show(self.sender, &self.settings);
-        self.error_frame = Some(error_frame);
-        self.connection_window = Some(wind);
+        self.ensure_main_window();
+        if let (Some(wizard), Some(view)) = (&mut self.wizard, &self.connect_view) {
+            wizard.set_current_widget(view);
+        }
+        if let Some(w) = &mut self.main_window {
+            // May be hidden in the tray when a disconnect arrives.
+            w.show();
+            w.redraw();
+        }
     }
 
-    fn show_main_screen(&mut self) {
+    /// Create the single application window (once): saved geometry, a
+    /// Wizard hosting the connect view, and an (initially empty) main
+    /// view container that show_main_screen() fills per connection.
+    fn ensure_main_window(&mut self) {
+        if self.main_window.is_some() {
+            return;
+        }
+
         let mut wind = window::Window::default()
             .with_size(self.settings.window.width, self.settings.window.height)
             .with_label("baucord");
@@ -1340,49 +1378,88 @@ impl App {
             wind.set_pos(cx, cy);
         }
         wind.make_resizable(true);
+        wind.size_range(500, 400, 0, 0);
         wind.set_color(theme::BG_PRIMARY);
         crate::ui::set_window_icon(&mut wind);
 
-        if let (Some(x), Some(y)) = (self.settings.window.x, self.settings.window.y) {
-            wind.set_pos(x, y);
-        }
+        let wizard = group::Wizard::default_fill();
 
-        let mut main_row = group::Flex::default_fill().row();
-        main_row.set_color(theme::BG_PRIMARY);
+        // View 1: connect form. Built once — it keeps typed values
+        // across failed attempts and reconnects, and error_frame stays
+        // valid for the app's lifetime.
+        let (connect_view, error_frame) =
+            crate::ui::connect::build_view(self.sender, &self.settings);
 
-        let mut sidebar = Sidebar::new(self.sender);
-        let sidebar_group = sidebar.create_ui();
-        main_row.fixed(&sidebar_group, 250);
-        sidebar.set_mute_state(self.is_muted);
+        // View 2: main screen container, filled by show_main_screen().
+        let main_view = group::Group::default_fill();
+        main_view.end();
 
-        let mut chat = Chat::new(self.sender);
-        let chat_group = chat.create_ui();
-        main_row.add(&chat_group);
-
-        main_row.end();
+        wizard.end();
         wind.end();
 
-        /*
+        // The OS close button means different things per view; route
+        // the decision through App, which knows the connection state.
         let sender = self.sender;
-        wind.set_callback(move |w| {
+        wind.set_callback(move |_| {
             if app::event() == enums::Event::Close {
-                sender.send(UiMessage::Shutdown);
-                w.hide();
-            }
-        });*/
-        wind.set_callback(move |w| {
-            if app::event() == enums::Event::Close {
-                w.hide(); // Just hide — don't shutdown
-                // The FLTK app keeps running because other internal
-                // mechanisms (timers, awake) keep the loop alive.
+                sender.send(UiMessage::MainWindowClose);
             }
         });
 
         wind.show();
 
+        self.error_frame = Some(error_frame);
+        self.wizard = Some(wizard);
+        self.connect_view = Some(connect_view);
+        self.main_view = Some(main_view);
         self.main_window = Some(wind);
-        self.sidebar = Some(sidebar);
-        self.chat = Some(chat);
+    }
+
+    fn show_main_screen(&mut self) {
+        self.ensure_main_window();
+
+        // (Re)build the main view fresh for this connection — same
+        // semantics as the old per-connection window: clean chat and
+        // clean sidebar every time. Drop the old handles BEFORE clear()
+        // so nothing holds references to deleted widgets.
+        self.sidebar = None;
+        self.chat = None;
+        if let Some(view) = &mut self.main_view {
+            view.clear();
+            view.begin();
+
+            let mut main_row = group::Flex::default_fill().row();
+            main_row.set_color(theme::BG_PRIMARY);
+
+            let mut sidebar = Sidebar::new(self.sender);
+            let sidebar_group = sidebar.create_ui();
+            main_row.fixed(&sidebar_group, 250);
+            sidebar.set_mute_state(self.is_muted);
+
+            let mut chat = Chat::new(self.sender);
+            let chat_group = chat.create_ui();
+            main_row.add(&chat_group);
+
+            main_row.end();
+            view.end();
+            // CRITICAL: Fl_Group::end() sets the current group to the
+            // widget's PARENT — for `view` that's the Wizard, not null.
+            // Without this reset, every window created afterwards
+            // (settings, audio popups, viewers, the tray sentinel) is
+            // silently adopted as an embedded child of the Wizard.
+            group::Group::set_current(None::<&group::Group>);
+
+            self.sidebar = Some(sidebar);
+            self.chat = Some(chat);
+        }
+
+        if let (Some(wizard), Some(view)) = (&mut self.wizard, &self.main_view) {
+            wizard.set_current_widget(view);
+        }
+        if let Some(w) = &mut self.main_window {
+            w.show();
+            w.redraw();
+        }
     }
 
     fn show_settings_window(&mut self) {
@@ -1411,7 +1488,6 @@ impl App {
             output_devices,
             self.voice.shared.output_level.clone(),
             self.voice.shared.denoised_level.clone(),
-            self.voice.shared.speaking.clone(),
             px,
             py,
             pw,

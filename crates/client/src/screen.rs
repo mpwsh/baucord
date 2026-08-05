@@ -17,7 +17,7 @@
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -239,6 +239,21 @@ struct PeerStream {
     stream_audio: Option<StreamDecoder>,
 }
 
+// ── Loop state ──────────────────────────────────────────────────────────
+
+/// Mutable state owned by the screen thread, grouped so it can be handed
+/// to `handle_control` as a single argument.
+struct ScreenState {
+    /// Our own capture + encode pipeline while sharing.
+    capture: Option<CaptureState>,
+    /// Decode pipelines for remote streams we're watching.
+    peer_streams: HashMap<u64, PeerStream>,
+    /// Peers whose decoder failed to initialize. Their frames are dropped
+    /// (and the error reported once) instead of panicking per frame.
+    decoder_failed: HashSet<u64>,
+    running: bool,
+}
+
 // ── Thread loop ─────────────────────────────────────────────────────────
 
 fn run_screen_loop(
@@ -249,16 +264,19 @@ fn run_screen_loop(
     wake: WakeFn,
     voice_energy: Arc<AtomicU32>,
 ) {
-    let mut capture: Option<CaptureState> = None;
-    let mut peer_streams: HashMap<u64, PeerStream> = HashMap::new();
-    let mut running = true;
+    let mut st = ScreenState {
+        capture: None,
+        peer_streams: HashMap::new(),
+        decoder_failed: HashSet::new(),
+        running: true,
+    };
     let mut next_capture = Instant::now();
 
-    while running {
+    while st.running {
         let now = Instant::now();
 
-        let is_viewing = !peer_streams.is_empty();
-        let is_capturing = capture.is_some();
+        let is_viewing = !st.peer_streams.is_empty();
+        let is_capturing = st.capture.is_some();
 
         if is_capturing {
             // ── Sharing mode ────────────────────────────────────────
@@ -267,13 +285,11 @@ fn run_screen_loop(
             match control_rx.recv_timeout(time_to_capture) {
                 Ok(ctrl) => handle_control(
                     ctrl,
-                    &mut capture,
-                    &mut peer_streams,
+                    &mut st,
                     &event_tx,
                     &network_tx,
                     &shared,
                     &wake,
-                    &mut running,
                     &voice_energy,
                 ),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -288,13 +304,11 @@ fn run_screen_loop(
             match control_rx.recv_timeout(Duration::from_millis(4)) {
                 Ok(ctrl) => handle_control(
                     ctrl,
-                    &mut capture,
-                    &mut peer_streams,
+                    &mut st,
                     &event_tx,
                     &network_tx,
                     &shared,
                     &wake,
-                    &mut running,
                     &voice_energy,
                 ),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -305,13 +319,11 @@ fn run_screen_loop(
             match control_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(ctrl) => handle_control(
                     ctrl,
-                    &mut capture,
-                    &mut peer_streams,
+                    &mut st,
                     &event_tx,
                     &network_tx,
                     &shared,
                     &wake,
-                    &mut running,
                     &voice_energy,
                 ),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -326,13 +338,11 @@ fn run_screen_loop(
         while let Ok(ctrl) = control_rx.try_recv() {
             handle_control(
                 ctrl,
-                &mut capture,
-                &mut peer_streams,
+                &mut st,
                 &event_tx,
                 &network_tx,
                 &shared,
                 &wake,
-                &mut running,
                 &voice_energy,
             );
         }
@@ -341,9 +351,9 @@ fn run_screen_loop(
         // Pull packets from each peer's jitter buffer and decode them.
         // This runs AFTER the channel drain, so all newly arrived packets
         // are in the buffer before we start decoding.
-        drain_and_decode(&mut peer_streams, &event_tx, &network_tx, &wake);
+        drain_and_decode(&mut st.peer_streams, &event_tx, &network_tx, &wake);
 
-        if let Some(state) = &mut capture
+        if let Some(state) = &mut st.capture
             && Instant::now() >= next_capture
         {
             let cap_start = Instant::now();
@@ -361,7 +371,8 @@ fn run_screen_loop(
                 }
             }
 
-            // FIX: advance from previous target, not from now
+            // Advance from the previous target (not from now) so the
+            // capture cadence stays exact instead of drifting.
             next_capture += state.quality.frame_duration();
 
             // If we fell behind, skip to now (don't burst)
@@ -412,7 +423,7 @@ fn drain_and_decode(
 
                 stream.width = packet.width;
                 stream.height = packet.height;
-                info!(
+                log::debug!(
                     "📺 Keyframe #{seq} from peer {client_id}: {frame_bytes} bytes \
                      (buffer depth: {:.0}ms)",
                     stream.jitter_buffer.depth_ms()
@@ -473,16 +484,13 @@ fn drain_and_decode(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_control(
     ctrl: ScreenControl,
-    capture: &mut Option<CaptureState>,
-    peer_streams: &mut HashMap<u64, PeerStream>,
+    st: &mut ScreenState,
     event_tx: &Sender<ScreenEvent>,
     network_tx: &Sender<NetworkControl>,
     shared: &SharedScreenState,
     wake: &WakeFn,
-    running: &mut bool,
     voice_energy: &Arc<AtomicU32>,
 ) {
     match ctrl {
@@ -534,7 +542,7 @@ fn handle_control(
                 }
             };
 
-            *capture = Some(CaptureState {
+            st.capture = Some(CaptureState {
                 capturer,
                 encoder,
                 quality,
@@ -559,7 +567,7 @@ fn handle_control(
         }
 
         ScreenControl::StopSharing => {
-            if capture.take().is_some() {
+            if st.capture.take().is_some() {
                 shared.is_sharing.store(false, Ordering::Relaxed);
                 let _ = network_tx.send(NetworkControl::ScreenShareStop);
                 *shared.current_quality.lock().unwrap() = None;
@@ -581,29 +589,57 @@ fn handle_control(
             height,
             data,
         } => {
-            let stream = peer_streams.entry(client_id).or_insert_with(|| {
-                info!("📺 Created decoder for peer {client_id} ({width}x{height})");
-                let decoder = create_decoder().expect("decoder creation failed");
-                // Assume 30fps initially; will be refined when Quality is known.
-                // The buffer adapts well even if the FPS guess is off.
-                let jitter_buffer = VideoJitterBuffer::new(30);
-                PeerStream {
-                    decoder,
+            // Decoder init already failed for this peer — drop their
+            // frames until they start a new share session.
+            if st.decoder_failed.contains(&client_id) {
+                return;
+            }
+
+            if !st.peer_streams.contains_key(&client_id) {
+                match create_decoder() {
+                    Ok(decoder) => {
+                        info!("📺 Created decoder for peer {client_id} ({width}x{height})");
+                        // Assume 30fps initially; will be refined when
+                        // Quality is known. The buffer adapts well even
+                        // if the FPS guess is off.
+                        st.peer_streams.insert(
+                            client_id,
+                            PeerStream {
+                                decoder,
+                                width,
+                                height,
+                                jitter_buffer: VideoJitterBuffer::new(30),
+                                stream_audio: None,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        // Do NOT panic here — this used to be an .expect
+                        // that killed the entire screen thread (and with
+                        // it, our own share) on a single failed init.
+                        warn!("📺 Decoder init failed for peer {client_id}: {e}");
+                        st.decoder_failed.insert(client_id);
+                        event_tx
+                            .send(ScreenEvent::Error(format!(
+                                "Video decoder init failed: {e}"
+                            )))
+                            .ok();
+                        wake();
+                        return;
+                    }
+                }
+            }
+
+            if let Some(stream) = st.peer_streams.get_mut(&client_id) {
+                stream.jitter_buffer.push(BufferedPacket {
+                    seq,
+                    is_keyframe,
                     width,
                     height,
-                    jitter_buffer,
-                    stream_audio: None,
-                }
-            });
-
-            stream.jitter_buffer.push(BufferedPacket {
-                seq,
-                is_keyframe,
-                width,
-                height,
-                data,
-                arrival_time: Instant::now(),
-            });
+                    data,
+                    arrival_time: Instant::now(),
+                });
+            }
         }
 
         ScreenControl::PeerStartedSharing {
@@ -611,6 +647,9 @@ fn handle_control(
             width,
             height,
         } => {
+            // New share session — allow a fresh decoder attempt even if
+            // a previous one failed.
+            st.decoder_failed.remove(&client_id);
             event_tx
                 .send(ScreenEvent::PeerStartedSharing {
                     client_id,
@@ -624,7 +663,8 @@ fn handle_control(
         ScreenControl::PeerStoppedSharing { client_id } => {
             // Dropping the PeerStream also drops StreamDecoder,
             // which stops the decode thread + playback pipeline.
-            peer_streams.remove(&client_id);
+            st.peer_streams.remove(&client_id);
+            st.decoder_failed.remove(&client_id);
             event_tx
                 .send(ScreenEvent::PeerStoppedSharing { client_id })
                 .ok();
@@ -636,11 +676,11 @@ fn handle_control(
             seq,
             data,
         } => {
-            decode_incoming_system_audio(client_id, seq, data, peer_streams, voice_energy);
+            decode_incoming_system_audio(client_id, seq, data, &mut st.peer_streams, voice_energy);
         }
 
         ScreenControl::SetStreamVolume { client_id, volume } => {
-            if let Some(stream) = peer_streams.get(&client_id)
+            if let Some(stream) = st.peer_streams.get(&client_id)
                 && let Some(ref audio) = stream.stream_audio
             {
                 audio.set_volume(volume);
@@ -648,7 +688,7 @@ fn handle_control(
         }
 
         ScreenControl::MuteStream { client_id, muted } => {
-            if let Some(stream) = peer_streams.get(&client_id)
+            if let Some(stream) = st.peer_streams.get(&client_id)
                 && let Some(ref audio) = stream.stream_audio
             {
                 audio.set_muted(muted);
@@ -656,7 +696,7 @@ fn handle_control(
         }
 
         ScreenControl::RestartSystemAudio => {
-            if let Some(state) = capture {
+            if let Some(state) = &mut st.capture {
                 // Stop the old capture (drops the dead WASAPI loopback stream)
                 if let Some(mut old) = state.system_audio.take() {
                     old.stop();
@@ -682,14 +722,14 @@ fn handle_control(
         }
 
         ScreenControl::ForceKeyframe => {
-            if let Some(state) = capture {
+            if let Some(state) = &mut st.capture {
                 info!("📺 Viewer requested keyframe — forcing IDR");
                 state.encoder.force_keyframe();
             }
         }
 
         ScreenControl::Shutdown => {
-            *running = false;
+            st.running = false;
         }
     }
 }
@@ -803,37 +843,27 @@ fn decode_incoming_system_audio(
 
 // ── Encoder/decoder factory ─────────────────────────────────────────────
 
-/// Create the best available video encoder.
+/// Create the video encoder (FFmpeg is currently the only backend).
 fn create_encoder(quality: Quality) -> Result<Box<dyn VideoEncoder + Send>, CodecError> {
-    {
-        match FfmpegEncoder::new(quality) {
-            Ok(enc) => {
-                info!("📺 Using FFmpeg encoder: {}", enc.encoder_name());
-                return Ok(Box::new(enc));
-            }
-            Err(e) => {
-                warn!("FFmpeg encoder unavailable: {e}, trying openh264");
-            }
+    match FfmpegEncoder::new(quality) {
+        Ok(enc) => {
+            info!("📺 Using FFmpeg encoder: {}", enc.encoder_name());
+            Ok(Box::new(enc))
+        }
+        Err(e) => {
+            warn!("FFmpeg encoder unavailable: {e}");
+            Err(CodecError::NoEncoder(e.to_string()))
         }
     }
-
-    #[allow(unreachable_code)]
-    Err(CodecError::NoEncoder(
-        "no codec features enabled".to_string(),
-    ))
 }
 
-/// Create the best available video decoder.
+/// Create the video decoder (FFmpeg is currently the only backend).
 fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
     match FfmpegDecoder::new() {
-        Ok(dec) => return Ok(Box::new(dec)),
+        Ok(dec) => Ok(Box::new(dec)),
         Err(e) => {
-            warn!("FFmpeg decoder unavailable: {e}, trying openh264");
+            warn!("FFmpeg decoder unavailable: {e}");
+            Err(CodecError::DecoderInit(e.to_string()))
         }
     }
-
-    #[allow(unreachable_code)]
-    Err(CodecError::DecoderInit(
-        "no codec features enabled".to_string(),
-    ))
 }

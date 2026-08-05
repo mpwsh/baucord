@@ -10,7 +10,9 @@ use bincode::Options;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use log::warn;
 use renet::{ChannelConfig, ClientId, ConnectionConfig, RenetClient, SendType};
-use renet_netcode::{ClientAuthentication, NETCODE_USER_DATA_BYTES, NetcodeClientTransport};
+use renet_netcode::{
+    ClientAuthentication, NETCODE_USER_DATA_BYTES, NetcodeClientTransport, NetcodeTransportError,
+};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::thread;
@@ -170,7 +172,17 @@ impl VoiceBundler {
             return None;
         }
         self.buf[20] = self.frames; // frame_count at byte offset 20
-        Some(self.buf.clone())
+        self.frames = 0;
+        // Hand off the buffer and leave a fresh one behind. This also
+        // fixes a real bug: the old version cloned the buffer WITHOUT
+        // resetting `frames`, so every network-loop tick re-sent the
+        // current bundle and each new frame was appended to an
+        // already-sent packet — duplicate, cumulatively growing voice
+        // packets on the wire.
+        Some(std::mem::replace(
+            &mut self.buf,
+            Vec::with_capacity(VOICE_MTU_BUDGET),
+        ))
     }
 }
 
@@ -190,7 +202,11 @@ fn encode_client_message(msg: &ClientMessage) -> Option<Vec<u8>> {
 
 fn encode_username(name: &str) -> [u8; NETCODE_USER_DATA_BYTES] {
     let mut user_data = [0u8; NETCODE_USER_DATA_BYTES];
-    let len = name.len().min(NETCODE_USER_DATA_BYTES - 8);
+    // Truncate on a char boundary so a multi-byte character is never split.
+    let mut len = name.len().min(NETCODE_USER_DATA_BYTES - 8);
+    while len > 0 && !name.is_char_boundary(len) {
+        len -= 1;
+    }
     user_data[0] = len as u8;
     user_data[1..=len].copy_from_slice(&name.as_bytes()[..len]);
     user_data
@@ -213,10 +229,13 @@ pub(crate) struct NetworkClient {
     // Reorder tracking for received voice packets
     expected_seqs: HashMap<u64, u32>,
 
-    // Speaking status throttle
+    // Speaking status dedupe (only send on change)
     last_speaking_sent: bool,
-    last_speaking_instant: Instant,
     last_rtt_check: Instant,
+    /// Whether we've announced `NetworkMessage::Connected` to the app.
+    /// Set once the netcode handshake actually completes — previously
+    /// Connected fired (twice) as soon as the socket was created.
+    announced_connected: bool,
 }
 
 impl NetworkClient {
@@ -288,13 +307,13 @@ impl NetworkClient {
             transport,
             usernames: HashMap::new(),
             client_id,
-            message_queue: vec![NetworkMessage::Connected],
+            message_queue: Vec::new(),
             last_updated: Instant::now(),
             voice_bundler: VoiceBundler::new(),
             expected_seqs: HashMap::new(),
             last_speaking_sent: false,
-            last_speaking_instant: Instant::now() - Duration::from_secs(5),
             last_rtt_check: Instant::now(),
+            announced_connected: false,
             reassembler: VideoReassembler::new(),
         })
     }
@@ -322,14 +341,24 @@ impl NetworkClient {
             return;
         }
 
+        // Announce Connected exactly once, when the handshake completes.
+        if !self.announced_connected && self.client.is_connected() {
+            self.announced_connected = true;
+            self.message_queue.push(NetworkMessage::Connected);
+        }
+
         self.process_reliable_messages();
         self.process_voice_messages();
         self.process_video_messages();
         self.process_system_audio_messages();
 
         if let Err(e) = self.transport.send_packets(&mut self.client) {
-            let is_would_block =
-                e.to_string().contains("10035") || e.to_string().contains("WouldBlock");
+            let is_would_block = matches!(
+                &e,
+                NetcodeTransportError::IO(io_err)
+                    if io_err.kind() == std::io::ErrorKind::WouldBlock
+            ) || e.to_string().contains("10035")
+                || e.to_string().contains("WouldBlock");
             if is_would_block {
                 log::debug!("send_packets: WouldBlock (OS buffer full), will retry next tick");
             } else {
@@ -601,20 +630,16 @@ impl NetworkClient {
     }
 
     pub fn send_speaking_status(&mut self, is_speaking: bool) {
-        const SPEAKING_THROTTLE_MS: u64 = 50;
-
-        let now = Instant::now();
-        let due = now.duration_since(self.last_speaking_instant)
-            >= Duration::from_millis(SPEAKING_THROTTLE_MS);
-        let edge = is_speaking != self.last_speaking_sent;
-
-        if edge || due {
-            if let Some(encoded) = encode_client_message(&ClientMessage::Speaking(is_speaking)) {
-                self.client.send_message(RELIABLE_CHANNEL, encoded);
-            }
-            self.last_speaking_sent = is_speaking;
-            self.last_speaking_instant = now;
+        // Edge-triggered by the voice thread; dedupe defensively in case
+        // the same state is ever delivered twice. (The old 50 ms throttle
+        // was dead code — this is only ever called on state changes.)
+        if is_speaking == self.last_speaking_sent {
+            return;
         }
+        if let Some(encoded) = encode_client_message(&ClientMessage::Speaking(is_speaking)) {
+            self.client.send_message(RELIABLE_CHANNEL, encoded);
+        }
+        self.last_speaking_sent = is_speaking;
     }
 
     /// Broadcast our mute/deafen state to all other users via the server.
@@ -875,12 +900,14 @@ fn run_network_loop(
             match control_rx.try_recv() {
                 Ok(ctrl) => match ctrl {
                     NetworkControl::Connect { addr, nickname } => {
+                        // Replace any existing session cleanly first.
+                        if let Some(mut old) = client.take() {
+                            old.disconnect();
+                        }
                         match NetworkClient::connect(addr, nickname) {
-                            Ok(c) => {
-                                msg_tx.send(NetworkMessage::Connected).ok();
-                                wake();
-                                client = Some(c);
-                            }
+                            // Connected is announced by NetworkClient::update()
+                            // once the handshake actually completes.
+                            Ok(c) => client = Some(c),
                             Err(e) => {
                                 msg_tx.send(NetworkMessage::Disconnected(e)).ok();
                                 wake();
@@ -1075,7 +1102,7 @@ fn run_network_loop(
                             width,
                             height,
                         });
-                        let _ = msg_tx.try_send(NetworkMessage::ScreenShareStarted {
+                        let _ = msg_tx.send(NetworkMessage::ScreenShareStarted {
                             client_id,
                             width,
                             height,
@@ -1084,7 +1111,7 @@ fn run_network_loop(
                     }
                     NetworkMessage::ScreenShareStopped { client_id } => {
                         let _ = screen_tx.try_send(ScreenControl::PeerStoppedSharing { client_id });
-                        let _ = msg_tx.try_send(NetworkMessage::ScreenShareStopped { client_id });
+                        let _ = msg_tx.send(NetworkMessage::ScreenShareStopped { client_id });
                         wake();
                     }
 
@@ -1095,9 +1122,12 @@ fn run_network_loop(
                         let _ = screen_tx.try_send(ScreenControl::ForceKeyframe);
                     }
 
-                    // Everything else → app
+                    // Everything else → app. These carry state (join /
+                    // leave, init, chat, mute states) — losing one desyncs
+                    // the UI until reconnect, so use a blocking send. The
+                    // app drains this channel every event-loop pass.
                     other => {
-                        let _ = msg_tx.try_send(other);
+                        let _ = msg_tx.send(other);
                         wake();
                     }
                 }

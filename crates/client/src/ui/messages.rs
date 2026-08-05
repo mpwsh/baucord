@@ -133,5 +133,9 @@ pub enum UiMessage {
     QuitFromTray,
 
     // ── Application lifecycle ───────────────────────────────────────
-    Shutdown,
+    /// OS close button on the main window. App decides what it means:
+    /// hide to tray when connected, quit from the connect view.
+    /// (Quit-from-tray and this cover all shutdown paths — the old
+    /// standalone `Shutdown` message had no senders left.)
+    MainWindowClose,
 }

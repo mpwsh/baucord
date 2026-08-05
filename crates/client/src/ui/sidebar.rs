@@ -27,6 +27,115 @@ fn svg_icon(data: &str, size: i32) -> Option<SvgImage> {
     })
 }
 
+thread_local! {
+    /// Parsed + scaled status icons, cached per thread (all UI work runs
+    /// on the main thread). Re-parsing the SVGs on every user-list
+    /// refresh was pure waste. Index 0 = muted, 1 = deafened.
+    static STATUS_ICONS: std::cell::RefCell<[Option<SvgImage>; 2]> =
+        const { std::cell::RefCell::new([None, None]) };
+}
+
+/// The mute/deafen status icon for a row, or `None` for neither.
+/// Deafened takes precedence. Parsed once, cloned per use.
+fn status_icon_image(deafened: bool, muted: bool) -> Option<SvgImage> {
+    let idx = if deafened {
+        1
+    } else if muted {
+        0
+    } else {
+        return None;
+    };
+    STATUS_ICONS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache[idx].is_none() {
+            let data = if idx == 1 {
+                SVG_SELF_DEAFENED
+            } else {
+                SVG_SELF_MUTED
+            };
+            cache[idx] = svg_icon(data, 14);
+        }
+        cache[idx].clone()
+    })
+}
+
+// ── Shared row styling ──────────────────────────────────────────────────
+// Used by BOTH create_user_item and refresh_user_rows so the two paths
+// cannot drift apart (they already had, before this was factored out).
+
+fn row_bg_color(state: &UserState) -> enums::Color {
+    if state.audio_settings.is_muted {
+        theme::ROW_MUTED_TINT
+    } else if (state.audio_settings.volume - 1.0).abs() > 0.01 {
+        theme::ROW_VOLUME_TINT
+    } else {
+        theme::BG_SECONDARY
+    }
+}
+
+/// Speaking-indicator label + colour. Muted wins over speaking.
+fn indicator_style(state: &UserState) -> (&'static str, enums::Color) {
+    if state.audio_settings.is_muted {
+        ("\u{2298}", theme::TEXT_MUTED)
+    } else if state.is_speaking {
+        ("\u{25cf}", theme::SUCCESS)
+    } else {
+        ("\u{25cb}", theme::TEXT_MUTED)
+    }
+}
+
+/// Display name, with a volume badge for non-default remote volume.
+fn display_name(state: &UserState, is_us: bool) -> String {
+    if !is_us && (state.audio_settings.volume - 1.0).abs() > 0.01 {
+        format!(
+            "{} ({}%)",
+            state.username,
+            (state.audio_settings.volume * 100.0) as i32
+        )
+    } else {
+        state.username.clone()
+    }
+}
+
+fn name_color(state: &UserState, is_us: bool) -> enums::Color {
+    if is_us {
+        theme::ACCENT
+    } else if state.audio_settings.is_muted {
+        // Grey, not red: "muted" is a state you chose, not an error.
+        // The tinted row, crossed indicator and icon carry the rest.
+        theme::TEXT_MUTED
+    } else {
+        theme::TEXT_PRIMARY
+    }
+}
+
+/// Style the row's action button: "Live" badge when sharing, invisible
+/// slot for self, hidden "…" (revealed on hover) for remote users.
+fn style_action_btn(
+    btn: &mut button::Button,
+    is_sharing: bool,
+    is_us: bool,
+    row_bg: enums::Color,
+) {
+    if is_sharing {
+        btn.set_label("Live");
+        btn.set_label_size(11);
+        btn.set_label_font(Font::HelveticaBold);
+        btn.set_color(theme::ACCENT);
+        btn.set_label_color(theme::BUTTON_TEXT);
+    } else if is_us {
+        btn.set_label("");
+        btn.set_color(row_bg);
+        btn.set_label_color(row_bg);
+    } else {
+        btn.set_label("\u{2026}");
+        btn.set_label_size(16);
+        btn.set_label_font(Font::Helvetica);
+        btn.set_color(row_bg);
+        btn.set_label_color(row_bg);
+    }
+}
+
 /// Handles for a single user row — kept around to update in-place.
 struct UserRow {
     client_id: ClientId,
@@ -148,7 +257,7 @@ impl Sidebar {
         sidebar.fixed(&settings_btn, 35);
 
         // Disconnect button
-        let mut disconnect_btn = controls::accent_button("Disconnect", theme::DANGER);
+        let mut disconnect_btn = controls::accent_button("Disconnect", theme::ACCENT);
         sidebar.fixed(&disconnect_btn, 35);
 
         sidebar.end();
@@ -233,9 +342,9 @@ impl Sidebar {
     /// `encode_ms` — average encode time in milliseconds
     pub fn update_stream_stats(&mut self, stats: Option<(&str, f32, f32)>) {
         match stats {
-            Some((_, avg_kb, encode_ms)) => {
+            Some((quality, avg_kb, encode_ms)) => {
                 let label =
-                    format!("  Stream: 720p 30fps | {avg_kb:.0}KB | {encode_ms:.1}ms enc");
+                    format!("  Stream: {quality} | {avg_kb:.0}KB | {encode_ms:.1}ms enc");
                 self.stream_stats_label.set_label(&label);
                 if !self.stream_stats_label.visible() {
                     self.stream_stats_label.show();
@@ -515,47 +624,15 @@ impl Sidebar {
                 continue;
             };
 
-            // Speaking indicator
-            if state.audio_settings.is_muted {
-                row.indicator.set_label("\u{2298}");
-                row.indicator.set_label_color(theme::TEXT_MUTED);
-            } else if state.is_speaking {
-                row.indicator.set_label("\u{25cf}");
-                row.indicator.set_label_color(theme::SUCCESS);
-            } else {
-                row.indicator.set_label("\u{25cb}");
-                row.indicator.set_label_color(theme::TEXT_MUTED);
-            }
+            let (ind_label, ind_color) = indicator_style(state);
+            row.indicator.set_label(ind_label);
+            row.indicator.set_label_color(ind_color);
 
-            // Display name (volume badge for non-default volume)
-            let display_name = if !row.is_us && (state.audio_settings.volume - 1.0).abs() > 0.01 {
-                format!(
-                    "{} ({}%)",
-                    state.username,
-                    (state.audio_settings.volume * 100.0) as i32
-                )
-            } else {
-                state.username.clone()
-            };
-            row.name_label.set_label(&display_name);
+            row.name_label.set_label(&display_name(state, row.is_us));
+            row.name_label.set_label_color(name_color(state, row.is_us));
 
-            // Name color
-            if row.is_us {
-                row.name_label.set_label_color(theme::ACCENT);
-            } else if state.audio_settings.is_muted {
-                row.name_label.set_label_color(theme::DANGER);
-            } else {
-                row.name_label.set_label_color(theme::TEXT_PRIMARY);
-            }
-
-            // Row background tint
-            if state.audio_settings.is_muted {
-                row.container.set_color(enums::Color::from_rgb(50, 30, 30));
-            } else if (state.audio_settings.volume - 1.0).abs() > 0.01 {
-                row.container.set_color(enums::Color::from_rgb(40, 40, 50));
-            } else {
-                row.container.set_color(theme::BG_SECONDARY);
-            }
+            let bg = row_bg_color(state);
+            row.container.set_color(bg);
 
             // Mute/deafen icon — for self rows use local state (which is
             // always up to date), for remote rows use broadcast state.
@@ -565,43 +642,14 @@ impl Sidebar {
                 } else {
                     (state.is_self_deafened, state.is_self_muted)
                 };
-
-                if show_deafened {
-                    if let Some(img) = svg_icon(SVG_SELF_DEAFENED, 14) {
-                        icon_frame.set_image(Some(img));
-                    }
-                } else if show_muted {
-                    if let Some(img) = svg_icon(SVG_SELF_MUTED, 14) {
-                        icon_frame.set_image(Some(img));
-                    }
-                } else {
-                    icon_frame.set_image(None::<SvgImage>);
-                }
+                icon_frame.set_image(status_icon_image(show_deafened, show_muted));
                 icon_frame.redraw();
             }
 
-            // "Live" badge — applies to both self and non-self rows now
+            // "Live" badge — applies to both self and non-self rows
             if let Some(btn) = &mut row.action_btn {
                 let is_sharing = self.active_sharers.contains(&row.client_id);
-                if is_sharing {
-                    btn.set_label("Live");
-                    btn.set_label_size(11);
-                    btn.set_label_font(Font::HelveticaBold);
-                    btn.set_color(theme::DANGER);
-                    btn.set_label_color(theme::BUTTON_TEXT);
-                } else if row.is_us {
-                    // Self row, not sharing — hide the badge entirely
-                    btn.set_label("");
-                    btn.set_color(theme::BG_SECONDARY);
-                    btn.set_label_color(theme::BG_SECONDARY);
-                } else {
-                    // Remote row, not sharing — revert to hidden "…"
-                    btn.set_label("\u{2026}");
-                    btn.set_label_size(16);
-                    btn.set_label_font(Font::Helvetica);
-                    btn.set_color(row.container.color());
-                    btn.set_label_color(row.container.color());
-                }
+                style_action_btn(btn, is_sharing, row.is_us, bg);
                 btn.redraw();
             }
         }
@@ -623,55 +671,22 @@ impl Sidebar {
         user_item.set_margins(5, 2, 5, 2);
         user_item.set_frame(enums::FrameType::FlatBox);
 
-        if state.audio_settings.is_muted {
-            user_item.set_color(enums::Color::from_rgb(50, 30, 30));
-        } else if (state.audio_settings.volume - 1.0).abs() > 0.01 {
-            user_item.set_color(enums::Color::from_rgb(40, 40, 50));
-        } else {
-            user_item.set_color(theme::BG_SECONDARY);
-        }
+        let row_bg = row_bg_color(state);
+        user_item.set_color(row_bg);
 
         // Speaking indicator
         let mut indicator = frame::Frame::default();
         user_item.fixed(&indicator, 20);
-
-        if state.audio_settings.is_muted {
-            indicator.set_label("\u{2298}");
-        } else if state.is_speaking {
-            indicator.set_label("\u{25cf}");
-        } else {
-            indicator.set_label("\u{25cb}");
-        }
-
         indicator.set_label_size(14);
         indicator.set_label_font(Font::Helvetica);
-        if state.is_speaking && !state.audio_settings.is_muted {
-            indicator.set_label_color(theme::SUCCESS);
-        } else {
-            indicator.set_label_color(theme::TEXT_MUTED);
-        }
+        let (ind_label, ind_color) = indicator_style(state);
+        indicator.set_label(ind_label);
+        indicator.set_label_color(ind_color);
 
         // Username label — takes remaining space
-        let display_name = if !is_us && (state.audio_settings.volume - 1.0).abs() > 0.01 {
-            format!(
-                "{} ({}%)",
-                state.username,
-                (state.audio_settings.volume * 100.0) as i32
-            )
-        } else {
-            state.username.clone()
-        };
-
-        let mut name_label = frame::Frame::default().with_label(&display_name);
+        let mut name_label = frame::Frame::default().with_label(&display_name(state, is_us));
         name_label.set_align(enums::Align::Left | enums::Align::Inside);
-
-        if is_us {
-            name_label.set_label_color(theme::ACCENT);
-        } else if state.audio_settings.is_muted {
-            name_label.set_label_color(theme::DANGER);
-        } else {
-            name_label.set_label_color(theme::TEXT_PRIMARY);
-        }
+        name_label.set_label_color(name_color(state, is_us));
         name_label.set_label_size(13);
 
         // Status icon frame — shows self-muted/deafened SVG for all users.
@@ -684,14 +699,7 @@ impl Sidebar {
         } else {
             (state.is_self_deafened, state.is_self_muted)
         };
-
-        if show_deafened {
-            if let Some(img) = svg_icon(SVG_SELF_DEAFENED, 14) {
-                icon_frm.set_image(Some(img));
-            }
-        } else if show_muted && let Some(img) = svg_icon(SVG_SELF_MUTED, 14) {
-            icon_frm.set_image(Some(img));
-        }
+        icon_frm.set_image(status_icon_image(show_deafened, show_muted));
 
         let status_icon = Some(icon_frm);
 
@@ -703,25 +711,7 @@ impl Sidebar {
         let mut options_btn = button::Button::default();
         options_btn.set_frame(enums::FrameType::FlatBox);
         user_item.fixed(&options_btn, 32);
-
-        if is_sharing {
-            options_btn.set_label("Live");
-            options_btn.set_label_size(11);
-            options_btn.set_label_font(Font::HelveticaBold);
-            options_btn.set_color(theme::DANGER);
-            options_btn.set_label_color(enums::Color::White);
-        } else if is_us {
-            // Self, not sharing — empty invisible slot
-            options_btn.set_label("");
-            options_btn.set_color(theme::BG_SECONDARY);
-            options_btn.set_label_color(theme::BG_SECONDARY);
-        } else {
-            // Remote, not sharing — hidden "…" (matches parent bg)
-            options_btn.set_label("\u{2026}");
-            options_btn.set_label_size(16);
-            options_btn.set_color(theme::BG_SECONDARY);
-            options_btn.set_label_color(theme::BG_SECONDARY);
-        }
+        style_action_btn(&mut options_btn, is_sharing, is_us, row_bg);
 
         if !is_us {
             // Non-self: clicking opens audio popup
@@ -742,7 +732,7 @@ impl Sidebar {
             let mut btn_clone = options_btn.clone();
             let mut container = user_item.clone();
             let base_color = user_item.color();
-            let hover_color = enums::Color::from_rgb(55, 55, 65);
+            let hover_color = theme::HOVER;
             let was_hovering = std::rc::Rc::new(std::cell::RefCell::new(false));
             let hovering = was_hovering.clone();
 
@@ -869,8 +859,8 @@ impl Sidebar {
         self.local_muted = muted;
         if muted {
             self.mute_btn.set_label("Unmute");
-            self.mute_btn.set_color(theme::DANGER);
-            self.mute_btn.set_label_color(enums::Color::White);
+            self.mute_btn.set_color(theme::ACCENT_HOVER);
+            self.mute_btn.set_label_color(theme::BUTTON_TEXT);
         } else {
             self.mute_btn.set_label("Mute");
             self.mute_btn.set_color(theme::BG_TERTIARY);
@@ -883,8 +873,8 @@ impl Sidebar {
         self.local_deafened = deafened;
         if deafened {
             self.deafen_btn.set_label("Undeafen");
-            self.deafen_btn.set_color(theme::WARNING);
-            self.deafen_btn.set_label_color(enums::Color::White);
+            self.deafen_btn.set_color(theme::ACCENT_HOVER);
+            self.deafen_btn.set_label_color(theme::BUTTON_TEXT);
         } else {
             self.deafen_btn.set_label("Deafen");
             self.deafen_btn.set_color(theme::BG_TERTIARY);
@@ -900,17 +890,7 @@ impl Sidebar {
                 continue;
             }
             if let Some(icon_frame) = &mut row.status_icon {
-                if self.local_deafened {
-                    if let Some(img) = svg_icon(SVG_SELF_DEAFENED, 14) {
-                        icon_frame.set_image(Some(img));
-                    }
-                } else if self.local_muted {
-                    if let Some(img) = svg_icon(SVG_SELF_MUTED, 14) {
-                        icon_frame.set_image(Some(img));
-                    }
-                } else {
-                    icon_frame.set_image(None::<SvgImage>);
-                }
+                icon_frame.set_image(status_icon_image(self.local_deafened, self.local_muted));
                 icon_frame.redraw();
             }
             break;

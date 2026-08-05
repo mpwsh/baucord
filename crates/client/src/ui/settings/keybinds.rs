@@ -8,7 +8,7 @@
 use fltk::{prelude::*, *};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use crate::config::{BindableAction, build_bind_string};
 use crate::ui::messages::UiMessage;
@@ -22,6 +22,8 @@ struct CapturedKey {
     bind: String,
     action: BindableAction,
 }
+
+static HANDLER_INIT: Once = Once::new();
 
 static RECORDING_ACTION: Mutex<Option<BindableAction>> = Mutex::new(None);
 static CAPTURED: Mutex<Option<CapturedKey>> = Mutex::new(None);
@@ -117,8 +119,12 @@ pub fn build(
 
     labels::section_header(&mut col, "\u{2328}", "KEYBOARD SHORTCUTS");
 
-    // Install the global handler once
-    app::add_handler(global_key_handler);
+    // Install the global handler once per process. `add_handler`
+    // appends — calling it on every settings-open used to accumulate
+    // duplicate handlers for the lifetime of the app.
+    HANDLER_INIT.call_once(|| {
+        app::add_handler(global_key_handler);
+    });
 
     let rows: Rc<RefCell<Vec<RowWidgets>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -143,7 +149,15 @@ pub fn build(
     // This bridges the static fn handler → FLTK widget updates + UiMessage sends.
 
     let rows_poll = rows.clone();
+    let alive_probe = col.clone();
     app::add_timeout3(0.05, move |handle| {
+        // Stop polling once the settings window is gone — otherwise every
+        // settings-open would leak a permanent 20 Hz timer. (The panel
+        // itself may be hidden by tab switching, so check the window.)
+        if !alive_probe.window().map(|w| w.visible()).unwrap_or(false) {
+            return;
+        }
+
         // Check for captured key
         let captured = CAPTURED.lock().ok().and_then(|mut g| g.take());
         if let Some(cap) = captured {
@@ -285,8 +299,8 @@ fn build_keybind_row(
                 *g = Some(action);
             }
             btn.set_label("...");
-            btn.set_color(theme::DANGER);
-            btn.set_label_color(enums::Color::White);
+            btn.set_color(theme::ACCENT_HOVER);
+            btn.set_label_color(theme::BUTTON_TEXT);
             disp.set_label("Press a key combo...");
             disp.set_label_color(theme::WARNING);
         }

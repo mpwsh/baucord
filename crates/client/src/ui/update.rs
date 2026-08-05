@@ -148,8 +148,14 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
     let mut meter_timer = meter.clone();
     let progress_timer = progress.clone();
     let mut status_timer = status_lbl.clone();
+    let alive_probe = meter.clone();
 
     app::add_timeout3(0.125, move |handle| {
+        // Stop once the download window is hidden (complete / error /
+        // cancel) — otherwise this timer would repeat forever.
+        if !alive_probe.window().map(|w| w.visible()).unwrap_or(false) {
+            return;
+        }
         let val = f32::from_bits(progress_timer.load(Ordering::Relaxed)).clamp(0.0, 1.0);
         let pct = (val * 100.0) as u32;
         status_timer.set_label(&format!("Downloading... {pct}%"));

@@ -14,7 +14,7 @@ pub mod keybinds;
 
 use fltk::{prelude::*, *};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicU32;
 
 use crate::config::Settings;
 use crate::ui::messages::UiMessage;
@@ -54,7 +54,6 @@ impl SettingsWindow {
         output_devices: Vec<(String, bool)>,
         output_level: Arc<AtomicU32>,
         denoised_level: Arc<AtomicU32>,
-        speaking: Arc<AtomicBool>,
         parent_x: i32,
         parent_y: i32,
         parent_w: i32,
@@ -119,7 +118,6 @@ impl SettingsWindow {
             output_devices,
             output_level,
             denoised_level,
-            speaking,
             content_x,
             10,
             content_w,
@@ -153,7 +151,7 @@ impl SettingsWindow {
         frame::Frame::default(); // left spacer
         let mut reset_btn = controls::button("Reset Defaults");
         btn_row.fixed(&reset_btn, 180);
-        let mut save_btn = controls::accent_button("Save and Close", theme::SUCCESS);
+        let mut save_btn = controls::accent_button("Save and Close", theme::ACCENT);
         btn_row.fixed(&save_btn, 180);
         frame::Frame::default(); // right spacer
         btn_row.end();

@@ -310,6 +310,14 @@ impl VoiceLoopState {
 
 // ── Thread loop ─────────────────────────────────────────────────────────
 
+/// Stamp our client id on an outgoing packet and hand it to the network
+/// thread. Voice frames are droppable by design (`try_send`) — losing one
+/// under pressure is better than stalling the voice loop.
+fn forward_outgoing(network_tx: &Sender<NetworkControl>, our_id: u64, mut packet: AudioPacket) {
+    packet.header.ssrc = our_id;
+    let _ = network_tx.try_send(NetworkControl::SendVoicePacket(packet));
+}
+
 fn run_voice_loop(
     control_rx: Receiver<VoiceControl>,
     event_tx: Sender<VoiceEvent>,
@@ -329,11 +337,12 @@ fn run_voice_loop(
                 Err(_) => { state.running = false; }
             },
             recv(outgoing.as_ref().unwrap_or(&dead_rx)) -> pkt => {
-                if let (Ok(mut packet), Some(id)) = (pkt, state.our_client_id) {
-                    if !is_testing_mic.load(Ordering::Relaxed) {
-                        packet.header.ssrc = id;
-                        let _ = network_tx.try_send(NetworkControl::SendVoicePacket(packet));
-                    }
+                // Low-latency path: forward the packet that woke us.
+                // Anything queued behind it is drained below.
+                if let (Ok(packet), Some(id)) = (pkt, state.our_client_id)
+                    && !is_testing_mic.load(Ordering::Relaxed)
+                {
+                    forward_outgoing(&network_tx, id, packet);
                 }
             },
             default(Duration::from_millis(5)) => {}
@@ -352,9 +361,8 @@ fn run_voice_loop(
             // Forward encoded packets to network (or drain in test mode)
             if let Some(id) = state.our_client_id {
                 if !is_testing_mic.load(Ordering::Relaxed) {
-                    for mut packet in voice.take_outgoing_packets() {
-                        packet.header.ssrc = id;
-                        let _ = network_tx.try_send(NetworkControl::SendVoicePacket(packet));
+                    for packet in voice.take_outgoing_packets() {
+                        forward_outgoing(&network_tx, id, packet);
                     }
                 } else {
                     while voice.outgoing_receiver().try_recv().is_ok() {}
@@ -382,12 +390,23 @@ fn run_voice_loop(
                 Ordering::Relaxed,
             );
 
-            // Edge-triggered speaking notification
-            let speaking = voice.is_speaking();
+            // Edge-triggered speaking notification. Blocking sends on
+            // purpose: there is no periodic refresh, so a dropped edge
+            // means a speaking light stuck in the wrong state until the
+            // next transition. Both channels are drained frequently.
+            //
+            // While mic-testing we're in pure loopback — voice packets
+            // are already gated above, and effective speaking is forced
+            // false here so the test never lights us up (server-side or
+            // on our own sidebar). Treating it as `raw && !testing`
+            // makes the edges self-correcting: starting a test
+            // mid-sentence emits a clean false edge, stopping it while
+            // still talking emits a clean true edge.
+            let speaking = voice.is_speaking() && !is_testing_mic.load(Ordering::Relaxed);
             if speaking != state.was_speaking {
                 state.was_speaking = speaking;
-                let _ = network_tx.try_send(NetworkControl::SendSpeakingStatus(speaking));
-                let _ = event_tx.try_send(VoiceEvent::SpeakingChanged(speaking));
+                let _ = network_tx.send(NetworkControl::SendSpeakingStatus(speaking));
+                let _ = event_tx.send(VoiceEvent::SpeakingChanged(speaking));
                 wake();
             }
         }

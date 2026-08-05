@@ -2,6 +2,10 @@
 //
 // Only Pressed events are forwarded — Released events are ignored so
 // the hotkeys act as toggles, not push-to-talk.
+//
+// Hotkeys are strictly optional: if the OS refuses to create a global
+// hotkey manager (common on Wayland, some remote sessions, etc.) the
+// app runs without them instead of crashing at startup.
 
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
@@ -14,25 +18,28 @@ use std::str::FromStr;
 use crate::config::{BindableAction, Settings};
 
 pub struct HotkeyManager {
-    manager: GlobalHotKeyManager,
+    /// `None` when the OS-level manager could not be created — hotkeys
+    /// are simply disabled in that case.
+    manager: Option<GlobalHotKeyManager>,
+    /// Hotkeys we actually registered, kept so `update()` can unregister
+    /// them properly instead of leaking OS-level grabs.
+    registered: Vec<HotKey>,
     bindings: HashMap<u32, BindableAction>,
 }
 
 impl HotkeyManager {
     pub fn new(settings: &Settings) -> Self {
         let manager = match GlobalHotKeyManager::new() {
-            Ok(m) => m,
+            Ok(m) => Some(m),
             Err(e) => {
-                warn!("Failed to create global hotkey manager: {e}");
-                return Self {
-                    manager: GlobalHotKeyManager::new().expect("GlobalHotKeyManager failed twice"),
-                    bindings: HashMap::new(),
-                };
+                warn!("Global hotkeys unavailable: {e}");
+                None
             }
         };
 
         let mut hm = Self {
             manager,
+            registered: Vec::new(),
             bindings: HashMap::new(),
         };
         hm.register_all(settings);
@@ -56,6 +63,10 @@ impl HotkeyManager {
     }
 
     fn register_all(&mut self, settings: &Settings) {
+        let Some(manager) = &self.manager else {
+            return;
+        };
+
         for entry in &settings.keybinds {
             if entry.bind.is_empty() {
                 continue;
@@ -100,8 +111,9 @@ impl HotkeyManager {
             let modifiers = if mods.is_empty() { None } else { Some(mods) };
             let hotkey = HotKey::new(modifiers, code);
 
-            match self.manager.register(hotkey) {
+            match manager.register(hotkey) {
                 Ok(()) => {
+                    self.registered.push(hotkey);
                     self.bindings.insert(hotkey.id(), entry.action);
                     info!(
                         "🔑 Registered global hotkey: {} → {}",
@@ -121,9 +133,14 @@ impl HotkeyManager {
     }
 
     fn unregister_all(&mut self) {
-        if let Ok(new_manager) = GlobalHotKeyManager::new() {
-            self.manager = new_manager;
+        if let Some(manager) = &self.manager {
+            for hotkey in self.registered.drain(..) {
+                if let Err(e) = manager.unregister(hotkey) {
+                    warn!("Failed to unregister hotkey: {e}");
+                }
+            }
         }
+        self.registered.clear();
         self.bindings.clear();
     }
 }

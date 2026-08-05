@@ -1,18 +1,20 @@
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use audio::PeerAudioSettings;
 
-/// Stable hash key for per-peer audio settings.
+/// Key used to store per-peer audio settings.
+///
+/// Historically this hashed the username with `DefaultHasher`, but that
+/// hash is explicitly not guaranteed stable across Rust releases — a
+/// toolchain bump could silently orphan every saved per-peer setting.
+/// The username itself is the key now. Old hashed entries remain in
+/// settings.json but are simply never read again (harmless dead weight).
 pub fn peer_key(username: &str) -> String {
-    let mut h = DefaultHasher::new();
-    username.hash(&mut h);
-    format!("{:016x}", h.finish())
+    username.to_string()
 }
 
 // ── Bindable actions ────────────────────────────────────────────────────
@@ -27,6 +29,10 @@ pub enum BindableAction {
 }
 
 impl BindableAction {
+    /// Actions shown in the keybind UI. `PushToTalk` is intentionally
+    /// excluded (not implemented yet) — but the enum variant must stay:
+    /// removing it would break deserialization of settings.json files
+    /// that already contain a `push_to_talk` keybind entry.
     pub const ALL: &'static [BindableAction] = &[
         BindableAction::ToggleMute,
         BindableAction::ToggleDeafen,
@@ -264,12 +270,12 @@ impl Settings {
         match serde_json::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = fs::write(&path, contents) {
-                    info!("Failed to save settings: {}", e);
+                    log::error!("Failed to save settings: {e}");
                 } else {
                     info!("Settings saved to {:?}", path);
                 }
             }
-            Err(e) => info!("Failed to serialize settings: {}", e),
+            Err(e) => log::error!("Failed to serialize settings: {e}"),
         }
     }
 

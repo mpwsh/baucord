@@ -263,6 +263,9 @@ fn is_newer(remote: &str, local: &str) -> bool {
 
     match (parse(remote), parse(local)) {
         (Some(r), Some(l)) => r > l,
-        _ => remote != local,
+        // Fail closed: if either side doesn't parse as semver, don't
+        // prompt. The old `remote != local` fallback meant any garbage
+        // /version response triggered an "update available" dialog.
+        _ => false,
     }
 }
