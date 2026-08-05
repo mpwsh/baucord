@@ -16,17 +16,21 @@ use ui::theme;
 use ui::widgets::{controls, style};
 
 /// Fixed size of the centered connect form.
-/// FORM_H = sum of fixed child heights (245) + 7 gaps × 15 spacing.
+/// FORM_H = sum of fixed child heights (305) + 9 gaps × 15 spacing.
 const FORM_W: i32 = 380;
-const FORM_H: i32 = 350;
+const FORM_H: i32 = 440;
+
+/// Widget handles the App needs to keep after the view is built.
+pub struct ConnectView {
+    pub group: group::Group,
+    pub error_frame: frame::Frame,
+    /// Shows "saved device is not connected" warnings; empty when fine.
+    pub device_warning: frame::Frame,
+}
 
 /// Build the connect view into the current group (the main window's
-/// Wizard). Returns the view group and the error frame so App can
-/// switch views and show validation/connection errors.
-pub fn build_view(
-    sender: app::Sender<UiMessage>,
-    settings: &Settings,
-) -> (group::Group, frame::Frame) {
+/// Wizard).
+pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> ConnectView {
     let view = group::Group::default_fill();
 
     // Flexible spacer frames on all four sides center the form.
@@ -96,6 +100,27 @@ pub fn build_view(
     let mut connect_btn = controls::accent_button("Connect", theme::ACCENT);
     col.fixed(&connect_btn, 40);
 
+    // ── Secondary actions ────────────────────────────────────────────
+    // Settings works before connecting (devices, gains, keybinds) —
+    // useful precisely when the saved device is gone.
+
+    let mut actions = group::Flex::default().row();
+    col.fixed(&actions, 30);
+    actions.set_spacing(10);
+    let mut settings_btn = controls::button("Settings");
+    let mut quit_btn = controls::button("Quit");
+    actions.end();
+
+    // ── Missing-device warning ───────────────────────────────────────
+    // Filled in by App when a device saved in settings isn't currently
+    // connected (e.g. the USB mic was unplugged before launch).
+    // Sits under the action row so the fix (Settings) is right above.
+
+    let mut device_warning = frame::Frame::default().with_align(enums::Align::Center);
+    device_warning.set_label_color(theme::WARNING);
+    device_warning.set_label_size(11);
+    col.fixed(&device_warning, 30);
+
     col.end();
 
     frame::Frame::default(); // right spacer
@@ -118,5 +143,19 @@ pub fn build_view(
         }
     });
 
-    (view, error_frame)
+    let s = sender;
+    settings_btn.set_callback(move |_| {
+        s.send(UiMessage::OpenSettings);
+    });
+
+    let s = sender;
+    quit_btn.set_callback(move |_| {
+        s.send(UiMessage::Shutdown);
+    });
+
+    ConnectView {
+        group: view,
+        error_frame,
+        device_warning,
+    }
 }

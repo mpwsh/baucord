@@ -505,7 +505,7 @@ impl VoiceChat {
                 devices.push((name, is_default));
             }
         }
-        info!("Found {} output devices", devices.len());
+        debug!("Found {} output devices", devices.len());
         if let Ok(mut cache) = CACHE.lock() {
             *cache = Some((std::time::Instant::now(), devices.clone()));
         }

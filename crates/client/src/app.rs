@@ -84,6 +84,8 @@ pub struct App {
     sidebar: Option<Sidebar>,
     chat: Option<Chat>,
     error_frame: Option<frame::Frame>,
+    /// "Saved device isn't connected" notice on the connect view.
+    device_warning: Option<frame::Frame>,
     settings_window_open: bool,
     hotkeys: Option<HotkeyManager>,
     tray_icon: Option<TrayIcon<UiMessage>>,
@@ -165,6 +167,7 @@ impl App {
             sidebar: None,
             chat: None,
             error_frame: None,
+            device_warning: None,
             settings_window_open: false,
             hotkeys: None,
             tray_icon: None,
@@ -698,14 +701,17 @@ impl App {
                 if let Some(ref mut hotkeys) = self.hotkeys {
                     hotkeys.update(&self.settings);
                 }
+                self.refresh_device_warning();
             }
             UiMessage::SetInputDevice(d) => {
                 self.settings.audio.input.device = d.clone();
                 self.voice.tx.send(VoiceControl::SetInputDevice(d)).ok();
+                self.refresh_device_warning();
             }
             UiMessage::SetOutputDevice(d) => {
                 self.settings.audio.output.device = d.clone();
                 self.voice.tx.send(VoiceControl::SetOutputDevice(d)).ok();
+                self.refresh_device_warning();
             }
 
             UiMessage::DevicesChanged {
@@ -799,6 +805,11 @@ impl App {
                 } else {
                     self.app.quit();
                 }
+            }
+            UiMessage::Shutdown => {
+                // Explicit quit (connect-view Quit button). Cleanup runs
+                // after the event loop exits in run().
+                self.app.quit();
             }
         }
     }
@@ -942,6 +953,8 @@ impl App {
 
         self.last_input_devices = new_input;
         self.last_output_devices = new_output;
+
+        self.refresh_device_warning();
     }
 
     /// Extract the name of whichever device is marked as the OS default.
@@ -1348,6 +1361,7 @@ impl App {
 
     fn show_connection_screen(&mut self) {
         self.ensure_main_window();
+        self.refresh_device_warning();
         if let (Some(wizard), Some(view)) = (&mut self.wizard, &self.connect_view) {
             wizard.set_current_widget(view);
         }
@@ -1356,6 +1370,39 @@ impl App {
             w.show();
             w.redraw();
         }
+    }
+
+    /// Compare the devices saved in settings against what's connected
+    /// right now and surface the result on the connect view. Runtime
+    /// unplugs already fall back to the system default with a chat
+    /// notice — this covers the silent case: the app launched (or sits
+    /// on the connect view) with a saved device that isn't there.
+    fn refresh_device_warning(&mut self) {
+        let Some(frame) = &mut self.device_warning else {
+            return;
+        };
+
+        let mut missing: Vec<String> = Vec::new();
+        if let Some(name) = &self.settings.audio.input.device
+            && !self.last_input_devices.iter().any(|(n, _)| n == name)
+        {
+            missing.push(format!("mic \"{name}\""));
+        }
+        if let Some(name) = &self.settings.audio.output.device
+            && !self.last_output_devices.iter().any(|(n, _)| n == name)
+        {
+            missing.push(format!("output \"{name}\""));
+        }
+
+        if missing.is_empty() {
+            frame.set_label("");
+        } else {
+            frame.set_label(&format!(
+                "\u{26a0} Saved {} not connected\nOpen Settings to pick another device",
+                missing.join(" and ")
+            ));
+        }
+        frame.redraw();
     }
 
     /// Create the single application window (once): saved geometry, a
@@ -1387,8 +1434,7 @@ impl App {
         // View 1: connect form. Built once — it keeps typed values
         // across failed attempts and reconnects, and error_frame stays
         // valid for the app's lifetime.
-        let (connect_view, error_frame) =
-            crate::ui::connect::build_view(self.sender, &self.settings);
+        let connect = crate::ui::connect::build_view(self.sender, &self.settings);
 
         // View 2: main screen container, filled by show_main_screen().
         let main_view = group::Group::default_fill();
@@ -1408,9 +1454,10 @@ impl App {
 
         wind.show();
 
-        self.error_frame = Some(error_frame);
+        self.error_frame = Some(connect.error_frame);
+        self.device_warning = Some(connect.device_warning);
         self.wizard = Some(wizard);
-        self.connect_view = Some(connect_view);
+        self.connect_view = Some(connect.group);
         self.main_view = Some(main_view);
         self.main_window = Some(wind);
     }
