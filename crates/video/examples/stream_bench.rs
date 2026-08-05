@@ -46,7 +46,7 @@ fn main() {
             }
         };
 
-        let encoded = match encoder.encode(&frame) {
+        let encoded_frames = match encoder.encode(&frame) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("Encode error: {e}");
@@ -55,10 +55,14 @@ fn main() {
             }
         };
 
-        total_bytes += encoded.data.len();
-        second_bytes += encoded.data.len();
-        second_frames += 1;
-        frames_encoded += 1;
+        let mut had_keyframe = false;
+        for encoded in &encoded_frames {
+            total_bytes += encoded.data.len();
+            second_bytes += encoded.data.len();
+            had_keyframe |= encoded.is_keyframe;
+        }
+        second_frames += encoded_frames.len() as u32;
+        frames_encoded += encoded_frames.len() as u64;
 
         if second_start.elapsed() >= Duration::from_secs(1) {
             let mbps = second_bytes as f64 * 8.0 / 1_000_000.0;
@@ -73,7 +77,7 @@ fn main() {
                 second_frames,
                 mbps,
                 avg_kb,
-                if encoded.is_keyframe { " [K]" } else { "" },
+                if had_keyframe { " [K]" } else { "" },
             );
             second_frames = 0;
             second_bytes = 0;

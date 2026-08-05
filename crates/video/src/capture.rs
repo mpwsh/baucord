@@ -3,7 +3,12 @@
 //! Captures a monitor's screen at native resolution. Scaling to the
 //! target encoding resolution is handled by the encoder's swscale pass
 //! (combined with RGBA→YUV420P conversion in a single operation).
-//! Reuses internal buffers to avoid per-frame allocations.
+//!
+//! `xcap` is a per-frame screenshot API: every `capture()` allocates and
+//! fills a fresh full-frame RGBA buffer. There is no buffer reuse to
+//! offer here — that only becomes possible with the OS streaming APIs
+//! (DXGI Desktop Duplication / Windows.Graphics.Capture, ScreenCaptureKit,
+//! PipeWire), which are the planned replacement for this backend.
 
 use std::time::Instant;
 
@@ -45,17 +50,13 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
 
 /// Captures frames from a specific monitor at native resolution.
 ///
-/// No scaling is performed here — the encoder handles downscaling via
-/// swscale during colorspace conversion (RGBA→YUV420P + resize in one
-/// pass with bicubic filtering).
+/// No scaling is performed here — the encoder handles aspect-preserving
+/// downscaling via swscale during the RGBA→YUV420P conversion pass.
 pub struct ScreenCapturer {
     monitor: Monitor,
     quality: Quality,
     frame_count: u64,
     start_time: Instant,
-    /// Reusable buffer for the raw RGBA capture. Avoids allocation per frame
-    /// when the caller returns the previous frame's buffer via `return_buffer()`.
-    reuse_buf: Vec<u8>,
 }
 
 impl ScreenCapturer {
@@ -73,21 +74,11 @@ impl ScreenCapturer {
             .nth(monitor_index)
             .ok_or(CaptureError::MonitorNotFound(monitor_index))?;
 
-        let name = monitor.name().unwrap_or_default();
-        let w = monitor.width().unwrap_or(0);
-        let h = monitor.height().unwrap_or(0);
-        info!("Capturer: monitor='{name}' ({w}x{h}), target={quality}");
-
-        Ok(Self {
-            monitor,
-            quality,
-            frame_count: 0,
-            start_time: Instant::now(),
-            reuse_buf: Vec::new(),
-        })
+        Ok(Self::from_monitor(monitor, quality))
     }
 
-    /// Create a capturer for the primary monitor.
+    /// Create a capturer for the primary monitor (falls back to the first
+    /// monitor if none is marked primary).
     pub fn primary(quality: Quality) -> Result<Self, CaptureError> {
         let monitors = Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
 
@@ -96,31 +87,33 @@ impl ScreenCapturer {
             .position(|m| m.is_primary().unwrap_or(false))
             .unwrap_or(0);
 
-        // Reuse the already-fetched list by picking the monitor directly
         let monitor = monitors
             .into_iter()
             .nth(primary_idx)
             .ok_or(CaptureError::MonitorNotFound(primary_idx))?;
 
+        Ok(Self::from_monitor(monitor, quality))
+    }
+
+    fn from_monitor(monitor: Monitor, quality: Quality) -> Self {
         let name = monitor.name().unwrap_or_default();
         let w = monitor.width().unwrap_or(0);
         let h = monitor.height().unwrap_or(0);
         info!("Capturer: monitor='{name}' ({w}x{h}), target={quality}");
 
-        Ok(Self {
+        Self {
             monitor,
             quality,
             frame_count: 0,
             start_time: Instant::now(),
-            reuse_buf: Vec::new(),
-        })
+        }
     }
 
     /// Capture one frame at the monitor's native resolution.
     ///
     /// Returns RGBA pixel data at the **source** resolution (not the
     /// target quality resolution). The encoder is responsible for
-    /// downscaling during the RGBA→YUV420P conversion pass.
+    /// aspect-preserving downscaling during the RGBA→YUV420P pass.
     pub fn capture(&mut self) -> Result<Frame, CaptureError> {
         let image = self
             .monitor
@@ -140,16 +133,6 @@ impl ScreenCapturer {
             height,
             timestamp_ms,
         })
-    }
-
-    /// Return the previously used RGBA buffer for reuse by the next capture.
-    ///
-    /// Call this after you're done with the [`Frame`] to avoid allocating a new
-    /// buffer on the next `capture()` call. Not required — just an
-    /// optimization when you own the frame and are done with it.
-    pub fn return_buffer(&mut self, mut buf: Vec<u8>) {
-        buf.clear();
-        self.reuse_buf = buf;
     }
 
     pub fn quality(&self) -> Quality {

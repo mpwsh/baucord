@@ -54,9 +54,18 @@ pub const VIDEO_HEADER_SIZE: usize = 20;
 /// We use 1,080 for safety margin (renet adds its own framing).
 pub const VIDEO_CHUNK_PAYLOAD: usize = 1_080;
 
-/// Maximum number of chunks per frame. At 1,080 bytes per chunk, this
-/// supports frames up to 255 × 1,080 ≈ 276 KB.
+/// Maximum number of chunks per frame (chunk_idx/chunk_count are u8).
 const MAX_CHUNKS: usize = 255;
+
+/// Largest encoded frame that fits the chunk format:
+/// [`MAX_CHUNKS`] × [`VIDEO_CHUNK_PAYLOAD`] ≈ 275 KB.
+///
+/// Senders must check against this **before** calling
+/// [`pack_video_frame`] (which panics past it) and drop oversized frames
+/// — the receiver's jitter buffer sees a seq gap and recovers via
+/// keyframe request. The encoder's VBV buffer is sized so frames stay
+/// well under this in normal operation (see `video::codec`).
+pub const MAX_VIDEO_FRAME_BYTES: usize = MAX_CHUNKS * VIDEO_CHUNK_PAYLOAD;
 
 /// Maximum age before an incomplete frame is discarded (milliseconds).
 const FRAME_TIMEOUT_MS: u128 = 500;

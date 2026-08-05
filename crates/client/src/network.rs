@@ -100,6 +100,11 @@ pub enum NetworkMessage {
         seq: u32,
         data: Vec<u8>,
     },
+    /// A viewer of our screen share requested a fresh keyframe
+    /// (routed to screen thread, not app).
+    KeyframeRequested {
+        viewer_id: ClientId,
+    },
 }
 
 // ── Voice packet bundler ────────────────────────────────────────────────
@@ -441,8 +446,15 @@ impl NetworkClient {
                     self.message_queue
                         .push(NetworkMessage::ScreenShareStopped { client_id });
                 }
-
-                _ => log::info!("Got unknown msg"),
+                ServerMessage::KeyframeRequested { viewer_id } => {
+                    self.message_queue
+                        .push(NetworkMessage::KeyframeRequested { viewer_id });
+                }
+                // No catch-all: the match is exhaustive on purpose, so a
+                // new ServerMessage variant is a compile error here (a
+                // reminder to handle it) instead of a silent log line.
+                // Truly unknown wire data never reaches this match — it
+                // fails bincode deserialization above and is skipped.
             }
         }
     }
@@ -691,6 +703,18 @@ impl NetworkClient {
         }
     }
 
+    /// Ask the server to relay a keyframe request to the user we're
+    /// watching. Sent when our jitter buffer hit an unrecoverable gap or
+    /// we joined mid-GOP; the sharer answers with a forced IDR. Reliable
+    /// channel — this message is rare (client-side rate-limited) and
+    /// must not be lost.
+    pub fn send_request_keyframe(&mut self, target_id: u64) {
+        if let Some(encoded) = encode_client_message(&ClientMessage::RequestKeyframe { target_id })
+        {
+            self.client.send_message(RELIABLE_CHANNEL, encoded);
+        }
+    }
+
     pub fn poll_messages(&mut self) -> Vec<NetworkMessage> {
         self.message_queue.drain(..).collect()
     }
@@ -764,6 +788,11 @@ pub enum NetworkControl {
         channels: u8,
         duration_ms: u16,
         data: Vec<u8>,
+    },
+    /// Request a fresh keyframe from the user we're watching
+    /// (viewer → server → sharer).
+    RequestKeyframe {
+        target_id: u64,
     },
     /// Subscribe to a remote user's screen share stream.
     SubscribeScreen {
@@ -912,6 +941,22 @@ fn run_network_loop(
                         data,
                     } => {
                         if let Some(c) = &mut client {
+                            // pack_video_frame panics past the chunk
+                            // format's limit (255 × 1080 B). The encoder's
+                            // VBV keeps frames well under it, but a codec
+                            // misbehaving must not kill the network
+                            // thread — drop the frame instead. The viewer
+                            // sees a seq gap and recovers via keyframe
+                            // request.
+                            if data.len() > protocol::MAX_VIDEO_FRAME_BYTES {
+                                warn!(
+                                    "📺 Encoded frame seq={seq} too large for chunking \
+                                     ({} bytes > {}), dropping",
+                                    data.len(),
+                                    protocol::MAX_VIDEO_FRAME_BYTES,
+                                );
+                                continue;
+                            }
                             let chunks = pack_video_frame(
                                 c.client_id(),
                                 seq,
@@ -933,6 +978,11 @@ fn run_network_loop(
                     } => {
                         if let Some(c) = &mut client {
                             c.send_system_audio(c.client_id(), seq, channels, duration_ms, &data);
+                        }
+                    }
+                    NetworkControl::RequestKeyframe { target_id } => {
+                        if let Some(c) = &mut client {
+                            c.send_request_keyframe(target_id);
                         }
                     }
                     NetworkControl::SubscribeScreen { target_id } => {
@@ -1036,6 +1086,13 @@ fn run_network_loop(
                         let _ = screen_tx.try_send(ScreenControl::PeerStoppedSharing { client_id });
                         let _ = msg_tx.try_send(NetworkMessage::ScreenShareStopped { client_id });
                         wake();
+                    }
+
+                    // Keyframe request from a viewer → screen thread
+                    // (hot path, bypass app)
+                    NetworkMessage::KeyframeRequested { viewer_id } => {
+                        log::info!("📺 Keyframe requested by viewer {viewer_id}");
+                        let _ = screen_tx.try_send(ScreenControl::ForceKeyframe);
                     }
 
                     // Everything else → app

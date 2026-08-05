@@ -17,21 +17,30 @@ fn main() {
     let mut last_decoded = None;
     for i in 0..5 {
         let frame = capturer.capture().expect("Capture failed");
-        let encoded = encoder.encode(&frame).expect("Encode failed");
-        println!(
-            "  frame {}: {} bytes, keyframe={}",
-            i,
-            encoded.data.len(),
-            encoded.is_keyframe
-        );
-        if let Some(decoded) = decoder.decode(&encoded).expect("Decode failed") {
+        // encode() returns zero or more access units (hardware encoders
+        // may buffer the first few frames before emitting anything).
+        let encoded_frames = encoder.encode(&frame).expect("Encode failed");
+        if encoded_frames.is_empty() {
+            println!("  frame {i}: (encoder warming up, no output yet)");
+        }
+        for encoded in &encoded_frames {
             println!(
-                "    decoded: {}x{}, {} bytes RGBA",
-                decoded.width,
-                decoded.height,
-                decoded.data.len()
+                "  frame {}: {} bytes, {}x{}, keyframe={}",
+                i,
+                encoded.data.len(),
+                encoded.width,
+                encoded.height,
+                encoded.is_keyframe
             );
-            last_decoded = Some(decoded);
+            if let Some(decoded) = decoder.decode(encoded).expect("Decode failed") {
+                println!(
+                    "    decoded: {}x{}, {} bytes RGBA",
+                    decoded.width,
+                    decoded.height,
+                    decoded.data.len()
+                );
+                last_decoded = Some(decoded);
+            }
         }
     }
 

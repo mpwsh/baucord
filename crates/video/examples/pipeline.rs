@@ -122,9 +122,9 @@ fn run_serial(
         };
         let capture_us = t.elapsed().as_micros() as u64;
 
-        // Encode
+        // Encode (zero or more access units per input frame)
         let t = Instant::now();
-        let encoded = match encoder.encode(&frame) {
+        let encoded_frames = match encoder.encode(&frame) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("  encode error: {e}");
@@ -132,47 +132,50 @@ fn run_serial(
             }
         };
         let encode_us = t.elapsed().as_micros() as u64;
-        let frame_bytes = encoded.data.len();
-        let is_keyframe = encoded.is_keyframe;
 
-        // Network
-        let network_us = simulate_network(&encoded, net_latency_ms, net_bandwidth);
+        for encoded in &encoded_frames {
+            let frame_bytes = encoded.data.len();
+            let is_keyframe = encoded.is_keyframe;
 
-        // Decode
-        let t = Instant::now();
-        let decoded = match decoder.decode(&encoded) {
-            Ok(Some(d)) => d,
-            Ok(None) => continue,
-            Err(e) => {
-                eprintln!("  decode error: {e}");
-                continue;
-            }
-        };
-        let decode_us = t.elapsed().as_micros() as u64;
+            // Network
+            let network_us = simulate_network(encoded, net_latency_ms, net_bandwidth);
 
-        // Rescale to viewer window
-        let t = Instant::now();
-        rescale_nearest(
-            &decoded.data,
-            decoded.width,
-            decoded.height,
-            &mut rescale_buf,
-            viewer_w,
-            viewer_h,
-        );
-        let rescale_us = t.elapsed().as_micros() as u64;
+            // Decode
+            let t = Instant::now();
+            let decoded = match decoder.decode(encoded) {
+                Ok(Some(d)) => d,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("  decode error: {e}");
+                    continue;
+                }
+            };
+            let decode_us = t.elapsed().as_micros() as u64;
 
-        decoder.return_buffer(decoded.data);
+            // Rescale to viewer window
+            let t = Instant::now();
+            rescale_nearest(
+                &decoded.data,
+                decoded.width,
+                decoded.height,
+                &mut rescale_buf,
+                viewer_w,
+                viewer_h,
+            );
+            let rescale_us = t.elapsed().as_micros() as u64;
 
-        timings.push(FrameTimings {
-            capture_us,
-            encode_us,
-            network_us,
-            decode_us,
-            rescale_us,
-            frame_bytes,
-            is_keyframe,
-        });
+            decoder.return_buffer(decoded.data);
+
+            timings.push(FrameTimings {
+                capture_us,
+                encode_us,
+                network_us,
+                decode_us,
+                rescale_us,
+                frame_bytes,
+                is_keyframe,
+            });
+        }
     }
 
     timings
@@ -214,18 +217,20 @@ fn run_threaded(
             let capture_us = t.elapsed().as_micros() as u64;
 
             let t = Instant::now();
-            let encoded = match encoder.encode(&frame) {
+            let encoded_frames = match encoder.encode(&frame) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
             let encode_us = t.elapsed().as_micros() as u64;
 
             // try_send: drop frame if consumer is behind
-            let _ = tx.try_send(EncodedMsg {
-                encoded,
-                capture_us,
-                encode_us,
-            });
+            for encoded in encoded_frames {
+                let _ = tx.try_send(EncodedMsg {
+                    encoded,
+                    capture_us,
+                    encode_us,
+                });
+            }
         }
     });
 

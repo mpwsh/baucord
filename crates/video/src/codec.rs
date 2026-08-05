@@ -1,18 +1,39 @@
 //! H.264 encode/decode via FFmpeg (`ffmpeg-next` crate).
 //!
-//! Tries hardware encoders in priority order, falls back to libx264.
-//! Reuses FFmpeg frame objects and output buffers across calls.
+//! Tries hardware encoders in priority order, falling back to the next
+//! candidate **when opening fails**, not just when the encoder is missing
+//! from the build (an FFmpeg build can contain `h264_nvenc` on a machine
+//! with no NVIDIA GPU — the open is the real capability test).
 //!
 //! # Scaling architecture
 //!
 //! The encoder accepts frames at **any** input resolution (typically the
-//! monitor's native resolution) and scales to the target encoding
-//! resolution during the RGBA→YUV420P colorspace conversion. This is a
-//! single swscale pass with bicubic filtering — no separate prescale step.
+//! monitor's native resolution) and scales to the output resolution during
+//! the RGBA→YUV420P colorspace conversion — a single swscale pass with
+//! bicubic filtering.
 //!
-//! This gives significantly sharper output for screen content vs the
-//! previous nearest-neighbor prescale, especially for text at non-native
-//! resolutions (e.g. 1080p monitor → 720p encode).
+//! The output resolution is the source scaled to **fit inside** the
+//! `Quality` bound with aspect ratio preserved (never upscaled, rounded
+//! to even dimensions for 4:2:0 chroma). A 1920×1200 source at `HD30`
+//! encodes as 1152×720; a portrait 1080×1920 source as 404×720.
+//!
+//! # Colorimetry
+//!
+//! RGB↔YUV conversion uses BT.709 with limited-range YUV, explicitly
+//! configured on swscale and signaled in the bitstream VUI. Without this,
+//! swscale silently defaults to BT.601 and the stream is unsignaled —
+//! fine as long as our own decoder makes the same wrong assumption, but
+//! subtly wrong colors the moment any other decoder touches the stream.
+//!
+//! # Timestamps and keyframes
+//!
+//! The encoder runs a 1/1000 time base and uses the frame's real capture
+//! timestamp as PTS, so rate control stays correct when the capture rate
+//! wobbles (screenshot APIs can't hold an exact frame rate). Keyframe
+//! cadence is time-based (one IDR every [`KEYFRAME_INTERVAL_MS`]) with a
+//! codec-level GOP as a long backstop, and forced keyframes are forced as
+//! **IDR** on every backend so a joining viewer always gets a clean
+//! recovery point with parameter sets.
 //!
 //! # System requirements
 //!
@@ -23,6 +44,8 @@
 
 extern crate ffmpeg_next as ffmpeg;
 
+use std::collections::VecDeque;
+
 use ffmpeg::codec::{self, encoder, packet::Packet};
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling::{Context as SwsContext, Flags};
@@ -31,239 +54,225 @@ use ffmpeg::{Dictionary, Rational};
 
 use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder, VideoEncoder};
 
+/// Time between IDR keyframes, in milliseconds of *capture time*.
+pub const KEYFRAME_INTERVAL_MS: u64 = 2_000;
+
+/// Codec-level GOP backstop, in seconds. The primary keyframe cadence is
+/// the time-based forcing above; this only guarantees an eventual refresh
+/// if that logic ever fails. Kept long so the two mechanisms don't fight.
+const GOP_BACKSTOP_SECS: u32 = 8;
+
+/// Encoder names to try, in priority order.
+const ENCODER_PRIORITY: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"];
+
+/// VBV buffer ceiling in bits. Bounds the worst-case single-frame size
+/// (≈ bufsize bits) so encoded frames always fit the app transport's
+/// per-frame chunking limit of ~275 KB. See `codec_options`.
+const VBV_MAX_BITS: u32 = 2_000_000;
+
 // ---------------------------------------------------------------------------
 // Encoder
 // ---------------------------------------------------------------------------
 
 /// Hardware-accelerated (or software fallback) H.264 encoder via FFmpeg.
 ///
-/// Accepts RGBA input at any resolution and downscales + converts to
-/// YUV420P in a single swscale pass. The swscale context is created
-/// lazily on the first `encode()` call (when the source resolution is
-/// known) and recreated if the source resolution changes mid-stream.
+/// Accepts RGBA input at any resolution. The encoding session (codec
+/// context + scaler + frame buffers) is created lazily on the first
+/// `encode()` call, when the source resolution is known, and recreated if
+/// the source resolution changes mid-stream (monitor switch, DPI change).
 pub struct FfmpegEncoder {
-    encoder: ffmpeg::encoder::Video,
+    codec: ffmpeg::Codec,
+    enc_name: &'static str,
     quality: Quality,
-    frame_count: i64,
-    keyframe_interval: i64,
     force_next_keyframe: bool,
+    /// Capture timestamp of the last IDR we forced (drives cadence).
+    last_keyframe_ms: Option<u64>,
+    /// Last PTS handed to the encoder — used to keep PTS strictly increasing.
+    last_pts: Option<i64>,
+    session: Option<EncSession>,
+}
 
-    // ── Scaling state (lazily initialized) ───────────────────────────
-    /// swscale context: RGBA(src_w×src_h) → YUV420P(target_w×target_h).
-    /// Created on first frame, recreated if source resolution changes.
-    sws_ctx: Option<SwsContext>,
-    /// Source resolution the current sws_ctx was built for.
-    sws_src_w: u32,
-    sws_src_h: u32,
+/// Everything tied to one (source resolution → output resolution) pairing.
+struct EncSession {
+    encoder: encoder::Video,
+    sws: SwsContext,
+    src_w: u32,
+    src_h: u32,
+    out_w: u32,
+    out_h: u32,
     /// Reusable FFmpeg frame for RGBA input (source resolution).
-    /// Recreated when source resolution changes.
-    rgba_frame: Option<VideoFrame>,
-
-    /// Reusable FFmpeg frame for YUV420P — fed to encoder (target resolution).
+    rgba_frame: VideoFrame,
+    /// Reusable FFmpeg frame for YUV420P — fed to the encoder.
     yuv_frame: VideoFrame,
     /// Reusable packet for receiving encoder output.
     pkt: Packet,
-    /// Reusable buffer for collecting encoded NAL data.
-    /// Taken via `std::mem::take` each frame to avoid cloning.
-    out_buf: Vec<u8>,
+    /// Capture timestamps of frames submitted but not yet emitted.
+    ///
+    /// B-frames are disabled, so output order == input order and a plain
+    /// FIFO maps each output packet back to its input frame's timestamp.
+    /// (Matters for hardware encoders, which run a few frames of delay.)
+    pending_ts: VecDeque<u64>,
 }
 
-/// Encoder names to try, in priority order.
-const ENCODER_PRIORITY: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"];
-
 impl FfmpegEncoder {
-    /// Create an encoder. Tries hardware encoders first, falls back to libx264.
+    /// Create an encoder. Tries hardware encoders first, falls back to
+    /// libx264 — including when a hardware encoder exists in the FFmpeg
+    /// build but fails to open (no GPU / driver missing).
     ///
-    /// The swscale context is **not** created here — it's lazily initialized
-    /// on the first `encode()` call when the source resolution is known.
+    /// The real encoding session is created lazily on the first
+    /// `encode()` call; `new()` opens and discards a probe session at the
+    /// preset's nominal resolution so "no usable encoder" is reported
+    /// here, up front, rather than mid-stream.
     pub fn new(quality: Quality) -> Result<Self, CodecError> {
         ffmpeg::init().map_err(|e| CodecError::EncoderInit(e.to_string()))?;
 
-        let (enc, enc_name) = find_encoder()?;
+        let mut errors: Vec<String> = Vec::new();
 
-        let mut ctx = ffmpeg::codec::context::Context::new_with_codec(enc)
-            .encoder()
-            .video()
-            .map_err(|e| CodecError::EncoderInit(e.to_string()))?;
+        for &name in ENCODER_PRIORITY {
+            let Some(codec) = encoder::find_by_name(name) else {
+                errors.push(format!("{name}: not in FFmpeg build"));
+                continue;
+            };
 
-        let target_bitrate = quality.bitrate() as usize;
-        // Peak bitrate: 1.5× target gives keyframes room to breathe
-        // without allowing unconstrained spikes.
-        let max_bitrate = target_bitrate * 3 / 2;
+            // The probe: actually open a session. `find_by_name` succeeding
+            // only means the encoder was compiled in, not that the hardware
+            // behind it exists.
+            match open_session(codec, name, quality, quality.width(), quality.height()) {
+                Ok(_probe) => {
+                    log::info!("Using FFmpeg encoder: {name}");
+                    return Ok(Self {
+                        codec,
+                        enc_name: name,
+                        quality,
+                        force_next_keyframe: false,
+                        last_keyframe_ms: None,
+                        last_pts: None,
+                        session: None,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Encoder {name} failed to open, trying next: {e}");
+                    errors.push(format!("{name}: {e}"));
+                }
+            }
+        }
 
-        ctx.set_width(quality.width());
-        ctx.set_height(quality.height());
-        ctx.set_format(Pixel::YUV420P);
-        ctx.set_time_base(Rational(1, quality.fps() as i32));
-        ctx.set_frame_rate(Some(Rational(quality.fps() as i32, 1)));
-        ctx.set_bit_rate(target_bitrate);
-        ctx.set_max_bit_rate(max_bitrate);
-        ctx.set_gop(quality.fps());
-        ctx.set_max_b_frames(0);
-
-        let opts = codec_options(enc_name, quality);
-        let encoder = ctx
-            .open_with(opts)
-            .map_err(|e| CodecError::EncoderInit(format!("{enc_name}: {e}")))?;
-
-        log::info!("Using FFmpeg encoder: {enc_name}");
-
-        let mut yuv_frame = VideoFrame::new(Pixel::YUV420P, quality.width(), quality.height());
-        yuv_frame.set_format(Pixel::YUV420P);
-
-        // Pre-allocate output buffer for typical keyframe size
-        let estimated_frame_bytes = target_bitrate / quality.fps() as usize / 8;
-        let out_buf = Vec::with_capacity(estimated_frame_bytes * 2);
-
-        Ok(Self {
-            encoder,
-            quality,
-            frame_count: 0,
-            keyframe_interval: (quality.fps() * 2) as i64,
-            //keyframe_interval: quality.fps() as i64,
-            force_next_keyframe: false,
-            sws_ctx: None,
-            sws_src_w: 0,
-            sws_src_h: 0,
-            rgba_frame: None,
-            yuv_frame,
-            pkt: Packet::empty(),
-            out_buf,
-        })
+        Err(CodecError::NoEncoder(errors.join("; ")))
     }
 
-    /// Ensure the swscale context matches the input frame dimensions.
-    ///
-    /// Creates the context on first call; recreates if source resolution
-    /// changes (e.g. monitor switch, DPI change).
-    fn ensure_sws(&mut self, src_w: u32, src_h: u32) -> Result<(), CodecError> {
-        if self.sws_ctx.is_some() && self.sws_src_w == src_w && self.sws_src_h == src_h {
-            return Ok(());
+    /// Ensure the session matches the input frame dimensions, creating or
+    /// recreating it as needed.
+    fn ensure_session(&mut self, src_w: u32, src_h: u32) -> Result<(), CodecError> {
+        if let Some(s) = &self.session {
+            if s.src_w == src_w && s.src_h == src_h {
+                return Ok(());
+            }
+            log::info!(
+                "encoder: source resolution changed {}x{} → {}x{}, reopening session \
+                 ({} in-flight frame(s) dropped)",
+                s.src_w,
+                s.src_h,
+                src_w,
+                src_h,
+                s.pending_ts.len(),
+            );
         }
 
-        let dst_w = self.quality.width();
-        let dst_h = self.quality.height();
-
-        // Use BICUBIC for downscaling — much sharper than FAST_BILINEAR for
-        // screen content (text, UI elements, hard edges). The CPU cost is
-        // negligible since swscale is SIMD-optimized and we're doing the
-        // colorspace conversion anyway.
-        let flags = if src_w == dst_w && src_h == dst_h {
-            // No resize needed — skip the expensive filter, just convert colorspace
-            Flags::FAST_BILINEAR
-        } else {
-            Flags::BICUBIC
-        };
-
-        let sws = SwsContext::get(
-            Pixel::RGBA,
+        let session = open_session(self.codec, self.enc_name, self.quality, src_w, src_h)?;
+        log::info!(
+            "encoder session: {}x{} → {}x{} ({})",
             src_w,
             src_h,
-            Pixel::YUV420P,
-            dst_w,
-            dst_h,
-            flags,
-        )
-        .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
+            session.out_w,
+            session.out_h,
+            if src_w == session.out_w && src_h == session.out_h {
+                "colorspace only"
+            } else {
+                "bicubic downscale + colorspace"
+            },
+        );
 
-        if self.sws_src_w != 0 {
-            log::info!(
-                "swscale: source resolution changed {}x{} → {}x{}, target {}x{}",
-                self.sws_src_w,
-                self.sws_src_h,
-                src_w,
-                src_h,
-                dst_w,
-                dst_h,
-            );
-        } else {
-            log::info!(
-                "swscale: {}x{} → {}x{} ({})",
-                src_w,
-                src_h,
-                dst_w,
-                dst_h,
-                if src_w == dst_w && src_h == dst_h {
-                    "colorspace only"
-                } else {
-                    "bicubic downscale + colorspace"
-                },
-            );
-        }
-
-        self.sws_ctx = Some(sws);
-        self.sws_src_w = src_w;
-        self.sws_src_h = src_h;
-        self.rgba_frame = Some(VideoFrame::new(Pixel::RGBA, src_w, src_h));
-
+        // A fresh session starts with an IDR anyway, but keep our cadence
+        // bookkeeping honest.
+        self.last_keyframe_ms = None;
+        self.session = Some(session);
         Ok(())
     }
 
-    /// Encode one RGBA frame.
-    ///
-    /// The input frame can be at **any** resolution — the encoder scales
-    /// to the target quality resolution during colorspace conversion.
-    pub fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame, CodecError> {
-        // Ensure swscale matches this frame's resolution
-        self.ensure_sws(frame.width, frame.height)?;
+    /// Encode one RGBA frame. See [`VideoEncoder::encode`] for the output
+    /// contract (zero or more access units, one `EncodedFrame` each).
+    pub fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        self.ensure_session(frame.width, frame.height)?;
 
-        let rgba_frame = self.rgba_frame.as_mut().expect("ensure_sws sets this");
+        // Strictly increasing PTS in the 1/1000 time base. Capture
+        // timestamps are ms-resolution, so a burst can repeat a value.
+        let mut pts = frame.timestamp_ms as i64;
+        if let Some(last) = self.last_pts {
+            if pts <= last {
+                pts = last + 1;
+            }
+        }
+        self.last_pts = Some(pts);
 
-        // Copy RGBA data into reusable FFmpeg frame (stride-aware)
-        fill_rgba_frame(rgba_frame, &frame.data, frame.width, frame.height);
+        // Time-based keyframe cadence: one IDR per KEYFRAME_INTERVAL_MS of
+        // capture time, plus explicit force_keyframe() requests. This is
+        // the single source of truth for cadence — the codec GOP is only a
+        // long backstop (see GOP_BACKSTOP_SECS).
+        let keyframe_due = match self.last_keyframe_ms {
+            None => true,
+            Some(last) => frame.timestamp_ms.saturating_sub(last) >= KEYFRAME_INTERVAL_MS,
+        };
+        let make_keyframe = self.force_next_keyframe || keyframe_due;
+        if make_keyframe {
+            self.force_next_keyframe = false;
+            self.last_keyframe_ms = Some(frame.timestamp_ms);
+        }
 
-        // RGBA(src) → YUV420P(target) via swscale: resize + colorspace in one pass
-        let sws = self.sws_ctx.as_mut().expect("ensure_sws sets this");
-        sws.run(rgba_frame, &mut self.yuv_frame)
+        let session = self.session.as_mut().expect("ensure_session sets this");
+
+        fill_rgba_frame(&mut session.rgba_frame, &frame.data, frame.width, frame.height)?;
+
+        // RGBA(src) → YUV420P(out) via swscale: resize + colorspace in one pass
+        session
+            .sws
+            .run(&session.rgba_frame, &mut session.yuv_frame)
             .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
 
-        self.yuv_frame.set_pts(Some(self.frame_count));
-
-        if self.force_next_keyframe || self.frame_count % self.keyframe_interval == 0 {
-            self.yuv_frame.set_kind(ffmpeg::picture::Type::I);
-            self.force_next_keyframe = false;
+        session.yuv_frame.set_pts(Some(pts));
+        if make_keyframe {
+            // With the per-backend `forced-idr` options set in
+            // codec_options(), a forced I picture is encoded as a true IDR
+            // (with parameter sets), not an open-GOP I frame.
+            session.yuv_frame.set_kind(ffmpeg::picture::Type::I);
         } else {
-            self.yuv_frame.set_kind(ffmpeg::picture::Type::None);
+            session.yuv_frame.set_kind(ffmpeg::picture::Type::None);
         }
 
-        self.encoder
-            .send_frame(&self.yuv_frame)
-            .map_err(|e| CodecError::Encode(e.to_string()))?;
-
-        // Collect output packets into reusable buffer.
-        // Re-initialize capacity from previous frame's size to avoid
-        // repeated small allocations after the take() below.
-        if self.out_buf.capacity() == 0 {
-            let estimated = self.quality.bitrate() as usize / self.quality.fps() as usize / 8;
-            self.out_buf.reserve(estimated * 2);
-        }
-        self.out_buf.clear();
-        let mut is_keyframe = false;
-        while self.encoder.receive_packet(&mut self.pkt).is_ok() {
-            if let Some(data) = self.pkt.data() {
-                self.out_buf.extend_from_slice(data);
+        let mut out = Vec::new();
+        match session.encoder.send_frame(&session.yuv_frame) {
+            Ok(()) => {
+                session.pending_ts.push_back(frame.timestamp_ms);
             }
-            if self.pkt.is_key() {
-                is_keyframe = true;
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
+                // Encoder's output queue is full — drain, then retry once.
+                drain_packets(session, &mut out)?;
+                session
+                    .encoder
+                    .send_frame(&session.yuv_frame)
+                    .map_err(|e| CodecError::Encode(e.to_string()))?;
+                session.pending_ts.push_back(frame.timestamp_ms);
             }
+            Err(e) => return Err(CodecError::Encode(e.to_string())),
         }
 
-        self.frame_count += 1;
-
-        // Transfer ownership instead of cloning — saves one allocation
-        // per frame (30-60 allocs/sec at typical frame rates). The buffer
-        // is re-allocated with capacity on the next encode() call above.
-        Ok(EncodedFrame {
-            data: std::mem::take(&mut self.out_buf),
-            timestamp_ms: frame.timestamp_ms,
-            is_keyframe,
-        })
+        drain_packets(session, &mut out)?;
+        Ok(out)
     }
 
-    /// Force the next encoded frame to be a keyframe.
+    /// Force the next encoded frame to be an IDR keyframe.
     ///
-    /// Call this when a new viewer subscribes so they immediately get a
-    /// decodable frame (with SPS/PPS parameter sets).
+    /// Call this when a new viewer subscribes or reports an unrecoverable
+    /// gap, so they immediately get a decodable frame with SPS/PPS.
     pub fn force_keyframe(&mut self) {
         self.force_next_keyframe = true;
     }
@@ -273,16 +282,18 @@ impl FfmpegEncoder {
     }
 
     /// Returns the name of the active encoder (e.g. "h264_nvenc", "libx264").
-    pub fn encoder_name(&self) -> String {
-        self.encoder
-            .codec()
-            .map(|c| c.name().to_owned())
-            .unwrap_or_else(|| "unknown".into())
+    pub fn encoder_name(&self) -> &'static str {
+        self.enc_name
+    }
+
+    /// The output dimensions of the current session, if one exists.
+    pub fn output_dimensions(&self) -> Option<(u32, u32)> {
+        self.session.as_ref().map(|s| (s.out_w, s.out_h))
     }
 }
 
 impl VideoEncoder for FfmpegEncoder {
-    fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame, CodecError> {
+    fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
         self.encode(frame)
     }
 
@@ -295,9 +306,16 @@ impl VideoEncoder for FfmpegEncoder {
     }
 }
 
-// SAFETY: FFmpeg contexts are single-owner. We never share them across
-// threads — they move into the screen thread and stay there for the
-// lifetime of the capture session.
+// SAFETY: These types own raw FFmpeg pointers (AVCodecContext, SwsContext,
+// AVFrame, AVPacket), none of which are thread-affine — FFmpeg permits
+// using a context from any thread as long as calls aren't concurrent, and
+// `&mut self` on every method already guarantees that. `Send` (move-only)
+// is therefore sound for every current field.
+//
+// MAINTENANCE HAZARD: these are blanket impls. If a genuinely non-Send
+// field is ever added (an `Rc`, a thread-local handle, ...), these impls
+// silently become unsound. Re-audit the field list when changing either
+// struct.
 unsafe impl Send for FfmpegEncoder {}
 unsafe impl Send for FfmpegDecoder {}
 
@@ -307,18 +325,37 @@ unsafe impl Send for FfmpegDecoder {}
 
 /// H.264 decoder via FFmpeg.
 ///
-/// Lazily initializes the YUV→RGBA scaler on first decoded frame
-/// (dimensions aren't known until then). Reuses the RGBA output frame
-/// and pixel buffer across calls.
+/// The YUV→RGBA scaler is created on the first decoded frame and rebuilt
+/// automatically whenever the decoded dimensions, pixel format, or
+/// colorimetry change mid-stream (sender quality switch, monitor change) —
+/// no `flush()` choreography required for those.
 pub struct FfmpegDecoder {
     decoder: ffmpeg::decoder::Video,
-    sws_ctx: Option<SwsContext>,
+    sws: Option<DecoderSws>,
     /// Reusable FFmpeg frame for decoded YUV output.
     decoded_frame: VideoFrame,
+    /// Scratch frame that `receive_frame` writes into.
+    ///
+    /// `avcodec_receive_frame` always unrefs its output frame first —
+    /// including on the EAGAIN call that terminates a drain loop. Receiving
+    /// directly into `decoded_frame` would therefore wipe the last good
+    /// frame right before we convert it. So we receive here and swap on
+    /// success; the terminating EAGAIN only ever clears the scratch.
+    scratch_frame: VideoFrame,
     /// Reusable FFmpeg frame for RGBA conversion output.
     rgba_frame: Option<VideoFrame>,
-    /// Reusable pixel buffer for the final RGBA data.
+    /// Recycled output buffer (from `return_buffer`). Empty when none.
     rgba_buf: Vec<u8>,
+}
+
+/// The scaler plus the source parameters it was built for.
+struct DecoderSws {
+    ctx: SwsContext,
+    w: u32,
+    h: u32,
+    format: Pixel,
+    color_space: ffmpeg::color::Space,
+    color_range: ffmpeg::color::Range,
 }
 
 impl FfmpegDecoder {
@@ -336,16 +373,20 @@ impl FfmpegDecoder {
 
         Ok(Self {
             decoder: ctx,
-            sws_ctx: None,
+            sws: None,
             decoded_frame: VideoFrame::empty(),
+            scratch_frame: VideoFrame::empty(),
             rgba_frame: None,
             rgba_buf: Vec::new(),
         })
     }
 
-    /// Decode H.264 NAL data into RGBA.
+    /// Decode one encoded access unit into RGBA.
     ///
     /// Returns `Ok(None)` when the decoder needs more data (EAGAIN).
+    /// If the decoder emits several frames at once (post-recovery), all
+    /// are consumed and the most recent is returned — older ones have
+    /// already served their purpose as reference frames.
     pub fn decode(&mut self, encoded: &EncodedFrame) -> Result<Option<DecodedFrame>, CodecError> {
         if encoded.data.is_empty() {
             return Ok(None);
@@ -359,56 +400,92 @@ impl FfmpegDecoder {
             .send_packet(&pkt)
             .map_err(|e| CodecError::Decode(e.to_string()))?;
 
-        match self.decoder.receive_frame(&mut self.decoded_frame) {
-            Ok(()) => {}
-            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
-                return Ok(None);
+        // Drain everything available; keep the newest frame. See the
+        // `scratch_frame` field docs for why we can't receive directly
+        // into `decoded_frame` here.
+        let mut got_frame = false;
+        loop {
+            match self.decoder.receive_frame(&mut self.scratch_frame) {
+                Ok(()) => {
+                    std::mem::swap(&mut self.decoded_frame, &mut self.scratch_frame);
+                    got_frame = true;
+                }
+                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => break,
+                Err(ffmpeg::Error::Eof) => break,
+                Err(e) => return Err(CodecError::Decode(e.to_string())),
             }
-            Err(e) => return Err(CodecError::Decode(e.to_string())),
+        }
+        if !got_frame {
+            return Ok(None);
         }
 
         let w = self.decoded_frame.width();
         let h = self.decoded_frame.height();
+        let format = self.decoded_frame.format();
+        let color_space = self.decoded_frame.color_space();
+        let color_range = self.decoded_frame.color_range();
 
-        // Lazily create SWS + RGBA frame on first decode (dimensions unknown until now)
-        if self.sws_ctx.is_none() {
-            self.sws_ctx = Some(
-                SwsContext::get(
-                    self.decoded_frame.format(),
-                    w,
-                    h,
-                    Pixel::RGBA,
-                    w,
-                    h,
-                    Flags::FAST_BILINEAR,
-                )
-                .map_err(|e| CodecError::ColorConversion(e.to_string()))?,
-            );
+        // (Re)build the scaler when the source parameters change. This is
+        // what makes mid-stream resolution/quality switches safe without
+        // any external flush() choreography.
+        let needs_rebuild = match &self.sws {
+            None => true,
+            Some(s) => {
+                s.w != w
+                    || s.h != h
+                    || s.format != format
+                    || s.color_space != color_space
+                    || s.color_range != color_range
+            }
+        };
+        if needs_rebuild {
+            if self.sws.is_some() {
+                log::info!("decoder: stream parameters changed, rebuilding scaler ({w}x{h})");
+            }
+            let mut ctx = SwsContext::get(format, w, h, Pixel::RGBA, w, h, Flags::FAST_BILINEAR)
+                .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
+
+            // YUV(limited, signaled colorspace) → RGBA(full). Falls back to
+            // BT.709/601-by-resolution when the stream is unsignaled.
+            let coeffs = sws_coefficients_for(color_space, h);
+            let src_full = color_range == ffmpeg::color::Range::JPEG;
+            set_sws_colorspace(&mut ctx, coeffs, src_full as i32, 1);
+
+            self.sws = Some(DecoderSws {
+                ctx,
+                w,
+                h,
+                format,
+                color_space,
+                color_range,
+            });
             self.rgba_frame = Some(VideoFrame::new(Pixel::RGBA, w, h));
         }
 
-        let rgba_frame = self.rgba_frame.as_mut().expect("initialized above");
-        let sws = self.sws_ctx.as_mut().expect("initialized above");
+        let rgba_frame = self.rgba_frame.as_mut().expect("built above");
+        let sws = self.sws.as_mut().expect("built above");
 
-        sws.run(&self.decoded_frame, rgba_frame)
+        sws.ctx
+            .run(&self.decoded_frame, rgba_frame)
             .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
 
-        // Extract RGBA data (stride-aware copy)
+        // Stride-aware copy into the output buffer. Reuses a returned
+        // buffer's allocation when available; rows are appended with
+        // `extend_from_slice` so the buffer is never redundantly
+        // zero-filled first (resize(n, 0) would memset multiple MB per
+        // frame just to immediately overwrite every byte).
         let stride = rgba_frame.stride(0);
         let src = rgba_frame.data(0);
-        let rgba_size = (w * h * 4) as usize;
-        self.rgba_buf.resize(rgba_size, 0);
-
         let row_bytes = w as usize * 4;
+        let rgba_size = row_bytes * h as usize;
+
+        let mut data = std::mem::take(&mut self.rgba_buf);
+        data.clear();
+        data.reserve(rgba_size);
         for row in 0..h as usize {
             let src_start = row * stride;
-            let dst_start = row * row_bytes;
-            self.rgba_buf[dst_start..dst_start + row_bytes]
-                .copy_from_slice(&src[src_start..src_start + row_bytes]);
+            data.extend_from_slice(&src[src_start..src_start + row_bytes]);
         }
-
-        // Hand off the buffer, replace with empty
-        let data = std::mem::take(&mut self.rgba_buf);
 
         Ok(Some(DecodedFrame {
             data,
@@ -418,9 +495,10 @@ impl FfmpegDecoder {
         }))
     }
 
-    /// Return a previously-decoded RGBA buffer for reuse.
-    pub fn return_buffer(&mut self, mut buf: Vec<u8>) {
-        buf.clear();
+    /// Return a previously-decoded RGBA buffer so its allocation can be
+    /// reused by the next `decode()` call.
+    pub fn return_buffer(&mut self, buf: Vec<u8>) {
+        // Deliberately not cleared here — decode() clears before writing.
         self.rgba_buf = buf;
     }
 }
@@ -433,30 +511,179 @@ impl VideoDecoder for FfmpegDecoder {
     fn return_buffer(&mut self, buf: Vec<u8>) {
         self.return_buffer(buf);
     }
+
     fn flush(&mut self) {
-        // Calls avcodec_flush_buffers — clears internal reference frames
-        // so the next keyframe decodes from a clean state.
+        // avcodec_flush_buffers — clears internal reference frames so the
+        // next keyframe decodes from a clean state after a known gap.
         self.decoder.flush();
-        // Also drop the SWS context — the next keyframe might have
-        // different dimensions after a stream reset.
-        self.sws_ctx = None;
-        self.rgba_frame = None;
+        // The scaler is parameter-checked every frame and rebuilds itself,
+        // so it does not need to be dropped here.
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session construction
+// ---------------------------------------------------------------------------
+
+/// Compute output dimensions: fit `src` inside the `Quality` bound,
+/// preserving aspect ratio, never upscaling, rounded down to even
+/// dimensions (4:2:0 chroma requires them), minimum 2×2.
+fn fit_dimensions(src_w: u32, src_h: u32, quality: Quality) -> (u32, u32) {
+    let (max_w, max_h) = (quality.width() as u64, quality.height() as u64);
+    let (sw, sh) = (src_w.max(1) as u64, src_h.max(1) as u64);
+
+    let (out_w, out_h) = if sw <= max_w && sh <= max_h {
+        (sw, sh) // never upscale
+    } else if sw * max_h >= sh * max_w {
+        // width-bound: source is wider (proportionally) than the target box
+        (max_w, (sh * max_w) / sw)
+    } else {
+        // height-bound
+        ((sw * max_h) / sh, max_h)
+    };
+
+    (((out_w as u32) & !1).max(2), ((out_h as u32) & !1).max(2))
+}
+
+/// Input pixel format for a given encoder. Most accept planar YUV420P;
+/// Intel QSV only takes the semi-planar NV12 layout (same 4:2:0 subsampling,
+/// interleaved chroma). swscale converts RGBA to either directly.
+fn encoder_pix_fmt(name: &str) -> Pixel {
+    match name {
+        "h264_qsv" => Pixel::NV12,
+        _ => Pixel::YUV420P,
+    }
+}
+
+fn open_session(
+    codec: ffmpeg::Codec,
+    name: &str,
+    quality: Quality,
+    src_w: u32,
+    src_h: u32,
+) -> Result<EncSession, CodecError> {
+    let (out_w, out_h) = fit_dimensions(src_w, src_h, quality);
+    let pix_fmt = encoder_pix_fmt(name);
+
+    // new_with_codec (allocation *with* the codec) is required, not
+    // cosmetic: it applies the codec's own default table. Allocating a
+    // bare context leaves FFmpeg's generic legacy defaults (qmin=2,
+    // qmax=31, ...) in place, which libx264 detects and rejects with
+    // "broken ffmpeg default settings detected".
+    let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()
+        .map_err(|e| CodecError::EncoderInit(e.to_string()))?;
+
+    let target_bitrate = quality.bitrate() as usize;
+    // Peak bitrate: 1.5× target gives keyframes room to breathe
+    // without allowing unconstrained spikes.
+    let max_bitrate = target_bitrate * 3 / 2;
+
+    ctx.set_width(out_w);
+    ctx.set_height(out_h);
+    ctx.set_format(pix_fmt);
+    // 1/1000 time base so PTS carries real capture milliseconds — keeps
+    // rate control honest under variable capture rates.
+    ctx.set_time_base(Rational(1, 1000));
+    ctx.set_frame_rate(Some(Rational(quality.fps() as i32, 1)));
+    ctx.set_bit_rate(target_bitrate);
+    ctx.set_max_bit_rate(max_bitrate);
+    // Backstop GOP only — the real cadence is the time-based IDR forcing
+    // in encode(). Keeping this much longer than KEYFRAME_INTERVAL_MS
+    // means exactly one mechanism decides where keyframes go.
+    ctx.set_gop(quality.fps() * GOP_BACKSTOP_SECS);
+    ctx.set_max_b_frames(0);
+
+    // Signal BT.709 limited-range in the bitstream VUI so any decoder —
+    // not just ours — converts colors correctly.
+    unsafe {
+        let p = ctx.as_mut_ptr();
+        (*p).colorspace = ffmpeg::ffi::AVColorSpace::AVCOL_SPC_BT709;
+        (*p).color_primaries = ffmpeg::ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*p).color_trc = ffmpeg::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        (*p).color_range = ffmpeg::ffi::AVColorRange::AVCOL_RANGE_MPEG;
+    }
+
+    let opts = codec_options(name, quality);
+    let encoder = ctx
+        .open_with(opts)
+        .map_err(|e| CodecError::EncoderInit(format!("{name}: {e}")))?;
+
+    // swscale: RGBA(src, full-range sRGB) → YUV420P(out, BT.709 limited),
+    // resize + colorspace conversion in one pass. BICUBIC when actually
+    // resizing — much sharper than FAST_BILINEAR for text and hard edges.
+    let flags = if src_w == out_w && src_h == out_h {
+        Flags::FAST_BILINEAR
+    } else {
+        Flags::BICUBIC
+    };
+    let mut sws = SwsContext::get(Pixel::RGBA, src_w, src_h, pix_fmt, out_w, out_h, flags)
+        .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
+    set_sws_colorspace(
+        &mut sws,
+        unsafe { ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_ITU709) },
+        1, // RGB input is full range
+        0, // YUV output is limited range
+    );
+
+    let rgba_frame = VideoFrame::new(Pixel::RGBA, src_w, src_h);
+    let mut yuv_frame = VideoFrame::new(pix_fmt, out_w, out_h);
+    // Tag the frames we hand to the encoder with the same colorimetry.
+    unsafe {
+        let f = yuv_frame.as_mut_ptr();
+        (*f).colorspace = ffmpeg::ffi::AVColorSpace::AVCOL_SPC_BT709;
+        (*f).color_primaries = ffmpeg::ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*f).color_trc = ffmpeg::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        (*f).color_range = ffmpeg::ffi::AVColorRange::AVCOL_RANGE_MPEG;
+    }
+
+    Ok(EncSession {
+        encoder,
+        sws,
+        src_w,
+        src_h,
+        out_w,
+        out_h,
+        rgba_frame,
+        yuv_frame,
+        pkt: Packet::empty(),
+        pending_ts: VecDeque::new(),
+    })
+}
+
+/// Receive all currently-available packets from the encoder, emitting one
+/// `EncodedFrame` per packet (one access unit each — never concatenated).
+fn drain_packets(session: &mut EncSession, out: &mut Vec<EncodedFrame>) -> Result<(), CodecError> {
+    loop {
+        match session.encoder.receive_packet(&mut session.pkt) {
+            Ok(()) => {
+                let Some(data) = session.pkt.data() else {
+                    continue;
+                };
+                let timestamp_ms = session
+                    .pending_ts
+                    .pop_front()
+                    .unwrap_or_else(|| session.pkt.pts().unwrap_or(0).max(0) as u64);
+                out.push(EncodedFrame {
+                    data: data.to_vec(),
+                    timestamp_ms,
+                    is_keyframe: session.pkt.is_key(),
+                    width: session.out_w,
+                    height: session.out_h,
+                });
+            }
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => break,
+            Err(ffmpeg::Error::Eof) => break,
+            Err(e) => return Err(CodecError::Encode(e.to_string())),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Find the best available H.264 encoder.
-fn find_encoder() -> Result<(ffmpeg::Codec, &'static str), CodecError> {
-    for &name in ENCODER_PRIORITY {
-        if let Some(enc) = encoder::find_by_name(name) {
-            return Ok((enc, name));
-        }
-    }
-    Err(CodecError::NoEncoder(ENCODER_PRIORITY.join(", ")))
-}
 
 /// Build codec-specific option dictionaries for screen-share encoding.
 ///
@@ -465,43 +692,46 @@ fn find_encoder() -> Result<(ffmpeg::Codec, &'static str), CodecError> {
 /// - **`veryfast` preset** (not `ultrafast`): Re-enables adaptive quantization,
 ///   better motion estimation refinement, and trellis. This is the single biggest
 ///   quality lever — `ultrafast` disables almost all quality tools and produces
-///   visibly worse output at the same bitrate. At 720p30 the CPU cost of
-///   `veryfast` is modest (~15-20% more than `ultrafast`).
+///   visibly worse output at the same bitrate.
 ///
-/// - **`high` profile**: Enables CABAC entropy coding + 8×8 DCT transforms,
-///   giving ~15-20% better compression vs baseline. Since we control both
-///   encoder and decoder, compatibility is not a concern. B-frames are
-///   disabled via `max_b_frames(0)` on the context, so High profile only
-///   adds coding efficiency without latency.
+/// - **`high` profile**: CABAC + 8×8 DCT, ~15-20% better compression vs
+///   baseline. We control both endpoints, so compatibility is not a concern.
+///   B-frames stay disabled via `max_b_frames(0)`.
 ///
-/// - **`zerolatency` tune**: Disables lookahead and frame reordering. Adds
-///   some quality cost but keeps per-frame encode latency minimal for
-///   real-time screen sharing.
+/// - **`zerolatency` tune**: Disables lookahead and frame reordering.
 ///
-/// VBV (Video Buffering Verifier) constrains peak bitrate for real-time
-/// transport. Buffer is 1 second at target bitrate — tight enough for
-/// responsive rate control on scene changes, with enough room for keyframes.
+/// - **ABR + VBV, no CRF**: the `Quality` preset bitrates are the actual
+///   rate-control target. (Setting `crf` alongside a bitrate makes x264
+///   ignore the bitrate entirely — capped CRF — which made the preset
+///   numbers decorative. One rate-control story now.)
+///
+/// - **`forced-idr`** on every backend: frames we force via
+///   `picture::Type::I` become true IDRs with parameter sets, not open-GOP
+///   I frames. Without this, hardware encoders can emit a forced "keyframe"
+///   that a newly-joined viewer cannot actually start decoding from.
 fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
     let mut opts = Dictionary::new();
 
     let target = quality.bitrate();
-    // VBV buffer: 1 second at target bitrate.
-    let vbv_bufsize = target;
-    // Peak rate: 1.5× target — enough for keyframe bursts without
-    // overwhelming the network or protocol buffer budget.
+    // VBV buffer caps the worst-case size of a single frame (a full
+    // buffer drain), which matters twice over: it bounds keyframe bursts
+    // on the wire, and the app's video chunking hard-limits one frame to
+    // 255 × 1080 B ≈ 275 KB (`protocol::MAX_VIDEO_FRAME_BYTES`) — beyond
+    // that the frame can't be sent at all. 2 Mbit ⇒ ≤250 KB per frame,
+    // comfortably inside that, and still 0.25–0.6 s of rate-control
+    // window depending on the preset.
+    let vbv_bufsize = target.min(VBV_MAX_BITS);
     let maxrate = target * 3 / 2;
 
     match name {
         "libx264" => {
-            // veryfast: best quality/speed tradeoff for real-time screen content.
-            // Enables AQ, trellis, and better ME vs ultrafast.
             opts.set("preset", "veryfast");
             opts.set("tune", "zerolatency");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
-            opts.set("crf", "20");
             opts.set("aq-mode", "3");
             opts.set("profile", "high");
+            opts.set("forced-idr", "1");
         }
         "h264_nvenc" => {
             opts.set("preset", "p1");
@@ -510,34 +740,116 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
             opts.set("zerolatency", "1");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
+            opts.set("forced-idr", "1");
         }
         "h264_qsv" => {
             opts.set("preset", "veryfast");
             opts.set("low_power", "1");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
+            opts.set("forced_idr", "1");
         }
         "h264_amf" => {
             opts.set("usage", "ultralowlatency");
             opts.set("quality", "speed");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
+            opts.set("forced_idr", "1");
         }
         _ => {}
     }
     opts
 }
 
+/// Pick the swscale coefficient table for a signaled (or unsignaled)
+/// colorspace.
+fn sws_coefficients_for(space: ffmpeg::color::Space, height: u32) -> *const i32 {
+    use ffmpeg::color::Space;
+    let cs = match space {
+        Space::BT709 => ffmpeg::ffi::SWS_CS_ITU709,
+        Space::BT470BG | Space::SMPTE170M | Space::SMPTE240M => ffmpeg::ffi::SWS_CS_ITU601,
+        // Unsignaled: guess by resolution, the same convention players use.
+        _ if height >= 720 => ffmpeg::ffi::SWS_CS_ITU709,
+        _ => ffmpeg::ffi::SWS_CS_ITU601,
+    };
+    unsafe { ffmpeg::ffi::sws_getCoefficients(cs) }
+}
+
+/// Apply colorspace coefficients + ranges to a swscale context.
+///
+/// `src_range`/`dst_range`: 0 = limited (MPEG), 1 = full (JPEG/RGB).
+fn set_sws_colorspace(sws: &mut SwsContext, coeffs: *const i32, src_range: i32, dst_range: i32) {
+    unsafe {
+        let ret = ffmpeg::ffi::sws_setColorspaceDetails(
+            sws.as_mut_ptr(),
+            coeffs,
+            src_range,
+            coeffs,
+            dst_range,
+            0,       // brightness
+            1 << 16, // contrast (fixed-point 1.0)
+            1 << 16, // saturation (fixed-point 1.0)
+        );
+        if ret < 0 {
+            log::warn!("sws_setColorspaceDetails unsupported for this conversion");
+        }
+    }
+}
+
 /// Copy RGBA pixel data into an ffmpeg VideoFrame (stride-aware).
-fn fill_rgba_frame(frame: &mut VideoFrame, rgba: &[u8], width: u32, height: u32) {
+fn fill_rgba_frame(
+    frame: &mut VideoFrame,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<(), CodecError> {
+    let row_bytes = width as usize * 4;
+    let needed = row_bytes * height as usize;
+    if rgba.len() < needed {
+        return Err(CodecError::Encode(format!(
+            "frame data too small: {} bytes for {width}x{height} RGBA (need {needed})",
+            rgba.len()
+        )));
+    }
+
     let stride = frame.stride(0);
     let dst = frame.data_mut(0);
-    let row_bytes = width as usize * 4;
 
     for row in 0..height as usize {
         let src_start = row * row_bytes;
         let dst_start = row * stride;
         dst[dst_start..dst_start + row_bytes]
             .copy_from_slice(&rgba[src_start..src_start + row_bytes]);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_preserves_aspect_and_never_upscales() {
+        // 16:9 native match
+        assert_eq!(fit_dimensions(1920, 1080, Quality::FHD30), (1920, 1080));
+        // 16:10 source at HD30 (1280x720 bound) → height-bound
+        assert_eq!(fit_dimensions(1920, 1200, Quality::HD30), (1152, 720));
+        // Ultrawide → width-bound
+        assert_eq!(fit_dimensions(3440, 1440, Quality::HD30), (1280, 534));
+        // Portrait → height-bound
+        assert_eq!(fit_dimensions(1080, 1920, Quality::HD30), (404, 720));
+        // Smaller than target: unchanged (no upscale)
+        assert_eq!(fit_dimensions(1280, 720, Quality::FHD30), (1280, 720));
+        assert_eq!(fit_dimensions(800, 600, Quality::HD30), (800, 600));
+        // Already-even odd-ball resolution passes through
+        assert_eq!(fit_dimensions(1366, 768, Quality::FHD30), (1366, 768));
+        // Odd input snaps to even
+        let (w, h) = fit_dimensions(1367, 769, Quality::FHD30);
+        assert_eq!((w % 2, h % 2), (0, 0));
+        // Degenerate inputs can't panic or produce 0
+        let (w, h) = fit_dimensions(1, 1, Quality::HD30);
+        assert!(w >= 2 && h >= 2);
+        let (w, h) = fit_dimensions(10_000, 2, Quality::HD30);
+        assert!(w >= 2 && h >= 2 && w <= 1280);
     }
 }

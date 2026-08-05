@@ -1,34 +1,55 @@
-//! Video jitter buffer — decouples packet receipt from decode.
+//! Reorder buffer for incoming video packets.
 //!
-//! The core problem: when the screen thread decodes a keyframe (10-16ms),
-//! it can't drain the crossbeam channel. Packets that arrive during decode
-//! are dropped by `try_send` on the network thread side. This manifests as
-//! consistent sequence gaps immediately after every keyframe.
+//! Video frames arrive over an unreliable channel (chunked, reassembled),
+//! so they can arrive out of order or not at all, and the decoder drains
+//! them from a different loop than the one that receives them. This
+//! buffer sits between the two and enforces one invariant: **packets are
+//! handed to the decoder in sequence order, and never after a silent
+//! gap** — feeding a P-frame whose reference frames were lost produces
+//! smearing/ghosting artifacts that persist until the next keyframe.
 //!
-//! The jitter buffer fixes this by separating receipt (fast `push`) from
-//! consumption (decoder-paced `pull_next`). Incoming packets go into a
-//! `BTreeMap` keyed by sequence number — insertion is O(log n) and takes
-//! nanoseconds. The decoder pulls packets at its own rate, immune to
-//! transient stalls.
+//! # Latency model
 //!
-//! ## Adaptive depth
+//! There is deliberately **no depth target and no pacing** here: when the
+//! next packet in sequence is present it is released immediately, so the
+//! happy path adds zero latency. Time is only spent when a packet is
+//! actually missing:
 //!
-//! The buffer automatically tracks inter-packet arrival jitter and adjusts
-//! its target depth to match real network conditions. Stable connections
-//! get ~1-2 packets of buffering (barely noticeable); flaky ones get more
-//! automatically. No user-facing knob needed.
+//! - If `next_seq` is absent but later packets exist, delivery pauses for
+//!   a short *reorder window* (derived from measured arrival jitter,
+//!   clamped to 20–150 ms) to give a reordered packet time to arrive.
+//! - When the window expires, the buffer recovers: it jumps forward to a
+//!   buffered **keyframe** if one exists (clean restart), otherwise it
+//!   skips to the next available packet and raises a *keyframe request*
+//!   (the frames after an unhealed gap reference lost data — the only
+//!   real fix is a fresh IDR from the sender).
 //!
-//! ## Design differences from the voice jitter buffer
+//! # Keyframe requests
 //!
-//! | Property          | Voice                    | Video                          |
-//! |-------------------|--------------------------|--------------------------------|
-//! | Packet size       | Uniform (~160B Opus)     | Variable (1KB–170KB)           |
-//! | Decode cost       | ~0.1ms                   | 1–16ms (keyframes expensive)   |
-//! | Loss tolerance    | PLC conceals 1-2 frames  | Any gap corrupts until keyframe|
-//! | Buffering unit    | PCM samples (time-based) | Encoded packets (seq-based)    |
+//! The buffer never talks to the network; it just raises a flag when
+//! recovery needs sender cooperation. The owner polls
+//! [`VideoJitterBuffer::take_keyframe_request`] after draining and relays
+//! it to the sender (which calls `VideoEncoder::force_keyframe`). The
+//! flag is rate-limited internally so a broken stream can't cause
+//! request spam.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long the buffer will wait, unprimed, watching undecodable delta
+/// frames stream past before asking the sender for a keyframe. Covers
+/// the "joined mid-GOP" case.
+const UNPRIMED_REQUEST_AFTER: Duration = Duration::from_millis(400);
+
+/// Minimum spacing between keyframe requests. Below the sender's
+/// keyframe interval by design: a request, its IDR, and that IDR's loss
+/// can all happen within one interval.
+const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_millis(700);
+
+/// Bounds for the reorder window (how long to hold out for a missing
+/// packet before recovering). Derived from measured jitter at runtime.
+const REORDER_WAIT_MIN: Duration = Duration::from_millis(20);
+const REORDER_WAIT_MAX: Duration = Duration::from_millis(150);
 
 /// An encoded video packet waiting in the jitter buffer.
 #[derive(Debug)]
@@ -41,654 +62,586 @@ pub struct BufferedPacket {
     pub arrival_time: Instant,
 }
 
-/// Statistics exposed for diagnostics and UI display.
-#[derive(Debug, Clone, Default)]
+/// Counters for observability. All monotonic except `current_depth`.
+#[derive(Debug, Default, Clone)]
 pub struct JitterBufferStats {
-    /// Total packets pushed into the buffer.
+    /// Packets pushed into the buffer.
     pub packets_received: u64,
-    /// Total packets pulled out for decoding.
+    /// Packets released to the decoder.
     pub packets_delivered: u64,
-    /// Packets dropped due to buffer overflow.
+    /// Packets discarded because the buffer hit its size cap.
     pub packets_dropped_overflow: u64,
-    /// Packets dropped because they arrived too late (seq < next_seq).
+    /// Packets discarded because their sequence was already released.
     pub packets_dropped_late: u64,
-    /// Number of sequence gaps detected during pull.
+    /// Sequence gaps that expired the reorder window (packet truly lost).
     pub gaps_detected: u64,
-    /// Number of keyframe resets.
+    /// Recoveries that jumped forward to a buffered keyframe.
     pub keyframe_resets: u64,
-    /// Current number of packets in the buffer.
+    /// Keyframe requests raised toward the sender.
+    pub keyframe_requests: u64,
+    /// Packets currently buffered.
     pub current_depth: usize,
 }
 
-/// Sequence-based jitter buffer for encoded H.264 video packets.
+/// Sequence-ordering reorder buffer with keyframe-aware loss recovery.
 ///
-/// Holds encoded packets sorted by sequence number and releases them
-/// to the decoder at a controlled rate. This decouples network receipt
-/// (which must be fast) from decode (which can stall on keyframes).
-///
-/// # Buffer depth
-///
-/// The buffer depth is managed by an adaptive algorithm that tracks
-/// inter-packet arrival jitter and sets the target depth accordingly.
-/// Stable connections converge to ~2 packets of buffering; flaky ones
-/// automatically increase. The depth is always active — not just during
-/// initial fill — so it continuously absorbs jitter throughout the stream.
+/// See the module docs for the latency model. Not thread-safe by design —
+/// owned and driven entirely by the screen thread.
 pub struct VideoJitterBuffer {
-    /// Packets waiting to be decoded, keyed by sequence number.
-    /// BTreeMap gives automatic ordering and O(log n) insert/lookup.
+    /// Buffered packets keyed by sequence number.
+    ///
+    /// Note: BTreeMap ordering is numeric, not wraparound-aware, so all
+    /// "which packet is next/first/latest" decisions use the wrapping
+    /// comparisons below rather than map iteration order.
     pending: BTreeMap<u32, BufferedPacket>,
-
-    /// Next sequence number we expect to release to the decoder.
+    /// Next sequence number to release. `None` until primed.
     next_seq: Option<u32>,
-
-    /// Whether we've received at least one keyframe and can start releasing.
+    /// Whether we've seen the first keyframe (nothing is decodable before it).
     primed: bool,
-
-    /// Stream frame rate (used for depth_ms calculation and max_depth).
-    fps: u32,
-
-    /// Maximum packets to hold before evicting. Safety valve against
-    /// runaway growth from stalled decoders or network bursts.
-    max_depth: u32,
-
-    /// Whether playback has started (first non-keyframe delta delivered).
-    /// Once true, stays true for the lifetime of the stream — we never
-    /// re-gate on buffer depth after the initial fill. Recovery from
-    /// gaps is handled by skipping to the next keyframe, not by pausing
-    /// playback to refill.
-    playing: bool,
-
-    /// Adaptive depth tracker — measures jitter and sets target depth.
-    adaptive: AdaptiveDepth,
-
-    /// Diagnostics.
+    /// Hard cap on buffered packets (~3 s at the nominal fps). Hitting it
+    /// means the consumer stalled; recovery jumps to the freshest keyframe.
+    max_depth: usize,
+    /// When the current sequence gap was first observed (reorder window start).
+    gap_since: Option<Instant>,
+    /// When packets started arriving while unprimed (keyframe-wait timer).
+    unprimed_since: Option<Instant>,
+    /// Set when recovery needs a fresh IDR from the sender.
+    want_keyframe: bool,
+    /// Last time a keyframe request was handed out (rate limiting).
+    last_keyframe_request: Option<Instant>,
+    /// Arrival-jitter estimator driving the reorder window.
+    jitter: JitterEstimate,
+    /// Test hook: fixed reorder window override.
+    #[cfg(test)]
+    reorder_wait_override: Option<Duration>,
     pub stats: JitterBufferStats,
 }
 
 impl VideoJitterBuffer {
-    /// Create a new jitter buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `fps` — expected frame rate of the incoming stream (e.g. 30 or 60).
-    ///   Used for adaptive depth calculations and max_depth sizing.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use video::buffer::VideoJitterBuffer;
-    /// let buf = VideoJitterBuffer::new(30);
-    /// assert!(buf.depth() == 0);
-    /// ```
+    /// `fps` is the sender's nominal frame rate — used only to size the
+    /// overflow cap and seed the jitter estimator; delivery itself is
+    /// not paced.
     pub fn new(fps: u32) -> Self {
-        let fps = fps.max(1); // avoid division by zero
-                              // Max depth: 3 seconds of video. Safety valve against unbounded growth.
-        let max_depth = fps * 3;
-
+        let fps = fps.max(1);
         Self {
             pending: BTreeMap::new(),
             next_seq: None,
             primed: false,
-            fps,
-            max_depth,
-            playing: false,
-            adaptive: AdaptiveDepth::new(fps),
+            max_depth: (fps as usize * 3).max(8),
+            gap_since: None,
+            unprimed_since: None,
+            want_keyframe: false,
+            last_keyframe_request: None,
+            jitter: JitterEstimate::new(fps),
+            #[cfg(test)]
+            reorder_wait_override: None,
             stats: JitterBufferStats::default(),
         }
     }
 
-    /// Push an incoming packet into the buffer.
-    ///
-    /// This is the hot path called from the channel drain loop — it must
-    /// be fast. Insertion into the BTreeMap is O(log n) with n typically
-    /// < 10 packets. No decoding happens here.
-    ///
-    /// Keyframes trigger a reset only when they represent a genuine stream
-    /// recovery (large forward jump in sequence numbers). Regular in-sequence
-    /// keyframes at GOP boundaries are inserted normally without disrupting
-    /// playback — they're just another packet in the buffer.
+    /// Insert a packet that arrived from the network.
     pub fn push(&mut self, packet: BufferedPacket) {
         self.stats.packets_received += 1;
-        self.adaptive.record_arrival();
+        self.jitter.record_arrival(packet.arrival_time);
 
-        // Drop packets that are behind our current play position.
-        // These arrived too late to be useful.
-        if let Some(next) = self.next_seq {
-            if is_seq_before(packet.seq, next) {
-                self.stats.packets_dropped_late += 1;
-                return;
+        // Late packet: its slot has already been released or skipped.
+        if self.primed {
+            if let Some(next) = self.next_seq {
+                if packet.seq != next && !is_seq_after(packet.seq, next) {
+                    self.stats.packets_dropped_late += 1;
+                    return;
+                }
             }
         }
 
-        if packet.is_keyframe {
-            let kf_seq = packet.seq;
-
-            // Determine if this keyframe represents a stream recovery
-            // (significant forward jump) vs a regular GOP keyframe.
-            //
-            // A keyframe is "recovery" only if it jumps far ahead of where
-            // we expect to be. The threshold uses the adaptive target depth:
-            // packets in the buffer are naturally ahead of next_seq by up to
-            // target_depth packets. A regular GOP keyframe at seq N+30 when
-            // next_seq is N+18 (12 packets buffered) is NOT recovery — it's
-            // just the next keyframe sitting in the buffer as expected.
-            //
-            // We use 2× adaptive target as the threshold: anything within
-            // that range is normal buffer operation. Beyond it means real
-            // packet loss or a stream reset.
-            let adaptive_target = self.adaptive.target_depth();
-            let is_recovery = match self.next_seq {
-                Some(next) => {
-                    let gap = kf_seq.wrapping_sub(next);
-                    is_seq_before(next, kf_seq) && gap > adaptive_target * 2 + 1
-                }
-                None => true, // first keyframe ever — always prime
-            };
-
-            if is_recovery {
-                self.pending.retain(|&seq, _| !is_seq_before(seq, kf_seq));
-                self.next_seq = Some(kf_seq);
-                if self.primed {
-                    self.stats.keyframe_resets += 1;
-                }
-                // NOTE: we do NOT reset self.playing here. Once playback has
-                // started, recovery should be seamless — we have a keyframe
-                // ready, so there's no reason to pause and wait for the buffer
-                // to refill. The keyframe will be released immediately by
-                // pull_next() (keyframes bypass depth gating).
-            }
-
-            if !self.primed {
-                self.next_seq = Some(kf_seq);
+        if !self.primed {
+            if packet.is_keyframe {
+                // Prime on the first keyframe; nothing before it is decodable.
+                let kf = packet.seq;
+                self.next_seq = Some(kf);
                 self.primed = true;
-            }
-        }
-
-        // Overflow protection: if we exceed max_depth, evict the oldest
-        // non-keyframe packets. This shouldn't happen in normal operation
-        // but protects against stalled decoders.
-        while self.pending.len() >= self.max_depth as usize {
-            // Find the oldest non-keyframe to evict
-            let evict_seq = self
-                .pending
-                .iter()
-                .find(|(_, p)| !p.is_keyframe)
-                .map(|(&seq, _)| seq);
-
-            if let Some(seq) = evict_seq {
-                self.pending.remove(&seq);
-                self.stats.packets_dropped_overflow += 1;
+                self.unprimed_since = None;
+                self.pending
+                    .retain(|&s, _| s == kf || is_seq_after(s, kf));
             } else {
-                // All packets are keyframes (shouldn't happen) — drop oldest
-                if let Some((&seq, _)) = self.pending.iter().next() {
-                    self.pending.remove(&seq);
-                    self.stats.packets_dropped_overflow += 1;
+                // Undecodable delta frames are streaming past — if this
+                // goes on long enough, ask the sender for an IDR instead
+                // of waiting out its keyframe interval.
+                let since = *self.unprimed_since.get_or_insert(packet.arrival_time);
+                if packet.arrival_time.duration_since(since) >= UNPRIMED_REQUEST_AFTER {
+                    self.want_keyframe = true;
                 }
-                break;
             }
         }
 
         self.pending.insert(packet.seq, packet);
+
+        if self.pending.len() > self.max_depth {
+            self.recover_from_overflow();
+        }
+
         self.stats.current_depth = self.pending.len();
     }
 
-    /// Pull the next packet to decode, if the buffer is ready.
+    /// Release the next packet in sequence, if the buffer's rules allow.
     ///
-    /// Returns `None` if:
-    /// - The buffer hasn't been primed (no keyframe yet)
-    /// - The adaptive depth gate hasn't been satisfied
-    /// - The next expected packet hasn't arrived yet
-    ///
-    /// The depth gate is always active and uses the adaptive target depth,
-    /// which tracks real network jitter. Keyframes always bypass the gate
-    /// so the decoder can start/recover immediately.
-    ///
-    /// When a gap is detected (expected seq missing but later packets
-    /// exist), the buffer skips forward to the next available keyframe
-    /// for clean recovery. If no keyframe is available, it skips to
-    /// the next available packet and lets the decoder handle artifacts.
+    /// Call repeatedly until it returns `None`. Afterwards, poll
+    /// [`Self::take_keyframe_request`] and forward it to the sender.
     pub fn pull_next(&mut self) -> Option<BufferedPacket> {
         if !self.primed {
             return None;
         }
         let next = self.next_seq?;
 
-        // Check if the next expected packet is available
-        if self.pending.contains_key(&next) {
-            // Depth gating: keyframes always bypass — release immediately
-            // so the decoder can start/recover ASAP.
-            let is_keyframe = self
-                .pending
-                .get(&next)
-                .map(|p| p.is_keyframe)
-                .unwrap_or(false);
-
-            if !is_keyframe && self.pending.len() < self.adaptive.target_depth() as usize {
-                return None;
-            }
-
-            let packet = self.pending.remove(&next)?;
+        // Happy path: next packet is here — release immediately.
+        if let Some(packet) = self.pending.remove(&next) {
             self.next_seq = Some(next.wrapping_add(1));
+            self.gap_since = None;
             self.stats.packets_delivered += 1;
             self.stats.current_depth = self.pending.len();
-            if !self.playing && !packet.is_keyframe {
-                self.playing = true;
-            }
             return Some(packet);
         }
 
-        // The packet we need isn't here. Check if we have later packets
-        // (meaning this one was truly lost, not just delayed).
-        let have_future = self.pending.keys().any(|&s| is_seq_after(s, next));
-        if !have_future {
-            return None; // hasn't arrived yet — wait
-        }
-
-        // Gap detected. Prefer skipping to the next keyframe for clean
-        // recovery. If no keyframe ahead, skip to the next available
-        // packet — decoder will produce artifacts until next keyframe.
-        self.stats.gaps_detected += 1;
-
-        // Look for the nearest keyframe ahead of our position
-        let keyframe_seq = self
-            .pending
-            .iter()
-            .find(|(_, p)| p.is_keyframe && is_seq_after_or_eq(p.seq, next))
-            .map(|(&seq, _)| seq);
-
-        if let Some(kf_seq) = keyframe_seq {
-            // Clean recovery: skip to keyframe, discard everything before it
-            self.pending.retain(|&seq, _| !is_seq_before(seq, kf_seq));
-            self.next_seq = Some(kf_seq);
-            // Don't deliver yet — let the next pull_next() get it so
-            // the buffer depth check runs against the cleaned-up state
+        // Is anything buffered *after* the missing slot?
+        let has_future = self.pending.keys().any(|&s| is_seq_after(s, next));
+        if !has_future {
+            // Fully caught up — nothing missing, just nothing new yet.
+            self.gap_since = None;
             return None;
         }
 
-        // No keyframe ahead — skip to the next available packet.
-        // The decoder will produce artifacts but at least keeps going.
-        let &next_available = self.pending.keys().next()?;
-        self.next_seq = Some(next_available);
-        let packet = self.pending.remove(&next_available)?;
-        self.next_seq = Some(next_available.wrapping_add(1));
+        // A gap: later packets exist but `next` is missing. Hold for the
+        // reorder window before declaring it lost.
+        let now = Instant::now();
+        let since = *self.gap_since.get_or_insert(now);
+        if now.duration_since(since) < self.reorder_wait() {
+            return None;
+        }
+
+        // Window expired: the packet is lost. Recover.
+        self.gap_since = None;
+        self.stats.gaps_detected += 1;
+
+        if let Some(kf) = self.first_keyframe_after(next) {
+            // Clean restart from a buffered keyframe: everything before it
+            // is unusable (broken reference chains), everything from it on
+            // is a fresh GOP.
+            self.pending.retain(|&s, _| s == kf || is_seq_after(s, kf));
+            self.stats.keyframe_resets += 1;
+            let packet = self.pending.remove(&kf).expect("keyframe located above");
+            self.next_seq = Some(kf.wrapping_add(1));
+            self.stats.packets_delivered += 1;
+            self.stats.current_depth = self.pending.len();
+            return Some(packet);
+        }
+
+        // No keyframe buffered: skip to the closest available packet so the
+        // stream keeps moving, and ask the sender for an IDR — every frame
+        // from here on references lost data and will show artifacts until
+        // one arrives.
+        let skip_to = self.closest_seq_after(next)?;
+        self.want_keyframe = true;
+        let packet = self.pending.remove(&skip_to).expect("located above");
+        self.next_seq = Some(skip_to.wrapping_add(1));
         self.stats.packets_delivered += 1;
         self.stats.current_depth = self.pending.len();
         Some(packet)
     }
 
-    /// Current number of packets in the buffer.
+    /// True at most once per [`KEYFRAME_REQUEST_COOLDOWN`] when recovery
+    /// wants a fresh IDR from the sender. The caller relays this to the
+    /// sender's encoder (`force_keyframe`).
+    pub fn take_keyframe_request(&mut self) -> bool {
+        if !self.want_keyframe {
+            return false;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_keyframe_request {
+            if now.duration_since(last) < KEYFRAME_REQUEST_COOLDOWN {
+                return false;
+            }
+        }
+        self.want_keyframe = false;
+        self.last_keyframe_request = Some(now);
+        self.stats.keyframe_requests += 1;
+        true
+    }
+
+    /// Number of packets currently buffered.
     pub fn depth(&self) -> usize {
         self.pending.len()
     }
 
-    /// Current buffer depth expressed in milliseconds (approximate).
+    /// Buffered span in milliseconds: arrival-time spread between the
+    /// oldest and newest pending packets.
     pub fn depth_ms(&self) -> f32 {
-        self.pending.len() as f32 * 1000.0 / self.fps.max(1) as f32
+        let mut oldest: Option<Instant> = None;
+        let mut newest: Option<Instant> = None;
+        for p in self.pending.values() {
+            oldest = Some(oldest.map_or(p.arrival_time, |o| o.min(p.arrival_time)));
+            newest = Some(newest.map_or(p.arrival_time, |n| n.max(p.arrival_time)));
+        }
+        match (oldest, newest) {
+            (Some(o), Some(n)) => n.duration_since(o).as_secs_f32() * 1000.0,
+            _ => 0.0,
+        }
     }
 
-    /// Current adaptive target depth in milliseconds (for UI display).
+    /// Current reorder window in milliseconds — the longest the buffer
+    /// will stall on a missing packet before recovering. (This is the
+    /// only latency this buffer ever adds, and only during loss.)
     pub fn adaptive_target_ms(&self) -> f32 {
-        self.adaptive.target_depth_ms()
+        self.reorder_wait().as_secs_f32() * 1000.0
     }
 
-    /// Current jitter estimate in milliseconds (for UI display).
+    /// Smoothed arrival-jitter estimate in milliseconds.
     pub fn adaptive_jitter_ms(&self) -> f32 {
-        self.adaptive.jitter_ms()
+        self.jitter.jitter_ms()
     }
 
-    /// Whether the buffer has been primed with a keyframe.
+    /// Whether the first keyframe has been seen.
     pub fn is_primed(&self) -> bool {
         self.primed
     }
 
-    /// Reset the buffer state. Called when a peer stops sharing.
+    /// Clear all state (e.g. when the peer restarts their share).
     pub fn reset(&mut self) {
         self.pending.clear();
         self.next_seq = None;
         self.primed = false;
-        self.playing = false;
-        self.adaptive = AdaptiveDepth::new(self.fps);
+        self.gap_since = None;
+        self.unprimed_since = None;
+        self.want_keyframe = false;
         self.stats.current_depth = 0;
     }
-}
 
-// ── Adaptive depth ──────────────────────────────────────────────────────
+    // ── Internals ───────────────────────────────────────────────────
 
-/// Adaptive jitter buffer depth that tracks inter-packet arrival variance
-/// and adjusts automatically. No user knob needed.
-///
-/// Tracks an exponential moving average (EMA) of the deviation between
-/// actual and expected inter-packet intervals. The target depth is set
-/// to ~2× the observed jitter, giving enough cushion to absorb bursts
-/// without adding unnecessary latency on stable connections.
-///
-/// Seeded at 100ms of jitter so the buffer starts conservative (~6 packets
-/// at 30fps). With α=0.1, it converges to reality within ~20 packets
-/// (~0.7s), so the initial conservatism is short-lived but covers the
-/// riskiest window (stream startup, no jitter data yet).
-pub struct AdaptiveDepth {
-    /// Exponential moving average of inter-packet jitter (ms).
-    jitter_ema: f32,
-    /// Smoothing factor: 0.05 = slow adaptation, 0.2 = fast.
-    alpha: f32,
-    /// Last packet arrival time.
-    last_arrival: Option<Instant>,
-    /// Expected interval between packets (1/fps in ms).
-    expected_interval_ms: f32,
-    /// Minimum depth in packets (floor).
-    min_depth: u32,
-    /// Maximum depth in packets (ceiling).
-    max_depth: u32,
-}
+    fn reorder_wait(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.reorder_wait_override {
+            return d;
+        }
+        // Hold out ~2× the measured jitter: a packet reordered by one
+        // "typical wobble" usually lands within that. The arrival-based
+        // estimator over-reads on keyframe bursts (big frames take longer
+        // to serialize), which errs toward waiting slightly longer during
+        // loss — acceptable, and the clamp bounds the damage.
+        let wait = Duration::from_secs_f32(self.jitter.jitter_ms() * 2.0 / 1000.0);
+        wait.clamp(REORDER_WAIT_MIN, REORDER_WAIT_MAX)
+    }
 
-impl AdaptiveDepth {
-    pub fn new(fps: u32) -> Self {
-        let fps = fps.max(1);
-        let expected_interval_ms = 1000.0 / fps as f32;
-        Self {
-            // Seed at ~100ms of jitter so we start conservative.
-            jitter_ema: 100.0,
-            alpha: 0.1,
-            last_arrival: None,
-            expected_interval_ms,
-            min_depth: 2,
-            max_depth: (fps * 3).max(10),
+    /// The buffered keyframe closest after `after` (wraparound-aware).
+    fn first_keyframe_after(&self, after: u32) -> Option<u32> {
+        self.pending
+            .iter()
+            .filter(|(&s, p)| p.is_keyframe && is_seq_after(s, after))
+            .map(|(&s, _)| s)
+            .min_by_key(|&s| s.wrapping_sub(after))
+    }
+
+    /// The buffered packet closest after `after` (wraparound-aware).
+    fn closest_seq_after(&self, after: u32) -> Option<u32> {
+        self.pending
+            .keys()
+            .filter(|&&s| is_seq_after(s, after))
+            .copied()
+            .min_by_key(|&s| s.wrapping_sub(after))
+    }
+
+    /// The buffer hit its size cap: the consumer stalled for seconds.
+    /// Jump to the *freshest* buffered keyframe (dropping everything
+    /// older — it's stale by definition), or clear entirely and request
+    /// an IDR if no keyframe is buffered.
+    fn recover_from_overflow(&mut self) {
+        let latest_kf = self.next_seq.and_then(|next| {
+            self.pending
+                .iter()
+                .filter(|(&s, p)| p.is_keyframe && (s == next || is_seq_after(s, next)))
+                .map(|(&s, _)| s)
+                .max_by_key(|&s| s.wrapping_sub(next))
+        });
+
+        match latest_kf {
+            Some(kf) => {
+                let before = self.pending.len();
+                self.pending.retain(|&s, _| s == kf || is_seq_after(s, kf));
+                self.stats.packets_dropped_overflow += (before - self.pending.len()) as u64;
+                self.stats.keyframe_resets += 1;
+                self.next_seq = Some(kf);
+                self.gap_since = None;
+                log::warn!(
+                    "jitter buffer overflow: jumped to keyframe seq {kf}, dropped {} packet(s)",
+                    before - self.pending.len(),
+                );
+            }
+            None => {
+                self.stats.packets_dropped_overflow += self.pending.len() as u64;
+                self.pending.clear();
+                self.gap_since = None;
+                self.want_keyframe = true;
+                log::warn!("jitter buffer overflow with no buffered keyframe: cleared, requesting IDR");
+            }
         }
     }
 
-    /// Call on every packet arrival to update jitter estimate.
-    pub fn record_arrival(&mut self) {
-        let now = Instant::now();
-        if let Some(last) = self.last_arrival {
-            let actual_ms = now.duration_since(last).as_secs_f32() * 1000.0;
-            let deviation = (actual_ms - self.expected_interval_ms).abs();
-            self.jitter_ema = self.jitter_ema * (1.0 - self.alpha) + deviation * self.alpha;
-        }
-        self.last_arrival = Some(now);
-    }
+    // ── Test hooks ──────────────────────────────────────────────────
 
-    /// Current recommended depth in packets.
-    /// Buffers ~2× the observed jitter, converted to packet count.
-    pub fn target_depth(&self) -> u32 {
-        let depth_ms = self.jitter_ema * 2.0;
-        let packets = (depth_ms / self.expected_interval_ms).ceil() as u32;
-        packets.clamp(self.min_depth, self.max_depth)
-    }
-
-    /// Current jitter estimate in ms (for display).
-    pub fn jitter_ms(&self) -> f32 {
-        self.jitter_ema
-    }
-
-    /// Current target depth in ms (for display).
-    pub fn target_depth_ms(&self) -> f32 {
-        self.target_depth() as f32 * self.expected_interval_ms
-    }
     #[cfg(test)]
-    fn freeze_at(&mut self, target_packets: u32) {
-        self.jitter_ema = target_packets as f32 * self.expected_interval_ms / 2.0;
-        self.min_depth = self.min_depth.min(target_packets);
-        self.alpha = 0.0;
+    fn set_reorder_wait(&mut self, d: Duration) {
+        self.reorder_wait_override = Some(d);
+    }
+
+    #[cfg(test)]
+    fn set_unprimed_since(&mut self, t: Instant) {
+        self.unprimed_since = Some(t);
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-/// Returns true if `a` is sequentially before `b`, handling u32 wraparound.
+/// Wraparound-aware "is `a` after `b`" for u32 sequence numbers.
 ///
-/// Uses the standard "half-space" comparison: if the distance from a to b
-/// (wrapping) is less than half the sequence space, a is before b.
-fn is_seq_before(a: u32, b: u32) -> bool {
-    a.wrapping_sub(b) > u32::MAX / 2
-}
-
-/// Returns true if `a` is sequentially after `b`, handling u32 wraparound.
+/// Uses the RTP convention: `a` is after `b` if the wrapped distance is in
+/// the forward half of the sequence space.
 fn is_seq_after(a: u32, b: u32) -> bool {
-    is_seq_before(b, a)
+    a != b && a.wrapping_sub(b) < u32::MAX / 2
 }
 
-/// Returns true if `a` is sequentially after or equal to `b`.
-fn is_seq_after_or_eq(a: u32, b: u32) -> bool {
-    a == b || is_seq_after(a, b)
+// ---------------------------------------------------------------------------
+// Arrival jitter estimation
+// ---------------------------------------------------------------------------
+
+/// EMA of the deviation between consecutive packet arrival gaps and the
+/// nominal frame interval.
+///
+/// **Known bias:** keyframes are ~10× larger than delta frames, so their
+/// serialization/chunking delay inflates arrival gaps once per keyframe
+/// interval. That inflates this estimate. It is used only to size the
+/// reorder window (clamped) and for UI stats — it does not gate delivery,
+/// so the bias costs at most a slightly longer hold during actual loss.
+struct JitterEstimate {
+    expected_interval_ms: f32,
+    jitter_ms: f32,
+    last_arrival: Option<Instant>,
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
+impl JitterEstimate {
+    fn new(fps: u32) -> Self {
+        Self {
+            expected_interval_ms: 1000.0 / fps.max(1) as f32,
+            // Seed at half a frame interval — a sane starting reorder
+            // window before real measurements accumulate.
+            jitter_ms: 1000.0 / fps.max(1) as f32 / 2.0,
+            last_arrival: None,
+        }
+    }
+
+    fn record_arrival(&mut self, at: Instant) {
+        if let Some(last) = self.last_arrival {
+            let gap_ms = at.duration_since(last).as_secs_f32() * 1000.0;
+            // Clamp the deviation so a stream pause (alt-tab, network
+            // hiccup measured in seconds) doesn't poison the estimate.
+            let deviation = (gap_ms - self.expected_interval_ms).abs().min(250.0);
+            const ALPHA: f32 = 1.0 / 16.0; // RFC 3550 smoothing factor
+            self.jitter_ms += ALPHA * (deviation - self.jitter_ms);
+        }
+        self.last_arrival = Some(at);
+    }
+
+    fn jitter_ms(&self) -> f32 {
+        self.jitter_ms
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_packet(seq: u32, is_keyframe: bool) -> BufferedPacket {
+    fn pkt(seq: u32, is_keyframe: bool) -> BufferedPacket {
         BufferedPacket {
             seq,
             is_keyframe,
             width: 1280,
             height: 720,
-            data: vec![0u8; if is_keyframe { 100_000 } else { 5_000 }],
+            data: vec![0u8; 8],
             arrival_time: Instant::now(),
         }
     }
 
-    /// Create a buffer with a known fixed adaptive depth for deterministic tests.
-    /// Seeds jitter_ema so that target_depth() returns exactly `target_packets`.
-    fn make_buffer_with_target(fps: u32, target_packets: u32) -> VideoJitterBuffer {
-        let mut buf = VideoJitterBuffer::new(fps);
-        buf.adaptive.freeze_at(target_packets);
-        assert_eq!(buf.adaptive.target_depth(), target_packets);
-        buf
-    }
-
     #[test]
-    fn buffer_requires_keyframe_before_releasing() {
+    fn unprimed_until_first_keyframe() {
         let mut buf = VideoJitterBuffer::new(30);
+        buf.push(pkt(5, false));
+        buf.push(pkt(6, false));
+        assert!(!buf.is_primed());
+        assert!(buf.pull_next().is_none());
 
-        buf.push(make_packet(1, false));
-        buf.push(make_packet(2, false));
-        assert!(
-            buf.pull_next().is_none(),
-            "should not release without keyframe"
-        );
-
-        buf.push(make_packet(3, true));
-        let pkt = buf.pull_next().unwrap();
-        assert_eq!(pkt.seq, 3);
-        assert!(pkt.is_keyframe);
+        buf.push(pkt(7, true));
+        assert!(buf.is_primed());
+        // Deltas before the keyframe were discarded on priming.
+        let p = buf.pull_next().expect("keyframe releases");
+        assert_eq!(p.seq, 7);
+        assert!(p.is_keyframe);
     }
 
     #[test]
-    fn packets_released_in_sequence_order() {
-        let mut buf = make_buffer_with_target(30, 1);
-
-        // Push out of order
-        buf.push(make_packet(10, true));
-        buf.push(make_packet(12, false));
-        buf.push(make_packet(11, false));
-
+    fn releases_immediately_and_in_order() {
+        let mut buf = VideoJitterBuffer::new(30);
+        buf.push(pkt(10, true));
+        // No depth gating: available == released.
         assert_eq!(buf.pull_next().unwrap().seq, 10);
+        assert!(buf.pull_next().is_none());
+
+        // Out-of-order arrival still releases in order.
+        buf.push(pkt(12, false));
+        buf.push(pkt(11, false));
         assert_eq!(buf.pull_next().unwrap().seq, 11);
         assert_eq!(buf.pull_next().unwrap().seq, 12);
         assert!(buf.pull_next().is_none());
     }
 
     #[test]
-    fn adaptive_depth_delays_initial_release() {
-        // Fixed target of 3 packets
-        let mut buf = make_buffer_with_target(30, 3);
+    fn gap_waits_for_reorder_window() {
+        let mut buf = VideoJitterBuffer::new(30);
+        buf.set_reorder_wait(Duration::from_secs(3600)); // effectively forever
+        buf.push(pkt(0, true));
+        assert_eq!(buf.pull_next().unwrap().seq, 0);
 
-        buf.push(make_packet(0, true));
-        // Keyframes bypass depth check
-        let pkt = buf.pull_next().unwrap();
-        assert_eq!(pkt.seq, 0);
+        buf.push(pkt(2, false)); // 1 is missing
+        // Window hasn't expired — hold.
+        assert!(buf.pull_next().is_none());
+        assert!(buf.pull_next().is_none());
 
-        // Delta frames respect depth check
-        buf.push(make_packet(1, false));
-        assert!(buf.pull_next().is_none(), "depth 1 < target 3");
-
-        buf.push(make_packet(2, false));
-        assert!(buf.pull_next().is_none(), "depth 2 < target 3");
-
-        buf.push(make_packet(3, false));
-        // Now depth = 3, target = 3, should release
-        let pkt = buf.pull_next().unwrap();
-        assert_eq!(pkt.seq, 1);
+        // The missing packet arrives late-but-in-time: normal delivery.
+        buf.push(pkt(1, false));
+        assert_eq!(buf.pull_next().unwrap().seq, 1);
+        assert_eq!(buf.pull_next().unwrap().seq, 2);
     }
 
     #[test]
-    fn genuine_recovery_keyframe_does_trigger_reset() {
-        let mut buf = make_buffer_with_target(30, 3);
+    fn expired_gap_skips_and_requests_keyframe() {
+        let mut buf = VideoJitterBuffer::new(30);
+        buf.set_reorder_wait(Duration::ZERO);
+        buf.push(pkt(0, true));
+        assert_eq!(buf.pull_next().unwrap().seq, 0);
 
-        // Start playing
-        buf.push(make_packet(0, true));
-        let _ = buf.pull_next();
-
-        buf.push(make_packet(1, false));
-        buf.push(make_packet(2, false));
-        buf.push(make_packet(3, false));
-        let _ = buf.pull_next(); // playing = true
-        let _ = buf.pull_next();
-        let _ = buf.pull_next();
-
-        // Large forward jump: well beyond 2*3+1=7
-        buf.push(make_packet(100, true));
-        assert_eq!(
-            buf.stats.keyframe_resets, 1,
-            "large jump should trigger recovery"
-        );
-
-        // Recovery keyframe should be immediately available
-        let pkt = buf.pull_next().unwrap();
-        assert_eq!(pkt.seq, 100);
-        assert!(pkt.is_keyframe);
+        buf.push(pkt(3, false)); // 1, 2 lost; no keyframe ahead
+        // Zero-length window: the pull that observes the gap also finds it
+        // already expired, so recovery happens immediately.
+        let p = buf.pull_next().expect("skips to next available");
+        assert_eq!(p.seq, 3);
+        // Reference chain is broken → keyframe request raised.
+        assert!(buf.take_keyframe_request());
+        // Rate-limited: not twice in a row.
+        assert!(!buf.take_keyframe_request());
+        assert_eq!(buf.stats.gaps_detected, 1);
     }
 
     #[test]
-    fn regular_keyframe_does_not_reset_playing() {
-        let mut buf = make_buffer_with_target(30, 3);
+    fn expired_gap_prefers_buffered_keyframe() {
+        let mut buf = VideoJitterBuffer::new(30);
+        buf.set_reorder_wait(Duration::ZERO);
+        buf.push(pkt(0, true));
+        assert_eq!(buf.pull_next().unwrap().seq, 0);
 
-        // Prime + start playing
-        buf.push(make_packet(0, true));
-        buf.push(make_packet(1, false));
-        buf.push(make_packet(2, false));
-        buf.push(make_packet(3, false));
-        buf.push(make_packet(4, false));
-        // Drain: keyframe(0) bypasses, then 1,2,3 (depth 4→3→2)
-        let _ = buf.pull_next(); // seq 0 (keyframe)
-        let _ = buf.pull_next(); // seq 1 (depth was 4 ≥ 3)
-        let _ = buf.pull_next(); // seq 2 (depth was 3 ≥ 3)
-                                 // seq 3 blocked (depth 2 < 3), seq 4 still in buffer
-                                 // playing = true, next_seq = 3
+        buf.push(pkt(4, false));
+        buf.push(pkt(6, true)); // fresh GOP starts at 6
+        buf.push(pkt(7, false));
 
-        let resets_before = buf.stats.keyframe_resets;
-
-        // In-sequence keyframe at seq 5 — gap from next_seq(3) = 2, threshold = 7
-        buf.push(make_packet(5, true));
-
-        assert_eq!(
-            buf.stats.keyframe_resets, resets_before,
-            "in-sequence keyframe should not trigger recovery"
-        );
-
-        // Keyframe at seq 5 is in the buffer but next_seq is 3.
-        // Push more to meet depth gate, then drain to keyframe.
-        buf.push(make_packet(6, false));
-        // pending: {3, 4, 5, 6} — depth 4 ≥ 3
-        assert_eq!(buf.pull_next().unwrap().seq, 3);
-        assert_eq!(buf.pull_next().unwrap().seq, 4);
-        // depth now 2, but seq 5 is keyframe → bypasses gate
-        let pkt = buf.pull_next().unwrap();
-        assert_eq!(pkt.seq, 5);
-        assert!(pkt.is_keyframe);
+        let p = buf.pull_next().expect("jumps to keyframe");
+        assert_eq!(p.seq, 6);
+        assert!(p.is_keyframe);
+        // The orphaned delta before the keyframe was discarded.
+        assert_eq!(buf.pull_next().unwrap().seq, 7);
+        // Clean keyframe restart → no request needed.
+        assert!(!buf.take_keyframe_request());
+        assert_eq!(buf.stats.keyframe_resets, 1);
     }
 
     #[test]
-    fn recovery_does_not_regate_on_depth() {
-        let mut buf = make_buffer_with_target(30, 3);
-
-        buf.push(make_packet(0, true));
-        let _ = buf.pull_next();
-
-        buf.push(make_packet(1, false));
-        buf.push(make_packet(2, false));
-        buf.push(make_packet(3, false));
-        let _ = buf.pull_next();
-        let _ = buf.pull_next();
-        let _ = buf.pull_next();
-
-        // Recovery keyframe at 50
-        buf.push(make_packet(50, true));
-        let pkt = buf.pull_next().unwrap();
-        assert_eq!(pkt.seq, 50, "recovery keyframe should release immediately");
-
-        // Deltas need depth >= target to release
-        buf.push(make_packet(51, false));
-        buf.push(make_packet(52, false));
-        buf.push(make_packet(53, false));
-        let pkt = buf.pull_next().unwrap();
-        assert_eq!(pkt.seq, 51, "post-recovery delta releases once depth met");
-    }
-
-    #[test]
-    fn late_packets_are_dropped() {
-        let mut buf = make_buffer_with_target(30, 1);
-
-        buf.push(make_packet(5, true));
-        let _ = buf.pull_next(); // consume seq 5, next_seq = 6
-
-        // Late packet (seq 3) arrives after we've moved past it
-        buf.push(make_packet(3, false));
+    fn late_packets_dropped() {
+        let mut buf = VideoJitterBuffer::new(30);
+        buf.push(pkt(10, true));
+        assert_eq!(buf.pull_next().unwrap().seq, 10);
+        buf.push(pkt(9, false)); // already superseded
+        assert!(buf.pull_next().is_none());
         assert_eq!(buf.stats.packets_dropped_late, 1);
-        assert_eq!(buf.depth(), 0);
     }
 
     #[test]
-    fn gap_skips_to_keyframe_for_clean_recovery() {
-        let mut buf = make_buffer_with_target(30, 1);
+    fn overflow_jumps_to_freshest_keyframe() {
+        let mut buf = VideoJitterBuffer::new(3); // max_depth = 9
+        buf.set_reorder_wait(Duration::from_secs(3600));
+        buf.push(pkt(0, true));
+        assert_eq!(buf.pull_next().unwrap().seq, 0);
 
-        buf.push(make_packet(0, true));
-        let _ = buf.pull_next(); // next_seq = 1
-
-        // Seq 1-4 lost, but seq 5 (keyframe) and 6 arrive
-        buf.push(make_packet(5, true));
-        buf.push(make_packet(6, false));
-
-        // push already recovered to seq 5, so first pull delivers it
-        let pkt = buf.pull_next().unwrap();
-        assert_eq!(pkt.seq, 5);
-        assert!(pkt.is_keyframe);
-    }
-
-    #[test]
-    fn seq_wraparound_comparison() {
-        // Normal case
-        assert!(is_seq_before(5, 10));
-        assert!(!is_seq_before(10, 5));
-        // Wraparound: u32::MAX is before 0
-        assert!(is_seq_before(u32::MAX, 0));
-        assert!(is_seq_after(0, u32::MAX));
-    }
-
-    #[test]
-    fn adaptive_depth_converges() {
-        let mut ad = AdaptiveDepth::new(30);
-        // Seeded at 100ms jitter — should start high
-        assert!(ad.target_depth() >= 5);
-
-        // Simulate stable arrivals (~33ms apart, matching 30fps)
-        let mut t = Instant::now();
-        ad.last_arrival = Some(t);
-        for _ in 0..100 {
-            t += std::time::Duration::from_millis(33);
-            // Manually set last_arrival to control timing in tests
-            let actual_ms = 33.0_f32;
-            let deviation = (actual_ms - ad.expected_interval_ms).abs();
-            ad.jitter_ema = ad.jitter_ema * (1.0 - ad.alpha) + deviation * ad.alpha;
+        // Stalled consumer: 1 never arrives, later packets pile up.
+        for seq in [2, 3, 4, 5, 6] {
+            buf.push(pkt(seq, false));
+        }
+        buf.push(pkt(7, true)); // a fresh GOP is in there
+        for seq in [8, 9, 10, 11] {
+            buf.push(pkt(seq, false)); // final push exceeds max_depth
         }
 
-        // After 100 stable packets, jitter should be low → small target
-        assert!(
-            ad.target_depth() <= 3,
-            "expected convergence to low depth, got {}",
-            ad.target_depth()
-        );
+        assert!(buf.stats.packets_dropped_overflow > 0);
+        // Recovery landed exactly on the keyframe.
+        assert_eq!(buf.pull_next().unwrap().seq, 7);
+        assert_eq!(buf.pull_next().unwrap().seq, 8);
+    }
+
+    #[test]
+    fn overflow_without_keyframe_clears_and_requests() {
+        let mut buf = VideoJitterBuffer::new(3); // max_depth = 9
+        buf.set_reorder_wait(Duration::from_secs(3600));
+        buf.push(pkt(0, true));
+        assert_eq!(buf.pull_next().unwrap().seq, 0);
+
+        for seq in 2..=11 {
+            buf.push(pkt(seq, false)); // all deltas, overflow on the 10th
+        }
+        assert_eq!(buf.depth(), 0);
+        assert!(buf.take_keyframe_request());
+    }
+
+    #[test]
+    fn unprimed_stream_requests_keyframe_after_grace() {
+        let mut buf = VideoJitterBuffer::new(30);
+        buf.push(pkt(100, false));
+        assert!(!buf.take_keyframe_request()); // inside the grace period
+
+        // Simulate the grace period having elapsed.
+        buf.set_unprimed_since(Instant::now() - UNPRIMED_REQUEST_AFTER * 2);
+        buf.push(pkt(101, false));
+        assert!(buf.take_keyframe_request());
+    }
+
+    #[test]
+    fn seq_wraparound() {
+        assert!(is_seq_after(1, 0));
+        assert!(is_seq_after(0, u32::MAX)); // wraps
+        assert!(!is_seq_after(u32::MAX, 0));
+        assert!(!is_seq_after(0, 0));
+
+        let mut buf = VideoJitterBuffer::new(30);
+        buf.push(pkt(u32::MAX, true));
+        assert_eq!(buf.pull_next().unwrap().seq, u32::MAX);
+        buf.push(pkt(0, false));
+        assert_eq!(buf.pull_next().unwrap().seq, 0);
+        buf.push(pkt(1, false));
+        assert_eq!(buf.pull_next().unwrap().seq, 1);
+    }
+
+    #[test]
+    fn reset_clears_everything() {
+        let mut buf = VideoJitterBuffer::new(30);
+        buf.push(pkt(0, true));
+        assert_eq!(buf.pull_next().unwrap().seq, 0);
+        buf.push(pkt(1, false));
+        buf.reset();
+        assert!(!buf.is_primed());
+        assert_eq!(buf.depth(), 0);
+        assert!(buf.pull_next().is_none());
     }
 }

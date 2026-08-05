@@ -46,19 +46,20 @@ fn main() {
         let frame = capturer.capture().expect("Capture failed");
         total_capture += t.elapsed();
 
-        // Encode
+        // Encode (zero or more access units per input frame)
         let t = Instant::now();
-        let encoded = encoder.encode(&frame).expect("Encode failed");
+        let encoded_frames = encoder.encode(&frame).expect("Encode failed");
         total_encode += t.elapsed();
-        total_bytes += encoded.data.len();
 
-        // Decode
-        let t = Instant::now();
-        let decoded = decoder.decode(&encoded).expect("Decode failed");
-        total_decode += t.elapsed();
-
-        if decoded.is_some() {
-            decoded_count += 1;
+        // Decode each access unit
+        for encoded in &encoded_frames {
+            total_bytes += encoded.data.len();
+            let t = Instant::now();
+            let decoded = decoder.decode(encoded).expect("Decode failed");
+            total_decode += t.elapsed();
+            if decoded.is_some() {
+                decoded_count += 1;
+            }
         }
 
         if i % 10 == 0 {

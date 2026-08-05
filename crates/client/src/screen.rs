@@ -85,6 +85,9 @@ pub enum ScreenControl {
     /// WASAPI loopback is bound to the default output device, so when that
     /// device changes the capture stream dies and must be rebuilt.
     RestartSystemAudio,
+    /// A viewer (relayed via the server) asked for a fresh keyframe —
+    /// their decoder hit an unrecoverable gap, or they joined mid-GOP.
+    ForceKeyframe,
     /// Clean shutdown.
     Shutdown,
 }
@@ -338,7 +341,7 @@ fn run_screen_loop(
         // Pull packets from each peer's jitter buffer and decode them.
         // This runs AFTER the channel drain, so all newly arrived packets
         // are in the buffer before we start decoding.
-        drain_and_decode(&mut peer_streams, &event_tx, &wake);
+        drain_and_decode(&mut peer_streams, &event_tx, &network_tx, &wake);
 
         if let Some(state) = &mut capture
             && Instant::now() >= next_capture
@@ -388,6 +391,7 @@ fn run_screen_loop(
 fn drain_and_decode(
     peer_streams: &mut HashMap<u64, PeerStream>,
     event_tx: &Sender<ScreenEvent>,
+    network_tx: &Sender<NetworkControl>,
     wake: &WakeFn,
 ) {
     for (&client_id, stream) in peer_streams.iter_mut() {
@@ -398,11 +402,12 @@ fn drain_and_decode(
             let frame_bytes = packet.data.len();
 
             if is_keyframe {
-                // Flush decoder before every keyframe. Since we're only
-                // receiving keyframes right now (delta frames lost in
-                // transit), every keyframe is effectively a recovery point.
-                // Even when deltas start arriving, flushing on keyframes
-                // is cheap and guarantees no corruption carryover.
+                // Flush decoder state before every keyframe. With the
+                // encoder forcing true IDRs this is belt-and-braces (an
+                // IDR resets reference state anyway), but it is cheap and
+                // guarantees no corruption carryover after packet loss.
+                // Resolution changes need no special handling — the
+                // decoder rebuilds its scaler automatically.
                 stream.decoder.flush();
 
                 stream.width = packet.width;
@@ -418,6 +423,8 @@ fn drain_and_decode(
                 data: packet.data,
                 timestamp_ms: 0,
                 is_keyframe,
+                width: packet.width,
+                height: packet.height,
             };
 
             let t0 = Instant::now();
@@ -451,6 +458,17 @@ fn drain_and_decode(
                     warn!("Decode error for peer {client_id} seq {seq}: {e}");
                 }
             }
+        }
+
+        // The buffer raises this when it recovered by skipping past lost
+        // packets without a keyframe (stream is showing artifacts) or
+        // when it's been watching undecodable deltas while unprimed.
+        // Rate-limited internally, so relaying every signal is safe.
+        if stream.jitter_buffer.take_keyframe_request() {
+            info!("📺 Requesting keyframe from peer {client_id}");
+            let _ = network_tx.try_send(NetworkControl::RequestKeyframe {
+                target_id: client_id,
+            });
         }
     }
 }
@@ -526,8 +544,11 @@ fn handle_control(
 
             shared.is_sharing.store(true, Ordering::Relaxed);
             shared.frames_encoded.store(0, Ordering::Relaxed);
+            *shared.current_quality.lock().unwrap() = Some(quality);
 
-            // Tell network to signal other clients
+            // Tell network to signal other clients. These are the
+            // quality *bounds* — the actual encoded dimensions travel
+            // with every video frame (aspect-preserving fit).
             let _ = network_tx.send(NetworkControl::ScreenShareStart {
                 width: quality.width(),
                 height: quality.height(),
@@ -660,6 +681,13 @@ fn handle_control(
             }
         }
 
+        ScreenControl::ForceKeyframe => {
+            if let Some(state) = capture {
+                info!("📺 Viewer requested keyframe — forcing IDR");
+                state.encoder.force_keyframe();
+            }
+        }
+
         ScreenControl::Shutdown => {
             *running = false;
         }
@@ -686,48 +714,52 @@ fn capture_and_encode(
         log::debug!("Slow capture: {capture_ms:.1}ms");
     }
 
-    // Encode
+    // Encode. Returns zero or more access units: zero while a hardware
+    // encoder's pipeline fills (first few frames on NVENC/QSV/AMF), and
+    // occasionally more than one when it flushes pending output. Each AU
+    // gets its own sequence number — the receiver's jitter buffer treats
+    // seq gaps as loss, so skipped/empty encodes must not consume seqs.
     let t1 = Instant::now();
-    let encoded = match state.encoder.encode(&frame) {
+    let encoded_frames = match state.encoder.encode(&frame) {
         Ok(e) => e,
         Err(e) => {
             warn!("Encode failed: {e}");
-            // Return capture buffer for reuse
-            state.capturer.return_buffer(frame.data);
             return;
         }
     };
-    if encoded.is_keyframe {
-        log::debug!(
-            "📺 Sent keyframe #{}: {} bytes",
-            state.seq,
-            encoded.data.len()
-        );
-    }
     let encode_us = t1.elapsed().as_micros() as u32;
 
-    // Update shared stats
     shared.last_capture_us.store(capture_us, Ordering::Relaxed);
     shared.last_encode_us.store(encode_us, Ordering::Relaxed);
-    shared
-        .last_frame_bytes
-        .store(encoded.data.len() as u32, Ordering::Relaxed);
-    shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
 
-    // Send to network
-    let seq = state.seq;
-    state.seq = state.seq.wrapping_add(1);
+    for encoded in encoded_frames {
+        if encoded.data.is_empty() {
+            continue;
+        }
 
-    let _ = network_tx.try_send(NetworkControl::SendVideoFrame {
-        seq,
-        is_keyframe: encoded.is_keyframe,
-        width: state.quality.width() as u16,
-        height: state.quality.height() as u16,
-        data: encoded.data,
-    });
+        let seq = state.seq;
+        state.seq = state.seq.wrapping_add(1);
 
-    // Return capture buffer for reuse
-    state.capturer.return_buffer(frame.data);
+        if encoded.is_keyframe {
+            log::debug!("📺 Sent keyframe #{seq}: {} bytes", encoded.data.len());
+        }
+
+        shared
+            .last_frame_bytes
+            .store(encoded.data.len() as u32, Ordering::Relaxed);
+        shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
+
+        // Actual encoded dimensions (aspect-preserving fit inside the
+        // quality bound) — NOT the quality preset's nominal size. A
+        // 1920×1200 monitor at HD30 sends 1152×720.
+        let _ = network_tx.try_send(NetworkControl::SendVideoFrame {
+            seq,
+            is_keyframe: encoded.is_keyframe,
+            width: encoded.width as u16,
+            height: encoded.height as u16,
+            data: encoded.data,
+        });
+    }
 }
 
 /// Decode an incoming system audio (Opus stereo) packet from a remote peer.
