@@ -37,6 +37,13 @@ pub enum Quality {
     FHD30,
     /// ≤1920×1080 @ 60 FPS — best quality, needs hardware encoder.
     FHD60,
+    /// ≤2560×1440 @ 30 FPS — near-native for 2K monitors, ~10 Mbps.
+    ///
+    /// Note: the transport's ~275 KB per-frame limit means keyframes get
+    /// fewer bits per pixel than at 1080p, so the first frame after each
+    /// IDR is slightly softer until P-frames sharpen it. Prefer FHD
+    /// unless viewers genuinely need to read fine detail at 1:1.
+    QHD30,
 }
 impl std::fmt::Display for Quality {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,6 +52,7 @@ impl std::fmt::Display for Quality {
             Self::HD60 => write!(f, "720p 60fps"),
             Self::FHD30 => write!(f, "1080p 30fps"),
             Self::FHD60 => write!(f, "1080p 60fps"),
+            Self::QHD30 => write!(f, "1440p 30fps"),
         }
     }
 }
@@ -56,6 +64,7 @@ impl Quality {
         match self {
             Self::HD30 | Self::HD60 => 1280,
             Self::FHD30 | Self::FHD60 => 1920,
+            Self::QHD30 => 2560,
         }
     }
 
@@ -65,12 +74,13 @@ impl Quality {
         match self {
             Self::HD30 | Self::HD60 => 720,
             Self::FHD30 | Self::FHD60 => 1080,
+            Self::QHD30 => 1440,
         }
     }
 
     pub const fn fps(self) -> u32 {
         match self {
-            Self::HD30 | Self::FHD30 => 30,
+            Self::HD30 | Self::FHD30 | Self::QHD30 => 30,
             Self::HD60 | Self::FHD60 => 60,
         }
     }
@@ -89,6 +99,7 @@ impl Quality {
             Self::HD60 => 4_500_000,
             Self::FHD30 => 6_000_000,
             Self::FHD60 => 8_000_000,
+            Self::QHD30 => 10_000_000,
         }
     }
 
@@ -112,7 +123,13 @@ impl Quality {
         self.pixel_count() * 3 / 2
     }
 
-    pub const ALL: &[Quality] = &[Self::HD30, Self::HD60, Self::FHD30, Self::FHD60];
+    pub const ALL: &[Quality] = &[
+        Self::HD30,
+        Self::HD60,
+        Self::FHD30,
+        Self::FHD60,
+        Self::QHD30,
+    ];
 }
 
 // ---------------------------------------------------------------------------

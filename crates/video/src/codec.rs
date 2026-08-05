@@ -838,6 +838,10 @@ mod tests {
         assert_eq!(fit_dimensions(3440, 1440, Quality::HD30), (1280, 534));
         // Portrait → height-bound
         assert_eq!(fit_dimensions(1080, 1920, Quality::HD30), (404, 720));
+        // QHD bound: native 2K passes through, ultrawide/4K fit inside
+        assert_eq!(fit_dimensions(2560, 1440, Quality::QHD30), (2560, 1440));
+        assert_eq!(fit_dimensions(3840, 2160, Quality::QHD30), (2560, 1440));
+        assert_eq!(fit_dimensions(3440, 1440, Quality::QHD30), (2560, 1070));
         // Smaller than target: unchanged (no upscale)
         assert_eq!(fit_dimensions(1280, 720, Quality::FHD30), (1280, 720));
         assert_eq!(fit_dimensions(800, 600, Quality::HD30), (800, 600));
