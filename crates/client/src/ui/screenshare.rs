@@ -51,9 +51,17 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
     quality_label.set_align(enums::Align::Left | enums::Align::Inside);
     col.fixed(&quality_label, 18);
 
+    // Built from Quality::ALL so new presets in the video crate appear
+    // here automatically. Display order == ALL order == picker indices.
     let mut quality_choice = menu::Choice::default();
-    quality_choice.add_choice("720p 30fps"); //|720p 60fps|1080p 30fps|1080p 60fps");
-    quality_choice.set_value(0); // default HD60
+    for q in Quality::ALL {
+        quality_choice.add_choice(&q.to_string());
+    }
+    let default_idx = Quality::ALL
+        .iter()
+        .position(|q| *q == Quality::FHD30)
+        .unwrap_or(0);
+    quality_choice.set_value(default_idx as i32);
     col.fixed(&quality_choice, 30);
 
     // Spacer
@@ -70,13 +78,10 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
     let mut wind_clone = wind.clone();
     start_btn.set_callback(move |_| {
         let monitor_index = monitor_choice.value().max(0) as usize;
-        let quality = match quality_choice.value() {
-            0 => Quality::HD30,
-            //  1 => Quality::HD60,
-            //  2 => Quality::FHD30,
-            //  3 => Quality::FHD60,
-            _ => Quality::HD30,
-        };
+        let quality = Quality::ALL
+            .get(quality_choice.value().max(0) as usize)
+            .copied()
+            .unwrap_or(Quality::FHD30);
         sender.send(UiMessage::StartScreenShare {
             quality,
             monitor_index,
