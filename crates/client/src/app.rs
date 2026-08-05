@@ -277,11 +277,10 @@ impl App {
     fn handle_voice_event(&mut self, evt: VoiceEvent) {
         match evt {
             VoiceEvent::Started => {
+                // No sound here: this event fires whenever the engine
+                // boots, including for standalone mic tests. The join
+                // ding is sent from handle_init_client instead.
                 info!("Voice engine ready");
-                self.voice
-                    .tx
-                    .send(VoiceControl::PlaySound(SoundType::UserJoined))
-                    .ok();
             }
             VoiceEvent::Error(e) => {
                 self.show_error(&e);
@@ -1076,6 +1075,15 @@ impl App {
                     settings: self.settings.clone(),
                     our_client_id: id,
                 })
+                .ok();
+            // Join ding, queued behind Start on the same channel so it
+            // plays on the freshly started (or still-running) engine.
+            // Tied to joining rather than VoiceEvent::Started so mic
+            // tests stay silent and fast reconnects still ding even if
+            // the deferred-stop kept the engine alive.
+            self.voice
+                .tx
+                .send(VoiceControl::PlaySound(SoundType::UserJoined))
                 .ok();
         }
 
