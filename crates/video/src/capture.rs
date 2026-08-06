@@ -10,9 +10,12 @@
 //! (DXGI Desktop Duplication / Windows.Graphics.Capture, ScreenCaptureKit,
 //! PipeWire), which are the planned replacement for this backend.
 
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use std::time::Instant;
 
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use log::info;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use xcap::Monitor;
 
 use crate::{CaptureError, Frame, Quality};
@@ -32,6 +35,7 @@ pub struct MonitorInfo {
 /// # Errors
 ///
 /// Returns [`CaptureError::MonitorList`] if the OS fails to enumerate monitors.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
     let monitors = Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
 
@@ -52,6 +56,7 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
 ///
 /// No scaling is performed here — the encoder handles aspect-preserving
 /// downscaling via swscale during the RGBA→YUV420P conversion pass.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub struct ScreenCapturer {
     monitor: Monitor,
     quality: Quality,
@@ -59,6 +64,7 @@ pub struct ScreenCapturer {
     start_time: Instant,
 }
 
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 impl ScreenCapturer {
     /// Create a capturer for the given monitor index and quality preset.
     ///
@@ -141,5 +147,48 @@ impl ScreenCapturer {
 
     pub fn frame_count(&self) -> u64 {
         self.frame_count
+    }
+}
+
+// ── Mobile stub ─────────────────────────────────────────────────────────
+// iOS / Android have no xcap backend. The same API surface exists so
+// dependent crates compile unchanged; construction fails cleanly and the
+// client's existing StartSharing error path surfaces it in the UI.
+// Methods past construction are unreachable — no instance can exist.
+
+/// Stub monitor list for platforms without a capture backend.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
+    Ok(Vec::new())
+}
+
+/// Stub capturer for platforms without a capture backend.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub struct ScreenCapturer {
+    _private: (),
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+impl ScreenCapturer {
+    pub fn new(_monitor_index: usize, _quality: Quality) -> Result<Self, CaptureError> {
+        Err(CaptureError::Capture(
+            "screen capture is not supported on this platform".into(),
+        ))
+    }
+
+    pub fn primary(quality: Quality) -> Result<Self, CaptureError> {
+        Self::new(0, quality)
+    }
+
+    pub fn capture(&mut self) -> Result<Frame, CaptureError> {
+        unreachable!("stub ScreenCapturer cannot be constructed")
+    }
+
+    pub fn quality(&self) -> Quality {
+        unreachable!("stub ScreenCapturer cannot be constructed")
+    }
+
+    pub fn frame_count(&self) -> u64 {
+        unreachable!("stub ScreenCapturer cannot be constructed")
     }
 }

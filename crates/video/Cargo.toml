@@ -4,10 +4,15 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-#xcap = { git = "https://github.com/nashaofu/xcap" }
-xcap = "0.9.8"
 log = "0.4"
 thiserror = "2"
+
+# Desktop-only backends. iOS/Android builds get stub implementations
+# whose constructors fail cleanly (see src/capture.rs, src/codec_stub.rs);
+# the pure types, traits and jitter buffer compile on every target.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+#xcap = { git = "https://github.com/nashaofu/xcap" }
+xcap = "0.9.8"
 # Windows static: vcpkg install ffmpeg[x264,gpl]:x64-windows-static-md
 #                 set VCPKG_ROOT=C:\path\to\vcpkg
 # Linux:          apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
@@ -16,4 +21,3 @@ ffmpeg-next = "8"
 
 [dev-dependencies]
 env_logger = "0.11"
-

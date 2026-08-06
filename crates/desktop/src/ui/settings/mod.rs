@@ -16,7 +16,7 @@ use fltk::{prelude::*, *};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-use crate::config::Settings;
+use client::config::Settings;
 use crate::ui::messages::UiMessage;
 use ui::theme;
 use ui::widgets::controls;

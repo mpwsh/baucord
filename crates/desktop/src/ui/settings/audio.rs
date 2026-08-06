@@ -3,7 +3,7 @@
 // Returns a Flex column with explicit size and position, placed directly
 // inside the parent Scroll.  This matches the layout pattern FLTK needs.
 
-use crate::config::Settings;
+use client::config::Settings;
 use crate::ui::messages::UiMessage;
 use fltk::{prelude::*, *};
 use std::sync::Arc;

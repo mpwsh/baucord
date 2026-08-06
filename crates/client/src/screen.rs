@@ -162,7 +162,8 @@ pub struct ScreenThreadHandle {
     pub tx: Sender<ScreenControl>,
     pub event_rx: Receiver<ScreenEvent>,
     pub shared: SharedScreenState,
-    pub(crate) join_handle: Option<thread::JoinHandle<()>>,
+    /// Joined by the frontend on shutdown (with a timeout).
+    pub join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ScreenThreadHandle {

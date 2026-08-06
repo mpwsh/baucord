@@ -838,7 +838,8 @@ pub enum NetworkControl {
 pub struct NetworkThreadHandle {
     pub tx: Sender<NetworkControl>,
     pub msg_rx: Receiver<NetworkMessage>,
-    pub(crate) join_handle: Option<thread::JoinHandle<()>>,
+    /// Joined by the frontend on shutdown (with a timeout).
+    pub join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl NetworkThreadHandle {

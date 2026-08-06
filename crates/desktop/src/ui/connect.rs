@@ -10,7 +10,7 @@
 
 use fltk::{prelude::*, *};
 
-use crate::config::Settings;
+use client::config::Settings;
 use crate::ui::messages::UiMessage;
 use ui::theme;
 use ui::widgets::{controls, style};

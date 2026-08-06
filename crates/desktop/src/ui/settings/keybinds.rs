@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Mutex, Once};
 
-use crate::config::{BindableAction, build_bind_string};
+use client::config::{BindableAction, build_bind_string};
 use crate::ui::messages::UiMessage;
 use ui::theme;
 use ui::widgets::labels;
@@ -106,7 +106,7 @@ struct RowWidgets {
 
 pub fn build(
     sender: app::Sender<UiMessage>,
-    settings: &crate::config::Settings,
+    settings: &client::config::Settings,
     x: i32,
     y: i32,
     w: i32,

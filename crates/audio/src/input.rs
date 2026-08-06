@@ -85,7 +85,7 @@ impl AudioInput {
 
         let device = if let Some(name) = device_name {
             host.input_devices()?
-                .find(|d| d.name().ok().as_deref() == Some(name))
+                .find(|d| crate::device_name(d).as_deref() == Some(name))
                 .ok_or_else(|| format!("Input device '{name}' not found"))?
         } else {
             host.default_input_device()
@@ -96,12 +96,12 @@ impl AudioInput {
             .default_input_config()
             .map_err(|e| format!("Failed to get default input config: {e}"))?;
 
-        let sample_rate = device_config.sample_rate().0;
+        let sample_rate = device_config.sample_rate();
         let channels = device_config.channels();
 
         info!(
             "🎤 Input device: {} @ {}Hz, {}ch, {:?}",
-            device.name().unwrap_or_else(|_| "Unknown".into()),
+            crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
             sample_rate,
             channels,
             device_config.sample_format(),
@@ -135,7 +135,7 @@ impl AudioInput {
     }
 
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let sample_rate = self.device_config.sample_rate().0;
+        let sample_rate = self.device_config.sample_rate();
         let channels = self.device_config.channels();
         let format = self.device_config.sample_format();
 
@@ -165,7 +165,7 @@ impl AudioInput {
     {
         let stream_config = StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             // ~10 ms when the device advertises a supported range;
             // untouched (Default) when it doesn't. See platform.rs.
             buffer_size: crate::platform::request_low_latency_buffer(
@@ -186,7 +186,7 @@ impl AudioInput {
         let ch = channels as usize;
 
         let stream = self.device.build_input_stream(
-            &stream_config,
+            stream_config,
             move |data: &[T], _: &_| {
                 if config.muted.load(Ordering::Relaxed) {
                     input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);

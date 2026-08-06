@@ -68,7 +68,7 @@ impl AudioOutput {
 
         let device = if let Some(name) = device_name {
             host.output_devices()?
-                .find(|d| d.name().ok().as_deref() == Some(name))
+                .find(|d| crate::device_name(d).as_deref() == Some(name))
                 .ok_or_else(|| format!("Output device '{}' not found", name))?
         } else {
             host.default_output_device()
@@ -79,11 +79,11 @@ impl AudioOutput {
             .default_output_config()
             .map_err(|e| format!("Failed to get default output config: {}", e))?;
 
-        let sample_rate = device_config.sample_rate().0;
+        let sample_rate = device_config.sample_rate();
 
         debug!(
             "Output device: {} @ {}Hz, {}ch, {:?}",
-            device.name().unwrap_or_else(|_| "Unknown".into()),
+            crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
             sample_rate,
             device_config.channels(),
             device_config.sample_format(),
@@ -127,7 +127,7 @@ impl AudioOutput {
     }
 
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let sample_rate = self.device_config.sample_rate().0;
+        let sample_rate = self.device_config.sample_rate();
         let channels = self.device_config.channels();
         let format = self.device_config.sample_format();
 
@@ -176,7 +176,7 @@ impl AudioOutput {
     {
         let config = cpal::StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             // ~10 ms when the device advertises a supported range;
             // untouched (Default) when it doesn't. See platform.rs.
             buffer_size: crate::platform::request_low_latency_buffer(
@@ -195,7 +195,7 @@ impl AudioOutput {
         let ch = channels as usize;
 
         let stream = self.device.build_output_stream(
-            &config,
+            config,
             move |data: &mut [T], _: &_| {
                 let mono_needed = data.len() / ch;
                 let mut rms_acc = 0.0f32;

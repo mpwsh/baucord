@@ -2,12 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod config;
 mod hotkeys;
-mod network;
-mod screen;
 mod ui;
-mod voice;
 
 use app::App;
 

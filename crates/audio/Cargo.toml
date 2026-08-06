@@ -9,7 +9,7 @@ serde = ["dep:serde"]
 
 [dependencies]
 # Audio I/O
-cpal = "0.15"
+cpal = "0.18"
 dasp_sample = "0.11"
 
 # Wav reading

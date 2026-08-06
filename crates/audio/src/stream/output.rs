@@ -109,7 +109,7 @@ impl StreamAudioOutput {
 
         let device = if let Some(name) = device_name {
             host.output_devices()?
-                .find(|d| d.name().ok().as_deref() == Some(name))
+                .find(|d| crate::device_name(d).as_deref() == Some(name))
                 .ok_or_else(|| format!("Output device '{}' not found", name))?
         } else {
             host.default_output_device()
@@ -120,12 +120,12 @@ impl StreamAudioOutput {
             .default_output_config()
             .map_err(|e| format!("Failed to get default output config: {e}"))?;
 
-        let sample_rate = device_config.sample_rate().0;
+        let sample_rate = device_config.sample_rate();
         let channels = device_config.channels();
 
         info!(
             "Stream audio output: {} @ {}Hz, {}ch, {:?}",
-            device.name().unwrap_or_else(|_| "Unknown".into()),
+            crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
             sample_rate,
             channels,
             device_config.sample_format(),
@@ -164,7 +164,7 @@ impl StreamAudioOutput {
     ///
     /// Spawns the worker thread and opens the cpal output stream.
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let sample_rate = self.device_config.sample_rate().0;
+        let sample_rate = self.device_config.sample_rate();
         let channels = self.device_config.channels();
         let format = self.device_config.sample_format();
 
@@ -254,7 +254,7 @@ impl StreamAudioOutput {
     {
         let config = cpal::StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -266,7 +266,7 @@ impl StreamAudioOutput {
         let ch = channels as usize;
 
         let stream = self.device.build_output_stream(
-            &config,
+            config,
             move |data: &mut [T], _: &_| {
                 let stereo_frames_needed = data.len() / ch;
 

@@ -51,6 +51,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait};
+
+/// Human-readable device name.
+///
+/// cpal 0.18 replaced `Device::name()` with `description()`, which
+/// returns structured metadata. Every call site in this crate only ever
+/// wanted the display name, so the new shape is wrapped exactly once.
+pub(crate) fn device_name(device: &cpal::Device) -> Option<String> {
+    device.description().ok().map(|d| d.name().to_string())
+}
 use input::AudioInput;
 use output::AudioOutput;
 
@@ -452,15 +461,15 @@ impl VoiceChat {
         }
 
         let host = cpal::default_host();
-        let default_name = host.default_input_device().and_then(|d| d.name().ok());
+        let default_name = host.default_input_device().and_then(|d| device_name(&d));
         let mut devices = Vec::new();
         for device in host.input_devices()? {
-            if let Ok(name) = device.name() {
+            if let Some(name) = device_name(&device) {
                 let is_default = default_name.as_deref() == Some(&name);
                 if let Ok(cfg) = device.default_input_config() {
                     debug!(
                         "  Input device: \"{name}\" {}Hz {}ch {:?}{}",
-                        cfg.sample_rate().0,
+                        cfg.sample_rate(),
                         cfg.channels(),
                         cfg.sample_format(),
                         if is_default { " [DEFAULT]" } else { "" },
@@ -488,15 +497,15 @@ impl VoiceChat {
         }
 
         let host = cpal::default_host();
-        let default_name = host.default_output_device().and_then(|d| d.name().ok());
+        let default_name = host.default_output_device().and_then(|d| device_name(&d));
         let mut devices = Vec::new();
         for device in host.output_devices()? {
-            if let Ok(name) = device.name() {
+            if let Some(name) = device_name(&device) {
                 let is_default = default_name.as_deref() == Some(&name);
                 if let Ok(cfg) = device.default_output_config() {
                     debug!(
                         "  Output device: \"{name}\" {}Hz {}ch {:?}{}",
-                        cfg.sample_rate().0,
+                        cfg.sample_rate(),
                         cfg.channels(),
                         cfg.sample_format(),
                         if is_default { " [DEFAULT]" } else { "" },

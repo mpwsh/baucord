@@ -17,13 +17,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trayicon::{MenuBuilder, TrayIcon, TrayIconBuilder};
 
-use crate::{
+use client::{
     config::{BindableAction, Settings, peer_key},
-    hotkeys::HotkeyManager,
     network::{NetworkControl, NetworkMessage, NetworkThreadHandle},
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
-    ui::{chat::Chat, messages::UiMessage, screenshare, sidebar::Sidebar, viewer::ViewerWindow},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
+};
+
+use crate::{
+    hotkeys::HotkeyManager,
+    ui::{chat::Chat, messages::UiMessage, screenshare, sidebar::Sidebar, viewer::ViewerWindow},
 };
 use audio::{PeerAudioSettings, SoundType};
 use ui::theme;
@@ -107,7 +110,7 @@ impl App {
 
         // Wake callback — worker threads call this to nudge the FLTK event loop.
         // This is the ONLY place fltk::app::awake is referenced for worker threads.
-        let wake: crate::voice::WakeFn = Arc::new(fltk::app::awake);
+        let wake: client::voice::WakeFn = Arc::new(fltk::app::awake);
 
         // Spawn threads via their handles.
         // Network needs voice_tx to route incoming voice packets,
@@ -951,7 +954,7 @@ impl App {
             if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
                 self.screen
                     .tx
-                    .send(crate::screen::ScreenControl::RestartSystemAudio)
+                    .send(client::screen::ScreenControl::RestartSystemAudio)
                     .ok();
             }
         }

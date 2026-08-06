@@ -1,0 +1,32 @@
+[package]
+name = "desktop"
+version = "0.1.30"
+edition = "2024"
+
+[[bin]]
+# The shipped binary keeps its name — the auto-updater and the release
+# zips expect `baucord` / `baucord.exe`.
+name = "baucord"
+path = "src/main.rs"
+
+[dependencies]
+client = { path = "../client" }
+ui = { path = "../ui" }
+audio = { path = "../audio", features = ["serde"] }
+video = { path = "../video" }
+fltk = { version = "1.5", features = ["fltk-bundled"] }
+renet = "2.0"
+crossbeam-channel = "0.5.15"
+log = "0.4"
+env_logger = "0.11"
+chrono = "0.4.41"
+ureq = "3.2.0"
+open = "5.3.3"
+global-hotkey = "0.7"
+trayicon = { git = "https://github.com/mpwsh/trayicon-rs" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+zip = "2"
+self-replace = "1.5.0"
+
+[build-dependencies]
+winresource = "0.1"

@@ -15,7 +15,7 @@ use log::{info, warn};
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use crate::config::{BindableAction, Settings};
+use client::config::{BindableAction, Settings};
 
 pub struct HotkeyManager {
     /// `None` when the OS-level manager could not be created — hotkeys

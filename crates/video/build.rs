@@ -1,7 +1,11 @@
 fn main() {
-    // FFmpeg static libs on Windows pull in DirectShow (dshow), Media Foundation (mfenc),
-    // and COM symbols that aren't linked by default.
-    if cfg!(target_os = "windows") {
+    // FFmpeg static libs on Windows pull in DirectShow (dshow), Media
+    // Foundation (mfenc), and COM symbols that aren't linked by default.
+    //
+    // Checked via CARGO_CFG_TARGET_OS (the *target*), not cfg! (which in
+    // a build script evaluates for the *host*) — matters now that this
+    // crate cross-compiles for mobile targets.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         for lib in &[
             "ole32",    // COM runtime (CoCreateInstance, etc.)
             "oleaut32", // OLE Automation (SysAllocString, etc.)

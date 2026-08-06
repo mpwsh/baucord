@@ -43,7 +43,9 @@ use crate::OPUS_SAMPLE_RATE;
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use log::{error, info, warn};
-use rtrb::{Consumer, Producer, RingBuffer};
+use rtrb::Consumer;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+use rtrb::{Producer, RingBuffer};
 use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
@@ -107,6 +109,7 @@ pub struct SystemAudioPacket {
 ///
 /// The `sample_rate()` method tells us what rate to expect so we
 /// can configure the resampler.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 trait SystemAudioBackend {
     /// Start capturing. Spawns platform callbacks that push into the ring buffer.
     fn start(&mut self) -> Result<(), Box<dyn std::error::Error>>;
@@ -173,8 +176,8 @@ mod wasapi_loopback {
 
             info!(
                 "🔊🎤 System audio capture: {} @ {}Hz, {}ch, {:?}",
-                device.name().unwrap_or_else(|_| "Unknown".into()),
-                device_config.sample_rate().0,
+                crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
+                device_config.sample_rate(),
                 device_config.channels(),
                 device_config.sample_format(),
             );
@@ -204,7 +207,7 @@ mod wasapi_loopback {
             // cpal supports this via `build_input_stream` on an output device
             // when using the WASAPI host.
             let stream = device.build_input_stream(
-                config,
+                config.clone(),
                 move |data: &[T], _: &_| {
                     // Output interleaved stereo (L, R, L, R, ...).
                     // Handle any source channel count:
@@ -243,13 +246,13 @@ mod wasapi_loopback {
 
     impl SystemAudioBackend for WasapiLoopback {
         fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-            let sample_rate = self.device_config.sample_rate().0;
+            let sample_rate = self.device_config.sample_rate();
             let channels = self.device_config.channels();
             let format = self.device_config.sample_format();
 
             let config = StreamConfig {
                 channels,
-                sample_rate: cpal::SampleRate(sample_rate),
+                sample_rate,
                 buffer_size: cpal::BufferSize::Default,
             };
 
@@ -297,13 +300,12 @@ mod wasapi_loopback {
         }
 
         fn sample_rate(&self) -> u32 {
-            self.device_config.sample_rate().0
+            self.device_config.sample_rate()
         }
 
         fn device_name(&self) -> String {
-            self.device
-                .name()
-                .unwrap_or_else(|_| "Unknown WASAPI device".into())
+            crate::device_name(&self.device)
+                .unwrap_or_else(|| "Unknown WASAPI device".into())
         }
     }
 }
@@ -480,6 +482,9 @@ pub struct SystemAudioCapture {
     volume: Arc<AtomicU32>,
 
     /// Stats (shared with voice chat engine for unified reporting).
+    /// Only read by the desktop backends — dead weight on mobile, kept
+    /// so the struct layout is identical everywhere.
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
     stats: Arc<AudioStats>,
 
     /// Platform backend handle — kept alive to maintain capture stream.
@@ -508,14 +513,26 @@ impl SystemAudioCapture {
             is_muted: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             stats,
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             backend: None,
         })
     }
 
     /// Start capturing system audio.
     ///
+    /// Unsupported on this platform — there is no loopback backend for
+    /// iOS / Android, so this always fails cleanly. Callers already
+    /// treat a failed start as "share without stream audio".
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        Err("system audio capture is not supported on this platform".into())
+    }
+
+    /// Start capturing system audio.
+    ///
     /// Creates the platform backend, ring buffer, and worker thread.
     /// Idempotent — calling twice is a no-op.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.is_active.load(Ordering::Relaxed) {
             return Ok(());
@@ -579,6 +596,7 @@ impl SystemAudioCapture {
         self.should_stop.store(true, Ordering::Release);
 
         // Stop the platform backend first (stops callbacks pushing to ring buffer)
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
         if let Some(mut backend) = self.backend.take() {
             backend.stop();
         }
@@ -639,6 +657,7 @@ impl SystemAudioCapture {
 
     // ── Worker thread ────────────────────────────────────────────────────
 
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
     fn spawn_worker(
         ring_consumer: Consumer<f32>,
         packet_tx: Sender<SystemAudioPacket>,

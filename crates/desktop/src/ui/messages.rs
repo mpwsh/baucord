@@ -124,7 +124,7 @@ pub enum UiMessage {
 
     // ── Keybinds ────────────────────────────────────────────────────
     SetKeybind {
-        action: crate::config::BindableAction,
+        action: client::config::BindableAction,
         bind: String,
     },
     /// User clicked "Show" in tray menu — restore the main window.

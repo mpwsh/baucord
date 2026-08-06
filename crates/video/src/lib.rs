@@ -18,6 +18,15 @@
 
 pub mod buffer;
 pub mod capture;
+
+// The real codec module is FFmpeg top to bottom, so it's swapped
+// wholesale on targets without an FFmpeg build. The stub exposes the
+// same types with constructors that fail cleanly — client code compiles
+// unchanged and its existing error paths handle the rest.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub mod codec;
+#[cfg(any(target_os = "ios", target_os = "android"))]
+#[path = "codec_stub.rs"]
 pub mod codec;
 
 /// Quality preset for screen sharing.
