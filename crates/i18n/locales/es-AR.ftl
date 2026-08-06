@@ -41,14 +41,20 @@ latency-line = Audio: { $audio } | Servidor: { $network }
 mute = Mutear
 unmute = Desmutear
 deafen = Ensordecer
+undeafen = Desensordecer
 share-screen = Compartir pantalla
 stop-sharing = Dejar de compartir
 disconnect = Desconectar
 user-volume = Volumen del usuario
+reset-audio = Restablecer audio
+watch-stream = Ver transmisión
+live = En vivo
+stream-stats = Transmisión: { $quality } | { $kb }KB | { $ms }ms cod
 
 # ── Chat ────────────────────────────────────────────────────────────────
 send = Enviar
 chat-disconnected = Desconectado: { $reason }
+disconnect-reason-user = El usuario se desconectó
 chat-user-joined = { $name } se unió
 chat-user-left = { $name } se fue
 chat-share-started = Empezaste a compartir pantalla ({ $quality })
@@ -71,6 +77,8 @@ unknown-device = dispositivo desconocido
 tray-show = Mostrar
 tray-quit = Salir
 viewer-title = Pantalla de { $name } ({ $width }x{ $height })
+stop-watching = Dejar de ver
+viewer-stats = { $res } { $fps }fps { $kbps }KB/s { $mb }MB | búfer { $depth }/{ $target }ms jitter { $jitter }ms
 
 # ── Panel de audio ──────────────────────────────────────────────────────
 audio-devices-header = DISPOSITIVOS
@@ -87,9 +95,84 @@ audio-test-hint = Escuchá tu propio micrófono (los demás no te escuchan)
 audio-testing-hint = Escuchando tu micrófono... los demás no te escuchan
 audio-output-header = SALIDA
 audio-master-volume = Volumen principal
+audio-system-default = Predeterminado del sistema
+audio-device-count = { $inputs } dispositivos de entrada, { $outputs } de salida
+audio-gain-value = Ganancia: { $percent }%
+audio-volume-value = Volumen: { $percent }%
+audio-sensitivity-line = Sensibilidad: { $name }  (umbral: { $threshold } RMS)
+sensitivity-very-high = Muy alta
+sensitivity-high = Alta
+sensitivity-medium = Media
+sensitivity-low = Baja
+sensitivity-very-low = Muy baja
 
 # ── Acciones de atajos ──────────────────────────────────────────────────
 action-toggle-mute = Alternar mute
 action-toggle-deafen = Alternar ensordecer
 action-toggle-share = Alternar compartir pantalla
 action-push-to-talk = Pulsar para hablar
+
+# ── Panel de atajos ─────────────────────────────────────────────────────
+keybinds-header = ATAJOS DE TECLADO
+keybinds-hint = Hacé clic en Grabar y presioná una combinación de teclas. Esc cancela, Retroceso borra.
+keybind-not-set = Sin asignar
+keybind-record = Grabar
+keybind-press-combo = Presioná una combinación...
+
+# ── Diálogo de compartir pantalla ───────────────────────────────────────
+monitor = Monitor
+monitor-primary = (principal)
+quality = Calidad
+start-sharing = Empezar a compartir
+error-no-monitors = No se encontraron monitores
+
+# ── Panel de créditos ───────────────────────────────────────────────────
+credits-header = CRÉDITOS
+credits-super-testers = SÚPER BETA TESTERS
+credits-beta-testers = BETA TESTERS
+
+# ── Panel Acerca de ─────────────────────────────────────────────────────
+about-header = ACERCA DE
+about-running-from = Ejecutando desde:
+about-config-file = Archivo de configuración:
+about-open-folder = Abrir carpeta de instalación
+about-built-with = HECHO CON
+tech-rust = Rust - Lenguaje de programación
+tech-fltk = FLTK - Interfaz de usuario
+tech-renet = Renet - Redes
+tech-ffmpeg = FFmpeg - Codificación/decodificación de video
+tech-xcap = Xcap - Captura de pantalla
+tech-cpal = CPAL - Entrada/salida de audio
+tech-opus = Opus - Códec de audio
+tech-rnnoise = RNNoise - Supresión de ruido
+tech-rubato = Rubato - Remuestreo de audio
+
+# ── Flujo de actualización ──────────────────────────────────────────────
+splash-checking = Buscando actualizaciones...
+update-available-title = Actualización disponible
+update-available-heading = ¡Nueva versión disponible!
+update-version-info =
+    Tu versión: { $current }
+    Última versión: { $latest }
+update-skip = Omitir
+update-now = Actualizar
+update-downloading-title = Actualizando
+update-downloading-heading = Descargando actualización v{ $version }...
+update-starting-download = Iniciando descarga...
+update-progress = Descargando... { $percent }%
+update-ready-title = Actualización lista
+update-downloaded-heading = ¡Actualización descargada!
+update-ready-info = Lista para instalar. La aplicación se reiniciará automáticamente.
+update-not-now = Ahora no
+# Se muestra en un label de FLTK — el código escapa '&' antes de mostrarlo.
+update-install-restart = Instalar y reiniciar
+update-failed-title = Error de actualización
+update-failed-heading = Falló la descarga
+update-continue = Continuar
+cancel = Cancelar
+
+# ── Errores y compartidos ───────────────────────────────────────────────
+error-invalid-address = Dirección inválida (usá ip:puerto)
+error-screen-share = Compartir pantalla: { $error }
+fallback-username = Usuario{ $id }
+unknown = Desconocido

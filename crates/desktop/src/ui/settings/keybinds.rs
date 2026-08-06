@@ -118,7 +118,7 @@ pub fn build(
         .column();
     col.set_spacing(8);
 
-    labels::section_header(&mut col, "\u{2328}", "KEYBOARD SHORTCUTS");
+    labels::section_header(&mut col, "\u{2328}", &t!("keybinds-header"));
 
     // Install the global handler once per process. `add_handler`
     // appends — calling it on every settings-open used to accumulate
@@ -139,10 +139,7 @@ pub fn build(
         });
     }
 
-    labels::hint_label(
-        &mut col,
-        "Click Record, then press a key combo. Esc cancels, Backspace clears.",
-    );
+    labels::hint_label(&mut col, &t!("keybinds-hint"));
 
     col.end();
 
@@ -201,7 +198,7 @@ pub fn build(
                 if row.action == action {
                     let mut disp = row.display.clone();
                     let mut btn = row.button.clone();
-                    disp.set_label("Not set");
+                    disp.set_label(&t!("keybind-not-set"));
                     disp.set_label_color(theme::TEXT_MUTED);
                     reset_button(&mut btn);
                 }
@@ -219,7 +216,7 @@ pub fn build(
 }
 
 fn reset_button(btn: &mut button::Button) {
-    btn.set_label("Record");
+    btn.set_label(&t!("keybind-record"));
     btn.set_color(theme::BG_TERTIARY);
     btn.set_label_color(theme::TEXT_PRIMARY);
 }
@@ -242,12 +239,12 @@ fn build_keybind_row(
     row.fixed(&label, 150);
 
     let display_text = if bind_str.is_empty() {
-        "Not set"
+        t!("keybind-not-set")
     } else {
-        bind_str
+        bind_str.to_string()
     };
     let mut binding_display = frame::Frame::default()
-        .with_label(display_text)
+        .with_label(&display_text)
         .with_align(enums::Align::Center);
     binding_display.set_label_color(if bind_str.is_empty() {
         theme::TEXT_MUTED
@@ -258,7 +255,7 @@ fn build_keybind_row(
     binding_display.set_frame(enums::FrameType::BorderBox);
     binding_display.set_color(theme::SURFACE);
 
-    let mut record_btn = button::Button::default().with_label("Record");
+    let mut record_btn = button::Button::default().with_label(&t!("keybind-record"));
     row.fixed(&record_btn, 80);
     record_btn.set_color(theme::BG_TERTIARY);
     record_btn.set_label_color(theme::TEXT_PRIMARY);
@@ -302,7 +299,7 @@ fn build_keybind_row(
             btn.set_label("...");
             btn.set_color(theme::ACCENT_HOVER);
             btn.set_label_color(theme::BUTTON_TEXT);
-            disp.set_label("Press a key combo...");
+            disp.set_label(&t!("keybind-press-combo"));
             disp.set_label_color(theme::WARNING);
         }
     });

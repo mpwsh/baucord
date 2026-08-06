@@ -13,14 +13,14 @@ use ui::theme;
 use ui::widgets::{controls, labels, layout, meter};
 
 fn format_sensitivity(value: f64) -> String {
-    let name = match value {
-        v if v < 0.010 => "Very High",
-        v if v < 0.020 => "High",
-        v if v < 0.040 => "Medium",
-        v if v < 0.065 => "Low",
-        _ => "Very Low",
-    };
-    format!("Sensitivity: {name}  (threshold: {value:.3} RMS)")
+    let name = t!(match value {
+        v if v < 0.010 => "sensitivity-very-high",
+        v if v < 0.020 => "sensitivity-high",
+        v if v < 0.040 => "sensitivity-medium",
+        v if v < 0.065 => "sensitivity-low",
+        _ => "sensitivity-very-low",
+    });
+    t!("audio-sensitivity-line", "name" => name, "threshold" => format!("{value:.3}"))
 }
 
 /// Build the audio settings panel.
@@ -56,7 +56,7 @@ pub fn build(
     let input_names: Vec<&str> = input_devices.iter().map(|(n, _)| n.as_str()).collect();
     controls::populate_dropdown(
         &mut input_choice,
-        "System Default",
+        &t!("audio-system-default"),
         &input_names,
         settings.audio.input.device.as_deref(),
     );
@@ -66,17 +66,17 @@ pub fn build(
     let output_names: Vec<&str> = output_devices.iter().map(|(n, _)| n.as_str()).collect();
     controls::populate_dropdown(
         &mut output_choice,
-        "System Default",
+        &t!("audio-system-default"),
         &output_names,
         settings.audio.output.device.as_deref(),
     );
 
     labels::hint_label(
         &mut col,
-        &format!(
-            "{} input, {} output devices",
-            input_devices.len(),
-            output_devices.len()
+        &t!(
+            "audio-device-count",
+            "inputs" => input_devices.len() as u32,
+            "outputs" => output_devices.len() as u32,
         ),
     );
 
@@ -101,7 +101,7 @@ pub fn build(
     );
     let input_gain_lbl = labels::hint_label(
         &mut col,
-        &format!("Gain: {}%", (settings.audio.input.gain * 100.0) as i32),
+        &t!("audio-gain-value", "percent" => (settings.audio.input.gain * 100.0) as i32),
     );
 
     labels::field_label(&mut col, &t!("audio-input-sensitivity"));
@@ -144,7 +144,7 @@ pub fn build(
     );
     let output_gain_lbl = labels::hint_label(
         &mut col,
-        &format!("Volume: {}%", (settings.audio.output.gain * 100.0) as i32),
+        &t!("audio-volume-value", "percent" => (settings.audio.output.gain * 100.0) as i32),
     );
 
     col.end();
@@ -179,7 +179,7 @@ pub fn build(
     let mut lbl = input_gain_lbl.clone();
     input_gain_slider.set_callback(move |sl| {
         let val = sl.value() as f32;
-        lbl.set_label(&format!("Gain: {}%", (val * 100.0) as i32));
+        lbl.set_label(&t!("audio-gain-value", "percent" => (val * 100.0) as i32));
         s.send(UiMessage::SetInputGain(val));
     });
 
@@ -187,7 +187,7 @@ pub fn build(
     let mut lbl = output_gain_lbl.clone();
     output_gain_slider.set_callback(move |sl| {
         let val = sl.value() as f32;
-        lbl.set_label(&format!("Volume: {}%", (val * 100.0) as i32));
+        lbl.set_label(&t!("audio-volume-value", "percent" => (val * 100.0) as i32));
         s.send(UiMessage::SetOutputGain(val));
     });
 

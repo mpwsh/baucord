@@ -8,6 +8,7 @@ use fltk::{prelude::*, *};
 use log::{info, warn};
 
 use crate::ui::messages::{UiMessage, VersionCheckResult};
+use i18n::t;
 use ui::theme;
 use ui::widgets::controls;
 
@@ -74,7 +75,7 @@ pub fn show(sender: app::Sender<UiMessage>) -> SplashHandles {
     col.fixed(&title, 35);
 
     let mut status = frame::Frame::default()
-        .with_label("Checking for updates...")
+        .with_label(&t!("splash-checking"))
         .with_align(enums::Align::Center);
     status.set_label_size(12);
     status.set_label_color(theme::TEXT_SECONDARY);
@@ -110,7 +111,7 @@ pub fn show_update_prompt(
 
     let mut wind = window::Window::default()
         .with_size(w, h)
-        .with_label("Update Available");
+        .with_label(&t!("update-available-title"));
     wind.set_pos(((screen_w as i32) - w) / 2, ((screen_h as i32) - h) / 2);
     wind.make_resizable(false);
     wind.set_color(theme::BG_PRIMARY);
@@ -121,13 +122,17 @@ pub fn show_update_prompt(
     col.set_spacing(10);
 
     let mut title = frame::Frame::default()
-        .with_label("New version available!")
+        .with_label(&t!("update-available-heading"))
         .with_align(enums::Align::Center);
     title.set_label_size(18);
     title.set_label_color(theme::TEXT_PRIMARY);
     col.fixed(&title, 30);
 
-    let msg = format!("Your version: {CURRENT_VERSION}\nLatest version: {remote_version}");
+    let msg = t!(
+        "update-version-info",
+        "current" => CURRENT_VERSION,
+        "latest" => remote_version,
+    );
     let mut info = frame::Frame::default()
         .with_label(&msg)
         .with_align(enums::Align::Center | enums::Align::Inside);
@@ -146,11 +151,11 @@ pub fn show_update_prompt(
     // Left spacer
     frame::Frame::default();
 
-    let mut skip_btn = controls::button("Skip");
+    let mut skip_btn = controls::button(&t!("update-skip"));
     button_row.fixed(&skip_btn, 120);
 
     let remote = remote_version.to_string();
-    let mut update_btn = controls::accent_button("Update", theme::ACCENT);
+    let mut update_btn = controls::accent_button(&t!("update-now"), theme::ACCENT);
     button_row.fixed(&update_btn, 120);
 
     // Right spacer

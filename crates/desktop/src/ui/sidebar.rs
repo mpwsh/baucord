@@ -119,7 +119,7 @@ fn style_action_btn(
     row_bg: enums::Color,
 ) {
     if is_sharing {
-        btn.set_label("Live");
+        btn.set_label(&t!("live"));
         btn.set_label_size(11);
         btn.set_label_font(Font::HelveticaBold);
         // Red, not accent: with a blue accent a blue "Live" reads
@@ -350,8 +350,15 @@ impl Sidebar {
     pub fn update_stream_stats(&mut self, stats: Option<(&str, f32, f32)>) {
         match stats {
             Some((quality, avg_kb, encode_ms)) => {
-                let label =
-                    format!("  Stream: {quality} | {avg_kb:.0}KB | {encode_ms:.1}ms enc");
+                // Leading pad is layout (left inset), not part of the message.
+                let label = format!(
+                    "  {}",
+                    t!("stream-stats",
+                        "quality" => quality,
+                        "kb" => format!("{avg_kb:.0}"),
+                        "ms" => format!("{encode_ms:.1}"),
+                    )
+                );
                 self.stream_stats_label.set_label(&label);
                 if !self.stream_stats_label.visible() {
                     self.stream_stats_label.show();
@@ -450,11 +457,11 @@ impl Sidebar {
         sep2.set_color(theme::BG_TERTIARY);
         col.fixed(&sep2, 1);
 
-        let mut reset_btn = controls::button("Reset Audio");
+        let mut reset_btn = controls::button(&t!("reset-audio"));
         col.fixed(&reset_btn, 26);
 
         if is_sharing {
-            let mut watch_btn = controls::accent_button("Watch Stream", theme::ACCENT);
+            let mut watch_btn = controls::accent_button(&t!("watch-stream"), theme::ACCENT);
             col.fixed(&watch_btn, 26);
 
             let mut wind_watch = wind.clone();
@@ -717,7 +724,8 @@ impl Sidebar {
 
         let mut options_btn = button::Button::default();
         options_btn.set_frame(enums::FrameType::FlatBox);
-        user_item.fixed(&options_btn, 32);
+        // 52px (was 32) so localized "Live" badges (e.g. "En vivo") fit.
+        user_item.fixed(&options_btn, 52);
         style_action_btn(&mut options_btn, is_sharing, is_us, row_bg);
 
         if !is_us {
@@ -752,7 +760,7 @@ impl Sidebar {
                     if !*hovering.borrow() {
                         *hovering.borrow_mut() = true;
 
-                        let is_live = btn_clone.label() == "Live";
+                        let is_live = btn_clone.label() == t!("live");
                         if !is_live {
                             btn_clone.set_label_color(theme::TEXT_PRIMARY);
                             btn_clone.set_color(hover_color);
@@ -771,7 +779,7 @@ impl Sidebar {
                     if mx < wx || mx > wx + w.w() || my < wy || my > wy + w.h() {
                         *hovering.borrow_mut() = false;
 
-                        let is_live = btn_clone.label() == "Live";
+                        let is_live = btn_clone.label() == t!("live");
                         if !is_live {
                             btn_clone.set_label_color(base_color);
                             btn_clone.set_color(base_color);
@@ -815,8 +823,11 @@ impl Sidebar {
     /// latency lines self-heal on their next periodic update; settings /
     /// disconnect buttons aren't stored and refresh on the next connect.
     pub fn relabel(&mut self) {
-        self.mute_btn.set_label(&t!("mute"));
-        self.deafen_btn.set_label(&t!("deafen"));
+        // Route through the state setters so a language change while
+        // muted/deafened keeps the toggled label ("Unmute"/"Undeafen"),
+        // not the base one.
+        self.set_mute_state(self.local_muted);
+        self.set_deafen_state(self.local_deafened);
         self.share_btn.set_label(&t!(if self.sharing {
             "stop-sharing"
         } else {
@@ -870,7 +881,8 @@ impl Sidebar {
     pub fn handle_disconnected(&mut self) {
         self.close_audio_popup();
         self.set_connection_status(false);
-        self.latency_label.set_label("Audio: -- | Network: --");
+        self.latency_label
+            .set_label(&t!("latency-line", "audio" => "--", "network" => "--"));
         self.user_list_pack.clear();
         self.user_rows.clear();
         self.user_count_label.set_label(&t!("users-count", "count" => 0));
@@ -882,11 +894,11 @@ impl Sidebar {
     pub fn set_mute_state(&mut self, muted: bool) {
         self.local_muted = muted;
         if muted {
-            self.mute_btn.set_label("Unmute");
+            self.mute_btn.set_label(&t!("unmute"));
             self.mute_btn.set_color(theme::ACCENT_HOVER);
             self.mute_btn.set_label_color(theme::BUTTON_TEXT);
         } else {
-            self.mute_btn.set_label("Mute");
+            self.mute_btn.set_label(&t!("mute"));
             self.mute_btn.set_color(theme::BG_TERTIARY);
             self.mute_btn.set_label_color(theme::TEXT_PRIMARY);
         }
@@ -896,11 +908,11 @@ impl Sidebar {
     pub fn set_deafen_state(&mut self, deafened: bool) {
         self.local_deafened = deafened;
         if deafened {
-            self.deafen_btn.set_label("Undeafen");
+            self.deafen_btn.set_label(&t!("undeafen"));
             self.deafen_btn.set_color(theme::ACCENT_HOVER);
             self.deafen_btn.set_label_color(theme::BUTTON_TEXT);
         } else {
-            self.deafen_btn.set_label("Deafen");
+            self.deafen_btn.set_label(&t!("deafen"));
             self.deafen_btn.set_color(theme::BG_TERTIARY);
             self.deafen_btn.set_label_color(theme::TEXT_PRIMARY);
         }

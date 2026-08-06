@@ -343,7 +343,7 @@ impl App {
                 }
             }
             ScreenEvent::Error(e) => {
-                self.show_error(&format!("Screen share: {e}"));
+                self.show_error(&t!("error-screen-share", "error" => e.as_str()));
             }
             ScreenEvent::FrameReady {
                 client_id,
@@ -559,7 +559,7 @@ impl App {
                         .lock()
                         .unwrap()
                         .map(|q| q.to_string())
-                        .unwrap_or_else(|| "Unknown".into());
+                        .unwrap_or_else(|| t!("unknown"));
                     if let Some(sidebar) = &mut self.sidebar {
                         sidebar.update_stream_stats(Some((&quality_str, avg_kb, encode_ms)));
                     }
@@ -999,7 +999,7 @@ impl App {
         let addr = match server.parse::<SocketAddr>() {
             Ok(a) => a,
             Err(_) => {
-                self.show_error("Invalid address (use ip:port)");
+                self.show_error(&t!("error-invalid-address"));
                 return;
             }
         };
@@ -1364,7 +1364,7 @@ impl App {
         self.network.tx.send(NetworkControl::Disconnect).ok();
 
         if let Some(chat) = &mut self.chat {
-            chat.handle_disconnected("User disconnected".to_string());
+            chat.handle_disconnected(t!("disconnect-reason-user"));
         }
 
         self.teardown_connection();
@@ -1643,7 +1643,9 @@ impl App {
         self.users
             .get(&client_id)
             .map(|u| u.username.clone())
-            .unwrap_or_else(|| format!("User{client_id}"))
+            // ClientId is u64 — pass it pre-formatted so Fluent's f64-backed
+            // numbers can't lose precision on large ids.
+            .unwrap_or_else(|| t!("fallback-username", "id" => client_id.to_string()))
     }
 
     /// Clean shutdown: signal threads, join with timeout, save settings.

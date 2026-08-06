@@ -4,6 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>baucord — self-hosted voice chat</title>
+    <!-- Stays English: crawlers and link unfurlers (Discord, etc.) read
+       this without running JS, and one URL can only carry one language. -->
     <meta
       name="description"
       content="A small, self-hosted voice, text and screen sharing app for you and your friends. Client and server ship together in one zip."
@@ -161,6 +163,25 @@
       }
       .nav-links a.dl:hover {
         background: var(--cobalt-deep);
+      }
+      /* language toggle — pointless without JS, so hidden until .js */
+      .lang-toggle {
+        display: none;
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        color: var(--steel);
+        background: none;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 0.25rem 0.5rem;
+        cursor: pointer;
+      }
+      .js .lang-toggle {
+        display: inline-block;
+      }
+      .lang-toggle:hover {
+        color: var(--fog);
+        border-color: var(--cobalt);
       }
 
       /* ── hero ────────────────────────────────── */
@@ -493,21 +514,35 @@
     </style>
   </head>
 
-  <body>
+  <body x-data>
     <nav>
       <div class="wrap nav-inner">
         <a class="wordmark" href="#">bau<b>cord</b></a>
         <div class="nav-links">
-          <a class="plain" href="#features">features</a>
-          <a class="plain" href="#screenshots">interface</a>
+          <a class="plain" href="#features" x-i18n="nav-features">features</a>
+          <a class="plain" href="#screenshots" x-i18n="nav-interface">interface</a>
           <a
             class="plain"
             href="https://github.com/baucord/baucord"
             target="_blank"
             rel="noopener"
+            x-i18n="nav-source"
             >source</a
           >
-          <a class="dl" href="#download">download</a>
+          <button
+            class="lang-toggle"
+            type="button"
+            @click="$store.i18n.toggle()"
+            :aria-label="
+              $store.i18n.lang === 'es'
+                ? 'Switch language to English'
+                : 'Cambiar idioma a español'
+            "
+            x-text="$store.i18n.lang === 'es' ? 'en' : 'es'"
+          >
+            es
+          </button>
+          <a class="dl" href="#download" x-i18n="nav-download">download</a>
         </div>
       </div>
     </nav>
@@ -515,107 +550,108 @@
     <header class="wrap hero">
       <div>
         <h1>bau<b>cord</b></h1>
-        <p>
+        <p x-i18n="hero-lede">
           Voice, text and screen sharing you host yourself. Written in Rust,
           tuned for low decoding latency, and small enough to leave running
           without noticing. No accounts, no telemetry — just you, your friends,
           and a server you control.
         </p>
         <div class="btn-row">
-          <a class="btn solid" href="#download">Download</a>
+          <a class="btn solid" href="#download" x-i18n="hero-download">Download</a>
           <a
             class="btn ghost"
             href="https://github.com/baucord/baucord"
             target="_blank"
             rel="noopener"
+            x-i18n="hero-source"
             >Source on GitHub</a
           >
         </div>
-        <p class="facts">
+        <p class="facts" x-i18n="hero-facts">
           Windows / macOS / Linux &nbsp;·&nbsp; client + server in one zip
           &nbsp;·&nbsp; Apache-licensed
         </p>
       </div>
 
-      <div class="term" aria-label="deployment example">
+      <div class="term" aria-label="deployment example" x-i18n:aria-label="term-aria">
         <div class="term-bar">
           <span>~/baucord</span>
           <span>v__VERSION__</span>
         </div>
         <!-- prettier-ignore -->
-        <pre class="term-body"><span class="c"># on whoever's hosting:</span>
+        <pre class="term-body"><span class="c" x-i18n="term-c-host"># on whoever's hosting:</span>
 <span class="p">$</span> unzip baucord-v__VERSION__-linux-x64.zip
 <span class="p">$</span> ./dedicated-server
 
-<span class="c"># everyone else:</span>
-<span class="p">$</span> ./baucord <span class="c"># enter host:port, pick a name</span>
+<span class="c" x-i18n="term-c-everyone"># everyone else:</span>
+<span class="p">$</span> ./baucord <span class="c" x-i18n="term-c-run"># enter host:port, pick a name</span>
 
-<span class="c"># we have discord at home</span>
+<span class="c" x-i18n="term-c-tagline"># we have discord at home</span>
 <span class="p">$</span> <span class="cursor"></span></pre>
       </div>
     </header>
 
     <section id="features">
       <div class="wrap">
-        <h2>What it does</h2>
-        <p class="section-note">
+        <h2 x-i18n="features-title">What it does</h2>
+        <p class="section-note" x-i18n="features-note">
           Hang out with a handful of friends: talk, type, share your screen.
           Nothing you don't need.
         </p>
 
         <dl class="spec">
           <div class="spec-row">
-            <dt>voice</dt>
-            <dd>
+            <dt x-i18n="spec-voice-t">voice</dt>
+            <dd x-i18n="spec-voice-d">
               Opus over UDP with voice activity detection or push-to-talk. Tuned
               to keep the gap between someone speaking and you hearing them as
               short as it can be.
             </dd>
           </div>
           <div class="spec-row">
-            <dt>rough connections</dt>
-            <dd>
+            <dt x-i18n="spec-net-t">rough connections</dt>
+            <dd x-i18n="spec-net-d">
               Each person gets their own adaptive jitter buffer, so one friend
               on hotel wi-fi doesn't drag everyone else's audio down with them.
             </dd>
           </div>
           <div class="spec-row">
-            <dt>screen share</dt>
-            <dd>
+            <dt x-i18n="spec-share-t">screen share</dt>
+            <dd x-i18n="spec-share-d">
               H.264 via FFmpeg, with the source's audio along for the ride. 720p
               or 1080p, quality is a slider. Viewers get a resizable window with
               live stats if they want to see them.
             </dd>
           </div>
           <div class="spec-row">
-            <dt>per-user audio</dt>
-            <dd>
+            <dt x-i18n="spec-peruser-t">per-user audio</dt>
+            <dd x-i18n="spec-peruser-d">
               Right-click anyone to mute them or ride their volume. Settings
               stick around, so the loud friend stays quiet next time too.
             </dd>
           </div>
           <div class="spec-row">
-            <dt>global hotkeys</dt>
-            <dd>
+            <dt x-i18n="spec-hotkeys-t">global hotkeys</dt>
+            <dd x-i18n="spec-hotkeys-d">
               Mute, deafen and start a screen share from any window. Rebind by
               pressing the keys you want, not by editing config.
             </dd>
           </div>
           <div class="spec-row">
-            <dt>text chat</dt>
-            <dd>For links, and for whoever's mic just died.</dd>
+            <dt x-i18n="spec-chat-t">text chat</dt>
+            <dd x-i18n="spec-chat-d">For links, and for whoever's mic just died.</dd>
           </div>
           <div class="spec-row">
-            <dt>your machine</dt>
-            <dd>
+            <dt x-i18n="spec-machine-t">your machine</dt>
+            <dd x-i18n="spec-machine-d">
               Closes to the tray and keeps the call running. Settings live in a
               JSON file next to the binary — no installer, no registry, no
               background services.
             </dd>
           </div>
           <div class="spec-row">
-            <dt>the server</dt>
-            <dd>
+            <dt x-i18n="spec-server-t">the server</dt>
+            <dd x-i18n="spec-server-d">
               A dumb relay. It forwards packets, that's it — no mixing, no
               transcoding, no accounts to manage. Ships in the same zip as the
               client.
@@ -627,8 +663,8 @@
 
     <section id="screenshots">
       <div class="wrap">
-        <h2>The interface</h2>
-        <p class="section-note">
+        <h2 x-i18n="shots-title">The interface</h2>
+        <p class="section-note" x-i18n="shots-note">
           Native widgets, one window. This is the whole app.
         </p>
 
@@ -638,20 +674,22 @@
               <img
                 src="img/client2.png"
                 alt="baucord connect screen — nickname and server address"
+                x-i18n:alt="shot-connect-alt"
                 loading="lazy"
               />
             </a>
-            <figcaption>connect — nickname and server address, done</figcaption>
+            <figcaption x-i18n="shot-connect-cap">connect — nickname and server address, done</figcaption>
           </figure>
           <figure>
             <a class="shot-link" href="img/client1.png">
               <img
                 src="img/client1.png"
                 alt="baucord main window — user list, chat and per-user controls"
+                x-i18n:alt="shot-call-alt"
                 loading="lazy"
               />
             </a>
-            <figcaption>a call — voices, chat, per-user controls</figcaption>
+            <figcaption x-i18n="shot-call-cap">a call — voices, chat, per-user controls</figcaption>
           </figure>
         </div>
       </div>
@@ -659,8 +697,8 @@
 
     <section id="download">
       <div class="wrap">
-        <h2>Download</h2>
-        <p class="section-note">
+        <h2 x-i18n="dl-title">Download</h2>
+        <p class="section-note" x-i18n="dl-note-top">
           Every zip has the client and the dedicated server for that platform.
           Grab the one you need; anyone hosting also needs the server-side one.
         </p>
@@ -696,7 +734,7 @@
           </a>
         </div>
 
-        <p class="dl-note">
+        <p class="dl-note" x-i18n.html="dl-note-bottom">
           Unzip, run <code>dedicated-server</code> somewhere your friends can
           reach — a spare box, a cheap VPS, a homelab — then hand them the
           address. That's the whole deployment.
@@ -716,9 +754,9 @@
       </div>
     </footer>
 
-    <dialog class="lightbox" aria-label="screenshot viewer">
+    <dialog class="lightbox" aria-label="screenshot viewer" x-i18n:aria-label="lightbox-aria">
       <img alt="" />
-      <p class="lightbox-hint">click anywhere or press esc to close</p>
+      <p class="lightbox-hint" x-i18n="lightbox-hint">click anywhere or press esc to close</p>
     </dialog>
 
     <script>
@@ -747,5 +785,94 @@
         box.close();
       });
     </script>
+
+    <script>
+      // i18n. English lives in the markup and is the fallback — this
+      // only swaps text when Spanish is active, so no-JS visitors,
+      // crawlers and link unfurlers keep the English page.
+      //
+      //   x-i18n="key"            swap text content
+      //   x-i18n.html="key"       swap innerHTML (our own strings only)
+      //   x-i18n:alt="key"        swap an attribute (alt, aria-label, …)
+      //
+      // Spanish strings: i18n/es.json. Keys missing there fall back to
+      // the cached English, so a half-translated file never blanks text.
+      document.addEventListener("alpine:init", function () {
+        var STORAGE_KEY = "baucord-lang";
+        var originalTitle = document.title;
+
+        Alpine.store("i18n", {
+          lang: "en",
+          dict: {},
+          loaded: false,
+          init: function () {
+            var saved = null;
+            try {
+              saved = localStorage.getItem(STORAGE_KEY);
+            } catch (e) {}
+            var auto =
+              (navigator.language || "").toLowerCase().indexOf("es") === 0
+                ? "es"
+                : "en";
+            this.set(saved || auto, false);
+          },
+          toggle: function () {
+            this.set(this.lang === "es" ? "en" : "es", true);
+          },
+          set: function (lang, persist) {
+            var store = this;
+            if (lang === "es" && !store.loaded) {
+              fetch("i18n/es.json")
+                .then(function (r) {
+                  return r.json();
+                })
+                .then(function (dict) {
+                  store.dict = dict;
+                  store.loaded = true;
+                  store.apply("es", persist);
+                })
+                .catch(function () {
+                  store.apply("en", persist); // fetch failed — stay English
+                });
+            } else {
+              store.apply(lang, persist);
+            }
+          },
+          apply: function (lang, persist) {
+            this.lang = lang;
+            document.documentElement.lang = lang;
+            document.title =
+              lang === "es"
+                ? this.dict["meta-title"] || originalTitle
+                : originalTitle;
+            if (persist) {
+              try {
+                localStorage.setItem(STORAGE_KEY, lang);
+              } catch (e) {}
+            }
+          },
+        });
+
+        Alpine.directive("i18n", function (el, directive, utils) {
+          var key = directive.expression;
+          var attr = directive.value; // "alt" from x-i18n:alt, else undefined
+          var html = directive.modifiers.indexOf("html") !== -1;
+          var original = attr
+            ? el.getAttribute(attr)
+            : html
+              ? el.innerHTML
+              : el.textContent;
+          utils.effect(function () {
+            var store = Alpine.store("i18n");
+            var text =
+              store.lang === "es" ? store.dict[key] || original : original;
+            if (attr) el.setAttribute(attr, text);
+            else if (html) el.innerHTML = text;
+            else el.textContent = text;
+          });
+        });
+      });
+    </script>
+    <script defer src="js/alpine.min.js"></script>
   </body>
 </html>

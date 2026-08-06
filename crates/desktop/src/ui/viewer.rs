@@ -161,9 +161,9 @@ impl ViewerWindow {
         sep1.set_color(theme::SUBTLE);
         toolbar.fixed(&sep1, 1);
 
-        // Mute button
-        let mute_btn = controls::button("Mute");
-        toolbar.fixed(&mute_btn, 50);
+        // Mute button — 90px (was 50) so "Desmutear" & co. fit.
+        let mute_btn = controls::button(&t!("mute"));
+        toolbar.fixed(&mute_btn, 90);
 
         // Separator
         let mut sep2 = frame::Frame::default();
@@ -171,9 +171,9 @@ impl ViewerWindow {
         sep2.set_color(theme::SUBTLE);
         toolbar.fixed(&sep2, 1);
 
-        // Stop Watching button
-        let mut stop_btn = controls::button("Stop Watching");
-        toolbar.fixed(&stop_btn, 90);
+        // Stop Watching button — 120px (was 90) for longer translations.
+        let mut stop_btn = controls::button(&t!("stop-watching"));
+        toolbar.fixed(&stop_btn, 120);
 
         // Separator
         let mut sep3 = frame::Frame::default();
@@ -273,11 +273,11 @@ impl ViewerWindow {
                 muted: is_stream_muted,
             });
             if is_stream_muted {
-                mute_clone.set_label("Unmute");
+                mute_clone.set_label(&t!("unmute"));
                 mute_clone.set_color(theme::DANGER);
                 mute_clone.set_label_color(theme::BUTTON_TEXT);
             } else {
-                mute_clone.set_label("Mute");
+                mute_clone.set_label(&t!("mute"));
                 mute_clone.set_color(theme::BG_TERTIARY);
                 mute_clone.set_label_color(theme::TEXT_PRIMARY);
             }
@@ -368,8 +368,15 @@ impl ViewerWindow {
             let throughput_kbps = avg_frame_kb * fps as f32;
             let total_mb = self.total_bytes as f32 / (1024.0 * 1024.0);
             let res = format!("{}p", height);
-            self.stats_label.set_label(&format!(
-    "{res} {fps}fps {throughput_kbps:.0}KB/s {total_mb:.1}MB | buf {buffer_depth_ms:.0}/{buffer_target_ms:.0}ms jit {buffer_jitter_ms:.0}ms"
+            self.stats_label.set_label(&t!(
+                "viewer-stats",
+                "res" => res,
+                "fps" => fps,
+                "kbps" => format!("{throughput_kbps:.0}"),
+                "mb" => format!("{total_mb:.1}"),
+                "depth" => format!("{buffer_depth_ms:.0}"),
+                "target" => format!("{buffer_target_ms:.0}"),
+                "jitter" => format!("{buffer_jitter_ms:.0}"),
             ));
         }
 

@@ -22,6 +22,7 @@ use log::{error, info};
 
 use crate::ui::messages::UiMessage;
 use crate::ui::splash;
+use i18n::t;
 use ui::theme;
 use ui::widgets::controls;
 
@@ -42,7 +43,7 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
 
     let mut wind = window::Window::default()
         .with_size(w, h)
-        .with_label("Updating");
+        .with_label(&t!("update-downloading-title"));
     wind.set_pos(((screen_w as i32) - w) / 2, ((screen_h as i32) - h) / 2);
     wind.make_resizable(false);
     wind.set_color(theme::BG_PRIMARY);
@@ -53,7 +54,7 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
     col.set_spacing(8);
 
     let mut title = frame::Frame::default()
-        .with_label(&format!("Downloading update v{remote_version}..."))
+        .with_label(&t!("update-downloading-heading", "version" => remote_version))
         .with_align(enums::Align::Center);
     title.set_label_size(16);
     title.set_label_color(theme::TEXT_PRIMARY);
@@ -95,7 +96,7 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
 
     // Status label — shows percentage or result
     let mut status_lbl = frame::Frame::default()
-        .with_label("Starting download...")
+        .with_label(&t!("update-starting-download"))
         .with_align(enums::Align::Center);
     status_lbl.set_label_size(11);
     status_lbl.set_label_color(theme::TEXT_MUTED);
@@ -111,7 +112,7 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
 
     frame::Frame::default(); // left spacer
 
-    let mut cancel_btn = controls::button("Cancel");
+    let mut cancel_btn = controls::button(&t!("cancel"));
     button_row.fixed(&cancel_btn, 140);
 
     frame::Frame::default(); // right spacer
@@ -158,7 +159,7 @@ pub fn show(sender: app::Sender<UiMessage>, remote_version: &str) -> window::Win
         }
         let val = f32::from_bits(progress_timer.load(Ordering::Relaxed)).clamp(0.0, 1.0);
         let pct = (val * 100.0) as u32;
-        status_timer.set_label(&format!("Downloading... {pct}%"));
+        status_timer.set_label(&t!("update-progress", "percent" => pct));
         meter_timer.redraw();
         app::repeat_timeout3(0.125, handle);
     });
@@ -210,7 +211,7 @@ pub fn show_complete(
 
     let mut wind = window::Window::default()
         .with_size(w, h)
-        .with_label("Update Ready");
+        .with_label(&t!("update-ready-title"));
     wind.set_pos(((screen_w as i32) - w) / 2, ((screen_h as i32) - h) / 2);
     wind.make_resizable(false);
     wind.set_color(theme::BG_PRIMARY);
@@ -221,14 +222,14 @@ pub fn show_complete(
     col.set_spacing(10);
 
     let mut title = frame::Frame::default()
-        .with_label("Update downloaded!")
+        .with_label(&t!("update-downloaded-heading"))
         .with_align(enums::Align::Center);
     title.set_label_size(18);
     title.set_label_color(theme::SUCCESS);
     col.fixed(&title, 30);
 
     let mut info = frame::Frame::default()
-        .with_label("Ready to install. The app will restart automatically.")
+        .with_label(&t!("update-ready-info"))
         .with_align(enums::Align::Center | enums::Align::Inside);
     info.set_label_size(12);
     info.set_label_color(theme::TEXT_SECONDARY);
@@ -251,10 +252,13 @@ pub fn show_complete(
 
     frame::Frame::default();
 
-    let mut not_now_btn = controls::button("Not Now");
+    let mut not_now_btn = controls::button(&t!("update-not-now"));
     button_row.fixed(&not_now_btn, 120);
 
-    let mut install_btn = controls::accent_button("Install && Restart", theme::SUCCESS);
+    // FLTK treats '&' as a shortcut marker — escape it so translated
+    // labels containing '&' render literally.
+    let install_label = t!("update-install-restart").replace('&', "&&");
+    let mut install_btn = controls::accent_button(&install_label, theme::SUCCESS);
     button_row.fixed(&install_btn, 160);
 
     frame::Frame::default();
@@ -299,7 +303,7 @@ pub fn show_error(
 
     let mut wind = window::Window::default()
         .with_size(w, h)
-        .with_label("Update Failed");
+        .with_label(&t!("update-failed-title"));
     wind.set_pos(((screen_w as i32) - w) / 2, ((screen_h as i32) - h) / 2);
     wind.make_resizable(false);
     wind.set_color(theme::BG_PRIMARY);
@@ -310,7 +314,7 @@ pub fn show_error(
     col.set_spacing(10);
 
     let mut title = frame::Frame::default()
-        .with_label("Download failed")
+        .with_label(&t!("update-failed-heading"))
         .with_align(enums::Align::Center);
     title.set_label_size(16);
     title.set_label_color(theme::DANGER);
@@ -332,7 +336,7 @@ pub fn show_error(
 
     frame::Frame::default();
 
-    let mut continue_btn = controls::accent_button("Continue", theme::ACCENT);
+    let mut continue_btn = controls::accent_button(&t!("update-continue"), theme::ACCENT);
     button_row.fixed(&continue_btn, 140);
 
     frame::Frame::default();

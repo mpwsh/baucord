@@ -1,6 +1,7 @@
 // ui/settings/credits.rs — Credits panel: testers and contributors.
 
 use fltk::{prelude::*, *};
+use i18n::t;
 use ui::theme;
 use ui::widgets::labels;
 
@@ -13,12 +14,12 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
         .column();
     col.set_spacing(4);
 
-    labels::section_header(&mut col, "\u{2139}", "CREDITS");
+    labels::section_header(&mut col, "\u{2139}", &t!("credits-header"));
 
     // ── Super beta testers (gold) ───────────────────────────────
 
     let mut super_header = frame::Frame::default()
-        .with_label(">  SUPER BETA TESTERS")
+        .with_label(&format!(">  {}", t!("credits-super-testers")))
         .with_align(enums::Align::Left | enums::Align::Inside);
     col.fixed(&super_header, 24);
     super_header.set_label_size(13);
@@ -38,7 +39,7 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
 
     // ── Beta testers (2 columns) ────────────────────────────────
 
-    labels::section_header(&mut col, ">", "BETA TESTERS");
+    labels::section_header(&mut col, ">", &t!("credits-beta-testers"));
 
     let mut testers = vec![
         "Bartrix",

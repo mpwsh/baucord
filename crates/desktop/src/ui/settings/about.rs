@@ -1,6 +1,7 @@
 // ui/settings/about.rs — About panel: version, paths, tech links.
 
 use fltk::{prelude::*, *};
+use i18n::t;
 use ui::theme;
 use ui::widgets::{controls, labels};
 
@@ -11,7 +12,7 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
         .column();
     col.set_spacing(4);
 
-    labels::section_header(&mut col, ">", "ABOUT");
+    labels::section_header(&mut col, ">", &t!("about-header"));
 
     let version = env!("CARGO_PKG_VERSION");
     let mut ver_label = frame::Frame::default()
@@ -27,7 +28,7 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
 
     let exe_path = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "Unknown".to_string());
+        .unwrap_or_else(|_| t!("unknown"));
 
     let config_path = std::env::current_exe()
         .ok()
@@ -35,12 +36,12 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
             p.parent()
                 .map(|d| d.join("settings.json").display().to_string())
         })
-        .unwrap_or_else(|| "Unknown".to_string());
+        .unwrap_or_else(|| t!("unknown"));
 
-    path_label(&mut col, "Running from:", &exe_path);
-    path_label(&mut col, "Config file:", &config_path);
+    path_label(&mut col, &t!("about-running-from"), &exe_path);
+    path_label(&mut col, &t!("about-config-file"), &config_path);
 
-    let mut open_btn = controls::button("Open install folder");
+    let mut open_btn = controls::button(&t!("about-open-folder"));
     col.fixed(&open_btn, 26);
     open_btn.set_frame(enums::FrameType::FlatBox);
     open_btn.set_color(theme::BG_TERTIARY);
@@ -56,32 +57,24 @@ pub fn build(x: i32, y: i32, w: i32) -> group::Flex {
 
     separator(&mut col);
 
-    labels::section_header(&mut col, ">", "BUILT WITH");
+    labels::section_header(&mut col, ">", &t!("about-built-with"));
 
+    // (message id, url) — labels come from the locale files.
     let techs: &[(&str, &str)] = &[
-        ("Rust - Programming Language", "https://rust-lang.org"),
-        ("FLTK - User Interface", "https://www.fltk.org/"),
-        ("Renet - Networking", "https://github.com/lucaspoffo/renet"),
-        (
-            "FFmpeg - Video Encoding/Decoding",
-            "https://www.ffmpeg.org/",
-        ),
-        ("Xcap - Screen capture", "https://github.com/nashaofu/xcap"),
-        ("CPAL - Audio I/O", "https://github.com/RustAudio/cpal"),
-        ("Opus - Audio Codec", "https://opus-codec.org/"),
-        (
-            "RNNoise - Noise Suppression",
-            "https://jmvalin.ca/demo/rnnoise/",
-        ),
-        (
-            "Rubato - Audio Resampling",
-            "https://github.com/HEnquist/rubato",
-        ),
+        ("tech-rust", "https://rust-lang.org"),
+        ("tech-fltk", "https://www.fltk.org/"),
+        ("tech-renet", "https://github.com/lucaspoffo/renet"),
+        ("tech-ffmpeg", "https://www.ffmpeg.org/"),
+        ("tech-xcap", "https://github.com/nashaofu/xcap"),
+        ("tech-cpal", "https://github.com/RustAudio/cpal"),
+        ("tech-opus", "https://opus-codec.org/"),
+        ("tech-rnnoise", "https://jmvalin.ca/demo/rnnoise/"),
+        ("tech-rubato", "https://github.com/HEnquist/rubato"),
     ];
 
-    for &(name, url) in techs {
+    for &(key, url) in techs {
         let mut name_lbl = frame::Frame::default()
-            .with_label(name)
+            .with_label(&t!(key))
             .with_align(enums::Align::Left | enums::Align::Inside);
         col.fixed(&name_lbl, 18);
         name_lbl.set_label_color(theme::TEXT_PRIMARY);

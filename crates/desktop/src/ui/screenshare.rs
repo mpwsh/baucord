@@ -1,4 +1,5 @@
 use fltk::{prelude::*, *};
+use i18n::t;
 use ui::theme;
 use ui::widgets::controls;
 use video::{Quality, capture::list_monitors};
@@ -8,7 +9,7 @@ use crate::ui::messages::UiMessage;
 pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
     let monitors = list_monitors().unwrap_or_default();
     if monitors.is_empty() {
-        sender.send(UiMessage::ShowError("No monitors found".into()));
+        sender.send(UiMessage::ShowError(t!("error-no-monitors")));
         return;
     }
 
@@ -19,7 +20,7 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
 
     let mut wind = window::Window::default()
         .with_size(w, h)
-        .with_label("Share Screen");
+        .with_label(&t!("share-screen"));
     wind.set_pos(px, py);
     wind.set_color(theme::BG_PRIMARY);
     wind.make_resizable(false);
@@ -29,7 +30,7 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
     col.set_spacing(10);
 
     // Monitor picker
-    let mut monitor_label = frame::Frame::default().with_label("Monitor");
+    let mut monitor_label = frame::Frame::default().with_label(&t!("monitor"));
     monitor_label.set_label_color(theme::TEXT_SECONDARY);
     monitor_label.set_label_size(12);
     monitor_label.set_align(enums::Align::Left | enums::Align::Inside);
@@ -37,7 +38,11 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
 
     let mut monitor_choice = menu::Choice::default();
     for m in &monitors {
-        let primary = if m.is_primary { " (primary)" } else { "" };
+        let primary = if m.is_primary {
+            format!(" {}", t!("monitor-primary"))
+        } else {
+            String::new()
+        };
         monitor_choice.add_choice(&format!("{} — {}x{}{}", m.name, m.width, m.height, primary));
     }
     let primary_idx = monitors.iter().position(|m| m.is_primary).unwrap_or(0);
@@ -45,7 +50,7 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
     col.fixed(&monitor_choice, 30);
 
     // Quality picker
-    let mut quality_label = frame::Frame::default().with_label("Quality");
+    let mut quality_label = frame::Frame::default().with_label(&t!("quality"));
     quality_label.set_label_color(theme::TEXT_SECONDARY);
     quality_label.set_label_size(12);
     quality_label.set_align(enums::Align::Left | enums::Align::Inside);
@@ -68,7 +73,7 @@ pub fn show(sender: app::Sender<UiMessage>, parent: &window::Window) {
     frame::Frame::default();
 
     // Start button
-    let mut start_btn = controls::accent_button("Start Sharing", theme::ACCENT);
+    let mut start_btn = controls::accent_button(&t!("start-sharing"), theme::ACCENT);
     col.fixed(&start_btn, 35);
 
     col.end();
