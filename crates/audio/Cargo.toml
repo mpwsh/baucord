@@ -25,14 +25,21 @@ crossbeam-channel = "0.5"
 #opus = { git = "https://github.com/mpwsh/opus-rs" }
 
 # Resampling
-rubato = "1.0.1"
-audioadapter-buffers = "2.0"
+rubato = "4.0"
+# NOTE: must track the audioadapter major that rubato depends on (4.x for
+# rubato 4.0) — a newer audioadapter here would resolve as a second copy
+# with incompatible adapter types at the rubato boundary.
+audioadapter-buffers = "4.0"
 
 # Noise suppression (Mozilla RNNoise, pure Rust)
 nnnoiseless = "0.5"
 
-#earshot = { git = "https://github.com/mpwsh/earshot" }
-earshot = { git = "https://github.com/mpwsh/earshot", rev = "6e650a3f2c8e072509a956b12b5776bb848f0b0f" }
+# Fork retired: upstream 1.x ships quantized weights in its default
+# predictor, which was the fork's whole reason to exist.
+earshot = "1.2"
+# Deliberately pinned AHEAD of crates.io: this rev (== current master)
+# uses the opusic-sys backend; the crates.io 0.3.1 release predates that
+# switch. Do not "downgrade" to the registry version.
 opus = { git = "https://github.com/SpaceManiac/opus-rs", rev = "559876660603dc8079a053e03e6438766f669e69" }
 serde = { version = "1", features = ["derive"], optional = true }
 

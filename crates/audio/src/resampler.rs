@@ -25,7 +25,10 @@ use rubato::{
 fn sinc_params() -> SincInterpolationParameters {
     SincInterpolationParameters {
         sinc_len: 64,
-        f_cutoff: 0.95,
+        // rubato 4: Option — None would auto-derive the highest
+        // anti-aliasing-safe cutoff from sinc_len + window. Kept at the
+        // hand-picked value to preserve the existing frequency response.
+        f_cutoff: Some(0.95),
         interpolation: SincInterpolationType::Linear,
         oversampling_factor: 128,
         window: WindowFunction::BlackmanHarris2,

@@ -39,7 +39,7 @@
 //! The gate's own smoothstep fade on open/close is smooth enough on
 //! its own. VAD stays out of the signal path.
 
-use earshot::{Detector, QuantizedPredictor};
+use earshot::Detector;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,7 +61,9 @@ const VAD_HOLD_FRAMES: usize = 15;
 /// machine. Never touches sample values.
 pub struct VadStage {
     // ── earshot classifier ───────────────────────────────────────────
-    detector: Detector<QuantizedPredictor<'static>>,
+    // Boxed: the detector carries FFT ring buffers + RNN state and
+    // upstream only offers boxed constructors (stack-size safety).
+    detector: Box<Detector>,
     accum_48k: Vec<f32>,
     /// Anti-alias lowpass applied at 48 kHz before the 3:1 decimation.
     aa_filter: Biquad,
@@ -89,7 +91,7 @@ impl Default for VadStage {
 impl VadStage {
     pub fn new() -> Self {
         Self {
-            detector: Detector::<QuantizedPredictor>::default(),
+            detector: Detector::default_boxed(),
             accum_48k: Vec::with_capacity(SAMPLES_48K_PER_FRAME * 2),
             aa_filter: Biquad::lowpass(7000.0, 48000.0),
             threshold: 0.5,
@@ -158,7 +160,7 @@ impl VadStage {
                 }
                 Err(_) => {
                     log::error!("earshot panic caught — resetting detector");
-                    self.detector = Detector::<QuantizedPredictor>::default();
+                    self.detector.reset();
                 }
             }
             ran_any = true;
@@ -246,7 +248,7 @@ impl AudioProcessor for VadStage {
     }
 
     fn reset(&mut self) {
-        self.detector = Detector::<QuantizedPredictor>::default();
+        self.detector.reset();
         self.accum_48k.clear();
         self.vad_hold_remaining = 0;
         self.was_speech = false;
