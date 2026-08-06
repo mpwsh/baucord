@@ -132,6 +132,9 @@ pub enum UiMessage {
     /// User clicked "Quit" in tray menu — actually shut down.
     QuitFromTray,
 
+    /// Change the UI language. `None` = follow the OS locale.
+    SetLanguage(Option<String>),
+
     // ── Application lifecycle ───────────────────────────────────────
     /// OS close button on the main window. App decides what it means:
     /// hide to tray when connected, quit from the connect view.

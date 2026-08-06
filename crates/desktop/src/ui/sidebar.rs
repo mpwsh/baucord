@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::app::UserState;
 use crate::ui::messages::UiMessage;
+use i18n::t;
 use ui::theme;
 use ui::widgets::controls;
 
@@ -180,6 +181,8 @@ pub struct Sidebar {
     /// Updated by set_mute_state() / set_deafen_state().
     local_muted: bool,
     local_deafened: bool,
+    /// Mirrors set_share_state, so relabel() picks the right label.
+    sharing: bool,
 }
 
 impl Sidebar {
@@ -192,7 +195,7 @@ impl Sidebar {
 
         // User count label
         let mut user_count_label = frame::Frame::default()
-            .with_label("Users: 0")
+            .with_label(&t!("users-count", "count" => 0))
             .with_align(enums::Align::Left | enums::Align::Inside);
         sidebar.fixed(&user_count_label, 25);
         user_count_label.set_label_color(theme::TEXT_SECONDARY);
@@ -226,7 +229,7 @@ impl Sidebar {
         status_col.set_spacing(2);
         sidebar.fixed(&status_col, 50);
 
-        let mut connection_status = frame::Frame::default().with_label("Connecting ...");
+        let mut connection_status = frame::Frame::default().with_label(&t!("status-connecting"));
         status_col.fixed(&connection_status, 20);
         connection_status.set_label_color(theme::CYAN);
         connection_status.set_label_size(12);
@@ -245,21 +248,21 @@ impl Sidebar {
         audio_row.set_spacing(5);
         sidebar.fixed(&audio_row, 35);
 
-        let mute_btn = controls::button("Mute");
-        let deafen_btn = controls::button("Deafen");
+        let mute_btn = controls::button(&t!("mute"));
+        let deafen_btn = controls::button(&t!("deafen"));
 
         audio_row.end();
 
         // Share Screen button — full width, toggles to "Stop Sharing"
-        let share_btn = controls::button("Share Screen");
+        let share_btn = controls::button(&t!("share-screen"));
         sidebar.fixed(&share_btn, 35);
 
         // Settings button
-        let mut settings_btn = controls::button("Settings");
+        let mut settings_btn = controls::button(&t!("settings"));
         sidebar.fixed(&settings_btn, 35);
 
         // Disconnect button
-        let mut disconnect_btn = controls::accent_button("Disconnect", theme::ACCENT);
+        let mut disconnect_btn = controls::accent_button(&t!("disconnect"), theme::ACCENT);
         sidebar.fixed(&disconnect_btn, 35);
 
         sidebar.end();
@@ -308,6 +311,7 @@ impl Sidebar {
             audio_popup: None,
             local_muted: false,
             local_deafened: false,
+            sharing: false,
         }
     }
 
@@ -323,12 +327,13 @@ impl Sidebar {
 
     /// Update the share button to reflect current sharing state.
     pub fn set_share_state(&mut self, is_sharing: bool) {
+        self.sharing = is_sharing;
         if is_sharing {
-            self.share_btn.set_label("Stop Sharing");
+            self.share_btn.set_label(&t!("stop-sharing"));
             self.share_btn.set_color(theme::DANGER);
             self.share_btn.set_label_color(theme::BUTTON_TEXT);
         } else {
-            self.share_btn.set_label("Share Screen");
+            self.share_btn.set_label(&t!("share-screen"));
             self.share_btn.set_color(theme::BG_TERTIARY);
             self.share_btn.set_label_color(theme::TEXT_PRIMARY);
         }
@@ -401,7 +406,7 @@ impl Sidebar {
         col.set_spacing(4);
 
         let mut vol_header = frame::Frame::default()
-            .with_label("User Volume")
+            .with_label(&t!("user-volume"))
             .with_align(enums::Align::Left | enums::Align::Inside);
         vol_header.set_label_color(theme::TEXT_PRIMARY);
         vol_header.set_label_size(12);
@@ -432,11 +437,11 @@ impl Sidebar {
         sep.set_color(theme::BG_TERTIARY);
         col.fixed(&sep, 1);
 
-        let mute_label = if is_muted { "Unmute" } else { "Mute" };
+        let mute_label = if is_muted { t!("unmute") } else { t!("mute") };
         let mut mute_btn = if is_muted {
-            controls::accent_button(mute_label, theme::DANGER)
+            controls::accent_button(&mute_label, theme::DANGER)
         } else {
-            controls::button(mute_label)
+            controls::button(&mute_label)
         };
         col.fixed(&mute_btn, 26);
 
@@ -563,7 +568,7 @@ impl Sidebar {
 
     pub fn update_users(&mut self, users: &HashMap<ClientId, UserState>, our_id: Option<ClientId>) {
         self.user_count_label
-            .set_label(&format!("Users: {}", users.len()));
+            .set_label(&t!("users-count", "count" => users.len() as u32));
 
         let mut current_ids: Vec<ClientId> = users.keys().copied().collect();
         current_ids.sort();
@@ -806,21 +811,38 @@ impl Sidebar {
         });
     }
 
+    /// Re-set the static labels after a language change. Status and
+    /// latency lines self-heal on their next periodic update; settings /
+    /// disconnect buttons aren't stored and refresh on the next connect.
+    pub fn relabel(&mut self) {
+        self.mute_btn.set_label(&t!("mute"));
+        self.deafen_btn.set_label(&t!("deafen"));
+        self.share_btn.set_label(&t!(if self.sharing {
+            "stop-sharing"
+        } else {
+            "share-screen"
+        }));
+        self.user_count_label
+            .set_label(&t!("users-count", "count" => self.user_rows.len() as u32));
+    }
+
     pub fn set_connection_status(&mut self, connected: bool) {
         if connected {
-            self.connection_status.set_label("\u{25cf} Connected");
+            self.connection_status
+                .set_label(&format!("\u{25cf} {}", t!("status-connected")));
             self.connection_status.set_label_color(theme::SUCCESS);
         } else {
-            self.connection_status.set_label("\u{25cf} Disconnected");
+            self.connection_status
+                .set_label(&format!("\u{25cf} {}", t!("status-disconnected")));
             self.connection_status.set_label_color(theme::DANGER);
         }
     }
 
     pub fn update_latency(&mut self, rtt_ms: f64, audio_latency_ms: Option<u32>) {
         let status_label = if rtt_ms < 1.0 {
-            "Disconnected".to_string()
+            t!("status-disconnected")
         } else {
-            "Connected".to_string()
+            t!("status-connected")
         };
         self.connection_status.set_label(&status_label);
 
@@ -842,7 +864,7 @@ impl Sidebar {
             None => "--".to_string(),
         };
         self.latency_label
-            .set_label(&format!("Audio: {audio_str} | Network: {net_str}"));
+            .set_label(&t!("latency-line", "audio" => audio_str, "network" => net_str));
     }
 
     pub fn handle_disconnected(&mut self) {
@@ -851,7 +873,7 @@ impl Sidebar {
         self.latency_label.set_label("Audio: -- | Network: --");
         self.user_list_pack.clear();
         self.user_rows.clear();
-        self.user_count_label.set_label("Users: 0");
+        self.user_count_label.set_label(&t!("users-count", "count" => 0));
         self.active_sharers.clear();
         self.set_share_state(false);
         self.update_stream_stats(None);

@@ -29,6 +29,7 @@ use crate::{
     ui::{chat::Chat, messages::UiMessage, screenshare, sidebar::Sidebar, viewer::ViewerWindow},
 };
 use audio::{PeerAudioSettings, SoundType};
+use i18n::t;
 use ui::theme;
 
 // ── Public types ────────────────────────────────────────────────────────
@@ -142,6 +143,9 @@ impl App {
         );
 
         let settings = Settings::load();
+
+        // Localize before any UI is built. None = follow the OS locale.
+        i18n::init(settings.language.as_deref());
 
         Self {
             app,
@@ -304,7 +308,7 @@ impl App {
             ScreenEvent::SharingStarted { quality } => {
                 info!("📺 Screen share started: {quality}");
                 if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(format!("Screen share started ({quality})"));
+                    chat.handle_system_message(t!("chat-share-started", "quality" => quality.to_string()));
                 }
                 if let Some(sidebar) = &mut self.sidebar {
                     sidebar.set_share_state(true);
@@ -329,7 +333,7 @@ impl App {
             ScreenEvent::SharingStopped => {
                 info!("📺 Screen share stopped");
                 if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message("Screen share stopped".to_string());
+                    chat.handle_system_message(t!("chat-share-stopped"));
                 }
                 if let Some(sidebar) = &mut self.sidebar {
                     sidebar.set_share_state(false);
@@ -399,14 +403,14 @@ impl App {
                 let username = self.get_username(client_id);
                 info!("📺 {username} started sharing ({width}x{height})");
                 if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(format!("{username} started sharing their screen"));
+                    chat.handle_system_message(t!("chat-peer-sharing", "name" => username.as_str()));
                 }
             }
             ScreenEvent::PeerStoppedSharing { client_id } => {
                 let username = self.get_username(client_id);
                 info!("📺 {username} stopped sharing");
                 if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(format!("{username} stopped sharing their screen"));
+                    chat.handle_system_message(t!("chat-peer-stopped-sharing", "name" => username.as_str()));
                 }
                 // Close viewer window if open
                 if let Some(mut viewer) = self.viewer_windows.remove(&client_id) {
@@ -573,7 +577,7 @@ impl App {
                     .tx
                     .send(NetworkControl::SubscribeScreen { target_id: raw_id })
                     .ok();
-                self.show_chat_system(&format!("Watching {username}'s screen..."));
+                self.show_chat_system(&t!("chat-watching", "name" => username.as_str()));
             }
             UiMessage::UnwatchPeer { client_id } => {
                 if let Some(mut viewer) = self.viewer_windows.remove(&client_id) {
@@ -586,7 +590,7 @@ impl App {
                     })
                     .ok();
                 let username = self.get_username(client_id);
-                self.show_chat_system(&format!("Stopped watching {username}."));
+                self.show_chat_system(&t!("chat-stopped-watching", "name" => username.as_str()));
             }
 
             UiMessage::SetStreamVolume { client_id, volume } => {
@@ -679,6 +683,18 @@ impl App {
             UiMessage::SaveSettings => {
                 self.settings.save();
             }
+            UiMessage::SetLanguage(lang) => {
+                self.settings.language = lang;
+                i18n::set_locale(self.settings.language.as_deref());
+                // Labels are copied into widgets at construction, so a
+                // language change re-renders per tier: the connect view
+                // rebuilds, sidebar buttons relabel in place, settings
+                // windows update on reopen, chat history stays as-is.
+                self.rebuild_connect_view();
+                if let Some(sidebar) = &mut self.sidebar {
+                    sidebar.relabel();
+                }
+            }
             UiMessage::ResetSettings => {
                 self.settings.reset();
                 // Push the defaults to the running subsystems so behavior
@@ -703,6 +719,8 @@ impl App {
                 if let Some(ref mut hotkeys) = self.hotkeys {
                     hotkeys.update(&self.settings);
                 }
+                i18n::set_locale(self.settings.language.as_deref());
+                self.rebuild_connect_view();
                 self.refresh_device_warning();
             }
             UiMessage::SetInputDevice(d) => {
@@ -891,16 +909,16 @@ impl App {
         // ── Chat notifications ──────────────────────────────────────
 
         for name in new_input_names.difference(&old_input_names) {
-            self.show_chat_system(&format!("\u{1f3a4} Microphone connected: {name}"));
+            self.show_chat_system(&t!("chat-mic-connected", "name" => name.as_str()));
         }
         for name in old_input_names.difference(&new_input_names) {
-            self.show_chat_system(&format!("\u{1f3a4} Microphone disconnected: {name}"));
+            self.show_chat_system(&t!("chat-mic-disconnected", "name" => name.as_str()));
         }
         for name in new_output_names.difference(&old_output_names) {
-            self.show_chat_system(&format!("\u{1f50a} Speaker connected: {name}"));
+            self.show_chat_system(&t!("chat-speaker-connected", "name" => name.as_str()));
         }
         for name in old_output_names.difference(&new_output_names) {
-            self.show_chat_system(&format!("\u{1f50a} Speaker disconnected: {name}"));
+            self.show_chat_system(&t!("chat-speaker-disconnected", "name" => name.as_str()));
         }
 
         // ── Input device: detect if a rebuild is needed ─────────────
@@ -913,14 +931,11 @@ impl App {
 
         if need_input_rebuild {
             if self.settings.audio.input.device.is_some() {
-                self.show_chat_system(
-                    "\u{1f3a4} Input device lost \u{2014} switching to system default",
-                );
+                self.show_chat_system(&t!("chat-input-lost"));
             } else {
-                let new_default = new_input_default.as_deref().unwrap_or("unknown device");
-                self.show_chat_system(&format!(
-                    "\u{1f3a4} Default input changed to: {new_default}"
-                ));
+                let fallback = t!("unknown-device");
+                let new_default = new_input_default.as_deref().unwrap_or(&fallback);
+                self.show_chat_system(&t!("chat-input-default-changed", "name" => new_default));
             }
             self.settings.audio.input.device = None;
             self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
@@ -936,14 +951,11 @@ impl App {
 
         if need_output_rebuild {
             if self.settings.audio.output.device.is_some() {
-                self.show_chat_system(
-                    "\u{1f50a} Output device lost \u{2014} switching to system default",
-                );
+                self.show_chat_system(&t!("chat-output-lost"));
             } else {
-                let new_default = new_output_default.as_deref().unwrap_or("unknown device");
-                self.show_chat_system(&format!(
-                    "\u{1f50a} Default output changed to: {new_default}"
-                ));
+                let fallback = t!("unknown-device");
+                let new_default = new_output_default.as_deref().unwrap_or(&fallback);
+                self.show_chat_system(&t!("chat-output-default-changed", "name" => new_default));
             }
             self.settings.audio.output.device = None;
             self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
@@ -1018,9 +1030,9 @@ impl App {
             .on_click(UiMessage::RestoreFromTray)
             .menu(
                 MenuBuilder::new()
-                    .item("Show", UiMessage::RestoreFromTray)
+                    .item(&t!("tray-show"), UiMessage::RestoreFromTray)
                     .separator()
-                    .item("Quit", UiMessage::QuitFromTray),
+                    .item(&t!("tray-quit"), UiMessage::QuitFromTray),
             )
             .build()
             .unwrap();
@@ -1408,6 +1420,41 @@ impl App {
         }
     }
 
+    /// Tear down and rebuild the connect view. FLTK widgets copy
+    /// their labels at construction, so a language change needs a
+    /// rebuild; this is the cheap view, and it keeps showing if it was
+    /// the active one.
+    fn rebuild_connect_view(&mut self) {
+        let Some(wizard) = &mut self.wizard else {
+            return;
+        };
+        let old = self.connect_view.take();
+
+        wizard.begin();
+        let connect = crate::ui::connect::build_view(self.sender, &self.settings);
+        wizard.end();
+        // end() sets the current group to the wizard's PARENT (the main
+        // window) — reset it, same trap as show_main_screen.
+        group::Group::set_current(None::<&group::Group>);
+
+        if let Some(mut old) = old {
+            wizard.remove(&old);
+            old.hide();
+        }
+
+        self.error_frame = Some(connect.error_frame);
+        self.device_warning = Some(connect.device_warning);
+        self.connect_view = Some(connect.group);
+        self.refresh_device_warning();
+
+        if !self.connected
+            && let (Some(wizard), Some(view)) = (&mut self.wizard, &self.connect_view)
+        {
+            wizard.set_current_widget(view);
+        }
+        app::redraw();
+    }
+
     /// Compare the devices saved in settings against what's connected
     /// right now and surface the result on the connect view. Runtime
     /// unplugs already fall back to the system default with a chat
@@ -1422,20 +1469,22 @@ impl App {
         if let Some(name) = &self.settings.audio.input.device
             && !self.last_input_devices.iter().any(|(n, _)| n == name)
         {
-            missing.push(format!("mic \"{name}\""));
+            missing.push(i18n::t!("device-missing-mic", "name" => name.as_str()));
         }
         if let Some(name) = &self.settings.audio.output.device
             && !self.last_output_devices.iter().any(|(n, _)| n == name)
         {
-            missing.push(format!("output \"{name}\""));
+            missing.push(i18n::t!("device-missing-output", "name" => name.as_str()));
         }
 
         if missing.is_empty() {
             frame.set_label("");
         } else {
+            let joiner = format!(" {} ", i18n::t!("list-and"));
             frame.set_label(&format!(
-                "\u{26a0} Saved {} not connected\nOpen Settings to pick another device",
-                missing.join(" and ")
+                "{}\n{}",
+                i18n::t!("device-warning", "devices" => missing.join(&joiner)),
+                i18n::t!("device-warning-hint"),
             ));
         }
         frame.redraw();

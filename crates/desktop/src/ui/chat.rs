@@ -1,6 +1,7 @@
 // ui/chat.rs
 use crate::ui::messages::UiMessage;
 use fltk::{prelude::*, *};
+use i18n::t;
 use ui::theme;
 use ui::widgets::{controls, style};
 
@@ -77,7 +78,7 @@ impl Chat {
         char_count.set_label_color(theme::TEXT_MUTED);
         char_count.set_label_size(11);
 
-        let mut send_btn = controls::accent_button("Send", theme::ACCENT);
+        let mut send_btn = controls::accent_button(&t!("send"), theme::ACCENT);
         input_row.fixed(&send_btn, 80);
 
         input_row.end();
@@ -150,19 +151,19 @@ impl Chat {
     }
 
     pub fn handle_disconnected(&mut self, reason: String) {
-        let msg = format!("Disconnected: {reason}\n");
+        let msg = format!("{}\n", t!("chat-disconnected", "reason" => reason.as_str()));
         self.append_system_message(&msg);
         self.scroll_to_bottom();
     }
 
     pub fn handle_user_joined(&mut self, username: String) {
-        let msg = format!("{username} joined\n");
+        let msg = format!("{}\n", t!("chat-user-joined", "name" => username.as_str()));
         self.append_system_message(&msg);
         self.scroll_to_bottom();
     }
 
     pub fn handle_user_left(&mut self, username: String) {
-        let msg = format!("{username} left\n");
+        let msg = format!("{}\n", t!("chat-user-left", "name" => username.as_str()));
         self.append_system_message(&msg);
         self.scroll_to_bottom();
     }

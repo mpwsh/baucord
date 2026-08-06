@@ -6,6 +6,7 @@
 use client::config::Settings;
 use crate::ui::messages::UiMessage;
 use fltk::{prelude::*, *};
+use i18n::t;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use ui::theme;
@@ -48,9 +49,9 @@ pub fn build(
 
     // ── Devices ─────────────────────────────────────────────────
 
-    labels::section_header(&mut col, "\u{1f3a7}", "DEVICES");
+    labels::section_header(&mut col, "\u{1f3a7}", &t!("audio-devices-header"));
 
-    labels::field_label(&mut col, "Input Device (Microphone)");
+    labels::field_label(&mut col, &t!("audio-input-device"));
     let mut input_choice = controls::dropdown(&mut col);
     let input_names: Vec<&str> = input_devices.iter().map(|(n, _)| n.as_str()).collect();
     controls::populate_dropdown(
@@ -60,7 +61,7 @@ pub fn build(
         settings.audio.input.device.as_deref(),
     );
 
-    labels::field_label(&mut col, "Output Device (Speakers/Headphones)");
+    labels::field_label(&mut col, &t!("audio-output-device"));
     let mut output_choice = controls::dropdown(&mut col);
     let output_names: Vec<&str> = output_devices.iter().map(|(n, _)| n.as_str()).collect();
     controls::populate_dropdown(
@@ -83,13 +84,13 @@ pub fn build(
 
     // ── Input ───────────────────────────────────────────────────
 
-    labels::section_header(&mut col, "\u{1f3a4}", "INPUT");
+    labels::section_header(&mut col, "\u{1f3a4}", &t!("audio-input-header"));
 
-    labels::field_label(&mut col, "Capture Level");
+    labels::field_label(&mut col, &t!("audio-capture-level"));
     let threshold_rc = std::rc::Rc::new(std::cell::RefCell::new(settings.audio.gate_threshold));
     let vu_input = meter::gate(&mut col, denoised_level.clone(), threshold_rc.clone(), 22);
 
-    labels::field_label(&mut col, "Input Gain");
+    labels::field_label(&mut col, &t!("audio-input-gain"));
     let mut input_gain_slider = controls::slider(
         &mut col,
         0.0,
@@ -103,7 +104,7 @@ pub fn build(
         &format!("Gain: {}%", (settings.audio.input.gain * 100.0) as i32),
     );
 
-    labels::field_label(&mut col, "Input Sensitivity");
+    labels::field_label(&mut col, &t!("audio-input-sensitivity"));
     let mut vad_slider = controls::slider(
         &mut col,
         0.005,
@@ -116,23 +117,23 @@ pub fn build(
         &mut col,
         &format_sensitivity(settings.audio.gate_threshold as f64),
     );
-    labels::hint_label(&mut col, "Audio below the red line won't be transmitted");
+    labels::hint_label(&mut col, &t!("audio-gate-hint"));
 
-    let mut test_mic_btn = controls::button("\u{1f3a4}  Test Microphone");
+    let mut test_mic_btn = controls::button(&t!("audio-test-mic"));
     col.fixed(&test_mic_btn, 30);
 
     let test_mic_info =
-        labels::hint_label(&mut col, "Listen to your own mic (others won't hear you)");
+        labels::hint_label(&mut col, &t!("audio-test-hint"));
 
     layout::separator(&mut col);
 
     // ── Output ──────────────────────────────────────────────────
 
-    labels::section_header(&mut col, "\u{1f50a}", "OUTPUT");
+    labels::section_header(&mut col, "\u{1f50a}", &t!("audio-output-header"));
 
     let vu_output = meter::vu(&mut col, output_level.clone(), 22, theme::CYAN);
 
-    labels::field_label(&mut col, "Master Volume");
+    labels::field_label(&mut col, &t!("audio-master-volume"));
     let mut output_gain_slider = controls::slider(
         &mut col,
         0.0,
@@ -199,16 +200,16 @@ pub fn build(
         *testing_cb.borrow_mut() = is_testing;
 
         if is_testing {
-            btn.set_label("\u{1f534}  Stop Testing");
+            btn.set_label(&t!("audio-stop-testing"));
             btn.set_color(theme::ACCENT_HOVER);
             btn.set_label_color(theme::BUTTON_TEXT);
-            info_lbl.set_label("Listening to your mic... others can't hear you");
+            info_lbl.set_label(&t!("audio-testing-hint"));
             info_lbl.set_label_color(theme::WARNING);
         } else {
-            btn.set_label("\u{1f3a4}  Test Microphone");
+            btn.set_label(&t!("audio-test-mic"));
             btn.set_color(theme::BG_TERTIARY);
             btn.set_label_color(theme::TEXT_PRIMARY);
-            info_lbl.set_label("Listen to your own mic (others won't hear you)");
+            info_lbl.set_label(&t!("audio-test-hint"));
             info_lbl.set_label_color(theme::TEXT_MUTED);
         }
 

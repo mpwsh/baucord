@@ -13,6 +13,7 @@ use fltk::{prelude::*, *};
 use client::config::Settings;
 use crate::ui::messages::UiMessage;
 use ui::theme;
+use i18n::t;
 use ui::widgets::{controls, style};
 
 /// Fixed size of the centered connect form.
@@ -54,7 +55,7 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     col.fixed(&title, 50);
 
     let mut subtitle = frame::Frame::default()
-        .with_label("We have discord at home")
+        .with_label(&t!("app-tagline"))
         .with_align(enums::Align::Center);
     subtitle.set_label_size(12);
     subtitle.set_label_color(theme::TEXT_SECONDARY);
@@ -71,7 +72,7 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     // ── Nickname ─────────────────────────────────────────────────────
 
     let mut nick_frame = frame::Frame::default()
-        .with_label("Nickname")
+        .with_label(&t!("nickname"))
         .with_align(enums::Align::Left | enums::Align::Inside);
     nick_frame.set_label_color(theme::TEXT_SECONDARY);
     nick_frame.set_label_size(11);
@@ -85,7 +86,7 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     // ── Server address ───────────────────────────────────────────────
 
     let mut addr_frame = frame::Frame::default()
-        .with_label("Server Address:Port")
+        .with_label(&t!("server-address"))
         .with_align(enums::Align::Left | enums::Align::Inside);
     addr_frame.set_label_color(theme::TEXT_SECONDARY);
     addr_frame.set_label_size(11);
@@ -98,7 +99,7 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
 
     // ── Connect button ───────────────────────────────────────────────
 
-    let mut connect_btn = controls::accent_button("Connect", theme::ACCENT);
+    let mut connect_btn = controls::accent_button(&t!("connect"), theme::ACCENT);
     col.fixed(&connect_btn, 40);
 
     // ── Secondary actions ────────────────────────────────────────────
@@ -108,8 +109,8 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     let mut actions = group::Flex::default().row();
     col.fixed(&actions, 30);
     actions.set_spacing(10);
-    let mut settings_btn = controls::button("Settings");
-    let mut quit_btn = controls::button("Quit");
+    let mut settings_btn = controls::button(&t!("settings"));
+    let mut quit_btn = controls::button(&t!("quit"));
     actions.end();
 
     // ── Missing-device warning ───────────────────────────────────────
@@ -138,7 +139,7 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
         let nickname = nick_input.value();
         let server = addr_input.value();
         if nickname.trim().is_empty() {
-            s.send(UiMessage::ShowError("Nickname cannot be empty".into()));
+            s.send(UiMessage::ShowError(t!("error-nickname-empty")));
         } else {
             s.send(UiMessage::Connect { nickname, server });
         }

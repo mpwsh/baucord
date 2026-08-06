@@ -227,6 +227,10 @@ pub struct Settings {
     pub keybinds: Vec<KeybindEntry>,
     #[serde(default)]
     pub peer_settings: HashMap<String, PeerAudioSettings>,
+    /// UI language as a BCP-47 code (e.g. "es-AR"). `None` = follow the
+    /// OS locale. Which locales exist is the frontends' business.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 impl Default for Settings {
@@ -238,6 +242,7 @@ impl Default for Settings {
             window: WindowSettings::default(),
             keybinds: default_keybinds(),
             peer_settings: HashMap::new(),
+            language: None,
         }
     }
 }

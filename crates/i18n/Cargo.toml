@@ -1,0 +1,18 @@
+[package]
+name = "i18n"
+version = "0.1.0"
+edition = "2024"
+description = "Shared Fluent localization for all baucord frontends"
+
+[lints]
+workspace = true
+
+[dependencies]
+# fluent-bundle is the engine crate (the `fluent` package is a re-export
+# shell). fluent_content was evaluated and skipped: 0.0.5 pins fluent
+# 0.16's types, so its trait would not apply to a current bundle — and
+# the `t!` macro below provides the same ergonomics.
+fluent-bundle = "0.16"
+unic-langid = "0.9"
+sys-locale = "0.3"
+log.workspace = true

@@ -19,6 +19,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use crate::ui::messages::UiMessage;
+use i18n::t;
 use ui::theme;
 use ui::widgets::controls;
 
@@ -108,7 +109,7 @@ impl ViewerWindow {
         // Extra height for toolbar
         let win_h = height.min(max_h) as i32 + TOOLBAR_HEIGHT;
 
-        let title = format!("{username}'s screen ({width}x{height})");
+        let title = t!("viewer-title", "name" => username, "width" => width, "height" => height);
 
         let mut wind = window::Window::default()
             .with_size(win_w, win_h)
@@ -338,7 +339,12 @@ impl ViewerWindow {
 
             // Update title bar to reflect new resolution
             self.wind
-                .set_label(&format!("{}'s screen ({width}x{height})", self.username));
+                .set_label(&t!(
+                    "viewer-title",
+                    "name" => self.username.as_str(),
+                    "width" => width,
+                    "height" => height
+                ));
         }
 
         // Swap in the new pixel data + dimensions

@@ -10,6 +10,7 @@
 pub mod about;
 pub mod audio;
 pub mod credits;
+pub mod general;
 pub mod keybinds;
 
 use fltk::{prelude::*, *};
@@ -18,12 +19,14 @@ use std::sync::atomic::AtomicU32;
 
 use client::config::Settings;
 use crate::ui::messages::UiMessage;
+use i18n::t;
 use ui::theme;
 use ui::widgets::controls;
 
 /// Tab identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    General,
     Audio,
     Keyboard,
     Credits,
@@ -31,14 +34,16 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: &'static [Tab] = &[Tab::Audio, Tab::Keyboard, Tab::Credits, Tab::About];
+    const ALL: &'static [Tab] =
+        &[Tab::General, Tab::Audio, Tab::Keyboard, Tab::Credits, Tab::About];
 
-    fn label(&self) -> &'static str {
+    fn label(&self) -> String {
         match self {
-            Tab::Audio => "Audio",
-            Tab::Keyboard => "Keyboard",
-            Tab::Credits => "Credits",
-            Tab::About => "About",
+            Tab::General => t!("tab-general"),
+            Tab::Audio => t!("tab-audio"),
+            Tab::Keyboard => t!("tab-keyboard"),
+            Tab::Credits => t!("tab-credits"),
+            Tab::About => t!("tab-about"),
         }
     }
 }
@@ -73,7 +78,7 @@ impl SettingsWindow {
 
         let mut wind = window::Window::default()
             .with_size(win_w, win_h)
-            .with_label("Settings");
+            .with_label(&t!("settings-title"));
         wind.set_pos(sx, sy);
         wind.make_resizable(false);
         wind.set_color(theme::BG_PRIMARY);
@@ -91,7 +96,7 @@ impl SettingsWindow {
 
         let mut nav_buttons: Vec<button::Button> = Vec::new();
         for &tab in Tab::ALL {
-            let mut btn = button::Button::default().with_label(tab.label());
+            let mut btn = button::Button::default().with_label(&tab.label());
             nav.fixed(&btn, 32);
             btn.set_frame(enums::FrameType::FlatBox);
             btn.set_label_size(13);
@@ -109,9 +114,12 @@ impl SettingsWindow {
         scroll.set_scrollbar_size(8);
         scroll.set_color(theme::BG_PRIMARY);
 
+        // General panel — first tab, visible initially.
+        let general_flex = general::build(sender, &settings, content_x, 10, content_w);
+
         // Audio panel — Flex with explicit size/pos inside the scroll.
         // This is the pattern the original settings.rs used.
-        let audio_flex = audio::build(
+        let mut audio_flex = audio::build(
             sender,
             &settings,
             input_devices,
@@ -122,6 +130,7 @@ impl SettingsWindow {
             10,
             content_w,
         );
+        audio_flex.hide();
 
         // Keyboard panel — same pattern, hidden initially
         let mut keyboard_flex = keybinds::build(sender, &settings, content_x, 10, content_w);
@@ -149,9 +158,9 @@ impl SettingsWindow {
         btn_row.set_frame(enums::FrameType::FlatBox);
 
         frame::Frame::default(); // left spacer
-        let mut reset_btn = controls::button("Reset Defaults");
+        let mut reset_btn = controls::button(&t!("reset-defaults"));
         btn_row.fixed(&reset_btn, 180);
-        let mut save_btn = controls::accent_button("Save and Close", theme::ACCENT);
+        let mut save_btn = controls::accent_button(&t!("save-and-close"), theme::ACCENT);
         btn_row.fixed(&save_btn, 180);
         frame::Frame::default(); // right spacer
         btn_row.end();
@@ -164,6 +173,7 @@ impl SettingsWindow {
         // Collect the switchable panels.  We use group::Flex which
         // implements WidgetExt, so show/hide work fine.
         let panels: Vec<group::Flex> = vec![
+            general_flex.clone(),
             audio_flex.clone(),
             keyboard_flex.clone(),
             credits_flex.clone(),

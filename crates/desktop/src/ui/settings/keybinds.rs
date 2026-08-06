@@ -6,6 +6,7 @@
 // and an FLTK sender to push captured keybinds back to the UI.
 
 use fltk::{prelude::*, *};
+use i18n::t;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Mutex, Once};
@@ -234,7 +235,7 @@ fn build_keybind_row(
     row.set_spacing(10);
 
     let mut label = frame::Frame::default()
-        .with_label(action.label())
+        .with_label(&action_label(action))
         .with_align(enums::Align::Left | enums::Align::Inside);
     label.set_label_color(theme::TEXT_PRIMARY);
     label.set_label_size(13);
@@ -390,4 +391,16 @@ fn fltk_key_to_code_string(key: enums::Key) -> Option<String> {
     }
 
     None
+}
+
+/// Localized display names for keybindable actions. The core's
+/// `BindableAction::label()` stays English on purpose — it feeds log
+/// lines, and logs are developer-facing.
+fn action_label(action: BindableAction) -> String {
+    t!(match action {
+        BindableAction::ToggleMute => "action-toggle-mute",
+        BindableAction::ToggleDeafen => "action-toggle-deafen",
+        BindableAction::ToggleScreenShare => "action-toggle-share",
+        BindableAction::PushToTalk => "action-push-to-talk",
+    })
 }
