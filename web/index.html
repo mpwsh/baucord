@@ -6,7 +6,7 @@
     <title>baucord — self-hosted voice chat</title>
     <meta
       name="description"
-      content="Self-hosted voice, text and screen sharing for you and your friends. Built for the lowest-latency calls — client and server in one small download."
+      content="A small, self-hosted voice, text and screen sharing app for you and your friends. Client and server ship together in one zip."
     />
     <meta name="theme-color" content="#1A1D21" />
 
@@ -516,10 +516,10 @@
       <div>
         <h1>bau<b>cord</b></h1>
         <p>
-          Self-hosted voice chat for you and your friends, built for the
-          lowest-latency calls that don't sacrifice quality. Voice, screen
-          sharing and text — no accounts, no telemetry, about as heavy as a
-          screenshot.
+          Voice, text and screen sharing you host yourself. Written in Rust,
+          tuned for low decoding latency, and small enough to leave running
+          without noticing. No accounts, no telemetry — just you, your friends,
+          and a server you control.
         </p>
         <div class="btn-row">
           <a class="btn solid" href="#download">Download</a>
@@ -532,8 +532,8 @@
           >
         </div>
         <p class="facts">
-          ~3.5 MB RAM &nbsp;·&nbsp; Windows / macOS / Linux &nbsp;·&nbsp; client
-          + server in one zip
+          Windows / macOS / Linux &nbsp;·&nbsp; client + server in one zip
+          &nbsp;·&nbsp; MIT-licensed
         </p>
       </div>
 
@@ -559,46 +559,46 @@
       <div class="wrap">
         <h2>What it does</h2>
         <p class="section-note">
-          A call with your friends: talk, type, share your screen, and control
-          how everyone sounds on your end.
+          Hang out with a handful of friends: talk, type, share your screen.
+          Nothing you don't need.
         </p>
 
         <dl class="spec">
           <div class="spec-row">
             <dt>voice</dt>
             <dd>
-              Starts sending the instant you speak and stays crisp on the other
-              end. The mic gate is yours to tune — sensitivity, volume, noise
-              suppression.
+              Opus over UDP with voice activity detection or push-to-talk. Tuned
+              to keep the gap between someone speaking and you hearing them as
+              short as it can be.
             </dd>
           </div>
           <div class="spec-row">
             <dt>rough connections</dt>
             <dd>
-              Each person's audio is smoothed out separately, so one friend on
-              hotel wi-fi doesn't turn the whole call to gravel.
+              Each person gets their own adaptive jitter buffer, so one friend
+              on hotel wi-fi doesn't drag everyone else's audio down with them.
             </dd>
           </div>
           <div class="spec-row">
             <dt>screen share</dt>
             <dd>
-              Share your screen with its sound. Viewers get a clean,
-              correctly-scaled picture; you get live stats on how your stream is
-              holding up.
+              H.264 via FFmpeg, with the source's audio along for the ride. 720p
+              or 1080p, quality is a slider. Viewers get a resizable window with
+              live stats if they want to see them.
             </dd>
           </div>
           <div class="spec-row">
             <dt>per-user audio</dt>
             <dd>
-              Volume and mute per person, remembered between sessions. The loud
-              friend stays quiet tomorrow.
+              Right-click anyone to mute them or ride their volume. Settings
+              stick around, so the loud friend stays quiet next time too.
             </dd>
           </div>
           <div class="spec-row">
             <dt>global hotkeys</dt>
             <dd>
-              Mute, deafen and share from any window. Rebind by pressing the
-              keys, not by typing arcane strings.
+              Mute, deafen and start a screen share from any window. Rebind by
+              pressing the keys you want, not by editing config.
             </dd>
           </div>
           <div class="spec-row">
@@ -606,17 +606,19 @@
             <dd>For links, and for whoever's mic just died.</dd>
           </div>
           <div class="spec-row">
-            <dt>tray &amp; updates</dt>
+            <dt>your machine</dt>
             <dd>
-              Closes to the tray and keeps the call running. Checks for a new
-              version at launch.
+              Closes to the tray and keeps the call running. Settings live in a
+              JSON file next to the binary — no installer, no registry, no
+              background services.
             </dd>
           </div>
           <div class="spec-row">
             <dt>the server</dt>
             <dd>
-              A dumb little relay with nothing to configure and nothing to
-              maintain. It ships in the same zip as the client.
+              A dumb relay. It forwards packets, that's it — no mixing, no
+              transcoding, no accounts to manage. Ships in the same zip as the
+              client.
             </dd>
           </div>
         </dl>
@@ -639,7 +641,7 @@
                 loading="lazy"
               />
             </a>
-            <figcaption>connect — the entire onboarding flow</figcaption>
+            <figcaption>connect — nickname and server address, done</figcaption>
           </figure>
           <figure>
             <a class="shot-link" href="img/client1.png">
@@ -649,7 +651,7 @@
                 loading="lazy"
               />
             </a>
-            <figcaption>a call — voice, chat, per-user controls</figcaption>
+            <figcaption>a call — voices, chat, per-user controls</figcaption>
           </figure>
         </div>
       </div>
@@ -659,8 +661,8 @@
       <div class="wrap">
         <h2>Download</h2>
         <p class="section-note">
-          Every zip contains the client and the dedicated server for that
-          platform.
+          Every zip has the client and the dedicated server for that platform.
+          Grab the one you need; anyone hosting also needs the server-side one.
         </p>
 
         <div class="dl-grid">
@@ -696,7 +698,8 @@
 
         <p class="dl-note">
           Unzip, run <code>dedicated-server</code> somewhere your friends can
-          reach, give them the address. That's the whole deployment story.
+          reach — a spare box, a cheap VPS, a homelab — then hand them the
+          address. That's the whole deployment.
         </p>
       </div>
     </section>
