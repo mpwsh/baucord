@@ -1,19 +1,31 @@
 // network.rs — Renet client + network thread.
 //
-// NetworkClient handles protocol, serialization, voice bundling.
-// NetworkThreadHandle owns the thread that polls the client and routes
-// voice packets to the voice thread and video packets to the screen thread.
+// NetworkClient handles protocol and serialization; NetworkThreadHandle
+// owns the thread that polls the client and routes voice packets to the
+// voice thread and video packets to the screen thread.
 //
 // All wire protocol types come from the shared `protocol` crate.
+//
+// Authentication: when `token_url` is configured, the client fetches a
+// netcode ConnectToken over HTTPS (the server's in-process issuer,
+// behind the deployment's TLS proxy) and connects in secure mode — the
+// server assigns our client id and username via the token. Without a
+// token URL it falls back to open (unsecure) mode for LAN/dev servers.
+//
+// Media attribution: relayed media arrives wrapped in the server's
+// sender envelope ([sender_id: u64][packet]) — the sender id is stamped
+// by the server from the authenticated transport, so it cannot be
+// spoofed by other clients. See `protocol::relayed`.
 
-use bincode::Options;
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use log::warn;
-use renet::{ChannelConfig, ClientId, ConnectionConfig, RenetClient, SendType};
+use renet::{ClientId, RenetClient};
 use renet_netcode::{
-    ClientAuthentication, NETCODE_USER_DATA_BYTES, NetcodeClientTransport, NetcodeTransportError,
+    ClientAuthentication, ConnectToken, NetcodeClientTransport, NetcodeTransportError,
+    generate_random_bytes,
 };
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -21,16 +33,23 @@ use std::time::{Duration, Instant, SystemTime};
 use audio::AudioPacket;
 
 use protocol::{
-    ClientMessage, PROTOCOL_ID, RELIABLE_BUFFER_BYTES, RELIABLE_CHANNEL, SYSTEM_AUDIO_BUFFER_BYTES,
-    SYSTEM_AUDIO_CHANNEL, SYSTEM_AUDIO_MTU_BUDGET, ServerMessage, VIDEO_BUFFER_BYTES,
-    VIDEO_CHANNEL, VOICE_BATCH_THRESHOLD, VOICE_BUFFER_BYTES, VOICE_CHANNEL, VOICE_MAX_FRAME_SIZE,
-    VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VideoReassembler,
-    VoiceHeader, pack_system_audio, pack_video_frame, parse_system_audio_header,
-    system_audio_payload,
+    CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ClientMessage, DenyReason, PROTOCOL_ID,
+    SIGNAL_CHANNEL, SYSTEM_AUDIO_CHANNEL, ServerMessage, VIDEO_CHANNEL, VOICE_CHANNEL,
+    VideoReassembler, pack_system_audio, pack_video_frame, pack_voice, parse_system_audio,
+    parse_voice, split_sender,
 };
 
 use crate::screen::ScreenControl;
 use crate::voice::{VoiceControl, WakeFn};
+
+/// How often to sample link statistics for the UI.
+const NETWORK_STATS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Timeout for the connect-token HTTP fetch.
+const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Largest token response we will read (a netcode token is 2048 bytes).
+const MAX_TOKEN_RESPONSE_BYTES: u64 = 8192;
 
 // ── Messages sent to the UI / App layer ─────────────────────────────────
 
@@ -72,8 +91,17 @@ pub enum NetworkMessage {
         muted: bool,
         deafened: bool,
     },
-    LatencyUpdate {
+    /// Periodic link statistics (replaces the old `LatencyUpdate`,
+    /// which carried only RTT while renet was already measuring loss
+    /// and throughput).
+    NetworkStats {
         rtt_ms: f64,
+        /// Packet loss, 0.0–100.0 (percent).
+        loss_pct: f64,
+        /// Outbound throughput in kbit/s.
+        kbps_up: f64,
+        /// Inbound throughput in kbit/s.
+        kbps_down: f64,
     },
 
     // ── Screen share events ─────────────────────────────────────────
@@ -86,6 +114,15 @@ pub enum NetworkMessage {
     /// A remote user stopped sharing their screen.
     ScreenShareStopped {
         client_id: ClientId,
+    },
+    /// The server refused our screen share request (limits/validation).
+    ShareDenied {
+        reason: DenyReason,
+    },
+    /// The server refused our subscribe request (limits/not sharing).
+    SubscribeDenied {
+        target_id: ClientId,
+        reason: DenyReason,
     },
     /// An inbound video frame (routed to screen thread, not app).
     VideoFrame {
@@ -107,109 +144,51 @@ pub enum NetworkMessage {
     KeyframeRequested {
         viewer_id: ClientId,
     },
+    /// Aggregated viewer health for the stream we are sharing
+    /// (routed to screen thread, not app — drives fps adaptation).
+    StreamHealth {
+        worst_loss: f32,
+        worst_rtt_ms: f32,
+        viewers: u16,
+    },
 }
 
-// ── Voice packet bundler ────────────────────────────────────────────────
+// ── Token fetch ─────────────────────────────────────────────────────────
 
-struct VoiceBundler {
-    buf: Vec<u8>,
-    frames: u8,
-    base_seq: u32,
-    base_ts: u32,
-}
+/// Fetch a netcode ConnectToken from the issuer.
+///
+/// Blocking (runs on the network thread during connect). The URL should
+/// be HTTPS in any real deployment — the token contains the session keys.
+fn fetch_connect_token(
+    url: &str,
+    username: &str,
+    password: Option<&str>,
+) -> Result<ConnectToken, String> {
+    let mut request = ureq::post(url).timeout(TOKEN_FETCH_TIMEOUT);
+    if let Some(pass) = password {
+        request = request.set("x-baucord-pass", pass);
+    }
 
-impl VoiceBundler {
-    fn new() -> Self {
-        Self {
-            buf: Vec::with_capacity(VOICE_MTU_BUDGET),
-            frames: 0,
-            base_seq: 0,
-            base_ts: 0,
+    let response = match request.send_string(username) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            return Err(format!(
+                "token server returned {code}: {}",
+                body.trim()
+            ));
         }
-    }
+        Err(e) => return Err(format!("token request failed: {e}")),
+    };
 
-    fn begin(&mut self, client_id: u64, seq: u32, ts_48k: u32) {
-        self.buf.clear();
-        self.frames = 0;
-        self.base_seq = seq;
-        self.base_ts = ts_48k;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_TOKEN_RESPONSE_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read token response: {e}"))?;
 
-        self.buf.push(VOICE_PROTOCOL_VERSION);
-        self.buf.extend_from_slice(&[0, 0, 0]); // reserved
-        self.buf.extend_from_slice(&client_id.to_le_bytes());
-        self.buf.extend_from_slice(&seq.to_le_bytes());
-        self.buf.extend_from_slice(&ts_48k.to_le_bytes());
-        self.buf.push(0); // placeholder for frame_count
-        self.buf.extend_from_slice(&[0, 0, 0]); // padding
-    }
-
-    fn try_push_frame(&mut self, opus_frame: &[u8]) -> bool {
-        if self.frames as usize >= VOICE_MAX_FRAMES_PER_PACKET {
-            return false;
-        }
-        if opus_frame.len() > VOICE_MAX_FRAME_SIZE {
-            return false;
-        }
-
-        let need = 2 + opus_frame.len();
-        if self.buf.len() + need > VOICE_MTU_BUDGET {
-            return false;
-        }
-
-        self.buf
-            .extend_from_slice(&(opus_frame.len() as u16).to_le_bytes());
-        self.buf.extend_from_slice(opus_frame);
-        self.frames += 1;
-        true
-    }
-
-    fn is_empty(&self) -> bool {
-        self.frames == 0
-    }
-
-    fn finish_into_vec(&mut self) -> Option<Vec<u8>> {
-        if self.frames == 0 {
-            return None;
-        }
-        self.buf[20] = self.frames; // frame_count at byte offset 20
-        self.frames = 0;
-        // Hand off the buffer and leave a fresh one behind. This also
-        // fixes a real bug: the old version cloned the buffer WITHOUT
-        // resetting `frames`, so every network-loop tick re-sent the
-        // current bundle and each new frame was appended to an
-        // already-sent packet — duplicate, cumulatively growing voice
-        // packets on the wire.
-        Some(std::mem::replace(
-            &mut self.buf,
-            Vec::with_capacity(VOICE_MTU_BUDGET),
-        ))
-    }
-}
-
-// ── Serialization helper ────────────────────────────────────────────────
-
-/// Serialize a `ClientMessage` via bincode, logging on failure.
-fn encode_client_message(msg: &ClientMessage) -> Option<Vec<u8>> {
-    bincode::options()
-        .serialize(msg)
-        .map_err(|e| {
-            warn!("Failed to serialize client message: {e}");
-        })
-        .ok()
-}
-
-// ── Username encoding for netcode ───────────────────────────────────────
-
-fn encode_username(name: &str) -> [u8; NETCODE_USER_DATA_BYTES] {
-    let mut user_data = [0u8; NETCODE_USER_DATA_BYTES];
-    // Truncate on a char boundary so a multi-byte character is never split.
-    let mut len = name.len().min(NETCODE_USER_DATA_BYTES - 8);
-    while len > 0 && !name.is_char_boundary(len) {
-        len -= 1;
-    }
-    user_data[0] = len as u8;
-    user_data[1..=len].copy_from_slice(&name.as_bytes()[..len]);
-    user_data
+    ConnectToken::read(&mut bytes.as_slice()).map_err(|e| format!("invalid connect token: {e}"))
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -220,61 +199,26 @@ pub(crate) struct NetworkClient {
     client: RenetClient,
     transport: NetcodeClientTransport,
     usernames: HashMap<ClientId, String>,
-    client_id: u64,
     message_queue: Vec<NetworkMessage>,
     last_updated: Instant,
-    voice_bundler: VoiceBundler,
     reassembler: VideoReassembler,
-
-    // Reorder tracking for received voice packets
-    expected_seqs: HashMap<u64, u32>,
 
     // Speaking status dedupe (only send on change)
     last_speaking_sent: bool,
-    last_rtt_check: Instant,
+    last_stats_check: Instant,
     /// Whether we've announced `NetworkMessage::Connected` to the app.
-    /// Set once the netcode handshake actually completes — previously
-    /// Connected fired (twice) as soon as the socket was created.
+    /// Set once the netcode handshake actually completes.
     announced_connected: bool,
 }
 
 impl NetworkClient {
-    pub fn connect(server_addr: SocketAddr, username: String) -> Result<Self, String> {
-        let reliable = ChannelConfig {
-            channel_id: RELIABLE_CHANNEL,
-            max_memory_usage_bytes: RELIABLE_BUFFER_BYTES,
-            send_type: SendType::ReliableOrdered {
-                resend_time: Duration::from_millis(200),
-            },
-        };
-
-        let voice = ChannelConfig {
-            channel_id: VOICE_CHANNEL,
-            max_memory_usage_bytes: VOICE_BUFFER_BYTES,
-            send_type: SendType::Unreliable,
-        };
-
-        let video = ChannelConfig {
-            channel_id: VIDEO_CHANNEL,
-            max_memory_usage_bytes: VIDEO_BUFFER_BYTES,
-            send_type: SendType::Unreliable,
-        };
-
-        let system_audio = ChannelConfig {
-            channel_id: SYSTEM_AUDIO_CHANNEL,
-            max_memory_usage_bytes: SYSTEM_AUDIO_BUFFER_BYTES,
-            send_type: SendType::Unreliable,
-        };
-
-        let channels = vec![reliable, voice, video, system_audio];
-
-        let connection_config = ConnectionConfig {
-            available_bytes_per_tick: 300_000,
-            server_channels_config: channels.clone(),
-            client_channels_config: channels,
-        };
-
-        let client = RenetClient::new(connection_config);
+    pub fn connect(
+        server_addr: SocketAddr,
+        username: &str,
+        token_url: Option<&str>,
+        token_password: Option<&str>,
+    ) -> Result<Self, String> {
+        let client = RenetClient::new(protocol::connection_config(CLIENT_BYTES_PER_TICK));
 
         let socket =
             UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind socket: {e}"))?;
@@ -290,13 +234,35 @@ impl NetworkClient {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| format!("System time error: {e}"))?;
 
-        let client_id = current_time.as_millis() as u64;
-
-        let authentication = ClientAuthentication::Unsecure {
-            server_addr,
-            client_id,
-            user_data: Some(encode_username(&username)),
-            protocol_id: PROTOCOL_ID,
+        let authentication = match token_url {
+            Some(url) => {
+                // Secure mode: the issuer assigns our client id and
+                // embeds our username inside the token; the connection
+                // is keyed by material derived from the server's
+                // private key.
+                log::info!("Fetching connect token from {url}");
+                let connect_token = fetch_connect_token(url, username, token_password)?;
+                ClientAuthentication::Secure { connect_token }
+            }
+            None => {
+                // Open mode (LAN/dev). The previous implementation used
+                // the wall-clock millisecond timestamp as the client id,
+                // which collides when two people connect in the same
+                // millisecond and is trivially predictable. Random is
+                // free.
+                let mut client_id = u64::from_le_bytes(generate_random_bytes());
+                if client_id == 0 {
+                    client_id = 1;
+                }
+                ClientAuthentication::Unsecure {
+                    server_addr,
+                    client_id,
+                    user_data: Some(protocol::encode_username(&protocol::sanitize_username(
+                        username,
+                    ))),
+                    protocol_id: PROTOCOL_ID,
+                }
+            }
         };
 
         let transport = NetcodeClientTransport::new(current_time, authentication, socket)
@@ -306,15 +272,12 @@ impl NetworkClient {
             client,
             transport,
             usernames: HashMap::new(),
-            client_id,
             message_queue: Vec::new(),
             last_updated: Instant::now(),
-            voice_bundler: VoiceBundler::new(),
-            expected_seqs: HashMap::new(),
-            last_speaking_sent: false,
-            last_rtt_check: Instant::now(),
-            announced_connected: false,
             reassembler: VideoReassembler::new(),
+            last_speaking_sent: false,
+            last_stats_check: Instant::now(),
+            announced_connected: false,
         })
     }
 
@@ -347,7 +310,7 @@ impl NetworkClient {
             self.message_queue.push(NetworkMessage::Connected);
         }
 
-        self.process_reliable_messages();
+        self.process_control_messages();
         self.process_voice_messages();
         self.process_video_messages();
         self.process_system_audio_messages();
@@ -369,122 +332,152 @@ impl NetworkClient {
             }
         }
 
-        // Sample RTT every ~2 seconds
-        if now.duration_since(self.last_rtt_check) >= Duration::from_secs(2) {
-            self.last_rtt_check = now;
+        // Sample link statistics for the UI every ~2 seconds. renet
+        // already measures loss and throughput alongside RTT — the old
+        // code exposed only RTT and left the rest unread.
+        if now.duration_since(self.last_stats_check) >= NETWORK_STATS_INTERVAL {
+            self.last_stats_check = now;
             if self.client.is_connected() {
-                self.message_queue.push(NetworkMessage::LatencyUpdate {
-                    rtt_ms: self.client.rtt() * 1000.0,
+                let info = self.client.network_info();
+                self.message_queue.push(NetworkMessage::NetworkStats {
+                    rtt_ms: info.rtt * 1000.0,
+                    loss_pct: info.packet_loss * 100.0,
+                    kbps_up: info.bytes_sent_per_second * 8.0 / 1000.0,
+                    kbps_down: info.bytes_received_per_second * 8.0 / 1000.0,
                 });
             }
         }
     }
 
-    // ── Reliable channel ────────────────────────────────────────────
+    // ── Control channels (control + signal) ─────────────────────────
 
-    fn process_reliable_messages(&mut self) {
-        while let Some(message) = self.client.receive_message(RELIABLE_CHANNEL) {
-            let Ok(msg) = bincode::options().deserialize::<ServerMessage>(&message) else {
-                continue;
-            };
+    fn process_control_messages(&mut self) {
+        for channel in [CONTROL_CHANNEL, SIGNAL_CHANNEL] {
+            while let Some(message) = self.client.receive_message(channel) {
+                let Some(msg) = protocol::decode_server_message(&message) else {
+                    continue;
+                };
+                self.handle_server_message(msg);
+            }
+        }
+    }
 
-            match msg {
-                ServerMessage::InitClient {
-                    usernames,
+    fn handle_server_message(&mut self, msg: ServerMessage) {
+        match msg {
+            ServerMessage::Init {
+                usernames,
+                client_id,
+                server_name,
+                greeting,
+            } => {
+                self.usernames = usernames.clone();
+                self.message_queue.push(NetworkMessage::InitClient {
                     client_id,
+                    users: usernames,
                     server_name,
                     greeting,
-                } => {
-                    self.usernames = usernames.clone();
-                    self.client_id = client_id;
-                    self.message_queue.push(NetworkMessage::InitClient {
-                        client_id,
-                        users: usernames,
-                        server_name,
-                        greeting,
-                    });
-                }
-                ServerMessage::ClientConnected {
+                });
+            }
+            ServerMessage::UserJoined {
+                client_id,
+                username,
+            } => {
+                self.usernames.insert(client_id, username.clone());
+                self.message_queue.push(NetworkMessage::UserJoined {
                     client_id,
                     username,
-                } => {
-                    self.usernames.insert(client_id, username.clone());
-                    self.message_queue.push(NetworkMessage::UserJoined {
-                        client_id,
-                        username,
-                    });
-                }
-                ServerMessage::ClientDisconnected { client_id } => {
-                    let username = self
-                        .usernames
-                        .remove(&client_id)
-                        .unwrap_or_else(|| format!("User{client_id}"));
-
-                    self.message_queue.push(NetworkMessage::UserLeft {
-                        client_id,
-                        username,
-                    });
-                }
-                ServerMessage::ClientMessage(msg) => {
-                    let username = self
-                        .usernames
-                        .get(&msg.client_id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("User{}", msg.client_id));
-
-                    self.message_queue.push(NetworkMessage::TextMessage {
-                        username,
-                        text: msg.text,
-                    });
-                }
-                ServerMessage::Speaking {
+                });
+            }
+            ServerMessage::UserLeft { client_id } => {
+                let username = self
+                    .usernames
+                    .remove(&client_id)
+                    .unwrap_or_else(|| format!("User{client_id}"));
+                self.message_queue.push(NetworkMessage::UserLeft {
+                    client_id,
+                    username,
+                });
+            }
+            ServerMessage::Chat(msg) => {
+                let username = self
+                    .usernames
+                    .get(&msg.client_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("User{}", msg.client_id));
+                self.message_queue.push(NetworkMessage::TextMessage {
+                    username,
+                    text: msg.text,
+                });
+            }
+            ServerMessage::Speaking {
+                client_id,
+                is_speaking,
+            } => {
+                self.message_queue.push(NetworkMessage::UserSpeaking {
                     client_id,
                     is_speaking,
-                } => {
-                    self.message_queue.push(NetworkMessage::UserSpeaking {
-                        client_id,
-                        is_speaking,
-                    });
-                }
-                ServerMessage::AudioState {
+                });
+            }
+            ServerMessage::AudioState {
+                client_id,
+                muted,
+                deafened,
+            } => {
+                self.message_queue.push(NetworkMessage::UserAudioState {
                     client_id,
                     muted,
                     deafened,
-                } => {
-                    self.message_queue.push(NetworkMessage::UserAudioState {
-                        client_id,
-                        muted,
-                        deafened,
-                    });
-                }
-                ServerMessage::VoiceData { .. } => {
-                    // Voice data shouldn't arrive on the reliable channel
-                }
-                ServerMessage::ScreenShareStarted {
-                    client_id,
-                    width,
-                    height,
-                } => {
-                    self.message_queue.push(NetworkMessage::ScreenShareStarted {
-                        client_id,
-                        width,
-                        height,
-                    });
-                }
-                ServerMessage::ScreenShareStopped { client_id } => {
-                    self.message_queue
-                        .push(NetworkMessage::ScreenShareStopped { client_id });
-                }
-                ServerMessage::KeyframeRequested { viewer_id } => {
-                    self.message_queue
-                        .push(NetworkMessage::KeyframeRequested { viewer_id });
-                }
-                // No catch-all: the match is exhaustive on purpose, so a
-                // new ServerMessage variant is a compile error here (a
-                // reminder to handle it) instead of a silent log line.
-                // Truly unknown wire data never reaches this match — it
-                // fails bincode deserialization above and is skipped.
+                });
             }
+            ServerMessage::ScreenShareStarted {
+                client_id,
+                width,
+                height,
+            } => {
+                self.message_queue.push(NetworkMessage::ScreenShareStarted {
+                    client_id,
+                    width: u32::from(width),
+                    height: u32::from(height),
+                });
+            }
+            ServerMessage::ScreenShareStopped { client_id } => {
+                // Forget any partial frames from that stream.
+                self.reassembler.forget_sender(client_id);
+                self.message_queue
+                    .push(NetworkMessage::ScreenShareStopped { client_id });
+            }
+            ServerMessage::ShareDenied { reason } => {
+                warn!("Server denied our screen share: {}", reason.describe());
+                self.message_queue.push(NetworkMessage::ShareDenied { reason });
+            }
+            ServerMessage::SubscribeDenied { target_id, reason } => {
+                warn!(
+                    "Server denied subscribe to {target_id}: {}",
+                    reason.describe()
+                );
+                self.message_queue
+                    .push(NetworkMessage::SubscribeDenied { target_id, reason });
+            }
+            ServerMessage::KeyframeRequested { viewer_id } => {
+                self.message_queue
+                    .push(NetworkMessage::KeyframeRequested { viewer_id });
+            }
+            ServerMessage::StreamHealth {
+                worst_loss,
+                worst_rtt_ms,
+                viewers,
+            } => {
+                self.message_queue.push(NetworkMessage::StreamHealth {
+                    worst_loss,
+                    worst_rtt_ms,
+                    viewers,
+                });
+            }
+            // No catch-all: the match is exhaustive on purpose, so a
+            // new ServerMessage variant is a compile error here (a
+            // reminder to handle it) instead of a silent log line.
+            // Truly unknown wire data never reaches this match — it
+            // fails deserialization above and is skipped.
         }
     }
 
@@ -492,98 +485,36 @@ impl NetworkClient {
 
     fn process_voice_messages(&mut self) {
         while let Some(message) = self.client.receive_message(VOICE_CHANNEL) {
-            self.process_voice_packet(message.to_vec());
-        }
-    }
-
-    fn process_voice_packet(&mut self, message: Vec<u8>) -> bool {
-        const OPUS_10MS_48K: u32 = 480;
-
-        // Structural validation
-        if message.len() < VoiceHeader::SIZE + 3 {
-            return false;
-        }
-        if message[0] != VOICE_PROTOCOL_VERSION {
-            return false;
-        }
-
-        let mut off = 4; // skip version + reserved
-
-        if off + 8 + 4 + 4 + 1 + 3 > message.len() {
-            return false;
-        }
-
-        let client_id = u64::from_le_bytes(message[off..off + 8].try_into().unwrap());
-        off += 8;
-        let base_seq = u32::from_le_bytes(message[off..off + 4].try_into().unwrap());
-        off += 4;
-        let base_ts = u32::from_le_bytes(message[off..off + 4].try_into().unwrap());
-        off += 4;
-        let frame_count = message[off] as usize;
-        off += 4; // frame_count + padding
-
-        if frame_count == 0 || frame_count > VOICE_MAX_FRAMES_PER_PACKET {
-            return false;
-        }
-
-        // Track sequence for reorder detection
-        let expected = self
-            .expected_seqs
-            .get(&client_id)
-            .copied()
-            .unwrap_or(base_seq);
-        let seq_diff = base_seq.wrapping_sub(expected) as i32;
-
-        // Unbundle frames
-        let mut seq_frame = base_seq;
-        let mut ts_frame = base_ts;
-
-        for _ in 0..frame_count {
-            if off + 2 > message.len() {
-                return false;
-            }
-            let len = u16::from_le_bytes(message[off..off + 2].try_into().unwrap()) as usize;
-            off += 2;
-
-            if len == 0 || len > VOICE_MAX_FRAME_SIZE || off + len > message.len() {
-                return false;
-            }
-
-            let data = message[off..off + len].to_vec();
-            off += len;
-
+            // [sender_id][voice packet] — sender stamped by the server.
+            let Some((sender_id, packet)) = split_sender(&message) else {
+                continue;
+            };
+            let Some((header, frame)) = parse_voice(packet) else {
+                continue;
+            };
             self.message_queue.push(NetworkMessage::VoiceData {
-                client_id,
-                seq: seq_frame,
-                timestamp: ts_frame,
-                data,
+                client_id: sender_id,
+                seq: header.seq,
+                timestamp: header.timestamp,
+                data: frame.to_vec(),
             });
-
-            seq_frame = seq_frame.wrapping_add(1);
-            ts_frame = ts_frame.wrapping_add(OPUS_10MS_48K);
         }
-
-        // Advance expected seq only if packet is new or ahead
-        if seq_diff >= 0 {
-            self.expected_seqs
-                .insert(client_id, base_seq.wrapping_add(frame_count as u32));
-        }
-
-        true
     }
 
-    // ── Video channels ──────────────────────────────────────────────
+    // ── Video channel ───────────────────────────────────────────────
 
     fn process_video_messages(&mut self) {
-        // All video now arrives as chunks on the unreliable channel
         while let Some(message) = self.client.receive_message(VIDEO_CHANNEL) {
-            if let Some(frame) = self.reassembler.push_chunk(&message) {
+            let Some((sender_id, chunk)) = split_sender(&message) else {
+                continue;
+            };
+            if let Some(frame) = self.reassembler.push_chunk(sender_id, chunk) {
                 self.message_queue.push(NetworkMessage::VideoFrame {
-                    client_id: frame.client_id,
+                    client_id: frame.sender_id,
                     seq: frame.seq,
                     is_keyframe: frame.is_keyframe,
-                    width: frame.width as u32,
-                    height: frame.height as u32,
+                    width: u32::from(frame.width),
+                    height: u32::from(frame.height),
                     data: frame.data,
                 });
             }
@@ -594,150 +525,125 @@ impl NetworkClient {
 
     fn process_system_audio_messages(&mut self) {
         while let Some(message) = self.client.receive_message(SYSTEM_AUDIO_CHANNEL) {
-            self.process_system_audio_packet(&message);
+            let Some((sender_id, packet)) = split_sender(&message) else {
+                continue;
+            };
+            let Some((header, payload)) = parse_system_audio(packet) else {
+                continue;
+            };
+            self.message_queue.push(NetworkMessage::SystemAudioData {
+                client_id: sender_id,
+                seq: header.seq,
+                data: payload.to_vec(),
+            });
         }
-    }
-
-    fn process_system_audio_packet(&mut self, message: &[u8]) {
-        let Some(hdr) = parse_system_audio_header(message) else {
-            return;
-        };
-        let Some(payload) = system_audio_payload(message) else {
-            return;
-        };
-
-        self.message_queue.push(NetworkMessage::SystemAudioData {
-            client_id: hdr.client_id,
-            seq: hdr.seq,
-            data: payload.to_vec(),
-        });
     }
 
     // ── Outbound messages ───────────────────────────────────────────
 
-    pub fn flush_voice_packet(&mut self) {
-        if let Some(pkt) = self.voice_bundler.finish_into_vec()
-            && pkt.len() <= VOICE_MTU_BUDGET
-        {
-            self.client.send_message(VOICE_CHANNEL, pkt);
+    /// Send a control-plane message on its designated channel.
+    fn send_control(&mut self, msg: &ClientMessage) {
+        match protocol::encode_client_message(msg) {
+            Some(encoded) => self.client.send_message(msg.channel(), encoded),
+            None => warn!("Failed to serialize client message"),
         }
     }
 
     pub fn send_message(&mut self, text: String) {
-        if let Some(encoded) = encode_client_message(&ClientMessage::Text(text)) {
-            self.client.send_message(RELIABLE_CHANNEL, encoded);
-        }
+        self.send_control(&ClientMessage::Chat(text));
     }
 
     pub fn send_speaking_status(&mut self, is_speaking: bool) {
         // Edge-triggered by the voice thread; dedupe defensively in case
-        // the same state is ever delivered twice. (The old 50 ms throttle
-        // was dead code — this is only ever called on state changes.)
+        // the same state is ever delivered twice.
         if is_speaking == self.last_speaking_sent {
             return;
         }
-        if let Some(encoded) = encode_client_message(&ClientMessage::Speaking(is_speaking)) {
-            self.client.send_message(RELIABLE_CHANNEL, encoded);
-        }
+        self.send_control(&ClientMessage::Speaking(is_speaking));
         self.last_speaking_sent = is_speaking;
     }
 
     /// Broadcast our mute/deafen state to all other users via the server.
     pub fn send_audio_state(&mut self, muted: bool, deafened: bool) {
-        if let Some(encoded) = encode_client_message(&ClientMessage::AudioState { muted, deafened })
-        {
-            self.client.send_message(RELIABLE_CHANNEL, encoded);
+        self.send_control(&ClientMessage::AudioState { muted, deafened });
+    }
+
+    /// Send one Opus voice frame. One frame per packet — no bundling,
+    /// no added latency (see `protocol::voice`).
+    pub fn send_voice_frame(&mut self, seq: u32, ts_48k: u32, opus_frame: &[u8]) {
+        match pack_voice(seq, ts_48k, opus_frame) {
+            Some(packet) => self.client.send_message(VOICE_CHANNEL, packet),
+            None => log::debug!(
+                "Dropping voice frame seq={seq}: invalid size {} bytes",
+                opus_frame.len()
+            ),
         }
     }
 
-    /// Send one 10 ms Opus frame through the voice bundler.
-    ///
-    /// Uses the caller's sequence number and timestamp to maintain
-    /// one authoritative sequence chain from encoder to decoder.
-    pub fn send_voice_frame(
+    /// Chunk and send an encoded H.264 frame on the video channel.
+    pub fn send_video_frame(
         &mut self,
-        our_client_id: ClientId,
         seq: u32,
-        ts_48k: u32,
-        opus_frame: &[u8],
+        is_keyframe: bool,
+        width: u16,
+        height: u16,
+        data: &[u8],
     ) {
-        if self.voice_bundler.is_empty() {
-            self.voice_bundler.begin(our_client_id, seq, ts_48k);
-        }
-
-        if !self.voice_bundler.try_push_frame(opus_frame) {
-            self.flush_voice_packet();
-            self.voice_bundler.begin(our_client_id, seq, ts_48k);
-            if !self.voice_bundler.try_push_frame(opus_frame) {
-                return; // frame too large, drop
+        // `pack_video_frame` refuses empty or oversize frames (past the
+        // chunk format's 255 × 1080 B limit). The encoder's VBV keeps
+        // frames well under it, but a misbehaving codec must not kill
+        // the stream — drop the frame; the viewer sees a seq gap and
+        // recovers via keyframe request.
+        match pack_video_frame(seq, is_keyframe, width, height, data) {
+            Some(chunks) => {
+                for chunk in chunks {
+                    self.client.send_message(VIDEO_CHANNEL, chunk);
+                }
             }
-        }
-
-        if self.voice_bundler.frames >= VOICE_BATCH_THRESHOLD {
-            self.flush_voice_packet();
+            None => warn!(
+                "📺 Encoded frame seq={seq} not packable ({} bytes, max {}), dropping",
+                data.len(),
+                protocol::MAX_VIDEO_FRAME_BYTES,
+            ),
         }
     }
 
     /// Send an encoded system audio (Opus stereo) packet.
-    pub fn send_system_audio(
-        &mut self,
-        our_client_id: u64,
-        seq: u32,
-        channels: u8,
-        duration_ms: u16,
-        opus_data: &[u8],
-    ) {
-        let buf = pack_system_audio(our_client_id, seq, channels, duration_ms, opus_data);
-        if buf.len() > SYSTEM_AUDIO_MTU_BUDGET {
-            warn!(
-                "System audio packet too large: {} bytes, dropping",
-                buf.len()
-            );
-            return;
+    pub fn send_system_audio(&mut self, seq: u32, channels: u8, duration_ms: u16, opus: &[u8]) {
+        match pack_system_audio(seq, channels, duration_ms, opus) {
+            Some(packet) => self.client.send_message(SYSTEM_AUDIO_CHANNEL, packet),
+            None => warn!(
+                "System audio packet not packable ({} bytes), dropping",
+                opus.len()
+            ),
         }
-        self.client.send_message(SYSTEM_AUDIO_CHANNEL, buf);
     }
 
-    /// Send screen share signaling on the reliable channel.
+    /// Send screen share signaling. Dimensions are clamped into the
+    /// wire format's u16 range (the server validates 16..=4096 anyway).
     pub fn send_screen_share_start(&mut self, width: u32, height: u32) {
-        if let Some(encoded) =
-            encode_client_message(&ClientMessage::ScreenShareStart { width, height })
-        {
-            self.client.send_message(RELIABLE_CHANNEL, encoded);
-        }
+        let width = u16::try_from(width.min(4096)).unwrap_or(u16::MAX);
+        let height = u16::try_from(height.min(4096)).unwrap_or(u16::MAX);
+        self.send_control(&ClientMessage::ScreenShareStart { width, height });
     }
 
     pub fn send_screen_share_stop(&mut self) {
-        if let Some(encoded) = encode_client_message(&ClientMessage::ScreenShareStop) {
-            self.client.send_message(RELIABLE_CHANNEL, encoded);
-        }
+        self.send_control(&ClientMessage::ScreenShareStop);
     }
 
     pub fn send_subscribe_screen(&mut self, target_id: u64) {
-        if let Some(encoded) = encode_client_message(&ClientMessage::SubscribeScreen { target_id })
-        {
-            self.client.send_message(RELIABLE_CHANNEL, encoded);
-        }
+        self.send_control(&ClientMessage::SubscribeScreen { target_id });
     }
 
     pub fn send_unsubscribe_screen(&mut self, target_id: u64) {
-        if let Some(encoded) =
-            encode_client_message(&ClientMessage::UnsubscribeScreen { target_id })
-        {
-            self.client.send_message(RELIABLE_CHANNEL, encoded);
-        }
+        self.send_control(&ClientMessage::UnsubscribeScreen { target_id });
     }
 
     /// Ask the server to relay a keyframe request to the user we're
-    /// watching. Sent when our jitter buffer hit an unrecoverable gap or
-    /// we joined mid-GOP; the sharer answers with a forced IDR. Reliable
-    /// channel — this message is rare (client-side rate-limited) and
-    /// must not be lost.
+    /// watching. Travels on the signal channel: reliable, but never
+    /// queued behind chat or presence traffic.
     pub fn send_request_keyframe(&mut self, target_id: u64) {
-        if let Some(encoded) = encode_client_message(&ClientMessage::RequestKeyframe { target_id })
-        {
-            self.client.send_message(RELIABLE_CHANNEL, encoded);
-        }
+        self.send_control(&ClientMessage::RequestKeyframe { target_id });
     }
 
     pub fn poll_messages(&mut self) -> Vec<NetworkMessage> {
@@ -752,6 +658,10 @@ impl NetworkClient {
         self.client.is_connecting()
     }
 
+    pub fn disconnect_reason(&self) -> Option<renet::DisconnectReason> {
+        self.client.disconnect_reason()
+    }
+
     pub fn disconnect(&mut self) {
         self.client.disconnect();
         // Flush the disconnect packet over the wire. Without this,
@@ -761,13 +671,10 @@ impl NetworkClient {
         // the disconnect packet is generated by the netcode transport
         // layer, not the renet client layer.
         let duration = Instant::now() - self.last_updated;
+        self.last_updated = Instant::now();
         self.client.update(duration);
         let _ = self.transport.update(duration, &mut self.client);
         let _ = self.transport.send_packets(&mut self.client);
-    }
-
-    pub fn client_id(&self) -> u64 {
-        self.transport.client_id()
     }
 }
 
@@ -780,6 +687,10 @@ pub enum NetworkControl {
     Connect {
         addr: SocketAddr,
         nickname: String,
+        /// Token issuer URL for secure servers (`None` = open connect).
+        token_url: Option<String>,
+        /// Optional shared password for the issuer.
+        token_password: Option<String>,
     },
     Disconnect,
     SendMessage(String),
@@ -792,7 +703,7 @@ pub enum NetworkControl {
     },
 
     // ── Screen share ────────────────────────────────────────────────
-    /// Signal that we started sharing (reliable → server → all clients).
+    /// Signal that we started sharing (control → server → all clients).
     ScreenShareStart {
         width: u32,
         height: u32,
@@ -885,6 +796,136 @@ impl Drop for NetworkThreadHandle {
 
 // ── Thread loop ─────────────────────────────────────────────────────────
 
+/// Handle one control message. Returns `false` when the loop should stop.
+fn handle_control(
+    ctrl: NetworkControl,
+    client: &mut Option<NetworkClient>,
+    msg_tx: &Sender<NetworkMessage>,
+    wake: &WakeFn,
+) -> bool {
+    match ctrl {
+        NetworkControl::Connect {
+            addr,
+            nickname,
+            token_url,
+            token_password,
+        } => {
+            // Replace any existing session cleanly first.
+            if let Some(mut old) = client.take() {
+                old.disconnect();
+            }
+            // Blocking: includes the token fetch in secure mode. That's
+            // fine — this is the network thread, the UI is elsewhere,
+            // and there is no session to service yet.
+            match NetworkClient::connect(
+                addr,
+                &nickname,
+                token_url.as_deref(),
+                token_password.as_deref(),
+            ) {
+                // Connected is announced by NetworkClient::update()
+                // once the handshake actually completes.
+                Ok(c) => *client = Some(c),
+                Err(e) => {
+                    msg_tx.send(NetworkMessage::Disconnected(e)).ok();
+                    wake();
+                }
+            }
+        }
+        NetworkControl::Disconnect => {
+            if let Some(mut c) = client.take() {
+                c.disconnect();
+            }
+            msg_tx
+                .send(NetworkMessage::Disconnected("User disconnected".into()))
+                .ok();
+            wake();
+        }
+        NetworkControl::SendMessage(text) => {
+            if let Some(c) = client {
+                c.send_message(text);
+            }
+        }
+        NetworkControl::SendVoicePacket(packet) => {
+            if let Some(c) = client {
+                // The packet's ssrc is not sent — the server stamps the
+                // authenticated sender id on relay.
+                c.send_voice_frame(
+                    packet.header.seq,
+                    packet.header.timestamp,
+                    &packet.opus_data,
+                );
+            }
+        }
+        NetworkControl::SendSpeakingStatus(speaking) => {
+            if let Some(c) = client {
+                c.send_speaking_status(speaking);
+            }
+        }
+        NetworkControl::SendAudioState { muted, deafened } => {
+            if let Some(c) = client {
+                c.send_audio_state(muted, deafened);
+            }
+        }
+
+        // ── Screen share controls ───────────────────────────────────
+        NetworkControl::ScreenShareStart { width, height } => {
+            if let Some(c) = client {
+                c.send_screen_share_start(width, height);
+            }
+        }
+        NetworkControl::ScreenShareStop => {
+            if let Some(c) = client {
+                c.send_screen_share_stop();
+            }
+        }
+        NetworkControl::SendVideoFrame {
+            seq,
+            is_keyframe,
+            width,
+            height,
+            data,
+        } => {
+            if let Some(c) = client {
+                c.send_video_frame(seq, is_keyframe, width, height, &data);
+            }
+        }
+        NetworkControl::SendSystemAudio {
+            seq,
+            channels,
+            duration_ms,
+            data,
+        } => {
+            if let Some(c) = client {
+                c.send_system_audio(seq, channels, duration_ms, &data);
+            }
+        }
+        NetworkControl::RequestKeyframe { target_id } => {
+            if let Some(c) = client {
+                c.send_request_keyframe(target_id);
+            }
+        }
+        NetworkControl::SubscribeScreen { target_id } => {
+            if let Some(c) = client {
+                c.send_subscribe_screen(target_id);
+            }
+        }
+        NetworkControl::UnsubscribeScreen { target_id } => {
+            if let Some(c) = client {
+                c.send_unsubscribe_screen(target_id);
+            }
+        }
+
+        NetworkControl::Shutdown => {
+            if let Some(mut c) = client.take() {
+                c.disconnect();
+            }
+            return false;
+        }
+    }
+    true
+}
+
 fn run_network_loop(
     control_rx: Receiver<NetworkControl>,
     msg_tx: Sender<NetworkMessage>,
@@ -896,147 +937,41 @@ fn run_network_loop(
     let mut running = true;
 
     while running {
-        // Process up to 32 control messages per tick
-        for _ in 0..32 {
-            match control_rx.try_recv() {
-                Ok(ctrl) => match ctrl {
-                    NetworkControl::Connect { addr, nickname } => {
-                        // Replace any existing session cleanly first.
-                        if let Some(mut old) = client.take() {
-                            old.disconnect();
-                        }
-                        match NetworkClient::connect(addr, nickname) {
-                            // Connected is announced by NetworkClient::update()
-                            // once the handshake actually completes.
-                            Ok(c) => client = Some(c),
-                            Err(e) => {
-                                msg_tx.send(NetworkMessage::Disconnected(e)).ok();
-                                wake();
-                            }
-                        }
-                    }
-                    NetworkControl::Disconnect => {
-                        if let Some(mut c) = client.take() {
-                            c.disconnect();
-                        }
-                        msg_tx
-                            .send(NetworkMessage::Disconnected("User disconnected".into()))
-                            .ok();
-                        wake();
-                    }
-                    NetworkControl::SendMessage(text) => {
-                        if let Some(c) = &mut client {
-                            c.send_message(text);
-                        }
-                    }
-                    NetworkControl::SendVoicePacket(packet) => {
-                        if let Some(c) = &mut client {
-                            c.send_voice_frame(
-                                packet.header.ssrc,
-                                packet.header.seq,
-                                packet.header.timestamp,
-                                &packet.opus_data,
-                            );
-                        }
-                    }
-                    NetworkControl::SendSpeakingStatus(speaking) => {
-                        if let Some(c) = &mut client {
-                            c.send_speaking_status(speaking);
-                        }
-                    }
-                    NetworkControl::SendAudioState { muted, deafened } => {
-                        if let Some(c) = &mut client {
-                            c.send_audio_state(muted, deafened);
-                        }
-                    }
+        // Block on the control channel with a timeout instead of the old
+        // try_recv + fixed 1 ms sleep. Outbound work (voice frames from
+        // the voice thread, video chunks from the screen thread) now
+        // wakes this loop *immediately* instead of waiting out the
+        // sleep, and an idle disconnected thread costs ~zero CPU. The
+        // timeout doubles as the inbound polling cadence.
+        let timeout = if client.is_some() {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(200)
+        };
 
-                    // ── Screen share controls ───────────────────────
-                    NetworkControl::ScreenShareStart { width, height } => {
-                        if let Some(c) = &mut client {
-                            c.send_screen_share_start(width, height);
-                        }
-                    }
-                    NetworkControl::ScreenShareStop => {
-                        if let Some(c) = &mut client {
-                            c.send_screen_share_stop();
-                        }
-                    }
-                    NetworkControl::SendVideoFrame {
-                        seq,
-                        is_keyframe,
-                        width,
-                        height,
-                        data,
-                    } => {
-                        if let Some(c) = &mut client {
-                            // pack_video_frame panics past the chunk
-                            // format's limit (255 × 1080 B). The encoder's
-                            // VBV keeps frames well under it, but a codec
-                            // misbehaving must not kill the network
-                            // thread — drop the frame instead. The viewer
-                            // sees a seq gap and recovers via keyframe
-                            // request.
-                            if data.len() > protocol::MAX_VIDEO_FRAME_BYTES {
-                                warn!(
-                                    "📺 Encoded frame seq={seq} too large for chunking \
-                                     ({} bytes > {}), dropping",
-                                    data.len(),
-                                    protocol::MAX_VIDEO_FRAME_BYTES,
-                                );
-                                continue;
-                            }
-                            let chunks = pack_video_frame(
-                                c.client_id(),
-                                seq,
-                                is_keyframe,
-                                width,
-                                height,
-                                &data,
-                            );
-                            for chunk in chunks {
-                                c.client.send_message(VIDEO_CHANNEL, chunk);
-                            }
-                        }
-                    }
-                    NetworkControl::SendSystemAudio {
-                        seq,
-                        channels,
-                        duration_ms,
-                        data,
-                    } => {
-                        if let Some(c) = &mut client {
-                            c.send_system_audio(c.client_id(), seq, channels, duration_ms, &data);
-                        }
-                    }
-                    NetworkControl::RequestKeyframe { target_id } => {
-                        if let Some(c) = &mut client {
-                            c.send_request_keyframe(target_id);
-                        }
-                    }
-                    NetworkControl::SubscribeScreen { target_id } => {
-                        if let Some(c) = &mut client {
-                            c.send_subscribe_screen(target_id);
-                        }
-                    }
-                    NetworkControl::UnsubscribeScreen { target_id } => {
-                        if let Some(c) = &mut client {
-                            c.send_unsubscribe_screen(target_id);
-                        }
-                    }
-
-                    NetworkControl::Shutdown => {
-                        if let Some(mut c) = client.take() {
-                            c.disconnect();
-                        }
-                        running = false;
-                    }
-                },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
+        match control_rx.recv_timeout(timeout) {
+            Ok(ctrl) => {
+                if !handle_control(ctrl, &mut client, &msg_tx, &wake) {
                     running = false;
-                    break;
+                }
+                // Drain a bounded burst of whatever else queued up.
+                for _ in 0..63 {
+                    match control_rx.try_recv() {
+                        Ok(ctrl) => {
+                            if !handle_control(ctrl, &mut client, &msg_tx, &wake) {
+                                running = false;
+                            }
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            running = false;
+                            break;
+                        }
+                    }
                 }
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
 
         // Poll network
@@ -1123,10 +1058,25 @@ fn run_network_loop(
                         let _ = screen_tx.try_send(ScreenControl::ForceKeyframe);
                     }
 
+                    // Viewer health for our stream → screen thread
+                    // (drives fps adaptation while sharing)
+                    NetworkMessage::StreamHealth {
+                        worst_loss,
+                        worst_rtt_ms,
+                        viewers,
+                    } => {
+                        let _ = screen_tx.try_send(ScreenControl::StreamHealth {
+                            worst_loss,
+                            worst_rtt_ms,
+                            viewers,
+                        });
+                    }
+
                     // Everything else → app. These carry state (join /
-                    // leave, init, chat, mute states) — losing one desyncs
-                    // the UI until reconnect, so use a blocking send. The
-                    // app drains this channel every event-loop pass.
+                    // leave, init, chat, mute states, denials) — losing
+                    // one desyncs the UI until reconnect, so use a
+                    // blocking send. The app drains this channel every
+                    // event-loop pass.
                     other => {
                         let _ = msg_tx.send(other);
                         wake();
@@ -1134,12 +1084,10 @@ fn run_network_loop(
                 }
             }
 
-            c.flush_voice_packet();
-
             if !c.is_connected() && !c.is_connecting() {
                 log::error!(
                     "Connection lost — is_connected=false, is_connecting=false, disconnect_reason={:?}",
-                    c.client.disconnect_reason()
+                    c.disconnect_reason()
                 );
                 client = None;
                 msg_tx
@@ -1147,12 +1095,6 @@ fn run_network_loop(
                     .ok();
                 wake();
             }
-        }
-
-        if client.is_some() {
-            thread::sleep(Duration::from_millis(1));
-        } else {
-            thread::sleep(Duration::from_millis(10));
         }
     }
 }

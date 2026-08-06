@@ -118,12 +118,27 @@ pub struct UserSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSettings {
     pub address: String,
+    /// Token issuer URL for secure servers, e.g.
+    /// `https://vc.example.com/token` (the deployment's reverse proxy
+    /// routes this to the server's in-process issuer).
+    ///
+    /// `Some` → fetch a connect token and authenticate securely.
+    /// `None` → open (unsecure) connect, for LAN/dev servers running
+    /// with `authentication.secure: false`.
+    #[serde(default)]
+    pub token_url: Option<String>,
+    /// Shared password sent to the issuer in the `x-baucord-pass`
+    /// header, if the server configures one.
+    #[serde(default)]
+    pub token_password: Option<String>,
 }
 
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             address: "64.176.16.18:5000".to_string(),
+            token_url: Some("https://key.mpw.sh/token".to_string()),
+            token_password: None,
         }
     }
 }
@@ -198,11 +213,11 @@ fn default_keybinds() -> Vec<KeybindEntry> {
     vec![
         KeybindEntry {
             action: BindableAction::ToggleMute,
-            bind: "Ctrl+Shift+KeyM".to_string(),
+            bind: "F7".to_string(),
         },
         KeybindEntry {
             action: BindableAction::ToggleDeafen,
-            bind: "Ctrl+Shift+KeyD".to_string(),
+            bind: "F8".to_string(),
         },
         KeybindEntry {
             action: BindableAction::ToggleScreenShare,
@@ -248,7 +263,21 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Canonical settings location: the platform config directory
+    /// (`%APPDATA%\baucord`, `~/.config/baucord`, `~/Library/Application
+    /// Support/baucord`). The old location — next to the executable —
+    /// broke under any install layout where the exe directory isn't
+    /// writable (Program Files, /usr/bin, macOS app bundles) and made
+    /// every new build directory silently reset the user's settings.
     fn get_settings_path() -> PathBuf {
+        match dirs::config_dir() {
+            Some(dir) => dir.join("baucord").join("settings.json"),
+            None => Self::legacy_settings_path(),
+        }
+    }
+
+    /// Pre-0.2 location: next to the executable.
+    fn legacy_settings_path() -> PathBuf {
         let mut path = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -257,21 +286,45 @@ impl Settings {
         path
     }
 
+    fn read_from(path: &PathBuf) -> Option<Self> {
+        if !path.exists() {
+            return None;
+        }
+        let contents = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&contents).ok()
+    }
+
     pub fn load() -> Self {
         let path = Self::get_settings_path();
-        if path.exists()
-            && let Ok(contents) = fs::read_to_string(&path)
-            && let Ok(settings) = serde_json::from_str(&contents)
-        {
+        if let Some(settings) = Self::read_from(&path) {
             info!("Loaded settings from {:?}", path);
             return settings;
         }
+
+        // One-time migration from the old exe-adjacent location, so
+        // upgrading users keep their nickname, keybinds, and per-peer
+        // audio settings.
+        let legacy = Self::legacy_settings_path();
+        if legacy != path
+            && let Some(settings) = Self::read_from(&legacy)
+        {
+            info!("Migrating settings from {:?} to {:?}", legacy, path);
+            settings.save();
+            return settings;
+        }
+
         info!("Using default settings");
         Settings::default()
     }
 
     pub fn save(&self) {
         let path = Self::get_settings_path();
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            log::error!("Failed to create settings directory {:?}: {e}", parent);
+            return;
+        }
         match serde_json::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = fs::write(&path, contents) {

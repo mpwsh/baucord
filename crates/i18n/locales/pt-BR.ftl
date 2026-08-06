@@ -30,6 +30,14 @@ language-system = Padrão do sistema
 language-note =
     Aplicado imediatamente. Janelas já abertas serão atualizadas quando
     forem reabertas, e o histórico do chat mantém seu idioma original.
+# ── Server config (connect + settings) ──────────────────────────────────
+server-password = Senha do servidor (opcional)
+connect-server-note = Conectando a { $server } — altere em Configurações
+settings-server = Servidor
+server-token-url = URL de token (somente servidores seguros)
+server-config-note =
+    Deixe a URL de token vazia para servidores abertos ou de LAN.
+    As alterações valem na próxima conexão.
 
 # ── Sidebar ─────────────────────────────────────────────────────────────
 users-count = Usuários: { $count }

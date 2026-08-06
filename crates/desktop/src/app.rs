@@ -308,7 +308,9 @@ impl App {
             ScreenEvent::SharingStarted { quality } => {
                 info!("📺 Screen share started: {quality}");
                 if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(t!("chat-share-started", "quality" => quality.to_string()));
+                    chat.handle_system_message(
+                        t!("chat-share-started", "quality" => quality.to_string()),
+                    );
                 }
                 if let Some(sidebar) = &mut self.sidebar {
                     sidebar.set_share_state(true);
@@ -403,14 +405,18 @@ impl App {
                 let username = self.get_username(client_id);
                 info!("📺 {username} started sharing ({width}x{height})");
                 if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(t!("chat-peer-sharing", "name" => username.as_str()));
+                    chat.handle_system_message(
+                        t!("chat-peer-sharing", "name" => username.as_str()),
+                    );
                 }
             }
             ScreenEvent::PeerStoppedSharing { client_id } => {
                 let username = self.get_username(client_id);
                 info!("📺 {username} stopped sharing");
                 if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(t!("chat-peer-stopped-sharing", "name" => username.as_str()));
+                    chat.handle_system_message(
+                        t!("chat-peer-stopped-sharing", "name" => username.as_str()),
+                    );
                 }
                 // Close viewer window if open
                 if let Some(mut viewer) = self.viewer_windows.remove(&client_id) {
@@ -483,11 +489,33 @@ impl App {
                 self.update_user_list();
             }
             NetworkMessage::VoiceData { .. } => {}
-            NetworkMessage::LatencyUpdate { rtt_ms } => {
+            NetworkMessage::NetworkStats { rtt_ms, .. } => {
                 if let Some(sidebar) = &mut self.sidebar {
                     let audio_ms = self.voice.shared.jitter_buffer_ms.load(Ordering::Relaxed);
                     sidebar.update_latency(rtt_ms, Some(audio_ms));
                 }
+            }
+            NetworkMessage::ShareDenied { reason } => {
+                // The screen thread starts capturing optimistically before
+                // the server answers — stop it so local state matches the
+                // server's (otherwise we encode into the void while the
+                // relay drops every chunk as not-sharing).
+                if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+                    self.screen.tx.send(ScreenControl::StopSharing).ok();
+                }
+                self.show_error(&format!("Screen share denied: {}", reason.describe()));
+            }
+            NetworkMessage::SubscribeDenied { target_id, reason } => {
+                // Close the viewer window WatchPeer opened optimistically.
+                if let Some(mut viewer) = self.viewer_windows.remove(&target_id) {
+                    viewer.close();
+                }
+                let username = self.get_username(target_id);
+                self.show_chat_system(&format!("Can't watch {username}: {}", reason.describe()));
+            }
+            NetworkMessage::StreamHealth { .. } => {
+                // Routed straight to the screen thread by the network loop
+                // (drives fps adaptation). Never arrives here.
             }
 
             // ── Screen share signaling ──────────────────────────────
@@ -515,7 +543,7 @@ impl App {
             }
         }
     }
-
+    #[allow(clippy::too_many_lines)]
     fn handle_ui_message(&mut self, msg: UiMessage) {
         match msg {
             UiMessage::StartScreenShare {
@@ -560,6 +588,17 @@ impl App {
                         .unwrap()
                         .map(|q| q.to_string())
                         .unwrap_or_else(|| t!("unknown"));
+                    let fps_scale = self.screen.shared.fps_scale_pct.load(Ordering::Relaxed);
+                    let viewers = self.screen.shared.stream_viewers.load(Ordering::Relaxed);
+                    let loss_pct =
+                        f32::from_bits(self.screen.shared.stream_loss_pct.load(Ordering::Relaxed));
+                    let quality_str = if fps_scale < 100 {
+                        format!("{quality_str} · {fps_scale}% fps · loss {loss_pct:.1}%")
+                    } else if viewers > 0 {
+                        format!("{quality_str} · {viewers} watching")
+                    } else {
+                        quality_str
+                    };
                     if let Some(sidebar) = &mut self.sidebar {
                         sidebar.update_stream_stats(Some((&quality_str, avg_kb, encode_ms)));
                     }
@@ -592,7 +631,12 @@ impl App {
                 let username = self.get_username(client_id);
                 self.show_chat_system(&t!("chat-stopped-watching", "name" => username.as_str()));
             }
-
+            UiMessage::SetServerAddress(addr) => {
+                self.settings.server.address = addr.trim().to_string();
+            }
+            UiMessage::SetServerTokenUrl(url) => {
+                self.settings.server.token_url = url;
+            }
             UiMessage::SetStreamVolume { client_id, volume } => {
                 self.screen
                     .tx
@@ -606,8 +650,8 @@ impl App {
                     .ok();
             }
 
-            UiMessage::Connect { nickname, server } => {
-                self.handle_connect(nickname, server);
+            UiMessage::Connect { nickname, password } => {
+                self.handle_connect(nickname, password);
             }
             UiMessage::Disconnect => {
                 self.handle_disconnect();
@@ -991,12 +1035,13 @@ impl App {
     //  CONNECTION HANDLERS
     // ════════════════════════════════════════════════════════════════════
 
-    fn handle_connect(&mut self, nickname: String, server: String) {
+    fn handle_connect(&mut self, nickname: String, password: String) {
         self.settings.user.nickname = nickname.clone();
-        self.settings.server.address = server.clone();
+        let password = password.trim();
+        self.settings.server.token_password = (!password.is_empty()).then(|| password.to_string());
         self.settings.save();
 
-        let addr = match server.parse::<SocketAddr>() {
+        let addr = match self.settings.server.address.trim().parse::<SocketAddr>() {
             Ok(a) => a,
             Err(_) => {
                 self.show_error(&t!("error-invalid-address"));
@@ -1006,7 +1051,12 @@ impl App {
 
         self.network
             .tx
-            .send(NetworkControl::Connect { addr, nickname })
+            .send(NetworkControl::Connect {
+                addr,
+                nickname,
+                token_url: self.settings.server.token_url.clone(),
+                token_password: self.settings.server.token_password.clone(),
+            })
             .ok();
     }
 

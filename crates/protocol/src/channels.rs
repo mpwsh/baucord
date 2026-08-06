@@ -1,58 +1,160 @@
-//! Channel IDs and shared network constants.
+//! Channel layout, buffer budgets, and the shared renet [`ConnectionConfig`].
 //!
-//! Renet multiplexes multiple logical channels over one UDP connection.
-//! Each channel has its own reliability and ordering semantics.
+//! Both client and server build their connection from
+//! [`connection_config`], so the channel set can never drift between the
+//! two ends. Channel IDs are **not** configurable at runtime on purpose —
+//! a mismatched channel map is an undebuggable failure mode.
+//!
+//! ## Channel map
+//!
+//! | id | name         | semantics            | carries                              |
+//! |----|--------------|----------------------|--------------------------------------|
+//! | 0  | control      | reliable, ordered    | chat, presence, share signaling      |
+//! | 1  | signal       | reliable, unordered  | keyframe requests, stream health     |
+//! | 2  | voice        | unreliable           | Opus voice packets                   |
+//! | 3  | video        | unreliable           | H.264 chunks                         |
+//! | 4  | system audio | unreliable           | Opus stereo (screen-share audio)     |
+//!
+//! Splitting `signal` from `control` means a burst of chat or presence
+//! traffic can never head-of-line-block a keyframe request — the one
+//! control message that must be timely for stream recovery. `signal` is
+//! reliable-unordered: requests must arrive, but their relative order is
+//! irrelevant (they are idempotent and rate-gated server-side).
+//!
+//! ## Priority & pacing
+//!
+//! renet packs outgoing packets by walking the channel Vec **in order**,
+//! each channel consuming from `available_bytes_per_tick` before passing
+//! the remainder down. The Vec below is therefore ordered
+//! control → signal → voice → system audio → video, so a video keyframe
+//! burst can never starve voice or control within a tick.
+//!
+//! `available_bytes_per_tick` doubles as burst pacing: at the server's
+//! ~1 ms tick, [`SERVER_BYTES_PER_TICK`] (20 KB) spreads a ~175 KB
+//! keyframe over ~9 ms instead of dumping 130+ datagrams onto the wire
+//! back-to-back — the burst pattern that overflows home-router queues.
+//! The ceiling is 20 KB/ms ≈ 160 Mbit/s per client: far above any real
+//! stream, so it never throttles steady-state traffic.
+
+use std::time::Duration;
+
+use renet::{ChannelConfig, ConnectionConfig, SendType};
 
 /// Application-level protocol identifier.
 ///
-/// Both client and server must agree on this value or the netcode
-/// handshake will reject the connection.
-pub const PROTOCOL_ID: u64 = 27;
+/// Both ends must agree or the netcode handshake refuses the connection.
+/// **Bump this on every breaking wire change** — that is the whole
+/// versioning story: old peers are rejected at the door rather than
+/// misparsing packets mid-session.
+pub const PROTOCOL_ID: u64 = 28;
 
 // ── Channel IDs ─────────────────────────────────────────────────────────
 
-/// Reliable ordered channel for chat, signaling, presence, and control
-/// messages. Guaranteed delivery, in-order, with automatic retransmit.
-pub const RELIABLE_CHANNEL: u8 = 2;
+/// Reliable ordered: chat, presence, screen-share signaling.
+pub const CONTROL_CHANNEL: u8 = 0;
+/// Reliable unordered: keyframe requests/pokes, stream health reports.
+pub const SIGNAL_CHANNEL: u8 = 1;
+/// Unreliable: voice (Opus) packets. Late packets are useless.
+pub const VOICE_CHANNEL: u8 = 2;
+/// Unreliable: video (H.264) chunks. Loss recovered via keyframe request.
+pub const VIDEO_CHANNEL: u8 = 3;
+/// Unreliable: system audio (Opus stereo) during screen share.
+/// Separate from voice so deafening voice chat doesn't kill stream audio.
+pub const SYSTEM_AUDIO_CHANNEL: u8 = 4;
 
-/// Unreliable channel for voice (Opus) packets.
-/// Low latency, no retransmit — late packets are useless for real-time audio.
-pub const VOICE_CHANNEL: u8 = 3;
+// ── Per-channel memory budgets ──────────────────────────────────────────
+//
+// For unreliable channels this is burst absorption, not durable
+// buffering: renet drops new messages once the budget is exhausted.
 
-/// Unreliable channel for video (H.264) chunks.
-/// All video — keyframes and P-frames — goes here as application-layer
-/// chunks. Lost keyframes are recovered via PLI on the reliable channel.
-pub const VIDEO_CHANNEL: u8 = 4;
+/// Control channel budget. Generous: a reliable channel that hits its
+/// ceiling disconnects the client (`ReliableChannelMaxMemoryReached`).
+pub const CONTROL_BUFFER_BYTES: usize = 5 * 1024 * 1024;
 
-/// Unreliable channel for system audio (Opus stereo) during screen share.
-/// Separate from voice so subscriber routing can mirror the video stream,
-/// and so deafening voice chat doesn't kill stream audio.
-pub const SYSTEM_AUDIO_CHANNEL: u8 = 6;
+/// Signal channel budget. Messages here are tiny (tens of bytes) and
+/// rate-gated; 256 KB is thousands of messages of headroom.
+pub const SIGNAL_BUFFER_BYTES: usize = 256 * 1024;
 
-// ── Buffer sizes ────────────────────────────────────────────────────────
+/// Voice channel budget. Voice is ~10 KB/s per speaker; 512 KB absorbs
+/// multi-second scheduling hiccups for a full room.
+pub const VOICE_BUFFER_BYTES: usize = 512 * 1024;
 
-/// Default memory budget for the reliable channel (bytes).
-pub const RELIABLE_BUFFER_BYTES: usize = 5 * 1024 * 1024; // 5 MB
+/// Video channel budget. Must absorb several keyframes in flight toward
+/// a slow viewer before the relay's backpressure kicks in.
+pub const VIDEO_BUFFER_BYTES: usize = 10 * 1024 * 1024;
 
-/// Default memory budget for the voice channel (bytes).
-pub const VOICE_BUFFER_BYTES: usize = 5 * 1024 * 1024; // 5 MB
+/// System audio budget. ~16 KB/s stream; 512 KB is ample.
+pub const SYSTEM_AUDIO_BUFFER_BYTES: usize = 512 * 1024;
 
-/// Default memory budget for the video channel (bytes).
-pub const VIDEO_BUFFER_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+// ── Pacing budgets ──────────────────────────────────────────────────────
 
-/// Default memory budget for the system audio channel (bytes).
-///
-/// System audio is ~16 KB/s (320-byte Opus frames × 50 packets/sec).
-/// 512 KB gives ~32 seconds of buffering — more than enough for renet's
-/// internal bookkeeping on an unreliable channel.
-pub const SYSTEM_AUDIO_BUFFER_BYTES: usize = 512 * 1024; // 512 KB
+/// Server-side `available_bytes_per_tick` default (per client, per
+/// ~1 ms tick). See module docs for the pacing rationale.
+pub const SERVER_BYTES_PER_TICK: u64 = 20_000;
+
+/// Client-side `available_bytes_per_tick` (per ~1 ms tick). Slightly
+/// tighter than the server: this paces keyframe bursts leaving a home
+/// uplink. 12 KB/ms ≈ 96 Mbit/s ceiling; a 175 KB keyframe spreads over
+/// ~15 ms — invisible next to the encode interval.
+pub const CLIENT_BYTES_PER_TICK: u64 = 12_000;
 
 /// Target OS-level UDP socket buffer size (send and receive).
 ///
-/// The Linux default is 208 KB, which is too small for relaying video
-/// keyframes (~136 chunks × ~1300 bytes = ~177 KB per burst). When the
-/// OS send buffer fills, `send_to` fails silently and keepalive packets
-/// get dropped, causing netcode timeouts.
+/// Pacing (above) smooths most bursts, but the OS buffer is the last
+/// line of defense: when it fills, `send_to` fails and keepalives get
+/// dropped, causing netcode timeouts. 8 MB is cheap insurance.
+pub const UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Resend interval for the ordered control channel.
+const CONTROL_RESEND: Duration = Duration::from_millis(200);
+/// Resend interval for the signal channel — faster, because keyframe
+/// requests are latency-sensitive and only bytes-tiny.
+const SIGNAL_RESEND: Duration = Duration::from_millis(100);
+
+/// Build the [`ConnectionConfig`] shared by client and server.
 ///
-/// 8 MB gives comfortable headroom for multiple keyframes in flight.
-pub const UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024; // 8 MB
+/// `available_bytes_per_tick` differs per side ([`SERVER_BYTES_PER_TICK`]
+/// / [`CLIENT_BYTES_PER_TICK`], or a server-config override); the channel
+/// set is identical by construction.
+#[must_use]
+pub fn connection_config(available_bytes_per_tick: u64) -> ConnectionConfig {
+    // Vec order = send priority (see module docs). IDs are stable and
+    // independent of this ordering.
+    let channels = vec![
+        ChannelConfig {
+            channel_id: CONTROL_CHANNEL,
+            max_memory_usage_bytes: CONTROL_BUFFER_BYTES,
+            send_type: SendType::ReliableOrdered {
+                resend_time: CONTROL_RESEND,
+            },
+        },
+        ChannelConfig {
+            channel_id: SIGNAL_CHANNEL,
+            max_memory_usage_bytes: SIGNAL_BUFFER_BYTES,
+            send_type: SendType::ReliableUnordered {
+                resend_time: SIGNAL_RESEND,
+            },
+        },
+        ChannelConfig {
+            channel_id: VOICE_CHANNEL,
+            max_memory_usage_bytes: VOICE_BUFFER_BYTES,
+            send_type: SendType::Unreliable,
+        },
+        ChannelConfig {
+            channel_id: SYSTEM_AUDIO_CHANNEL,
+            max_memory_usage_bytes: SYSTEM_AUDIO_BUFFER_BYTES,
+            send_type: SendType::Unreliable,
+        },
+        ChannelConfig {
+            channel_id: VIDEO_CHANNEL,
+            max_memory_usage_bytes: VIDEO_BUFFER_BYTES,
+            send_type: SendType::Unreliable,
+        },
+    ];
+
+    ConnectionConfig {
+        available_bytes_per_tick,
+        server_channels_config: channels.clone(),
+        client_channels_config: channels,
+    }
+}

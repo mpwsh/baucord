@@ -1,10 +1,10 @@
 //! Dark-mode styling helpers for FLTK text widgets.
-
 use crate::theme;
-use fltk::{enums, input, prelude::*, text};
+use fltk::{enums, prelude::*, text};
 
-/// Apply dark styling to an [`input::Input`] widget.
-pub fn style_input(input: &mut input::Input) {
+/// Apply dark styling to any input-type widget
+/// ([`fltk::input::Input`], [`fltk::input::SecretInput`], …).
+pub fn style_input(input: &mut impl InputExt) {
     input.set_color(theme::SURFACE);
     input.set_text_color(enums::Color::Foreground);
     input.set_cursor_color(enums::Color::Selection);

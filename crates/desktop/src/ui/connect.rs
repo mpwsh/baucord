@@ -1,25 +1,32 @@
-// ui/connect.rs — Connection view (nickname + server address).
+// ui/connect.rs — Connection view (nickname + optional server password).
 //
 // Pure UI construction — all logic routes through UiMessages back to App.
 //
 // Since the single-window migration this builds a *view* (a Group hosted
 // in the main window's Wizard) rather than its own window: a fixed-size
 // form kept centered by flexible spacers, so it stays centered at any
-// window size. The old borderless window, its drag-to-move handler and
-// its custom ✕ button are gone — the real titlebar does that job now.
+// window size.
+//
+// The server address (and token URL for secure servers) moved to
+// Settings → General: for this app they're deployment constants, not
+// per-session choices — a friend's first run should be nickname +
+// password + Connect. A read-only line under the form shows which
+// server we'll dial so a failed connect is never a mystery, and the
+// Settings button right below it is the way to change it. App rebuilds
+// this view when the settings window closes, so the line stays current.
 
 use fltk::{prelude::*, *};
 
-use client::config::Settings;
 use crate::ui::messages::UiMessage;
-use ui::theme;
+use client::config::Settings;
 use i18n::t;
+use ui::theme;
 use ui::widgets::{controls, style};
 
 /// Fixed size of the centered connect form.
-/// FORM_H = sum of fixed child heights (305) + 9 gaps × 15 spacing.
+/// FORM_H = sum of fixed child heights (325) + 10 gaps × 15 spacing.
 const FORM_W: i32 = 380;
-const FORM_H: i32 = 440;
+const FORM_H: i32 = 475;
 
 /// Widget handles the App needs to keep after the view is built.
 pub struct ConnectView {
@@ -83,19 +90,32 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     style::style_input(&mut nick_input);
     col.fixed(&nick_input, 35);
 
-    // ── Server address ───────────────────────────────────────────────
+    // ── Server password (optional) ───────────────────────────────────
+    // The issuer's shared secret on secure servers; ignored by open
+    // servers. Prefilled from settings so returning users don't retype.
 
-    let mut addr_frame = frame::Frame::default()
-        .with_label(&t!("server-address"))
+    let mut pass_frame = frame::Frame::default()
+        .with_label(&t!("server-password"))
         .with_align(enums::Align::Left | enums::Align::Inside);
-    addr_frame.set_label_color(theme::TEXT_SECONDARY);
-    addr_frame.set_label_size(11);
-    col.fixed(&addr_frame, 20);
+    pass_frame.set_label_color(theme::TEXT_SECONDARY);
+    pass_frame.set_label_size(11);
+    col.fixed(&pass_frame, 20);
 
-    let mut addr_input = input::Input::default();
-    addr_input.set_value(&settings.server.address);
-    style::style_input(&mut addr_input);
-    col.fixed(&addr_input, 35);
+    let mut pass_input = input::SecretInput::default();
+    pass_input.set_value(settings.server.token_password.as_deref().unwrap_or(""));
+    style::style_input(&mut pass_input);
+    col.fixed(&pass_input, 35);
+
+    // ── Target server note ───────────────────────────────────────────
+    // Read-only: which server the Connect button will dial. The way to
+    // change it is the Settings button right below.
+
+    let mut server_note = frame::Frame::default()
+        .with_label(&t!("connect-server-note", "server" => settings.server.address.as_str()))
+        .with_align(enums::Align::Center);
+    server_note.set_label_size(11);
+    server_note.set_label_color(theme::TEXT_MUTED);
+    col.fixed(&server_note, 20);
 
     // ── Connect button ───────────────────────────────────────────────
 
@@ -103,8 +123,9 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     col.fixed(&connect_btn, 40);
 
     // ── Secondary actions ────────────────────────────────────────────
-    // Settings works before connecting (devices, gains, keybinds) —
-    // useful precisely when the saved device is gone.
+    // Settings works before connecting (devices, gains, keybinds, and
+    // now the server address) — useful precisely when something saved
+    // no longer matches reality.
 
     let mut actions = group::Flex::default().row();
     col.fixed(&actions, 30);
@@ -137,11 +158,11 @@ pub fn build_view(sender: app::Sender<UiMessage>, settings: &Settings) -> Connec
     let s = sender;
     connect_btn.set_callback(move |_| {
         let nickname = nick_input.value();
-        let server = addr_input.value();
+        let password = pass_input.value();
         if nickname.trim().is_empty() {
             s.send(UiMessage::ShowError(t!("error-nickname-empty")));
         } else {
-            s.send(UiMessage::Connect { nickname, server });
+            s.send(UiMessage::Connect { nickname, password });
         }
     });
 

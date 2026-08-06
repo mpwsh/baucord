@@ -2,6 +2,7 @@ server:
   name: Baucord Server
   host: 0.0.0.0
   port: 5000
+  public_address: "127.0.0.1:5000"
   greeting_message: Welcome to the server!
 network:
   max_clients: 64
@@ -15,6 +16,10 @@ channels:
   bytes_per_tick: 60000
 logging:
   level: info
-  stats_interval_secs: 30
+  stats_interval_secs: 60
 authentication:
-  enabled: false
+  secure: true
+  private_key_file: netcode.key
+  issuer:
+    bind: "127.0.0.1:5001"
+    #password: somepw

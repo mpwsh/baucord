@@ -31,6 +31,14 @@ language-note =
     Se aplica inmediatamente. Las ventanas que ya están abiertas se
     actualizan al reabrirlas, y el historial del chat conserva su
     idioma original.
+# ── Server config (connect + settings) ──────────────────────────────────
+server-password = Contraseña del servidor (opcional)
+connect-server-note = Conectando a { $server } — se cambia en Configuración
+settings-server = Servidor
+server-token-url = URL de token (solo servidores seguros)
+server-config-note =
+    Dejá la URL de token vacía para servidores abiertos o de LAN.
+    Los cambios se aplican en la próxima conexión.
 
 # ── Barra lateral ───────────────────────────────────────────────────────
 users-count = Usuarios: { $count }

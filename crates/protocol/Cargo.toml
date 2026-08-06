@@ -1,6 +1,6 @@
 [package]
 name = "protocol"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 description = "Shared wire protocol types for baucord client and server."
 
@@ -10,3 +10,4 @@ workspace = true
 [dependencies]
 renet = "2.0"
 serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }

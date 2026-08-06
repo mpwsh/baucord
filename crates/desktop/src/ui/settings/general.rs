@@ -1,6 +1,16 @@
-// settings/general.rs — General panel: language selection.
+// settings/general.rs — General panel: language + server configuration.
 //
 // Same explicit size/pos-inside-scroll pattern as the other panels.
+//
+// The server fields live here (not on the connect page) because for
+// this app they're deployment constants: set once, shared by the whole
+// friend group, changed only when the server moves. The connect page
+// shows a read-only note of the current address and is rebuilt when
+// this window closes, so edits here surface there immediately.
+//
+// Edits apply to Settings live (per keystroke, like every other panel)
+// and persist on window close; they take effect on the next connect —
+// there's deliberately no live re-dial of an active session.
 
 use fltk::{prelude::*, *};
 
@@ -18,7 +28,7 @@ pub fn build(
 ) -> group::Flex {
     let mut col = group::Flex::default()
         .with_pos(x, y)
-        .with_size(w, 220)
+        .with_size(w, 500)
         .column();
     col.set_spacing(12);
 
@@ -29,6 +39,8 @@ pub fn build(
     title.set_label_font(enums::Font::HelveticaBold);
     title.set_label_color(theme::TEXT_PRIMARY);
     col.fixed(&title, 30);
+
+    // ── Language ─────────────────────────────────────────────────────
 
     let mut lang_label = frame::Frame::default()
         .with_label(&t!("language"))
@@ -73,6 +85,72 @@ pub fn build(
     note.set_label_size(11);
     note.set_label_color(theme::TEXT_MUTED);
     col.fixed(&note, 50);
+
+    // ── Server ───────────────────────────────────────────────────────
+
+    let mut server_title = frame::Frame::default()
+        .with_label(&t!("settings-server"))
+        .with_align(enums::Align::Left | enums::Align::Inside);
+    server_title.set_label_size(16);
+    server_title.set_label_font(enums::Font::HelveticaBold);
+    server_title.set_label_color(theme::TEXT_PRIMARY);
+    col.fixed(&server_title, 30);
+
+    let mut addr_label = frame::Frame::default()
+        .with_label(&t!("server-address"))
+        .with_align(enums::Align::Left | enums::Align::Inside);
+    addr_label.set_label_size(11);
+    addr_label.set_label_color(theme::TEXT_SECONDARY);
+    col.fixed(&addr_label, 20);
+
+    let mut addr_input = input::Input::default();
+    addr_input.set_value(&settings.server.address);
+    addr_input.set_color(theme::SURFACE);
+    addr_input.set_text_color(theme::TEXT_PRIMARY);
+    addr_input.set_text_size(13);
+    col.fixed(&addr_input, 32);
+
+    // Live per-keystroke updates into Settings, matching how the other
+    // panels apply their values; persistence happens on window close.
+    addr_input.set_trigger(enums::CallbackTrigger::Changed);
+    let s = sender;
+    addr_input.set_callback(move |i| {
+        s.send(UiMessage::SetServerAddress(i.value()));
+    });
+
+    let mut url_label = frame::Frame::default()
+        .with_label(&t!("server-token-url"))
+        .with_align(enums::Align::Left | enums::Align::Inside);
+    url_label.set_label_size(11);
+    url_label.set_label_color(theme::TEXT_SECONDARY);
+    col.fixed(&url_label, 20);
+
+    let mut url_input = input::Input::default();
+    url_input.set_value(settings.server.token_url.as_deref().unwrap_or(""));
+    url_input.set_color(theme::SURFACE);
+    url_input.set_text_color(theme::TEXT_PRIMARY);
+    url_input.set_text_size(13);
+    col.fixed(&url_input, 32);
+
+    url_input.set_trigger(enums::CallbackTrigger::Changed);
+    let s = sender;
+    url_input.set_callback(move |i| {
+        let value = i.value();
+        let trimmed = value.trim();
+        let url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        s.send(UiMessage::SetServerTokenUrl(url));
+    });
+
+    let mut server_note = frame::Frame::default()
+        .with_label(&t!("server-config-note"))
+        .with_align(enums::Align::Left | enums::Align::Inside | enums::Align::Wrap);
+    server_note.set_label_size(11);
+    server_note.set_label_color(theme::TEXT_MUTED);
+    col.fixed(&server_note, 65);
 
     col.end();
     col

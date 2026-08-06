@@ -15,9 +15,11 @@ pub enum UiMessage {
     // ── Connection flow ─────────────────────────────────────────────
     Connect {
         nickname: String,
-        server: String,
+        password: String,
     },
     Disconnect,
+    SetServerAddress(String),
+    SetServerTokenUrl(Option<String>),
 
     // ── Chat ────────────────────────────────────────────────────────
     SendChatMessage(String),

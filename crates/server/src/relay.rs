@@ -1,22 +1,32 @@
-//! Media relay modules — voice and video.
+//! Media relay — voice and video fan-out.
 //!
-//! Each relay struct owns its validation logic, stats, and fan-out behavior.
-//! The server calls `process()` once per tick; the relay reads from clients,
-//! validates, and forwards to the appropriate recipients.
+//! Both relays share the same trust model: media arriving from a client
+//! carries **no sender identity**. The relay validates the packet with
+//! the shared `protocol` parsers (the only parsers that exist — P2-1),
+//! then prepends the sender's authenticated transport id via
+//! [`protocol::wrap_sender`] before fan-out. A client cannot impersonate
+//! another client's voice or video, full stop.
+//!
+//! The video relay additionally implements per-viewer backpressure: a
+//! viewer whose outbound video queue grows past a watermark stops
+//! receiving delta frames (which would be useless without their
+//! predecessors anyway) and is resumed at the next keyframe boundary
+//! once the queue drains — the classic SFU pattern. Without this, renet
+//! tail-drops arbitrary chunks once the channel budget fills, corrupting
+//! every subsequent frame while still burning bandwidth on them.
 
 use log::{debug, info, warn};
-use std::time::{Duration, Instant};
-use renet::{ClientId, RenetServer};
+use renet::{Bytes, ClientId, RenetServer};
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use protocol::{
-    SYSTEM_AUDIO_MTU_BUDGET, SystemAudioHeader, VIDEO_HEADER_SIZE, VOICE_MAX_FRAME_SIZE,
-    VOICE_MAX_FRAMES_PER_PACKET, VOICE_MTU_BUDGET, VOICE_PROTOCOL_VERSION, VoiceHeader,
-    parse_system_audio_header, parse_video_header,
+    SYSTEM_AUDIO_CHANNEL, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_CHANNEL, parse_system_audio,
+    parse_video_header, parse_voice, wrap_sender,
 };
 
 // ════════════════════════════════════════════════════════════════════════
-//  Voice relay — broadcast to all other clients in the room
+//  Voice relay — broadcast to all other (non-deafened) clients
 // ════════════════════════════════════════════════════════════════════════
 
 #[derive(Default)]
@@ -24,10 +34,9 @@ pub struct VoiceStats {
     pub packets_received: u64,
     pub packets_forwarded: u64,
     pub packets_dropped_malformed: u64,
-    pub packets_dropped_oversize: u64,
-    pub packets_dropped_version: u64,
-    pub total_frames: u64,
-    pub avg_frames_per_packet: f32,
+    /// Per-recipient sends skipped because the recipient is deafened.
+    pub sends_skipped_deafened: u64,
+    pub bytes_relayed: u64,
 }
 
 pub struct VoiceRelay {
@@ -41,208 +50,137 @@ impl VoiceRelay {
         }
     }
 
-    /// Read voice packets from all clients and broadcast to everyone else.
-    pub fn process(&mut self, server: &mut RenetServer, channel_id: u8) {
+    /// Read voice packets from all clients and forward to everyone else,
+    /// skipping deafened recipients — they discard the audio anyway, so
+    /// relaying it is pure wasted egress (a deafened client in a busy
+    /// room was previously still downloading every speaker's stream).
+    pub fn process(&mut self, server: &mut RenetServer, deafened: &HashSet<ClientId>) {
         let clients: Vec<ClientId> = server.clients_id();
 
-        for client_id in &clients {
-            while let Some(message) = server.receive_message(*client_id, channel_id) {
+        for sender in &clients {
+            while let Some(message) = server.receive_message(*sender, VOICE_CHANNEL) {
                 self.stats.packets_received += 1;
 
-                if !self.validate(&message, *client_id) {
+                // Single source of validation: the shared parser.
+                if parse_voice(&message).is_none() {
+                    self.stats.packets_dropped_malformed += 1;
                     continue;
                 }
 
-                // Parse frame_count for stats
-                let frame_count = message[20] as usize;
-                self.stats.total_frames += frame_count as u64;
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    self.stats.avg_frames_per_packet =
-                        self.stats.avg_frames_per_packet * 0.95 + frame_count as f32 * 0.05;
+                // Stamp the authenticated sender once; fan out refcounted.
+                let envelope = Bytes::from(wrap_sender(*sender, &message));
+                let mut sent = 0u64;
+                for recipient in &clients {
+                    if recipient == sender {
+                        continue;
+                    }
+                    if deafened.contains(recipient) {
+                        self.stats.sends_skipped_deafened += 1;
+                        continue;
+                    }
+                    server.send_message(*recipient, VOICE_CHANNEL, envelope.clone());
+                    sent += 1;
                 }
 
-                // Forward raw bytes to all other clients.
-                // Capture len before move — broadcast_message_except takes ownership.
-                let msg_len = message.len();
-                let recipients = clients.len().saturating_sub(1);
-
-                server.broadcast_message_except(*client_id, channel_id, message);
-
-                self.stats.packets_forwarded += 1;
-                let _ = (msg_len, recipients); // available for byte stats if needed
+                if sent > 0 {
+                    self.stats.packets_forwarded += 1;
+                    self.stats.bytes_relayed += envelope.len() as u64 * sent;
+                }
             }
         }
-    }
-
-    /// Validate a voice packet. Returns true if valid, false if dropped.
-    fn validate(&mut self, message: &[u8], client_id: ClientId) -> bool {
-        // Size check
-        if message.len() < VoiceHeader::SIZE + 3 {
-            self.stats.packets_dropped_malformed += 1;
-            return false;
-        }
-
-        if message.len() > VOICE_MTU_BUDGET {
-            self.stats.packets_dropped_oversize += 1;
-            warn!(
-                "Dropping oversize voice packet: {} bytes from {client_id}",
-                message.len(),
-            );
-            return false;
-        }
-
-        // Version check
-        if message[0] != VOICE_PROTOCOL_VERSION {
-            self.stats.packets_dropped_version += 1;
-            warn!(
-                "Invalid voice protocol version {} from {client_id}",
-                message[0]
-            );
-            return false;
-        }
-
-        // Parse header fields for validation
-        let mut off = 4; // skip version + reserved
-
-        let hdr_client_id = u64::from_le_bytes(message[off..off + 8].try_into().unwrap());
-        off += 8;
-        let _seq = u32::from_le_bytes(message[off..off + 4].try_into().unwrap());
-        off += 4;
-        let _ts_48k = u32::from_le_bytes(message[off..off + 4].try_into().unwrap());
-        off += 4;
-        let frame_count = message[off] as usize;
-        off += 4; // frame_count + padding
-
-        // Frame count
-        if frame_count == 0 || frame_count > VOICE_MAX_FRAMES_PER_PACKET {
-            self.stats.packets_dropped_malformed += 1;
-            warn!("Invalid frame count {frame_count} from {client_id}");
-            return false;
-        }
-
-        // Client ID mismatch is informational only — transport guarantees sender
-        if hdr_client_id != client_id {
-            debug!("Header client_id {hdr_client_id} != sender {client_id} (stale session?)",);
-        }
-
-        // Validate all frame lengths
-        let mut validation_offset = off;
-        for i in 0..frame_count {
-            if validation_offset + 2 > message.len() {
-                self.stats.packets_dropped_malformed += 1;
-                return false;
-            }
-
-            let len = u16::from_le_bytes(
-                message[validation_offset..validation_offset + 2]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            validation_offset += 2;
-
-            if len == 0 || len > VOICE_MAX_FRAME_SIZE {
-                debug!("Invalid frame {i} size: {len} bytes from {client_id}");
-                self.stats.packets_dropped_malformed += 1;
-                return false;
-            }
-
-            if validation_offset + len > message.len() {
-                self.stats.packets_dropped_malformed += 1;
-                return false;
-            }
-
-            validation_offset += len;
-        }
-
-        if validation_offset != message.len() {
-            self.stats.packets_dropped_malformed += 1;
-            debug!(
-                "Trailing bytes: expected {validation_offset}, got {} from {client_id}",
-                message.len(),
-            );
-            return false;
-        }
-
-        true
     }
 
     #[allow(clippy::cast_precision_loss)]
     pub fn print_stats(&self) {
+        if self.stats.packets_received == 0 {
+            return;
+        }
         info!(
-            "Voice packets — RX: {}, FWD: {}",
-            self.stats.packets_received, self.stats.packets_forwarded
+            "Voice — RX: {}, FWD: {}, relayed: {:.2} MB",
+            self.stats.packets_received,
+            self.stats.packets_forwarded,
+            self.stats.bytes_relayed as f64 / 1_048_576.0,
         );
-
-        if self.stats.packets_received > 0 {
-            let total_dropped = self.stats.packets_dropped_malformed
-                + self.stats.packets_dropped_oversize
-                + self.stats.packets_dropped_version;
-            let drop_rate = total_dropped as f32 / self.stats.packets_received as f32 * 100.0;
-
+        if self.stats.packets_dropped_malformed > 0 || self.stats.sends_skipped_deafened > 0 {
             info!(
-                "Voice drops: {} malformed, {} oversize, {} bad version ({drop_rate:.1}% total)",
-                self.stats.packets_dropped_malformed,
-                self.stats.packets_dropped_oversize,
-                self.stats.packets_dropped_version,
+                "Voice — malformed drops: {}, deafened skips: {}",
+                self.stats.packets_dropped_malformed, self.stats.sends_skipped_deafened,
             );
         }
-
-        info!(
-            "Avg frames/packet: {:.2}, Total frames: {}",
-            self.stats.avg_frames_per_packet, self.stats.total_frames
-        );
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════
-//  Video relay — subscription-based forwarding
+//  Video relay — subscription-based forwarding with backpressure
 // ════════════════════════════════════════════════════════════════════════
 
 #[derive(Default)]
 pub struct VideoStats {
-    pub packets_received: u64,
-    pub packets_forwarded: u64,
-    pub packets_dropped_no_subscribers: u64,
-    pub packets_dropped_malformed: u64,
-    pub packets_dropped_oversize: u64,
-    pub packets_dropped_not_sharing: u64,
+    pub chunks_received: u64,
+    pub chunks_forwarded: u64,
+    /// Per-viewer chunk sends suppressed by backpressure.
+    pub chunks_suppressed_backpressure: u64,
+    pub chunks_dropped_malformed: u64,
+    pub chunks_dropped_not_sharing: u64,
+    pub chunks_dropped_no_subscribers: u64,
+    /// Keyframe frame-starts forwarded to at least one viewer.
     pub keyframes_relayed: u64,
     pub keyframe_requests_forwarded: u64,
     pub keyframe_requests_suppressed: u64,
+    /// Times a viewer entered the backpressure (waiting-for-keyframe) state.
+    pub backpressure_marks: u64,
     pub bytes_relayed: u64,
-    // Chunk stats
-    pub chunks_received: u64,
-    pub chunks_forwarded: u64,
-    // System audio stats
+    // System audio
     pub sys_audio_received: u64,
     pub sys_audio_forwarded: u64,
     pub sys_audio_dropped_malformed: u64,
-    pub sys_audio_dropped_oversize: u64,
     pub sys_audio_dropped_not_sharing: u64,
     pub sys_audio_dropped_no_subscribers: u64,
     pub sys_audio_bytes_relayed: u64,
 }
 
-pub struct VideoRelay {
-    /// Which clients are currently screen sharing: client_id → (width, height).
-    sharers: HashMap<ClientId, (u32, u32)>,
-    /// Subscription map: streamer_id → set of viewer client_ids.
-    subscribers: HashMap<ClientId, HashSet<ClientId>>,
-    /// Last time a keyframe request was forwarded to each sharer.
-    ///
-    /// Per-sharer server-side rate limit: viewers self-limit to one
-    /// request per 700 ms, but N viewers could still multiply that by N.
-    /// Requests suppressed here are harmless — the IDR produced for the
-    /// request that *did* pass serves every viewer of that stream.
-    keyframe_request_gate: HashMap<ClientId, Instant>,
-    pub stats: VideoStats,
+/// Aggregated per-stream viewer health, produced once a second and sent
+/// to the sharer as `ServerMessage::StreamHealth`.
+pub struct StreamHealthReport {
+    pub sharer: ClientId,
+    /// Worst packet loss among connected viewers, 0.0–1.0.
+    pub worst_loss: f32,
+    /// Worst RTT among connected viewers, in milliseconds.
+    pub worst_rtt_ms: f32,
+    pub viewers: u16,
 }
 
 /// Minimum spacing between keyframe requests forwarded to one sharer.
-/// Kept below the client-side cooldown (700 ms) so a single viewer is
-/// never throttled by the server, only stampedes are.
+/// The **only** authoritative keyframe rate limit in the system: viewer
+/// requests, new-subscriber kicks, and backpressure pokes all funnel
+/// through it, and an IDR produced for one passes serves every viewer.
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Suspend delta forwarding to a viewer once their queued (unsent)
+/// video exceeds this. 1 MB ≈ 2–3 s of a 3 Mbit/s stream or ~6 queued
+/// keyframes — the stream is already stalled for that viewer; feeding
+/// the queue further only adds latency to their eventual recovery.
+const VIDEO_QUEUE_SUSPEND_BYTES: usize = 1_000_000;
+
+/// Resume a suspended viewer only at a keyframe boundary once their
+/// queue has drained below this.
+const VIDEO_QUEUE_RESUME_BYTES: usize = 256 * 1024;
+
+pub struct VideoRelay {
+    /// Currently sharing clients: client_id → announced (width, height).
+    sharers: HashMap<ClientId, (u16, u16)>,
+    /// streamer_id → set of viewer client_ids.
+    subscribers: HashMap<ClientId, HashSet<ClientId>>,
+    /// Last time a keyframe request was forwarded to each sharer.
+    keyframe_request_gate: HashMap<ClientId, Instant>,
+    /// Viewers in backpressure: `(sharer, viewer)` pairs receiving no
+    /// deltas until a keyframe boundary + drained queue.
+    waiting_keyframe: HashSet<(ClientId, ClientId)>,
+    /// Keyframe pokes to send to sharers, drained by the server each
+    /// tick (subject to the gate): `(sharer, viewer)`.
+    pending_pokes: Vec<(ClientId, ClientId)>,
+    pub stats: VideoStats,
+}
 
 impl VideoRelay {
     pub fn new() -> Self {
@@ -250,14 +188,16 @@ impl VideoRelay {
             sharers: HashMap::new(),
             subscribers: HashMap::new(),
             keyframe_request_gate: HashMap::new(),
+            waiting_keyframe: HashSet::new(),
+            pending_pokes: Vec::new(),
             stats: VideoStats::default(),
         }
     }
 
-    // ── Subscription management (called from reliable message handler) ──
+    // ── Subscription management (called from the control handler) ───
 
-    /// A client started sharing their screen.
-    pub fn start_sharing(&mut self, client_id: ClientId, width: u32, height: u32) {
+    /// A client started (or re-announced) sharing their screen.
+    pub fn start_sharing(&mut self, client_id: ClientId, width: u16, height: u16) {
         info!("Screen share started: {client_id} ({width}x{height})");
         self.sharers.insert(client_id, (width, height));
         self.subscribers.entry(client_id).or_default();
@@ -269,9 +209,11 @@ impl VideoRelay {
         self.sharers.remove(&client_id);
         self.subscribers.remove(&client_id);
         self.keyframe_request_gate.remove(&client_id);
+        self.waiting_keyframe.retain(|(sharer, _)| *sharer != client_id);
+        self.pending_pokes.retain(|(sharer, _)| *sharer != client_id);
     }
 
-    /// A viewer wants to watch a streamer.
+    /// A viewer wants to watch a streamer. Caller enforces caps first.
     pub fn subscribe(&mut self, viewer: ClientId, streamer: ClientId) {
         if self.sharers.contains_key(&streamer) {
             self.subscribers.entry(streamer).or_default().insert(viewer);
@@ -286,41 +228,48 @@ impl VideoRelay {
         if let Some(subs) = self.subscribers.get_mut(&streamer) {
             subs.remove(&viewer);
         }
+        self.waiting_keyframe.remove(&(streamer, viewer));
+        self.pending_pokes
+            .retain(|(s, v)| !(*s == streamer && *v == viewer));
     }
 
-    /// Clean up when a client disconnects — stop their share and remove
-    /// them from all subscription lists.
+    /// Clean up when a client disconnects.
     pub fn handle_disconnect(&mut self, client_id: ClientId) {
-        // If they were sharing, stop it
-        let was_sharing = self.sharers.remove(&client_id).is_some();
-        if was_sharing {
+        if self.sharers.remove(&client_id).is_some() {
             self.subscribers.remove(&client_id);
             self.keyframe_request_gate.remove(&client_id);
         }
-
-        // Remove them as a viewer from everyone else
         for subs in self.subscribers.values_mut() {
             subs.remove(&client_id);
         }
+        self.waiting_keyframe
+            .retain(|(sharer, viewer)| *sharer != client_id && *viewer != client_id);
+        self.pending_pokes
+            .retain(|(sharer, viewer)| *sharer != client_id && *viewer != client_id);
     }
 
-    /// Returns true if the client is currently sharing.
     pub fn is_sharing(&self, client_id: ClientId) -> bool {
         self.sharers.contains_key(&client_id)
     }
 
-    /// Returns true if `viewer` is subscribed to `streamer`'s stream.
     pub fn is_subscribed(&self, viewer: ClientId, streamer: ClientId) -> bool {
         self.subscribers
             .get(&streamer)
             .is_some_and(|subs| subs.contains(&viewer))
     }
 
-    /// Rate-gate keyframe requests toward `streamer`.
-    ///
-    /// Returns true (and arms the gate) if enough time has passed since
-    /// the last forwarded request; the caller then forwards it. Counted
-    /// either way in stats.
+    /// Number of active screen shares.
+    pub fn sharer_count(&self) -> usize {
+        self.sharers.len()
+    }
+
+    /// Number of viewers subscribed to `streamer`.
+    pub fn viewer_count(&self, streamer: ClientId) -> usize {
+        self.subscribers.get(&streamer).map_or(0, HashSet::len)
+    }
+
+    /// Rate-gate keyframe requests toward `streamer`. Returns true (and
+    /// arms the gate) if the request should be forwarded.
     pub fn allow_keyframe_request(&mut self, streamer: ClientId) -> bool {
         let now = Instant::now();
         let allowed = self
@@ -336,203 +285,220 @@ impl VideoRelay {
         allowed
     }
 
-    /// Returns the set of active sharers (for sending state to newly connected clients).
-    pub fn sharers(&self) -> &HashMap<ClientId, (u32, u32)> {
+    /// Active sharers (for the join snapshot sent to new clients).
+    pub fn sharers(&self) -> &HashMap<ClientId, (u16, u16)> {
         &self.sharers
+    }
+
+    /// Drain pending backpressure keyframe pokes: `(sharer, viewer)`.
+    pub fn take_pokes(&mut self) -> Vec<(ClientId, ClientId)> {
+        std::mem::take(&mut self.pending_pokes)
+    }
+
+    /// Per-stream viewer health for the periodic `StreamHealth` report.
+    pub fn stream_health(&self, server: &RenetServer) -> Vec<StreamHealthReport> {
+        let mut reports = Vec::new();
+        for (sharer, subs) in &self.subscribers {
+            if !self.sharers.contains_key(sharer) || subs.is_empty() {
+                continue;
+            }
+            let mut worst_loss = 0f32;
+            let mut worst_rtt_ms = 0f32;
+            let mut viewers = 0u16;
+            for viewer in subs {
+                if let Ok(info) = server.network_info(*viewer) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        worst_loss = worst_loss.max(info.packet_loss as f32);
+                        worst_rtt_ms = worst_rtt_ms.max((info.rtt * 1000.0) as f32);
+                    }
+                    viewers = viewers.saturating_add(1);
+                }
+            }
+            if viewers > 0 {
+                reports.push(StreamHealthReport {
+                    sharer: *sharer,
+                    worst_loss,
+                    worst_rtt_ms,
+                    viewers,
+                });
+            }
+        }
+        reports
     }
 
     // ── Packet relay (called every tick) ────────────────────────────
 
-    pub fn process(&mut self, server: &mut RenetServer, video_channel_id: u8) {
+    pub fn process(&mut self, server: &mut RenetServer) {
         let clients: Vec<ClientId> = server.clients_id();
-
-        // All video arrives as chunks on the unreliable channel
         for client_id in &clients {
-            while let Some(message) = server.receive_message(*client_id, video_channel_id) {
-                self.relay_video_chunk(server, *client_id, &message, video_channel_id);
+            while let Some(message) = server.receive_message(*client_id, VIDEO_CHANNEL) {
+                self.relay_video_chunk(server, *client_id, &message);
             }
         }
     }
 
-    /// Relay a video chunk (VideoChunkHeader format) on the unreliable channel.
-    ///
-    /// Each chunk is a small (<1.2 KB) self-contained message — no renet
-    /// fragmentation. The server doesn't reassemble; it just validates the
-    /// header and forwards to subscribers. The client reassembles.
-    fn relay_video_chunk(
-        &mut self,
-        server: &mut RenetServer,
-        client_id: ClientId,
-        message: &bytes::Bytes,
-        outbound_channel: u8,
-    ) {
+    /// Validate and fan out one video chunk with per-viewer backpressure.
+    fn relay_video_chunk(&mut self, server: &mut RenetServer, sender: ClientId, message: &Bytes) {
         self.stats.chunks_received += 1;
 
-        // Validate chunk header
-        if message.len() < VIDEO_HEADER_SIZE {
-            self.stats.packets_dropped_malformed += 1;
-            return;
-        }
-
-        let Some(hdr) = parse_video_header(&message) else {
-            self.stats.packets_dropped_malformed += 1;
+        // Single source of validation (header, framing invariant, dims).
+        let Some((hdr, _payload)) = parse_video_header(message) else {
+            self.stats.chunks_dropped_malformed += 1;
             return;
         };
 
-        // Basic sanity: chunk_count > 0, chunk_idx < chunk_count
-        if hdr.chunk_count == 0 || hdr.chunk_idx >= hdr.chunk_count {
-            self.stats.packets_dropped_malformed += 1;
+        if !self.sharers.contains_key(&sender) {
+            self.stats.chunks_dropped_not_sharing += 1;
             return;
         }
 
-        // Only relay if sender is actually sharing
-        if !self.sharers.contains_key(&client_id) {
-            self.stats.packets_dropped_not_sharing += 1;
-            return;
-        }
-
-        // Get subscriber list
-        let Some(subs) = self.subscribers.get(&client_id) else {
-            self.stats.packets_dropped_no_subscribers += 1;
-            return;
-        };
-
-        if subs.is_empty() {
-            self.stats.packets_dropped_no_subscribers += 1;
-            return;
-        }
-
-        // Forward to each subscriber
-        let msg_len = message.len();
-        let mut sent_count = 0u64;
-
-        for viewer_id in subs {
-            if server.is_connected(*viewer_id) {
-                server.send_message(*viewer_id, outbound_channel, message.clone());
-                sent_count += 1;
+        // Snapshot viewers so we can mutate backpressure state below.
+        let viewers: Vec<ClientId> = match self.subscribers.get(&sender) {
+            Some(subs) if !subs.is_empty() => subs.iter().copied().collect(),
+            _ => {
+                self.stats.chunks_dropped_no_subscribers += 1;
+                return;
             }
-        }
+        };
 
-        self.stats.chunks_forwarded += 1;
-        self.stats.bytes_relayed += msg_len as u64 * sent_count;
-    }
+        let keyframe_start = hdr.is_keyframe() && hdr.chunk_idx == 0;
+        let envelope = Bytes::from(wrap_sender(sender, message));
+        let mut sent = 0u64;
 
-    // ── System audio relay (called every tick) ──────────────────────
+        for viewer in viewers {
+            if !server.is_connected(viewer) {
+                continue;
+            }
 
-    /// Read system audio packets from all clients on the system audio
-    /// channel and forward to the same subscribers as video.
-    pub fn process_system_audio(&mut self, server: &mut RenetServer, system_audio_channel_id: u8) {
-        let clients: Vec<ClientId> = server.clients_id();
+            let available = server.channel_available_memory(viewer, VIDEO_CHANNEL);
+            let queued = VIDEO_BUFFER_BYTES.saturating_sub(available);
+            let key = (sender, viewer);
 
-        for client_id in &clients {
-            while let Some(message) = server.receive_message(*client_id, system_audio_channel_id) {
-                self.relay_system_audio_packet(
-                    server,
-                    *client_id,
-                    &message,
-                    system_audio_channel_id,
+            if self.waiting_keyframe.contains(&key) {
+                if keyframe_start && queued < VIDEO_QUEUE_RESUME_BYTES {
+                    // Clean resume: the viewer's decoder restarts from
+                    // this keyframe with no torn frames in between.
+                    self.waiting_keyframe.remove(&key);
+                    debug!("Backpressure cleared for viewer {viewer} of {sender}");
+                    server.send_message(viewer, VIDEO_CHANNEL, envelope.clone());
+                    sent += 1;
+                } else {
+                    // Still suspended. If we just skipped the start of a
+                    // keyframe (queue not drained yet), poke the sharer
+                    // so the next one arrives promptly; the per-sharer
+                    // gate absorbs duplicates.
+                    if keyframe_start {
+                        self.pending_pokes.push(key);
+                    }
+                    self.stats.chunks_suppressed_backpressure += 1;
+                }
+            } else if queued > VIDEO_QUEUE_SUSPEND_BYTES {
+                self.waiting_keyframe.insert(key);
+                self.stats.backpressure_marks += 1;
+                self.stats.chunks_suppressed_backpressure += 1;
+                self.pending_pokes.push(key);
+                warn!(
+                    "Viewer {viewer} can't keep up with {sender}'s stream \
+                     ({queued} bytes queued) — suspending deltas until next keyframe"
                 );
+            } else {
+                server.send_message(viewer, VIDEO_CHANNEL, envelope.clone());
+                sent += 1;
+            }
+        }
+
+        if sent > 0 {
+            self.stats.chunks_forwarded += 1;
+            self.stats.bytes_relayed += envelope.len() as u64 * sent;
+            if keyframe_start {
+                self.stats.keyframes_relayed += 1;
             }
         }
     }
 
-    fn relay_system_audio_packet(
-        &mut self,
-        server: &mut RenetServer,
-        client_id: ClientId,
-        message: &bytes::Bytes,
-        system_audio_channel_id: u8,
-    ) {
+    // ── System audio relay ──────────────────────────────────────────
+
+    /// Forward system audio to the stream's subscribers. Deliberately
+    /// not gated by voice-chat deafen state: deafening the room's
+    /// voices shouldn't mute the movie.
+    pub fn process_system_audio(&mut self, server: &mut RenetServer) {
+        let clients: Vec<ClientId> = server.clients_id();
+        for client_id in &clients {
+            while let Some(message) = server.receive_message(*client_id, SYSTEM_AUDIO_CHANNEL) {
+                self.relay_system_audio(server, *client_id, &message);
+            }
+        }
+    }
+
+    fn relay_system_audio(&mut self, server: &mut RenetServer, sender: ClientId, message: &Bytes) {
         self.stats.sys_audio_received += 1;
 
-        // Validate header size
-        if message.len() < SystemAudioHeader::SIZE {
+        if parse_system_audio(message).is_none() {
             self.stats.sys_audio_dropped_malformed += 1;
             return;
         }
 
-        if message.len() > SYSTEM_AUDIO_MTU_BUDGET {
-            self.stats.sys_audio_dropped_oversize += 1;
-            warn!(
-                "Dropping oversize system audio packet: {} bytes from {client_id}",
-                message.len(),
-            );
-            return;
-        }
-
-        let Some(hdr) = parse_system_audio_header(&message) else {
-            self.stats.sys_audio_dropped_malformed += 1;
-            return;
-        };
-
-        // Verify payload length matches header
-        if SystemAudioHeader::SIZE + hdr.data_len as usize > message.len() {
-            self.stats.sys_audio_dropped_malformed += 1;
-            return;
-        }
-
-        // Only relay if sender is actually sharing
-        if !self.sharers.contains_key(&client_id) {
+        if !self.sharers.contains_key(&sender) {
             self.stats.sys_audio_dropped_not_sharing += 1;
             return;
         }
 
-        // Get subscriber list (same as video)
-        let Some(subs) = self.subscribers.get(&client_id) else {
-            self.stats.sys_audio_dropped_no_subscribers += 1;
-            return;
+        let viewers: Vec<ClientId> = match self.subscribers.get(&sender) {
+            Some(subs) if !subs.is_empty() => subs.iter().copied().collect(),
+            _ => {
+                self.stats.sys_audio_dropped_no_subscribers += 1;
+                return;
+            }
         };
 
-        if subs.is_empty() {
-            self.stats.sys_audio_dropped_no_subscribers += 1;
-            return;
-        }
-
-        // Forward to each subscriber on the same unreliable channel
-        let msg_len = message.len();
-        let mut sent_count = 0u64;
-
-        for viewer_id in subs {
-            if server.is_connected(*viewer_id) {
-                server.send_message(*viewer_id, system_audio_channel_id, message.clone());
-                sent_count += 1;
+        let envelope = Bytes::from(wrap_sender(sender, message));
+        let mut sent = 0u64;
+        for viewer in viewers {
+            if server.is_connected(viewer) {
+                server.send_message(viewer, SYSTEM_AUDIO_CHANNEL, envelope.clone());
+                sent += 1;
             }
         }
 
-        self.stats.sys_audio_forwarded += 1;
-        self.stats.sys_audio_bytes_relayed += msg_len as u64 * sent_count;
+        if sent > 0 {
+            self.stats.sys_audio_forwarded += 1;
+            self.stats.sys_audio_bytes_relayed += envelope.len() as u64 * sent;
+        }
     }
 
     #[allow(clippy::cast_precision_loss)]
     pub fn print_stats(&self) {
-        if self.stats.packets_received == 0
-            && self.stats.chunks_received == 0
+        if self.stats.chunks_received == 0
             && self.stats.sys_audio_received == 0
             && self.sharers.is_empty()
         {
-            return; // don't print stats if never used
+            return;
         }
 
         info!(
-            "Video — keyframe packets RX: {}, FWD: {}, keyframes: {}",
-            self.stats.packets_received, self.stats.packets_forwarded, self.stats.keyframes_relayed,
-        );
-        info!(
-            "Video — chunks RX: {}, FWD: {}",
-            self.stats.chunks_received, self.stats.chunks_forwarded,
-        );
-        info!(
-            "Video drops — no subs: {}, not sharing: {}, malformed: {}, oversize: {}",
-            self.stats.packets_dropped_no_subscribers,
-            self.stats.packets_dropped_not_sharing,
-            self.stats.packets_dropped_malformed,
-            self.stats.packets_dropped_oversize,
-        );
-        info!(
-            "Video relayed: {:.2} MB, Active streams: {}, Total subscribers: {}",
+            "Video — chunks RX: {}, FWD: {}, keyframes: {}, relayed: {:.2} MB",
+            self.stats.chunks_received,
+            self.stats.chunks_forwarded,
+            self.stats.keyframes_relayed,
             self.stats.bytes_relayed as f64 / 1_048_576.0,
+        );
+        info!(
+            "Video drops — no subs: {}, not sharing: {}, malformed: {}",
+            self.stats.chunks_dropped_no_subscribers,
+            self.stats.chunks_dropped_not_sharing,
+            self.stats.chunks_dropped_malformed,
+        );
+        if self.stats.backpressure_marks > 0 {
+            info!(
+                "Video backpressure — viewers suspended: {}, chunks suppressed: {}",
+                self.stats.backpressure_marks, self.stats.chunks_suppressed_backpressure,
+            );
+        }
+        info!(
+            "Streams active: {}, total subscribers: {}",
             self.sharers.len(),
-            self.subscribers.values().map(|s| s.len()).sum::<usize>(),
+            self.subscribers.values().map(HashSet::len).sum::<usize>(),
         );
         if self.stats.keyframe_requests_forwarded + self.stats.keyframe_requests_suppressed > 0 {
             info!(
@@ -540,7 +506,6 @@ impl VideoRelay {
                 self.stats.keyframe_requests_forwarded, self.stats.keyframe_requests_suppressed,
             );
         }
-
         if self.stats.sys_audio_received > 0 {
             info!(
                 "System audio — RX: {}, FWD: {}, relayed: {:.2} MB",
@@ -548,19 +513,6 @@ impl VideoRelay {
                 self.stats.sys_audio_forwarded,
                 self.stats.sys_audio_bytes_relayed as f64 / 1_048_576.0,
             );
-            let dropped = self.stats.sys_audio_dropped_malformed
-                + self.stats.sys_audio_dropped_oversize
-                + self.stats.sys_audio_dropped_not_sharing
-                + self.stats.sys_audio_dropped_no_subscribers;
-            if dropped > 0 {
-                info!(
-                    "System audio drops — no subs: {}, not sharing: {}, malformed: {}, oversize: {}",
-                    self.stats.sys_audio_dropped_no_subscribers,
-                    self.stats.sys_audio_dropped_not_sharing,
-                    self.stats.sys_audio_dropped_malformed,
-                    self.stats.sys_audio_dropped_oversize,
-                );
-            }
         }
     }
 }

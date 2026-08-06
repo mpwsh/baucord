@@ -1,15 +1,24 @@
 use clap::Parser;
 use log::{error, info};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod auth;
 mod config;
 mod relay;
 mod server;
+
 use config::Config;
 use env_logger::Builder;
 use server::ChatServer;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+
+const LOG_PATH: &str = "server.log";
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+const LOG_ROTATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -27,19 +36,27 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let mut config = Config::from_file(&args.config).unwrap_or_else(|e| {
-        eprintln!("Failed to load config from {}: {e}", args.config);
+
+    // Missing config: write defaults and continue. Present-but-invalid
+    // config: refuse to start — never overwrite an operator's file with
+    // defaults just because it failed to parse.
+    let mut config = if Path::new(&args.config).exists() {
+        match Config::from_file(&args.config) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("Failed to parse config {}: {e}", args.config);
+                eprintln!("Fix the file, or delete it to regenerate defaults.");
+                std::process::exit(1);
+            }
+        }
+    } else {
         let config = Config::default();
-        if let Err(save_err) = config.save_to_file(&args.config) {
-            eprintln!(
-                "Could not save default config to {}: {save_err}",
-                args.config
-            );
-        } else {
-            eprintln!("Default configuration saved to {}", args.config);
+        match config.save_to_file(&args.config) {
+            Ok(()) => eprintln!("Wrote default configuration to {}", args.config),
+            Err(e) => eprintln!("Could not save default config to {}: {e}", args.config),
         }
         config
-    });
+    };
 
     if let Some(host) = args.host {
         config.server.host = host;
@@ -48,20 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.server.port = port;
     }
 
-    let log_path = "server.log";
-
-    // Cap log file at 5 MB
-    if let Ok(meta) = fs::metadata(log_path) {
-        if meta.len() > 5 * 1024 * 1024 {
-            let _ = fs::write(log_path, b"");
-        }
-    }
-
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    let log_file = std::sync::Mutex::new(log_file);
+    let log_file = Arc::new(Mutex::new(open_log_file()?));
 
     Builder::new()
         .filter_level(
@@ -71,21 +75,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()
                 .unwrap_or(log::LevelFilter::Info),
         )
-        .format(move |_, record| {
-            let line = format!(
-                "[{} {} {}] {}\n",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.target(),
-                record.args()
-            );
-            // Write to stderr (terminal)
-            eprint!("{line}");
-            // Write to file
-            if let Ok(mut f) = log_file.lock() {
-                let _ = f.write_all(line.as_bytes());
+        .format({
+            let log_file = Arc::clone(&log_file);
+            move |_, record| {
+                let line = format!(
+                    "[{} {} {}] {}\n",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    record.level(),
+                    record.target(),
+                    record.args()
+                );
+                eprint!("{line}");
+                if let Ok(mut f) = log_file.lock() {
+                    let _ = f.write_all(line.as_bytes());
+                }
+                Ok(())
             }
-            Ok(())
         })
         .init();
 
@@ -99,22 +104,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("Press Ctrl+C to stop");
 
-    // ── Tight poll loop ─────────────────────────────────────────────
+    // ── Adaptive poll loop ──────────────────────────────────────────
     //
-    // Voice packets need sub-millisecond relay turnaround. At 10 ms
-    // sleep the server adds 0–10 ms (avg 5 ms) of pure relay latency
-    // on every voice packet — that's perceptible.
-    //
-    // At 1 ms sleep we add 0–1 ms (avg 0.5 ms) which is negligible.
-    // CPU cost is ~0.5–1% of a single core on modern hardware, well
-    // worth the latency savings for a voice server.
-    //
-    // The socket is set to non-blocking in ChatServer::new(), so
-    // update() returns immediately when there's nothing to process.
+    // Voice packets need sub-millisecond relay turnaround, so the loop
+    // runs at 1 ms while media is flowing. But a voice server is idle
+    // most of its life; the server tells us how fast the next tick
+    // needs to come (1 ms hot, 5 ms quiet, 20 ms empty), which cuts
+    // idle CPU roughly 5–20× at a worst-case cost of +5 ms on the first
+    // packet of a talk burst — inaudible under the jitter buffer.
+    let mut last_rotate_check = Instant::now();
     loop {
         if let Err(e) = server.update() {
             error!("Server error: {e}");
         }
-        thread::sleep(Duration::from_millis(1));
+
+        if last_rotate_check.elapsed() >= LOG_ROTATE_CHECK_INTERVAL {
+            rotate_log_if_needed(&log_file);
+            last_rotate_check = Instant::now();
+        }
+
+        thread::sleep(server.suggested_sleep());
+    }
+}
+
+fn open_log_file() -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(LOG_PATH)
+}
+
+/// Rotate `server.log` → `server.log.1` once it exceeds the cap, so a
+/// long-running server keeps recent history instead of either growing
+/// unbounded or vaporizing all evidence at startup (the previous
+/// behavior — the log was truncated exactly when you restart to debug
+/// a crash, which is when you needed it).
+fn rotate_log_if_needed(log_file: &Arc<Mutex<File>>) {
+    let Ok(meta) = fs::metadata(LOG_PATH) else {
+        return;
+    };
+    if meta.len() <= MAX_LOG_BYTES {
+        return;
+    }
+    let Ok(mut guard) = log_file.lock() else {
+        return;
+    };
+    let _ = guard.flush();
+    let rotated = format!("{LOG_PATH}.1");
+    if fs::rename(LOG_PATH, &rotated).is_ok() {
+        // Open a fresh file at the canonical path and swap it in; the
+        // renamed handle keeps writing to .1 until the swap lands.
+        match open_log_file() {
+            Ok(new_file) => *guard = new_file,
+            Err(_) => {
+                let _ = guard.set_len(0);
+            }
+        }
+    } else {
+        // Rename can fail with an open handle on some platforms — fall
+        // back to truncating in place.
+        let _ = guard.set_len(0);
     }
 }

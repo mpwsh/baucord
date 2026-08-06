@@ -1,204 +1,93 @@
-//! Video (H.264) packet wire format and reassembly.
+//! Video wire format (version 2): frame chunking and reassembly.
 //!
-//! Video frames are chunked at the application layer so each chunk fits
-//! in a single UDP packet — no renet fragmentation. This avoids renet's
-//! all-or-nothing reassembly behavior where losing **any** fragment drops
-//! the **entire** message. With application-layer chunking, a lost chunk
-//! only affects one frame.
-//!
-//! All video — keyframes and P-frames alike — uses this format on
-//! [`VIDEO_CHANNEL`] (unreliable). There is no reliable video channel.
-//!
-//! ## Wire format
-//!
-//! Each chunk is a self-contained message sent over renet's unreliable channel:
+//! Encoded H.264 frames exceed a single safe datagram, so frames are
+//! split into chunks of at most [`VIDEO_CHUNK_PAYLOAD`] bytes. Chunk
+//! layout (all integers little-endian):
 //!
 //! ```text
 //! offset  size  field
-//!   0       1   version (VIDEO_PROTOCOL_VERSION)
-//!   1       1   flags (bit 0 = keyframe)
-//!   2       1   chunk_idx (0-based)
-//!   3       1   chunk_count (total chunks in this frame)
-//!   4       8   client_id (u64 LE) — sender
-//!  12       4   seq (u32 LE) — frame sequence number
-//!  16       2   width (u16 LE)
-//!  18       2   height (u16 LE)
-//!  20..     payload: [u8] — chunk of encoded H.264 data
+//! 0       1     version      (= 2)
+//! 1       1     flags        (bit 0: keyframe)
+//! 2       1     chunk index
+//! 3       1     chunk count
+//! 4       4     frame sequence number
+//! 8       2     frame width
+//! 10      2     frame height
+//! 12      —     payload (≤ VIDEO_CHUNK_PAYLOAD bytes)
 //! ```
 //!
-//! Header is 20 bytes. With a 1,080-byte chunk payload, total message size
-//! is 1,100 bytes — well under the ~1,200-byte MTU, leaving room for renet's
-//! own framing and UDP/IP headers.
+//! Framing invariant: every chunk except the last carries **exactly**
+//! [`VIDEO_CHUNK_PAYLOAD`] bytes; the last carries the remainder
+//! (1..=[`VIDEO_CHUNK_PAYLOAD`]). Parsers reject anything else, which
+//! lets the reassembler write chunks straight into one pre-sized buffer
+//! at `idx * VIDEO_CHUNK_PAYLOAD` — no per-chunk allocations, no
+//! concatenation pass (the v1 reassembler allocated a `Vec` per chunk
+//! plus a final copy; at 30 fps that was ~10k transient allocations/s
+//! per stream).
 //!
-//! ## Keyframe recovery
-//!
-//! Since all video is unreliable, lost keyframes are recovered via PLI
-//! (Picture Loss Indication): the viewer detects the gap and sends a
-//! keyframe request on the reliable signaling channel. The sharer's
-//! encoder forces an IDR on the next frame.
+//! Sender identity comes from the relay envelope ([`crate::relayed`]),
+//! not the chunk header; the reassembler keys pending frames by
+//! `(sender, seq)` so interleaved streams can't collide.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// Video sub-protocol version. Bump when the wire format changes.
-pub const VIDEO_PROTOCOL_VERSION: u8 = 1;
+use renet::Bytes;
 
-/// Header size in bytes.
-pub const VIDEO_HEADER_SIZE: usize = 20;
+/// Current video wire format version.
+pub const VIDEO_PROTOCOL_VERSION: u8 = 2;
 
-/// Maximum payload bytes per chunk.
-///
-/// Chosen so header + payload fits in a single UDP packet without
-/// triggering renet fragmentation. Conservative MTU budget is ~1,200
-/// bytes for internet traffic; minus 20 bytes header = 1,180 available.
-/// We use 1,080 for safety margin (renet adds its own framing).
-pub const VIDEO_CHUNK_PAYLOAD: usize = 1_080;
+/// Serialized chunk header size in bytes.
+pub const VIDEO_HEADER_SIZE: usize = 12;
 
-/// Maximum number of chunks per frame (chunk_idx/chunk_count are u8).
-const MAX_CHUNKS: usize = 255;
+/// Maximum payload bytes per chunk. Header + payload + relay envelope
+/// (8) totals 1100 bytes — comfortably inside a 1200-byte conservative
+/// MTU with renet/netcode overhead on top.
+pub const VIDEO_CHUNK_PAYLOAD: usize = 1080;
 
-/// Largest encoded frame that fits the chunk format:
-/// [`MAX_CHUNKS`] × [`VIDEO_CHUNK_PAYLOAD`] ≈ 275 KB.
-///
-/// Senders must check against this **before** calling
-/// [`pack_video_frame`] (which panics past it) and drop oversized frames
-/// — the receiver's jitter buffer sees a seq gap and recovers via
-/// keyframe request. The encoder's VBV buffer is sized so frames stay
-/// well under this in normal operation (see `video::codec`).
-pub const MAX_VIDEO_FRAME_BYTES: usize = MAX_CHUNKS * VIDEO_CHUNK_PAYLOAD;
+/// Maximum encoded frame size (chunk count is a `u8`).
+pub const MAX_VIDEO_FRAME_BYTES: usize = 255 * VIDEO_CHUNK_PAYLOAD;
 
-/// Maximum age before an incomplete frame is discarded (milliseconds).
-const FRAME_TIMEOUT_MS: u128 = 500;
+/// Sanity bounds for frame dimensions, enforced on parse.
+pub const MIN_VIDEO_DIMENSION: u16 = 16;
+/// See [`MIN_VIDEO_DIMENSION`].
+pub const MAX_VIDEO_DIMENSION: u16 = 4096;
 
-/// Maximum number of in-flight frames in the reassembly buffer per peer.
-const MAX_PENDING_FRAMES: usize = 10;
+const FLAG_KEYFRAME: u8 = 0b0000_0001;
 
-// ── Flags ───────────────────────────────────────────────────────────────
+/// Discard incomplete frames older than this. At 30 fps a frame missing
+/// chunks for 500 ms is 15 frames stale — unrecoverable, waiting for a
+/// keyframe anyway.
+const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Flag: this frame is a keyframe (IDR).
-pub const VIDEO_FLAG_KEYFRAME: u8 = 0x01;
+/// Maximum in-flight partial frames across all senders. Bounds hostile
+/// or badly-reordered input; normal operation holds 1–2 per stream.
+const MAX_PENDING_FRAMES: usize = 16;
 
-// ── Parsed header ───────────────────────────────────────────────────────
-
-/// Parsed video chunk header.
-///
-/// Not stored on the wire as a struct — we serialize field-by-field
-/// like the other protocol headers for portability.
-#[derive(Copy, Clone, Debug)]
+/// Parsed chunk header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoHeader {
     pub version: u8,
     pub flags: u8,
     pub chunk_idx: u8,
     pub chunk_count: u8,
-    pub client_id: u64,
     pub seq: u32,
     pub width: u16,
     pub height: u16,
 }
 
 impl VideoHeader {
+    #[must_use]
     pub fn is_keyframe(&self) -> bool {
-        self.flags & VIDEO_FLAG_KEYFRAME != 0
+        self.flags & FLAG_KEYFRAME != 0
     }
 }
 
-// ── Parse / pack helpers ────────────────────────────────────────────────
-
-/// Parse a video chunk header from raw bytes.
-///
-/// Returns `None` if the buffer is too small or the version doesn't match.
-pub fn parse_video_header(data: &[u8]) -> Option<VideoHeader> {
-    if data.len() < VIDEO_HEADER_SIZE {
-        return None;
-    }
-    if data[0] != VIDEO_PROTOCOL_VERSION {
-        return None;
-    }
-    Some(VideoHeader {
-        version: data[0],
-        flags: data[1],
-        chunk_idx: data[2],
-        chunk_count: data[3],
-        client_id: u64::from_le_bytes(data[4..12].try_into().ok()?),
-        seq: u32::from_le_bytes(data[12..16].try_into().ok()?),
-        width: u16::from_le_bytes(data[16..18].try_into().ok()?),
-        height: u16::from_le_bytes(data[18..20].try_into().ok()?),
-    })
-}
-
-/// Extract the chunk payload from a raw video message.
-pub fn video_payload(data: &[u8]) -> Option<&[u8]> {
-    if data.len() < VIDEO_HEADER_SIZE {
-        return None;
-    }
-    Some(&data[VIDEO_HEADER_SIZE..])
-}
-
-// ── Chunker (sender side) ───────────────────────────────────────────────
-
-/// Split an encoded video frame into chunks that each fit in a single
-/// UDP packet.
-///
-/// Returns a Vec of byte vectors, each ready to send as an independent
-/// renet unreliable message. No chunk will trigger renet's internal
-/// fragmentation.
-///
-/// # Panics
-///
-/// Panics if the frame exceeds [`MAX_CHUNKS`] × [`VIDEO_CHUNK_PAYLOAD`]
-/// bytes (~276 KB). This should never happen with properly configured
-/// encoder bitrate limits.
-pub fn pack_video_frame(
-    client_id: u64,
-    seq: u32,
-    is_keyframe: bool,
-    width: u16,
-    height: u16,
-    data: &[u8],
-) -> Vec<Vec<u8>> {
-    let chunk_count = (data.len() + VIDEO_CHUNK_PAYLOAD - 1) / VIDEO_CHUNK_PAYLOAD;
-    assert!(
-        chunk_count <= MAX_CHUNKS,
-        "frame too large: {} bytes = {} chunks (max {})",
-        data.len(),
-        chunk_count,
-        MAX_CHUNKS,
-    );
-    // Handle empty frames (shouldn't happen, but be safe)
-    let chunk_count = chunk_count.max(1);
-
-    let flags = if is_keyframe { VIDEO_FLAG_KEYFRAME } else { 0 };
-
-    let mut chunks = Vec::with_capacity(chunk_count);
-
-    for i in 0..chunk_count {
-        let start = i * VIDEO_CHUNK_PAYLOAD;
-        let end = (start + VIDEO_CHUNK_PAYLOAD).min(data.len());
-        let payload = &data[start..end];
-
-        let mut buf = Vec::with_capacity(VIDEO_HEADER_SIZE + payload.len());
-        buf.push(VIDEO_PROTOCOL_VERSION); // 0
-        buf.push(flags); // 1
-        buf.push(i as u8); // 2: chunk_idx
-        buf.push(chunk_count as u8); // 3: chunk_count
-        buf.extend_from_slice(&client_id.to_le_bytes()); // 4..12
-        buf.extend_from_slice(&seq.to_le_bytes()); // 12..16
-        buf.extend_from_slice(&width.to_le_bytes()); // 16..18
-        buf.extend_from_slice(&height.to_le_bytes()); // 18..20
-        buf.extend_from_slice(payload); // 20..
-
-        chunks.push(buf);
-    }
-
-    chunks
-}
-
-// ── Reassembler (receiver side) ─────────────────────────────────────────
-
-/// A fully reassembled video frame, ready to push into the jitter buffer.
-#[derive(Debug)]
+/// A fully reassembled video frame.
+#[derive(Debug, Clone)]
 pub struct ReassembledFrame {
-    pub client_id: u64,
+    /// Authenticated sender (from the relay envelope).
+    pub sender_id: u64,
     pub seq: u32,
     pub is_keyframe: bool,
     pub width: u16,
@@ -206,340 +95,464 @@ pub struct ReassembledFrame {
     pub data: Vec<u8>,
 }
 
-/// Tracks reassembly state for a single frame.
-struct PendingFrame {
-    client_id: u64,
-    chunk_count: u8,
-    received: u8,
+/// Split an encoded frame into wire chunks.
+///
+/// All chunks share one backing allocation; the returned [`Bytes`] are
+/// zero-copy slices of it, ready to hand to renet.
+///
+/// Returns `None` for an empty frame or one larger than
+/// [`MAX_VIDEO_FRAME_BYTES`] — the caller should drop the frame (and,
+/// for a keyframe, request a fresh one) rather than send a torn frame.
+#[must_use]
+pub fn pack_video_frame(
+    seq: u32,
     is_keyframe: bool,
     width: u16,
     height: u16,
-    /// Chunks indexed by chunk_idx. `None` = not yet received.
-    chunks: Vec<Option<Vec<u8>>>,
+    data: &[u8],
+) -> Option<Vec<Bytes>> {
+    if data.is_empty() || data.len() > MAX_VIDEO_FRAME_BYTES {
+        return None;
+    }
+    let chunk_count = data.len().div_ceil(VIDEO_CHUNK_PAYLOAD);
+    let flags = if is_keyframe { FLAG_KEYFRAME } else { 0 };
+
+    let mut buf = Vec::with_capacity(data.len() + chunk_count * VIDEO_HEADER_SIZE);
+    let mut boundaries = Vec::with_capacity(chunk_count);
+
+    for (idx, payload) in data.chunks(VIDEO_CHUNK_PAYLOAD).enumerate() {
+        let start = buf.len();
+        buf.push(VIDEO_PROTOCOL_VERSION);
+        buf.push(flags);
+        // chunk_count ≤ 255 is guaranteed by the MAX_VIDEO_FRAME_BYTES
+        // bound above, so these casts cannot truncate.
+        buf.push(idx as u8);
+        buf.push(chunk_count as u8);
+        buf.extend_from_slice(&seq.to_le_bytes());
+        buf.extend_from_slice(&width.to_le_bytes());
+        buf.extend_from_slice(&height.to_le_bytes());
+        buf.extend_from_slice(payload);
+        boundaries.push((start, buf.len()));
+    }
+
+    let backing = Bytes::from(buf);
+    Some(
+        boundaries
+            .into_iter()
+            .map(|(start, end)| backing.slice(start..end))
+            .collect(),
+    )
+}
+
+/// Parse a chunk header from untrusted bytes, returning the header and
+/// the payload slice. Enforces the framing invariant and dimension
+/// sanity bounds.
+#[must_use]
+pub fn parse_video_header(data: &[u8]) -> Option<(VideoHeader, &[u8])> {
+    if data.len() <= VIDEO_HEADER_SIZE {
+        return None;
+    }
+    if data[0] != VIDEO_PROTOCOL_VERSION {
+        return None;
+    }
+    let header = VideoHeader {
+        version: data[0],
+        flags: data[1],
+        chunk_idx: data[2],
+        chunk_count: data[3],
+        seq: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+        width: u16::from_le_bytes([data[8], data[9]]),
+        height: u16::from_le_bytes([data[10], data[11]]),
+    };
+    if header.chunk_count == 0 || header.chunk_idx >= header.chunk_count {
+        return None;
+    }
+    if header.width < MIN_VIDEO_DIMENSION
+        || header.width > MAX_VIDEO_DIMENSION
+        || header.height < MIN_VIDEO_DIMENSION
+        || header.height > MAX_VIDEO_DIMENSION
+    {
+        return None;
+    }
+    let payload = &data[VIDEO_HEADER_SIZE..];
+    let is_last = header.chunk_idx == header.chunk_count - 1;
+    let valid_len = if is_last {
+        (1..=VIDEO_CHUNK_PAYLOAD).contains(&payload.len())
+    } else {
+        payload.len() == VIDEO_CHUNK_PAYLOAD
+    };
+    if !valid_len {
+        return None;
+    }
+    Some((header, payload))
+}
+
+// ── Reassembly ──────────────────────────────────────────────────────────
+
+struct PendingFrame {
+    chunk_count: u8,
+    received: u8,
+    /// Bit `i` set ⇒ chunk `i` received. 4 × 64 covers the u8 range.
+    bitmap: [u64; 4],
+    is_keyframe: bool,
+    width: u16,
+    height: u16,
+    /// Single pre-sized buffer; chunk `i` lands at `i * VIDEO_CHUNK_PAYLOAD`.
+    data: Vec<u8>,
+    /// Payload length of the final chunk, recorded when it arrives.
+    last_len: usize,
     first_seen: Instant,
 }
 
-/// Reassembles chunked video frames from individual chunk messages.
-///
-/// Keyed by `(client_id, seq)` so multiple peers can stream simultaneously.
-/// Incomplete frames are discarded after [`FRAME_TIMEOUT_MS`] or when
-/// the pending buffer exceeds [`MAX_PENDING_FRAMES`].
+impl PendingFrame {
+    fn mark(&mut self, idx: u8) -> bool {
+        let word = (idx / 64) as usize;
+        let bit = 1u64 << (idx % 64);
+        if self.bitmap[word] & bit != 0 {
+            return false; // duplicate
+        }
+        self.bitmap[word] |= bit;
+        self.received += 1;
+        true
+    }
+}
+
+/// Reassembly statistics (diagnostics only).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReassemblyStats {
+    pub chunks_received: u64,
+    pub chunks_rejected: u64,
+    pub frames_completed: u64,
+    pub frames_dropped: u64,
+}
+
+/// Reassembles video frames from chunks, across multiple senders.
 pub struct VideoReassembler {
     pending: HashMap<(u64, u32), PendingFrame>,
-    /// Stats for diagnostics.
-    pub frames_completed: u64,
-    pub frames_dropped_timeout: u64,
-    pub frames_dropped_overflow: u64,
-    pub chunks_received: u64,
-    pub chunks_duplicate: u64,
+    pub stats: ReassemblyStats,
+}
+
+impl Default for VideoReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VideoReassembler {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
-            frames_completed: 0,
-            frames_dropped_timeout: 0,
-            frames_dropped_overflow: 0,
-            chunks_received: 0,
-            chunks_duplicate: 0,
+            stats: ReassemblyStats::default(),
         }
     }
 
-    /// Process a raw chunk message received from the network.
-    ///
-    /// Returns `Some(ReassembledFrame)` if this chunk completed a frame,
-    /// `None` otherwise.
-    pub fn push_chunk(&mut self, raw: &[u8]) -> Option<ReassembledFrame> {
-        let hdr = parse_video_header(raw)?;
-        let payload = video_payload(raw)?;
-
-        if hdr.chunk_count == 0 || hdr.chunk_idx >= hdr.chunk_count {
+    /// Feed one chunk (relay envelope already stripped). Returns a frame
+    /// when its final missing chunk arrives.
+    pub fn push_chunk(&mut self, sender_id: u64, data: &[u8]) -> Option<ReassembledFrame> {
+        let Some((header, payload)) = parse_video_header(data) else {
+            self.stats.chunks_rejected += 1;
             return None;
-        }
+        };
+        self.stats.chunks_received += 1;
 
-        self.chunks_received += 1;
-
-        let key = (hdr.client_id, hdr.seq);
-
-        // Evict stale/overflow before touching the entry to avoid
-        // borrow conflicts with &mut self inside entry().
         self.evict_stale();
-        if self.pending.len() >= MAX_PENDING_FRAMES && !self.pending.contains_key(&key) {
-            self.evict_oldest();
-        }
 
-        let frame = self.pending.entry(key).or_insert_with(|| PendingFrame {
-            client_id: hdr.client_id,
-            chunk_count: hdr.chunk_count,
-            received: 0,
-            is_keyframe: hdr.is_keyframe(),
-            width: hdr.width,
-            height: hdr.height,
-            chunks: vec![None; hdr.chunk_count as usize],
-            first_seen: Instant::now(),
-        });
-
-        // Validate chunk_count consistency
-        if frame.chunk_count != hdr.chunk_count {
-            return None;
-        }
-
-        let idx = hdr.chunk_idx as usize;
-
-        // Duplicate chunk?
-        if frame.chunks[idx].is_some() {
-            self.chunks_duplicate += 1;
-            return None;
-        }
-
-        frame.chunks[idx] = Some(payload.to_vec());
-        frame.received += 1;
-
-        // Complete?
-        if frame.received == frame.chunk_count {
-            let frame = self.pending.remove(&key)?;
-            self.frames_completed += 1;
-
-            let total_size: usize = frame
-                .chunks
-                .iter()
-                .map(|c| c.as_ref().map_or(0, |v| v.len()))
-                .sum();
-            let mut data = Vec::with_capacity(total_size);
-            for chunk in &frame.chunks {
-                if let Some(p) = chunk {
-                    data.extend_from_slice(p);
-                }
+        let key = (sender_id, header.seq);
+        if !self.pending.contains_key(&key) {
+            if self.pending.len() >= MAX_PENDING_FRAMES {
+                self.evict_oldest();
             }
-
-            Some(ReassembledFrame {
-                client_id: frame.client_id,
-                seq: hdr.seq,
-                is_keyframe: frame.is_keyframe,
-                width: frame.width,
-                height: frame.height,
-                data,
-            })
-        } else {
-            None
+            self.pending.insert(
+                key,
+                PendingFrame {
+                    chunk_count: header.chunk_count,
+                    received: 0,
+                    bitmap: [0; 4],
+                    is_keyframe: header.is_keyframe(),
+                    width: header.width,
+                    height: header.height,
+                    data: vec![0; header.chunk_count as usize * VIDEO_CHUNK_PAYLOAD],
+                    last_len: 0,
+                    first_seen: Instant::now(),
+                },
+            );
         }
-    }
 
-    /// Remove frames that have been pending longer than the timeout.
-    fn evict_stale(&mut self) {
-        let now = Instant::now();
-        let before = self.pending.len();
-        self.pending.retain(|_key, frame| {
-            now.duration_since(frame.first_seen).as_millis() <= FRAME_TIMEOUT_MS
-        });
-        let evicted = before - self.pending.len();
-        self.frames_dropped_timeout += evicted as u64;
-    }
+        // Borrow scope: mutate the entry, deciding completeness.
+        let complete = {
+            let Some(frame) = self.pending.get_mut(&key) else {
+                return None; // unreachable: inserted above
+            };
+            // A chunk contradicting the frame's parameters is hostile or
+            // corrupt; reject the chunk, keep the frame.
+            if frame.chunk_count != header.chunk_count
+                || frame.width != header.width
+                || frame.height != header.height
+                || frame.is_keyframe != header.is_keyframe()
+            {
+                self.stats.chunks_rejected += 1;
+                return None;
+            }
+            if !frame.mark(header.chunk_idx) {
+                self.stats.chunks_rejected += 1; // duplicate
+                return None;
+            }
+            let offset = header.chunk_idx as usize * VIDEO_CHUNK_PAYLOAD;
+            frame.data[offset..offset + payload.len()].copy_from_slice(payload);
+            if header.chunk_idx == header.chunk_count - 1 {
+                frame.last_len = payload.len();
+            }
+            frame.received == frame.chunk_count
+        };
 
-    /// Evict the oldest non-keyframe pending frame to make room.
-    fn evict_oldest(&mut self) {
-        let oldest = self
-            .pending
-            .iter()
-            .filter(|(_, f)| !f.is_keyframe)
-            .min_by_key(|(_, f)| f.first_seen)
-            .map(|(&key, _)| key);
-
-        let to_remove = oldest.or_else(|| {
-            self.pending
-                .iter()
-                .min_by_key(|(_, f)| f.first_seen)
-                .map(|(&key, _)| key)
-        });
-
-        if let Some(key) = to_remove {
-            self.pending.remove(&key);
-            self.frames_dropped_overflow += 1;
+        if !complete {
+            return None;
         }
+
+        let Some(frame) = self.pending.remove(&key) else {
+            return None; // unreachable: checked above
+        };
+        let total = (frame.chunk_count as usize - 1) * VIDEO_CHUNK_PAYLOAD + frame.last_len;
+        let mut data = frame.data;
+        data.truncate(total);
+        self.stats.frames_completed += 1;
+        Some(ReassembledFrame {
+            sender_id,
+            seq: header.seq,
+            is_keyframe: frame.is_keyframe,
+            width: frame.width,
+            height: frame.height,
+            data,
+        })
     }
 
-    /// Number of frames currently being reassembled.
+    /// Drop all partial frames from one sender (stream stopped, user left).
+    pub fn forget_sender(&mut self, sender_id: u64) {
+        self.pending.retain(|(sid, _), _| *sid != sender_id);
+    }
+
+    /// Number of frames currently awaiting chunks.
+    #[must_use]
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
-    /// Reset all state (e.g. when a peer stops sharing).
+    /// Drop all partial frames.
     pub fn reset(&mut self) {
         self.pending.clear();
     }
-}
 
-// ── Tests ───────────────────────────────────────────────────────────────
+    fn evict_stale(&mut self) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|_, frame| frame.first_seen.elapsed() < FRAME_TIMEOUT);
+        self.stats.frames_dropped += (before - self.pending.len()) as u64;
+    }
+
+    fn evict_oldest(&mut self) {
+        if let Some(oldest) = self
+            .pending
+            .iter()
+            .min_by_key(|(_, frame)| frame.first_seen)
+            .map(|(key, _)| *key)
+        {
+            self.pending.remove(&oldest);
+            self.stats.frames_dropped += 1;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const TEST_CID: u64 = 12345;
+    const SENDER: u64 = 42;
 
-    #[test]
-    fn single_chunk_frame_roundtrips() {
-        let data = vec![0xAB; 500];
-        let chunks = pack_video_frame(TEST_CID, 42, true, 1280, 720, &data);
-        assert_eq!(chunks.len(), 1);
-
-        let mut r = VideoReassembler::new();
-        let frame = r.push_chunk(&chunks[0]).unwrap();
-
-        assert_eq!(frame.client_id, TEST_CID);
-        assert_eq!(frame.seq, 42);
-        assert!(frame.is_keyframe);
-        assert_eq!(frame.width, 1280);
-        assert_eq!(frame.height, 720);
-        assert_eq!(frame.data, data);
+    fn make_frame(len: usize, byte: u8) -> Vec<u8> {
+        vec![byte; len]
     }
 
     #[test]
-    fn multi_chunk_frame_roundtrips() {
-        let data = vec![0xCD; 5000]; // ~5 chunks
-        let chunks = pack_video_frame(TEST_CID, 99, false, 1920, 1080, &data);
-        assert_eq!(chunks.len(), 5);
+    fn single_chunk_roundtrip() {
+        let data = make_frame(500, 0xAA);
+        let chunks = pack_video_frame(1, true, 1920, 1080, &data).unwrap();
+        assert_eq!(chunks.len(), 1);
 
-        let mut r = VideoReassembler::new();
+        let mut reassembler = VideoReassembler::new();
+        let frame = reassembler.push_chunk(SENDER, &chunks[0]).unwrap();
+        assert_eq!(frame.data, data);
+        assert_eq!(frame.sender_id, SENDER);
+        assert!(frame.is_keyframe);
+        assert_eq!(frame.width, 1920);
+        assert_eq!(frame.height, 1080);
+    }
+
+    #[test]
+    fn multi_chunk_roundtrip() {
+        let data = make_frame(VIDEO_CHUNK_PAYLOAD * 3 + 123, 0xBB);
+        let chunks = pack_video_frame(7, false, 1280, 720, &data).unwrap();
+        assert_eq!(chunks.len(), 4);
+
+        let mut reassembler = VideoReassembler::new();
         for (i, chunk) in chunks.iter().enumerate() {
-            let result = r.push_chunk(chunk);
-            if i < chunks.len() - 1 {
+            let result = reassembler.push_chunk(SENDER, chunk);
+            if i < 3 {
                 assert!(result.is_none());
             } else {
                 let frame = result.unwrap();
-                assert_eq!(frame.seq, 99);
-                assert!(!frame.is_keyframe);
                 assert_eq!(frame.data, data);
+                assert_eq!(frame.seq, 7);
+                assert!(!frame.is_keyframe);
             }
         }
+        assert_eq!(reassembler.pending_count(), 0);
     }
 
     #[test]
-    fn out_of_order_chunks_reassemble() {
-        let data = vec![0xEF; 3500]; // 4 chunks
-        let chunks = pack_video_frame(TEST_CID, 7, true, 1280, 720, &data);
-        assert_eq!(chunks.len(), 4);
+    fn out_of_order_chunks() {
+        let data = make_frame(VIDEO_CHUNK_PAYLOAD * 2 + 50, 0xCC);
+        let chunks = pack_video_frame(9, true, 640, 480, &data).unwrap();
+        assert_eq!(chunks.len(), 3);
 
-        let mut r = VideoReassembler::new();
-        assert!(r.push_chunk(&chunks[3]).is_none());
-        assert!(r.push_chunk(&chunks[1]).is_none());
-        assert!(r.push_chunk(&chunks[0]).is_none());
-        let frame = r.push_chunk(&chunks[2]).unwrap();
+        let mut reassembler = VideoReassembler::new();
+        assert!(reassembler.push_chunk(SENDER, &chunks[2]).is_none());
+        assert!(reassembler.push_chunk(SENDER, &chunks[0]).is_none());
+        let frame = reassembler.push_chunk(SENDER, &chunks[1]).unwrap();
         assert_eq!(frame.data, data);
     }
 
     #[test]
     fn duplicate_chunks_ignored() {
-        let data = vec![0x11; 2500];
-        let chunks = pack_video_frame(TEST_CID, 1, false, 1280, 720, &data);
+        let data = make_frame(VIDEO_CHUNK_PAYLOAD + 10, 0xDD);
+        let chunks = pack_video_frame(3, false, 800, 600, &data).unwrap();
 
-        let mut r = VideoReassembler::new();
-        r.push_chunk(&chunks[0]);
-        r.push_chunk(&chunks[0]); // duplicate
-        assert_eq!(r.chunks_duplicate, 1);
-
-        r.push_chunk(&chunks[1]);
-        let frame = r.push_chunk(&chunks[2]).unwrap();
+        let mut reassembler = VideoReassembler::new();
+        assert!(reassembler.push_chunk(SENDER, &chunks[0]).is_none());
+        assert!(reassembler.push_chunk(SENDER, &chunks[0]).is_none()); // dup
+        let frame = reassembler.push_chunk(SENDER, &chunks[1]).unwrap();
         assert_eq!(frame.data, data);
     }
 
     #[test]
-    fn lost_chunk_means_lost_frame() {
-        let data = vec![0x22; 3500];
-        let chunks = pack_video_frame(TEST_CID, 5, false, 1280, 720, &data);
+    fn interleaved_senders_do_not_collide() {
+        // Same seq from two senders must reassemble independently.
+        let data_a = make_frame(VIDEO_CHUNK_PAYLOAD + 5, 0x01);
+        let data_b = make_frame(VIDEO_CHUNK_PAYLOAD + 5, 0x02);
+        let chunks_a = pack_video_frame(1, false, 800, 600, &data_a).unwrap();
+        let chunks_b = pack_video_frame(1, false, 800, 600, &data_b).unwrap();
 
-        let mut r = VideoReassembler::new();
-        r.push_chunk(&chunks[0]);
-        r.push_chunk(&chunks[1]);
-        r.push_chunk(&chunks[3]);
-
-        assert_eq!(r.pending_count(), 1);
-        assert_eq!(r.frames_completed, 0);
+        let mut reassembler = VideoReassembler::new();
+        assert!(reassembler.push_chunk(1, &chunks_a[0]).is_none());
+        assert!(reassembler.push_chunk(2, &chunks_b[0]).is_none());
+        let frame_b = reassembler.push_chunk(2, &chunks_b[1]).unwrap();
+        let frame_a = reassembler.push_chunk(1, &chunks_a[1]).unwrap();
+        assert_eq!(frame_a.data, data_a);
+        assert_eq!(frame_b.data, data_b);
     }
 
     #[test]
-    fn large_keyframe_chunks_correctly() {
-        let data = vec![0xFF; 120_000];
-        let chunks = pack_video_frame(TEST_CID, 1000, true, 1280, 720, &data);
-        // ceil(120_000 / 1_080) = 112
-        assert_eq!(chunks.len(), 112);
+    fn empty_frame_refused() {
+        assert!(pack_video_frame(1, false, 800, 600, &[]).is_none());
+    }
 
-        for chunk in &chunks {
-            assert!(chunk.len() <= VIDEO_CHUNK_PAYLOAD + VIDEO_HEADER_SIZE);
-        }
+    #[test]
+    fn oversize_frame_refused() {
+        let data = make_frame(MAX_VIDEO_FRAME_BYTES + 1, 0);
+        assert!(pack_video_frame(1, false, 800, 600, &data).is_none());
+    }
 
-        let mut r = VideoReassembler::new();
+    #[test]
+    fn max_size_frame_roundtrips() {
+        let data = make_frame(MAX_VIDEO_FRAME_BYTES, 0xEE);
+        let chunks = pack_video_frame(1, true, 3840, 2160, &data).unwrap();
+        assert_eq!(chunks.len(), 255);
+
+        let mut reassembler = VideoReassembler::new();
         let mut result = None;
         for chunk in &chunks {
-            result = r.push_chunk(chunk);
+            result = reassembler.push_chunk(SENDER, chunk);
         }
-        let frame = result.unwrap();
-        assert_eq!(frame.data, data);
-        assert!(frame.is_keyframe);
+        assert_eq!(result.unwrap().data, data);
     }
 
     #[test]
     fn malformed_chunks_rejected() {
-        let mut r = VideoReassembler::new();
-
-        // Too short
-        assert!(r.push_chunk(&[0; 5]).is_none());
-
-        // chunk_count = 0
-        let mut bad = vec![0u8; VIDEO_HEADER_SIZE + 10];
-        bad[0] = VIDEO_PROTOCOL_VERSION;
-        bad[3] = 0;
-        assert!(r.push_chunk(&bad).is_none());
-
-        // chunk_idx >= chunk_count
+        let mut reassembler = VideoReassembler::new();
+        // Too short.
+        assert!(reassembler.push_chunk(SENDER, &[2, 0, 0, 1]).is_none());
+        // Wrong version.
+        let chunks = pack_video_frame(1, false, 800, 600, &[1, 2, 3]).unwrap();
+        let mut bad = chunks[0].to_vec();
+        bad[0] = 1;
+        assert!(reassembler.push_chunk(SENDER, &bad).is_none());
+        // chunk_idx ≥ chunk_count.
+        let mut bad = chunks[0].to_vec();
         bad[2] = 5;
-        bad[3] = 3;
-        assert!(r.push_chunk(&bad).is_none());
+        bad[3] = 2;
+        assert!(reassembler.push_chunk(SENDER, &bad).is_none());
+        // Silly dimensions.
+        let mut bad = chunks[0].to_vec();
+        bad[8] = 0;
+        bad[9] = 0;
+        assert!(reassembler.push_chunk(SENDER, &bad).is_none());
+        assert_eq!(reassembler.stats.chunks_rejected, 4);
     }
 
     #[test]
-    fn chunk_size_fits_mtu() {
-        assert!(
-            VIDEO_CHUNK_PAYLOAD + VIDEO_HEADER_SIZE <= 1200,
-            "chunk total {} exceeds MTU safe zone",
-            VIDEO_CHUNK_PAYLOAD + VIDEO_HEADER_SIZE
-        );
+    fn non_last_chunk_with_short_payload_rejected() {
+        // Hand-build a 2-chunk frame where chunk 0 is undersized.
+        let mut bad = Vec::new();
+        bad.push(VIDEO_PROTOCOL_VERSION);
+        bad.push(0);
+        bad.push(0); // idx 0
+        bad.push(2); // count 2 ⇒ chunk 0 must be exactly VIDEO_CHUNK_PAYLOAD
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(&800u16.to_le_bytes());
+        bad.extend_from_slice(&600u16.to_le_bytes());
+        bad.extend_from_slice(&[0u8; 100]);
+        assert!(parse_video_header(&bad).is_none());
     }
 
     #[test]
-    fn multiple_peers_interleaved() {
-        let data_a = vec![0xAA; 2200];
-        let data_b = vec![0xBB; 2200];
-        let chunks_a = pack_video_frame(111, 1, false, 1280, 720, &data_a);
-        let chunks_b = pack_video_frame(222, 1, true, 1920, 1080, &data_b);
+    fn contradictory_chunk_rejected_without_poisoning_frame() {
+        let data = make_frame(VIDEO_CHUNK_PAYLOAD + 10, 0x11);
+        let chunks = pack_video_frame(5, false, 800, 600, &data).unwrap();
 
-        let mut r = VideoReassembler::new();
-        r.push_chunk(&chunks_a[0]);
-        r.push_chunk(&chunks_b[0]);
-        r.push_chunk(&chunks_a[1]);
-        r.push_chunk(&chunks_b[1]);
-
-        let frame_b = r.push_chunk(&chunks_b[2]).unwrap();
-        assert_eq!(frame_b.client_id, 222);
-        assert_eq!(frame_b.data, data_b);
-
-        let frame_a = r.push_chunk(&chunks_a[2]).unwrap();
-        assert_eq!(frame_a.client_id, 111);
-        assert_eq!(frame_a.data, data_a);
+        let mut reassembler = VideoReassembler::new();
+        assert!(reassembler.push_chunk(SENDER, &chunks[0]).is_none());
+        // Same (sender, seq) but different dims: reject chunk only.
+        let mut liar = chunks[1].to_vec();
+        liar[8..10].copy_from_slice(&1024u16.to_le_bytes());
+        assert!(reassembler.push_chunk(SENDER, &liar).is_none());
+        // Original frame still completes.
+        let frame = reassembler.push_chunk(SENDER, &chunks[1]).unwrap();
+        assert_eq!(frame.data, data);
     }
 
     #[test]
-    fn header_parse_roundtrip() {
-        let chunks = pack_video_frame(99999, 42, true, 1920, 1080, &[0xDE; 100]);
-        let hdr = parse_video_header(&chunks[0]).unwrap();
-        assert_eq!(hdr.version, VIDEO_PROTOCOL_VERSION);
-        assert_eq!(hdr.client_id, 99999);
-        assert_eq!(hdr.seq, 42);
-        assert!(hdr.is_keyframe());
-        assert_eq!(hdr.width, 1920);
-        assert_eq!(hdr.height, 1080);
-        assert_eq!(hdr.chunk_idx, 0);
-        assert_eq!(hdr.chunk_count, 1);
+    fn pending_overflow_evicts_oldest() {
+        let mut reassembler = VideoReassembler::new();
+        let data = make_frame(VIDEO_CHUNK_PAYLOAD + 1, 0);
+        // 17 incomplete frames; the first should be evicted.
+        for seq in 0..17u32 {
+            let chunks = pack_video_frame(seq, false, 800, 600, &data).unwrap();
+            assert!(reassembler.push_chunk(SENDER, &chunks[0]).is_none());
+        }
+        assert_eq!(reassembler.pending_count(), 16);
+        assert_eq!(reassembler.stats.frames_dropped, 1);
+    }
+
+    #[test]
+    fn forget_sender_clears_only_that_sender() {
+        let data = make_frame(VIDEO_CHUNK_PAYLOAD + 1, 0);
+        let chunks = pack_video_frame(1, false, 800, 600, &data).unwrap();
+        let mut reassembler = VideoReassembler::new();
+        assert!(reassembler.push_chunk(1, &chunks[0]).is_none());
+        assert!(reassembler.push_chunk(2, &chunks[0]).is_none());
+        reassembler.forget_sender(1);
+        assert_eq!(reassembler.pending_count(), 1);
+        // Sender 2 can still finish.
+        assert!(reassembler.push_chunk(2, &chunks[1]).is_some());
     }
 }

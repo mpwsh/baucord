@@ -30,6 +30,14 @@ language-system = System default
 language-note =
     Applies immediately. Windows that are already open update when
     reopened, and chat history keeps its original language.
+# ── Server config (connect + settings) ──────────────────────────────────
+server-password = Server password (optional)
+connect-server-note = Connecting to { $server } — change in Settings
+settings-server = Server
+server-token-url = Token URL (secure servers only)
+server-config-note =
+    Leave the token URL empty for open/LAN servers.
+    Changes apply on the next connect.
 
 # ── Sidebar ─────────────────────────────────────────────────────────────
 users-count = Users: { $count }

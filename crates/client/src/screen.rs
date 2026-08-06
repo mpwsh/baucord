@@ -88,6 +88,13 @@ pub enum ScreenControl {
     /// A viewer (relayed via the server) asked for a fresh keyframe —
     /// their decoder hit an unrecoverable gap, or they joined mid-GOP.
     ForceKeyframe,
+    /// Aggregated viewer health for our stream, relayed by the network
+    /// thread ~1/s while sharing. Drives sender-side fps adaptation.
+    StreamHealth {
+        worst_loss: f32,
+        worst_rtt_ms: f32,
+        viewers: u16,
+    },
     /// Clean shutdown.
     Shutdown,
 }
@@ -141,6 +148,16 @@ pub struct SharedScreenState {
     pub last_capture_us: Arc<AtomicU32>,
     /// Selected quality by streamer
     pub current_quality: Arc<Mutex<Option<Quality>>>,
+    /// Worst packet loss among our viewers, in percent, stored as f32
+    /// bits — read with `f32::from_bits`. Updated ~1/s while sharing.
+    pub stream_loss_pct: Arc<AtomicU32>,
+    /// Worst viewer RTT in milliseconds, stored as f32 bits.
+    pub stream_rtt_ms: Arc<AtomicU32>,
+    /// Number of viewers currently subscribed to our stream.
+    pub stream_viewers: Arc<AtomicU32>,
+    /// Current capture pace as a percentage of the preset fps
+    /// (100 / 75 / 50) — sender-side adaptation under viewer loss.
+    pub fps_scale_pct: Arc<AtomicU32>,
 }
 
 impl SharedScreenState {
@@ -152,6 +169,10 @@ impl SharedScreenState {
             last_encode_us: Arc::new(AtomicU32::new(0)),
             last_capture_us: Arc::new(AtomicU32::new(0)),
             current_quality: Arc::new(Mutex::new(None)),
+            stream_loss_pct: Arc::new(AtomicU32::new(0)),
+            stream_rtt_ms: Arc::new(AtomicU32::new(0)),
+            stream_viewers: Arc::new(AtomicU32::new(0)),
+            fps_scale_pct: Arc::new(AtomicU32::new(100)),
         }
     }
 }
@@ -223,6 +244,81 @@ struct CaptureState {
     /// System audio capture — started alongside video, sends Opus stereo
     /// packets to the network. `None` if platform doesn't support it.
     system_audio: Option<SystemAudioCapture>,
+    /// Index into `PACE_SCALES` — current fps adaptation step.
+    pace_idx: usize,
+    /// When the pace last changed (hysteresis cooldown).
+    pace_changed: Instant,
+    /// Since when viewer loss has been continuously low (recovery hold).
+    pace_good_since: Option<Instant>,
+}
+
+// ── Sender-side fps adaptation ──────────────────────────────────────────
+//
+// When viewers report sustained packet loss (via the server's
+// StreamHealth aggregation), reduce capture fps instead of per-frame
+// quality: bitrate falls roughly proportionally while every frame keeps
+// its full clarity — the right trade for screen share, where viewers
+// are *reading* the stream, not judging motion smoothness. The
+// encoder's bitrate/quality settings are untouched; in fact each frame
+// gets a slightly larger share of the rate budget.
+
+const PACE_SCALES: [f32; 3] = [1.0, 0.75, 0.5];
+/// Step the fps down when worst viewer loss exceeds this.
+const PACE_LOSS_STEP_DOWN: f32 = 0.08;
+/// Consider the link recovered below this loss.
+const PACE_LOSS_RECOVERED: f32 = 0.02;
+/// Minimum time between pace changes.
+const PACE_STEP_COOLDOWN: Duration = Duration::from_secs(2);
+/// How long loss must stay low before stepping back up.
+const PACE_RECOVER_HOLD: Duration = Duration::from_secs(5);
+
+/// The capture interval at the current pace.
+fn effective_frame_interval(state: &CaptureState) -> Duration {
+    state
+        .quality
+        .frame_duration()
+        .mul_f32(1.0 / PACE_SCALES[state.pace_idx])
+}
+
+/// Apply one StreamHealth sample to the pace state machine.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn adapt_pace(state: &mut CaptureState, worst_loss: f32, shared: &SharedScreenState) {
+    let now = Instant::now();
+    if worst_loss >= PACE_LOSS_STEP_DOWN {
+        state.pace_good_since = None;
+        if state.pace_idx + 1 < PACE_SCALES.len()
+            && now.duration_since(state.pace_changed) >= PACE_STEP_COOLDOWN
+        {
+            state.pace_idx += 1;
+            state.pace_changed = now;
+            info!(
+                "📺 Viewer loss {:.1}% — reducing capture to {:.0}% fps (clarity preserved)",
+                worst_loss * 100.0,
+                PACE_SCALES[state.pace_idx] * 100.0
+            );
+        }
+    } else if worst_loss <= PACE_LOSS_RECOVERED {
+        if state.pace_idx > 0 {
+            let since = *state.pace_good_since.get_or_insert(now);
+            if now.duration_since(since) >= PACE_RECOVER_HOLD
+                && now.duration_since(state.pace_changed) >= PACE_STEP_COOLDOWN
+            {
+                state.pace_idx -= 1;
+                state.pace_changed = now;
+                state.pace_good_since = Some(now);
+                info!(
+                    "📺 Viewer link recovered — restoring capture to {:.0}% fps",
+                    PACE_SCALES[state.pace_idx] * 100.0
+                );
+            }
+        }
+    } else {
+        // Middle band: hold the current pace, restart the recovery clock.
+        state.pace_good_since = None;
+    }
+    shared
+        .fps_scale_pct
+        .store((PACE_SCALES[state.pace_idx] * 100.0) as u32, Ordering::Relaxed);
 }
 
 // ── Decoder state for incoming streams ──────────────────────────────────
@@ -373,8 +469,9 @@ fn run_screen_loop(
             }
 
             // Advance from the previous target (not from now) so the
-            // capture cadence stays exact instead of drifting.
-            next_capture += state.quality.frame_duration();
+            // capture cadence stays exact instead of drifting. The
+            // interval reflects the current pace (fps adaptation).
+            next_capture += effective_frame_interval(state);
 
             // If we fell behind, skip to now (don't burst)
             if next_capture < Instant::now() {
@@ -385,7 +482,7 @@ fn run_screen_loop(
             log::debug!(
                 "📊 ENCODE seq={} {cap_ms:.1}ms (budget {:.1}ms)",
                 state.seq,
-                state.quality.frame_duration().as_secs_f32() * 1000.0
+                effective_frame_interval(state).as_secs_f32() * 1000.0
             );
         }
     }
@@ -549,10 +646,17 @@ fn handle_control(
                 quality,
                 seq: 0,
                 system_audio,
+                pace_idx: 0,
+                pace_changed: Instant::now(),
+                pace_good_since: None,
             });
 
             shared.is_sharing.store(true, Ordering::Relaxed);
             shared.frames_encoded.store(0, Ordering::Relaxed);
+            shared.fps_scale_pct.store(100, Ordering::Relaxed);
+            shared.stream_loss_pct.store(0, Ordering::Relaxed);
+            shared.stream_rtt_ms.store(0, Ordering::Relaxed);
+            shared.stream_viewers.store(0, Ordering::Relaxed);
             *shared.current_quality.lock().unwrap() = Some(quality);
 
             // Tell network to signal other clients. These are the
@@ -570,6 +674,10 @@ fn handle_control(
         ScreenControl::StopSharing => {
             if st.capture.take().is_some() {
                 shared.is_sharing.store(false, Ordering::Relaxed);
+                shared.fps_scale_pct.store(100, Ordering::Relaxed);
+                shared.stream_loss_pct.store(0, Ordering::Relaxed);
+                shared.stream_rtt_ms.store(0, Ordering::Relaxed);
+                shared.stream_viewers.store(0, Ordering::Relaxed);
                 let _ = network_tx.send(NetworkControl::ScreenShareStop);
                 *shared.current_quality.lock().unwrap() = None;
                 event_tx.send(ScreenEvent::SharingStopped).ok();
@@ -726,6 +834,25 @@ fn handle_control(
             if let Some(state) = &mut st.capture {
                 info!("📺 Viewer requested keyframe — forcing IDR");
                 state.encoder.force_keyframe();
+            }
+        }
+
+        ScreenControl::StreamHealth {
+            worst_loss,
+            worst_rtt_ms,
+            viewers,
+        } => {
+            shared
+                .stream_loss_pct
+                .store((worst_loss * 100.0).to_bits(), Ordering::Relaxed);
+            shared
+                .stream_rtt_ms
+                .store(worst_rtt_ms.to_bits(), Ordering::Relaxed);
+            shared
+                .stream_viewers
+                .store(u32::from(viewers), Ordering::Relaxed);
+            if let Some(state) = &mut st.capture {
+                adapt_pace(state, worst_loss, shared);
             }
         }
 
