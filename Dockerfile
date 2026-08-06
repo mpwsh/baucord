@@ -5,7 +5,7 @@ WORKDIR /app
 FROM chef AS planner
 COPY Cargo.* ./
 COPY crates crates
-RUN rm -rf crates/audio crates/client crates/ui crates/video
+RUN rm -rf crates/audio crates/client crates/desktop crates/protocol crates/ui crates/video
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -15,7 +15,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Build the binary
 COPY Cargo.* ./
 COPY crates crates
-RUN rm -rf crates/audio crates/client crates/ui crates/video
+RUN rm -rf crates/audio crates/client crates/desktop crates/protocol crates/ui crates/video
 RUN cargo build --release --bin server && \
   strip target/release/server
 

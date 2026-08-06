@@ -2,20 +2,27 @@
 members = ["crates/*"]
 resolver = "2"
 
-[workspace.package]
-version = "0.1.0"
-edition = "2021"
-authors = ["x@mpw.sh"]
+# ── Shared dependency versions ──────────────────────────────────────────
+# Crates opt in per dependency with `dep.workspace = true`. Only deps
+# used by two or more crates live here; single-user deps stay local.
+[workspace.dependencies]
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+crossbeam-channel = "0.5.15"
+fltk = { version = "1.5", features = ["fltk-bundled"] }
+renet = "2.0"
 
-# ── Shared lints (inherited by crates via `[lints] workspace = true`) ────
+# ── Shared lints (crates opt in with `[lints] workspace = true`) ────────
 [workspace.lints.rust]
 future-incompatible = "warn"
 nonstandard_style = { level = "deny", priority = -1 }
 
 [workspace.lints.clippy]
-all = { level = "deny", priority = 10 }
-pedantic = { level = "warn", priority = 3 }
-redundant_clone = { level = "deny", priority = 9 }
+# Groups sit at negative priority so the individual lints below can
+# override them — cargo applies lower priorities first.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+redundant_clone = "deny"
 
 # ── Release: fast binary ────────────────────────────────────────────────
 [profile.release]

@@ -3,6 +3,9 @@ name = "server"
 version = "0.2.3"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 protocol = { path = "../protocol" }
 bytes = "1.11.1"
@@ -16,6 +19,3 @@ log = "0.4"
 env_logger = "0.11"
 clap = { version = "4.5.45", features = ["derive"] }
 serde_yaml = "0.9.34"
-
-[lints]
-workspace = true

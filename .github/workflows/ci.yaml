@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Guards the client/desktop split: the core crate must keep compiling
+  # for iOS with no desktop-only dependencies leaking in. This is the
+  # cheapest job in the repo (no FFmpeg, no fltk, no linking) and it
+  # catches the exact class of regression that is invisible on desktop.
+  ios-seam:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-seam
+      - name: Core compiles for iOS
+        run: cargo check -p client --target aarch64-apple-ios
+      - name: Audio compiles for iOS
+        run: cargo check -p audio --target aarch64-apple-ios

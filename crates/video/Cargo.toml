@@ -3,8 +3,11 @@ name = "video"
 version = "0.2.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
-log = "0.4"
+log.workspace = true
 thiserror = "2"
 
 # Desktop-only backends. iOS/Android builds get stub implementations

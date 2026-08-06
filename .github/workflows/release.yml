@@ -106,21 +106,25 @@ jobs:
       - name: Get version
         id: version
         shell: bash
-        run: grep '^version' crates/client/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | xargs -I{} echo "version={}" >> "$GITHUB_OUTPUT"
+        run: grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | xargs -I{} echo "version={}" >> "$GITHUB_OUTPUT"
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
+        # The desktop crate pins `[[bin]] name = "baucord"` (the updater
+        # and release zips expect that exact name), so cargo's output is
+        # `baucord`, not `desktop`.
         run: |
           mkdir -p staging
-          cp target/${{ matrix.target }}/deploy/client staging/baucord
+          cp target/${{ matrix.target }}/deploy/baucord staging/baucord
           cp target/${{ matrix.target }}/deploy/server staging/dedicated-server
           cd staging
           zip -r ../baucord-v${{ steps.version.outputs.version }}-${{ matrix.suffix }}.zip baucord dedicated-server
       - name: Package (Windows)
         if: runner.os == 'Windows'
+        # Same as Unix: the binary is already named baucord.exe.
         run: |
           mkdir staging
-          copy target\${{ matrix.target }}\deploy\client.exe staging\baucord.exe
+          copy target\${{ matrix.target }}\deploy\baucord.exe staging\baucord.exe
           copy target\${{ matrix.target }}\deploy\server.exe staging\dedicated-server.exe
           cd staging
           Compress-Archive -Path baucord.exe,dedicated-server.exe -DestinationPath ..\baucord-v${{ steps.version.outputs.version }}-${{ matrix.suffix }}.zip
@@ -148,7 +152,7 @@ jobs:
           files: artifacts/*.zip
       - name: Prepare release files for R2
         run: |
-          VERSION=$(grep '^version' crates/client/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           mkdir -p r2-upload
           cp artifacts/*.zip r2-upload/
           echo "$VERSION" > r2-upload/version

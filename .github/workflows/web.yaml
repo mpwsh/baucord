@@ -21,7 +21,7 @@ jobs:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
       - name: Stamp version into index.html
         run: |
-          VERSION=$(grep '^version' crates/client/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           sed -i "s/__VERSION__/$VERSION/g" web/index.html
       - name: Upload to R2
         uses: jakejarvis/s3-sync-action@v0.5.1
@@ -32,4 +32,4 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_S3_ENDPOINT: https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com
-          SOURCE_DIR: web 
+          SOURCE_DIR: web
