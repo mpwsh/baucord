@@ -55,14 +55,19 @@ pub const MAX_VIDEO_DIMENSION: u16 = 4096;
 
 const FLAG_KEYFRAME: u8 = 0b0000_0001;
 
-/// Discard incomplete frames older than this. At 30 fps a frame missing
-/// chunks for 500 ms is 15 frames stale — unrecoverable, waiting for a
-/// keyframe anyway.
-const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
+/// Discard incomplete frames older than this. Must comfortably exceed
+/// the worst-case *transit time* of one frame, not one frame interval:
+/// a VBV-capped keyframe (~250 KB) needs 250–350 ms of pure wire time
+/// at stream bitrate before jitter — a 500 ms timeout silently evicted
+/// marginal keyframes and locked the stream into a PLI → forced-IDR →
+/// evicted-again loop. 2 s equals the GOP interval: anything still
+/// incomplete then is superseded by the next natural keyframe anyway.
+const FRAME_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Maximum in-flight partial frames across all senders. Bounds hostile
 /// or badly-reordered input; normal operation holds 1–2 per stream.
 const MAX_PENDING_FRAMES: usize = 16;
+
 
 /// Parsed chunk header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,12 +348,21 @@ impl VideoReassembler {
         self.pending.clear();
     }
 
-    fn evict_stale(&mut self) {
+   fn evict_stale(&mut self) {
         let before = self.pending.len();
-        self.pending
-            .retain(|_, frame| frame.first_seen.elapsed() < FRAME_TIMEOUT);
+        self.pending.retain(|(sender, seq), frame| {
+            let keep = frame.first_seen.elapsed() < FRAME_TIMEOUT;
+            if !keep {
+                log::warn!(
+                    "reassembly timeout: dropped frame seq={seq} from {sender} \
+                     with {}/{} chunks (keyframe: {})",
+                    frame.received, frame.chunk_count, frame.is_keyframe,
+                );
+            }
+            keep
+        });
         self.stats.frames_dropped += (before - self.pending.len()) as u64;
-    }
+    } 
 
     fn evict_oldest(&mut self) {
         if let Some(oldest) = self

@@ -98,6 +98,7 @@ pub struct App {
     // Device hot-reload polling
     last_input_devices: Vec<(String, bool)>,
     last_output_devices: Vec<(String, bool)>,
+    frames_coalesced: u64,
 }
 
 impl App {
@@ -181,6 +182,7 @@ impl App {
             sentinel_window: None,
             last_input_devices: Vec::new(),
             last_output_devices: Vec::new(),
+            frames_coalesced: 0,
         }
     }
 
@@ -265,12 +267,23 @@ impl App {
             let mut latest_frames: HashMap<u64, ScreenEvent> = HashMap::new();
             for _ in 0..64 {
                 match self.screen.event_rx.try_recv() {
-                    Ok(evt @ ScreenEvent::FrameReady { .. }) => {
+                   Ok(evt @ ScreenEvent::FrameReady { .. }) => {
                         if let ScreenEvent::FrameReady { client_id, .. } = &evt {
-                            latest_frames.insert(*client_id, evt);
+                            if latest_frames.insert(*client_id, evt).is_some() {
+                                // A newer frame displaced an unrendered one
+                                // this pass — the only case coalescing
+                                // actually skips anything.
+                                self.frames_coalesced += 1;
+                                if self.frames_coalesced % 60 == 0 {
+                                    log::warn!(
+                                        "📊 UI coalescing has skipped {} frames — main thread slower than stream",
+                                        self.frames_coalesced
+                                    );
+                                }
+                            }
                         }
                         needs_redraw = true;
-                    }
+                    } 
                     Ok(evt) => {
                         self.handle_screen_event(evt);
                         needs_redraw = true;

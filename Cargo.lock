@@ -3111,6 +3111,7 @@ dependencies = [
 name = "protocol"
 version = "0.2.0"
 dependencies = [
+ "log",
  "postcard",
  "renet",
  "serde",
