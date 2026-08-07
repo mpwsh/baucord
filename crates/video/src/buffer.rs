@@ -19,10 +19,14 @@
 //!   a short *reorder window* (derived from measured arrival jitter,
 //!   clamped to 20–150 ms) to give a reordered packet time to arrive.
 //! - When the window expires, the buffer recovers: it jumps forward to a
-//!   buffered **keyframe** if one exists (clean restart), otherwise it
-//!   skips to the next available packet and raises a *keyframe request*
-//!   (the frames after an unhealed gap reference lost data — the only
-//!   real fix is a fresh IDR from the sender).
+//!   buffered **keyframe** if one exists (clean restart). Otherwise it
+//!   **freezes**: buffered deltas are discarded, the buffer drops back to
+//!   the unprimed state, and a *keyframe request* is raised — every frame
+//!   past an unhealed gap references lost data, and decoding them anyway
+//!   paints reference-corruption smear (ghosting, dragged blocks) until
+//!   the next IDR. For viewers actually watching a stream, a short
+//!   freeze on the last clean frame reads far better than motion made of
+//!   artifacts. Delivery resumes at the next keyframe.
 //!
 //! # Keyframe requests
 //!
@@ -75,6 +79,9 @@ pub struct JitterBufferStats {
     pub packets_dropped_late: u64,
     /// Sequence gaps that expired the reorder window (packet truly lost).
     pub gaps_detected: u64,
+    /// Packets discarded because an unhealed gap broke their reference
+    /// chain (the buffer froze rather than decode them into smear).
+    pub packets_dropped_broken_reference: u64,
     /// Recoveries that jumped forward to a buffered keyframe.
     pub keyframe_resets: u64,
     /// Keyframe requests raised toward the sender.
@@ -235,17 +242,27 @@ impl VideoJitterBuffer {
             return Some(packet);
         }
 
-        // No keyframe buffered: skip to the closest available packet so the
-        // stream keeps moving, and ask the sender for an IDR — every frame
-        // from here on references lost data and will show artifacts until
-        // one arrives.
-        let skip_to = self.closest_seq_after(next)?;
+        // No keyframe buffered: every buffered and future delta frame
+        // references data that is gone. Decoding them would keep motion
+        // on screen at the cost of reference-corruption smear until the
+        // next IDR — the wrong trade for people *watching* a stream.
+        // Freeze instead: discard the orphaned deltas, drop back to
+        // unprimed (only a keyframe restarts delivery — the same
+        // machinery as stream start), and ask the sender for an IDR.
+        // If that IDR is itself lost, the unprimed-grace logic in
+        // `push` re-raises the request, so recovery self-heals.
+        let dropped = self.pending.len();
+        self.pending.clear();
+        self.stats.packets_dropped_broken_reference += dropped as u64;
+        self.primed = false;
+        self.next_seq = None;
+        self.unprimed_since = Some(now);
         self.want_keyframe = true;
-        let packet = self.pending.remove(&skip_to).expect("located above");
-        self.next_seq = Some(skip_to.wrapping_add(1));
-        self.stats.packets_delivered += 1;
-        self.stats.current_depth = self.pending.len();
-        Some(packet)
+        self.stats.current_depth = 0;
+        log::debug!(
+            "gap at seq {next} with no buffered keyframe: froze, dropped {dropped} delta(s), requesting IDR"
+        );
+        None
     }
 
     /// True at most once per [`KEYFRAME_REQUEST_COOLDOWN`] when recovery
@@ -340,15 +357,6 @@ impl VideoJitterBuffer {
             .min_by_key(|&s| s.wrapping_sub(after))
     }
 
-    /// The buffered packet closest after `after` (wraparound-aware).
-    fn closest_seq_after(&self, after: u32) -> Option<u32> {
-        self.pending
-            .keys()
-            .filter(|&&s| is_seq_after(s, after))
-            .copied()
-            .min_by_key(|&s| s.wrapping_sub(after))
-    }
-
     /// The buffer hit its size cap: the consumer stalled for seconds.
     /// Jump to the *freshest* buffered keyframe (dropping everything
     /// older — it's stale by definition), or clear entirely and request
@@ -379,8 +387,14 @@ impl VideoJitterBuffer {
                 self.stats.packets_dropped_overflow += self.pending.len() as u64;
                 self.pending.clear();
                 self.gap_since = None;
+                // Same freeze semantics as an unhealed gap: nothing
+                // buffered is decodable without a keyframe, so drop to
+                // unprimed and resume at the next IDR.
+                self.primed = false;
+                self.next_seq = None;
+                self.unprimed_since = Some(Instant::now());
                 self.want_keyframe = true;
-                log::warn!("jitter buffer overflow with no buffered keyframe: cleared, requesting IDR");
+                log::warn!("jitter buffer overflow with no buffered keyframe: froze, requesting IDR");
             }
         }
     }
@@ -520,22 +534,38 @@ mod tests {
     }
 
     #[test]
-    fn expired_gap_skips_and_requests_keyframe() {
+    fn expired_gap_without_keyframe_freezes_and_requests() {
         let mut buf = VideoJitterBuffer::new(30);
         buf.set_reorder_wait(Duration::ZERO);
         buf.push(pkt(0, true));
         assert_eq!(buf.pull_next().unwrap().seq, 0);
 
         buf.push(pkt(3, false)); // 1, 2 lost; no keyframe ahead
+        buf.push(pkt(4, false));
         // Zero-length window: the pull that observes the gap also finds it
-        // already expired, so recovery happens immediately.
-        let p = buf.pull_next().expect("skips to next available");
-        assert_eq!(p.seq, 3);
-        // Reference chain is broken → keyframe request raised.
+        // already expired. Freeze: nothing is delivered (decoding these
+        // deltas would smear), the orphans are dropped, and an IDR is
+        // requested.
+        assert!(buf.pull_next().is_none());
+        assert!(!buf.is_primed());
+        assert_eq!(buf.depth(), 0);
+        assert_eq!(buf.stats.packets_dropped_broken_reference, 2);
         assert!(buf.take_keyframe_request());
         // Rate-limited: not twice in a row.
         assert!(!buf.take_keyframe_request());
         assert_eq!(buf.stats.gaps_detected, 1);
+
+        // More deltas from the broken GOP arrive: still frozen.
+        buf.push(pkt(5, false));
+        assert!(buf.pull_next().is_none());
+
+        // The requested IDR arrives: delivery resumes cleanly from it.
+        buf.push(pkt(6, true));
+        let p = buf.pull_next().expect("resumes at the keyframe");
+        assert_eq!(p.seq, 6);
+        assert!(p.is_keyframe);
+        buf.push(pkt(7, false));
+        assert_eq!(buf.pull_next().unwrap().seq, 7);
     }
 
     #[test]
@@ -592,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn overflow_without_keyframe_clears_and_requests() {
+    fn overflow_without_keyframe_freezes_and_requests() {
         let mut buf = VideoJitterBuffer::new(3); // max_depth = 9
         buf.set_reorder_wait(Duration::from_secs(3600));
         buf.push(pkt(0, true));
@@ -602,7 +632,13 @@ mod tests {
             buf.push(pkt(seq, false)); // all deltas, overflow on the 10th
         }
         assert_eq!(buf.depth(), 0);
+        assert!(!buf.is_primed());
         assert!(buf.take_keyframe_request());
+
+        // Resumes at the next keyframe, exactly like stream start.
+        buf.push(pkt(12, true));
+        assert!(buf.is_primed());
+        assert_eq!(buf.pull_next().unwrap().seq, 12);
     }
 
     #[test]
