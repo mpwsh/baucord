@@ -250,6 +250,8 @@ struct CaptureState {
     pace_changed: Instant,
     /// Since when viewer loss has been continuously low (recovery hold).
     pace_good_since: Option<Instant>,
+    /// Consecutive over-threshold StreamHealth samples (spike filter).
+    pace_bad_samples: u32,
 }
 
 // ── Sender-side fps adaptation ──────────────────────────────────────────
@@ -271,6 +273,17 @@ const PACE_LOSS_RECOVERED: f32 = 0.02;
 const PACE_STEP_COOLDOWN: Duration = Duration::from_secs(2);
 /// How long loss must stay low before stepping back up.
 const PACE_RECOVER_HOLD: Duration = Duration::from_secs(5);
+/// Ignore StreamHealth samples with implausible loss. renet computes
+/// loss over a 6 s window that excludes the newest 900 ms; on a quiet
+/// or freshly-subscribed connection that window holds a handful of
+/// packets (idle exchanges even end with a terminal ack packet that is
+/// never acked), so a perfect link can read 50–100% "loss". A link
+/// that genuinely loses half its packets can't watch a stream at all —
+/// adaptation has nothing useful to do with such a sample either way.
+const PACE_LOSS_IMPLAUSIBLE: f32 = 0.5;
+/// Consecutive over-threshold samples (1/s each) required to step down —
+/// a single spike is measurement noise, three seconds of it is weather.
+const PACE_STEP_DOWN_SAMPLES: u32 = 3;
 
 /// The capture interval at the current pace.
 fn effective_frame_interval(state: &CaptureState) -> Duration {
@@ -284,20 +297,28 @@ fn effective_frame_interval(state: &CaptureState) -> Duration {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn adapt_pace(state: &mut CaptureState, worst_loss: f32, shared: &SharedScreenState) {
     let now = Instant::now();
-    if worst_loss >= PACE_LOSS_STEP_DOWN {
+    if worst_loss >= PACE_LOSS_IMPLAUSIBLE {
+        // Measurement artifact (or a dead link, where fps changes help
+        // nobody): display it, adapt on nothing, hold all timers.
+        state.pace_bad_samples = 0;
+    } else if worst_loss >= PACE_LOSS_STEP_DOWN {
         state.pace_good_since = None;
-        if state.pace_idx + 1 < PACE_SCALES.len()
+        state.pace_bad_samples += 1;
+        if state.pace_bad_samples >= PACE_STEP_DOWN_SAMPLES
+            && state.pace_idx + 1 < PACE_SCALES.len()
             && now.duration_since(state.pace_changed) >= PACE_STEP_COOLDOWN
         {
             state.pace_idx += 1;
             state.pace_changed = now;
+            state.pace_bad_samples = 0;
             info!(
-                "📺 Viewer loss {:.1}% — reducing capture to {:.0}% fps (clarity preserved)",
+                "Viewer loss {:.1}% sustained — reducing capture to {:.0}% fps (clarity preserved)",
                 worst_loss * 100.0,
                 PACE_SCALES[state.pace_idx] * 100.0
             );
         }
     } else if worst_loss <= PACE_LOSS_RECOVERED {
+        state.pace_bad_samples = 0;
         if state.pace_idx > 0 {
             let since = *state.pace_good_since.get_or_insert(now);
             if now.duration_since(since) >= PACE_RECOVER_HOLD
@@ -307,18 +328,20 @@ fn adapt_pace(state: &mut CaptureState, worst_loss: f32, shared: &SharedScreenSt
                 state.pace_changed = now;
                 state.pace_good_since = Some(now);
                 info!(
-                    "📺 Viewer link recovered — restoring capture to {:.0}% fps",
+                    "Viewer link recovered — restoring capture to {:.0}% fps",
                     PACE_SCALES[state.pace_idx] * 100.0
                 );
             }
         }
     } else {
-        // Middle band: hold the current pace, restart the recovery clock.
+        // Middle band: hold the current pace, restart both clocks.
+        state.pace_bad_samples = 0;
         state.pace_good_since = None;
     }
-    shared
-        .fps_scale_pct
-        .store((PACE_SCALES[state.pace_idx] * 100.0) as u32, Ordering::Relaxed);
+    shared.fps_scale_pct.store(
+        (PACE_SCALES[state.pace_idx] * 100.0) as u32,
+        Ordering::Relaxed,
+    );
 }
 
 // ── Decoder state for incoming streams ──────────────────────────────────
@@ -541,7 +564,11 @@ fn drain_and_decode(
                 Ok(Some(decoded)) => {
                     let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
                     let decoded_at = Instant::now();
-                    if decode_ms > 10.0 {
+                    // 1080p keyframes cost 12–15 ms in software decode —
+                    // that's normal and the jitter buffer absorbs it.
+                    // Only flag decodes that actually threaten cadence.
+                    let slow_threshold = if is_keyframe { 33.0 } else { 15.0 };
+                    if decode_ms > slow_threshold {
                         log::warn!("Slow decode: {decode_ms:.1}ms for seq {seq}");
                     }
                     event_tx
@@ -649,6 +676,7 @@ fn handle_control(
                 pace_idx: 0,
                 pace_changed: Instant::now(),
                 pace_good_since: None,
+                pace_bad_samples: 0,
             });
 
             shared.is_sharing.store(true, Ordering::Relaxed);

@@ -45,7 +45,6 @@ users-count = Usuarios: { $count }
 status-connecting = Conectando ...
 status-connected = Conectado
 status-disconnected = Desconectado
-latency-line = Audio: { $audio } | Servidor: { $network }
 mute = Mutear
 unmute = Desmutear
 deafen = Ensordecer
@@ -57,7 +56,11 @@ user-volume = Volumen del usuario
 reset-audio = Restablecer audio
 watch-stream = Ver transmisión
 live = En vivo
-stream-stats = Transmisión: { $quality } | { $kb }KB | { $ms }ms cod
+stream-stats-quality = { $quality } · { $viewers } viendo
+stream-stats-frame = { $kb }KB · { $ms }ms cod
+stream-stats-degraded = { $fps }% fps · pérdida { $loss }%
+latency-line = Audio: { $audio } | Server: { $network } | ↑{ $up } ↓{ $down } Mb
+
 
 # ── Chat ────────────────────────────────────────────────────────────────
 send = Enviar

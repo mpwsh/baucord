@@ -112,12 +112,7 @@ fn name_color(state: &UserState, is_us: bool) -> enums::Color {
 
 /// Style the row's action button: "Live" badge when sharing, invisible
 /// slot for self, hidden "…" (revealed on hover) for remote users.
-fn style_action_btn(
-    btn: &mut button::Button,
-    is_sharing: bool,
-    is_us: bool,
-    row_bg: enums::Color,
-) {
+fn style_action_btn(btn: &mut button::Button, is_sharing: bool, is_us: bool, row_bg: enums::Color) {
     if is_sharing {
         btn.set_label(&t!("live"));
         btn.set_label_size(11);
@@ -151,6 +146,18 @@ struct UserRow {
     /// (no "…" menu). For other users it shows "…" on hover or "Live".
     action_btn: Option<button::Button>,
     is_us: bool,
+}
+
+/// Live stream statistics for the sharer-side stats block.
+pub struct StreamStats<'a> {
+    pub quality: &'a str,
+    pub avg_frame_kb: f32,
+    pub encode_ms: f32,
+    pub viewers: u32,
+    /// 100 = full rate; below 100 the sender is shedding fps for lossy viewers.
+    pub fps_scale_pct: u32,
+    /// Worst viewer loss in percent (from StreamHealth).
+    pub loss_pct: f32,
 }
 
 pub struct Sidebar {
@@ -216,9 +223,9 @@ impl Sidebar {
         user_list_scroll.resizable(&user_list_pack);
 
         // ── Stream stats line (hidden when not streaming) ─────────────
-        let mut stream_stats_label = frame::Frame::default()
-            .with_label("")
-            .with_align(enums::Align::Left | enums::Align::Inside);
+        let mut stream_stats_label = frame::Frame::default().with_label("");
+        stream_stats_label
+            .set_align(enums::Align::Left | enums::Align::Inside | enums::Align::Clip);
         sidebar.fixed(&stream_stats_label, 0); // 0 height = hidden
         stream_stats_label.set_label_color(theme::TEXT_MUTED);
         stream_stats_label.set_label_size(10);
@@ -239,7 +246,7 @@ impl Sidebar {
         status_col.fixed(&latency_label, 16);
         latency_label.set_label_color(theme::TEXT_MUTED);
         latency_label.set_label_size(10);
-        latency_label.set_align(enums::Align::Left | enums::Align::Inside);
+        latency_label.set_align(enums::Align::Left | enums::Align::Inside | enums::Align::Clip);
 
         status_col.end();
 
@@ -339,30 +346,36 @@ impl Sidebar {
         }
     }
 
-    /// Update the stream stats line shown above the connection status.
-    ///
-    /// Call this on a timer (e.g. every second) while we're sharing.
-    /// Pass `None` to hide the stats (when sharing stops).
-    ///
-    /// `resolution` — e.g. "720p30"
-    /// `avg_frame_kb` — average encoded frame size in KB
-    /// `encode_ms` — average encode time in milliseconds
-    pub fn update_stream_stats(&mut self, stats: Option<(&str, f32, f32)>) {
+    /// Update the two-line stream stats block shown above the connection
+    /// status while sharing. Pass `None` to hide it.
+    pub fn update_stream_stats(&mut self, stats: Option<&StreamStats>) {
         match stats {
-            Some((quality, avg_kb, encode_ms)) => {
-                // Leading pad is layout (left inset), not part of the message.
-                let label = format!(
-                    "  {}",
-                    t!("stream-stats",
-                        "quality" => quality,
-                        "kb" => format!("{avg_kb:.0}"),
-                        "ms" => format!("{encode_ms:.1}"),
-                    )
-                );
-                self.stream_stats_label.set_label(&label);
+            Some(s) => {
+                let line1 = t!("stream-stats-quality",
+                    "quality" => s.quality, "viewers" => s.viewers);
+                let mut line2 = t!("stream-stats-frame",
+                    "kb" => format!("{:.0}", s.avg_frame_kb),
+                    "ms" => format!("{:.1}", s.encode_ms));
+                let degraded = s.fps_scale_pct < 100;
+                if degraded {
+                    line2.push_str(" · ");
+                    line2.push_str(&t!("stream-stats-degraded",
+                        "fps" => s.fps_scale_pct,
+                        "loss" => format!("{:.1}", s.loss_pct)));
+                }
+                // Leading pads are layout (left inset), not message text.
+                self.stream_stats_label
+                    .set_label(&format!("  {line1}\n  {line2}"));
+                // The block turns warning-colored when adaptation kicked
+                // in — the sharer should notice without reading numbers.
+                self.stream_stats_label.set_label_color(if degraded {
+                    theme::WARNING
+                } else {
+                    theme::TEXT_MUTED
+                });
                 if !self.stream_stats_label.visible() {
                     self.stream_stats_label.show();
-                    self.group.fixed(&self.stream_stats_label, 16);
+                    self.group.fixed(&self.stream_stats_label, 30);
                     self.group.layout();
                 }
             }
@@ -849,21 +862,25 @@ impl Sidebar {
         }
     }
 
-    pub fn update_latency(&mut self, rtt_ms: f64, audio_latency_ms: Option<u32>) {
-        let status_label = if rtt_ms < 1.0 {
-            t!("status-disconnected")
-        } else {
-            t!("status-connected")
-        };
-        self.connection_status.set_label(&status_label);
-
-        if rtt_ms < 80.0 {
-            self.connection_status.set_label_color(theme::SUCCESS);
+    pub fn update_latency(
+        &mut self,
+        rtt_ms: f64,
+        audio_latency_ms: Option<u32>,
+        kbps_up: f64,
+        kbps_down: f64,
+    ) {
+        // Color from RTT only. (The old `< 1ms ⇒ Disconnected` heuristic
+        // showed "Disconnected" mid-call on any LAN — disconnection is a
+        // real event handled by handle_disconnected, never inferred.)
+        self.connection_status
+            .set_label(&format!("\u{25cf} {}", t!("status-connected")));
+        self.connection_status.set_label_color(if rtt_ms < 80.0 {
+            theme::SUCCESS
         } else if rtt_ms < 150.0 {
-            self.connection_status.set_label_color(theme::WARNING);
+            theme::WARNING
         } else {
-            self.connection_status.set_label_color(theme::DANGER);
-        }
+            theme::DANGER
+        });
 
         let net_str = if rtt_ms < 1.0 {
             "<1ms".to_string()
@@ -874,8 +891,11 @@ impl Sidebar {
             Some(ms) => format!("{ms}ms"),
             None => "--".to_string(),
         };
-        self.latency_label
-            .set_label(&t!("latency-line", "audio" => audio_str, "network" => net_str));
+        self.latency_label.set_label(&t!("latency-line",
+            "audio" => audio_str,
+            "network" => net_str,
+            "up" => format!("{:.1}", kbps_up / 1000.0),
+            "down" => format!("{:.1}", kbps_down / 1000.0)));
     }
 
     pub fn handle_disconnected(&mut self) {
@@ -885,7 +905,8 @@ impl Sidebar {
             .set_label(&t!("latency-line", "audio" => "--", "network" => "--"));
         self.user_list_pack.clear();
         self.user_rows.clear();
-        self.user_count_label.set_label(&t!("users-count", "count" => 0));
+        self.user_count_label
+            .set_label(&t!("users-count", "count" => 0));
         self.active_sharers.clear();
         self.set_share_state(false);
         self.update_stream_stats(None);

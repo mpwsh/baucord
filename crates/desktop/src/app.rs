@@ -257,15 +257,29 @@ impl App {
                 }
             }
 
-            // Screen events (bounded drain)
+            // Screen events (bounded drain). FrameReady is coalesced per
+            // stream: if frames queued while the UI thread was busy (a
+            // window drag blocks FLTK's loop for hundreds of ms), blitting
+            // each stale frame just replays the past — show the newest,
+            // skip the rest.
+            let mut latest_frames: HashMap<u64, ScreenEvent> = HashMap::new();
             for _ in 0..64 {
                 match self.screen.event_rx.try_recv() {
+                    Ok(evt @ ScreenEvent::FrameReady { .. }) => {
+                        if let ScreenEvent::FrameReady { client_id, .. } = &evt {
+                            latest_frames.insert(*client_id, evt);
+                        }
+                        needs_redraw = true;
+                    }
                     Ok(evt) => {
                         self.handle_screen_event(evt);
                         needs_redraw = true;
                     }
                     Err(_) => break,
                 }
+            }
+            for (_, evt) in latest_frames {
+                self.handle_screen_event(evt);
             }
 
             if needs_redraw {
@@ -489,10 +503,15 @@ impl App {
                 self.update_user_list();
             }
             NetworkMessage::VoiceData { .. } => {}
-            NetworkMessage::NetworkStats { rtt_ms, .. } => {
+            NetworkMessage::NetworkStats {
+                rtt_ms,
+                kbps_up,
+                kbps_down,
+                ..
+            } => {
                 if let Some(sidebar) = &mut self.sidebar {
                     let audio_ms = self.voice.shared.jitter_buffer_ms.load(Ordering::Relaxed);
-                    sidebar.update_latency(rtt_ms, Some(audio_ms));
+                    sidebar.update_latency(rtt_ms, Some(audio_ms), kbps_up, kbps_down);
                 }
             }
             NetworkMessage::ShareDenied { reason } => {
@@ -574,33 +593,30 @@ impl App {
             UiMessage::QuitFromTray => {
                 self.app.quit(); // triggers shutdown() after loop exits
             }
+            #[allow(clippy::cast_precision_loss, clippy::similar_names)]
             UiMessage::UpdateStreamStats => {
                 if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                    let frame_bytes = self.screen.shared.last_frame_bytes.load(Ordering::Relaxed);
-                    let encode_us = self.screen.shared.last_encode_us.load(Ordering::Relaxed);
-                    let avg_kb = frame_bytes as f32 / 1024.0;
-                    let encode_ms = encode_us as f32 / 1000.0;
-                    let quality_str = self
-                        .screen
-                        .shared
+                    let sh = &self.screen.shared;
+                    let frame_bytes = sh.last_frame_bytes.load(Ordering::Relaxed);
+                    let encode_us = sh.last_encode_us.load(Ordering::Relaxed);
+                    let viewers = sh.stream_viewers.load(Ordering::Relaxed);
+                    let fps_scale_pct = sh.fps_scale_pct.load(Ordering::Relaxed);
+                    let loss_pct = f32::from_bits(sh.stream_loss_pct.load(Ordering::Relaxed));
+                    let quality_str = sh
                         .current_quality
                         .lock()
                         .unwrap()
                         .map(|q| q.to_string())
                         .unwrap_or_else(|| t!("unknown"));
-                    let fps_scale = self.screen.shared.fps_scale_pct.load(Ordering::Relaxed);
-                    let viewers = self.screen.shared.stream_viewers.load(Ordering::Relaxed);
-                    let loss_pct =
-                        f32::from_bits(self.screen.shared.stream_loss_pct.load(Ordering::Relaxed));
-                    let quality_str = if fps_scale < 100 {
-                        format!("{quality_str} · {fps_scale}% fps · loss {loss_pct:.1}%")
-                    } else if viewers > 0 {
-                        format!("{quality_str} · {viewers} watching")
-                    } else {
-                        quality_str
-                    };
                     if let Some(sidebar) = &mut self.sidebar {
-                        sidebar.update_stream_stats(Some((&quality_str, avg_kb, encode_ms)));
+                        sidebar.update_stream_stats(Some(&crate::ui::sidebar::StreamStats {
+                            quality: &quality_str,
+                            avg_frame_kb: frame_bytes as f32 / 1024.0,
+                            encode_ms: encode_us as f32 / 1000.0,
+                            viewers,
+                            fps_scale_pct,
+                            loss_pct,
+                        }));
                     }
                 }
             }
