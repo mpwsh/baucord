@@ -66,9 +66,12 @@ const GOP_BACKSTOP_SECS: u32 = 8;
 const ENCODER_PRIORITY: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"];
 
 /// VBV buffer ceiling in bits. Bounds the worst-case single-frame size
-/// (≈ bufsize bits) so encoded frames always fit the app transport's
-/// per-frame chunking limit of ~275 KB. See `codec_options`.
-const VBV_MAX_BITS: u32 = 2_000_000;
+/// (≈ bufsize bits). NOTE: under `tune zerolatency` (no lookahead) x264
+/// treats VBV as a soft bound and overshoots forced IDRs by 10–25% on
+/// detailed content — so this must sit WELL below the app transport's
+/// hard per-frame chunking limit (~275 KB), not just under it. 1.6 Mbit
+/// ⇒ ~200 KB nominal, leaving overshoot room.
+const VBV_MAX_BITS: u32 = 1_600_000;
 
 // ---------------------------------------------------------------------------
 // Encoder

@@ -125,9 +125,9 @@ pub struct VideoJitterBuffer {
 }
 
 impl VideoJitterBuffer {
-    /// `fps` is the sender's nominal frame rate — used only to size the
-    /// overflow cap and seed the jitter estimator; delivery itself is
-    /// not paced.
+    /// `fps` seeds the jitter estimator and sizes the overflow cap; the
+    /// estimator then learns the sender's real cadence from arrivals, so
+    /// the seed only matters for the first second or so of a stream.
     pub fn new(fps: u32) -> Self {
         let fps = fps.max(1);
         Self {
@@ -449,9 +449,22 @@ impl JitterEstimate {
         }
     }
 
-    fn record_arrival(&mut self, at: Instant) {
+   fn record_arrival(&mut self, at: Instant) {
         if let Some(last) = self.last_arrival {
             let gap_ms = at.duration_since(last).as_secs_f32() * 1000.0;
+
+            // Learn the sender's actual frame cadence instead of trusting
+            // the constructor's nominal fps: sharers pick 30 or 60, and
+            // sender-side fps adaptation changes the true rate mid-stream,
+            // so any static number is eventually wrong. Only plausible
+            // frame-cadence gaps train the estimate — chunk-completion
+            // bursts (~0 ms) and keyframe-assembly pauses (150 ms+) are
+            // arrival artifacts, not cadence.
+            if (8.0..=120.0).contains(&gap_ms) {
+                const RATE_ALPHA: f32 = 1.0 / 32.0;
+                self.expected_interval_ms += RATE_ALPHA * (gap_ms - self.expected_interval_ms);
+            }
+
             // Clamp the deviation so a stream pause (alt-tab, network
             // hiccup measured in seconds) doesn't poison the estimate.
             let deviation = (gap_ms - self.expected_interval_ms).abs().min(250.0);
@@ -459,7 +472,7 @@ impl JitterEstimate {
             self.jitter_ms += ALPHA * (deviation - self.jitter_ms);
         }
         self.last_arrival = Some(at);
-    }
+    } 
 
     fn jitter_ms(&self) -> f32 {
         self.jitter_ms

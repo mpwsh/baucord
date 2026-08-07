@@ -997,10 +997,22 @@ fn capture_and_encode(
             .store(encoded.data.len() as u32, Ordering::Relaxed);
         shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
 
-        // Actual encoded dimensions (aspect-preserving fit inside the
-        // quality bound) — NOT the quality preset's nominal size. A
-        // 1920×1200 monitor at HD30 sends 1152×720.
-        let _ = network_tx.try_send(NetworkControl::SendVideoFrame {
+       // A frame the chunker can't carry must not become a silent seq
+        // gap: every viewer would freeze and burn a PLI round trip
+        // (~700 ms) recovering. Drop it AND restart the GOP on the next
+        // frame — a one-frame hiccup instead. (Rate control also reacts
+        // to the oversized frame, so the retried IDR comes out smaller.)
+        if encoded.data.len() > protocol::MAX_VIDEO_FRAME_BYTES {
+            warn!(
+                "📺 Encoded frame seq={seq} too large to send ({} bytes, max {}) — dropping and forcing a fresh keyframe",
+                encoded.data.len(),
+                protocol::MAX_VIDEO_FRAME_BYTES,
+            );
+            state.encoder.force_keyframe();
+            continue;
+        }
+
+        let _ = network_tx.try_send(NetworkControl::SendVideoFrame { 
             seq,
             is_keyframe: encoded.is_keyframe,
             width: encoded.width as u16,
