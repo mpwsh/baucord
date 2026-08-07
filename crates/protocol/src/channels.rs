@@ -88,15 +88,22 @@ pub const SYSTEM_AUDIO_BUFFER_BYTES: usize = 512 * 1024;
 
 // ── Pacing budgets ──────────────────────────────────────────────────────
 
-/// Server-side `available_bytes_per_tick` default (per client, per
-/// ~1 ms tick). See module docs for the pacing rationale.
-pub const SERVER_BYTES_PER_TICK: u64 = 20_000;
+/// Per-tick outbound byte budget, server side.
+///
+/// ⚠ This is NOT pacing. renet's unreliable channels drain their whole
+/// queue every tick and silently DROP any message over the remaining
+/// budget (`unreliable.rs`: "Drop message, no available bytes to
+/// send"). The budget must therefore exceed the worst burst ever
+/// queued between two ticks — a max video frame is ~278 KB of chunks
+/// queued in one call — or keyframes are silently beheaded and streams
+/// never start. 4 MB is ~14× that worst case; burst absorption is the
+/// OS socket buffer's job, congestion response is StreamHealth's.
+pub const SERVER_BYTES_PER_TICK: u64 = 4 * 1024 * 1024;
 
-/// Client-side `available_bytes_per_tick` (per ~1 ms tick). Slightly
-/// tighter than the server: this paces keyframe bursts leaving a home
-/// uplink. 12 KB/ms ≈ 96 Mbit/s ceiling; a 175 KB keyframe spreads over
-/// ~15 ms — invisible next to the encode interval.
-pub const CLIENT_BYTES_PER_TICK: u64 = 12_000;
+/// Per-tick outbound byte budget, client side. Same hazard as
+/// [`SERVER_BYTES_PER_TICK`]: this must never bind, or the tail of
+/// every keyframe is dropped at the sharer.
+pub const CLIENT_BYTES_PER_TICK: u64 = 4 * 1024 * 1024;
 
 /// Target OS-level UDP socket buffer size (send and receive).
 ///

@@ -136,7 +136,16 @@ impl ChatServer {
         };
 
         let transport = NetcodeServerTransport::new(server_config, socket)?;
-        let server = RenetServer::new(protocol::connection_config(config.network.bytes_per_tick));
+        let mut bytes_per_tick = config.network.bytes_per_tick;
+        if bytes_per_tick < 1_048_576 {
+            warn!(
+                "network.bytes_per_tick = {bytes_per_tick} is unsafe: renet DROPS unreliable \
+                 messages over the per-tick budget, beheading video keyframes. Clamping to {}.",
+                protocol::SERVER_BYTES_PER_TICK
+            );
+            bytes_per_tick = protocol::SERVER_BYTES_PER_TICK;
+        }
+        let server = RenetServer::new(protocol::connection_config(bytes_per_tick));
 
         let now = Instant::now();
         Ok(Self {
