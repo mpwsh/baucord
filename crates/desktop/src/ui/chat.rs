@@ -106,6 +106,7 @@ impl Chat {
         let picker_input = picker.clone();
         message_input.handle(move |input, event| match event {
             enums::Event::KeyUp | enums::Event::KeyDown => {
+                scrub_control_chars(input);
                 update_char_count(input, &mut count_clone);
 
                 if event == enums::Event::KeyDown {
@@ -119,6 +120,23 @@ impl Chat {
                         return true;
                     }
 
+                    // Windows synthesizes an extra key event carrying the
+                    // literal SYN control char (0x16) for Ctrl+V, which
+                    // Fl_Input would insert as a visible "^V". The only
+                    // ^V-carrying event that may fall through is a
+                    // genuine text paste (modifier held AND text on the
+                    // clipboard); everything else is a stray duplicate —
+                    // swallow it. Note the image-paste combo already
+                    // returned above, so this can't shadow it.
+                    if app::event_text() == "\u{16}" {
+                        let genuine_text_paste = app::event_state()
+                            .contains(enums::EventState::Command)
+                            && app::clipboard_contains(app::ClipboardContent::Text);
+                        if !genuine_text_paste {
+                            return true;
+                        }
+                    }
+
                     if app::event_key() == enums::Key::Enter {
                         close_picker(&picker_input);
                         send_current(input, &mut count_clone, &sender);
@@ -126,6 +144,14 @@ impl Chat {
                     }
                 }
                 false
+            }
+            // The input regains focus right after the preview dialog
+            // closes (Enter, click, or Escape alike) — scrub then, so a
+            // stray ^V never survives to be seen or typed around.
+            enums::Event::Focus => {
+                scrub_control_chars(input);
+                update_char_count(input, &mut count_clone);
+                false // let Fl_Input handle focus normally
             }
             enums::Event::Paste => match app::event_clipboard() {
                 Some(app::ClipboardEvent::Image(Some(img))) => {
@@ -217,6 +243,29 @@ fn close_picker(picker: &Rc<RefCell<Option<window::Window>>>) {
     }
 }
 
+/// Remove any control characters that slipped into the input (e.g. the
+/// literal ^V Windows can synthesize around Ctrl+V), keeping the cursor
+/// where the user left it. Reactive backstop: whatever the insertion
+/// mechanism, the character is gone by the next event the input sees.
+fn scrub_control_chars(input: &mut input::Input) {
+    let v = input.value();
+    if !v.contains(|c: char| c.is_control()) {
+        return;
+    }
+    let pos = (input.position().max(0) as usize).min(v.len());
+    // Control chars are single-byte in UTF-8, so the cursor shifts left
+    // by exactly the number removed before it.
+    let removed_before = v
+        .get(..pos)
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_control())
+        .count();
+    let cleaned: String = v.chars().filter(|c| !c.is_control()).collect();
+    input.set_value(&cleaned);
+    let _ = input.set_position((pos - removed_before) as i32);
+}
+
 fn update_char_count(input: &input::Input, count: &mut frame::Frame) {
     let len = input.value().len();
     count.set_label(&format!("{len}/400"));
@@ -234,7 +283,10 @@ fn send_current(
     count: &mut frame::Frame,
     sender: &app::Sender<UiMessage>,
 ) {
-    let text = emoji::replace_shortcodes(input.value().trim());
+    // Strip control characters first: stray ones (e.g. a ^V that slipped
+    // past the paste interception) must never reach the wire.
+    let cleaned: String = input.value().chars().filter(|c| !c.is_control()).collect();
+    let text = emoji::replace_shortcodes(cleaned.trim());
     if !text.is_empty() && text.len() <= 400 {
         sender.send(UiMessage::SendChatMessage(text));
         input.set_value("");
@@ -346,11 +398,46 @@ fn show_image_preview_dialog(png: Vec<u8>, sender: app::Sender<UiMessage>) {
     let btn_y = ph + 44;
     let mut cancel_btn = controls::button("Cancel");
     cancel_btn.resize(win_w / 2 - 130, btn_y, 120, 30);
-    let mut send_btn = controls::accent_button("Send", theme::ACCENT);
+
+    // ReturnButton: FLTK's default button — Enter anywhere in the
+    // dialog triggers it, so the flow is Ctrl+V → Enter. Styled to
+    // match `controls::accent_button`.
+    let mut send_btn = button::ReturnButton::default().with_label("Send");
+    send_btn.set_color(theme::ACCENT);
+    send_btn.set_label_color(theme::BUTTON_TEXT);
+    send_btn.set_selection_color(theme::ACCENT);
+    send_btn.set_frame(enums::FrameType::FlatBox);
+    send_btn.set_label_size(11);
     send_btn.resize(win_w / 2 + 10, btn_y, 120, 30);
 
     win.end();
     win.show();
+
+    // The dialog is created mid key-dispatch (paste delivery is
+    // synchronous), so shortcut routing to the ReturnButton can miss
+    // the very first Enter before focus settles. Focus Send explicitly
+    // and catch Enter at the window level as a backstop — whichever
+    // path fires first closes the dialog, so double-send is impossible.
+    let _ = send_btn.take_focus();
+    let mut send_for_keys = send_btn.clone();
+    win.handle(move |_, ev| {
+        if ev == enums::Event::KeyDown
+            && (app::event_key() == enums::Key::Enter
+                || app::event_key() == enums::Key::KPEnter)
+        {
+            send_for_keys.do_callback();
+            return true;
+        }
+        false
+    });
+
+    // Escape and the window-manager close both fire the window
+    // callback: cancel and free the dialog instead of leaking it
+    // hidden.
+    win.set_callback(|w| {
+        w.hide();
+        app::delete_widget(w.clone());
+    });
 
     let mut win_cancel = win.clone();
     cancel_btn.set_callback(move |_| {
