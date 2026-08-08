@@ -23,6 +23,9 @@ pub enum UiMessage {
 
     // ── Chat ────────────────────────────────────────────────────────
     SendChatMessage(String),
+    /// User confirmed sending a pasted image (PNG-encoded, already
+    /// bounded by the paste pipeline in `ui::chat`).
+    SendChatImage(Vec<u8>),
 
     // ── Voice controls ──────────────────────────────────────────────
     ToggleMute,

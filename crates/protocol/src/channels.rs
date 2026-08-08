@@ -9,7 +9,7 @@
 //!
 //! | id | name         | semantics            | carries                              |
 //! |----|--------------|----------------------|--------------------------------------|
-//! | 0  | control      | reliable, ordered    | chat, presence, share signaling      |
+//! | 0  | control      | reliable, ordered    | chat (text+images), presence, share  |
 //! | 1  | signal       | reliable, unordered  | keyframe requests, stream health     |
 //! | 2  | voice        | unreliable           | Opus voice packets                   |
 //! | 3  | video        | unreliable           | H.264 chunks                         |
@@ -46,11 +46,11 @@ use renet::{ChannelConfig, ConnectionConfig, SendType};
 /// **Bump this on every breaking wire change** — that is the whole
 /// versioning story: old peers are rejected at the door rather than
 /// misparsing packets mid-session.
-pub const PROTOCOL_ID: u64 = 28;
+pub const PROTOCOL_ID: u64 = 29;
 
 // ── Channel IDs ─────────────────────────────────────────────────────────
 
-/// Reliable ordered: chat, presence, screen-share signaling.
+/// Reliable ordered: chat (text and images), presence, share signaling.
 pub const CONTROL_CHANNEL: u8 = 0;
 /// Reliable unordered: keyframe requests/pokes, stream health reports.
 pub const SIGNAL_CHANNEL: u8 = 1;
@@ -69,6 +69,9 @@ pub const SYSTEM_AUDIO_CHANNEL: u8 = 4;
 
 /// Control channel budget. Generous: a reliable channel that hits its
 /// ceiling disconnects the client (`ReliableChannelMaxMemoryReached`).
+/// Sized with chat images in mind — several 1 MiB images
+/// ([`crate::MAX_CHAT_IMAGE_BYTES`]) can be in flight toward a slow
+/// client before the ceiling is anywhere near.
 pub const CONTROL_BUFFER_BYTES: usize = 5 * 1024 * 1024;
 
 /// Signal channel budget. Messages here are tiny (tens of bytes) and

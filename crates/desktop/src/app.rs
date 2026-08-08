@@ -495,6 +495,11 @@ impl App {
                     chat.handle_text_message(username, text);
                 }
             }
+            NetworkMessage::ImageMessage { username, data } => {
+                if let Some(chat) = &mut self.chat {
+                    chat.handle_image_message(username, data);
+                }
+            }
             NetworkMessage::UserSpeaking {
                 client_id,
                 is_speaking,
@@ -687,6 +692,12 @@ impl App {
             }
             UiMessage::SendChatMessage(text) => {
                 self.network.tx.send(NetworkControl::SendMessage(text)).ok();
+            }
+            UiMessage::SendChatImage(data) => {
+                // Same broadcast semantics as SendMessage: the server
+                // relays ImageMessage back to everyone (sender included),
+                // so no local echo is needed here.
+                self.network.tx.send(NetworkControl::SendImage(data)).ok();
             }
             UiMessage::ToggleMute => {
                 self.handle_toggle_mute();

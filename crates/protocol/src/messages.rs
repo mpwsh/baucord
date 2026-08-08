@@ -20,7 +20,25 @@ use crate::channels::{CONTROL_CHANNEL, SIGNAL_CHANNEL};
 /// Upper bound for a serialized control message. Anything larger is
 /// dropped before deserialization — a cheap guard against hostile length
 /// games, independent of renet's channel memory cap.
+///
+/// Chat images are the one deliberate exception: their wire size is
+/// governed by [`MAX_IMAGE_MESSAGE_BYTES`] instead, and the codec
+/// enforces per-variant that *only* image messages may exceed this
+/// bound (see [`decode_client_message`] / [`decode_server_message`]).
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Maximum PNG payload of a chat image, enforced on both ends: the
+/// sending client downscales until it fits, and the codec refuses to
+/// encode or decode anything larger — so a modified client can't spray
+/// relay memory.
+pub const MAX_CHAT_IMAGE_BYTES: usize = 1024 * 1024;
+
+/// Upper bound for a serialized chat-image message: the payload cap
+/// plus generous headroom for the envelope (postcard varints + ids are
+/// a handful of bytes). This is the pre-deserialization length guard
+/// for the image path, and the worst transient allocation `decode_*`
+/// can be tricked into.
+pub const MAX_IMAGE_MESSAGE_BYTES: usize = MAX_CHAT_IMAGE_BYTES + 1024;
 
 // ── Shared payload types ────────────────────────────────────────────────
 
@@ -29,6 +47,18 @@ pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub struct ChatMessage {
     pub client_id: ClientId,
     pub text: String,
+}
+
+/// An image chat message attributed to a specific client.
+///
+/// `data` is an encoded PNG no larger than [`MAX_CHAT_IMAGE_BYTES`];
+/// the codec refuses oversized payloads in both directions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatImageMessage {
+    /// Authoritative sender id, stamped by the server on relay.
+    pub client_id: ClientId,
+    /// Encoded PNG bytes.
+    pub data: Vec<u8>,
 }
 
 /// Why the server refused a screen-share request.
@@ -90,6 +120,13 @@ pub enum ClientMessage {
     /// (viewer → server → sharer). Travels on the signal channel so it
     /// can never queue behind chat.
     RequestKeyframe { target_id: ClientId },
+
+    // ── Chat, continued ─────────────────────────────────────────────
+    // (Appended after the original variants so existing postcard
+    // discriminants are untouched.)
+    /// Send an image chat message (encoded PNG, ≤
+    /// [`MAX_CHAT_IMAGE_BYTES`]) to the room.
+    ChatImage(Vec<u8>),
 }
 
 impl ClientMessage {
@@ -177,6 +214,12 @@ pub enum ServerMessage {
         /// Number of connected viewers.
         viewers: u16,
     },
+
+    // ── Chat, continued ─────────────────────────────────────────────
+    // (Appended after the original variants so existing postcard
+    // discriminants are untouched.)
+    /// An image chat message from a client.
+    ChatImage(ChatImageMessage),
 }
 
 impl ServerMessage {
@@ -197,36 +240,65 @@ impl ServerMessage {
 // One encode/decode pair per direction, used by both binaries. Errors
 // are logged via the caller (these return Option so hot loops can just
 // skip malformed input).
+//
+// Length discipline lives here so client and server can't drift:
+// pre-decode, anything over MAX_IMAGE_MESSAGE_BYTES is dropped unread
+// (bounding the worst transient allocation); post-decode, only image
+// variants may exceed MAX_CONTROL_MESSAGE_BYTES, and their payload must
+// fit MAX_CHAT_IMAGE_BYTES. Encode applies the same caps so a buggy
+// caller fails locally instead of poisoning the wire.
+
+/// Does this client message respect the length budget for its variant?
+fn client_message_len_ok(msg: &ClientMessage, wire_len: usize) -> bool {
+    match msg {
+        ClientMessage::ChatImage(data) => data.len() <= MAX_CHAT_IMAGE_BYTES,
+        _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
+    }
+}
+
+/// Does this server message respect the length budget for its variant?
+fn server_message_len_ok(msg: &ServerMessage, wire_len: usize) -> bool {
+    match msg {
+        ServerMessage::ChatImage(img) => img.data.len() <= MAX_CHAT_IMAGE_BYTES,
+        _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
+    }
+}
 
 /// Serialize a [`ClientMessage`]. `None` on serializer failure (should
-/// never happen for these types; treated as a droppable event).
+/// never happen for these types; treated as a droppable event) or if the
+/// message exceeds its variant's length budget.
 #[must_use]
 pub fn encode_client_message(msg: &ClientMessage) -> Option<Vec<u8>> {
-    postcard::to_allocvec(msg).ok()
+    let bytes = postcard::to_allocvec(msg).ok()?;
+    client_message_len_ok(msg, bytes.len()).then_some(bytes)
 }
 
 /// Deserialize a [`ClientMessage`] from untrusted bytes.
 #[must_use]
 pub fn decode_client_message(bytes: &[u8]) -> Option<ClientMessage> {
-    if bytes.is_empty() || bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_MESSAGE_BYTES {
         return None;
     }
-    postcard::from_bytes(bytes).ok()
+    let msg: ClientMessage = postcard::from_bytes(bytes).ok()?;
+    client_message_len_ok(&msg, bytes.len()).then_some(msg)
 }
 
-/// Serialize a [`ServerMessage`].
+/// Serialize a [`ServerMessage`]. `None` on serializer failure or if the
+/// message exceeds its variant's length budget.
 #[must_use]
 pub fn encode_server_message(msg: &ServerMessage) -> Option<Vec<u8>> {
-    postcard::to_allocvec(msg).ok()
+    let bytes = postcard::to_allocvec(msg).ok()?;
+    server_message_len_ok(msg, bytes.len()).then_some(bytes)
 }
 
 /// Deserialize a [`ServerMessage`] from untrusted bytes.
 #[must_use]
 pub fn decode_server_message(bytes: &[u8]) -> Option<ServerMessage> {
-    if bytes.is_empty() || bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_MESSAGE_BYTES {
         return None;
     }
-    postcard::from_bytes(bytes).ok()
+    let msg: ServerMessage = postcard::from_bytes(bytes).ok()?;
+    server_message_len_ok(&msg, bytes.len()).then_some(msg)
 }
 
 #[cfg(test)]
@@ -267,6 +339,72 @@ mod tests {
     fn garbage_rejected() {
         assert!(decode_server_message(&[0xFF, 0xFF, 0xFF, 0xFF]).is_none());
         assert!(decode_client_message(&[]).is_none());
+    }
+
+    #[test]
+    fn chat_image_roundtrips_past_the_control_cap() {
+        // 200 KB: comfortably over MAX_CONTROL_MESSAGE_BYTES, under the
+        // image budget — the whole point of the split.
+        let payload = vec![0xA5u8; 200 * 1024];
+        let msg = ClientMessage::ChatImage(payload.clone());
+        let bytes = encode_client_message(&msg).unwrap();
+        assert!(bytes.len() > MAX_CONTROL_MESSAGE_BYTES);
+        let back = decode_client_message(&bytes).unwrap();
+        assert!(matches!(back, ClientMessage::ChatImage(d) if d == payload));
+
+        let msg = ServerMessage::ChatImage(ChatImageMessage {
+            client_id: 7,
+            data: payload.clone(),
+        });
+        let bytes = encode_server_message(&msg).unwrap();
+        let back = decode_server_message(&bytes).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::ChatImage(img) if img.client_id == 7 && img.data == payload
+        ));
+    }
+
+    #[test]
+    fn oversized_image_refused_both_ways() {
+        let too_big = vec![0u8; MAX_CHAT_IMAGE_BYTES + 1];
+
+        // Encode refuses locally…
+        assert!(encode_client_message(&ClientMessage::ChatImage(too_big.clone())).is_none());
+        assert!(
+            encode_server_message(&ServerMessage::ChatImage(ChatImageMessage {
+                client_id: 1,
+                data: too_big.clone(),
+            }))
+            .is_none()
+        );
+
+        // …and a hostile peer that serializes it anyway is dropped at
+        // decode (post-decode payload check).
+        let raw = postcard::to_allocvec(&ClientMessage::ChatImage(too_big)).unwrap();
+        assert!(decode_client_message(&raw).is_none());
+    }
+
+    #[test]
+    fn huge_non_image_message_still_rejected() {
+        // The relaxed pre-decode bound must not open the door for other
+        // variants to balloon: a 500 KB text chat is refused post-decode.
+        let msg = ClientMessage::Chat("x".repeat(500 * 1024));
+        assert!(encode_client_message(&msg).is_none());
+        let raw = postcard::to_allocvec(&msg).unwrap();
+        assert!(decode_client_message(&raw).is_none());
+    }
+
+    #[test]
+    fn chat_image_uses_control_channel() {
+        assert_eq!(ClientMessage::ChatImage(Vec::new()).channel(), CONTROL_CHANNEL);
+        assert_eq!(
+            ServerMessage::ChatImage(ChatImageMessage {
+                client_id: 0,
+                data: Vec::new(),
+            })
+            .channel(),
+            CONTROL_CHANNEL
+        );
     }
 
     #[test]

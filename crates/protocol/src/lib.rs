@@ -31,8 +31,9 @@ pub use channels::{
     VOICE_CHANNEL, connection_config,
 };
 pub use messages::{
-    ChatMessage, ClientMessage, DenyReason, MAX_CONTROL_MESSAGE_BYTES, ServerMessage,
-    decode_client_message, decode_server_message, encode_client_message, encode_server_message,
+    ChatImageMessage, ChatMessage, ClientMessage, DenyReason, MAX_CHAT_IMAGE_BYTES,
+    MAX_CONTROL_MESSAGE_BYTES, MAX_IMAGE_MESSAGE_BYTES, ServerMessage, decode_client_message,
+    decode_server_message, encode_client_message, encode_server_message,
 };
 pub use relayed::{RELAY_SENDER_BYTES, split_sender, wrap_sender};
 pub use system_audio::{

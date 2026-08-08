@@ -63,6 +63,12 @@ pub struct LimitSettings {
     pub max_viewers_per_stream: usize,
     /// Chat messages longer than this (bytes) are truncated.
     pub max_chat_bytes: usize,
+    /// Chat images allowed per client per minute (sliding window);
+    /// images beyond this are dropped with a warning. `0` disables
+    /// image relay entirely. Size (≤ 1 MiB each) is enforced by the
+    /// protocol codec, so this bounds relay egress: worst case
+    /// ≈ `max_images_per_minute` MiB/min per chatty client.
+    pub max_images_per_minute: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -159,6 +165,7 @@ impl Default for LimitSettings {
             max_sharers: 2,
             max_viewers_per_stream: 8,
             max_chat_bytes: 2000,
+            max_images_per_minute: 12,
         }
     }
 }

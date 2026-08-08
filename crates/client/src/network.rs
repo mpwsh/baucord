@@ -74,6 +74,12 @@ pub enum NetworkMessage {
         username: String,
         text: String,
     },
+    /// A chat image from a user (encoded PNG bytes, ≤
+    /// `protocol::MAX_CHAT_IMAGE_BYTES`).
+    ImageMessage {
+        username: String,
+        data: Vec<u8>,
+    },
     VoiceData {
         client_id: ClientId,
         seq: u32,
@@ -405,6 +411,17 @@ impl NetworkClient {
                     text: msg.text,
                 });
             }
+            ServerMessage::ChatImage(img) => {
+                let username = self
+                    .usernames
+                    .get(&img.client_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("User{}", img.client_id));
+                self.message_queue.push(NetworkMessage::ImageMessage {
+                    username,
+                    data: img.data,
+                });
+            }
             ServerMessage::Speaking {
                 client_id,
                 is_speaking,
@@ -549,6 +566,12 @@ impl NetworkClient {
         self.send_control(&ClientMessage::Chat(text));
     }
 
+    /// Send a chat image. `send_control` refuses (with a warning) if the
+    /// payload somehow exceeds the protocol budget.
+    pub fn send_image(&mut self, data: Vec<u8>) {
+        self.send_control(&ClientMessage::ChatImage(data));
+    }
+
     pub fn send_speaking_status(&mut self, is_speaking: bool) {
         // Edge-triggered by the voice thread; dedupe defensively in case
         // the same state is ever delivered twice.
@@ -690,6 +713,9 @@ pub enum NetworkControl {
     },
     Disconnect,
     SendMessage(String),
+    /// Send a chat image (encoded PNG; the UI caps it at
+    /// `protocol::MAX_CHAT_IMAGE_BYTES` before it gets here).
+    SendImage(Vec<u8>),
     SendVoicePacket(AudioPacket),
     SendSpeakingStatus(bool),
     /// Broadcast mute/deafen state to other users.
@@ -840,6 +866,11 @@ fn handle_control(
         NetworkControl::SendMessage(text) => {
             if let Some(c) = client {
                 c.send_message(text);
+            }
+        }
+        NetworkControl::SendImage(data) => {
+            if let Some(c) = client {
+                c.send_image(data);
             }
         }
         NetworkControl::SendVoicePacket(packet) => {

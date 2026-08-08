@@ -1,6 +1,8 @@
 // ui/mod.rs
 pub mod chat;
+pub mod chat_view;
 pub mod connect;
+pub mod emoji;
 pub mod messages;
 pub mod screenshare;
 pub mod settings;

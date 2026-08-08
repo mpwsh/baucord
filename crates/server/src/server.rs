@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
 
-use protocol::{ChatMessage, ClientMessage, DenyReason, ServerMessage};
+use protocol::{ChatImageMessage, ChatMessage, ClientMessage, DenyReason, ServerMessage};
 
 use crate::auth;
 use crate::config::Config;
@@ -62,6 +62,9 @@ pub struct ChatServer {
     audio_states: HashMap<ClientId, (bool, bool)>,
     /// Clients currently deafened (voice relay skips them).
     deafened: HashSet<ClientId>,
+    /// Recent chat-image send times per client, pruned to the last
+    /// minute — the sliding window behind `limits.max_images_per_minute`.
+    image_stamps: HashMap<ClientId, Vec<Instant>>,
     last_updated: Instant,
     last_stats: Instant,
     last_pressure_check: Instant,
@@ -160,6 +163,7 @@ impl ChatServer {
             usernames: HashMap::new(),
             audio_states: HashMap::new(),
             deafened: HashSet::new(),
+            image_stamps: HashMap::new(),
             last_updated: now,
             last_stats: now,
             last_pressure_check: now,
@@ -245,6 +249,31 @@ impl ChatServer {
             self.stats.bytes_sent += encoded.len() as u64;
             self.server.send_message(client_id, msg.channel(), encoded);
         }
+    }
+
+    /// Sliding-window rate check for chat images: record `now`, prune
+    /// stamps older than a minute, and refuse once the window holds
+    /// `limits.max_images_per_minute` sends (0 = images disabled).
+    fn allow_image(&mut self, client_id: ClientId) -> bool {
+        let cap = self.config.limits.max_images_per_minute;
+        if cap == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let stamps = self.image_stamps.entry(client_id).or_default();
+        stamps.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+        if stamps.len() >= cap {
+            warn!(
+                "Rate-limiting chat images from {} ({} in the last minute)",
+                self.usernames
+                    .get(&client_id)
+                    .map_or("<unknown>", String::as_str),
+                stamps.len(),
+            );
+            return false;
+        }
+        stamps.push(now);
+        true
     }
 
     fn broadcast_msg(&mut self, msg: &ServerMessage) {
@@ -352,6 +381,7 @@ impl ChatServer {
             .unwrap_or_else(|| format!("User{client_id}"));
         self.audio_states.remove(&client_id);
         self.deafened.remove(&client_id);
+        self.image_stamps.remove(&client_id);
 
         warn!(
             "CLIENT DISCONNECTED: {username} ({client_id}) reason={reason:?} display=\"{reason}\""
@@ -419,6 +449,36 @@ impl ChatServer {
                 info!("[{username}]: {text}");
                 self.stats.messages_count += 1;
                 self.broadcast_msg(&ServerMessage::Chat(ChatMessage { client_id, text }));
+            }
+            ClientMessage::ChatImage(data) => {
+                // Size is already enforced: decode_client_message refuses
+                // payloads over MAX_CHAT_IMAGE_BYTES, so `data` is bounded
+                // before this arm can run. This arm owns policy only.
+                if !self.allow_image(client_id) {
+                    return;
+                }
+                // Relay only what claims to be a PNG — the desktop encodes
+                // PNG exclusively, so anything else is a modified client
+                // wasting everyone's bandwidth.
+                const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+                if !data.starts_with(&PNG_MAGIC) {
+                    warn!(
+                        "Dropping non-PNG chat image ({} bytes) from {}",
+                        data.len(),
+                        self.get_username(client_id),
+                    );
+                    return;
+                }
+                info!(
+                    "[{}] sent an image ({} KB)",
+                    self.get_username(client_id),
+                    data.len() / 1024,
+                );
+                self.stats.messages_count += 1;
+                self.broadcast_msg(&ServerMessage::ChatImage(ChatImageMessage {
+                    client_id,
+                    data,
+                }));
             }
             ClientMessage::Speaking(is_speaking) => {
                 // Broadcast to everyone including the sender: the UI
