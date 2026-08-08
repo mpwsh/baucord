@@ -86,6 +86,67 @@ struct Frag {
     text: String,
     kind: Kind,
     url: Option<String>,
+    /// Draw as a Twemoji image instead of text (`text` holds the
+    /// emoji string, `w` is the fixed image advance).
+    emoji: bool,
+}
+
+/// Square size of an inline emoji image, fitted into `LINE_H`.
+const EMOJI_SZ: i32 = 17;
+
+/// Split a whitespace-free piece into alternating text/emoji runs
+/// (`true` = bundled emoji). Longest match wins, so multi-codepoint
+/// sequences (e.g. "\u{2764}\u{fe0f}") stay whole.
+fn split_emoji(piece: &str) -> Vec<(bool, &str)> {
+    let idx = crate::ui::emoji_assets::by_first_char();
+    let mut out: Vec<(bool, &str)> = Vec::new();
+    let mut text_start = 0;
+    let mut i = 0;
+    while i < piece.len() {
+        let rest = &piece[i..];
+        let c = rest.chars().next().unwrap();
+        let hit = idx
+            .get(&c)
+            .and_then(|cands| cands.iter().find(|e| rest.starts_with(**e)));
+        if let Some(e) = hit {
+            if text_start < i {
+                out.push((false, &piece[text_start..i]));
+            }
+            out.push((true, &piece[i..i + e.len()]));
+            i += e.len();
+            text_start = i;
+        } else {
+            i += c.len_utf8();
+        }
+    }
+    if text_start < piece.len() {
+        out.push((false, &piece[text_start..]));
+    }
+    out
+}
+
+/// Draw a bundled emoji at its chat-line size, decoding and caching on
+/// first use. Returns false if the image is unavailable (caller falls
+/// back to font rendering).
+fn draw_emoji_img(emoji: &str, x: i32, y: i32) -> bool {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Option<fltk::image::RgbImage>>> =
+            RefCell::new(HashMap::new());
+    }
+    CACHE.with_borrow_mut(|cache| {
+        let entry = cache.entry(emoji.to_string()).or_insert_with(|| {
+            crate::ui::emoji_assets::rgb_image(emoji, EMOJI_SZ as u32)
+        });
+        match entry {
+            Some(img) => {
+                img.draw(x, y, EMOJI_SZ, EMOJI_SZ);
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 // ── URL detection ───────────────────────────────────────────────────────
@@ -181,10 +242,14 @@ fn layout(spans: &[Span], cw: i32) -> (Vec<Frag>, i32) {
     let mut frags = Vec::new();
     let (mut x, mut y) = (0, 0);
 
-    let mut push = |text: &str, kind: Kind, url: &Option<String>, x: &mut i32, y: i32| {
-        let (f, s) = kind.font();
-        fltk::draw::set_font(f, s);
-        let w = fltk::draw::width(text) as i32;
+    let mut push = |text: &str, kind: Kind, url: &Option<String>, x: &mut i32, y: i32, emoji: bool| {
+        let w = if emoji {
+            EMOJI_SZ
+        } else {
+            let (f, s) = kind.font();
+            fltk::draw::set_font(f, s);
+            fltk::draw::width(text) as i32
+        };
         frags.push(Frag {
             x: *x,
             y,
@@ -192,6 +257,7 @@ fn layout(spans: &[Span], cw: i32) -> (Vec<Frag>, i32) {
             text: text.to_string(),
             kind,
             url: url.clone(),
+            emoji,
         });
         *x += w;
     };
@@ -217,34 +283,49 @@ fn layout(spans: &[Span], cw: i32) -> (Vec<Frag>, i32) {
             }
 
             fltk::draw::set_font(f, s);
-            let w = fltk::draw::width(piece) as i32;
 
-            if x > 0 && x + w > cw {
-                x = 0;
-                y += LINE_H;
-            }
-
-            if w <= cw {
-                push(piece, span.kind, &span.url, &mut x, y);
-            } else {
-                // Word wider than the whole row (long URLs): hard-split
-                // by characters.
-                let mut chunk = String::new();
-                for c in piece.chars() {
-                    let char_w = fltk::draw::width(&c.to_string()) as i32;
-                    let chunk_w = fltk::draw::width(&chunk) as i32;
-                    if x + chunk_w + char_w > cw {
-                        if !chunk.is_empty() {
-                            push(&chunk, span.kind, &span.url, &mut x, y);
-                            chunk.clear();
-                        }
+            // Bundled emoji render as images with a fixed advance; the
+            // rest of the piece wraps as text. Each run wraps like a
+            // word of its own.
+            for (is_emoji, seg) in split_emoji(piece) {
+                if is_emoji {
+                    if x > 0 && x + EMOJI_SZ > cw {
                         x = 0;
                         y += LINE_H;
                     }
-                    chunk.push(c);
+                    push(seg, span.kind, &span.url, &mut x, y, true);
+                    continue;
                 }
-                if !chunk.is_empty() {
-                    push(&chunk, span.kind, &span.url, &mut x, y);
+
+                let w = fltk::draw::width(seg) as i32;
+
+                if x > 0 && x + w > cw {
+                    x = 0;
+                    y += LINE_H;
+                }
+
+                if w <= cw {
+                    push(seg, span.kind, &span.url, &mut x, y, false);
+                } else {
+                    // Word wider than the whole row (long URLs): hard-split
+                    // by characters.
+                    let mut chunk = String::new();
+                    for c in seg.chars() {
+                        let char_w = fltk::draw::width(&c.to_string()) as i32;
+                        let chunk_w = fltk::draw::width(&chunk) as i32;
+                        if x + chunk_w + char_w > cw {
+                            if !chunk.is_empty() {
+                                push(&chunk, span.kind, &span.url, &mut x, y, false);
+                                chunk.clear();
+                            }
+                            x = 0;
+                            y += LINE_H;
+                        }
+                        chunk.push(c);
+                    }
+                    if !chunk.is_empty() {
+                        push(&chunk, span.kind, &span.url, &mut x, y, false);
+                    }
                 }
             }
         }
@@ -295,6 +376,13 @@ fn make_text_row(spans: Vec<Span>, copy_text: String, width: i32) -> (frame::Fra
             fltk::draw::set_draw_color(frag.kind.color());
             let baseline = r.y() + PAD_Y + frag.y + LINE_H - fltk::draw::descent() - 2;
             let fx = r.x() + PAD_X + frag.x;
+            if frag.emoji {
+                // Twemoji image, vertically centered in the line; font
+                // glyph only if the image is somehow unavailable.
+                if draw_emoji_img(&frag.text, fx, r.y() + PAD_Y + frag.y + 1) {
+                    continue;
+                }
+            }
             fltk::draw::draw_text(&frag.text, fx, baseline);
             if frag.kind == Kind::Link {
                 fltk::draw::draw_line(fx, baseline + 2, fx + frag.w, baseline + 2);
@@ -473,7 +561,11 @@ fn make_image_row(
             fltk::draw::set_font(f, s);
             fltk::draw::set_draw_color(frag.kind.color());
             let baseline = r.y() + PAD_Y + frag.y + LINE_H - fltk::draw::descent() - 2;
-            fltk::draw::draw_text(&frag.text, r.x() + PAD_X + frag.x, baseline);
+            let fx = r.x() + PAD_X + frag.x;
+            if frag.emoji && draw_emoji_img(&frag.text, fx, r.y() + PAD_Y + frag.y + 1) {
+                continue;
+            }
+            fltk::draw::draw_text(&frag.text, fx, baseline);
         }
         let (dw, dh) = st.disp;
         let (ix, iy) = (r.x() + PAD_X, r.y() + PAD_Y + LINE_H + 1);
@@ -827,6 +919,30 @@ mod tests {
         let spans = detect_links("hello world", Kind::Body);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].text, "hello world");
+    }
+
+    #[test]
+    fn emoji_splitter_separates_runs() {
+        let segs = split_emoji("hi\u{1F602}there");
+        assert_eq!(
+            segs,
+            vec![(false, "hi"), (true, "\u{1F602}"), (false, "there")]
+        );
+        // Adjacent emoji stay individual fixed-advance runs.
+        assert_eq!(
+            split_emoji("\u{1F602}\u{1F602}"),
+            vec![(true, "\u{1F602}"), (true, "\u{1F602}")]
+        );
+        // Multi-codepoint sequences match longest-first, staying whole.
+        assert_eq!(split_emoji("x\u{2764}\u{FE0F}y").len(), 3);
+        assert!(split_emoji("x\u{2764}\u{FE0F}y")[1].0);
+        // Plain text passes through untouched.
+        assert_eq!(split_emoji("plain"), vec![(false, "plain")]);
+        // Round-trip: concatenation reproduces the input.
+        for s in ["a\u{1F602}b", "\u{1F602}", "abc", "\u{2764}\u{FE0F}"] {
+            let joined: String = split_emoji(s).iter().map(|(_, t)| *t).collect();
+            assert_eq!(joined, s);
+        }
     }
 
     #[test]

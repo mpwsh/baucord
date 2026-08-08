@@ -46,8 +46,14 @@ impl Chat {
         chat_col.fixed(&input_row, 40);
         input_row.set_spacing(10);
 
-        let mut emoji_btn = controls::button("🙂");
-        emoji_btn.set_label_size(16);
+        let mut emoji_btn = controls::button("");
+        match crate::ui::emoji_assets::rgb_image("\u{1F642}", 20) {
+            Some(img) => emoji_btn.set_image(Some(img)),
+            None => {
+                emoji_btn.set_label("\u{1F642}");
+                emoji_btn.set_label_size(16);
+            }
+        }
         emoji_btn.set_tooltip("Emoji — or type :name: codes like :joy:");
         input_row.fixed(&emoji_btn, 40);
 

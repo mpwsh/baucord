@@ -272,11 +272,20 @@ pub fn open_picker<F: FnMut(&str) + 'static>(x: i32, y: i32, on_pick: F) -> wind
         }
 
         let bx = ox + col * CELL;
-        let mut btn = fltk::button::Button::new(bx, cur_y, 32, 32, None).with_label(emoji);
+        let mut btn = fltk::button::Button::new(bx, cur_y, 32, 32, None);
         btn.set_frame(enums::FrameType::FlatBox);
         btn.set_color(theme::BG_SECONDARY);
         btn.set_selection_color(theme::BG_TERTIARY);
-        btn.set_label_size(18);
+        // Twemoji image: identical, full-color glyphs on every platform
+        // (font rendering is monochrome on Windows GDI). Text label only
+        // as a fallback for anything not bundled.
+        match crate::ui::emoji_assets::rgb_image(emoji, 24) {
+            Some(img) => btn.set_image(Some(img)),
+            None => {
+                btn.set_label(emoji);
+                btn.set_label_size(18);
+            }
+        }
         btn.set_tooltip(&format!(":{name}:"));
         let cb = on_pick.clone();
         btn.set_callback(move |_| (cb.borrow_mut())(emoji));
