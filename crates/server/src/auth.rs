@@ -101,7 +101,8 @@ pub fn spawn_issuer(
     private_key: [u8; NETCODE_KEY_BYTES],
     public_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let http = Server::http(bind).map_err(|e| format!("token issuer failed to bind {bind}: {e}"))?;
+    let http =
+        Server::http(bind).map_err(|e| format!("token issuer failed to bind {bind}: {e}"))?;
     info!("Token issuer listening on http://{bind} (POST /token) — put TLS in front");
 
     std::thread::Builder::new()
@@ -138,8 +139,8 @@ fn issuer_loop(
                         .map(|h| h.value.as_str().to_string());
                     if presented.as_deref() != Some(expected) {
                         warn!("Token request refused: bad or missing password");
-                        let _ =
-                            request.respond(Response::from_string("forbidden").with_status_code(403));
+                        let _ = request
+                            .respond(Response::from_string("forbidden").with_status_code(403));
                         continue;
                     }
                 }
@@ -151,7 +152,8 @@ fn issuer_loop(
                     .read_to_string(&mut body)
                     .is_err()
                 {
-                    let _ = request.respond(Response::from_string("bad request").with_status_code(400));
+                    let _ =
+                        request.respond(Response::from_string("bad request").with_status_code(400));
                     continue;
                 }
 
@@ -164,8 +166,9 @@ fn issuer_loop(
                     }
                     None => {
                         warn!("Failed to generate connect token");
-                        let _ = request
-                            .respond(Response::from_string("token generation failed").with_status_code(500));
+                        let _ = request.respond(
+                            Response::from_string("token generation failed").with_status_code(500),
+                        );
                     }
                 }
             }

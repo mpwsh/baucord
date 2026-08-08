@@ -997,7 +997,7 @@ fn capture_and_encode(
             .store(encoded.data.len() as u32, Ordering::Relaxed);
         shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
 
-       // A frame the chunker can't carry must not become a silent seq
+        // A frame the chunker can't carry must not become a silent seq
         // gap: every viewer would freeze and burn a PLI round trip
         // (~700 ms) recovering. Drop it AND restart the GOP on the next
         // frame — a one-frame hiccup instead. (Rate control also reacts
@@ -1012,7 +1012,7 @@ fn capture_and_encode(
             continue;
         }
 
-        let _ = network_tx.try_send(NetworkControl::SendVideoFrame { 
+        let _ = network_tx.try_send(NetworkControl::SendVideoFrame {
             seq,
             is_keyframe: encoded.is_keyframe,
             width: encoded.width as u16,

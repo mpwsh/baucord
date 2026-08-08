@@ -68,7 +68,6 @@ const FRAME_TIMEOUT: Duration = Duration::from_millis(2000);
 /// or badly-reordered input; normal operation holds 1–2 per stream.
 const MAX_PENDING_FRAMES: usize = 16;
 
-
 /// Parsed chunk header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoHeader {
@@ -348,7 +347,7 @@ impl VideoReassembler {
         self.pending.clear();
     }
 
-   fn evict_stale(&mut self) {
+    fn evict_stale(&mut self) {
         let before = self.pending.len();
         self.pending.retain(|(sender, seq), frame| {
             let keep = frame.first_seen.elapsed() < FRAME_TIMEOUT;
@@ -356,13 +355,15 @@ impl VideoReassembler {
                 log::warn!(
                     "reassembly timeout: dropped frame seq={seq} from {sender} \
                      with {}/{} chunks (keyframe: {})",
-                    frame.received, frame.chunk_count, frame.is_keyframe,
+                    frame.received,
+                    frame.chunk_count,
+                    frame.is_keyframe,
                 );
             }
             keep
         });
         self.stats.frames_dropped += (before - self.pending.len()) as u64;
-    } 
+    }
 
     fn evict_oldest(&mut self) {
         if let Some(oldest) = self

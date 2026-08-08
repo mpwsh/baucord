@@ -10,9 +10,7 @@
 //! VideoToolbox / MediaCodec implementation of [`VideoDecoder`] — the
 //! trait, `Quality`, and the jitter buffer already compile on mobile.
 
-use crate::{
-    CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder, VideoEncoder,
-};
+use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder, VideoEncoder};
 
 const UNSUPPORTED: &str = "no video codec backend on this platform";
 

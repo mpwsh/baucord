@@ -168,8 +168,7 @@ impl VideoJitterBuffer {
                 self.next_seq = Some(kf);
                 self.primed = true;
                 self.unprimed_since = None;
-                self.pending
-                    .retain(|&s, _| s == kf || is_seq_after(s, kf));
+                self.pending.retain(|&s, _| s == kf || is_seq_after(s, kf));
             } else {
                 // Undecodable delta frames are streaming past — if this
                 // goes on long enough, ask the sender for an IDR instead
@@ -394,7 +393,9 @@ impl VideoJitterBuffer {
                 self.next_seq = None;
                 self.unprimed_since = Some(Instant::now());
                 self.want_keyframe = true;
-                log::warn!("jitter buffer overflow with no buffered keyframe: froze, requesting IDR");
+                log::warn!(
+                    "jitter buffer overflow with no buffered keyframe: froze, requesting IDR"
+                );
             }
         }
     }
@@ -449,7 +450,7 @@ impl JitterEstimate {
         }
     }
 
-   fn record_arrival(&mut self, at: Instant) {
+    fn record_arrival(&mut self, at: Instant) {
         if let Some(last) = self.last_arrival {
             let gap_ms = at.duration_since(last).as_secs_f32() * 1000.0;
 
@@ -472,7 +473,7 @@ impl JitterEstimate {
             self.jitter_ms += ALPHA * (deviation - self.jitter_ms);
         }
         self.last_arrival = Some(at);
-    } 
+    }
 
     fn jitter_ms(&self) -> f32 {
         self.jitter_ms
@@ -536,7 +537,7 @@ mod tests {
         assert_eq!(buf.pull_next().unwrap().seq, 0);
 
         buf.push(pkt(2, false)); // 1 is missing
-        // Window hasn't expired — hold.
+                                 // Window hasn't expired — hold.
         assert!(buf.pull_next().is_none());
         assert!(buf.pull_next().is_none());
 

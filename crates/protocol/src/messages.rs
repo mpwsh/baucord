@@ -250,7 +250,10 @@ mod tests {
         };
         let bytes = encode_server_message(&msg).unwrap();
         let back = decode_server_message(&bytes).unwrap();
-        assert!(matches!(back, ServerMessage::StreamHealth { viewers: 3, .. }));
+        assert!(matches!(
+            back,
+            ServerMessage::StreamHealth { viewers: 3, .. }
+        ));
     }
 
     #[test]
@@ -276,6 +279,9 @@ mod tests {
             ServerMessage::KeyframeRequested { viewer_id: 1 }.channel(),
             SIGNAL_CHANNEL
         );
-        assert_eq!(ClientMessage::Chat(String::new()).channel(), CONTROL_CHANNEL);
+        assert_eq!(
+            ClientMessage::Chat(String::new()).channel(),
+            CONTROL_CHANNEL
+        );
     }
 }

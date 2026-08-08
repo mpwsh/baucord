@@ -33,10 +33,9 @@ use std::time::{Duration, Instant, SystemTime};
 use audio::AudioPacket;
 
 use protocol::{
-    CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ClientMessage, DenyReason, PROTOCOL_ID,
-    SIGNAL_CHANNEL, SYSTEM_AUDIO_CHANNEL, ServerMessage, VIDEO_CHANNEL, VOICE_CHANNEL,
-    VideoReassembler, pack_system_audio, pack_video_frame, pack_voice, parse_system_audio,
-    parse_voice, split_sender,
+    CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ClientMessage, DenyReason, PROTOCOL_ID, SIGNAL_CHANNEL,
+    SYSTEM_AUDIO_CHANNEL, ServerMessage, VIDEO_CHANNEL, VOICE_CHANNEL, VideoReassembler,
+    pack_system_audio, pack_video_frame, pack_voice, parse_system_audio, parse_voice, split_sender,
 };
 
 use crate::screen::ScreenControl;
@@ -173,10 +172,7 @@ fn fetch_connect_token(
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
             let body = response.into_string().unwrap_or_default();
-            return Err(format!(
-                "token server returned {code}: {}",
-                body.trim()
-            ));
+            return Err(format!("token server returned {code}: {}", body.trim()));
         }
         Err(e) => return Err(format!("token request failed: {e}")),
     };
@@ -448,7 +444,8 @@ impl NetworkClient {
             }
             ServerMessage::ShareDenied { reason } => {
                 warn!("Server denied our screen share: {}", reason.describe());
-                self.message_queue.push(NetworkMessage::ShareDenied { reason });
+                self.message_queue
+                    .push(NetworkMessage::ShareDenied { reason });
             }
             ServerMessage::SubscribeDenied { target_id, reason } => {
                 warn!(
@@ -472,12 +469,11 @@ impl NetworkClient {
                     worst_rtt_ms,
                     viewers,
                 });
-            }
-            // No catch-all: the match is exhaustive on purpose, so a
-            // new ServerMessage variant is a compile error here (a
-            // reminder to handle it) instead of a silent log line.
-            // Truly unknown wire data never reaches this match — it
-            // fails deserialization above and is skipped.
+            } // No catch-all: the match is exhaustive on purpose, so a
+              // new ServerMessage variant is a compile error here (a
+              // reminder to handle it) instead of a silent log line.
+              // Truly unknown wire data never reaches this match — it
+              // fails deserialization above and is skipped.
         }
     }
 

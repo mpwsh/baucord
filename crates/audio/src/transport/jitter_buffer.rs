@@ -188,7 +188,7 @@ impl AdaptiveJitterBuffer {
         Self {
             sample_rate,
             target_samples: (initial_target_ms * sample_rate) / 1000,
-            min_samples: (2 * sample_rate) / 1000,   // 2ms floor
+            min_samples: (2 * sample_rate) / 1000, // 2ms floor
             max_samples: (200 * sample_rate) / 1000, // 200ms ceiling
             buffers: HashMap::new(),
             peer_settings,
@@ -320,8 +320,7 @@ impl AdaptiveJitterBuffer {
                     } else {
                         0.02
                     };
-                    peer.jitter_estimate =
-                        peer.jitter_estimate * (1.0 - coeff) + capped * coeff;
+                    peer.jitter_estimate = peer.jitter_estimate * (1.0 - coeff) + capped * coeff;
                 }
             }
             peer.last_arrival = Some(frame.arrival_time);
@@ -681,7 +680,11 @@ impl AdaptiveJitterBuffer {
         }
     }
 
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn ms_to_samples(&self, ms: f32) -> usize {
         ((ms * self.sample_rate as f32) / 1000.0) as usize
     }

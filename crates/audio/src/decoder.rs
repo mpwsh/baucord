@@ -376,12 +376,28 @@ fn conceal_to_earliest_pending(
     match peer.decoder.decode_float(&packet.opus_data, buf, true) {
         Ok(n) => {
             stats.fec_recoveries.fetch_add(1, Ordering::Relaxed);
-            emit(packet.header.ssrc, fec_seq, fec_ts, arrival, &buf[..n], true, tx);
+            emit(
+                packet.header.ssrc,
+                fec_seq,
+                fec_ts,
+                arrival,
+                &buf[..n],
+                true,
+                tx,
+            );
         }
         Err(_) => {
             if let Ok(n) = peer.decoder.decode_float(&[], buf, false) {
                 stats.plc_frames.fetch_add(1, Ordering::Relaxed);
-                emit(packet.header.ssrc, fec_seq, fec_ts, arrival, &buf[..n], true, tx);
+                emit(
+                    packet.header.ssrc,
+                    fec_seq,
+                    fec_ts,
+                    arrival,
+                    &buf[..n],
+                    true,
+                    tx,
+                );
             }
         }
     }
@@ -400,11 +416,7 @@ fn flush_consecutive(
 ) {
     loop {
         let next = peer.last_seq.wrapping_add(1);
-        let Some(idx) = peer
-            .pending
-            .iter()
-            .position(|(p, _)| p.header.seq == next)
-        else {
+        let Some(idx) = peer.pending.iter().position(|(p, _)| p.header.seq == next) else {
             return;
         };
         let (packet, arrival) = peer.pending.swap_remove(idx);

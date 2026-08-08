@@ -116,8 +116,13 @@ impl ChatServer {
                 key,
                 public_addr,
             )?;
-            info!("Secure mode: clients must present a connect token (public address {public_addr})");
-            (ServerAuthentication::Secure { private_key: key }, public_addr)
+            info!(
+                "Secure mode: clients must present a connect token (public address {public_addr})"
+            );
+            (
+                ServerAuthentication::Secure { private_key: key },
+                public_addr,
+            )
         } else {
             warn!("╔══════════════════════════════════════════════════════════════╗");
             warn!("║ AUTHENTICATION DISABLED — running in open (unsecure) mode.   ║");
@@ -251,8 +256,8 @@ impl ChatServer {
 
     fn broadcast_msg_except(&mut self, except: ClientId, msg: &ServerMessage) {
         if let Some(encoded) = protocol::encode_server_message(msg) {
-            self.stats.bytes_sent += encoded.len() as u64
-                * self.server.connected_clients().saturating_sub(1) as u64;
+            self.stats.bytes_sent +=
+                encoded.len() as u64 * self.server.connected_clients().saturating_sub(1) as u64;
             self.server
                 .broadcast_message_except(except, msg.channel(), encoded);
         }
@@ -584,7 +589,10 @@ impl ChatServer {
     /// Forward a keyframe request to `sharer` on behalf of `viewer`.
     fn send_keyframe_request(&mut self, sharer: ClientId, viewer: ClientId) {
         debug!("Forwarding keyframe request: viewer {viewer} → sharer {sharer}");
-        self.send_msg(sharer, &ServerMessage::KeyframeRequested { viewer_id: viewer });
+        self.send_msg(
+            sharer,
+            &ServerMessage::KeyframeRequested { viewer_id: viewer },
+        );
     }
 
     // ── Utilities ───────────────────────────────────────────────────

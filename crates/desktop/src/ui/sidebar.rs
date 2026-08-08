@@ -865,6 +865,7 @@ impl Sidebar {
     pub fn update_latency(
         &mut self,
         rtt_ms: f64,
+        loss_pct: f64,
         audio_latency_ms: Option<u32>,
         kbps_up: f64,
         kbps_down: f64,
@@ -884,6 +885,10 @@ impl Sidebar {
 
         let net_str = if rtt_ms < 1.0 {
             "<1ms".to_string()
+        } else if loss_pct >= 0.05 {
+            // A lossy link is the #1 cause of bad streams and was
+            // previously invisible — show it the moment it's nonzero.
+            format!("{rtt_ms:.0}ms · {loss_pct:.1}% loss")
         } else {
             format!("{rtt_ms:.0}ms")
         };

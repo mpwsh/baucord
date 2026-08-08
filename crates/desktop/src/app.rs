@@ -267,7 +267,7 @@ impl App {
             let mut latest_frames: HashMap<u64, ScreenEvent> = HashMap::new();
             for _ in 0..64 {
                 match self.screen.event_rx.try_recv() {
-                   Ok(evt @ ScreenEvent::FrameReady { .. }) => {
+                    Ok(evt @ ScreenEvent::FrameReady { .. }) => {
                         if let ScreenEvent::FrameReady { client_id, .. } = &evt {
                             if latest_frames.insert(*client_id, evt).is_some() {
                                 // A newer frame displaced an unrendered one
@@ -283,7 +283,7 @@ impl App {
                             }
                         }
                         needs_redraw = true;
-                    } 
+                    }
                     Ok(evt) => {
                         self.handle_screen_event(evt);
                         needs_redraw = true;
@@ -518,13 +518,13 @@ impl App {
             NetworkMessage::VoiceData { .. } => {}
             NetworkMessage::NetworkStats {
                 rtt_ms,
+                loss_pct,
                 kbps_up,
                 kbps_down,
-                ..
             } => {
                 if let Some(sidebar) = &mut self.sidebar {
                     let audio_ms = self.voice.shared.jitter_buffer_ms.load(Ordering::Relaxed);
-                    sidebar.update_latency(rtt_ms, Some(audio_ms), kbps_up, kbps_down);
+                    sidebar.update_latency(rtt_ms, loss_pct, Some(audio_ms), kbps_up, kbps_down);
                 }
             }
             NetworkMessage::ShareDenied { reason } => {

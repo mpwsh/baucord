@@ -256,7 +256,6 @@ impl AudioProcessor for VadStage {
     }
 }
 
-
 // ── Anti-alias filter ───────────────────────────────────────────────────
 
 /// Minimal RBJ-cookbook lowpass biquad (Direct Form 1).

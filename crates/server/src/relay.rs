@@ -209,8 +209,10 @@ impl VideoRelay {
         self.sharers.remove(&client_id);
         self.subscribers.remove(&client_id);
         self.keyframe_request_gate.remove(&client_id);
-        self.waiting_keyframe.retain(|(sharer, _)| *sharer != client_id);
-        self.pending_pokes.retain(|(sharer, _)| *sharer != client_id);
+        self.waiting_keyframe
+            .retain(|(sharer, _)| *sharer != client_id);
+        self.pending_pokes
+            .retain(|(sharer, _)| *sharer != client_id);
     }
 
     /// A viewer wants to watch a streamer. Caller enforces caps first.

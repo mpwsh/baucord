@@ -17,8 +17,8 @@ use fltk::{prelude::*, *};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-use client::config::Settings;
 use crate::ui::messages::UiMessage;
+use client::config::Settings;
 use i18n::t;
 use ui::theme;
 use ui::widgets::controls;
@@ -34,8 +34,13 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: &'static [Tab] =
-        &[Tab::General, Tab::Audio, Tab::Keyboard, Tab::Credits, Tab::About];
+    const ALL: &'static [Tab] = &[
+        Tab::General,
+        Tab::Audio,
+        Tab::Keyboard,
+        Tab::Credits,
+        Tab::About,
+    ];
 
     fn label(&self) -> String {
         match self {

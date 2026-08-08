@@ -338,13 +338,12 @@ impl ViewerWindow {
             self.height = height;
 
             // Update title bar to reflect new resolution
-            self.wind
-                .set_label(&t!(
-                    "viewer-title",
-                    "name" => self.username.as_str(),
-                    "width" => width,
-                    "height" => height
-                ));
+            self.wind.set_label(&t!(
+                "viewer-title",
+                "name" => self.username.as_str(),
+                "width" => width,
+                "height" => height
+            ));
         }
 
         // Swap in the new pixel data + dimensions

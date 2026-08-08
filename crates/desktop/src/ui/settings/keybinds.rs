@@ -11,8 +11,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Mutex, Once};
 
-use client::config::{BindableAction, build_bind_string};
 use crate::ui::messages::UiMessage;
+use client::config::{BindableAction, build_bind_string};
 use ui::theme;
 use ui::widgets::labels;
 

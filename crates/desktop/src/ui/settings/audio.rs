@@ -3,8 +3,8 @@
 // Returns a Flex column with explicit size and position, placed directly
 // inside the parent Scroll.  This matches the layout pattern FLTK needs.
 
-use client::config::Settings;
 use crate::ui::messages::UiMessage;
+use client::config::Settings;
 use fltk::{prelude::*, *};
 use i18n::t;
 use std::sync::Arc;
@@ -122,8 +122,7 @@ pub fn build(
     let mut test_mic_btn = controls::button(&t!("audio-test-mic"));
     col.fixed(&test_mic_btn, 30);
 
-    let test_mic_info =
-        labels::hint_label(&mut col, &t!("audio-test-hint"));
+    let test_mic_info = labels::hint_label(&mut col, &t!("audio-test-hint"));
 
     layout::separator(&mut col);
 

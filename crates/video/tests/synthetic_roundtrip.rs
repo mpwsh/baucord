@@ -131,7 +131,10 @@ fn synthetic_roundtrip() {
             }
         }
     }
-    assert!(saw_new_dims, "decoder never produced frames at the new size");
+    assert!(
+        saw_new_dims,
+        "decoder never produced frames at the new size"
+    );
 
     // ── Phase 4: colorspace sanity ──────────────────────────────────
     // Encode solid mid-tones and verify they roundtrip close to the
@@ -140,9 +143,14 @@ fn synthetic_roundtrip() {
     // range mismatch shows up as crushed blacks / gray whites).
     let mut enc2 = FfmpegEncoder::new(quality).expect("encoder 2");
     let mut dec2 = FfmpegDecoder::new().expect("decoder 2");
-    for (i, rgb) in [[200u8, 60, 60], [60, 200, 60], [60, 60, 200], [235, 235, 235]]
-        .iter()
-        .enumerate()
+    for (i, rgb) in [
+        [200u8, 60, 60],
+        [60, 200, 60],
+        [60, 60, 200],
+        [235, 235, 235],
+    ]
+    .iter()
+    .enumerate()
     {
         // A few identical frames each so quantization settles.
         let mut last: Option<Vec<u8>> = None;

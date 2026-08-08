@@ -109,7 +109,10 @@ pub struct SystemAudioPacket {
 ///
 /// The `sample_rate()` method tells us what rate to expect so we
 /// can configure the resampler.
-#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 trait SystemAudioBackend {
     /// Start capturing. Spawns platform callbacks that push into the ring buffer.
     fn start(&mut self) -> Result<(), Box<dyn std::error::Error>>;
@@ -304,8 +307,7 @@ mod wasapi_loopback {
         }
 
         fn device_name(&self) -> String {
-            crate::device_name(&self.device)
-                .unwrap_or_else(|| "Unknown WASAPI device".into())
+            crate::device_name(&self.device).unwrap_or_else(|| "Unknown WASAPI device".into())
         }
     }
 }
@@ -484,7 +486,10 @@ pub struct SystemAudioCapture {
     /// Stats (shared with voice chat engine for unified reporting).
     /// Only read by the desktop backends — dead weight on mobile, kept
     /// so the struct layout is identical everywhere.
-    #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     stats: Arc<AudioStats>,
 
     /// Platform backend handle — kept alive to maintain capture stream.
@@ -657,7 +662,10 @@ impl SystemAudioCapture {
 
     // ── Worker thread ────────────────────────────────────────────────────
 
-    #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
     fn spawn_worker(
         ring_consumer: Consumer<f32>,
         packet_tx: Sender<SystemAudioPacket>,

@@ -233,7 +233,12 @@ impl FfmpegEncoder {
 
         let session = self.session.as_mut().expect("ensure_session sets this");
 
-        fill_rgba_frame(&mut session.rgba_frame, &frame.data, frame.width, frame.height)?;
+        fill_rgba_frame(
+            &mut session.rgba_frame,
+            &frame.data,
+            frame.width,
+            frame.height,
+        )?;
 
         // RGBA(src) → YUV420P(out) via swscale: resize + colorspace in one pass
         session

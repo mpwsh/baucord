@@ -39,7 +39,9 @@ pub use system_audio::{
     SYSTEM_AUDIO_HEADER_SIZE, SYSTEM_AUDIO_MTU_BUDGET, SystemAudioHeader, pack_system_audio,
     parse_system_audio,
 };
-pub use user_data::{MAX_USERNAME_BYTES, USER_DATA_BYTES, decode_username, encode_username, sanitize_username};
+pub use user_data::{
+    MAX_USERNAME_BYTES, USER_DATA_BYTES, decode_username, encode_username, sanitize_username,
+};
 pub use video::{
     MAX_VIDEO_FRAME_BYTES, ReassembledFrame, VIDEO_CHUNK_PAYLOAD, VIDEO_HEADER_SIZE, VideoHeader,
     VideoReassembler, pack_video_frame, parse_video_header,
