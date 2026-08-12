@@ -935,8 +935,8 @@ impl Sidebar {
     pub fn handle_disconnected(&mut self) {
         self.close_audio_popup();
         self.set_connection_status(false);
-        self.latency_label
-            .set_label(&t!("latency-line", "audio" => "--", "network" => "--"));
+        self.latency_label.set_label(&t!("latency-line",
+            "audio" => "--", "network" => "--", "up" => "--", "down" => "--"));
         self.resource_label.set_label(" ");
         self.user_list_pack.clear();
         self.user_rows.clear();

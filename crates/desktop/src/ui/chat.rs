@@ -136,40 +136,37 @@ impl Chat {
         // ── Input: counter, Enter-to-send, image paste ──────────────
         let mut count_clone = char_count.clone();
         let picker_input = picker.clone();
+        // cfltk2 defaults to base-class-first dispatch (both handlers
+        // always run). This input's closure *intercepts* — right-click
+        // menu, Cmd+V, DND — so it must run first and be able to
+        // suppress Fl_Input's own handling (notably its built-in
+        // text-only right-click menu).
+        message_input.super_handle_first(false);
         message_input.handle(move |input, event| match event {
             enums::Event::KeyUp | enums::Event::KeyDown => {
                 scrub_control_chars(input);
                 update_char_count(input, &mut count_clone);
 
                 if event == enums::Event::KeyDown {
-                    // Ctrl/Cmd+V with an image on the clipboard becomes
-                    // an image send; text pastes fall through to the
-                    // default Fl_Input handler.
-                    let paste_combo = app::event_state().contains(enums::EventState::Command)
-                        && app::event_key() == enums::Key::from_char('v');
-                    if paste_combo {
-                        // Full chain: copied file → native PNG → FLTK
-                        // image → text. Text still lands through the
-                        // default handler inside paste_into_chat.
-                        paste_into_chat(input, sender);
+                    // Windows synthesizes an extra key event carrying
+                    // the literal SYN control char (0x16) alongside the
+                    // real Ctrl+V. The real event drives the paste
+                    // chain below; the stray would either insert a
+                    // visible "^V" (base handler) or double-trigger the
+                    // combo (ours). Swallow it unconditionally, first.
+                    if app::event_text() == "\u{16}" {
                         return true;
                     }
 
-                    // Windows synthesizes an extra key event carrying the
-                    // literal SYN control char (0x16) for Ctrl+V, which
-                    // Fl_Input would insert as a visible "^V". The only
-                    // ^V-carrying event that may fall through is a
-                    // genuine text paste (modifier held AND text on the
-                    // clipboard); everything else is a stray duplicate —
-                    // swallow it. Note the image-paste combo already
-                    // returned above, so this can't shadow it.
-                    if app::event_text() == "\u{16}" {
-                        let genuine_text_paste = app::event_state()
-                            .contains(enums::EventState::Command)
-                            && app::clipboard_contains(app::ClipboardContent::Text);
-                        if !genuine_text_paste {
-                            return true;
-                        }
+                    // Ctrl/Cmd+V: one chain for every clipboard flavor
+                    // — copied file → native PNG → FLTK image → text
+                    // (text still lands through the default Fl_Input
+                    // handler, via paste_text inside the chain).
+                    let paste_combo = app::event_state().contains(enums::EventState::Command)
+                        && app::event_key() == enums::Key::from_char('v');
+                    if paste_combo {
+                        paste_into_chat(input, sender);
+                        return true;
                     }
 
                     if app::event_key() == enums::Key::Enter
@@ -766,15 +763,22 @@ fn show_image_preview_dialog(png: Vec<u8>, sender: app::Sender<UiMessage>) {
     // way we normalize to an RgbImage for uniform scaling below.
     let is_gif = png.starts_with(b"GIF8");
     let decoded: Option<RgbImage> = if is_gif {
-        image::GifImage::from_data(&png)
-            .ok()
-            .and_then(|g| g.to_rgb_image().ok())
+        // fltk's GifImage can't convert to RGB (it's pixmap-based and
+        // to_rgb_image refuses count() != 1), so decode the first
+        // frame with the image crate instead.
+        decode_bounded(&png).ok().and_then(|d| {
+            let rgb = d.to_rgb8();
+            #[allow(clippy::cast_possible_wrap)]
+            let (w, h) = (rgb.width() as i32, rgb.height() as i32);
+            RgbImage::new(rgb.as_raw(), w, h, enums::ColorDepth::Rgb8).ok()
+        })
     } else {
         PngImage::from_data(&png)
             .ok()
             .and_then(|p| p.to_rgb_image().ok())
     };
     let Some(mut preview) = decoded else {
+        log::warn!("image preview: could not decode {} bytes for display", png.len());
         return;
     };
 
