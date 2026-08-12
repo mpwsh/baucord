@@ -187,3 +187,29 @@ error-invalid-address = Dirección inválida (usá ip:puerto)
 error-screen-share = Compartir pantalla: { $error }
 fallback-username = Usuario{ $id }
 unknown = Desconocido
+
+# ── Chat input, image attach & context menus ────────────────────────────
+chat-emoji-tooltip = Emojis — o escribí códigos :nombre: como :joy:
+chat-attach-tooltip = Enviá una imagen desde tu computadora
+chat-image-filter = Imágenes
+chat-image-load-error = No se pudo cargar la imagen: { $error }
+chat-image-undisplayable = { $name } envió una imagen que no se pudo mostrar
+image-preview-title = Enviar imagen
+image-save-filter = Imagen PNG
+image-window-title = { $name } — imagen
+menu-cut = Cortar
+menu-copy = Copiar
+menu-paste = Pegar
+menu-copy-message = Copiar mensaje
+menu-copy-link = Copiar enlace
+menu-open-link = Abrir enlace
+menu-open-image = Abrir imagen
+menu-save-image = Guardar imagen…
+
+# ── Resource stats (sidebar) ────────────────────────────────────────────
+resource-line = CPU { $cpu }% · Mem { $mem } MB
+
+# ── GIFs & media caps ───────────────────────────────────────────────────
+chat-gif-too-large = El GIF supera el límite de { $mb } MB
+chat-gif-too-big = Los GIF animados pueden tener como máximo { $dim } px de ancho o alto
+image-save-filter-gif = Imagen GIF

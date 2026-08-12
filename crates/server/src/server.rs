@@ -423,7 +423,11 @@ impl ChatServer {
 
     fn process_control_messages(&mut self) {
         for client_id in self.server.clients_id() {
-            for channel in [protocol::CONTROL_CHANNEL, protocol::SIGNAL_CHANNEL] {
+            for channel in [
+                protocol::CONTROL_CHANNEL,
+                protocol::SIGNAL_CHANNEL,
+                protocol::MEDIA_CHANNEL,
+            ] {
                 while let Some(message) = self.server.receive_message(client_id, channel) {
                     self.stats.bytes_received += message.len() as u64;
                     match protocol::decode_client_message(&message) {
@@ -457,13 +461,16 @@ impl ChatServer {
                 if !self.allow_image(client_id) {
                     return;
                 }
-                // Relay only what claims to be a PNG — the desktop encodes
-                // PNG exclusively, so anything else is a modified client
-                // wasting everyone's bandwidth.
+                // Relay only what claims to be a PNG or GIF — the
+                // desktop encodes exactly these two, so anything else is
+                // a modified client wasting everyone's bandwidth.
+                // Receivers sniff the same magic to pick a decoder.
                 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-                if !data.starts_with(&PNG_MAGIC) {
+                let is_png = data.starts_with(&PNG_MAGIC);
+                let is_gif = data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a");
+                if !is_png && !is_gif {
                     warn!(
-                        "Dropping non-PNG chat image ({} bytes) from {}",
+                        "Dropping non-PNG/GIF chat image ({} bytes) from {}",
                         data.len(),
                         self.get_username(client_id),
                     );
@@ -669,20 +676,24 @@ impl ChatServer {
     /// here deserves attention. Rate-limited to once a second.
     #[allow(clippy::cast_precision_loss)]
     fn monitor_channel_pressure(&self) {
-        let max_bytes = protocol::channels::CONTROL_BUFFER_BYTES;
-        let threshold = max_bytes / 4; // warn at 75% used
-
+        // Both reliable channels disconnect on ceiling; media carries
+        // the big payloads now, so it's the one that usually matters.
+        let watched = [
+            ("control", protocol::CONTROL_CHANNEL, protocol::channels::CONTROL_BUFFER_BYTES),
+            ("media", protocol::MEDIA_CHANNEL, protocol::channels::MEDIA_BUFFER_BYTES),
+        ];
         for client_id in self.server.clients_id() {
-            let available = self
-                .server
-                .channel_available_memory(client_id, protocol::CONTROL_CHANNEL);
-            if available < threshold {
-                let username = self.get_username(client_id);
-                let used_pct = (1.0 - available as f64 / max_bytes as f64) * 100.0;
-                warn!(
-                    "CHANNEL PRESSURE: {username} ({client_id}) control channel at {used_pct:.0}% \
-                     ({available} bytes remaining of {max_bytes})",
-                );
+            for (name, channel, max_bytes) in watched {
+                let threshold = max_bytes / 4; // warn at 75% used
+                let available = self.server.channel_available_memory(client_id, channel);
+                if available < threshold {
+                    let username = self.get_username(client_id);
+                    let used_pct = (1.0 - available as f64 / max_bytes as f64) * 100.0;
+                    warn!(
+                        "CHANNEL PRESSURE: {username} ({client_id}) {name} channel at \
+                         {used_pct:.0}% ({available} bytes remaining of {max_bytes})",
+                    );
+                }
             }
         }
     }
@@ -727,6 +738,7 @@ fn channel_name(channel_id: u8) -> &'static str {
     match channel_id {
         protocol::CONTROL_CHANNEL => "control",
         protocol::SIGNAL_CHANNEL => "signal",
+        protocol::MEDIA_CHANNEL => "media",
         protocol::VOICE_CHANNEL => "voice",
         protocol::VIDEO_CHANNEL => "video",
         protocol::SYSTEM_AUDIO_CHANNEL => "system_audio",

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use renet::ClientId;
 use serde::{Deserialize, Serialize};
 
-use crate::channels::{CONTROL_CHANNEL, SIGNAL_CHANNEL};
+use crate::channels::{CONTROL_CHANNEL, MEDIA_CHANNEL, SIGNAL_CHANNEL};
 
 /// Upper bound for a serialized control message. Anything larger is
 /// dropped before deserialization — a cheap guard against hostile length
@@ -27,11 +27,12 @@ use crate::channels::{CONTROL_CHANNEL, SIGNAL_CHANNEL};
 /// bound (see [`decode_client_message`] / [`decode_server_message`]).
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 
-/// Maximum PNG payload of a chat image, enforced on both ends: the
-/// sending client downscales until it fits, and the codec refuses to
-/// encode or decode anything larger — so a modified client can't spray
-/// relay memory.
-pub const MAX_CHAT_IMAGE_BYTES: usize = 1024 * 1024;
+/// Maximum payload of a chat image (PNG) or animated GIF, enforced on
+/// both ends: the sending client downscales/rejects until it fits, and
+/// the codec refuses to encode or decode anything larger — so a
+/// modified client can't spray relay memory. Sized for memes: static
+/// images rarely approach this, animated GIFs do.
+pub const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Upper bound for a serialized chat-image message: the payload cap
 /// plus generous headroom for the envelope (postcard varints + ids are
@@ -51,8 +52,9 @@ pub struct ChatMessage {
 
 /// An image chat message attributed to a specific client.
 ///
-/// `data` is an encoded PNG no larger than [`MAX_CHAT_IMAGE_BYTES`];
-/// the codec refuses oversized payloads in both directions.
+/// `data` is an encoded PNG or animated GIF (receivers sniff the magic
+/// bytes) no larger than [`MAX_CHAT_IMAGE_BYTES`]; the codec refuses
+/// oversized payloads in both directions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatImageMessage {
     /// Authoritative sender id, stamped by the server on relay.
@@ -135,6 +137,9 @@ impl ClientMessage {
     pub fn channel(&self) -> u8 {
         match self {
             ClientMessage::RequestKeyframe { .. } => SIGNAL_CHANNEL,
+            // Bulk media rides its own reliable-unordered channel so it
+            // can never head-of-line block ordered chat text.
+            ClientMessage::ChatImage(_) => MEDIA_CHANNEL,
             _ => CONTROL_CHANNEL,
         }
     }
@@ -230,6 +235,7 @@ impl ServerMessage {
             ServerMessage::KeyframeRequested { .. } | ServerMessage::StreamHealth { .. } => {
                 SIGNAL_CHANNEL
             }
+            ServerMessage::ChatImage(_) => MEDIA_CHANNEL,
             _ => CONTROL_CHANNEL,
         }
     }

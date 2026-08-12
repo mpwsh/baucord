@@ -34,6 +34,19 @@ const PLATFORM_SUFFIX: &str = "macos-intel";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const PLATFORM_SUFFIX: &str = "linux-x64";
 
+/// Fallback for targets without published release archives (e.g. a
+/// future linux-aarch64 build). Empty means "no updater": the version
+/// check short-circuits to UpToDate instead of prompting for a
+/// download that cannot exist — and the build compiles instead of
+/// failing on a missing const.
+#[cfg(not(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+)))]
+const PLATFORM_SUFFIX: &str = "";
+
 /// Build the versioned download URL for a given version string.
 pub fn download_url(version: &str) -> String {
     format!("{DOWNLOAD_BASE}/baucord-v{version}-{PLATFORM_SUFFIX}.zip")
@@ -206,6 +219,12 @@ fn check_version_in_background(sender: app::Sender<UiMessage>) {
 
 /// Blocking version check — runs on the spawned thread.
 fn check_version() -> VersionCheckResult {
+    // No release archive exists for this target — never prompt.
+    if PLATFORM_SUFFIX.is_empty() {
+        info!("No update channel for this platform — skipping check");
+        return VersionCheckResult::UpToDate;
+    }
+
     info!("Checking for updates at {VERSION_URL}");
 
     let remote = match fetch_remote_version() {

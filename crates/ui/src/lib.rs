@@ -5,6 +5,7 @@
 //! - **[`theme`]** — one-call dark theme backed by [`fltk_theme`].
 //! - **[`widgets`]** — reusable UI primitives: labels, controls, meters,
 //!   layout helpers, and styling utilities.
+//! - **[`fps`]** — frames-per-second measurement for streaming views.
 //!
 //! # Quick start
 //!
@@ -16,5 +17,6 @@
 
 #![deny(missing_docs)]
 
+pub mod fps;
 pub mod theme;
 pub mod widgets;

@@ -124,7 +124,15 @@ pub enum UiMessage {
 
     // ── UI updates ──────────────────────────────────────────────────
     UpdateStreamStats,
+    /// Fired by the 2 s resource timer. App samples own-process
+    /// CPU/memory — only when the sidebar is actually on screen — and
+    /// pushes the result to the sidebar's resource line.
+    SampleResources,
     ShowError(String),
+    /// Show a local system line in chat (not sent to the server) —
+    /// used for feedback that must be visible while connected, where
+    /// the connect view's error frame isn't.
+    ShowChatNotice(String),
     ClearError,
 
     // ── Keybinds ────────────────────────────────────────────────────

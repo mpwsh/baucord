@@ -99,6 +99,11 @@ pub struct App {
     last_input_devices: Vec<(String, bool)>,
     last_output_devices: Vec<(String, bool)>,
     frames_coalesced: u64,
+
+    // Own-process resource sampling (sidebar stats line)
+    sys: sysinfo::System,
+    /// `None` if the OS refused to identify our own process.
+    pid: Option<sysinfo::Pid>,
 }
 
 impl App {
@@ -183,6 +188,8 @@ impl App {
             last_input_devices: Vec::new(),
             last_output_devices: Vec::new(),
             frames_coalesced: 0,
+            sys: sysinfo::System::new(),
+            pid: sysinfo::get_current_pid().ok(),
         }
     }
 
@@ -210,6 +217,21 @@ impl App {
             });
             app::repeat_timeout3(2.5, handle);
         });
+
+        // Resource sampler — 2 s cadence, matching NetworkStats. The
+        // handler skips the sampling (and the label update) entirely
+        // while the sidebar isn't on screen — hidden to the tray,
+        // minimized, or on the connect view — so the idle cost is one
+        // no-op message per tick.
+        let resource_sender = self.sender;
+        app::add_timeout3(2.0, move |handle| {
+            resource_sender.send(UiMessage::SampleResources);
+            app::repeat_timeout3(2.0, handle);
+        });
+
+        // Reused across loop iterations (drained each pass) so the map
+        // isn't reallocated on every event-loop wakeup.
+        let mut latest_frames: HashMap<u64, ScreenEvent> = HashMap::new();
 
         while self.app.wait() {
             // UI messages
@@ -264,7 +286,6 @@ impl App {
             // window drag blocks FLTK's loop for hundreds of ms), blitting
             // each stale frame just replays the past — show the newest,
             // skip the rest.
-            let mut latest_frames: HashMap<u64, ScreenEvent> = HashMap::new();
             for _ in 0..64 {
                 match self.screen.event_rx.try_recv() {
                     Ok(evt @ ScreenEvent::FrameReady { .. }) => {
@@ -291,7 +312,7 @@ impl App {
                     Err(_) => break,
                 }
             }
-            for (_, evt) in latest_frames {
+            for (_, evt) in latest_frames.drain() {
                 self.handle_screen_event(evt);
             }
 
@@ -527,7 +548,12 @@ impl App {
                 kbps_up,
                 kbps_down,
             } => {
-                if let Some(sidebar) = &mut self.sidebar {
+                // Skip the label churn when nobody can see it (window
+                // in the tray or minimized). Labels refresh at the next
+                // 2 s sample once visible again.
+                if let Some(sidebar) = &mut self.sidebar
+                    && sidebar.is_on_screen()
+                {
                     let audio_ms = self.voice.shared.jitter_buffer_ms.load(Ordering::Relaxed);
                     sidebar.update_latency(rtt_ms, loss_pct, Some(audio_ms), kbps_up, kbps_down);
                 }
@@ -626,7 +652,9 @@ impl App {
                         .unwrap()
                         .map(|q| q.to_string())
                         .unwrap_or_else(|| t!("unknown"));
-                    if let Some(sidebar) = &mut self.sidebar {
+                    if let Some(sidebar) = &mut self.sidebar
+                        && sidebar.is_on_screen()
+                    {
                         sidebar.update_stream_stats(Some(&crate::ui::sidebar::StreamStats {
                             quality: &quality_str,
                             avg_frame_kb: frame_bytes as f32 / 1024.0,
@@ -638,13 +666,61 @@ impl App {
                     }
                 }
             }
+            #[allow(clippy::cast_precision_loss)]
+            UiMessage::SampleResources => {
+                // Sample only when someone can actually see the result.
+                // The check comes first so a hidden/minimized app pays
+                // nothing — not even the process-table refresh.
+                if let Some(pid) = self.pid
+                    && self.sidebar.as_ref().is_some_and(Sidebar::is_on_screen)
+                {
+                    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+                    self.sys.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&[pid]),
+                        false,
+                        ProcessRefreshKind::nothing().with_memory().with_cpu(),
+                    );
+                    if let Some(proc) = self.sys.process(pid) {
+                        // cpu_usage() is % of one core; normalize to %
+                        // of the whole machine (task-manager style).
+                        let cores = std::thread::available_parallelism()
+                            .map_or(1, std::num::NonZero::get)
+                            as f32;
+                        let cpu_pct = proc.cpu_usage() / cores;
+                        // Memory: the platform-native figure (what the
+                        // user's own task monitor shows — footprint on
+                        // macOS, private working set on Windows), with
+                        // sysinfo's RSS as the fallback. RSS counts
+                        // clean shared framework pages too and reads
+                        // 1.5–2× higher, which users mistake for a
+                        // leak when comparing against their monitor.
+                        let mem_bytes = crate::resources::native_monitor_memory()
+                            .unwrap_or_else(|| proc.memory());
+                        let mem_mb = mem_bytes as f64 / (1024.0 * 1024.0);
+                        if let Some(sidebar) = &mut self.sidebar {
+                            sidebar.update_resources(cpu_pct, mem_mb);
+                        }
+                    }
+                }
+            }
+            UiMessage::ShowChatNotice(text) => {
+                self.show_chat_system(&text);
+            }
             UiMessage::WatchPeer { client_id } => {
                 let raw_id = client_id;
                 if self.viewer_windows.contains_key(&raw_id) {
                     return;
                 }
                 let username = self.get_username(client_id);
-                let viewer = ViewerWindow::new(raw_id, &username, 1280, 720, self.sender);
+                // Open at the sharer's announced dimensions (from
+                // ScreenShareStarted) so a 1080p stream doesn't flash
+                // open as a 720p window before the first frame.
+                let (share_w, share_h) = self
+                    .active_sharers
+                    .get(&client_id)
+                    .copied()
+                    .unwrap_or((1280, 720));
+                let viewer = ViewerWindow::new(raw_id, &username, share_w, share_h, self.sender);
                 self.viewer_windows.insert(raw_id, viewer);
                 self.network
                     .tx
@@ -887,6 +963,11 @@ impl App {
             }
             UiMessage::SettingsWindowClosed => {
                 self.settings_window_open = false;
+                // Abort any in-progress keybind recording — otherwise
+                // the global key handler stays armed and the next
+                // unconsumed keypress (hours later, anywhere in the
+                // app) would silently become a keybind.
+                crate::ui::settings::keybinds::cancel_recording();
                 if self.is_testing_mic {
                     self.handle_test_microphone(false);
                 }
@@ -1761,11 +1842,12 @@ impl App {
         // 2. Stop the voice engine (releases audio devices + internal threads)
         self.voice.tx.send(VoiceControl::Stop).ok();
 
-        // 3. Disconnect from server cleanly
+        // 3. Disconnect from server cleanly. No delay needed: the
+        //    control channel is FIFO, so the network thread flushes the
+        //    disconnect packet (synchronously, inside its Disconnect
+        //    handler) before it ever sees the Shutdown queued below —
+        //    and step 5 joins the thread regardless.
         self.network.tx.send(NetworkControl::Disconnect).ok();
-
-        // Small delay to let the disconnect packet go out
-        std::thread::sleep(Duration::from_millis(50));
 
         // 4. Signal all threads to exit their loops
         self.voice.tx.send(VoiceControl::Shutdown).ok();

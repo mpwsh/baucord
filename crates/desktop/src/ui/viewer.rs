@@ -16,10 +16,10 @@
 use fltk::{enums, image::RgbImage, prelude::*, *};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
 
 use crate::ui::messages::UiMessage;
 use i18n::t;
+use ui::fps::FpsCounter;
 use ui::theme;
 use ui::widgets::controls;
 
@@ -31,35 +31,6 @@ struct ViewerPixels {
     data: Vec<u8>,
     width: u32,
     height: u32,
-}
-
-/// Per-second FPS tracking for the stats display.
-struct FpsCounter {
-    frames_this_second: u32,
-    last_fps: u32,
-    last_tick: Instant,
-}
-
-impl FpsCounter {
-    fn new() -> Self {
-        Self {
-            frames_this_second: 0,
-            last_fps: 0,
-            last_tick: Instant::now(),
-        }
-    }
-
-    /// Record a frame. Returns the current FPS estimate (updated once/sec).
-    fn tick(&mut self) -> u32 {
-        self.frames_this_second += 1;
-        let elapsed = self.last_tick.elapsed();
-        if elapsed.as_secs_f32() >= 1.0 {
-            self.last_fps = self.frames_this_second;
-            self.frames_this_second = 0;
-            self.last_tick = Instant::now();
-        }
-        self.last_fps
-    }
 }
 
 /// State for a single viewer window.
@@ -360,7 +331,7 @@ impl ViewerWindow {
         self.ring_idx = (self.ring_idx + 1) % self.recent_frame_bytes.len();
 
         let fps = self.fps.tick();
-        if self.fps.frames_this_second == 1 {
+        if self.fps.second_started() {
             let avg_frame_kb = self.recent_frame_bytes.iter().sum::<u64>() as f32
                 / self.recent_frame_bytes.len() as f32
                 / 1024.0;

@@ -33,13 +33,15 @@ use std::time::{Duration, Instant, SystemTime};
 use audio::AudioPacket;
 
 use protocol::{
-    CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ClientMessage, DenyReason, PROTOCOL_ID, SIGNAL_CHANNEL,
+    CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ClientMessage, DenyReason, MEDIA_CHANNEL, PROTOCOL_ID,
+    SIGNAL_CHANNEL,
     SYSTEM_AUDIO_CHANNEL, ServerMessage, VIDEO_CHANNEL, VOICE_CHANNEL, VideoReassembler,
     pack_system_audio, pack_video_frame, pack_voice, parse_system_audio, parse_voice, split_sender,
 };
 
+use crate::WakeFn;
 use crate::screen::ScreenControl;
-use crate::voice::{VoiceControl, WakeFn};
+use crate::voice::VoiceControl;
 
 /// How often to sample link statistics for the UI.
 const NETWORK_STATS_INTERVAL: Duration = Duration::from_secs(2);
@@ -318,12 +320,18 @@ impl NetworkClient {
         self.process_system_audio_messages();
 
         if let Err(e) = self.transport.send_packets(&mut self.client) {
+            // Primary check: the typed IO error kind. The string probe
+            // is a fallback for WouldBlock surfacing through a wrapped
+            // variant (WSAEWOULDBLOCK = 10035 on Windows) — computed
+            // once, only on the (rare) error path.
             let is_would_block = matches!(
                 &e,
                 NetcodeTransportError::IO(io_err)
                     if io_err.kind() == std::io::ErrorKind::WouldBlock
-            ) || e.to_string().contains("10035")
-                || e.to_string().contains("WouldBlock");
+            ) || {
+                let msg = e.to_string();
+                msg.contains("10035") || msg.contains("WouldBlock")
+            };
             if is_would_block {
                 log::debug!("send_packets: WouldBlock (OS buffer full), will retry next tick");
             } else {
@@ -354,7 +362,7 @@ impl NetworkClient {
     // ── Control channels (control + signal) ─────────────────────────
 
     fn process_control_messages(&mut self) {
-        for channel in [CONTROL_CHANNEL, SIGNAL_CHANNEL] {
+        for channel in [CONTROL_CHANNEL, SIGNAL_CHANNEL, MEDIA_CHANNEL] {
             while let Some(message) = self.client.receive_message(channel) {
                 let Some(msg) = protocol::decode_server_message(&message) else {
                     continue;
@@ -666,7 +674,7 @@ impl NetworkClient {
     }
 
     pub fn poll_messages(&mut self) -> Vec<NetworkMessage> {
-        self.message_queue.drain(..).collect()
+        std::mem::take(&mut self.message_queue)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -964,19 +972,23 @@ fn run_network_loop(
     let mut running = true;
 
     while running {
-        // Block on the control channel with a timeout instead of the old
-        // try_recv + fixed 1 ms sleep. Outbound work (voice frames from
-        // the voice thread, video chunks from the screen thread) now
-        // wakes this loop *immediately* instead of waiting out the
-        // sleep, and an idle disconnected thread costs ~zero CPU. The
-        // timeout doubles as the inbound polling cadence.
-        let timeout = if client.is_some() {
-            Duration::from_millis(1)
+        // Block on the control channel instead of the old try_recv +
+        // fixed 1 ms sleep. Outbound work (voice frames from the voice
+        // thread, video chunks from the screen thread) wakes this loop
+        // *immediately*. Connected, the 1 ms timeout doubles as the
+        // inbound polling cadence (renet needs regular update() calls
+        // to service the UDP socket). Disconnected there is nothing to
+        // poll, so block outright — zero wakeups until Connect or
+        // Shutdown arrives.
+        let recv_result = if client.is_some() {
+            control_rx.recv_timeout(Duration::from_millis(1))
         } else {
-            Duration::from_millis(200)
+            control_rx
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected)
         };
 
-        match control_rx.recv_timeout(timeout) {
+        match recv_result {
             Ok(ctrl) => {
                 if !handle_control(ctrl, &mut client, &msg_tx, &wake) {
                     running = false;

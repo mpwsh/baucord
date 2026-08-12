@@ -17,9 +17,15 @@
 // and get a hand cursor. Right-click offers copy/save actions (the
 // widget view has no native text selection, unlike TextDisplay).
 
-use fltk::{app, enums, frame, group, image::PngImage, menu, prelude::*, window};
+use fltk::{
+    app, enums, frame, group,
+    image::{AnimGifImage, AnimGifImageFlags, GifImage, PngImage},
+    menu, prelude::*, window,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use i18n::t;
 use ui::theme;
 
 // ── Metrics ─────────────────────────────────────────────────────────────
@@ -458,39 +464,233 @@ fn make_text_row(spans: Vec<Span>, copy_text: String, width: i32) -> (frame::Fra
 }
 
 fn show_text_context_menu(copy_text: &str, link: Option<&str>) {
+    let copy_message = t!("menu-copy-message");
+    let copy_link = t!("menu-copy-link");
+    let open_link = t!("menu-open-link");
+
+    // `MenuItem::new` demands `&'static str`; build with placeholders
+    // and relabel (set_label copies), then match the localized strings.
     let items: &[&'static str] = if link.is_some() {
-        &["Copy message", "Copy link", "Open link"]
+        &["copy-message", "copy-link", "open-link"]
     } else {
-        &["Copy message"]
+        &["copy-message"]
     };
     let menu = menu::MenuItem::new(items);
+    let labels: &[&String] = if link.is_some() {
+        &[&copy_message, &copy_link, &open_link]
+    } else {
+        &[&copy_message]
+    };
+    for (i, label) in labels.iter().enumerate() {
+        if let Some(mut item) = menu.at(i as i32) {
+            item.set_label(label);
+        }
+    }
+
     if let Some(choice) = menu.popup(app::event_x(), app::event_y()) {
-        match choice.label().as_deref() {
-            Some("Copy message") => app::copy(copy_text),
-            Some("Copy link") => {
-                if let Some(url) = link {
-                    app::copy(url);
-                }
+        let label = choice.label();
+        let label = label.as_deref();
+        if label == Some(copy_message.as_str()) {
+            app::copy(copy_text);
+        } else if label == Some(copy_link.as_str()) {
+            if let Some(url) = link {
+                app::copy(url);
             }
-            Some("Open link") => {
-                if let Some(url) = link {
-                    let _ = open::that_detached(url);
-                }
+        } else if label == Some(open_link.as_str()) {
+            if let Some(url) = link {
+                let _ = open::that_detached(url);
             }
-            _ => {}
         }
     }
 }
 
 // ── Image rows ──────────────────────────────────────────────────────────
 
+/// The inline image of a chat row, in one of three states. GIF rows
+/// move between `GifStill` (frozen first frame — the cheap steady
+/// state) and `GifAnim` (live animation whose decoded frames exist
+/// *only while it plays*): autoplay runs ~3 loops then freezes back,
+/// hover replays. That policy is the memory model, not a nicety — a
+/// decoded 100-frame GIF is tens of MB, and history keeps 500 rows.
+enum RowImage {
+    Png(PngImage),
+    GifStill(GifImage),
+    GifAnim(AnimGifImage),
+}
+
+impl RowImage {
+    fn data_w(&self) -> i32 {
+        match self {
+            RowImage::Png(i) => i.data_w(),
+            RowImage::GifStill(i) => i.data_w(),
+            RowImage::GifAnim(i) => i.data_w(),
+        }
+    }
+    fn data_h(&self) -> i32 {
+        match self {
+            RowImage::Png(i) => i.data_h(),
+            RowImage::GifStill(i) => i.data_h(),
+            RowImage::GifAnim(i) => i.data_h(),
+        }
+    }
+    fn scale(&mut self, w: i32, h: i32) {
+        match self {
+            RowImage::Png(i) => i.scale(w, h, true, true),
+            RowImage::GifStill(i) => i.scale(w, h, true, true),
+            RowImage::GifAnim(i) => i.scale(w, h, true, true),
+        }
+    }
+    fn draw(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        match self {
+            RowImage::Png(i) => i.draw(x, y, w, h),
+            RowImage::GifStill(i) => i.draw(x, y, w, h),
+            RowImage::GifAnim(i) => i.draw(x, y, w, h),
+        }
+    }
+}
+
+/// Swap a GIF row to live animation, bound to the row widget so frame
+/// advances damage exactly this row. `with_freeze_timer` arms the
+/// autoplay budget (~3 loops); hover-initiated playback skips it and
+/// freezes on Leave instead.
+fn play_gif(state: &Rc<RefCell<ImageRowState>>, row: &frame::Frame, with_freeze_timer: bool) {
+    let anim = {
+        let st = state.borrow();
+        let mut canvas = row.clone();
+        AnimGifImage::from_data(
+            &st.bytes,
+            &mut canvas,
+            // Coexist with the row's custom draw: don't hijack the
+            // widget's image slot or size, just damage it per frame.
+            AnimGifImageFlags::DONT_SET_AS_IMAGE
+                | AnimGifImageFlags::DONT_RESIZE_CANVAS
+                | AnimGifImageFlags::OPTIMIZE_MEMORY,
+        )
+    };
+    let Ok(mut anim) = anim else {
+        return;
+    };
+    {
+        let mut st = state.borrow_mut();
+        let (dw, dh) = st.disp;
+        anim.scale(dw, dh, true, true);
+        st.img = RowImage::GifAnim(anim);
+        st.hover_play = !with_freeze_timer;
+    }
+    if with_freeze_timer {
+        let state = state.clone();
+        let row = row.clone();
+        let budget = 3.0 * gif_loop_secs(&state.borrow().bytes) + 0.25;
+        app::add_timeout3(budget, move |_| {
+            if !row.was_deleted() {
+                freeze_gif(&state, &row);
+            }
+        });
+    }
+}
+
+/// Freeze a playing GIF back to its first-frame still, releasing every
+/// decoded frame. No-op if the row is already still.
+fn freeze_gif(state: &Rc<RefCell<ImageRowState>>, row: &frame::Frame) {
+    {
+        let st = state.borrow();
+        if !matches!(st.img, RowImage::GifAnim(_)) {
+            return;
+        }
+    }
+    let still = {
+        let st = state.borrow();
+        GifImage::from_data(&st.bytes)
+    };
+    let mut st = state.borrow_mut();
+    if let RowImage::GifAnim(anim) = &mut st.img {
+        anim.stop();
+    }
+    if let Ok(mut still) = still {
+        let (dw, dh) = st.disp;
+        still.scale(dw, dh, true, true);
+        st.img = RowImage::GifStill(still); // anim (and its frames) dropped here
+    }
+    st.hover_play = false;
+    drop(st);
+    let mut row = row.clone();
+    row.redraw();
+}
+
+/// Total duration of one animation loop, from the GIF's own Graphic
+/// Control Extension delays (centiseconds) — no pixel decoding. The
+/// structural walk mirrors chat.rs's animation sniffer. Delays of
+/// 0–1 cs render as ~100 ms everywhere (browser convention), so they
+/// count as such. Falls back to 3 s if the parse loses sync.
+fn gif_loop_secs(bytes: &[u8]) -> f64 {
+    let gct = match bytes.get(10) {
+        Some(&flags) if flags & 0x80 != 0 => 3usize << ((flags & 0x07) + 1),
+        _ => 0,
+    };
+    let mut i = 13 + gct;
+    let mut total_cs: u64 = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x3B => break,
+            0x21 => {
+                let is_gce = bytes.get(i + 1) == Some(&0xF9);
+                if is_gce && i + 4 < bytes.len() {
+                    let d = u64::from(u16::from_le_bytes([bytes[i + 3], bytes[i + 4]]));
+                    total_cs += d.max(10); // 0–1 cs → 100 ms convention
+                }
+                i += 2;
+                i = skip_subblocks(bytes, i);
+            }
+            0x2C => {
+                if i + 9 >= bytes.len() {
+                    break;
+                }
+                let flags = bytes[i + 9];
+                let lct = if flags & 0x80 != 0 {
+                    3usize << ((flags & 0x07) + 1)
+                } else {
+                    0
+                };
+                i += 10 + lct + 1;
+                i = skip_subblocks(bytes, i);
+            }
+            _ => break,
+        }
+    }
+    if total_cs == 0 {
+        3.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            total_cs as f64 / 100.0
+        }
+    }
+}
+
+/// Advance past GIF data sub-blocks (len byte + payload, zero-length
+/// terminator).
+fn skip_subblocks(bytes: &[u8], mut i: usize) -> usize {
+    while let Some(&len) = bytes.get(i) {
+        i += 1 + len as usize;
+        if len == 0 {
+            return i;
+        }
+    }
+    bytes.len() + 1
+}
+
 struct ImageRowState {
     header: Vec<Span>,
     header_frags: Vec<Frag>,
-    img: PngImage,
+    img: RowImage,
+    /// True when `bytes` is a GIF (drives replay-on-hover).
+    gif: bool,
+    /// The current animation was started by hover, so Leave freezes it.
+    hover_play: bool,
     /// Displayed (scaled) size.
     disp: (i32, i32),
-    /// Original PNG bytes, kept for "Save image…".
+    /// Original PNG/GIF bytes, kept for "Save image…" and for
+    /// rebuilding stills/animations without re-fetching.
     bytes: Vec<u8>,
     username: String,
 }
@@ -498,9 +698,10 @@ struct ImageRowState {
 fn make_image_row(
     timestamp: String,
     username: String,
-    img: PngImage,
+    img: RowImage,
     bytes: Vec<u8>,
     width: i32,
+    autoplay_gif: bool,
 ) -> (frame::Frame, RelayoutFn) {
     let header = vec![
         Span {
@@ -515,10 +716,13 @@ fn make_image_row(
         },
     ];
 
+    let gif = bytes.starts_with(b"GIF8");
     let state = Rc::new(RefCell::new(ImageRowState {
         header,
         header_frags: Vec::new(),
         img,
+        gif,
+        hover_play: false,
         disp: (0, 0),
         bytes,
         username,
@@ -529,7 +733,7 @@ fn make_image_row(
     row.set_color(theme::SURFACE);
 
     // Compute display size for a given row width.
-    fn fit(img: &PngImage, cw: i32) -> (i32, i32) {
+    fn fit(img: &RowImage, cw: i32) -> (i32, i32) {
         let (dw, dh) = (img.data_w().max(1), img.data_h().max(1));
         let max_w = IMG_MAX_W.min(cw).max(40);
         let scale = f64::min(
@@ -547,9 +751,15 @@ fn make_image_row(
         let (frags, _) = layout(&st.header, width - 2 * PAD_X);
         st.header_frags = frags;
         let disp = fit(&st.img, width - 2 * PAD_X);
-        st.img.scale(disp.0, disp.1, true, true);
+        st.img.scale(disp.0, disp.1);
         st.disp = disp;
         row.set_size(width, PAD_Y + LINE_H + disp.1 + PAD_Y + 2);
+    }
+
+    // Fresh GIFs animate on arrival (only when the chat is on screen),
+    // then freeze after ~3 loops — see play_gif/freeze_gif.
+    if autoplay_gif && gif {
+        play_gif(&state, &row, true);
     }
 
     let st = state.clone();
@@ -610,9 +820,27 @@ fn make_image_row(
             }
             false
         }
+        enums::Event::Enter => {
+            // Replay a frozen GIF while hovered.
+            let frozen = {
+                let st_ref = st.borrow();
+                st_ref.gif && matches!(st_ref.img, RowImage::GifStill(_))
+            };
+            if frozen {
+                play_gif(&st, r, false);
+                r.redraw();
+            }
+            false
+        }
         enums::Event::Leave => {
             if let Some(mut w) = r.window() {
                 w.set_cursor(enums::Cursor::Default);
+            }
+            // Hover-initiated playback ends with the hover; the
+            // autoplay window is governed by its own timer instead.
+            let hover_playing = st.borrow().hover_play;
+            if hover_playing {
+                freeze_gif(&st, r);
             }
             false
         }
@@ -626,7 +854,7 @@ fn make_image_row(
         let (frags, _) = layout(&st.header, w - 2 * PAD_X);
         st.header_frags = frags;
         let disp = fit(&st.img, w - 2 * PAD_X);
-        st.img.scale(disp.0, disp.1, true, true);
+        st.img.scale(disp.0, disp.1);
         st.disp = disp;
         let h = PAD_Y + LINE_H + disp.1 + PAD_Y + 2;
         row_for_layout.set_size(w, h);
@@ -637,29 +865,43 @@ fn make_image_row(
 }
 
 fn show_image_context_menu(state: &Rc<RefCell<ImageRowState>>) {
-    let menu = menu::MenuItem::new(&["Open image", "Save image…"]);
+    let open_image = t!("menu-open-image");
+    let save_image = t!("menu-save-image");
+
+    let menu = menu::MenuItem::new(&["open-image", "save-image"]);
+    for (i, label) in [&open_image, &save_image].into_iter().enumerate() {
+        if let Some(mut item) = menu.at(i as i32) {
+            item.set_label(label);
+        }
+    }
+
     if let Some(choice) = menu.popup(app::event_x(), app::event_y()) {
-        match choice.label().as_deref() {
-            Some("Open image") => open_image_viewer(&state.borrow()),
-            Some("Save image…") => {
-                let mut dialog =
-                    fltk::dialog::NativeFileChooser::new(fltk::dialog::FileDialogType::BrowseSaveFile);
-                dialog.set_option(fltk::dialog::FileDialogOptions::SaveAsConfirm);
-                dialog.set_filter("PNG image\t*.png");
-                dialog.set_preset_file(&format!("{}.png", state.borrow().username));
-                dialog.show();
-                let path = dialog.filename();
-                if !path.as_os_str().is_empty() {
-                    let mut path = path;
-                    if path.extension().is_none() {
-                        path.set_extension("png");
-                    }
-                    if let Err(e) = std::fs::write(&path, &state.borrow().bytes) {
-                        log::warn!("Failed to save image: {e}");
-                    }
+        let label = choice.label();
+        let label = label.as_deref();
+        if label == Some(open_image.as_str()) {
+            open_image_viewer(&state.borrow());
+        } else if label == Some(save_image.as_str()) {
+            let mut dialog =
+                fltk::dialog::NativeFileChooser::new(fltk::dialog::FileDialogType::BrowseSaveFile);
+            dialog.set_option(fltk::dialog::FileDialogOptions::SaveAsConfirm);
+            let (ext, filter_label) = if state.borrow().gif {
+                ("gif", t!("image-save-filter-gif"))
+            } else {
+                ("png", t!("image-save-filter"))
+            };
+            dialog.set_filter(&format!("{filter_label}\t*.{ext}"));
+            dialog.set_preset_file(&format!("{}.{ext}", state.borrow().username));
+            dialog.show();
+            let path = dialog.filename();
+            if !path.as_os_str().is_empty() {
+                let mut path = path;
+                if path.extension().is_none() {
+                    path.set_extension(ext);
+                }
+                if let Err(e) = std::fs::write(&path, &state.borrow().bytes) {
+                    log::warn!("Failed to save image: {e}");
                 }
             }
-            _ => {}
         }
     }
 }
@@ -683,13 +925,24 @@ fn open_image_viewer(state: &ImageRowState) {
 
     let mut win = window::Window::default()
         .with_size(ww, wh)
-        .with_label(&format!("{} — image", state.username));
+        .with_label(&t!("image-window-title", "name" => state.username.as_str()));
     win.set_color(theme::BG_PRIMARY);
     win.make_resizable(true);
 
     let mut frame = frame::Frame::default_fill();
     // A fresh copy so viewer scaling never fights the inline row's.
-    if let Ok(mut full) = PngImage::from_data(&state.bytes) {
+    if state.gif {
+        // Bound to the viewer frame with default set-as-image
+        // behavior: it animates for as long as the window lives and
+        // is freed with it on close.
+        if let Ok(mut anim) = AnimGifImage::from_data(
+            &state.bytes,
+            &mut frame,
+            AnimGifImageFlags::DONT_RESIZE_CANVAS,
+        ) {
+            anim.scale(ww, wh, true, true);
+        }
+    } else if let Ok(mut full) = PngImage::from_data(&state.bytes) {
         full.scale(ww, wh, true, true);
         frame.set_image(Some(full));
     }
@@ -853,21 +1106,55 @@ impl ChatView {
 
     /// Append an inline image from PNG bytes. Returns `false` when the
     /// bytes can't be decoded (caller may show a system line instead).
-    pub fn push_image(&mut self, timestamp: &str, username: &str, png_bytes: Vec<u8>) -> bool {
-        let Ok(img) = PngImage::from_data(&png_bytes) else {
-            return false;
+    pub fn push_image(&mut self, timestamp: &str, username: &str, media_bytes: Vec<u8>) -> bool {
+        // The wire carries PNG or GIF; sniff the magic to pick the
+        // decoder (matching the server's relay filter).
+        let img = if media_bytes.starts_with(b"GIF8") {
+            match GifImage::from_data(&media_bytes) {
+                Ok(g) => RowImage::GifStill(g),
+                Err(_) => return false,
+            }
+        } else {
+            match PngImage::from_data(&media_bytes) {
+                Ok(p) => RowImage::Png(p),
+                Err(_) => return false,
+            }
         };
         let cw = self.content_width();
+        // Animate on arrival only when someone can see it — hidden or
+        // minimized chat starts frozen and plays on hover instead.
+        let autoplay = self.scroll.visible_r();
         let (widget, relayout) = make_image_row(
             timestamp.to_string(),
             username.to_string(),
             img,
-            png_bytes,
+            media_bytes,
             cw,
+            autoplay,
         );
         let height = widget.h();
         self.append(widget, relayout, height);
         true
+    }
+
+    /// Make the message area a drop target for image files. FLTK
+    /// delivers the drop as an FL_PASTE whose text is paths (mac/win)
+    /// or file:// URIs (X11); the shared sniffer routes the first
+    /// image into the attach/preview flow. Rows under the mouse
+    /// ignore DND events, so they bubble here.
+    pub fn accept_image_drops(&mut self, sender: app::Sender<super::messages::UiMessage>) {
+        self.scroll.handle(move |_, ev| match ev {
+            enums::Event::DndEnter | enums::Event::DndDrag | enums::Event::DndRelease => true,
+            enums::Event::Paste => {
+                if let Some(path) = super::chat::first_image_path_in(&app::event_text()) {
+                    super::chat::attach_path(&path, sender);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        });
     }
 
     /// Remove all rows (fresh connection).

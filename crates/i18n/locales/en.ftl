@@ -185,3 +185,29 @@ error-invalid-address = Invalid address (use ip:port)
 error-screen-share = Screen share: { $error }
 fallback-username = User{ $id }
 unknown = Unknown
+
+# ── Chat input, image attach & context menus ────────────────────────────
+chat-emoji-tooltip = Emoji — or type :name: codes like :joy:
+chat-attach-tooltip = Send an image from your computer
+chat-image-filter = Images
+chat-image-load-error = Couldn't load image: { $error }
+chat-image-undisplayable = { $name } sent an image that could not be displayed
+image-preview-title = Send image
+image-save-filter = PNG image
+image-window-title = { $name } — image
+menu-cut = Cut
+menu-copy = Copy
+menu-paste = Paste
+menu-copy-message = Copy message
+menu-copy-link = Copy link
+menu-open-link = Open link
+menu-open-image = Open image
+menu-save-image = Save image…
+
+# ── Resource stats (sidebar) ────────────────────────────────────────────
+resource-line = CPU { $cpu }% · Mem { $mem } MB
+
+# ── GIFs & media caps ───────────────────────────────────────────────────
+chat-gif-too-large = GIF is over the { $mb } MB limit
+chat-gif-too-big = Animated GIFs can be at most { $dim } px wide or tall
+image-save-filter-gif = GIF image

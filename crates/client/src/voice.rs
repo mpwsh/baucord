@@ -21,9 +21,9 @@ use crate::config::Settings;
 use crate::network::NetworkControl;
 use audio::{AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig};
 
-/// A callback the worker thread invokes to wake the UI event loop.
-/// Injected at construction so this module never imports a UI crate.
-pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
+/// Re-exported for backwards compatibility — the definition moved to
+/// the crate root since network and screen use it too.
+pub use crate::WakeFn;
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -331,22 +331,38 @@ fn run_voice_loop(
     let (_dead_tx, dead_rx) = bounded::<audio::AudioPacket>(1);
 
     while state.running {
-        let outgoing = state.vc.as_ref().map(|v| v.outgoing_receiver());
-        select! {
-            recv(control_rx) -> msg => match msg {
+        if state.vc.is_none() {
+            // Idle: no engine, so no meters to feed, no packets to
+            // forward, and no speaking edges to detect — block until a
+            // command arrives instead of spinning the 5 ms cadence
+            // below (which cost ~200 wakeups/s from app launch until
+            // the first connect).
+            match control_rx.recv() {
                 Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
-                Err(_) => { state.running = false; }
-            },
-            recv(outgoing.as_ref().unwrap_or(&dead_rx)) -> pkt => {
-                // Low-latency path: forward the packet that woke us.
-                // Anything queued behind it is drained below.
-                if let (Ok(packet), Some(id)) = (pkt, state.our_client_id)
-                    && !is_testing_mic.load(Ordering::Relaxed)
-                {
-                    forward_outgoing(&network_tx, id, packet);
+                Err(_) => {
+                    state.running = false;
                 }
-            },
-            default(Duration::from_millis(5)) => {}
+            }
+        } else {
+            let outgoing = state.vc.as_ref().map(|v| v.outgoing_receiver());
+            select! {
+                recv(control_rx) -> msg => match msg {
+                    Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
+                    Err(_) => { state.running = false; }
+                },
+                recv(outgoing.as_ref().unwrap_or(&dead_rx)) -> pkt => {
+                    // Low-latency path: forward the packet that woke us.
+                    // Anything queued behind it is drained below.
+                    if let (Ok(packet), Some(id)) = (pkt, state.our_client_id)
+                        && !is_testing_mic.load(Ordering::Relaxed)
+                    {
+                        forward_outgoing(&network_tx, id, packet);
+                    }
+                },
+                // Engine running: the 5 ms cadence feeds the UI level
+                // meters even when the gate is closed (no packets).
+                default(Duration::from_millis(5)) => {}
+            }
         }
 
         // Drain any queued control messages

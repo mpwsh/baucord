@@ -171,6 +171,7 @@ pub struct Sidebar {
     stream_stats_label: frame::Frame,
     connection_status: frame::Frame,
     latency_label: frame::Frame,
+    resource_label: frame::Frame,
     mute_btn: button::Button,
     deafen_btn: button::Button,
     share_btn: button::Button,
@@ -234,7 +235,7 @@ impl Sidebar {
         // ── Connection status panel ─────────────────────────────────
         let mut status_col = group::Flex::default().column();
         status_col.set_spacing(2);
-        sidebar.fixed(&status_col, 50);
+        sidebar.fixed(&status_col, 66);
 
         let mut connection_status = frame::Frame::default().with_label(&t!("status-connecting"));
         status_col.fixed(&connection_status, 20);
@@ -247,6 +248,15 @@ impl Sidebar {
         latency_label.set_label_color(theme::TEXT_MUTED);
         latency_label.set_label_size(10);
         latency_label.set_align(enums::Align::Left | enums::Align::Inside | enums::Align::Clip);
+
+        // Own-process CPU/memory. Blank until the first sample; only
+        // refreshed while the sidebar is actually on screen (App gates
+        // the sampling on `is_on_screen`).
+        let mut resource_label = frame::Frame::default().with_label(" ");
+        status_col.fixed(&resource_label, 14);
+        resource_label.set_label_color(theme::TEXT_MUTED);
+        resource_label.set_label_size(10);
+        resource_label.set_align(enums::Align::Left | enums::Align::Inside | enums::Align::Clip);
 
         status_col.end();
 
@@ -310,6 +320,7 @@ impl Sidebar {
             stream_stats_label,
             connection_status,
             latency_label,
+            resource_label,
             mute_btn,
             deafen_btn,
             share_btn,
@@ -803,7 +814,7 @@ impl Sidebar {
                     }
                     true
                 }
-                enums::Event::Push if app::event_button() == 3 => {
+                enums::Event::Push if app::event_mouse_button() == app::MouseButton::Right => {
                     sender_rc.send(UiMessage::OpenUserAudioPopup {
                         client_id: client_id_rc,
                         username: username_rc.clone(),
@@ -862,6 +873,24 @@ impl Sidebar {
         }
     }
 
+    /// Whether the sidebar is actually being rendered: `visible_r`
+    /// walks the parent chain, so this is false when the wizard shows
+    /// the connect view, the window is hidden to the tray, or it is
+    /// minimized (FLTK clears the window's visible flag on iconify on
+    /// all three platforms). Stats updates and resource sampling are
+    /// skipped while this is false.
+    pub fn is_on_screen(&self) -> bool {
+        self.group.visible_r()
+    }
+
+    /// Update the own-process resource line (CPU % of the whole
+    /// machine, resident memory in MB).
+    pub fn update_resources(&mut self, cpu_pct: f32, mem_mb: f64) {
+        self.resource_label.set_label(&t!("resource-line",
+            "cpu" => format!("{cpu_pct:.1}"),
+            "mem" => format!("{mem_mb:.0}")));
+    }
+
     pub fn update_latency(
         &mut self,
         rtt_ms: f64,
@@ -908,6 +937,7 @@ impl Sidebar {
         self.set_connection_status(false);
         self.latency_label
             .set_label(&t!("latency-line", "audio" => "--", "network" => "--"));
+        self.resource_label.set_label(" ");
         self.user_list_pack.clear();
         self.user_rows.clear();
         self.user_count_label

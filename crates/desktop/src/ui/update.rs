@@ -270,7 +270,13 @@ pub fn show_complete(
 
     // ── Callbacks ────────────────────────────────────────────────────
 
+    // Skipping the install would otherwise leave the downloaded zip
+    // next to the exe forever — one per skipped version — and the next
+    // prompt re-downloads from scratch anyway. Best-effort cleanup on
+    // both skip paths (button and window close).
+    let zip_for_skip = path.to_string();
     not_now_btn.set_callback(move |_| {
+        let _ = std::fs::remove_file(&zip_for_skip);
         sender.send(UiMessage::SkipUpdate);
     });
 
@@ -279,8 +285,10 @@ pub fn show_complete(
         sender.send(UiMessage::InstallUpdate(path_owned.clone()));
     });
 
+    let zip_for_close = path.to_string();
     wind.set_callback(move |w| {
         if app::event() == enums::Event::Close {
+            let _ = std::fs::remove_file(&zip_for_close);
             sender.send(UiMessage::SkipUpdate);
             w.hide();
         }
@@ -497,12 +505,13 @@ pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
 
     info!("Relaunching {}", current_exe.display());
 
+    // spawn() returning Ok means the OS has created the process — the
+    // child runs the freshly-replaced binary from the same path and
+    // does not need this parent alive. Exit immediately.
     std::process::Command::new(&current_exe)
         .spawn()
         .map_err(|e| format!("Failed to relaunch: {e}"))?;
 
-    // Give the new process a moment to start before we exit
-    std::thread::sleep(std::time::Duration::from_millis(200));
     std::process::exit(0);
 }
 

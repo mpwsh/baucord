@@ -33,7 +33,7 @@ use video::{
     codec::{FfmpegDecoder, FfmpegEncoder},
 };
 
-use crate::{network::NetworkControl, voice::WakeFn};
+use crate::{WakeFn, network::NetworkControl};
 
 use audio::{
     stats::AudioStats,
@@ -453,7 +453,9 @@ fn run_screen_loop(
             }
         } else {
             // ── Idle mode ───────────────────────────────────────────
-            match control_rx.recv_timeout(Duration::from_millis(100)) {
+            // Nothing to capture and no jitter buffers to drain —
+            // block until a command arrives instead of waking 10×/s.
+            match control_rx.recv() {
                 Ok(ctrl) => handle_control(
                     ctrl,
                     &mut st,
@@ -463,7 +465,6 @@ fn run_screen_loop(
                     &wake,
                     &voice_energy,
                 ),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
         }

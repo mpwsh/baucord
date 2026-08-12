@@ -7,6 +7,7 @@
 // hotkey manager (common on Wayland, some remote sessions, etc.) the
 // app runs without them instead of crashing at startup.
 
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
     hotkey::{Code, HotKey, Modifiers},
@@ -14,8 +15,22 @@ use global_hotkey::{
 use log::{info, warn};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Once, OnceLock};
 
 use client::config::{BindableAction, Settings};
+
+/// Our own event channel. `GlobalHotKeyEvent::set_event_handler`
+/// *replaces* the crate's internal channel delivery, so the handler
+/// forwards into this one — and, crucially, calls `fltk::app::awake()`
+/// the instant a key fires. Previously a press just sat in the crate's
+/// channel until the next unrelated UI event woke the FLTK loop
+/// (worst case: the 2.5 s device-poll timer, i.e. a mute key that
+/// lands seconds late while the app idles in the tray).
+fn event_channel() -> &'static (Sender<GlobalHotKeyEvent>, Receiver<GlobalHotKeyEvent>) {
+    static CHANNEL: OnceLock<(Sender<GlobalHotKeyEvent>, Receiver<GlobalHotKeyEvent>)> =
+        OnceLock::new();
+    CHANNEL.get_or_init(unbounded)
+}
 
 pub struct HotkeyManager {
     /// `None` when the OS-level manager could not be created — hotkeys
@@ -29,6 +44,19 @@ pub struct HotkeyManager {
 
 impl HotkeyManager {
     pub fn new(settings: &Settings) -> Self {
+        // The handler is process-global state in the global-hotkey
+        // crate; guard against reinstall if a second manager is ever
+        // created (harmless today — new() runs once per app).
+        static INSTALL_HANDLER: Once = Once::new();
+        INSTALL_HANDLER.call_once(|| {
+            GlobalHotKeyEvent::set_event_handler(Some(|event: GlobalHotKeyEvent| {
+                let _ = event_channel().0.send(event);
+                // Thread-safe by design — this runs on whatever thread
+                // the OS delivers hotkey events on.
+                fltk::app::awake();
+            }));
+        });
+
         let manager = match GlobalHotKeyManager::new() {
             Ok(m) => Some(m),
             Err(e) => {
@@ -52,8 +80,11 @@ impl HotkeyManager {
     }
 
     /// Poll for hotkey press events. Ignores releases.
+    ///
+    /// Reads our own channel (see [`event_channel`]) — with an event
+    /// handler installed, the crate's built-in receiver never fires.
     pub fn poll(&self) -> Option<BindableAction> {
-        if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv()
+        if let Ok(event) = event_channel().1.try_recv()
             && event.state() == HotKeyState::Pressed
             && let Some(&action) = self.bindings.get(&event.id())
         {

@@ -10,7 +10,22 @@
 //! depends on no UI toolkit. The FLTK app lives in the sibling
 //! `desktop` crate; a future mobile shell sits on the same seam.
 
+use std::sync::Arc;
+
 pub mod config;
 pub mod network;
 pub mod screen;
 pub mod voice;
+
+/// A callback the worker threads invoke to wake the UI event loop.
+/// Injected at construction so this crate never imports a UI toolkit
+/// (e.g. `fltk::app::awake` for the desktop, a no-op for headless).
+///
+/// Lives at the crate root because all three worker modules use it;
+/// `voice` re-exports it for backwards compatibility.
+pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Wire budget for a chat image/GIF payload, re-exported so the UI
+/// layer enforces the same cap the codec does — the numbers can't
+/// drift because they are the same constant.
+pub use protocol::MAX_CHAT_IMAGE_BYTES;

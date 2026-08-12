@@ -26,10 +26,40 @@ struct CapturedKey {
 
 static HANDLER_INIT: Once = Once::new();
 
-static RECORDING_ACTION: Mutex<Option<BindableAction>> = Mutex::new(None);
-static CAPTURED: Mutex<Option<CapturedKey>> = Mutex::new(None);
-static CANCELLED: Mutex<bool> = Mutex::new(false);
-static CLEARED: Mutex<Option<BindableAction>> = Mutex::new(None);
+/// All capture state behind one lock, so the invariants (recording is
+/// exclusive with a pending result; at most one of captured /
+/// cancelled / cleared is set per capture) live in one place instead
+/// of four independent Mutexes.
+#[derive(Default)]
+struct CaptureShared {
+    /// The action currently being recorded, if any.
+    recording: Option<BindableAction>,
+    /// A completed capture waiting for the panel's bridge timer.
+    captured: Option<CapturedKey>,
+    /// Escape was pressed — reset the row buttons.
+    cancelled: bool,
+    /// Backspace was pressed — clear this action's binding.
+    cleared: Option<BindableAction>,
+}
+
+static CAPTURE: Mutex<CaptureShared> = Mutex::new(CaptureShared {
+    recording: None,
+    captured: None,
+    cancelled: false,
+    cleared: None,
+});
+
+/// Abort any in-progress keybind recording and drop pending results.
+///
+/// Called by App when the settings window closes: the global key
+/// handler is installed for the process lifetime, so a recording left
+/// armed would swallow the next unconsumed keypress anywhere in the
+/// app and silently apply it as a keybind on the next settings-open.
+pub fn cancel_recording() {
+    if let Ok(mut g) = CAPTURE.lock() {
+        *g = CaptureShared::default();
+    }
+}
 
 /// Global FLTK event handler — captures keys while recording is active.
 /// Installed once via app::add_handler.
@@ -38,7 +68,7 @@ fn global_key_handler(ev: enums::Event) -> bool {
         return false;
     }
 
-    let current_action = match RECORDING_ACTION.lock().ok().and_then(|g| *g) {
+    let current_action = match CAPTURE.lock().ok().and_then(|g| g.recording) {
         Some(a) => a,
         None => return false,
     };
@@ -52,23 +82,18 @@ fn global_key_handler(ev: enums::Event) -> bool {
 
     // Escape = cancel
     if key == enums::Key::Escape {
-        if let Ok(mut g) = RECORDING_ACTION.lock() {
-            *g = None;
-        }
-        if let Ok(mut g) = CANCELLED.lock() {
-            *g = true;
+        if let Ok(mut g) = CAPTURE.lock() {
+            g.recording = None;
+            g.cancelled = true;
         }
         return true;
     }
 
     // Backspace = clear binding
     if key == enums::Key::BackSpace {
-        let action = current_action;
-        if let Ok(mut g) = RECORDING_ACTION.lock() {
-            *g = None;
-        }
-        if let Ok(mut g) = CLEARED.lock() {
-            *g = Some(action);
+        if let Ok(mut g) = CAPTURE.lock() {
+            g.recording = None;
+            g.cleared = Some(current_action);
         }
         return true;
     }
@@ -83,11 +108,9 @@ fn global_key_handler(ev: enums::Event) -> bool {
     if let Some(code) = fltk_key_to_code_string(key) {
         let bind = build_bind_string(ctrl, alt, shift, &code);
 
-        if let Ok(mut g) = RECORDING_ACTION.lock() {
-            *g = None;
-        }
-        if let Ok(mut g) = CAPTURED.lock() {
-            *g = Some(CapturedKey {
+        if let Ok(mut g) = CAPTURE.lock() {
+            g.recording = None;
+            g.captured = Some(CapturedKey {
                 bind,
                 action: current_action,
             });
@@ -156,8 +179,17 @@ pub fn build(
             return;
         }
 
+        // Take all pending results under one lock.
+        let (captured, cancelled, cleared) = match CAPTURE.lock() {
+            Ok(mut g) => (
+                g.captured.take(),
+                std::mem::take(&mut g.cancelled),
+                g.cleared.take(),
+            ),
+            Err(_) => (None, false, None),
+        };
+
         // Check for captured key
-        let captured = CAPTURED.lock().ok().and_then(|mut g| g.take());
         if let Some(cap) = captured {
             for row in rows_poll.borrow().iter() {
                 if row.action == cap.action {
@@ -166,6 +198,21 @@ pub fn build(
                     disp.set_label(&cap.bind);
                     disp.set_label_color(theme::ACCENT);
                     reset_button(&mut btn);
+                } else if row.display.label() == cap.bind {
+                    // The key was bound to another action — steal it.
+                    // Registering the same hotkey twice fails at the OS
+                    // level, so a duplicate would silently leave the
+                    // other action without a working key while its row
+                    // still showed the bind.
+                    let mut disp = row.display.clone();
+                    let mut btn = row.button.clone();
+                    disp.set_label(&t!("keybind-not-set"));
+                    disp.set_label_color(theme::TEXT_MUTED);
+                    reset_button(&mut btn);
+                    sender.send(UiMessage::SetKeybind {
+                        action: row.action,
+                        bind: String::new(),
+                    });
                 }
             }
             sender.send(UiMessage::SetKeybind {
@@ -175,15 +222,6 @@ pub fn build(
         }
 
         // Check for cancel
-        let cancelled = CANCELLED
-            .lock()
-            .ok()
-            .map(|mut g| {
-                let v = *g;
-                *g = false;
-                v
-            })
-            .unwrap_or(false);
         if cancelled {
             for row in rows_poll.borrow().iter() {
                 let mut btn = row.button.clone();
@@ -192,7 +230,6 @@ pub fn build(
         }
 
         // Check for clear
-        let cleared = CLEARED.lock().ok().and_then(|mut g| g.take());
         if let Some(action) = cleared {
             for row in rows_poll.borrow().iter() {
                 if row.action == action {
@@ -269,10 +306,10 @@ fn build_keybind_row(
 
     let mut disp = binding_display.clone();
     record_btn.set_callback(move |btn| {
-        let was_recording = RECORDING_ACTION
+        let was_recording = CAPTURE
             .lock()
             .ok()
-            .map(|g| *g == Some(action))
+            .map(|g| g.recording == Some(action))
             .unwrap_or(false);
 
         // Cancel any other active recording first
@@ -287,14 +324,14 @@ fn build_keybind_row(
 
         if was_recording {
             // Cancel
-            if let Ok(mut g) = RECORDING_ACTION.lock() {
-                *g = None;
+            if let Ok(mut g) = CAPTURE.lock() {
+                g.recording = None;
             }
             reset_button(btn);
         } else {
             // Start recording
-            if let Ok(mut g) = RECORDING_ACTION.lock() {
-                *g = Some(action);
+            if let Ok(mut g) = CAPTURE.lock() {
+                g.recording = Some(action);
             }
             btn.set_label("...");
             btn.set_color(theme::ACCENT_HOVER);

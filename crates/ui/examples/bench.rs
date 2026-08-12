@@ -31,8 +31,8 @@
 use fltk::{app, draw, enums, frame, group, image::RgbImage, prelude::*, window};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
 
+use ui::fps::FpsCounter;
 use ui::theme;
 
 /// Stream resolution (720p).
@@ -105,55 +105,6 @@ impl Strategy {
             Self::DrawImageDirect => Self::PreallocatedRgbImage,
             Self::PreallocatedRgbImage => Self::RgbImagePerFrame,
         }
-    }
-}
-
-// ── FPS counter ─────────────────────────────────────────────────────────
-
-struct FpsCounter {
-    frames_this_second: u32,
-    last_fps: u32,
-    last_tick: Instant,
-    total_frames: u64,
-    start: Instant,
-}
-
-impl FpsCounter {
-    fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            frames_this_second: 0,
-            last_fps: 0,
-            last_tick: now,
-            total_frames: 0,
-            start: now,
-        }
-    }
-
-    fn tick(&mut self) -> u32 {
-        self.frames_this_second += 1;
-        self.total_frames += 1;
-
-        if self.last_tick.elapsed().as_secs_f32() >= 1.0 {
-            self.last_fps = self.frames_this_second;
-            self.frames_this_second = 0;
-            self.last_tick = Instant::now();
-        }
-
-        self.last_fps
-    }
-
-    fn avg_fps(&self) -> f64 {
-        let elapsed = self.start.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            self.total_frames as f64 / elapsed
-        } else {
-            0.0
-        }
-    }
-
-    fn reset(&mut self) {
-        *self = Self::new();
     }
 }
 
@@ -337,10 +288,10 @@ fn main() {
         }
 
         // Print to console every second
-        if fps.frames_this_second == 1 && current_fps > 0 {
+        if fps.second_started() && current_fps > 0 {
             println!(
                 "[{:>5.1}s] {}: {}fps (avg {:.1})",
-                fps.start.elapsed().as_secs_f64(),
+                fps.elapsed_secs(),
                 strat.label(),
                 current_fps,
                 fps.avg_fps(),

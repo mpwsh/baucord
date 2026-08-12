@@ -129,6 +129,12 @@ pub struct ServerSettings {
     pub token_url: Option<String>,
     /// Shared password sent to the issuer in the `x-baucord-pass`
     /// header, if the server configures one.
+    ///
+    /// Stored in settings.json as plain text on purpose: this is a
+    /// shared room secret for a friends server, not a personal
+    /// credential — treat it accordingly (and don't reuse a personal
+    /// password for it). An OS-keychain integration would add a
+    /// per-platform dependency for a secret every member knows.
     #[serde(default)]
     pub token_password: Option<String>,
 }
