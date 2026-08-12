@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.1.37"
+version = "0.1.38"
 edition = "2024"
 
 [lints]
@@ -33,12 +33,12 @@ trayicon = { git = "https://github.com/mpwsh/trayicon-rs" }
 # floor guarantees the root ImageReader/Limits API used for bounded
 # decoding.
 image = { version = "0.25.9", default-features = false, features = [
-  "png",
-  "jpeg",
-  "gif",
-  "webp",
-  "bmp",
-  "tiff",
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
 ] }
 # Own-process CPU/memory for the sidebar stats line. Only the `system`
 # feature — no disks/network/components/users — to keep the build lean.
@@ -52,8 +52,8 @@ self-replace = "1.5.0"
 # sources like screenshot copies. Only the NSPasteboard header —
 # default features would compile every AppKit binding.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
-  "std",
-  "NSPasteboard",
+    "std",
+    "NSPasteboard",
 ] }
 
 [build-dependencies]

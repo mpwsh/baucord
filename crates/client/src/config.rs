@@ -364,3 +364,44 @@ impl Settings {
         }
     }
 }
+
+// ── Window-position store ───────────────────────────────────────────────
+//
+// Deliberately a separate tiny file, NOT part of `Settings`: dialogs
+// persist their position with a load-modify-save on close, and going
+// through Settings would race the app's own in-memory copy (whichever
+// saved last would clobber the other's changes).
+
+fn window_positions_path() -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("baucord").join("windows.json"))
+}
+
+fn read_window_positions() -> HashMap<String, (i32, i32)> {
+    window_positions_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Last saved position of the named window, if any. Callers should
+/// clamp to the current screen before applying — monitors change.
+#[must_use]
+pub fn window_pos(key: &str) -> Option<(i32, i32)> {
+    read_window_positions().get(key).copied()
+}
+
+/// Persist the named window's position. Failures are silent — losing a
+/// window position is not worth an error dialog.
+pub fn set_window_pos(key: &str, pos: (i32, i32)) {
+    let Some(path) = window_positions_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut map = read_window_positions();
+    map.insert(key.to_string(), pos);
+    if let Ok(contents) = serde_json::to_string_pretty(&map) {
+        let _ = fs::write(&path, contents);
+    }
+}

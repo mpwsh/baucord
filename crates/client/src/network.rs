@@ -56,6 +56,10 @@ const MAX_TOKEN_RESPONSE_BYTES: u64 = 8192;
 
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
+    /// Outbound image upload progress, 0–100. 100 means the reliable
+    /// channel has drained (every byte acked) — the UI hides its
+    /// indicator on it.
+    UploadProgress { pct: u8 },
     Connected,
     Disconnected(String),
     InitClient {
@@ -209,6 +213,14 @@ pub(crate) struct NetworkClient {
 
     // Speaking status dedupe (only send on change)
     last_speaking_sent: bool,
+    /// Total bytes of an in-flight chat image upload, if any. Progress
+    /// is inferred from the media channel's buffered (unacked) bytes
+    /// draining back toward zero — renet exposes no per-message acks,
+    /// but with one upload at a time the channel's memory usage IS the
+    /// unacked remainder.
+    upload_total: Option<usize>,
+    /// Last percentage reported to the UI (255 = force first emit).
+    upload_last_pct: u8,
     last_stats_check: Instant,
     /// Whether we've announced `NetworkMessage::Connected` to the app.
     /// Set once the netcode handshake actually completes.
@@ -280,6 +292,8 @@ impl NetworkClient {
             last_updated: Instant::now(),
             reassembler: VideoReassembler::new(),
             last_speaking_sent: false,
+            upload_total: None,
+            upload_last_pct: 255,
             last_stats_check: Instant::now(),
             announced_connected: false,
         })
@@ -307,6 +321,8 @@ impl NetworkClient {
                 .push(NetworkMessage::Disconnected(reason.to_string()));
             return;
         }
+
+        self.sample_upload_progress();
 
         // Announce Connected exactly once, when the handshake completes.
         if !self.announced_connected && self.client.is_connected() {
@@ -563,6 +579,37 @@ impl NetworkClient {
     // ── Outbound messages ───────────────────────────────────────────
 
     /// Send a control-plane message on its designated channel.
+    /// Report outbound image progress from the media channel's
+    /// buffered-bytes drain (see `upload_total`). Emits only on change,
+    /// so this is a handful of messages per upload, not per tick.
+    fn sample_upload_progress(&mut self) {
+        let Some(total) = self.upload_total else {
+            return;
+        };
+        let available = self
+            .client
+            .channel_available_memory(protocol::MEDIA_CHANNEL);
+        let used = protocol::channels::MEDIA_BUFFER_BYTES.saturating_sub(available);
+        let pct = if used == 0 {
+            100
+        } else {
+            // `used` can momentarily exceed `total` (envelope bytes);
+            // clamp so progress never goes negative.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (total.saturating_sub(used.min(total)) * 100 / total.max(1)) as u8
+            }
+        };
+        if pct != self.upload_last_pct {
+            self.upload_last_pct = pct;
+            self.message_queue
+                .push(NetworkMessage::UploadProgress { pct });
+        }
+        if pct == 100 {
+            self.upload_total = None;
+        }
+    }
+
     fn send_control(&mut self, msg: &ClientMessage) {
         match protocol::encode_client_message(msg) {
             Some(encoded) => self.client.send_message(msg.channel(), encoded),
@@ -577,6 +624,8 @@ impl NetworkClient {
     /// Send a chat image. `send_control` refuses (with a warning) if the
     /// payload somehow exceeds the protocol budget.
     pub fn send_image(&mut self, data: Vec<u8>) {
+        self.upload_total = Some(data.len());
+        self.upload_last_pct = 255;
         self.send_control(&ClientMessage::ChatImage(data));
     }
 

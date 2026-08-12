@@ -516,6 +516,11 @@ impl App {
                     chat.handle_text_message(username, text);
                 }
             }
+            NetworkMessage::UploadProgress { pct } => {
+                if let Some(chat) = &mut self.chat {
+                    chat.set_upload_progress(pct);
+                }
+            }
             NetworkMessage::ImageMessage { username, data } => {
                 if let Some(chat) = &mut self.chat {
                     chat.handle_image_message(username, data);
@@ -768,6 +773,14 @@ impl App {
             }
             UiMessage::SendChatMessage(text) => {
                 self.network.tx.send(NetworkControl::SendMessage(text)).ok();
+            }
+            UiMessage::CloseFloatingPopups => {
+                if let Some(chat) = &mut self.chat {
+                    chat.close_popups();
+                }
+                if let Some(sidebar) = &mut self.sidebar {
+                    sidebar.close_audio_popup();
+                }
             }
             UiMessage::SendChatImage(data) => {
                 // Same broadcast semantics as SendMessage: the server
@@ -1708,6 +1721,18 @@ impl App {
             }
         });
 
+        // Floating helpers (emoji picker, volume popup) are separate
+        // top-level windows: minimizing or closing the main window
+        // would strand them on the desktop. FL_HIDE covers both.
+        // (Deliberately NOT Unfocus/Push: those fire while *opening* a
+        // popup and would close it in the same breath.)
+        let popup_sender = self.sender;
+        wind.handle(move |_, ev| {
+            if ev == enums::Event::Hide {
+                popup_sender.send(UiMessage::CloseFloatingPopups);
+            }
+            false
+        });
         wind.show();
 
         self.error_frame = Some(connect.error_frame);

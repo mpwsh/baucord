@@ -230,7 +230,20 @@ const HEADER_H: i32 = 22;
 /// clicked; the window stays open so several emoji can be inserted in
 /// a row. The caller owns the returned window and decides when to hide
 /// or delete it (Escape inside the picker hides it too).
-pub fn open_picker<F: FnMut(&str) + 'static>(x: i32, y: i32, on_pick: F) -> window::Window {
+/// Returns the picker window and the image wrappers its cells display.
+/// The caller must keep the images alive as long as the window lives:
+/// `set_image` does not own the underlying Fl image — the last Rust
+/// wrapper to drop deletes it, leaving the cell drawing freed memory.
+pub fn open_picker<F, D>(
+    x: i32,
+    y: i32,
+    on_pick: F,
+    mut on_dismiss: D,
+) -> (window::Window, Vec<fltk::image::RgbImage>)
+where
+    F: FnMut(&str) + 'static,
+    D: FnMut() + 'static,
+{
     // Popups must never be adopted by whatever group is current.
     group::Group::set_current(None::<&group::Group>);
 
@@ -253,6 +266,7 @@ pub fn open_picker<F: FnMut(&str) + 'static>(x: i32, y: i32, on_pick: F) -> wind
     let mut col = 0;
     let mut last_section = "";
     let on_pick = std::rc::Rc::new(std::cell::RefCell::new(on_pick));
+    let mut images: Vec<fltk::image::RgbImage> = Vec::new();
 
     for (name, emoji, section) in EMOJI {
         if *section != last_section {
@@ -280,7 +294,13 @@ pub fn open_picker<F: FnMut(&str) + 'static>(x: i32, y: i32, on_pick: F) -> wind
         // (font rendering is monochrome on Windows GDI). Text label only
         // as a fallback for anything not bundled.
         match crate::ui::emoji_assets::rgb_image(emoji, 24) {
-            Some(img) => btn.set_image(Some(img)),
+            Some(img) => {
+                // Clone keeps the strong count above 1 across
+                // set_image's internal drop; the original goes in the
+                // keeper vec the caller pins to the window's lifetime.
+                btn.set_image(Some(img.clone()));
+                images.push(img);
+            }
             None => {
                 btn.set_label(emoji);
                 btn.set_label_size(18);
@@ -300,17 +320,23 @@ pub fn open_picker<F: FnMut(&str) + 'static>(x: i32, y: i32, on_pick: F) -> wind
     scroll.end();
     win.end();
 
-    // Escape hides the picker.
-    win.handle(move |w, ev| {
-        if ev == enums::Event::KeyDown && fltk::app::event_key() == enums::Key::Escape {
-            w.hide();
-            return true;
+    // One handler for both dismissal paths — Escape and losing focus
+    // (click outside, app switch). Installed here, once: a second
+    // `win.handle` at the call site would silently REPLACE this one.
+    win.handle(move |_, ev| match ev {
+        enums::Event::Unfocus => {
+            on_dismiss();
+            true
         }
-        false
+        enums::Event::KeyDown if fltk::app::event_key() == enums::Key::Escape => {
+            on_dismiss();
+            true
+        }
+        _ => false,
     });
 
     win.show();
-    win
+    (win, images)
 }
 
 /// Height of the picker popup, for anchoring it above the emoji button.

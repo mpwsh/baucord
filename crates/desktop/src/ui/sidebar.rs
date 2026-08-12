@@ -400,7 +400,7 @@ impl Sidebar {
         }
     }
 
-    fn close_audio_popup(&mut self) {
+    pub fn close_audio_popup(&mut self) {
         if let Some(mut w) = self.audio_popup.take() {
             w.hide();
         }

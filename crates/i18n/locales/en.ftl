@@ -211,3 +211,4 @@ resource-line = CPU { $cpu }% · Mem { $mem } MB
 chat-gif-too-large = GIF is over the { $mb } MB limit
 chat-gif-too-big = Animated GIFs can be at most { $dim } px wide or tall
 image-save-filter-gif = GIF image
+chat-upload-progress = Uploading image… { $pct }%

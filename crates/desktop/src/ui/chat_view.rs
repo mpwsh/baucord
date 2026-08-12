@@ -562,9 +562,11 @@ fn play_gif(state: &Rc<RefCell<ImageRowState>>, row: &frame::Frame, with_freeze_
             &mut canvas,
             // Coexist with the row's custom draw: don't hijack the
             // widget's image slot or size, just damage it per frame.
-            AnimGifImageFlags::DONT_SET_AS_IMAGE
-                | AnimGifImageFlags::DONT_RESIZE_CANVAS
-                | AnimGifImageFlags::OPTIMIZE_MEMORY,
+            // No OPTIMIZE_MEMORY: it stores frames at their partial
+            // sizes and FLTK documents resize artifacts — which is
+            // exactly our case (rows always draw scaled). Costs more
+            // RAM per frame while playing; the 800 px cap bounds it.
+            AnimGifImageFlags::DONT_SET_AS_IMAGE | AnimGifImageFlags::DONT_RESIZE_CANVAS,
         )
     };
     let Ok(mut anim) = anim else {
@@ -580,7 +582,10 @@ fn play_gif(state: &Rc<RefCell<ImageRowState>>, row: &frame::Frame, with_freeze_
     if with_freeze_timer {
         let state = state.clone();
         let row = row.clone();
-        let budget = 3.0 * gif_loop_secs(&state.borrow().bytes) + 0.25;
+        // ~3 loops, but never more than 30 s of autoplay: a duration
+        // misread (or a pathologically long GIF) must not turn into
+        // minutes of animation. Hover still replays after the freeze.
+        let budget = (3.0 * gif_loop_secs(&state.borrow().bytes) + 0.25).min(30.0);
         app::add_timeout3(budget, move |_| {
             if !row.was_deleted() {
                 freeze_gif(&state, &row);
@@ -636,7 +641,11 @@ fn gif_loop_secs(bytes: &[u8]) -> f64 {
                 let is_gce = bytes.get(i + 1) == Some(&0xF9);
                 if is_gce && i + 4 < bytes.len() {
                     let d = u64::from(u16::from_le_bytes([bytes[i + 3], bytes[i + 4]]));
-                    total_cs += d.max(10); // 0–1 cs → 100 ms convention
+                    // Match Fl_Anim_GIF's convert_delay exactly: only
+                    // a zero delay becomes 10 cs; small real delays
+                    // play as-is. Clamping them up here made the
+                    // 3-loop budget 3–5× too long for fast GIFs.
+                    total_cs += if d == 0 { 10 } else { d };
                 }
                 i += 2;
                 i = skip_subblocks(bytes, i);
@@ -702,7 +711,7 @@ fn make_image_row(
     bytes: Vec<u8>,
     width: i32,
     autoplay_gif: bool,
-) -> (frame::Frame, RelayoutFn) {
+) -> (frame::Frame, RelayoutFn, Rc<RefCell<ImageRowState>>) {
     let header = vec![
         Span {
             kind: Kind::Timestamp,
@@ -847,6 +856,7 @@ fn make_image_row(
         _ => false,
     });
 
+    let media = state.clone();
     let st = state;
     let mut row_for_layout = row.clone();
     let relayout: RelayoutFn = Box::new(move |w| {
@@ -861,7 +871,7 @@ fn make_image_row(
         h
     });
 
-    (row, relayout)
+    (row, relayout, media)
 }
 
 fn show_image_context_menu(state: &Rc<RefCell<ImageRowState>>) {
@@ -906,6 +916,17 @@ fn show_image_context_menu(state: &Rc<RefCell<ImageRowState>>) {
     }
 }
 
+/// Clamp a remembered window position onto the current screen, so a
+/// monitor change can't strand a dialog off-screen.
+pub(crate) fn clamp_win_pos(pos: (i32, i32)) -> (i32, i32) {
+    let (sw, sh) = app::screen_size();
+    #[allow(clippy::cast_possible_truncation)]
+    (
+        pos.0.clamp(0, (sw as i32 - 200).max(0)),
+        pos.1.clamp(0, (sh as i32 - 200).max(0)),
+    )
+}
+
 /// Open a chat image at (up to) full resolution in its own window.
 fn open_image_viewer(state: &ImageRowState) {
     group::Group::set_current(None::<&group::Group>);
@@ -928,23 +949,42 @@ fn open_image_viewer(state: &ImageRowState) {
         .with_label(&t!("image-window-title", "name" => state.username.as_str()));
     win.set_color(theme::BG_PRIMARY);
     win.make_resizable(true);
+    if let Some(pos) = client::config::window_pos("viewer") {
+        let (x, y) = clamp_win_pos(pos);
+        win.set_pos(x, y);
+    }
 
     let mut frame = frame::Frame::default_fill();
     // A fresh copy so viewer scaling never fights the inline row's.
+    // Lifetime model: neither FLTK's widget->image() nor fltk-rs's
+    // set_image takes ownership of the underlying Fl image — the last
+    // Rust wrapper to drop deletes it (Fl_Image::release() is plain
+    // `delete` outside Fl_Shared_Image). Letting these wrappers die at
+    // the end of this function leaves the frame pointing at freed
+    // memory; for GIFs the very first Resize during show() then
+    // crashes inside Fl_Image_scale. The wrappers are therefore moved
+    // into the window's close callback below, pinning them to the
+    // window's lifetime. (Fl_Anim_GIF's destructor only removes its
+    // timer — it never touches the canvas — so dropping after widget
+    // deletion is safe.)
+    let mut keep_anim: Option<AnimGifImage> = None;
+    let mut keep_png: Option<PngImage> = None;
     if state.gif {
-        // Bound to the viewer frame with default set-as-image
-        // behavior: it animates for as long as the window lives and
-        // is freed with it on close.
         if let Ok(mut anim) = AnimGifImage::from_data(
             &state.bytes,
             &mut frame,
             AnimGifImageFlags::DONT_RESIZE_CANVAS,
         ) {
             anim.scale(ww, wh, true, true);
+            // Fl_Anim_GIF already bound itself via canvas->image().
+            keep_anim = Some(anim);
         }
     } else if let Ok(mut full) = PngImage::from_data(&state.bytes) {
         full.scale(ww, wh, true, true);
-        frame.set_image(Some(full));
+        // The clone keeps the strong count above 1 across set_image's
+        // internal drop; `full` then lives in the callback.
+        frame.set_image(Some(full.clone()));
+        keep_png = Some(full);
     }
     frame.handle(|f, ev| {
         if ev == enums::Event::Resize {
@@ -956,7 +996,20 @@ fn open_image_viewer(state: &ImageRowState) {
     });
 
     win.end();
-    win.set_callback(|w| {
+    let mut keep_anim = keep_anim;
+    let mut keep_png = keep_png;
+    win.set_callback(move |w| {
+        // The animation's frame timer holds a raw canvas pointer with
+        // no deletion guard (verified in Fl_Anim_GIF_Image.cxx), so it
+        // must die BEFORE the widgets do — relying on the closure being
+        // dropped during widget deletion demonstrably fires the timer
+        // on a dead frame. stop() removes the pending timeout; the
+        // drop frees the frames.
+        if let Some(mut anim) = keep_anim.take() {
+            anim.stop();
+        }
+        keep_png.take();
+        client::config::set_window_pos("viewer", (w.x(), w.y()));
         w.hide();
         app::delete_widget(w.clone());
     });
@@ -967,8 +1020,23 @@ fn open_image_viewer(state: &ImageRowState) {
 
 type RelayoutFn = Box<dyn FnMut(i32) -> i32>;
 
+/// Stop (and thereby unschedule) a row's GIF animation before its
+/// canvas widget is deleted — the timer has no deletion guard and
+/// would otherwise fire on a dead frame. Dropping the frames happens
+/// with the state; stopping the timer is what prevents the crash.
+fn stop_row_anim(row: &Row) {
+    if let Some(state) = &row.media {
+        if let RowImage::GifAnim(anim) = &mut state.borrow_mut().img {
+            anim.stop();
+        }
+    }
+}
+
 struct Row {
     widget: frame::Frame,
+    /// Image rows expose their state so deletion paths can stop a
+    /// playing animation BEFORE the widget dies (see `stop_row_anim`).
+    media: Option<Rc<RefCell<ImageRowState>>>,
     relayout: RelayoutFn,
     height: i32,
 }
@@ -1033,7 +1101,13 @@ impl ChatView {
         content_h <= self.scroll.h() || self.scroll.yposition() >= content_h - self.scroll.h() - AUTOSCROLL_SLACK
     }
 
-    fn append(&mut self, widget: frame::Frame, relayout: RelayoutFn, height: i32) {
+    fn append(
+        &mut self,
+        widget: frame::Frame,
+        relayout: RelayoutFn,
+        height: i32,
+        media: Option<Rc<RefCell<ImageRowState>>>,
+    ) {
         let stick = self.at_bottom();
 
         self.pack.add(&widget);
@@ -1041,11 +1115,13 @@ impl ChatView {
             widget,
             relayout,
             height,
+            media,
         });
 
         // History cap: drop the oldest row.
         if self.rows.borrow().len() > MAX_ROWS {
             let old = self.rows.borrow_mut().remove(0);
+            stop_row_anim(&old);
             self.pack.remove(&old.widget);
             app::delete_widget(old.widget);
         }
@@ -1092,7 +1168,7 @@ impl ChatView {
         let cw = self.content_width();
         let (widget, relayout) = make_text_row(spans, copy_text, cw);
         let height = widget.h();
-        self.append(widget, relayout, height);
+        self.append(widget, relayout, height, None);
     }
 
     /// Append a muted, italic system line.
@@ -1101,7 +1177,7 @@ impl ChatView {
         let cw = self.content_width();
         let (widget, relayout) = make_text_row(spans, text.to_string(), cw);
         let height = widget.h();
-        self.append(widget, relayout, height);
+        self.append(widget, relayout, height, None);
     }
 
     /// Append an inline image from PNG bytes. Returns `false` when the
@@ -1124,7 +1200,7 @@ impl ChatView {
         // Animate on arrival only when someone can see it — hidden or
         // minimized chat starts frozen and plays on hover instead.
         let autoplay = self.scroll.visible_r();
-        let (widget, relayout) = make_image_row(
+        let (widget, relayout, media) = make_image_row(
             timestamp.to_string(),
             username.to_string(),
             img,
@@ -1133,7 +1209,7 @@ impl ChatView {
             autoplay,
         );
         let height = widget.h();
-        self.append(widget, relayout, height);
+        self.append(widget, relayout, height, Some(media));
         true
     }
 
@@ -1160,6 +1236,7 @@ impl ChatView {
     /// Remove all rows (fresh connection).
     pub fn clear(&mut self) {
         for row in self.rows.borrow_mut().drain(..) {
+            stop_row_anim(&row);
             self.pack.remove(&row.widget);
             app::delete_widget(row.widget);
         }

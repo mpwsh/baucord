@@ -12,6 +12,10 @@ pub enum VersionCheckResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiMessage {
+    /// Close any floating helper windows (emoji picker, per-user
+    /// volume popup). Sent when the main window hides/minimizes so
+    /// they can't be left orphaned on the desktop.
+    CloseFloatingPopups,
     // ── Connection flow ─────────────────────────────────────────────
     Connect {
         nickname: String,

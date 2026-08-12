@@ -28,6 +28,8 @@ const MAX_IMAGE_DIM: u32 = 1280;
 /// 50-frame GIF is already ~128 MB of transient frame data.
 const MAX_ANIM_GIF_DIM: u32 = 800;
 
+type PickerSlot = Rc<RefCell<Option<(window::Window, Vec<RgbImage>)>>>;
+
 pub struct Chat {
     // UI elements kept alive for method access.
     // sender, message_input, char_count, and the emoji button are
@@ -35,8 +37,15 @@ pub struct Chat {
     // struct.
     group: group::Flex,
     view: ChatView,
-    /// Currently open emoji picker popup, if any.
-    picker: Rc<RefCell<Option<window::Window>>>,
+    /// Keeps the bar-icon Fl images alive (see construction).
+    _icon_images: Vec<RgbImage>,
+    /// Muted one-line upload indicator between history and input.
+    upload_label: frame::Frame,
+    
+    /// The open picker window plus the image wrappers its cells
+    /// display — the images must live exactly as long as the window
+    /// (set_image does not own the underlying Fl image).
+    picker: PickerSlot,
 }
 
 impl Chat {
@@ -54,14 +63,25 @@ impl Chat {
         chat_col.fixed(&input_row, 40);
         input_row.set_spacing(10);
 
+        // Bar-icon images are kept on the struct: set_image does not
+        // own the underlying Fl image, so dropping the wrapper here
+        // would leave the button drawing freed memory.
+        let mut icon_images: Vec<RgbImage> = Vec::new();
         let mut emoji_btn = controls::button("");
         match crate::ui::emoji_assets::rgb_image("\u{1F642}", 20) {
-            Some(img) => emoji_btn.set_image(Some(img)),
+            Some(img) => {
+                emoji_btn.set_image(Some(img.clone()));
+                icon_images.push(img);
+            }
             None => {
                 emoji_btn.set_label("\u{1F642}");
                 emoji_btn.set_label_size(16);
             }
         }
+        // ImageBackdrop centers the icon in the button; the default
+        // image-above-label layout reserves a text line even for an
+        // empty label, pushing the icon visibly off-center.
+        emoji_btn.set_align(enums::Align::Center | enums::Align::ImageBackdrop);
         emoji_btn.set_tooltip(&t!("chat-emoji-tooltip"));
         input_row.fixed(&emoji_btn, 40);
 
@@ -69,12 +89,16 @@ impl Chat {
         // as clipboard paste.
         let mut attach_btn = controls::button("");
         match crate::ui::emoji_assets::rgb_image("\u{1F4CE}", 20) {
-            Some(img) => attach_btn.set_image(Some(img)),
+            Some(img) => {
+                attach_btn.set_image(Some(img.clone()));
+                icon_images.push(img);
+            }
             None => {
                 attach_btn.set_label("\u{1F4CE}");
                 attach_btn.set_label_size(16);
             }
         }
+        attach_btn.set_align(enums::Align::Center | enums::Align::ImageBackdrop);
         attach_btn.set_tooltip(&t!("chat-attach-tooltip"));
         input_row.fixed(&attach_btn, 40);
 
@@ -91,23 +115,54 @@ impl Chat {
         input_row.fixed(&send_btn, 80);
 
         input_row.end();
+
+        // Thin, muted status line for upload progress, below the input.
+        // Its 12 px are reserved PERMANENTLY (empty when idle) so
+        // showing/hiding the text never resizes anything above it.
+        let mut upload_label = frame::Frame::default();
+        upload_label.set_label_size(11);
+        upload_label.set_label_color(theme::TEXT_MUTED);
+        upload_label.set_align(enums::Align::Left | enums::Align::Inside);
+        chat_col.fixed(&upload_label, 12);
         chat_col.end();
 
-        let picker: Rc<RefCell<Option<window::Window>>> = Rc::new(RefCell::new(None));
+        let picker: PickerSlot = Rc::new(RefCell::new(None));
+        // When the picker closes itself on Unfocus, a click on the 😀
+        // button IS a click outside: Unfocus fires first, and by the
+        // time this callback runs the picker is gone — so a naive
+        // toggle would instantly reopen it. The Unfocus handler stamps
+        // the close time; a click arriving right after it is treated
+        // as the closing click.
+        let picker_closed_at: Rc<RefCell<Option<std::time::Instant>>> =
+            Rc::new(RefCell::new(None));
 
         // ── Emoji picker toggle ─────────────────────────────────────
         let picker_toggle = picker.clone();
+        let closed_at_toggle = picker_closed_at.clone();
         let input_for_picker = message_input.clone();
         let count_for_picker = char_count.clone();
         emoji_btn.set_callback(move |btn| {
-            // Second click (or a stale hidden popup) closes it.
-            if let Some(mut open) = picker_toggle.borrow_mut().take() {
-                let was_visible = open.visible();
-                open.hide();
-                app::delete_widget(open);
-                if was_visible {
-                    return;
+            // Second click (or a stale hidden popup) closes it. Take
+            // on its own statement so the RefCell borrow ends before
+            // hide() — which can reenter via the Unfocus handler.
+            let open = picker_toggle.borrow_mut().take();
+            if let Some((mut open, _images)) = open {
+                if !open.was_deleted() {
+                    let was_visible = open.visible();
+                    open.hide();
+                    app::delete_widget(open);
+                    if was_visible {
+                        return;
+                    }
                 }
+            }
+            // The Unfocus self-close just handled this same click.
+            let recently_closed = closed_at_toggle
+                .borrow_mut()
+                .take()
+                .is_some_and(|t| t.elapsed().as_millis() < 300);
+            if recently_closed {
+                return;
             }
 
             // Anchor the palette just above the button.
@@ -120,12 +175,26 @@ impl Chat {
 
             let mut input = input_for_picker.clone();
             let mut count = count_for_picker.clone();
-            let win = emoji::open_picker(x, y, move |e| {
-                input.insert(e).ok();
-                let _ = input.take_focus();
-                update_char_count(&input, &mut count);
-            });
-            *picker_toggle.borrow_mut() = Some(win);
+            // Dismissal (Escape, click outside, app switch) closes
+            // the picker and stamps the time so the toggle recognizes
+            // a close its own click caused. The handler lives inside
+            // open_picker — installing one here would replace it.
+            let picker_dismiss = picker_toggle.clone();
+            let closed_at_dismiss = closed_at_toggle.clone();
+            let (win, images) = emoji::open_picker(
+                x,
+                y,
+                move |e| {
+                    input.insert(e).ok();
+                    let _ = input.take_focus();
+                    update_char_count(&input, &mut count);
+                },
+                move || {
+                    *closed_at_dismiss.borrow_mut() = Some(std::time::Instant::now());
+                    close_picker(&picker_dismiss);
+                },
+            );
+            *picker_toggle.borrow_mut() = Some((win, images));
         });
 
         // ── Attach image from disk ──────────────────────────────────
@@ -247,8 +316,32 @@ impl Chat {
         Self {
             group: chat_col,
             view,
+            _icon_images: icon_images,
+            upload_label,
             picker,
         }
+    }
+
+    /// Close any floating helper windows owned by the chat (currently
+    /// the emoji picker). Called when the main window hides/minimizes.
+    pub fn close_popups(&mut self) {
+        close_picker(&self.picker);
+    }
+
+    /// Show/update the outbound-upload indicator. 100 (or anything
+    /// above) clears it — the network thread reports 100 exactly once,
+    /// when the media channel has fully drained. Only the text changes;
+    /// the line's height is reserved permanently so nothing resizes.
+    pub fn set_upload_progress(&mut self, pct: u8) {
+        if pct >= 100 {
+            self.upload_label.set_label("");
+        } else {
+            self.upload_label.set_label(&t!(
+                "chat-upload-progress",
+                "pct" => u32::from(pct)
+            ));
+        }
+        self.upload_label.redraw();
     }
 
     pub fn create_ui(&mut self) -> group::Flex {
@@ -307,10 +400,19 @@ impl Drop for Chat {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn close_picker(picker: &Rc<RefCell<Option<window::Window>>>) {
-    if let Some(mut w) = picker.borrow_mut().take() {
-        w.hide();
-        app::delete_widget(w);
+fn close_picker(picker: &PickerSlot) {
+    // Take first, on its own statement: an `if let` on
+    // `borrow_mut().take()` keeps the RefCell guard alive through the
+    // whole body, and `hide()` can synchronously deliver Unfocus to
+    // the picker — whose handler calls back in here. With the borrow
+    // already released, the reentrant call just sees None. Dropping
+    // the taken tuple also frees the cell images, deterministically.
+    let taken = picker.borrow_mut().take();
+    if let Some((mut w, _images)) = taken {
+        if !w.was_deleted() {
+            w.hide();
+            app::delete_widget(w);
+        }
     }
 }
 
@@ -798,13 +900,40 @@ fn show_image_preview_dialog(png: Vec<u8>, sender: app::Sender<UiMessage>) {
     let mut win = window::Window::default()
         .with_size(win_w, win_h)
         .with_label(&t!("image-preview-title"));
+    if let Some(pos) = client::config::window_pos("preview") {
+        let (x, y) = super::chat_view::clamp_win_pos(pos);
+        win.set_pos(x, y);
+    }
     win.set_color(theme::BG_PRIMARY);
     win.make_modal(true);
 
     let mut img_frame = frame::Frame::new(win_w / 2 - pw / 2, 12, pw, ph, None);
     img_frame.set_frame(enums::FrameType::BorderBox);
     img_frame.set_color(theme::SURFACE);
-    img_frame.set_image(Some(preview));
+    // Neither widget->image() nor set_image owns the Fl image — the
+    // last Rust wrapper to drop deletes it. The keeper is shared by
+    // every close path (window callback, Cancel, Send), each of which
+    // must stop the animation BEFORE deleting widgets: its frame timer
+    // holds a raw canvas pointer with no deletion guard.
+    let media = Rc::new(RefCell::new(PreviewMedia {
+        anim: None,
+        still: None,
+    }));
+    if png.starts_with(b"GIF8") {
+        // Play the GIF in the preview; it binds itself to the frame.
+        if let Ok(mut anim) = image::AnimGifImage::from_data(
+            &png,
+            &mut img_frame,
+            image::AnimGifImageFlags::DONT_RESIZE_CANVAS,
+        ) {
+            anim.scale(pw, ph, true, true);
+            media.borrow_mut().anim = Some(anim);
+        }
+    }
+    if media.borrow().anim.is_none() {
+        img_frame.set_image(Some(preview.clone()));
+        media.borrow_mut().still = Some(preview);
+    }
 
     let mut caption = frame::Frame::new(0, ph + 16, win_w, 20, None).with_label(&format!(
         "{}×{} — {} KB",
@@ -854,21 +983,47 @@ fn show_image_preview_dialog(png: Vec<u8>, sender: app::Sender<UiMessage>) {
     // Escape and the window-manager close both fire the window
     // callback: cancel and free the dialog instead of leaking it
     // hidden.
-    win.set_callback(|w| {
+    let media_cb = media.clone();
+    win.set_callback(move |w| {
+        media_cb.borrow_mut().release();
+        client::config::set_window_pos("preview", (w.x(), w.y()));
         w.hide();
         app::delete_widget(w.clone());
     });
 
     let mut win_cancel = win.clone();
+    let media_cancel = media.clone();
     cancel_btn.set_callback(move |_| {
+        media_cancel.borrow_mut().release();
+        client::config::set_window_pos("preview", (win_cancel.x(), win_cancel.y()));
         win_cancel.hide();
         app::delete_widget(win_cancel.clone());
     });
 
     let mut win_send = win.clone();
+    let media_send = media;
     send_btn.set_callback(move |_| {
         sender.send(UiMessage::SendChatImage(png.clone()));
+        media_send.borrow_mut().release();
+        client::config::set_window_pos("preview", (win_send.x(), win_send.y()));
         win_send.hide();
         app::delete_widget(win_send.clone());
     });
+}
+
+/// The preview dialog's displayed image(s). Shared by every close path
+/// so whichever fires first can stop the animation before widget
+/// deletion — the anim timer has no canvas-deletion guard.
+struct PreviewMedia {
+    anim: Option<image::AnimGifImage>,
+    still: Option<RgbImage>,
+}
+
+impl PreviewMedia {
+    fn release(&mut self) {
+        if let Some(mut anim) = self.anim.take() {
+            anim.stop();
+        }
+        self.still.take();
+    }
 }
