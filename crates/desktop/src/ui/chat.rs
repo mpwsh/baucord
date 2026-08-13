@@ -127,6 +127,10 @@ impl Chat {
         chat_col.end();
 
         let picker: PickerSlot = Rc::new(RefCell::new(None));
+        // Bumped on every open; a scheduled dismissal only acts if the
+        // generation is still the one it was created for, so a stale
+        // deferred close can never tear down a reopened picker.
+        let picker_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
         // When the picker closes itself on Unfocus, a click on the 😀
         // button IS a click outside: Unfocus fires first, and by the
         // time this callback runs the picker is gone — so a naive
@@ -175,23 +179,59 @@ impl Chat {
 
             let mut input = input_for_picker.clone();
             let mut count = count_for_picker.clone();
-            // Dismissal (Escape, click outside, app switch) closes
-            // the picker and stamps the time so the toggle recognizes
-            // a close its own click caused. The handler lives inside
-            // open_picker — installing one here would replace it.
+            // Dismissal (Escape, click outside, app switch — and via
+            // take_focus below, picking an emoji) stamps the time
+            // immediately but DEFERS the actual teardown one event-loop
+            // pass. Unfocus can arrive synchronously in the middle of
+            // the picker's own event dispatch (e.g. inside a cell's
+            // click callback); freeing the cell images and scheduling
+            // deletion right there leaves FLTK's post-event bookkeeping
+            // running against a dying widget. On the deferred pass the
+            // stack is clean. The generation guard keeps a stale
+            // deferred close from hitting a reopened picker.
+            let generation = picker_gen.get().wrapping_add(1);
+            picker_gen.set(generation);
             let picker_dismiss = picker_toggle.clone();
             let closed_at_dismiss = closed_at_toggle.clone();
+            let gen_dismiss = picker_gen.clone();
+            // Cocoa re-keys the main window while finishing the very
+            // mouse-up that opened the picker, delivering a spurious
+            // Unfocus right after show() — which would dismiss the
+            // picker in the same breath. Ignore dismissal events in
+            // the first instant after opening; a genuine click-outside
+            // or Escape always comes on a human timescale.
+            let opened_at = std::time::Instant::now();
             let (win, images) = emoji::open_picker(
                 x,
                 y,
                 move |e| {
                     input.insert(e).ok();
-                    let _ = input.take_focus();
                     update_char_count(&input, &mut count);
+                    // Deferred: take_focus runs Fl::focus's unfocus
+                    // walk over the OLD focus chain — the crash logs
+                    // show that walk detonating when it overlaps
+                    // picker teardown. One pass later the stack is
+                    // clean and any dismissal has fully settled.
+                    let input = input.clone();
+                    app::add_timeout3(0.0, move |_| {
+                        let mut input = input.clone();
+                        if !input.was_deleted() {
+                            let _ = input.take_focus();
+                        }
+                    });
                 },
                 move || {
+                    if opened_at.elapsed().as_millis() < 250 {
+                        return; // show-time focus churn, not a dismissal
+                    }
                     *closed_at_dismiss.borrow_mut() = Some(std::time::Instant::now());
-                    close_picker(&picker_dismiss);
+                    let slot = picker_dismiss.clone();
+                    let gen_check = gen_dismiss.clone();
+                    app::add_timeout3(0.0, move |_| {
+                        if gen_check.get() == generation {
+                            close_picker(&slot);
+                        }
+                    });
                 },
             );
             *picker_toggle.borrow_mut() = Some((win, images));
