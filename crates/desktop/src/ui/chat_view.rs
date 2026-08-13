@@ -27,6 +27,7 @@ use std::rc::Rc;
 
 use i18n::t;
 use ui::theme;
+use ui::widgets::controls;
 
 // ── Metrics ─────────────────────────────────────────────────────────────
 
@@ -711,6 +712,8 @@ fn make_image_row(
     bytes: Vec<u8>,
     width: i32,
     autoplay_gif: bool,
+    rows: RowsHandle,
+    viewer: ViewerSlot,
 ) -> (frame::Frame, RelayoutFn, Rc<RefCell<ImageRowState>>) {
     let header = vec![
         Span {
@@ -794,6 +797,8 @@ fn make_image_row(
     });
 
     let st = state.clone();
+    let rows_h = rows;
+    let viewer_h = viewer;
     row.handle(move |r, ev| match ev {
         enums::Event::Push => {
             let (mx, my) = (app::event_x(), app::event_y());
@@ -804,12 +809,12 @@ fn make_image_row(
 
             if app::event_mouse_button() == app::MouseButton::Right {
                 drop(st_ref);
-                show_image_context_menu(&st);
+                show_image_context_menu(&st, &rows_h, &viewer_h);
                 return true;
             }
             if over_image {
                 drop(st_ref);
-                open_image_viewer(&st.borrow());
+                viewer_show(&viewer_h, &rows_h, &st);
                 return true;
             }
             false
@@ -874,7 +879,11 @@ fn make_image_row(
     (row, relayout, media)
 }
 
-fn show_image_context_menu(state: &Rc<RefCell<ImageRowState>>) {
+fn show_image_context_menu(
+    state: &Rc<RefCell<ImageRowState>>,
+    rows: &RowsHandle,
+    viewer: &ViewerSlot,
+) {
     let open_image = t!("menu-open-image");
     let save_image = t!("menu-save-image");
 
@@ -889,29 +898,9 @@ fn show_image_context_menu(state: &Rc<RefCell<ImageRowState>>) {
         let label = choice.label();
         let label = label.as_deref();
         if label == Some(open_image.as_str()) {
-            open_image_viewer(&state.borrow());
+            viewer_show(viewer, rows, state);
         } else if label == Some(save_image.as_str()) {
-            let mut dialog =
-                fltk::dialog::NativeFileChooser::new(fltk::dialog::FileDialogType::BrowseSaveFile);
-            dialog.set_option(fltk::dialog::FileDialogOptions::SaveAsConfirm);
-            let (ext, filter_label) = if state.borrow().gif {
-                ("gif", t!("image-save-filter-gif"))
-            } else {
-                ("png", t!("image-save-filter"))
-            };
-            dialog.set_filter(&format!("{filter_label}\t*.{ext}"));
-            dialog.set_preset_file(&format!("{}.{ext}", state.borrow().username));
-            dialog.show();
-            let path = dialog.filename();
-            if !path.as_os_str().is_empty() {
-                let mut path = path;
-                if path.extension().is_none() {
-                    path.set_extension(ext);
-                }
-                if let Err(e) = std::fs::write(&path, &state.borrow().bytes) {
-                    log::warn!("Failed to save image: {e}");
-                }
-            }
+            save_image_dialog(state);
         }
     }
 }
@@ -927,26 +916,63 @@ pub(crate) fn clamp_win_pos(pos: (i32, i32)) -> (i32, i32) {
     )
 }
 
-/// Open a chat image at (up to) full resolution in its own window.
-fn open_image_viewer(state: &ImageRowState) {
+/// The single-instance image viewer with gallery navigation.
+///
+/// Lifetime model (hard-won; see the crash history): neither FLTK's
+/// widget->image() nor fltk-rs's set_image owns the underlying Fl
+/// image, and Fl_Anim_GIF's frame timer holds a raw canvas pointer
+/// with no deletion guard. The displayed image wrappers therefore live
+/// HERE, swapped atomically on navigation with the animation stopped
+/// first, and torn down before the window's widgets are deleted.
+struct Viewer {
+    win: window::Window,
+    frame: frame::Frame,
+    back_btn: fltk::button::Button,
+    fwd_btn: fltk::button::Button,
+    anim: Option<AnimGifImage>,
+    still: Option<PngImage>,
+    /// The image currently shown — position anchor for navigation.
+    current: Rc<RefCell<ImageRowState>>,
+}
+
+type ViewerSlot = Rc<RefCell<Option<Viewer>>>;
+type RowsHandle = Rc<RefCell<Vec<Row>>>;
+
+/// Show `state` in the viewer, creating the window on first use and
+/// reusing it afterwards — clicking another image swaps the content.
+fn viewer_show(slot: &ViewerSlot, rows: &RowsHandle, state: &Rc<RefCell<ImageRowState>>) {
+    {
+        let mut s = slot.borrow_mut();
+        if let Some(v) = s.as_mut() {
+            if !v.win.was_deleted() {
+                viewer_set_content(v, state);
+                viewer_update_nav(v, rows);
+                v.win.show();
+                return;
+            }
+        }
+    }
+
     group::Group::set_current(None::<&group::Group>);
 
-    let (dw, dh) = (state.img.data_w().max(1), state.img.data_h().max(1));
+    const BAR_H: i32 = 44;
+    let (dw, dh) = {
+        let st = state.borrow();
+        (st.img.data_w().max(1), st.img.data_h().max(1))
+    };
     let (sw, sh) = app::screen_size();
     let max_w = (sw as i32 - 120).max(320);
-    let max_h = (sh as i32 - 120).max(240);
+    let max_h = (sh as i32 - 120 - BAR_H).max(240);
     let scale = f64::min(
         1.0,
         f64::min(max_w as f64 / dw as f64, max_h as f64 / dh as f64),
     );
     let (ww, wh) = (
-        ((dw as f64 * scale) as i32).max(120),
+        ((dw as f64 * scale) as i32).max(220),
         ((dh as f64 * scale) as i32).max(90),
     );
 
-    let mut win = window::Window::default()
-        .with_size(ww, wh)
-        .with_label(&t!("image-window-title", "name" => state.username.as_str()));
+    let mut win = window::Window::default().with_size(ww, wh + BAR_H);
     win.set_color(theme::BG_PRIMARY);
     win.make_resizable(true);
     if let Some(pos) = client::config::window_pos("viewer") {
@@ -954,38 +980,15 @@ fn open_image_viewer(state: &ImageRowState) {
         win.set_pos(x, y);
     }
 
-    let mut frame = frame::Frame::default_fill();
-    // A fresh copy so viewer scaling never fights the inline row's.
-    // Lifetime model: neither FLTK's widget->image() nor fltk-rs's
-    // set_image takes ownership of the underlying Fl image — the last
-    // Rust wrapper to drop deletes it (Fl_Image::release() is plain
-    // `delete` outside Fl_Shared_Image). Letting these wrappers die at
-    // the end of this function leaves the frame pointing at freed
-    // memory; for GIFs the very first Resize during show() then
-    // crashes inside Fl_Image_scale. The wrappers are therefore moved
-    // into the window's close callback below, pinning them to the
-    // window's lifetime. (Fl_Anim_GIF's destructor only removes its
-    // timer — it never touches the canvas — so dropping after widget
-    // deletion is safe.)
-    let mut keep_anim: Option<AnimGifImage> = None;
-    let mut keep_png: Option<PngImage> = None;
-    if state.gif {
-        if let Ok(mut anim) = AnimGifImage::from_data(
-            &state.bytes,
-            &mut frame,
-            AnimGifImageFlags::DONT_RESIZE_CANVAS,
-        ) {
-            anim.scale(ww, wh, true, true);
-            // Fl_Anim_GIF already bound itself via canvas->image().
-            keep_anim = Some(anim);
-        }
-    } else if let Ok(mut full) = PngImage::from_data(&state.bytes) {
-        full.scale(ww, wh, true, true);
-        // The clone keeps the strong count above 1 across set_image's
-        // internal drop; `full` then lives in the callback.
-        frame.set_image(Some(full.clone()));
-        keep_png = Some(full);
-    }
+    let mut col = group::Flex::default_fill().column();
+    col.set_margins(0, 0, 0, 6);
+    col.set_spacing(4);
+
+    let mut frame = frame::Frame::default();
+    // FlatBox: the frame repaints its full area every draw, so a
+    // smaller image never shows the previous one around its edges.
+    frame.set_frame(enums::FrameType::FlatBox);
+    frame.set_color(theme::BG_PRIMARY);
     frame.handle(|f, ev| {
         if ev == enums::Event::Resize {
             if let Some(mut img) = f.image() {
@@ -995,25 +998,222 @@ fn open_image_viewer(state: &ImageRowState) {
         false
     });
 
+    let mut bar = group::Flex::default().row();
+    col.fixed(&bar, BAR_H - 8);
+    bar.set_spacing(8);
+    let _spacer_l = frame::Frame::default();
+    let back_btn = controls::button("\u{25C0}");
+    bar.fixed(&back_btn, 44);
+    let save_btn = controls::button(&t!("menu-save-image"));
+    bar.fixed(&save_btn, 110);
+    let fwd_btn = controls::button("\u{25B6}");
+    bar.fixed(&fwd_btn, 44);
+    let _spacer_r = frame::Frame::default();
+    bar.end();
+
+    col.end();
     win.end();
-    let mut keep_anim = keep_anim;
-    let mut keep_png = keep_png;
-    win.set_callback(move |w| {
-        // The animation's frame timer holds a raw canvas pointer with
-        // no deletion guard (verified in Fl_Anim_GIF_Image.cxx), so it
-        // must die BEFORE the widgets do — relying on the closure being
-        // dropped during widget deletion demonstrably fires the timer
-        // on a dead frame. stop() removes the pending timeout; the
-        // drop frees the frames.
-        if let Some(mut anim) = keep_anim.take() {
-            anim.stop();
+
+    let mut back_btn = back_btn;
+    let mut fwd_btn = fwd_btn;
+    let mut save_btn = save_btn;
+
+    let slot_back = slot.clone();
+    let rows_back = rows.clone();
+    back_btn.set_callback(move |_| viewer_step(&slot_back, &rows_back, -1));
+    let slot_fwd = slot.clone();
+    let rows_fwd = rows.clone();
+    fwd_btn.set_callback(move |_| viewer_step(&slot_fwd, &rows_fwd, 1));
+    let slot_save = slot.clone();
+    save_btn.set_callback(move |_| {
+        // Clone the state Rc out before the dialog blocks in a nested
+        // event loop — holding the slot borrow across it invites
+        // reentrancy panics.
+        let current = slot_save.borrow().as_ref().map(|v| v.current.clone());
+        if let Some(state) = current {
+            save_image_dialog(&state);
         }
-        keep_png.take();
-        client::config::set_window_pos("viewer", (w.x(), w.y()));
-        w.hide();
-        app::delete_widget(w.clone());
     });
+
+    let slot_close = slot.clone();
+    win.set_callback(move |_| viewer_close(&slot_close));
+    // Self-resize forces the Flex to lay out its children NOW: without
+    // it the frame still reports ~0×0 when the first set_content runs,
+    // and the image gets scaled to a single pixel (the mysterious
+    // one-dot first open).
+    let (wx, wy, wwd, wht) = (win.x(), win.y(), win.w(), win.h());
+    win.resize(wx, wy, wwd, wht);
     win.show();
+
+    let mut viewer = Viewer {
+        win,
+        frame,
+        back_btn,
+        fwd_btn,
+        anim: None,
+        still: None,
+        current: state.clone(),
+    };
+    viewer_set_content(&mut viewer, state);
+    viewer_update_nav(&mut viewer, rows);
+    *slot.borrow_mut() = Some(viewer);
+}
+
+/// Swap the displayed image: stop and drop the old (timer first —
+/// it has no canvas-deletion guard), then bind the new.
+fn viewer_set_content(v: &mut Viewer, state: &Rc<RefCell<ImageRowState>>) {
+    if let Some(mut a) = v.anim.take() {
+        a.stop();
+    }
+    v.still.take();
+    // Clear the raw pointer left by the previous image so a failed
+    // decode below can never leave the frame drawing freed memory.
+    v.frame.set_image(None::<PngImage>);
+
+    let st = state.borrow();
+    // Fallback to window-derived dims if the frame hasn't been laid
+    // out yet (belt to the resize above).
+    let (mut fw, mut fh) = (v.frame.w(), v.frame.h());
+    if fw <= 1 || fh <= 1 {
+        fw = v.win.w().max(220);
+        fh = (v.win.h() - 44).max(90);
+    }
+    if st.gif {
+        let mut canvas = v.frame.clone();
+        if let Ok(mut anim) =
+            AnimGifImage::from_data(&st.bytes, &mut canvas, AnimGifImageFlags::DONT_RESIZE_CANVAS)
+        {
+            anim.scale(fw, fh, true, true);
+            // Fl_Anim_GIF bound itself via canvas->image(); the
+            // wrapper lives on the Viewer.
+            v.anim = Some(anim);
+        }
+    } else if let Ok(mut full) = PngImage::from_data(&st.bytes) {
+        full.scale(fw, fh, true, true);
+        // Clone keeps the strong count above 1 across set_image's
+        // internal drop; the original lives on the Viewer.
+        v.frame.set_image(Some(full.clone()));
+        v.still = Some(full);
+    }
+    v.win
+        .set_label(&t!("image-window-title", "name" => st.username.as_str()));
+    drop(st);
+    v.current = state.clone();
+    v.win.redraw();
+}
+
+/// Move through the history's image rows. `delta` is ±1; if the
+/// current image was evicted from history, navigation restarts from
+/// the newest one.
+fn viewer_step(slot: &ViewerSlot, rows: &RowsHandle, delta: i32) {
+    // Find the target with only the rows borrowed, then swap with only
+    // the slot borrowed — never both, never across widget calls.
+    let target = {
+        let s = slot.borrow();
+        let Some(v) = s.as_ref() else { return };
+        neighbor_image(rows, &v.current, delta)
+    };
+    if let Some(t) = target {
+        let mut s = slot.borrow_mut();
+        if let Some(v) = s.as_mut() {
+            viewer_set_content(v, &t);
+            viewer_update_nav(v, rows);
+        }
+    }
+}
+
+fn neighbor_image(
+    rows: &RowsHandle,
+    current: &Rc<RefCell<ImageRowState>>,
+    delta: i32,
+) -> Option<Rc<RefCell<ImageRowState>>> {
+    let rows_ref = rows.borrow();
+    let media: Vec<&Rc<RefCell<ImageRowState>>> =
+        rows_ref.iter().filter_map(|r| r.media.as_ref()).collect();
+    if media.is_empty() {
+        return None;
+    }
+    let pos = media
+        .iter()
+        .position(|m| Rc::ptr_eq(m, current))
+        .unwrap_or(media.len() - 1);
+    let next = pos as i32 + delta;
+    if next < 0 || next as usize >= media.len() {
+        return None;
+    }
+    Some(media[next as usize].clone())
+}
+
+/// Grey out the arrows at the ends of the gallery.
+fn viewer_update_nav(v: &mut Viewer, rows: &RowsHandle) {
+    let (pos, len) = {
+        let rows_ref = rows.borrow();
+        let media: Vec<&Rc<RefCell<ImageRowState>>> =
+            rows_ref.iter().filter_map(|r| r.media.as_ref()).collect();
+        let pos = media
+            .iter()
+            .position(|m| Rc::ptr_eq(m, &v.current))
+            .unwrap_or(media.len().saturating_sub(1));
+        (pos, media.len())
+    };
+    if pos > 0 {
+        v.back_btn.activate();
+    } else {
+        v.back_btn.deactivate();
+    }
+    if pos + 1 < len {
+        v.fwd_btn.activate();
+    } else {
+        v.fwd_btn.deactivate();
+    }
+}
+
+/// Tear the viewer down: animation timer first, then position save,
+/// then the widgets. Take-first so a reentrant call sees None.
+fn viewer_close(slot: &ViewerSlot) {
+    let taken = slot.borrow_mut().take();
+    if let Some(mut v) = taken {
+        if let Some(mut a) = v.anim.take() {
+            a.stop();
+        }
+        v.still.take();
+        if !v.win.was_deleted() {
+            client::config::set_window_pos("viewer", (v.win.x(), v.win.y()));
+            v.win.hide();
+            app::delete_widget(v.win.clone());
+        }
+    }
+}
+
+/// The shared "Save image…" dialog, used by the row context menu and
+/// the viewer's save button.
+fn save_image_dialog(state: &Rc<RefCell<ImageRowState>>) {
+    let mut dialog =
+        fltk::dialog::NativeFileChooser::new(fltk::dialog::FileDialogType::BrowseSaveFile);
+    dialog.set_option(fltk::dialog::FileDialogOptions::SaveAsConfirm);
+    let (ext, filter_label) = if state.borrow().gif {
+        ("gif", t!("image-save-filter-gif"))
+    } else {
+        ("png", t!("image-save-filter"))
+    };
+    dialog.set_filter(&format!("{filter_label}\t*.{ext}"));
+    // Short per-save id so consecutive saves never need renaming.
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_micros() & 0xFFFF)
+        .unwrap_or(0);
+    dialog.set_preset_file(&format!("{}-{id:04x}.{ext}", state.borrow().username));
+    dialog.show();
+    let path = dialog.filename();
+    if !path.as_os_str().is_empty() {
+        let mut path = path;
+        if path.extension().is_none() {
+            path.set_extension(ext);
+        }
+        if let Err(e) = std::fs::write(&path, &state.borrow().bytes) {
+            log::warn!("Failed to save image: {e}");
+        }
+    }
 }
 
 // ── ChatView ────────────────────────────────────────────────────────────
@@ -1046,6 +1246,8 @@ pub struct ChatView {
     scroll: group::Scroll,
     pack: group::Pack,
     rows: Rc<RefCell<Vec<Row>>>,
+    /// The single shared image viewer (gallery), if open.
+    viewer: ViewerSlot,
 }
 
 impl ChatView {
@@ -1080,7 +1282,12 @@ impl ChatView {
             s.redraw();
         });
 
-        Self { scroll, pack, rows }
+        Self {
+            scroll,
+            pack,
+            rows,
+            viewer: Rc::new(RefCell::new(None)),
+        }
     }
 
     fn content_width_for(scroll: &group::Scroll) -> i32 {
@@ -1207,6 +1414,8 @@ impl ChatView {
             media_bytes,
             cw,
             autoplay,
+            self.rows.clone(),
+            self.viewer.clone(),
         );
         let height = widget.h();
         self.append(widget, relayout, height, Some(media));
@@ -1235,6 +1444,8 @@ impl ChatView {
 
     /// Remove all rows (fresh connection).
     pub fn clear(&mut self) {
+        // The gallery browses this history; close it with the history.
+        viewer_close(&self.viewer);
         for row in self.rows.borrow_mut().drain(..) {
             stop_row_anim(&row);
             self.pack.remove(&row.widget);

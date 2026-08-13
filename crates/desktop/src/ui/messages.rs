@@ -16,6 +16,10 @@ pub enum UiMessage {
     /// volume popup). Sent when the main window hides/minimizes so
     /// they can't be left orphaned on the desktop.
     CloseFloatingPopups,
+    /// An image fetched from a pasted URL, ready for the send-preview
+    /// dialog. Produced on a background thread; consumed on the UI
+    /// thread.
+    ImageUrlFetched(Vec<u8>),
     // ── Connection flow ─────────────────────────────────────────────
     Connect {
         nickname: String,

@@ -774,6 +774,9 @@ impl App {
             UiMessage::SendChatMessage(text) => {
                 self.network.tx.send(NetworkControl::SendMessage(text)).ok();
             }
+            UiMessage::ImageUrlFetched(bytes) => {
+                crate::ui::chat::preview_fetched_image(bytes, self.sender);
+            }
             UiMessage::CloseFloatingPopups => {
                 if let Some(chat) = &mut self.chat {
                     chat.close_popups();

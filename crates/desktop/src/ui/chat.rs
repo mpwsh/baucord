@@ -257,24 +257,27 @@ impl Chat {
                 update_char_count(input, &mut count_clone);
 
                 if event == enums::Event::KeyDown {
-                    // Windows synthesizes an extra key event carrying
-                    // the literal SYN control char (0x16) alongside the
-                    // real Ctrl+V. The real event drives the paste
-                    // chain below; the stray would either insert a
-                    // visible "^V" (base handler) or double-trigger the
-                    // combo (ours). Swallow it unconditionally, first.
-                    if app::event_text() == "\u{16}" {
-                        return true;
-                    }
-
                     // Ctrl/Cmd+V: one chain for every clipboard flavor
                     // — copied file → native PNG → FLTK image → text
                     // (text still lands through the default Fl_Input
-                    // handler, via paste_text inside the chain).
+                    // handler, via paste_text inside the chain). This
+                    // check runs FIRST: on Windows the genuine Ctrl+V
+                    // keydown itself carries ^V (0x16) in event_text,
+                    // so a blanket SYN swallow above it eats the real
+                    // paste (as v0.1.38 painfully demonstrated).
                     let paste_combo = app::event_state().contains(enums::EventState::Command)
                         && app::event_key() == enums::Key::from_char('v');
                     if paste_combo {
                         paste_into_chat(input, sender);
+                        return true;
+                    }
+
+                    // Windows also synthesizes a WM_CHAR-derived event
+                    // carrying the literal SYN char, which doesn't
+                    // match the combo (different keysym) but would be
+                    // inserted as a visible "^V" by the base handler.
+                    // Swallow it.
+                    if app::event_text() == "\u{16}" {
                         return true;
                     }
 
@@ -328,6 +331,15 @@ impl Chat {
                     // the path string into the message.
                     if let Some(path) = first_image_path_in(&app::event_text()) {
                         attach_path(&path, sender);
+                        return true;
+                    }
+                    // A pasted (or browser-dragged) image URL loads
+                    // the image itself instead of the link text. Also
+                    // the answer to Chrome's "Copy image" on GIFs,
+                    // which only carries one frame as a bitmap: copy
+                    // the image address instead and paste it here.
+                    if let Some(url) = image_url_in(&app::event_text()) {
+                        fetch_image_url(url, sender);
                         return true;
                     }
                     let input_after = input.clone();
@@ -876,6 +888,49 @@ fn percent_decode(s: &str) -> String {
 /// URIs, if any. This is the single sniffer serving drag&drop on all
 /// three platforms (FLTK delivers drops as FL_PASTE text) and Linux
 /// clipboard file copies.
+/// The pasted text as a single http(s) image URL, if that's what it
+/// is: one token, no whitespace, an image extension on the URL path
+/// (query/fragment ignored).
+fn image_url_in(text: &str) -> Option<String> {
+    let t = text.trim();
+    if !(t.starts_with("https://") || t.starts_with("http://")) || t.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    let path = t.split(['?', '#']).next().unwrap_or(t);
+    is_image_path(std::path::Path::new(path)).then(|| t.to_string())
+}
+
+/// Download a pasted image URL on a background thread, capped at the
+/// wire budget, and hand the bytes back to the UI thread for the
+/// normal validate-and-preview flow. Failures become a chat notice.
+fn fetch_image_url(url: String, sender: app::Sender<UiMessage>) {
+    std::thread::spawn(move || {
+        let fetched = (|| -> Result<Vec<u8>, String> {
+            let mut resp = ureq::get(&url).call().map_err(|e| e.to_string())?;
+            let bytes = resp
+                .body_mut()
+                .with_config()
+                // +1 so an over-budget file is detectable vs truncated.
+                .limit(MAX_IMAGE_BYTES as u64 + 1)
+                .read_to_vec()
+                .map_err(|e| e.to_string())?;
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return Err(format!("image is over {} MB", MAX_IMAGE_BYTES / (1024 * 1024)));
+            }
+            Ok(bytes)
+        })();
+        // fltk-rs senders are backed by the awake queue and are safe
+        // to use from worker threads.
+        match fetched {
+            Ok(bytes) => sender.send(UiMessage::ImageUrlFetched(bytes)),
+            Err(e) => sender.send(UiMessage::ShowChatNotice(
+                t!("chat-image-load-error", "error" => e.as_str()),
+            )),
+        }
+    });
+}
+
 pub(crate) fn first_image_path_in(text: &str) -> Option<std::path::PathBuf> {
     text.lines()
         .filter_map(file_url_to_path)
@@ -900,6 +955,15 @@ fn notify_image_error(error: &str, sender: app::Sender<UiMessage>) {
 }
 
 /// Modal preview with Send / Cancel, WhatsApp-style.
+/// Validate URL-fetched bytes exactly like any attach (cap, dims, GIF
+/// rules) and open the send-preview; failures become a chat notice.
+pub(crate) fn preview_fetched_image(bytes: Vec<u8>, sender: app::Sender<UiMessage>) {
+    match load_image_bytes(bytes) {
+        Ok(ready) => show_image_preview_dialog(ready, sender),
+        Err(e) => notify_image_error(&e, sender),
+    }
+}
+
 fn show_image_preview_dialog(png: Vec<u8>, sender: app::Sender<UiMessage>) {
     // GIFs preview as their first frame; PNGs as themselves. Either
     // way we normalize to an RgbImage for uniform scaling below.
