@@ -1,12 +1,19 @@
 [package]
 name = "ui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Shared FLTK widgets and theming for the baucord desktop app"
-
-[dependencies]
-fltk.workspace = true
-fltk-theme = "0.7"
+description = "The baucord UI: .slint screens + generated-component glue. Compiles identically for desktop and the future mobile shells."
 
 [lints]
 workspace = true
+
+[dependencies]
+app-core = { path = "../app-core" }
+# Default features = winit backend + femtovg & software renderers.
+# Software is the footprint path (select at runtime via SLINT_BACKEND);
+# femtovg stays one env var away for A/B testing.
+slint.workspace = true
+log.workspace = true
+
+[build-dependencies]
+slint-build = "1.17"

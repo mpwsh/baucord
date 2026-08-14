@@ -1,0 +1,338 @@
+// chat.slint — rich chat history + composer.
+//
+// The FLTK build's 1,500-line custom-drawn ChatView collapses into a
+// ListView over a row model. Row kinds:
+//   0 message  — [12:34] name  body (wraps)
+//   1 system   — muted italic notice
+//   2 image    — header + rounded inline image; GIFs animate (the shell
+//                swaps frames into `image` on a slint::Timer, autoplay
+//                ~3 loops → freeze → hover replay), click opens the
+//                gallery viewer, right-click offers save/open
+//   3 link     — accent-colored tappable URL row (links detected in a
+//                message are emitted as their own rows: Slint has no
+//                inline rich text, and a dedicated row is a bigger
+//                click target anyway)
+//
+// Context menus use the builtin ContextMenuArea (keyboard + a11y for
+// free — the hand-rolled FLTK menus had neither). Copy for messages,
+// copy/open for links, save/open for images.
+//
+// The composer: emoji + attach icon buttons, the input, live counter
+// (amber past 380), send. The emoji palette is an in-window popover —
+// the entire FLTK focus-churn saga (Unfocus debounce, generation
+// guards, deferred teardown) is retired by construction.
+
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Tr } from "tr.slint";
+import { State, Logic, ChatRow } from "globals.slint";
+import { IconBtn, Btn, Field } from "widgets.slint";
+
+// ── Rows ────────────────────────────────────────────────────────────────
+
+component MessageRow inherits Rectangle {
+    in property <ChatRow> data;
+    height: body.preferred-height + 8px;
+
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: Tr.menu-copy-message;
+                activated => { Logic.copy-text(data.body); }
+            }
+        }
+        HorizontalLayout {
+            padding-left: Theme.gap-sm;
+            padding-right: Theme.gap-sm;
+            padding-top: 4px;
+            spacing: Theme.gap-sm;
+            Text {
+                text: "[\{data.ts}]";
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+            }
+            Text {
+                text: data.user;
+                color: Theme.accent;
+                font-size: Theme.font-body;
+                font-weight: 700;
+            }
+            body := Text {
+                text: data.body;
+                color: Theme.text-secondary;
+                font-size: Theme.font-body;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}
+
+component SystemRow inherits Rectangle {
+    in property <ChatRow> data;
+    height: body.preferred-height + 6px;
+    body := Text {
+        x: Theme.gap-sm;
+        y: 3px;
+        width: parent.width - 2 * Theme.gap-sm;
+        text: data.body;
+        color: Theme.text-muted;
+        font-size: Theme.font-sm;
+        font-italic: true;
+        wrap: word-wrap;
+    }
+}
+
+component LinkRow inherits Rectangle {
+    in property <ChatRow> data;
+    height: 24px;
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: Tr.menu-open-link;
+                activated => { Logic.link-clicked(data.body); }
+            }
+            MenuItem {
+                title: Tr.menu-copy-link;
+                activated => { Logic.copy-text(data.body); }
+            }
+        }
+        HorizontalLayout {
+            padding-left: 28px;   // indent under the message body
+            link := Text {
+                text: data.body;
+                color: touch.has-hover ? Theme.accent.brighter(0.3) : Theme.accent;
+                font-size: Theme.font-body;
+                vertical-alignment: center;
+                overflow: elide;
+                touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Logic.link-clicked(data.body); }
+                }
+            }
+            Rectangle { }   // spacer — keep the hit target on the text
+        }
+    }
+}
+
+component ImageRow inherits Rectangle {
+    in property <ChatRow> data;
+
+    // Fit within 360×280 like before, and never wider than the view.
+    property <length> avail: root.width - 2 * Theme.gap-sm;
+    property <float> maxw: Math.min(360.0, avail / 1px);
+    property <float> scale: Math.min(1.0, Math.min(
+        maxw / Math.max(1.0, data.img-w),
+        280.0 / Math.max(1.0, data.img-h)));
+    property <length> disp-w: Math.max(1.0, data.img-w * scale) * 1px;
+    property <length> disp-h: Math.max(1.0, data.img-h * scale) * 1px;
+
+    height: 24px + disp-h + 10px;
+
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: Tr.menu-open-image;
+                activated => { Logic.row-open-image(data.row-id); }
+            }
+            MenuItem {
+                title: Tr.menu-save-image;
+                activated => { Logic.row-save-image(data.row-id); }
+            }
+        }
+        VerticalLayout {
+            padding-left: Theme.gap-sm;
+            padding-right: Theme.gap-sm;
+            padding-top: 4px;
+            spacing: 4px;
+            HorizontalLayout {
+                spacing: Theme.gap-sm;
+                Text { text: "[\{data.ts}]"; color: Theme.text-muted; font-size: Theme.font-sm; }
+                Text { text: data.user; color: Theme.accent; font-size: Theme.font-body; font-weight: 700; }
+                Rectangle { }
+            }
+            HorizontalLayout {
+                frame := Rectangle {
+                    width: root.disp-w;
+                    height: root.disp-h;
+                    border-radius: Theme.radius-md;
+                    background: Theme.surface;
+                    clip: true;
+                    Image {
+                        width: 100%;
+                        height: 100%;
+                        source: data.image;
+                        image-fit: contain;
+                    }
+                    it := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { Logic.row-open-image(data.row-id); }
+                        changed has-hover => {
+                            if (data.is-gif) { Logic.gif-hover(data.row-id, self.has-hover); }
+                        }
+                    }
+                }
+                Rectangle { }   // left-align the image
+            }
+        }
+    }
+}
+
+// ── Composer + history ──────────────────────────────────────────────────
+
+export component ChatPane inherits Rectangle {
+    background: Theme.bg-primary;
+
+    public function scroll-to-end() {
+        list.viewport-y = -Math.max(0px, list.viewport-height - list.visible-height);
+    }
+    /// True when the user is at (or within ~40px of) the bottom — the
+    /// shell asks before appending, to preserve read position.
+    public pure function at-bottom() -> bool {
+        return list.viewport-height <= list.visible-height
+            || list.viewport-y <= -(list.viewport-height - list.visible-height - 40px);
+    }
+    public function focus-composer() { input.focus-input(); }
+
+    VerticalLayout {
+        padding: Theme.gap-md;
+        spacing: Theme.gap-sm;
+
+        list := ListView {
+            vertical-stretch: 1;
+            for row[i] in State.chat : Rectangle {
+                // One delegate hosting all four kinds; only the matching
+                // one is visible and the wrapper takes its height.
+                // ListView virtualizes, so only on-screen rows exist.
+                height: row.kind == 0 ? msg.height
+                    : row.kind == 1 ? sys.height
+                    : row.kind == 2 ? img.height
+                    : lnk.height;
+                msg := MessageRow { data: row; visible: row.kind == 0; }
+                sys := SystemRow  { data: row; visible: row.kind == 1; }
+                img := ImageRow   { data: row; visible: row.kind == 2; }
+                lnk := LinkRow    { data: row; visible: row.kind == 3; }
+            }
+        }
+
+        // Composer
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            emoji-btn := IconBtn {
+                icon: @image-url("icons/smile.svg");
+                tooltip: Tr.chat-emoji-tooltip;
+                clicked => { emoji-pop.show(); }
+            }
+            IconBtn {
+                icon: @image-url("icons/paperclip.svg");
+                tooltip: Tr.chat-attach-tooltip;
+                clicked => { Logic.attach-image(); }
+            }
+            // capture-key-pressed runs BEFORE the focused TextInput, so
+            // Ctrl/Cmd+V reaches the host's paste chain (copied file →
+            // native PNG → toolkit image → text) instead of the plain
+            // text-only default. Everything else falls through.
+            paste-scope := FocusScope {
+                horizontal-stretch: 1;
+                capture-key-pressed(ev) => {
+                    if ((ev.modifiers.control || ev.modifiers.meta) && (ev.text == "v" || ev.text == "V")) {
+                        Logic.paste-rich();
+                        return accept;
+                    }
+                    reject
+                }
+                ContextMenuArea {
+                    Menu {
+                        MenuItem { title: Tr.menu-cut;   activated => { input.do-cut(); } }
+                        MenuItem { title: Tr.menu-copy;  activated => { input.do-copy(); } }
+                        MenuItem { title: Tr.menu-paste; activated => { Logic.paste-rich(); } }
+                    }
+                    input := Field {
+                        text <=> State.draft;
+                        accepted => { Logic.send-message(); }
+                        edited => { Logic.draft-edited(); }
+                    }
+                }
+            }
+            counter := Text {
+                width: 52px;
+                text: "\{State.draft.character-count}/\{State.max-chars}";
+                color: State.draft.character-count > State.max-chars - 20
+                    ? Theme.warning : Theme.text-muted;
+                font-size: Theme.font-sm;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+            send-btn := Rectangle {
+                width: 44px;
+                height: 40px;
+                border-radius: Theme.radius-md;
+                background: st.has-hover ? Theme.accent-hover : Theme.accent;
+                animate background { duration: 150ms; }
+                Image {
+                    width: 18px; height: 18px;
+                    source: @image-url("icons/send.svg");
+                    colorize: Theme.on-accent;
+                }
+                st := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Logic.send-message(); }
+                }
+            }
+        }
+
+        // Upload progress line — height reserved permanently, as before.
+        Text {
+            height: 14px;
+            text: State.upload-line;
+            color: Theme.text-muted;
+            font-size: Theme.font-sm;
+        }
+    }
+
+    // ── Emoji palette (in-window popover) ──────────────────────────
+    emoji-pop := PopupWindow {
+        x: Theme.gap-md;
+        y: root.height - 380px;
+        width: Math.min(360px, root.width - 2 * Theme.gap-md);
+        height: 320px;
+        Rectangle {
+            background: Theme.bg-tertiary;
+            border-radius: Theme.radius-lg;
+            border-width: 1px;
+            border-color: Theme.border;
+            clip: true;
+            Flickable {
+                x: Theme.gap-sm; y: Theme.gap-sm;
+                width: parent.width - 2 * Theme.gap-sm;
+                height: parent.height - 2 * Theme.gap-sm;
+                viewport-height: grid.preferred-height;
+                grid := VerticalLayout {
+                    // 9 columns of 36px cells
+                    property <int> cols: 9;
+                    for r in Math.ceil(State.emoji.length / self.cols) : HorizontalLayout {
+                        height: 36px;
+                        for c in grid.cols : Rectangle {
+                            width: 36px;
+                            property <int> idx: r * grid.cols + c;
+                            border-radius: Theme.radius-sm;
+                            background: et.has-hover ? Theme.hover : transparent;
+                            if idx < State.emoji.length : Text {
+                                text: State.emoji[idx].glyph;
+                                font-size: 20px;
+                            }
+                            et := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if (idx < State.emoji.length) {
+                                        Logic.emoji-picked(State.emoji[idx].glyph);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

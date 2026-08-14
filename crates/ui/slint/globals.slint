@@ -1,0 +1,171 @@
+// globals.slint — host interop contract.
+//
+// Two-global pattern (interop.md): `State` is what Rust pushes in,
+// `Logic` is what the UI calls out. Any component reads/calls them
+// directly — nothing threads through component properties.
+//
+// The row structs mirror app-core's view-model types; the shell
+// converts and keeps live Rc<VecModel<…>> handles for in-place updates.
+
+// ── App phase ───────────────────────────────────────────────────────────
+
+export enum Phase {
+    splash,          // checking for updates
+    update-prompt,   // newer version available
+    downloading,     // update download in progress
+    download-done,   // zip staged, offer install
+    download-failed, // download error
+    connect,         // nickname + password form
+    main,            // sidebar + chat
+}
+
+// ── Row models ──────────────────────────────────────────────────────────
+
+export struct UserRow {
+    client-id-lo: int,      // ClientId is u64; split for exact round-trips
+    client-id-hi: int,
+    name: string,
+    volume-pct: int,        // 100 = default; badge shown when != 100
+    is-us: bool,
+    speaking: bool,
+    local-muted: bool,      // muted *by us*
+    self-muted: bool,       // their broadcast state
+    self-deafened: bool,
+    sharing: bool,          // "LIVE" badge + Watch stream in popover
+}
+
+/// One chat row. `kind`: 0 = message, 1 = system, 2 = image, 3 = link
+/// (links render as their own tappable rows under the message that
+/// carried them — Slint has no inline rich text).
+export struct ChatRow {
+    kind: int,
+    ts: string,
+    user: string,
+    body: string,        // message text / system text / link URL (kind 3)
+    image: image,        // kind 2 — current frame (Rust swaps for GIFs)
+    img-w: float,        // native px, for aspect layout
+    img-h: float,
+    row-id: int,         // stable id for gif hover/click callbacks
+    is-gif: bool,
+}
+
+export struct EmojiRow  { glyph: string, section: string }
+export struct KeybindRow { action-label: string, bind: string, recording: bool }
+
+// ── State (host → UI) ───────────────────────────────────────────────────
+
+export global State {
+    in property <Phase> phase: Phase.connect;
+
+    // Startup / update flow (formatted host-side)
+    in property <string> update-heading;
+    in property <string> update-body;
+    in property <float>  update-progress: 0.0;   // 0..1
+    in property <string> update-progress-text;
+
+    // Connect view
+    in-out property <string> nickname;
+    in-out property <string> password;
+    in property <string> server-note;      // "Connecting to 1.2.3.4:5000"
+    in property <string> error-text;       // 5s toast, cleared by host
+    in property <string> device-warning;   // "saved mic missing" notice
+
+    // Roster / sidebar
+    in property <[UserRow]> users;
+    in property <string> users-count-label;
+    in property <bool> muted;
+    in property <bool> deafened;
+    in property <bool> sharing;
+    in property <string> status-text;      // "● Connected"
+    in property <color> status-color: #2BAC76;
+    in property <string> latency-line;
+    in property <string> resource-line;
+    in property <string> stream-stats;     // "" hides the block
+    in property <bool> stream-degraded;
+
+    // Chat
+    in property <[ChatRow]> chat;
+    in-out property <string> draft;
+    in property <int> max-chars: 400;
+    in property <string> upload-line;      // "" when idle
+
+    // Emoji picker (from app-core's catalog)
+    in property <[EmojiRow]> emoji;
+
+    // Screen share dialog
+    in property <[string]> monitors;      // preformatted "Name — 1920x1080 (primary)"
+    in property <[string]> qualities;
+    in property <int> default-monitor: 0;
+    in property <int> default-quality: 0;
+
+    // Image send preview overlay
+    in property <bool> preview-open: false;
+    in property <image> preview-image;
+    in property <string> preview-caption;  // "1280×720 — 412 KB"
+
+    // Per-user audio popover (opened by Logic.user-menu)
+    in property <bool> user-popup-open: false;
+
+    // Image viewer overlay (chat image tapped) — replaces the old
+    // separate gallery window.
+    in property <bool> viewer-open: false;
+    in property <image> viewer-image;
+    in property <string> viewer-heading;
+    in property <bool> viewer-has-prev: false;
+    in property <bool> viewer-has-next: false;
+    in property <int> popup-user-index: -1;   // index into `users`
+    in-out property <float> popup-volume: 1.0;
+}
+
+// ── Logic (UI → host) ───────────────────────────────────────────────────
+
+export global Logic {
+    // Connect view
+    callback connect-clicked();
+    callback open-settings();
+    callback quit();
+
+    // Sidebar
+    callback toggle-mute();
+    callback toggle-deafen();
+    callback toggle-share();
+    callback disconnect();
+    callback user-menu(int);              // row index → host opens popover
+    callback popup-set-volume(int, float);
+    callback popup-toggle-mute(int);
+    callback popup-reset-audio(int);
+    callback popup-watch(int);
+    callback popup-closed();
+
+    // Chat
+    callback send-message();
+    callback draft-edited();              // host enforces the char cap
+    callback attach-image();
+    callback emoji-picked(string);
+    callback paste-rich();                // Ctrl/Cmd+V — host runs the paste chain
+    callback link-clicked(string);
+    callback copy-text(string);
+    callback row-save-image(int);
+    callback row-open-image(int);
+    /// Image viewer overlay: step -1/+1, save current, close.
+    callback viewer-step(int);
+    callback viewer-save();
+    callback viewer-close();         // opens the gallery viewer
+    callback gif-hover(int, bool);        // row-id, entering
+
+    // Image preview overlay
+    callback preview-send();
+    callback preview-cancel();
+
+    // Screen share dialog
+    callback start-share(int, int);       // monitor index, quality index
+
+    // Startup / update flow
+    callback update-now();
+    callback update-skip();
+    callback update-cancel();
+    callback update-install();
+
+    // Window lifecycle
+    callback main-close-requested();
+}

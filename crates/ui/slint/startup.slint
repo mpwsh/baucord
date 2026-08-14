@@ -1,0 +1,103 @@
+// startup.slint — splash + update flow, as phases of the main window.
+//
+// The FLTK build used three separate little windows (splash → prompt →
+// download). Here they're states of the single app window — one less
+// window class, no orphaned splash on a crash mid-check. Headings and
+// bodies arrive host-formatted (they carry version numbers).
+
+import { Theme } from "theme.slint";
+import { Tr } from "tr.slint";
+import { State, Logic, Phase } from "globals.slint";
+import { Btn } from "widgets.slint";
+
+export component StartupView inherits Rectangle {
+    background: Theme.bg-primary;
+
+    card := Rectangle {
+        width: 420px;
+        height: layout.preferred-height;
+        border-radius: Theme.radius-lg;
+        background: Theme.bg-secondary;
+
+        layout := VerticalLayout {
+            padding: Theme.gap-xl;
+            spacing: Theme.gap-lg;
+
+            Text {
+                text: "baucord";
+                color: Theme.text-primary;
+                font-size: Theme.font-title;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+
+            Text {
+                text: State.phase == Phase.splash ? Tr.splash-checking : State.update-heading;
+                color: Theme.text-secondary;
+                font-size: Theme.font-md;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            if State.update-body != "" : Text {
+                text: State.update-body;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            // Splash shimmer / download progress
+            if State.phase == Phase.splash || State.phase == Phase.downloading : Rectangle {
+                height: 8px;
+                border-radius: 4px;
+                background: Theme.subtle;
+                clip: true;
+                if State.phase == Phase.downloading : Rectangle {
+                    x: 0;
+                    width: parent.width * Math.clamp(State.update-progress, 0.0, 1.0);
+                    height: parent.height;
+                    border-radius: 4px;
+                    background: Theme.accent;
+                    animate width { duration: 150ms; }
+                }
+                if State.phase == Phase.splash : Rectangle {
+                    // indeterminate sweep
+                    property <float> t: Math.mod(animation-tick() / 1.2s, 1.0);
+                    x: (parent.width + 120px) * self.t - 120px;
+                    width: 120px;
+                    height: parent.height;
+                    border-radius: 4px;
+                    background: Theme.accent;
+                }
+            }
+
+            if State.update-progress-text != "" : Text {
+                text: State.update-progress-text;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+            }
+
+            if State.phase == Phase.update-prompt : HorizontalLayout {
+                spacing: Theme.gap-sm;
+                Btn { text: Tr.update-skip; clicked => { Logic.update-skip(); } }
+                Btn { text: Tr.update-now; accent: true; clicked => { Logic.update-now(); } }
+            }
+            if State.phase == Phase.downloading : Btn {
+                text: Tr.cancel;
+                clicked => { Logic.update-cancel(); }
+            }
+            if State.phase == Phase.download-done : HorizontalLayout {
+                spacing: Theme.gap-sm;
+                Btn { text: Tr.update-not-now; clicked => { Logic.update-skip(); } }
+                Btn { text: Tr.update-install-restart; accent: true; clicked => { Logic.update-install(); } }
+            }
+            if State.phase == Phase.download-failed : Btn {
+                text: Tr.update-continue;
+                accent: true;
+                clicked => { Logic.update-skip(); }
+            }
+        }
+    }
+}

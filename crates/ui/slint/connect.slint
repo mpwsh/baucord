@@ -1,0 +1,95 @@
+// connect.slint — the connect view.
+//
+// Same shape as the FLTK build (nickname + optional password, server
+// note, Settings/Quit, error + device-warning lines), redressed as a
+// centered rounded card. Values live in State so they survive failed
+// attempts and reconnects.
+
+import { Theme } from "theme.slint";
+import { Tr } from "tr.slint";
+import { State, Logic } from "globals.slint";
+import { Btn, Field, FieldLabel, Hint } from "widgets.slint";
+
+export component ConnectView inherits Rectangle {
+    background: Theme.bg-primary;
+
+    card := Rectangle {
+        width: 400px;
+        height: layout.preferred-height;
+        border-radius: Theme.radius-lg;
+        background: Theme.bg-secondary;
+
+        layout := VerticalLayout {
+            padding: Theme.gap-xl;
+            spacing: Theme.gap-md;
+
+            Text {
+                text: "baucord";
+                color: Theme.text-primary;
+                font-size: Theme.font-title;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: Tr.app-tagline;
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+            }
+
+            // Error line — reserved height so the form never jumps.
+            Text {
+                text: State.error-text;
+                color: Theme.danger;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                min-height: 18px;
+            }
+
+            FieldLabel { text: Tr.nickname; }
+            nick := Field {
+                text <=> State.nickname;
+                accepted => { Logic.connect-clicked(); }
+            }
+
+            FieldLabel { text: Tr.server-password; }
+            Field {
+                text <=> State.password;
+                secret: true;
+                accepted => { Logic.connect-clicked(); }
+            }
+
+            Text {
+                text: State.server-note;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+            }
+
+            Btn {
+                text: Tr.connect;
+                accent: true;
+                height: 42px;
+                clicked => { Logic.connect-clicked(); }
+            }
+
+            HorizontalLayout {
+                spacing: Theme.gap-sm;
+                Btn { text: Tr.settings; clicked => { Logic.open-settings(); } }
+                Btn { text: Tr.quit; clicked => { Logic.quit(); } }
+            }
+
+            // "Saved device isn't connected" — the fix (Settings) sits
+            // right above it, same as before.
+            Text {
+                text: State.device-warning;
+                color: Theme.warning;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                min-height: 16px;
+            }
+        }
+    }
+}

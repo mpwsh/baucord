@@ -1,0 +1,411 @@
+// media.rs — chat images: ingestion (paste/attach/URL), the outgoing
+// preview, and inline GIF playback.
+//
+// FLTK's Fl_Anim_GIF is gone; Slint has no animated Image. The
+// replacement is a small frame driver: app-core decodes the GIF to
+// RGBA frames, a `slint::Timer` steps them into the chat row via
+// `set_row_data`. Autoplay policy is unchanged: ~3 loops (≤30 s),
+// freeze to frame 0 (dropping the decoded frames), replay on hover.
+
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use log::{info, warn};
+use slint::{ComponentHandle, Model};
+
+use app_core::gif::{self, GifAnimation};
+use app_core::images::{self, ImageError};
+use i18n::t;
+use ui::State;
+
+use crate::app::AppState;
+
+/// Original wire bytes of a chat image row, kept for save / gallery /
+/// GIF replay.
+pub struct ImageEntry {
+    pub bytes: Rc<Vec<u8>>,
+    pub is_gif: bool,
+}
+
+/// Localize an app-core image error (keys from the real i18n catalog).
+fn describe(err: &ImageError) -> String {
+    match err {
+        ImageError::GifTooLarge(max) => {
+            t!("chat-gif-too-large", "mb" => (max / (1024 * 1024)).to_string())
+        }
+        ImageError::GifTooBig => {
+            t!("chat-gif-too-big", "dim" => images::MAX_ANIM_GIF_DIM.to_string())
+        }
+        ImageError::TooLargeAfterDownscale(kb) => {
+            t!("chat-image-too-large", "kb" => kb.to_string())
+        }
+        ImageError::Codec(e) => t!("chat-image-load-error", "error" => e.as_str()),
+    }
+}
+
+// ── Incoming images → chat rows ─────────────────────────────────────────
+
+/// Append an image message to chat. Returns false if the bytes don't
+/// decode (the caller posts a system-row notice instead).
+pub fn push_image_row(app: &mut AppState, ts: &str, user: &str, data: Vec<u8>) -> bool {
+    let Ok((frame, w, h)) = ui::convert::decode_to_image(&data) else {
+        return false;
+    };
+    let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);
+
+    let at_bottom = app.chat_scroll_state();
+    let delta = app
+        .history_mut()
+        .push_image(ts, user, data.clone(), w, h, is_gif);
+    // sync_history_tail equivalent: history rows were appended; mirror
+    // them (push_image appends exactly one row and may drop from front).
+    app.sync_delta(&delta);
+
+    // The freshly appended row is the last one — install the decoded
+    // frame (convert::chat_row only sets a placeholder).
+    let model = app.chat_model().clone();
+    let last = model.row_count() - 1;
+    if let Some(mut row) = model.row_data(last) {
+        row.image = frame;
+        let row_id = row.row_id;
+        model.set_row_data(last, row);
+
+        let bytes = Rc::new(data);
+        app.images.insert(
+            row_id,
+            ImageEntry {
+                bytes: bytes.clone(),
+                is_gif,
+            },
+        );
+
+        if is_gif {
+            let mut player = GifPlayer::new(bytes);
+            player.start_autoplay();
+            app.gifs_mut().insert(row_id, player);
+            app.ensure_gif_ticker();
+        }
+    }
+
+    app.chat_appended(at_bottom);
+    true
+}
+
+// ── GIF playback ────────────────────────────────────────────────────────
+
+enum GifMode {
+    /// Playing with a wall-clock budget; freezes when it expires.
+    Autoplay { deadline: Instant },
+    /// Hover replay — runs until the pointer leaves.
+    Hover,
+    /// Showing frame 0, decoded frames released.
+    Frozen,
+}
+
+/// One tick's outcome for a player.
+pub enum GifStep {
+    /// Nothing to draw (frozen, or the current frame hasn't elapsed).
+    Idle,
+    /// Draw this frame.
+    Blit { anim: Rc<GifAnimation>, idx: usize },
+    /// Budget expired: draw frame 0 and release the animation.
+    Freeze { anim: Rc<GifAnimation> },
+}
+
+/// Chat-row GIF playback state, advanced by the app's single 33 ms
+/// animation ticker (`AppState::gif_tick`) instead of per-player
+/// timers — one repeating timer for any number of playing GIFs, and
+/// no timer-restarted-from-its-own-callback patterns.
+pub struct GifPlayer {
+    bytes: Rc<Vec<u8>>,
+    /// Present only while playing — frozen players hold no frames.
+    anim: Option<Rc<GifAnimation>>,
+    frame_idx: usize,
+    in_frame_ms: f64,
+    mode: GifMode,
+}
+
+impl GifPlayer {
+    pub fn new(bytes: Rc<Vec<u8>>) -> Self {
+        Self {
+            bytes,
+            anim: None,
+            frame_idx: 0,
+            in_frame_ms: 0.0,
+            mode: GifMode::Frozen,
+        }
+    }
+
+    fn decode(&mut self) -> bool {
+        if self.anim.is_none() {
+            match gif::decode_animation(&self.bytes) {
+                Ok(anim) if !anim.frames.is_empty() => self.anim = Some(Rc::new(anim)),
+                Ok(_) => return false,
+                Err(e) => {
+                    warn!("GIF decode failed: {e}");
+                    return false;
+                }
+            }
+        }
+        self.frame_idx = 0;
+        self.in_frame_ms = 0.0;
+        true
+    }
+
+    pub fn start_autoplay(&mut self) {
+        let budget = GifAnimation::autoplay_budget_secs(&self.bytes);
+        if self.decode() {
+            self.mode = GifMode::Autoplay {
+                deadline: Instant::now() + Duration::from_secs_f64(budget),
+            };
+        }
+    }
+
+    /// Pointer entered/left the image. Returns true when playback (and
+    /// therefore the ticker) should be running.
+    pub fn hover(&mut self, entering: bool) -> bool {
+        if entering {
+            if matches!(self.mode, GifMode::Frozen) && self.decode() {
+                self.mode = GifMode::Hover;
+            }
+        } else if matches!(self.mode, GifMode::Hover) {
+            // Next tick freezes (draws frame 0, releases frames).
+            self.mode = GifMode::Autoplay {
+                deadline: Instant::now(),
+            };
+        }
+        self.playing()
+    }
+
+    pub fn playing(&self) -> bool {
+        !matches!(self.mode, GifMode::Frozen)
+    }
+
+    /// Advance by `dt_ms` of wall time.
+    pub fn step(&mut self, dt_ms: f64) -> GifStep {
+        let Some(anim) = self.anim.clone() else {
+            return GifStep::Idle;
+        };
+        if let GifMode::Autoplay { deadline } = self.mode
+            && Instant::now() >= deadline
+        {
+            self.mode = GifMode::Frozen;
+            self.anim = None;
+            self.frame_idx = 0;
+            self.in_frame_ms = 0.0;
+            return GifStep::Freeze { anim };
+        }
+
+        self.in_frame_ms += dt_ms;
+        let mut advanced = false;
+        // Catch up through short frames; bail after one loop's worth so
+        // a stall can't spiral.
+        for _ in 0..anim.frames.len() {
+            let delay = f64::from(anim.frames[self.frame_idx].delay_ms);
+            if self.in_frame_ms < delay {
+                break;
+            }
+            self.in_frame_ms -= delay;
+            self.frame_idx = (self.frame_idx + 1) % anim.frames.len();
+            advanced = true;
+        }
+        if advanced {
+            GifStep::Blit {
+                anim,
+                idx: self.frame_idx,
+            }
+        } else {
+            GifStep::Idle
+        }
+    }
+}
+
+// ── Outgoing: paste chain, attach, preview ──────────────────────────────
+
+/// The paste chain, highest-fidelity source first (ported semantics):
+///   1. a copied image *file* (Linux file-manager copies, and pasted
+///      paths/URIs)
+///   2. native clipboard PNG (screenshots)
+///   3. pasted text that is an image URL → fetch
+///   4. plain text → append to the draft
+pub fn paste_into_chat(app: &mut AppState) {
+    // 1. Copied file (platform clipboards expose these differently —
+    //    clipboard.rs handles each).
+    if let Some(path) = crate::clipboard::clipboard_file()
+        && images::is_image_path(&path) {
+            attach_path(app, &path);
+            return;
+        }
+
+    // 2. Native image data (PNG from screenshots etc.).
+    if let Some(png) = crate::clipboard::clipboard_png() {
+        match images::load_image_bytes(png, client::MAX_CHAT_IMAGE_BYTES) {
+            Ok(bytes) => {
+                show_preview(app, bytes);
+                return;
+            }
+            Err(e) => {
+                app.show_error(&describe(&e));
+                return;
+            }
+        }
+    }
+
+    // 3./4. Text flavors.
+    if let Some(text) = crate::clipboard::clipboard_text() {
+        if let Some(path) = images::first_image_path_in(&text) {
+            attach_path(app, &path);
+            return;
+        }
+        if let Some(url) = images::image_url_in(&text) {
+            fetch_image_url(app, &url);
+            return;
+        }
+        // Plain text — the capture-key handler consumed the paste
+        // keystroke, so insert it ourselves (append; chat drafts are
+        // effectively always cursor-at-end).
+        let s = app.main.global::<State>();
+        let mut draft = s.get_draft().to_string();
+        draft.push_str(&app_core::chat::scrub_control_chars(&text));
+        let capped: String = draft
+            .chars()
+            .take(app_core::chat::MAX_MESSAGE_CHARS)
+            .collect();
+        s.set_draft(capped.into());
+    }
+}
+
+/// Load an image file from disk into the preview.
+fn attach_path(app: &mut AppState, path: &std::path::Path) {
+    match std::fs::read(path) {
+        Ok(raw) => match images::load_image_bytes(raw, client::MAX_CHAT_IMAGE_BYTES) {
+            Ok(bytes) => show_preview(app, bytes),
+            Err(e) => app.show_error(&describe(&e)),
+        },
+        Err(e) => app.show_error(&t!("chat-image-load-error", "error" => e.to_string())),
+    }
+}
+
+/// Async native file dialog → attach. rfd's portal backend is async;
+/// run it on a scratch thread and hop back via the event loop.
+pub fn attach_image_from_disk() {
+    std::thread::spawn(|| {
+        let picked = pollster::block_on(
+            rfd::AsyncFileDialog::new()
+                .add_filter(t!("chat-image-filter"), images::IMAGE_EXTENSIONS)
+                .pick_file(),
+        );
+        if let Some(handle) = picked {
+            let path = handle.path().to_path_buf();
+            let _ = slint::invoke_from_event_loop(move || {
+                crate::app::with_current(move |app| attach_path(app, &path));
+            });
+        }
+    });
+}
+
+/// Fetch a pasted image URL off-thread, then preview it. The status
+/// line under the composer shows "Downloading image…" while the fetch
+/// runs (same slot the upload progress uses).
+fn fetch_image_url(app: &mut AppState, url: &str) {
+    app.main
+        .global::<State>()
+        .set_upload_line(t!("chat-downloading-image").into());
+    let url = url.to_string();
+    info!("Fetching pasted image URL: {url}");
+    std::thread::spawn(move || {
+        let result = fetch_bytes(&url);
+        let _ = slint::invoke_from_event_loop(move || {
+            crate::app::with_current(move |app| {
+                app.main.global::<State>().set_upload_line("".into());
+                match result {
+                    Ok(raw) => match images::load_image_bytes(raw, client::MAX_CHAT_IMAGE_BYTES) {
+                        Ok(bytes) => show_preview(app, bytes),
+                        Err(e) => app.show_error(&describe(&e)),
+                    },
+                    Err(e) => {
+                        app.show_error(&t!("chat-image-load-error", "error" => e.as_str()));
+                    }
+                }
+            });
+        });
+    });
+}
+
+fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let agent: ureq::Agent = ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .build()
+        .into();
+    let mut resp = agent.get(url).call().map_err(|e| e.to_string())?;
+    // Cap the read at budget+1 so an oversized body fails fast instead
+    // of buffering hundreds of MB.
+    // `.take` is std::io::Read's — fully qualified so it can't resolve
+    // to Iterator::take on some future BodyReader.
+    let mut reader =
+        std::io::Read::take(resp.body_mut().as_reader(), client::MAX_CHAT_IMAGE_BYTES as u64 + 1);
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > client::MAX_CHAT_IMAGE_BYTES {
+        return Err(t!("chat-image-too-large",
+            "kb" => (buf.len() / 1024).to_string()));
+    }
+    Ok(buf)
+}
+
+/// Fill and open the in-window preview overlay.
+fn show_preview(app: &mut AppState, bytes: Vec<u8>) {
+    match ui::convert::decode_to_image(&bytes) {
+        Ok((image, w, h)) => {
+            let kb = bytes.len() / 1024;
+            let s = app.main.global::<State>();
+            s.set_preview_image(image);
+            s.set_preview_caption(format!("{w}×{h} — {kb} KB").into());
+            s.set_preview_open(true);
+            app.set_pending_preview(bytes);
+        }
+        Err(e) => app.show_error(&describe(&e)),
+    }
+}
+
+/// Save an image row to disk via the native save dialog.
+pub fn save_image_dialog(app: &mut AppState, row_id: i32) {
+    let Some(entry) = app.images.get(&row_id) else {
+        return;
+    };
+    let bytes: Arc<Vec<u8>> = Arc::new(entry.bytes.as_ref().clone());
+    let (ext, filter) = if entry.is_gif {
+        ("gif", &["gif"][..])
+    } else {
+        ("png", &["png"][..])
+    };
+    let default_name = format!("baucord-image.{ext}");
+    let filter_name = if entry.is_gif {
+        t!("image-save-filter-gif")
+    } else {
+        t!("image-save-filter")
+    };
+    let filter: Vec<String> = filter.iter().map(|s| (*s).to_string()).collect();
+    std::thread::spawn(move || {
+        let picked = pollster::block_on(
+            rfd::AsyncFileDialog::new()
+                .set_file_name(&default_name)
+                .add_filter(&filter_name, &filter)
+                .save_file(),
+        );
+        if let Some(handle) = picked {
+            let path = handle.path().to_path_buf();
+            let write_result = std::fs::write(&path, bytes.as_slice());
+            let _ = slint::invoke_from_event_loop(move || {
+                crate::app::with_current(move |app| {
+                    if let Err(e) = write_result {
+                        app.show_error(&t!("chat-image-save-error", "error" => e.to_string()));
+                    } else {
+                        info!("Saved image to {}", path.display());
+                    }
+                });
+            });
+        }
+    });
+}

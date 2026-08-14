@@ -1,0 +1,67 @@
+// theme.slint — the "workbench" palette as design tokens.
+//
+// Same hues the FLTK build shipped (layered dark greys + cobalt accent,
+// Slack-adjacent, no purple), promoted from per-widget constants to one
+// global every component reads. New in the Slint skin: a radius scale
+// (flat but curved) and an 8px spacing scale.
+//
+// | name      | hex       | role                 |
+// |-----------|-----------|----------------------|
+// | graphite  | #1A1D21   | ground               |
+// | gunmetal  | #222529   | raised panels        |
+// | fog       | #D1D2D3   | primary text         |
+// | steel     | #ABADB0   | secondary text       |
+// | cobalt    | #1264A3   | accent               |
+// | green     | #2BAC76   | positive / speaking  |
+// | amber     | #ECB22E   | caution              |
+// | raspberry | #E01E5A   | errors / live        |
+
+export global Theme {
+    // ── Backgrounds ────────────────────────────────────────────────
+    out property <brush> bg-primary:   #1A1D21;
+    out property <brush> bg-secondary: #222529;
+    out property <brush> bg-tertiary:  #2B2E33;
+    out property <brush> surface:      #15171A;
+    out property <brush> hover:        #272A2F;
+    out property <brush> subtle:       #303338;
+    out property <brush> border:       #3A3D42;
+
+    // ── Text ───────────────────────────────────────────────────────
+    out property <color> text-primary:   #D1D2D3;
+    out property <color> text-secondary: #ABADB0;
+    out property <color> text-muted:     #808386;
+    out property <color> mono-text:      #86AA90;
+    out property <color> on-accent:      #FFFFFF;
+
+    // ── Accents & status ───────────────────────────────────────────
+    out property <color> accent:       #1264A3;
+    out property <color> accent-hover: #0E5082;
+    out property <color> success:      #2BAC76;
+    out property <color> warning:      #ECB22E;
+    out property <color> danger:       #E01E5A;
+    out property <color> meter:        #ABADB0;
+
+    // ── Row tints (sidebar) ────────────────────────────────────────
+    out property <brush> row-muted-tint:  #2E1C23;
+    out property <brush> row-volume-tint: #1C232D;
+
+    // ── Radii — "flat but curved" ──────────────────────────────────
+    out property <length> radius-lg: 14px;  // cards, panels, popovers
+    out property <length> radius-md: 10px;  // buttons, inputs, rows
+    out property <length> radius-sm: 6px;   // chips, badges
+
+    // ── Spacing scale ──────────────────────────────────────────────
+    out property <length> gap-xs: 4px;
+    out property <length> gap-sm: 8px;
+    out property <length> gap-md: 12px;
+    out property <length> gap-lg: 16px;
+    out property <length> gap-xl: 24px;
+
+    // ── Type scale ─────────────────────────────────────────────────
+    out property <length> font-xs:   10px;
+    out property <length> font-sm:   11px;
+    out property <length> font-body: 13px;
+    out property <length> font-md:   14px;
+    out property <length> font-lg:   16px;
+    out property <length> font-title: 30px;
+}

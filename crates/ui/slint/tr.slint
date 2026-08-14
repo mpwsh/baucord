@@ -1,0 +1,102 @@
+// tr.slint — localizable UI strings.
+//
+// Fluent stays on the Rust side (the `i18n` crate is unchanged): the
+// shell writes every one of these `in` properties from `t!(...)` at
+// startup and again on every language change, so switching languages
+// re-renders live — no view rebuilds, unlike the FLTK build.
+//
+// Strings with arguments (chat notices, stats lines, error toasts,
+// window titles) are *not* here: Rust formats them and pushes the
+// final string through state properties instead.
+//
+// The English defaults keep `slint-viewer` previews readable.
+
+export global Tr {
+    // Connect view
+    in property <string> app-tagline: "voice, chat & screen share for your crew";
+    in property <string> nickname: "Nickname";
+    in property <string> server-password: "Server password (optional)";
+    in property <string> connect: "Connect";
+    in property <string> settings: "Settings";
+    in property <string> quit: "Quit";
+
+    // Sidebar
+    in property <string> mute: "Mute";
+    in property <string> unmute: "Unmute";
+    in property <string> deafen: "Deafen";
+    in property <string> undeafen: "Undeafen";
+    in property <string> share-screen: "Share screen";
+    in property <string> stop-sharing: "Stop sharing";
+    in property <string> disconnect: "Disconnect";
+    in property <string> live: "LIVE";
+
+    // Per-user popover
+    in property <string> user-volume: "User volume";
+    in property <string> watch-stream: "Watch stream";
+    in property <string> reset-audio: "Reset audio";
+
+    // Chat
+    in property <string> send: "Send";
+    in property <string> cancel: "Cancel";
+    in property <string> chat-emoji-tooltip: "Emoji";
+    in property <string> chat-attach-tooltip: "Attach image";
+    in property <string> image-preview-title: "Send image?";
+    in property <string> menu-cut: "Cut";
+    in property <string> menu-copy: "Copy";
+    in property <string> menu-paste: "Paste";
+    in property <string> menu-copy-message: "Copy message";
+    in property <string> menu-copy-link: "Copy link";
+    in property <string> menu-open-link: "Open link";
+    in property <string> menu-save-image: "Save image…";
+    in property <string> menu-open-image: "Open image";
+
+    // Screen share dialog
+    in property <string> monitor: "Monitor";
+    in property <string> quality: "Quality";
+    in property <string> start-sharing: "Start sharing";
+
+    // Stream viewer
+    in property <string> stop-watching: "Stop watching";
+
+    // Settings
+    in property <string> settings-title: "Settings";
+    in property <string> tab-general: "General";
+    in property <string> tab-audio: "Audio";
+    in property <string> tab-keyboard: "Keyboard";
+    in property <string> tab-credits: "Credits";
+    in property <string> tab-about: "About";
+    in property <string> save-and-close: "Save & close";
+    in property <string> reset-defaults: "Reset to defaults";
+    in property <string> language: "Language";
+    in property <string> language-note: "Chat history keeps its language; new labels apply immediately.";
+    in property <string> settings-server: "Server";
+    in property <string> server-address: "Server address";
+    in property <string> server-token-url: "Token URL (secure servers)";
+    in property <string> server-config-note: "These are deployment constants — set once and shared by everyone on your server. They apply on the next connect.";
+    in property <string> audio-devices-header: "Devices";
+    in property <string> audio-input-device: "Input device";
+    in property <string> audio-output-device: "Output device";
+    in property <string> audio-system-default: "System default";
+    in property <string> audio-input-header: "Input";
+    in property <string> audio-capture-level: "Capture level";
+    in property <string> audio-input-gain: "Input gain";
+    in property <string> audio-input-sensitivity: "Voice sensitivity";
+    in property <string> audio-gate-hint: "Speak normally — the bar should turn green while you talk.";
+    in property <string> audio-test-mic: "Test microphone";
+    in property <string> audio-stop-testing: "Stop testing";
+    in property <string> audio-output-header: "Output";
+    in property <string> audio-master-volume: "Master volume";
+    in property <string> keybinds-header: "Keyboard shortcuts";
+    in property <string> keybinds-hint: "Click a binding, then press the new key combination. Esc cancels, Backspace clears.";
+    in property <string> keybind-record: "Record";
+    in property <string> keybind-press-combo: "Press keys…";
+    in property <string> keybind-not-set: "Not set";
+
+    // Startup / update flow
+    in property <string> update-now: "Update";
+    in property <string> update-skip: "Skip";
+    in property <string> update-not-now: "Not now";
+    in property <string> update-continue: "Continue";
+    in property <string> update-install-restart: "Install & restart";
+    in property <string> splash-checking: "Checking for updates…";
+}

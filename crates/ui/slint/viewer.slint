@@ -1,0 +1,87 @@
+// viewer.slint — the two media windows.
+//
+// StreamViewerWindow: one per watched peer. The shell pushes each
+// decoded frame as an `image` property (SharedPixelBuffer → Image on
+// the Rust side) — property damage repaints exactly the canvas, no
+// global-redraw concerns. Toolbar: volume, mute, stop watching, stats.
+//
+// GalleryWindow: the chat image viewer — ◀ / ▶ walk neighbouring image
+// rows, Save… on the right. Single instance, managed by the shell.
+
+import { Theme } from "theme.slint";
+import { Tr } from "tr.slint";
+import { IconBtn, Btn, HSlider } from "widgets.slint";
+
+export component StreamViewerWindow inherits Window {
+    in property <string> peer-name;
+    in property <image> frame;
+    in property <string> stats: "--";
+    in-out property <bool> stream-muted: false;
+    in-out property <float> volume: 1.0;
+    callback volume-changed(float);
+    callback mute-toggled(bool);
+    callback stop-watching();
+
+    title: peer-name;
+    background: black;
+    preferred-width: 1280px;
+    preferred-height: 752px;
+    min-width: 320px;
+    min-height: 272px;
+
+    VerticalLayout {
+        Image {
+            vertical-stretch: 1;
+            source: root.frame;
+            image-fit: contain;   // aspect-preserving letterbox
+        }
+        Rectangle {
+            height: 44px;
+            background: Theme.bg-secondary;
+            HorizontalLayout {
+                padding-left: Theme.gap-md;
+                padding-right: Theme.gap-md;
+                spacing: Theme.gap-md;
+                Image {
+                    width: 16px;
+                    source: @image-url("icons/volume.svg");
+                    colorize: Theme.text-muted;
+                }
+                HSlider {
+                    width: 130px;
+                    y: (parent.height - self.height) / 2;
+                    minimum: 0.0; maximum: 1.0;
+                    value <=> root.volume;
+                    live-changed(v) => { root.volume-changed(v); }
+                }
+                Btn {
+                    width: 110px;
+                    height: 32px;
+                    y: (parent.height - self.height) / 2;
+                    text: root.stream-muted ? Tr.unmute : Tr.mute;
+                    danger: root.stream-muted;
+                    clicked => {
+                        root.stream-muted = !root.stream-muted;
+                        root.mute-toggled(root.stream-muted);
+                    }
+                }
+                Btn {
+                    width: 140px;
+                    height: 32px;
+                    y: (parent.height - self.height) / 2;
+                    text: Tr.stop-watching;
+                    clicked => { root.stop-watching(); }
+                }
+                Text {
+                    text: root.stats;
+                    color: Theme.text-muted;
+                    font-size: Theme.font-xs;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}

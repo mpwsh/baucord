@@ -1,0 +1,391 @@
+// widgets.slint — reusable primitives for the baucord skin.
+//
+// Everything here is flat, rounded, and reactive: hover/press states
+// animate over ~150ms so state changes feel intentional. Meters are
+// plain Rectangles with width bindings — the custom-draw code the FLTK
+// build needed is gone.
+
+import { Theme } from "theme.slint";
+
+// ── Buttons ─────────────────────────────────────────────────────────────
+
+/// Standard subdued button. `accent`/`danger` switch the fill for
+/// primary and destructive actions; `engaged` marks a latched toggle.
+export component Btn inherits Rectangle {
+    in property <string> text;
+    in property <bool> accent: false;
+    in property <bool> danger: false;
+    in property <bool> engaged: false;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    property <bool> filled: accent || danger || engaged;
+    property <brush> fill:
+        danger ? Theme.danger
+        : accent ? (touch.has-hover ? Theme.accent-hover : Theme.accent)
+        : engaged ? Theme.accent-hover
+        : touch.has-hover ? Theme.hover : Theme.bg-tertiary;
+
+    height: 36px;
+    border-radius: Theme.radius-md;
+    background: fill;
+    opacity: enabled ? (touch.pressed ? 0.85 : 1.0) : 0.4;
+    animate background { duration: 150ms; }
+    animate opacity { duration: 100ms; }
+
+    lbl := Text {
+        text: root.text;
+        color: filled ? Theme.on-accent : Theme.text-primary;
+        font-size: Theme.font-body;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Square icon button. `active` latches it (engaged toggle) and
+/// `active-danger` colors the latched state raspberry instead of cobalt.
+export component IconBtn inherits Rectangle {
+    in property <image> icon;
+    in property <string> tooltip;
+    in property <bool> active: false;
+    in property <bool> active-danger: false;
+    in property <length> size: 40px;
+    in property <length> icon-size: 18px;
+    in property <color> idle-color: Theme.text-secondary;
+    callback clicked;
+
+    width: size;
+    height: size;
+    border-radius: Theme.radius-md;
+    background:
+        active ? (active-danger ? Theme.danger : Theme.accent)
+        : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: 150ms; }
+
+    Image {
+        source: root.icon;
+        width: root.icon-size;
+        height: root.icon-size;
+        colorize: root.active ? Theme.on-accent
+            : touch.has-hover ? Theme.text-primary : root.idle-color;
+        animate colorize { duration: 150ms; }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    if touch.has-hover && tooltip != "" : Rectangle {
+        y: -28px;
+        x: (root.width - self.width) / 2;
+        height: 22px;
+        width: tip.preferred-width + 16px;
+        border-radius: Theme.radius-sm;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        tip := Text {
+            text: root.tooltip;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+        }
+    }
+}
+
+// ── Text input ──────────────────────────────────────────────────────────
+
+/// Single-line dark input with rounded border and focus ring.
+export component Field inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text <=> input.text;
+    in property <bool> secret: false;
+    in property <InputType> input-type: secret ? InputType.password : InputType.text;
+    callback accepted;                 // Enter
+    // Fires per keystroke. Character caps are enforced host-side (the
+    // shell trims and writes `text` back) — Slint strings have no
+    // substring op, and the wire check in send_current still guards.
+    callback edited;
+    public function focus-input() { input.focus(); }
+    public function do-cut() { input.cut(); }
+    public function do-copy() { input.copy(); }
+    public function do-paste() { input.paste(); }
+
+    height: 40px;
+    border-radius: Theme.radius-md;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    animate border-color { duration: 150ms; }
+
+    HorizontalLayout {
+        padding-left: Theme.gap-md;
+        padding-right: Theme.gap-md;
+        input := TextInput {
+            single-line: true;
+            vertical-alignment: center;
+            font-size: Theme.font-body;
+            color: Theme.text-primary;
+            selection-background-color: Theme.accent;
+            input-type: root.input-type;
+            accepted => { root.accepted(); }
+            edited => { root.edited(); }
+        }
+    }
+    if input.text == "" && !input.has-focus : Text {
+        x: Theme.gap-md;
+        height: 100%;
+        vertical-alignment: center;
+        text: root.placeholder;
+        color: Theme.text-muted;
+        font-size: Theme.font-body;
+    }
+}
+
+// ── Slider ──────────────────────────────────────────────────────────────
+
+/// Horizontal slider: rounded track, accent fill, round thumb.
+/// `live-changed` fires on every drag tick, `released` once at the end
+/// (mirrors the FLTK release-to-commit popup behavior where needed).
+export component HSlider inherits Rectangle {
+    in property <float> minimum: 0.0;
+    in property <float> maximum: 1.0;
+    in-out property <float> value: 0.0;
+    callback live-changed(float);
+    callback released(float);
+
+    height: 24px;
+    property <float> norm: Math.clamp((value - minimum) / Math.max(0.0001, maximum - minimum), 0.0, 1.0);
+    property <length> usable: root.width - 16px;
+
+    track := Rectangle {
+        y: (root.height - self.height) / 2;
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.subtle;
+    }
+    fillbar := Rectangle {
+        x: 0;
+        y: (root.height - self.height) / 2;
+        height: 6px;
+        width: 8px + root.norm * root.usable;
+        border-radius: 3px;
+        background: Theme.accent;
+    }
+    thumb := Rectangle {
+        x: root.norm * root.usable;
+        y: (root.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: touch.has-hover || touch.pressed ? Theme.text-primary : #C8C9CA;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        moved => {
+            if (self.pressed) {
+                root.value = Math.clamp(
+                    root.minimum + ((self.mouse-x - 8px) / root.usable) * (root.maximum - root.minimum),
+                    root.minimum, root.maximum);
+                root.live-changed(root.value);
+            }
+        }
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                root.value = Math.clamp(
+                    root.minimum + ((self.mouse-x - 8px) / root.usable) * (root.maximum - root.minimum),
+                    root.minimum, root.maximum);
+                root.live-changed(root.value);
+            }
+            if (ev.kind == PointerEventKind.up) {
+                root.released(root.value);
+            }
+        }
+    }
+}
+
+// ── Meters ──────────────────────────────────────────────────────────────
+
+/// VU meter: accent → amber → raspberry as the level rises.
+/// The level property is pushed from Rust (8 Hz while visible).
+export component VuMeter inherits Rectangle {
+    in property <float> level: 0.0;       // 0.0–1.0
+    in property <color> accent: Theme.meter;
+
+    height: 20px;
+    border-radius: Theme.radius-sm;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+
+    property <float> lv: Math.clamp(level, 0.0, 1.0);
+    bar := Rectangle {
+        x: 2px;
+        y: 3px;
+        height: root.height - 6px;
+        width: (root.width - 4px) * root.lv;
+        border-radius: Theme.radius-sm - 2px;
+        background: root.lv > 0.9 ? Theme.danger
+            : root.lv > 0.7 ? Theme.warning
+            : root.accent;
+        animate width { duration: 80ms; }
+    }
+}
+
+/// Gate meter: green when the level clears the threshold, dim below;
+/// a raspberry marker shows the threshold position. `display-scale`
+/// mirrors the input pipeline's rms*3 scaling.
+export component GateMeter inherits Rectangle {
+    in property <float> level: 0.0;
+    in property <float> threshold: 0.02;   // raw threshold
+    in property <float> display-scale: 3.0;
+
+    height: 20px;
+    border-radius: Theme.radius-sm;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+
+    property <float> lv: Math.clamp(level, 0.0, 1.0);
+    property <float> thr: Math.clamp(threshold * display-scale, 0.0, 1.0);
+
+    bar := Rectangle {
+        x: 2px;
+        y: 4px;
+        height: root.height - 8px;
+        width: (root.width - 4px) * root.lv;
+        border-radius: Theme.radius-sm - 2px;
+        background: root.lv > root.thr ? Theme.success : Theme.subtle;
+        animate width { duration: 80ms; }
+    }
+    marker := Rectangle {
+        x: 2px + (root.width - 4px) * root.thr - 1px;
+        y: 1px;
+        width: 2px;
+        height: root.height - 2px;
+        background: Theme.danger;
+    }
+}
+
+// ── Layout helpers ──────────────────────────────────────────────────────
+
+/// 1px separator line.
+export component Sep inherits Rectangle {
+    height: 1px;
+    background: Theme.subtle;
+}
+
+/// Raised rounded card.
+export component Card inherits Rectangle {
+    border-radius: Theme.radius-lg;
+    background: Theme.bg-secondary;
+}
+
+/// Small field label above a control.
+export component FieldLabel inherits Text {
+    color: Theme.text-secondary;
+    font-size: Theme.font-sm;
+}
+
+/// Muted hint under a control.
+export component Hint inherits Text {
+    color: Theme.text-muted;
+    font-size: Theme.font-xs;
+    wrap: word-wrap;
+}
+
+/// Bold section heading.
+export component SectionHeader inherits Text {
+    color: Theme.text-primary;
+    font-size: Theme.font-md;
+    font-weight: 700;
+}
+
+// ── Dropdown ────────────────────────────────────────────────────────────
+
+/// Rounded dark dropdown. Options come as a string model; index 0 is
+/// conventionally the default entry ("System default", …).
+export component Dropdown inherits Rectangle {
+    in property <[string]> options;
+    in-out property <int> current: 0;
+    callback selected(int);
+
+    height: 36px;
+    border-radius: Theme.radius-md;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    animate border-color { duration: 150ms; }
+
+    HorizontalLayout {
+        padding-left: Theme.gap-md;
+        padding-right: Theme.gap-sm;
+        spacing: Theme.gap-sm;
+        Text {
+            text: root.current >= 0 && root.current < root.options.length
+                ? root.options[root.current] : "";
+            color: Theme.text-primary;
+            font-size: Theme.font-body;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: "▾";
+            color: Theme.text-muted;
+            font-size: Theme.font-body;
+            vertical-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { pop.show(); }
+    }
+
+    pop := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        Rectangle {
+            background: Theme.bg-tertiary;
+            border-radius: Theme.radius-md;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding: 4px;
+                for opt[i] in root.options : Rectangle {
+                    height: 30px;
+                    border-radius: Theme.radius-sm;
+                    background: it.has-hover ? Theme.hover
+                        : i == root.current ? Theme.accent : transparent;
+                    Text {
+                        x: Theme.gap-sm;
+                        width: parent.width - 2 * Theme.gap-sm;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: opt;
+                        color: i == root.current && !it.has-hover ? Theme.on-accent : Theme.text-primary;
+                        font-size: Theme.font-body;
+                        overflow: elide;
+                    }
+                    it := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.current = i;
+                            root.selected(i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

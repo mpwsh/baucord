@@ -1,21 +1,38 @@
-// app.rs — Main application coordinator.
+// app.rs — Main application coordinator (Slint edition).
 //
-// Owns the FLTK event loop and delegates to:
-//   - NetworkThreadHandle (network.rs) for renet client + protocol
-//   - VoiceThreadHandle   (voice.rs)   for audio capture/playback/encoding
-//   - ScreenThreadHandle  (screen.rs)  for screen capture/encode/decode
+// Owns the Slint event loop and delegates to:
+//   - NetworkThreadHandle (client::network) for renet client + protocol
+//   - VoiceThreadHandle   (client::voice)   for audio capture/playback
+//   - ScreenThreadHandle  (client::screen)  for screen capture/encode/decode
 //
-// Speaking state is driven by vc.is_speaking(), not inferred from packet flow.
+// Architecture vs the FLTK build:
+//   - Worker threads keep their crossbeam channels; the `WakeFn` they
+//     already call now schedules a drain on the Slint event loop via
+//     `invoke_from_event_loop` (the one-for-one replacement of
+//     `fltk::app::awake` + the manual `while app.wait()` drain).
+//   - All periodic work (device poll 2.5 s, resources 2 s, stream
+//     stats 1 s, error clear 5 s) runs on `slint::Timer`s.
+//   - UI state lives in `State`/`Logic` globals; row models are
+//     `Rc<VecModel<…>>` mutated in place (push/set_row_data), so
+//     roster refreshes preserve scroll position exactly like the old
+//     incremental sidebar updates.
+//   - Every floating helper (emoji palette, per-user popover, share
+//     dialog, image preview) is an in-window overlay — the orphaned-
+//     popup lifecycle code has no equivalent here because the failure
+//     mode is structurally impossible.
+//
+// Speaking state is driven by voice events, not inferred from packet flow.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use fltk::{prelude::*, *};
-use log::{info, warn};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use trayicon::{MenuBuilder, TrayIcon, TrayIconBuilder};
+
+use log::{info, warn};
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
 use client::{
     config::{BindableAction, Settings, peer_key},
@@ -24,76 +41,88 @@ use client::{
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
 };
 
-use crate::{
-    hotkeys::HotkeyManager,
-    ui::{chat::Chat, messages::UiMessage, screenshare, sidebar::Sidebar, viewer::ViewerWindow},
-};
+use app_core::chat::ChatHistory;
+use app_core::roster::{self, PeerAudio, UserState};
 use audio::{PeerAudioSettings, SoundType};
 use i18n::t;
-use ui::theme;
+use ui::{ChatRow, Logic, MainWindow, Phase, State, Tr, UserRow};
 
-// ── Public types ────────────────────────────────────────────────────────
+use crate::hotkeys::HotkeyManager;
+use crate::media::{self, GifPlayer};
+use crate::viewers::Viewer;
 
-#[derive(Clone)]
-pub struct UserState {
-    pub username: String,
-    pub is_speaking: bool,
-    pub audio_settings: PeerAudioSettings,
-    /// Remote user's self-reported mute state (distinct from local per-user mute).
-    pub is_self_muted: bool,
-    /// Remote user's self-reported deafen state.
-    pub is_self_deafened: bool,
+/// Compiled-in version of this binary.
+pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ── The UI-thread singleton ─────────────────────────────────────────────
+
+thread_local! {
+    /// The app lives on the UI thread; worker wakes reach it through
+    /// `invoke_from_event_loop` + this slot.
+    static APP: RefCell<Option<Rc<RefCell<AppState>>>> = const { RefCell::new(None) };
 }
 
-// ── App ────────────────────────────────────────────────────────────────
+/// Schedule a drain on the UI thread. Cheap and coalescing: multiple
+/// wakes before the loop runs just queue multiple no-op-ish drains.
+fn wake() {
+    let _ = slint::invoke_from_event_loop(|| {
+        let app = APP.with(|a| a.borrow().clone());
+        if let Some(app) = app {
+            AppState::drain(&app);
+        }
+    });
+}
 
-pub struct App {
-    app: app::App,
-    sender: app::Sender<UiMessage>,
-    receiver: app::Receiver<UiMessage>,
-
+// struct_excessive_bools: connected/is_muted/is_deafened/is_testing_mic
+// are four independent facts about the session, not an encoded state
+// machine — a bitflags/enum here would only obscure the call sites.
+#[allow(clippy::struct_excessive_bools)]
+pub struct AppState {
     // Thread handles (own the threads + their channels)
     network: NetworkThreadHandle,
     voice: VoiceThreadHandle,
     screen: ScreenThreadHandle,
 
-    // State
-    users: HashMap<renet::ClientId, UserState>,
-    our_client_id: Option<renet::ClientId>,
+    // Domain state
+    users: HashMap<u64, UserState>,
+    our_client_id: Option<u64>,
     connected: bool,
-    settings: Settings,
+    pub settings: Settings,
     is_muted: bool,
     is_deafened: bool,
-    is_testing_mic: bool,
+    pub is_testing_mic: bool,
     is_testing_mic_shared: Arc<AtomicBool>,
 
-    /// Active screen sharers: client_id → (width, height).
-    /// Updated when ScreenShareStarted/Stopped arrives from network.
-    active_sharers: HashMap<renet::ClientId, (u32, u32)>,
-    viewer_windows: HashMap<u64, ViewerWindow>,
-    /// True while the 1-second stream-stats timer is scheduled. Prevents
-    /// starting a second timer on every share start.
-    stream_stats_timer_active: Arc<AtomicBool>,
+    /// Active screen sharers: `client_id` → (width, height).
+    active_sharers: HashMap<u64, (u32, u32)>,
+    /// Sharer display order for the roster projection.
+    sharer_ids: HashSet<u64>,
 
-    // UI
-    splash_window: Option<window::Window>,
-    update_window: Option<window::Window>,
-    /// The single application window. Hosts a Wizard with two views:
-    /// the connect form and the main (sidebar + chat) screen.
-    main_window: Option<window::Window>,
-    wizard: Option<group::Wizard>,
-    connect_view: Option<group::Group>,
-    /// Container for the main screen; content is rebuilt per connection.
-    main_view: Option<group::Group>,
-    sidebar: Option<Sidebar>,
-    chat: Option<Chat>,
-    error_frame: Option<frame::Frame>,
-    /// "Saved device isn't connected" notice on the connect view.
-    device_warning: Option<frame::Frame>,
-    settings_window_open: bool,
-    hotkeys: Option<HotkeyManager>,
-    tray_icon: Option<TrayIcon<UiMessage>>,
-    sentinel_window: Option<window::Window>,
+    // Chat
+    history: ChatHistory,
+    chat_model: Rc<VecModel<ChatRow>>,
+    /// Image bytes per chat row-id (save / viewer / GIF replay).
+    pub images: HashMap<i32, media::ImageEntry>,
+    gifs: HashMap<i32, GifPlayer>,
+    /// Pending outgoing image awaiting Send/Cancel in the preview.
+    pending_preview: Option<Vec<u8>>,
+
+    // Roster
+    users_model: Rc<VecModel<UserRow>>,
+
+    // Windows
+    pub main: MainWindow,
+    pub settings_win: Option<ui::SettingsWindow>,
+    viewers: HashMap<u64, Viewer>,
+    /// Image-viewer overlay: the chat row shown, and GIF playback
+    /// state while that row is an animated GIF.
+    pub gallery_row: Option<i32>,
+    pub gallery_gif: Option<crate::viewers::GalleryGif>,
+
+    // Update flow
+    update_version: Option<String>,
+    update_zip_path: Option<String>,
+    download_cancelled: Arc<AtomicBool>,
 
     // Device hot-reload polling
     last_input_devices: Vec<(String, bool)>,
@@ -104,230 +133,555 @@ pub struct App {
     sys: sysinfo::System,
     /// `None` if the OS refused to identify our own process.
     pid: Option<sysinfo::Pid>,
+
+    hotkeys: Option<HotkeyManager>,
+    pub keybind_recording: Option<usize>,
+
+    // Timers — held so they keep firing.
+    timers: Vec<slint::Timer>,
+    error_timer: slint::Timer,
+    stream_stats_timer_active: Arc<AtomicBool>,
+    pub meter_timer: slint::Timer,
+    /// The single animation ticker driving every playing GIF (chat
+    /// rows + the viewer overlay). Runs only while something plays.
+    gif_ticker: slint::Timer,
 }
 
-impl App {
-    pub fn new() -> Self {
-        let app = app::App::default();
-        theme::apply();
+/// Spawn the three worker threads. Network needs `voice_tx/screen_tx` to
+/// route hot-path packets, so channels are created up front. The wake
+/// callback is how workers nudge the Slint loop — the only reference
+/// to the wake mechanism they ever get.
+fn spawn_workers(
+    is_testing_mic_shared: &Arc<AtomicBool>,
+) -> (VoiceThreadHandle, ScreenThreadHandle, NetworkThreadHandle) {
+    let wake_fn: client::voice::WakeFn = Arc::new(wake);
+    let (network_tx, network_control_rx) = crossbeam_channel::bounded::<NetworkControl>(256);
+    let (network_msg_tx, network_msg_rx) = crossbeam_channel::bounded::<NetworkMessage>(256);
 
-        let (sender, receiver) = app::channel::<UiMessage>();
+    let voice = VoiceThreadHandle::spawn(
+        network_tx.clone(),
+        is_testing_mic_shared.clone(),
+        wake_fn.clone(),
+    );
+    let screen = ScreenThreadHandle::spawn(
+        network_tx.clone(),
+        wake_fn.clone(),
+        voice.shared.output_level.clone(),
+    );
+    let network = NetworkThreadHandle::spawn(
+        network_tx,
+        network_control_rx,
+        network_msg_tx,
+        network_msg_rx,
+        voice.tx.clone(),
+        screen.tx.clone(),
+        wake_fn,
+    );
+    (voice, screen, network)
+}
 
-        let is_testing_mic_shared = Arc::new(AtomicBool::new(false));
+/// Build everything and run the event loop until quit.
+pub fn run() {
+    let is_testing_mic_shared = Arc::new(AtomicBool::new(false));
+    let (voice, screen, network) = spawn_workers(&is_testing_mic_shared);
 
-        // Wake callback — worker threads call this to nudge the FLTK event loop.
-        // This is the ONLY place fltk::app::awake is referenced for worker threads.
-        let wake: client::voice::WakeFn = Arc::new(fltk::app::awake);
+    let settings = Settings::load();
 
-        // Spawn threads via their handles.
-        // Network needs voice_tx to route incoming voice packets,
-        // so we use spawn_with_channels to share the sender.
-        let (network_tx, network_control_rx) = crossbeam_channel::bounded::<NetworkControl>(256);
-        let (network_msg_tx, network_msg_rx) = crossbeam_channel::bounded::<NetworkMessage>(256);
+    // Localize before any UI is built. None = follow the OS locale.
+    i18n::init(settings.language.as_deref());
 
-        let voice = VoiceThreadHandle::spawn(
-            network_tx.clone(),
-            is_testing_mic_shared.clone(),
-            wake.clone(),
-        );
+    let main = MainWindow::new().expect("failed to create the main window");
 
-        // After spawning voice, before spawning network:
-        let screen = ScreenThreadHandle::spawn(
-            network_tx.clone(),
-            wake.clone(),
-            voice.shared.output_level.clone(),
-        );
-
-        let network = NetworkThreadHandle::spawn(
-            network_tx,
-            network_control_rx,
-            network_msg_tx,
-            network_msg_rx,
-            voice.tx.clone(),
-            screen.tx.clone(),
-            wake,
-        );
-
-        let settings = Settings::load();
-
-        // Localize before any UI is built. None = follow the OS locale.
-        i18n::init(settings.language.as_deref());
-
-        Self {
-            app,
-            sender,
-            receiver,
-            network,
-            voice,
-            screen,
-            users: HashMap::new(),
-            our_client_id: None,
-            connected: false,
-            settings,
-            is_muted: false,
-            is_deafened: false,
-            is_testing_mic: false,
-            is_testing_mic_shared,
-            active_sharers: HashMap::new(),
-            viewer_windows: HashMap::new(),
-            stream_stats_timer_active: Arc::new(AtomicBool::new(false)),
-            splash_window: None,
-            update_window: None,
-            main_window: None,
-            wizard: None,
-            connect_view: None,
-            main_view: None,
-            sidebar: None,
-            chat: None,
-            error_frame: None,
-            device_warning: None,
-            settings_window_open: false,
-            hotkeys: None,
-            tray_icon: None,
-            sentinel_window: None,
-            last_input_devices: Vec::new(),
-            last_output_devices: Vec::new(),
-            frames_coalesced: 0,
-            sys: sysinfo::System::new(),
-            pid: sysinfo::get_current_pid().ok(),
+    // Saved geometry (falls back to the window's preferred size,
+    // centered by the WM).
+    // Saved px dimensions; i32→f32 precision is irrelevant at window
+    // scale.
+    #[allow(clippy::cast_precision_loss)]
+    {
+        main.window().set_size(slint::LogicalSize::new(
+            settings.window.width.max(500) as f32,
+            settings.window.height.max(400) as f32,
+        ));
+        if let (Some(x), Some(y)) = (settings.window.x, settings.window.y) {
+            main.window()
+                .set_position(slint::LogicalPosition::new(x as f32, y as f32));
         }
     }
 
-    pub fn run(&mut self) {
+    let chat_model = Rc::new(VecModel::<ChatRow>::default());
+    let users_model = Rc::new(VecModel::<UserRow>::default());
+    main.global::<State>()
+        .set_chat(ModelRc::from(chat_model.clone()));
+    main.global::<State>()
+        .set_users(ModelRc::from(users_model.clone()));
+
+    // The emoji palette — straight from the shared catalog.
+    let emoji_rows: Vec<ui::EmojiRow> = app_core::EMOJI
+        .iter()
+        .map(|(_, glyph, section)| ui::EmojiRow {
+            glyph: (*glyph).into(),
+            section: (*section).into(),
+        })
+        .collect();
+    main.global::<State>()
+        .set_emoji(ModelRc::new(VecModel::from(emoji_rows)));
+
+    let state = Rc::new(RefCell::new(AppState {
+        network,
+        voice,
+        screen,
+        users: HashMap::new(),
+        our_client_id: None,
+        connected: false,
+        settings,
+        is_muted: false,
+        is_deafened: false,
+        is_testing_mic: false,
+        is_testing_mic_shared,
+        active_sharers: HashMap::new(),
+        sharer_ids: HashSet::new(),
+        history: ChatHistory::new(),
+        chat_model,
+        images: HashMap::new(),
+        gifs: HashMap::new(),
+        pending_preview: None,
+        users_model,
+        main,
+        settings_win: None,
+        viewers: HashMap::new(),
+        gallery_row: None,
+        gallery_gif: None,
+        update_version: None,
+        update_zip_path: None,
+        download_cancelled: Arc::new(AtomicBool::new(false)),
+        last_input_devices: Vec::new(),
+        last_output_devices: Vec::new(),
+        frames_coalesced: 0,
+        sys: sysinfo::System::new(),
+        pid: sysinfo::get_current_pid().ok(),
+        hotkeys: None,
+        keybind_recording: None,
+        timers: Vec::new(),
+        error_timer: slint::Timer::default(),
+        stream_stats_timer_active: Arc::new(AtomicBool::new(false)),
+        meter_timer: slint::Timer::default(),
+        gif_ticker: slint::Timer::default(),
+    }));
+
+    APP.with(|a| *a.borrow_mut() = Some(state.clone()));
+
+    {
+        let mut st = state.borrow_mut();
+
         // Register global hotkeys on the main thread (required by the OS).
-        self.hotkeys = Some(HotkeyManager::new(&self.settings));
+        st.hotkeys = Some(HotkeyManager::new(&st.settings, Arc::new(wake)));
 
-        let handles = crate::ui::splash::show(self.sender);
-        self.splash_window = Some(handles.window);
+        st.push_tr();
+        st.push_connect_fields();
+        st.main.global::<State>().set_phase(Phase::Splash);
 
-        // Seed the initial device snapshot so the first poll has something to diff against.
-        self.last_input_devices = audio::VoiceChat::list_input_devices().unwrap_or_default();
-        self.last_output_devices = audio::VoiceChat::list_output_devices().unwrap_or_default();
+        // Seed the initial device snapshot so the first poll has
+        // something to diff against.
+        st.last_input_devices = audio::VoiceChat::list_input_devices().unwrap_or_default();
+        st.last_output_devices = audio::VoiceChat::list_output_devices().unwrap_or_default();
+        st.refresh_device_warning();
+    }
 
-        // Start a repeating timer that polls for device changes every 2.5 s.
-        // The callback just enumerates devices and, if changed, sends a
-        // UiMessage so all the diffing logic stays in handle_ui_message.
-        let device_sender = self.sender;
-        app::add_timeout3(2.5, move |handle| {
+    wire_logic(&state);
+    start_timers(&state);
+    crate::updater::spawn_version_check();
+
+    state.borrow().main.show().expect("failed to show the main window");
+
+    // The loop keeps running while every window is hidden (tray) —
+    // the FLTK build needed an off-screen sentinel window for this.
+    slint::run_event_loop_until_quit().expect("event loop failed");
+
+    // Loop exited (quit_event_loop called). Clean shutdown.
+    let st = state;
+    APP.with(|a| a.borrow_mut().take());
+    st.borrow_mut().shutdown();
+}
+
+// ── Callback wiring ─────────────────────────────────────────────────────
+
+/// Convenience: run `f` with a `&mut AppState` if the app still exists.
+fn with_app(weak: &Weak<RefCell<AppState>>, f: impl FnOnce(&mut AppState)) {
+    if let Some(rc) = weak.upgrade() {
+        f(&mut rc.borrow_mut());
+    }
+}
+
+/// Run `f` against the live app (UI thread only). No-op after shutdown.
+pub fn with_current(f: impl FnOnce(&mut AppState)) {
+    let app = APP.with(|a| a.borrow().clone());
+    if let Some(app) = app {
+        f(&mut app.borrow_mut());
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn wire_logic(state: &Rc<RefCell<AppState>>) {
+    let st = state.borrow();
+    let logic = st.main.global::<Logic>();
+
+    // ── Connect view ────────────────────────────────────────────
+    let w = Rc::downgrade(state);
+    logic.on_connect_clicked(move || {
+        with_app(&w, |app| {
+            let s = app.main.global::<State>();
+            let nickname = s.get_nickname().to_string();
+            let password = s.get_password().to_string();
+            if nickname.trim().is_empty() {
+                app.show_error(&t!("error-nickname-empty"));
+            } else {
+                app.handle_connect(&nickname, &password);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_open_settings(move || {
+        with_app(&w, crate::settingsui::open);
+    });
+    logic.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+
+    // ── Sidebar ─────────────────────────────────────────────────
+    let w = Rc::downgrade(state);
+    logic.on_toggle_mute(move || with_app(&w, AppState::handle_toggle_mute));
+    let w = Rc::downgrade(state);
+    logic.on_toggle_deafen(move || with_app(&w, AppState::handle_toggle_deafen));
+    let w = Rc::downgrade(state);
+    logic.on_toggle_share(move || with_app(&w, AppState::handle_toggle_screenshare));
+    let w = Rc::downgrade(state);
+    logic.on_disconnect(move || with_app(&w, AppState::handle_disconnect));
+
+    let w = Rc::downgrade(state);
+    logic.on_user_menu(move |index| {
+        with_app(&w, |app| app.open_user_popup(index));
+    });
+    let w = Rc::downgrade(state);
+    logic.on_popup_set_volume(move |index, volume| {
+        with_app(&w, |app| {
+            if let Some(id) = app.user_id_at(index) {
+                let username = app.username_of(id);
+                app.handle_set_user_volume(id, &username, volume);
+                app.main.global::<State>().set_user_popup_open(false);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_popup_toggle_mute(move |index| {
+        with_app(&w, |app| {
+            if let Some(id) = app.user_id_at(index) {
+                let username = app.username_of(id);
+                let muted = app
+                    .users
+                    .get(&id)
+                    .is_some_and(|u| u.audio.is_muted);
+                app.handle_mute_user(id, &username, !muted);
+                app.main.global::<State>().set_user_popup_open(false);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_popup_reset_audio(move |index| {
+        with_app(&w, |app| {
+            if let Some(id) = app.user_id_at(index) {
+                let username = app.username_of(id);
+                app.handle_reset_peer_audio(id, &username);
+                app.main.global::<State>().set_user_popup_open(false);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_popup_watch(move |index| {
+        with_app(&w, |app| {
+            if let Some(id) = app.user_id_at(index) {
+                app.handle_watch_peer(id);
+                app.main.global::<State>().set_user_popup_open(false);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_popup_closed(move || {
+        with_app(&w, |app| {
+            app.main.global::<State>().set_user_popup_open(false);
+        });
+    });
+
+    // ── Chat ────────────────────────────────────────────────────
+    let w = Rc::downgrade(state);
+    logic.on_send_message(move || with_app(&w, AppState::send_current_message));
+    let w = Rc::downgrade(state);
+    logic.on_draft_edited(move || {
+        with_app(&w, |app| {
+            // Enforce the character cap host-side (chars, not bytes —
+            // FLTK's maximum_size counted UTF-8 characters too) and
+            // scrub control chars the moment they appear.
+            let s = app.main.global::<State>();
+            let draft = s.get_draft().to_string();
+            let cleaned = app_core::chat::scrub_control_chars(&draft);
+            let capped: String = cleaned
+                .chars()
+                .take(app_core::chat::MAX_MESSAGE_CHARS)
+                .collect();
+            if capped != draft {
+                s.set_draft(capped.into());
+            }
+        });
+    });
+    logic.on_attach_image(|| {
+        media::attach_image_from_disk();
+    });
+    let w = Rc::downgrade(state);
+    logic.on_emoji_picked(move |glyph| {
+        with_app(&w, |app| {
+            let s = app.main.global::<State>();
+            let mut draft = s.get_draft().to_string();
+            draft.push_str(glyph.as_str());
+            s.set_draft(draft.into());
+            app.main.invoke_focus_composer();
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_paste_rich(move || {
+        with_app(&w, media::paste_into_chat);
+    });
+    logic.on_link_clicked(|url| {
+        if let Err(e) = open::that_detached(url.as_str()) {
+            warn!("Failed to open link: {e}");
+        }
+    });
+    logic.on_copy_text(|text| {
+        crate::clipboard::set_clipboard_text(text.as_str());
+    });
+    let w = Rc::downgrade(state);
+    logic.on_row_save_image(move |row_id| {
+        with_app(&w, |app| media::save_image_dialog(app, row_id));
+    });
+    let w = Rc::downgrade(state);
+    logic.on_row_open_image(move |row_id| {
+        with_app(&w, |app| crate::viewers::open_gallery(app, row_id));
+    });
+    let w = Rc::downgrade(state);
+    logic.on_viewer_step(move |dir| {
+        with_app(&w, |app| crate::viewers::step_gallery(app, dir));
+    });
+    let w = Rc::downgrade(state);
+    logic.on_viewer_save(move || {
+        with_app(&w, |app| {
+            if let Some(id) = app.gallery_row {
+                media::save_image_dialog(app, id);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_viewer_close(move || {
+        with_app(&w, crate::viewers::close_gallery);
+    });
+    let w = Rc::downgrade(state);
+    logic.on_gif_hover(move |row_id, entering| {
+        with_app(&w, |app| app.gif_hover(row_id, entering));
+    });
+
+    // ── Image preview overlay ───────────────────────────────────
+    let w = Rc::downgrade(state);
+    logic.on_preview_send(move || {
+        with_app(&w, |app| {
+            if let Some(png) = app.pending_preview.take() {
+                // Same broadcast semantics as SendMessage: the server
+                // relays ImageMessage back to everyone (sender
+                // included), so no local echo is needed here.
+                app.network.tx.send(NetworkControl::SendImage(png)).ok();
+            }
+            app.main.global::<State>().set_preview_open(false);
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_preview_cancel(move || {
+        with_app(&w, |app| {
+            app.pending_preview = None;
+            app.main.global::<State>().set_preview_open(false);
+        });
+    });
+
+    // ── Screen share dialog ─────────────────────────────────────
+    let w = Rc::downgrade(state);
+    logic.on_start_share(move |monitor_index, quality_index| {
+        with_app(&w, |app| {
+            let quality = usize::try_from(quality_index)
+                .ok()
+                .and_then(|i| video::Quality::ALL.get(i))
+                .copied()
+                .unwrap_or(video::Quality::FHD30);
+            app.screen
+                .tx
+                .send(ScreenControl::StartSharing {
+                    quality,
+                    monitor_index: usize::try_from(monitor_index).unwrap_or(0),
+                })
+                .ok();
+        });
+    });
+
+    // ── Update flow ─────────────────────────────────────────────
+    let w = Rc::downgrade(state);
+    logic.on_update_now(move || {
+        with_app(&w, crate::updater::start_download);
+    });
+    let w = Rc::downgrade(state);
+    logic.on_update_skip(move || {
+        with_app(&w, AppState::show_connect_phase);
+    });
+    let w = Rc::downgrade(state);
+    logic.on_update_cancel(move || {
+        with_app(&w, |app| {
+            app.download_cancelled.store(true, Ordering::Relaxed);
+            app.show_connect_phase();
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_update_install(move || {
+        with_app(&w, |app| {
+            if let Some(path) = app.update_zip_path.clone()
+                && let Err(e) = crate::updater::extract_and_install(&path) {
+                    app.show_error(&e);
+                }
+        });
+    });
+
+    drop(st);
+
+    // OS close button on the main window. App decides what it means:
+    // hide when connected (tray keeps the process reachable), quit from
+    // the connect view.
+    let w = Rc::downgrade(state);
+    let main = state.borrow().main.clone_strong();
+    main.window().on_close_requested(move || {
+        let mut response = slint::CloseRequestResponse::HideWindow;
+        with_app(&w, |app| {
+            if app.connected && cfg!(feature = "tray") {
+                response = slint::CloseRequestResponse::HideWindow;
+            } else {
+                app.save_window_geometry();
+                response = slint::CloseRequestResponse::HideWindow;
+                let _ = slint::quit_event_loop();
+            }
+        });
+        response
+    });
+}
+
+// ── Timers ──────────────────────────────────────────────────────────────
+
+fn start_timers(state: &Rc<RefCell<AppState>>) {
+    let mut timers = Vec::new();
+
+    // Device poll — 2.5 s. Enumeration is cheap; all diffing logic
+    // lives in app-core's reducer.
+    let w = Rc::downgrade(state);
+    let t = slint::Timer::default();
+    t.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(2500),
+        move || {
             let input = audio::VoiceChat::list_input_devices().unwrap_or_default();
             let output = audio::VoiceChat::list_output_devices().unwrap_or_default();
-            device_sender.send(UiMessage::DevicesChanged {
-                input_devices: input,
-                output_devices: output,
-            });
-            app::repeat_timeout3(2.5, handle);
-        });
+            with_app(&w, |app| app.handle_devices_changed(input, output));
+        },
+    );
+    timers.push(t);
 
-        // Resource sampler — 2 s cadence, matching NetworkStats. The
-        // handler skips the sampling (and the label update) entirely
-        // while the sidebar isn't on screen — hidden to the tray,
-        // minimized, or on the connect view — so the idle cost is one
-        // no-op message per tick.
-        let resource_sender = self.sender;
-        app::add_timeout3(2.0, move |handle| {
-            resource_sender.send(UiMessage::SampleResources);
-            app::repeat_timeout3(2.0, handle);
-        });
+    // Resource sampler — 2 s cadence, matching NetworkStats. The
+    // handler skips the sampling entirely while the main screen isn't
+    // on screen (tray/minimized/connect view) so the idle cost is one
+    // no-op closure per tick.
+    let w = Rc::downgrade(state);
+    let t = slint::Timer::default();
+    t.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(2000),
+        move || {
+            with_app(&w, AppState::sample_resources);
+        },
+    );
+    timers.push(t);
 
-        // Reused across loop iterations (drained each pass) so the map
-        // isn't reallocated on every event-loop wakeup.
-        let mut latest_frames: HashMap<u64, ScreenEvent> = HashMap::new();
+    state.borrow_mut().timers = timers;
+}
 
-        while self.app.wait() {
-            // UI messages
-            while let Some(msg) = self.receiver.recv() {
-                self.handle_ui_message(msg);
+// ── The drain (worker → UI) ─────────────────────────────────────────────
+
+impl AppState {
+    /// Drain every worker channel. Bounded like the FLTK loop was, and
+    /// `FrameReady` is coalesced per stream: if frames queued while the
+    /// UI thread was busy, blitting each stale frame just replays the
+    /// past — show the newest, skip the rest.
+    fn drain(app: &Rc<RefCell<AppState>>) {
+        let mut st = app.borrow_mut();
+
+        // Global hotkeys — collect first, then handle.
+        let mut hotkey_actions = Vec::new();
+        if let Some(hotkeys) = &st.hotkeys {
+            while let Some(action) = hotkeys.poll() {
+                hotkey_actions.push(action);
             }
-
-            // Global hotkeys — collect first, then handle (avoids borrow conflict)
-            let mut hotkey_actions = Vec::new();
-            if let Some(ref hotkeys) = self.hotkeys {
-                while let Some(action) = hotkeys.poll() {
-                    hotkey_actions.push(action);
-                }
+        }
+        for action in hotkey_actions {
+            if !st.connected {
+                continue;
             }
-            for action in hotkey_actions {
-                if !self.connected {
-                    continue;
-                }
-                match action {
-                    BindableAction::ToggleMute => self.handle_toggle_mute(),
-                    BindableAction::ToggleDeafen => self.handle_toggle_deafen(),
-                    BindableAction::ToggleScreenShare => self.handle_toggle_screenshare(),
-                    BindableAction::PushToTalk => {}
-                }
-            }
-
-            // Network messages (bounded drain)
-            let mut needs_redraw = false;
-            for _ in 0..256 {
-                match self.network.msg_rx.try_recv() {
-                    Ok(msg) => {
-                        self.handle_network_message(msg);
-                        needs_redraw = true;
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            // Voice events (bounded drain)
-            for _ in 0..32 {
-                match self.voice.event_rx.try_recv() {
-                    Ok(evt) => {
-                        self.handle_voice_event(evt);
-                        needs_redraw = true;
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            // Screen events (bounded drain). FrameReady is coalesced per
-            // stream: if frames queued while the UI thread was busy (a
-            // window drag blocks FLTK's loop for hundreds of ms), blitting
-            // each stale frame just replays the past — show the newest,
-            // skip the rest.
-            for _ in 0..64 {
-                match self.screen.event_rx.try_recv() {
-                    Ok(evt @ ScreenEvent::FrameReady { .. }) => {
-                        if let ScreenEvent::FrameReady { client_id, .. } = &evt {
-                            if latest_frames.insert(*client_id, evt).is_some() {
-                                // A newer frame displaced an unrendered one
-                                // this pass — the only case coalescing
-                                // actually skips anything.
-                                self.frames_coalesced += 1;
-                                if self.frames_coalesced % 60 == 0 {
-                                    log::warn!(
-                                        "📊 UI coalescing has skipped {} frames — main thread slower than stream",
-                                        self.frames_coalesced
-                                    );
-                                }
-                            }
-                        }
-                        needs_redraw = true;
-                    }
-                    Ok(evt) => {
-                        self.handle_screen_event(evt);
-                        needs_redraw = true;
-                    }
-                    Err(_) => break,
-                }
-            }
-            for (_, evt) in latest_frames.drain() {
-                self.handle_screen_event(evt);
-            }
-
-            if needs_redraw {
-                app::redraw();
+            match action {
+                BindableAction::ToggleMute => st.handle_toggle_mute(),
+                BindableAction::ToggleDeafen => st.handle_toggle_deafen(),
+                BindableAction::ToggleScreenShare => st.handle_toggle_screenshare(),
+                BindableAction::PushToTalk => {}
             }
         }
 
-        // FLTK loop exited (all windows closed or app.quit() called).
-        self.shutdown();
+        for _ in 0..256 {
+            match st.network.msg_rx.try_recv() {
+                Ok(msg) => st.handle_network_message(msg),
+                Err(_) => break,
+            }
+        }
+
+        for _ in 0..32 {
+            match st.voice.event_rx.try_recv() {
+                Ok(evt) => st.handle_voice_event(evt),
+                Err(_) => break,
+            }
+        }
+
+        let mut latest_frames: HashMap<u64, ScreenEvent> = HashMap::new();
+        for _ in 0..64 {
+            match st.screen.event_rx.try_recv() {
+                Ok(evt @ ScreenEvent::FrameReady { .. }) => {
+                    if let ScreenEvent::FrameReady { client_id, .. } = &evt
+                        && latest_frames.insert(*client_id, evt).is_some() {
+                            st.frames_coalesced += 1;
+                            if st.frames_coalesced.is_multiple_of(60) {
+                                warn!(
+                                    "📊 UI coalescing has skipped {} frames — main thread slower than stream",
+                                    st.frames_coalesced
+                                );
+                            }
+                        }
+                }
+                Ok(evt) => st.handle_screen_event(evt),
+                Err(_) => break,
+            }
+        }
+        for (_, evt) in latest_frames.drain() {
+            st.handle_screen_event(evt);
+        }
     }
 
-    // ════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════
     //  EVENT HANDLERS
-    // ════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════
 
     fn handle_voice_event(&mut self, evt: VoiceEvent) {
         match evt {
@@ -337,9 +691,7 @@ impl App {
                 // ding is sent from handle_init_client instead.
                 info!("Voice engine ready");
             }
-            VoiceEvent::Error(e) => {
-                self.show_error(&e);
-            }
+            VoiceEvent::Error(e) => self.show_error(&e),
             VoiceEvent::SpeakingChanged(speaking) => {
                 if let Some(id) = self.our_client_id
                     && let Some(user) = self.users.get_mut(&id)
@@ -351,46 +703,53 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_screen_event(&mut self, evt: ScreenEvent) {
         match evt {
             ScreenEvent::SharingStarted { quality } => {
                 info!("📺 Screen share started: {quality}");
-                if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(
-                        t!("chat-share-started", "quality" => quality.to_string()),
-                    );
-                }
-                if let Some(sidebar) = &mut self.sidebar {
-                    sidebar.set_share_state(true);
-                }
+                self.push_chat_system(&t!("chat-share-started", "quality" => quality.to_string()));
+                self.main.global::<State>().set_sharing(true);
                 // Start the 1-second stream stats timer once. It stops
-                // itself when sharing ends; the guard prevents stacking a
-                // new repeating timer on every share start.
+                // itself when sharing ends; the guard prevents stacking
+                // a new repeating timer on every share start.
                 if !self.stream_stats_timer_active.swap(true, Ordering::Relaxed) {
-                    let sender = self.sender;
                     let timer_active = self.stream_stats_timer_active.clone();
                     let is_sharing = self.screen.shared.is_sharing.clone();
-                    app::add_timeout3(1.0, move |handle| {
-                        if is_sharing.load(Ordering::Relaxed) {
-                            sender.send(UiMessage::UpdateStreamStats);
-                            app::repeat_timeout3(1.0, handle);
-                        } else {
-                            timer_active.store(false, Ordering::Relaxed);
-                        }
-                    });
+                    let t = slint::Timer::default();
+                    let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+                    if let Some(weak) = weak {
+                        t.start(
+                            slint::TimerMode::Repeated,
+                            Duration::from_secs(1),
+                            move || {
+                                if is_sharing.load(Ordering::Relaxed) {
+                                    with_app(&weak, AppState::update_stream_stats);
+                                } else {
+                                    timer_active.store(false, Ordering::Relaxed);
+                                    with_app(&weak, |app| {
+                                        // Timer removes itself by
+                                        // dropping out of the vec on
+                                        // the next share start.
+                                        app.main
+                                            .global::<State>()
+                                            .set_stream_stats("".into());
+                                    });
+                                }
+                            },
+                        );
+                        self.timers.push(t);
+                    }
                 }
             }
             ScreenEvent::SharingStopped => {
                 info!("📺 Screen share stopped");
-                if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(t!("chat-share-stopped"));
-                }
-                if let Some(sidebar) = &mut self.sidebar {
-                    sidebar.set_share_state(false);
-                    // Clear the stats line — it used to keep showing the
-                    // last sample after the share ended.
-                    sidebar.update_stream_stats(None);
-                }
+                self.push_chat_system(&t!("chat-share-stopped"));
+                let s = self.main.global::<State>();
+                s.set_sharing(false);
+                // Clear the stats line — it used to keep showing the
+                // last sample after the share ended.
+                s.set_stream_stats("".into());
             }
             ScreenEvent::Error(e) => {
                 self.show_error(&t!("error-screen-share", "error" => e.as_str()));
@@ -416,22 +775,23 @@ impl App {
                     app_drain_at.duration_since(decoded_at).as_secs_f32() * 1000.0;
                 let total_ms = app_drain_at.duration_since(enqueued_at).as_secs_f32() * 1000.0;
                 let frame_type = if is_keyframe { "K" } else { "P" };
+                #[allow(clippy::cast_precision_loss)] // KB for a log line
+                let frame_kb = frame_bytes as f64 / 1024.0;
                 log::debug!(
-                    "📊 [seq={seq} {frame_type} {:.0}KB] net→decode: {net_to_screen_ms:.1}ms | \
+                    "📊 [seq={seq} {frame_type} {frame_kb:.0}KB] net→decode: {net_to_screen_ms:.1}ms | \
         decode→app: {screen_to_app_ms:.1}ms | total: {total_ms:.1}ms | \
         buf: {buffer_depth_ms:.0}/{buffer_target_ms:.0}ms jit: {buffer_jitter_ms:.0}ms",
-                    frame_bytes as f64 / 1024.0,
                 );
                 if total_ms > 25.0 {
-                    log::warn!(
+                    warn!(
                         "📊 SLOW FRAME seq={seq}: {total_ms:.1}ms total \
             (net→decode: {net_to_screen_ms:.1}ms, decode→app: {screen_to_app_ms:.1}ms)"
                     );
                 }
-                if let Some(viewer) = self.viewer_windows.get_mut(&client_id) {
+                if let Some(viewer) = self.viewers.get_mut(&client_id) {
                     let blit_start = Instant::now();
                     viewer.update_frame(
-                        rgba,
+                        &rgba,
                         width,
                         height,
                         frame_bytes,
@@ -441,7 +801,7 @@ impl App {
                     );
                     let blit_ms = blit_start.elapsed().as_secs_f32() * 1000.0;
                     if blit_ms > 5.0 {
-                        log::warn!("📊 Slow blit: {blit_ms:.1}ms for seq {seq}");
+                        warn!("📊 Slow blit: {blit_ms:.1}ms for seq {seq}");
                     }
                 }
             }
@@ -450,46 +810,37 @@ impl App {
                 width,
                 height,
             } => {
-                let username = self.get_username(client_id);
+                let username = self.username_of(client_id);
                 info!("📺 {username} started sharing ({width}x{height})");
-                if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(
-                        t!("chat-peer-sharing", "name" => username.as_str()),
-                    );
-                }
+                self.push_chat_system(&t!("chat-peer-sharing", "name" => username.as_str()));
             }
             ScreenEvent::PeerStoppedSharing { client_id } => {
-                let username = self.get_username(client_id);
+                let username = self.username_of(client_id);
                 info!("📺 {username} stopped sharing");
-                if let Some(chat) = &mut self.chat {
-                    chat.handle_system_message(
-                        t!("chat-peer-stopped-sharing", "name" => username.as_str()),
-                    );
-                }
-                // Close viewer window if open
-                if let Some(mut viewer) = self.viewer_windows.remove(&client_id) {
+                self.push_chat_system(&t!("chat-peer-stopped-sharing", "name" => username.as_str()));
+                if let Some(viewer) = self.viewers.remove(&client_id) {
                     viewer.close();
                 }
             }
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_network_message(&mut self, msg: NetworkMessage) {
         match msg {
             NetworkMessage::Connected => {
-                self.handle_connection_established();
+                self.connected = true;
+                self.main.global::<State>().set_error_text("".into());
             }
             NetworkMessage::Disconnected(reason) => {
                 if self.connected {
-                    self.handle_disconnect_event(&reason);
+                    self.push_chat_system(&t!("chat-disconnected", "reason" => reason.as_str()));
+                    self.teardown_connection();
+                    self.show_connect_phase();
+                    self.show_error(&reason);
                 } else {
                     self.show_error(&reason);
                 }
-            }
-            NetworkMessage::SystemAudioData { .. } => {
-                // System audio packets are routed directly to the screen
-                // thread by the network loop (hot path). They should never
-                // arrive here, but if they do we silently ignore them.
             }
             NetworkMessage::InitClient {
                 users,
@@ -497,33 +848,38 @@ impl App {
                 server_name,
                 greeting,
             } => {
-                self.handle_init_client(client_id, users, server_name, greeting);
+                self.handle_init_client(client_id, &users, &server_name, &greeting);
             }
             NetworkMessage::UserJoined {
                 client_id,
                 username,
-            } => {
-                self.handle_user_joined(client_id, username);
-            }
+            } => self.handle_user_joined(client_id, username),
             NetworkMessage::UserLeft {
                 client_id,
                 username,
-            } => {
-                self.handle_user_left(client_id, username);
-            }
+            } => self.handle_user_left(client_id, &username),
             NetworkMessage::TextMessage { username, text } => {
-                if let Some(chat) = &mut self.chat {
-                    chat.handle_text_message(username, text);
-                }
+                let timestamp = chrono::Local::now().format("%H:%M").to_string();
+                // Render shortcodes from clients that send them raw.
+                let text = app_core::emoji::replace_shortcodes(&text);
+                self.push_chat_message(&timestamp, &username, &text);
             }
             NetworkMessage::UploadProgress { pct } => {
-                if let Some(chat) = &mut self.chat {
-                    chat.set_upload_progress(pct);
+                let s = self.main.global::<State>();
+                if pct >= 100 {
+                    s.set_upload_line("".into());
+                } else {
+                    s.set_upload_line(
+                        t!("chat-upload-progress", "pct" => u32::from(pct)).into(),
+                    );
                 }
             }
             NetworkMessage::ImageMessage { username, data } => {
-                if let Some(chat) = &mut self.chat {
-                    chat.handle_image_message(username, data);
+                let timestamp = chrono::Local::now().format("%H:%M").to_string();
+                if !media::push_image_row(self, &timestamp, &username, data) {
+                    self.push_chat_system(
+                        &t!("chat-image-undisplayable", "name" => username.as_str()),
+                    );
                 }
             }
             NetworkMessage::UserSpeaking {
@@ -546,28 +902,24 @@ impl App {
                 }
                 self.update_user_list();
             }
-            NetworkMessage::VoiceData { .. } => {}
             NetworkMessage::NetworkStats {
                 rtt_ms,
                 loss_pct,
                 kbps_up,
                 kbps_down,
             } => {
-                // Skip the label churn when nobody can see it (window
-                // in the tray or minimized). Labels refresh at the next
-                // 2 s sample once visible again.
-                if let Some(sidebar) = &mut self.sidebar
-                    && sidebar.is_on_screen()
-                {
+                // Skip the label churn when nobody can see it (window in
+                // the tray or minimized). Labels refresh at the next 2 s
+                // sample once visible again.
+                if self.main_on_screen() {
                     let audio_ms = self.voice.shared.jitter_buffer_ms.load(Ordering::Relaxed);
-                    sidebar.update_latency(rtt_ms, loss_pct, Some(audio_ms), kbps_up, kbps_down);
+                    self.update_latency(rtt_ms, loss_pct, Some(audio_ms), kbps_up, kbps_down);
                 }
             }
             NetworkMessage::ShareDenied { reason } => {
-                // The screen thread starts capturing optimistically before
-                // the server answers — stop it so local state matches the
-                // server's (otherwise we encode into the void while the
-                // relay drops every chunk as not-sharing).
+                // The screen thread starts capturing optimistically
+                // before the server answers — stop it so local state
+                // matches the server's.
                 if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
                     self.screen.tx.send(ScreenControl::StopSharing).ok();
                 }
@@ -575,694 +927,99 @@ impl App {
             }
             NetworkMessage::SubscribeDenied { target_id, reason } => {
                 // Close the viewer window WatchPeer opened optimistically.
-                if let Some(mut viewer) = self.viewer_windows.remove(&target_id) {
+                if let Some(viewer) = self.viewers.remove(&target_id) {
                     viewer.close();
                 }
-                let username = self.get_username(target_id);
-                self.show_chat_system(&format!("Can't watch {username}: {}", reason.describe()));
+                let username = self.username_of(target_id);
+                self.push_chat_system(&format!(
+                    "Can't watch {username}: {}",
+                    reason.describe()
+                ));
             }
-            NetworkMessage::StreamHealth { .. } => {
-                // Routed straight to the screen thread by the network loop
-                // (drives fps adaptation). Never arrives here.
-            }
-
-            // ── Screen share signaling ──────────────────────────────
             NetworkMessage::ScreenShareStarted {
                 client_id,
                 width,
                 height,
             } => {
                 self.active_sharers.insert(client_id, (width, height));
-                self.sync_sharers_to_sidebar();
+                self.sharer_ids = self.active_sharers.keys().copied().collect();
+                self.update_user_list();
             }
             NetworkMessage::ScreenShareStopped { client_id } => {
                 self.active_sharers.remove(&client_id);
-                self.sync_sharers_to_sidebar();
+                self.sharer_ids = self.active_sharers.keys().copied().collect();
+                self.update_user_list();
             }
-            NetworkMessage::VideoFrame { .. } => {
-                // Video frames are routed directly to the screen thread by the
-                // network loop. They should never arrive here, but if they do
-                // we silently ignore them.
-            }
-            NetworkMessage::KeyframeRequested { .. } => {
-                // Keyframe requests are routed directly to the screen thread
-                // by the network loop (→ ScreenControl::ForceKeyframe). Like
-                // VideoFrame, they should never arrive here.
-            }
-        }
-    }
-    #[allow(clippy::too_many_lines)]
-    fn handle_ui_message(&mut self, msg: UiMessage) {
-        match msg {
-            UiMessage::StartScreenShare {
-                quality,
-                monitor_index,
-            } => {
-                self.screen
-                    .tx
-                    .send(ScreenControl::StartSharing {
-                        quality,
-                        monitor_index,
-                    })
-                    .ok();
-            }
-            // ── Screen share buttons ────────────────────────────────
-            UiMessage::ToggleScreenShare => {
-                if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                    self.screen.tx.send(ScreenControl::StopSharing).ok();
-                } else if let Some(ref main_win) = self.main_window {
-                    screenshare::show(self.sender, main_win);
-                }
-            }
-            UiMessage::RestoreFromTray => {
-                if let Some(w) = &mut self.main_window {
-                    w.show();
-                }
-            }
-            UiMessage::QuitFromTray => {
-                self.app.quit(); // triggers shutdown() after loop exits
-            }
-            #[allow(clippy::cast_precision_loss, clippy::similar_names)]
-            UiMessage::UpdateStreamStats => {
-                if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                    let sh = &self.screen.shared;
-                    let frame_bytes = sh.last_frame_bytes.load(Ordering::Relaxed);
-                    let encode_us = sh.last_encode_us.load(Ordering::Relaxed);
-                    let viewers = sh.stream_viewers.load(Ordering::Relaxed);
-                    let fps_scale_pct = sh.fps_scale_pct.load(Ordering::Relaxed);
-                    let loss_pct = f32::from_bits(sh.stream_loss_pct.load(Ordering::Relaxed));
-                    let quality_str = sh
-                        .current_quality
-                        .lock()
-                        .unwrap()
-                        .map(|q| q.to_string())
-                        .unwrap_or_else(|| t!("unknown"));
-                    if let Some(sidebar) = &mut self.sidebar
-                        && sidebar.is_on_screen()
-                    {
-                        sidebar.update_stream_stats(Some(&crate::ui::sidebar::StreamStats {
-                            quality: &quality_str,
-                            avg_frame_kb: frame_bytes as f32 / 1024.0,
-                            encode_ms: encode_us as f32 / 1000.0,
-                            viewers,
-                            fps_scale_pct,
-                            loss_pct,
-                        }));
-                    }
-                }
-            }
-            #[allow(clippy::cast_precision_loss)]
-            UiMessage::SampleResources => {
-                // Sample only when someone can actually see the result.
-                // The check comes first so a hidden/minimized app pays
-                // nothing — not even the process-table refresh.
-                if let Some(pid) = self.pid
-                    && self.sidebar.as_ref().is_some_and(Sidebar::is_on_screen)
-                {
-                    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
-                    self.sys.refresh_processes_specifics(
-                        ProcessesToUpdate::Some(&[pid]),
-                        false,
-                        ProcessRefreshKind::nothing().with_memory().with_cpu(),
-                    );
-                    if let Some(proc) = self.sys.process(pid) {
-                        // cpu_usage() is % of one core; normalize to %
-                        // of the whole machine (task-manager style).
-                        let cores = std::thread::available_parallelism()
-                            .map_or(1, std::num::NonZero::get)
-                            as f32;
-                        let cpu_pct = proc.cpu_usage() / cores;
-                        // Memory: the platform-native figure (what the
-                        // user's own task monitor shows — footprint on
-                        // macOS, private working set on Windows), with
-                        // sysinfo's RSS as the fallback. RSS counts
-                        // clean shared framework pages too and reads
-                        // 1.5–2× higher, which users mistake for a
-                        // leak when comparing against their monitor.
-                        let mem_bytes = crate::resources::native_monitor_memory()
-                            .unwrap_or_else(|| proc.memory());
-                        let mem_mb = mem_bytes as f64 / (1024.0 * 1024.0);
-                        if let Some(sidebar) = &mut self.sidebar {
-                            sidebar.update_resources(cpu_pct, mem_mb);
-                        }
-                    }
-                }
-            }
-            UiMessage::ShowChatNotice(text) => {
-                self.show_chat_system(&text);
-            }
-            UiMessage::WatchPeer { client_id } => {
-                let raw_id = client_id;
-                if self.viewer_windows.contains_key(&raw_id) {
-                    return;
-                }
-                let username = self.get_username(client_id);
-                // Open at the sharer's announced dimensions (from
-                // ScreenShareStarted) so a 1080p stream doesn't flash
-                // open as a 720p window before the first frame.
-                let (share_w, share_h) = self
-                    .active_sharers
-                    .get(&client_id)
-                    .copied()
-                    .unwrap_or((1280, 720));
-                let viewer = ViewerWindow::new(raw_id, &username, share_w, share_h, self.sender);
-                self.viewer_windows.insert(raw_id, viewer);
-                self.network
-                    .tx
-                    .send(NetworkControl::SubscribeScreen { target_id: raw_id })
-                    .ok();
-                self.show_chat_system(&t!("chat-watching", "name" => username.as_str()));
-            }
-            UiMessage::UnwatchPeer { client_id } => {
-                if let Some(mut viewer) = self.viewer_windows.remove(&client_id) {
-                    viewer.close();
-                }
-                self.network
-                    .tx
-                    .send(NetworkControl::UnsubscribeScreen {
-                        target_id: client_id,
-                    })
-                    .ok();
-                let username = self.get_username(client_id);
-                self.show_chat_system(&t!("chat-stopped-watching", "name" => username.as_str()));
-            }
-            UiMessage::SetServerAddress(addr) => {
-                self.settings.server.address = addr.trim().to_string();
-            }
-            UiMessage::SetServerTokenUrl(url) => {
-                self.settings.server.token_url = url;
-            }
-            UiMessage::SetStreamVolume { client_id, volume } => {
-                self.screen
-                    .tx
-                    .send(ScreenControl::SetStreamVolume { client_id, volume })
-                    .ok();
-            }
-            UiMessage::MuteStream { client_id, muted } => {
-                self.screen
-                    .tx
-                    .send(ScreenControl::MuteStream { client_id, muted })
-                    .ok();
-            }
-
-            UiMessage::Connect { nickname, password } => {
-                self.handle_connect(nickname, password);
-            }
-            UiMessage::Disconnect => {
-                self.handle_disconnect();
-            }
-            UiMessage::SendChatMessage(text) => {
-                self.network.tx.send(NetworkControl::SendMessage(text)).ok();
-            }
-            UiMessage::ImageUrlFetched(bytes) => {
-                crate::ui::chat::preview_fetched_image(bytes, self.sender);
-            }
-            UiMessage::CloseFloatingPopups => {
-                if let Some(chat) = &mut self.chat {
-                    chat.close_popups();
-                }
-                if let Some(sidebar) = &mut self.sidebar {
-                    sidebar.close_audio_popup();
-                }
-            }
-            UiMessage::SendChatImage(data) => {
-                // Same broadcast semantics as SendMessage: the server
-                // relays ImageMessage back to everyone (sender included),
-                // so no local echo is needed here.
-                self.network.tx.send(NetworkControl::SendImage(data)).ok();
-            }
-            UiMessage::ToggleMute => {
-                self.handle_toggle_mute();
-            }
-            UiMessage::ToggleDeafen => {
-                self.handle_toggle_deafen();
-            }
-            UiMessage::TestMicrophone(enabled) => {
-                self.handle_test_microphone(enabled);
-            }
-            UiMessage::SetGateThreshold(t) => {
-                self.settings.audio.gate_threshold = t;
-                self.voice.tx.send(VoiceControl::SetGateThreshold(t)).ok();
-            }
-            UiMessage::SetInputGain(g) => {
-                self.settings.audio.input.gain = g;
-                self.voice.tx.send(VoiceControl::SetInputGain(g)).ok();
-            }
-            UiMessage::SetOutputGain(g) => {
-                self.settings.audio.output.gain = g;
-                self.voice.tx.send(VoiceControl::SetOutputGain(g)).ok();
-            }
-            UiMessage::MuteUser {
-                client_id,
-                username,
-                muted,
-            } => {
-                self.handle_mute_user(client_id, username, muted);
-            }
-            UiMessage::SetUserVolume {
-                client_id,
-                username,
-                volume,
-            } => {
-                self.handle_set_user_volume(client_id, username, volume);
-            }
-            UiMessage::ResetUserAudio {
-                client_id,
-                username,
-            } => {
-                self.handle_reset_peer_audio(client_id, username);
-            }
-            UiMessage::OpenSettings => {
-                if !self.settings_window_open {
-                    self.settings_window_open = true;
-                    self.show_settings_window();
-                }
-            }
-            UiMessage::OpenUserAudioPopup {
-                client_id,
-                username,
-                click_x,
-                click_y,
-            } => {
-                let (volume, muted) = self
-                    .users
-                    .get(&client_id)
-                    .map(|u| (u.audio_settings.volume, u.audio_settings.is_muted))
-                    .unwrap_or((1.0, false));
-
-                if let Some(sidebar) = &mut self.sidebar {
-                    sidebar.handle_open_audio_popup(
-                        client_id, &username, volume, muted, click_x, click_y,
-                    );
-                }
-            }
-            UiMessage::SaveSettings => {
-                self.settings.save();
-            }
-            UiMessage::SetLanguage(lang) => {
-                self.settings.language = lang;
-                i18n::set_locale(self.settings.language.as_deref());
-                // Labels are copied into widgets at construction, so a
-                // language change re-renders per tier: the connect view
-                // rebuilds, sidebar buttons relabel in place, settings
-                // windows update on reopen, chat history stays as-is.
-                self.rebuild_connect_view();
-                if let Some(sidebar) = &mut self.sidebar {
-                    sidebar.relabel();
-                }
-            }
-            UiMessage::ResetSettings => {
-                self.settings.reset();
-                // Push the defaults to the running subsystems so behavior
-                // matches the file immediately — previously only the file
-                // changed while the voice engine kept the old values.
-                self.voice
-                    .tx
-                    .send(VoiceControl::SetGateThreshold(
-                        self.settings.audio.gate_threshold,
-                    ))
-                    .ok();
-                self.voice
-                    .tx
-                    .send(VoiceControl::SetInputGain(self.settings.audio.input.gain))
-                    .ok();
-                self.voice
-                    .tx
-                    .send(VoiceControl::SetOutputGain(self.settings.audio.output.gain))
-                    .ok();
-                self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
-                self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
-                if let Some(ref mut hotkeys) = self.hotkeys {
-                    hotkeys.update(&self.settings);
-                }
-                i18n::set_locale(self.settings.language.as_deref());
-                self.rebuild_connect_view();
-                self.refresh_device_warning();
-            }
-            UiMessage::SetInputDevice(d) => {
-                self.settings.audio.input.device = d.clone();
-                self.voice.tx.send(VoiceControl::SetInputDevice(d)).ok();
-                self.refresh_device_warning();
-            }
-            UiMessage::SetOutputDevice(d) => {
-                self.settings.audio.output.device = d.clone();
-                self.voice.tx.send(VoiceControl::SetOutputDevice(d)).ok();
-                self.refresh_device_warning();
-            }
-
-            UiMessage::DevicesChanged {
-                input_devices,
-                output_devices,
-            } => {
-                self.handle_devices_changed(input_devices, output_devices);
-            }
-
-            // ── Update flow ─────────────────────────────────────────
-            UiMessage::VersionCheckComplete(result) => {
-                use crate::ui::messages::VersionCheckResult;
-                match result {
-                    VersionCheckResult::UpdateAvailable { remote_version } => {
-                        if let Some(splash) = &mut self.splash_window {
-                            let prompt = crate::ui::splash::show_update_prompt(
-                                self.sender,
-                                &remote_version,
-                                splash,
-                            );
-                            // The splash is now hidden; track the prompt as the new splash
-                            self.splash_window = Some(prompt);
-                        }
-                    }
-                    VersionCheckResult::UpToDate => {
-                        self.dismiss_update_flow_and_connect();
-                    }
-                }
-            }
-            UiMessage::SkipUpdate => {
-                self.dismiss_update_flow_and_connect();
-            }
-            UiMessage::StartDownload(remote_version) => {
-                if let Some(mut w) = self.splash_window.take() {
-                    w.end(); // end any active group context
-                    w.hide();
-                }
-                let wind = crate::ui::update::show(self.sender, &remote_version);
-                self.update_window = Some(wind);
-            }
-            UiMessage::DownloadComplete(path) => {
-                if let Some(wind) = &mut self.update_window {
-                    let complete = crate::ui::update::show_complete(self.sender, &path, wind);
-                    self.update_window = Some(complete);
-                }
-            }
-            UiMessage::DownloadFailed(error) => {
-                if let Some(wind) = &mut self.update_window {
-                    let err_wind = crate::ui::update::show_error(self.sender, &error, wind);
-                    self.update_window = Some(err_wind);
-                }
-            }
-            UiMessage::DownloadCancelled => {
-                self.dismiss_update_flow_and_connect();
-            }
-            UiMessage::InstallUpdate(path) => {
-                if let Err(e) = crate::ui::update::extract_and_install(&path) {
-                    self.sender.send(UiMessage::ShowError(e));
-                }
-            }
-
-            UiMessage::ShowError(e) => {
-                self.show_error(&e);
-            }
-            UiMessage::ClearError => {
-                if let Some(frame) = &mut self.error_frame {
-                    frame.set_label("");
-                }
-            }
-            UiMessage::SettingsWindowClosed => {
-                self.settings_window_open = false;
-                // Abort any in-progress keybind recording — otherwise
-                // the global key handler stays armed and the next
-                // unconsumed keypress (hours later, anywhere in the
-                // app) would silently become a keybind.
-                crate::ui::settings::keybinds::cancel_recording();
-                if self.is_testing_mic {
-                    self.handle_test_microphone(false);
-                }
-                self.settings.save();
-            }
-            UiMessage::SetKeybind { action, bind } => {
-                self.settings.set_bind(action, bind);
-                if let Some(ref mut hotkeys) = self.hotkeys {
-                    hotkeys.update(&self.settings);
-                }
-            }
-            UiMessage::MainWindowClose => {
-                // Hide to tray only once the tray infrastructure exists
-                // (tray icon + sentinel are created on connect). From the
-                // connect view, closing the window quits the app.
-                if self.connected && self.sentinel_window.is_some() {
-                    if let Some(w) = &mut self.main_window {
-                        w.hide();
-                    }
-                } else {
-                    self.app.quit();
-                }
-            }
-            UiMessage::Shutdown => {
-                // Explicit quit (connect-view Quit button). Cleanup runs
-                // after the event loop exits in run().
-                self.app.quit();
-            }
-            UiMessage::StopVoiceAfterDisconnect => {
-                // Deferred from teardown_connection so the leave sound
-                // can finish. Skip if we're already in a new session or
-                // a mic test — their engine must keep running.
-                if !self.connected && !self.is_testing_mic {
-                    self.voice.tx.send(VoiceControl::Stop).ok();
-                }
-            }
+            // Hot-path variants routed straight to the voice/screen
+            // threads by the network loop. They should never arrive
+            // here; if they do we silently ignore them.
+            NetworkMessage::SystemAudioData { .. }
+            | NetworkMessage::VoiceData { .. }
+            | NetworkMessage::VideoFrame { .. }
+            | NetworkMessage::StreamHealth { .. }
+            | NetworkMessage::KeyframeRequested { .. } => {}
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    //  HELPERS
-    // ════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════
+    //  CONNECTION FLOW
+    // ════════════════════════════════════════════════════════════════
 
-    /// Push the current active_sharers set to the sidebar so it can show
-    /// "Live" badges and "Watch Stream" in the popup.
-    fn sync_sharers_to_sidebar(&mut self) {
-        if let Some(sidebar) = &mut self.sidebar {
-            sidebar.set_active_sharers(&self.active_sharers);
-        }
-        // Trigger a user list refresh so badges update immediately
-        self.update_user_list();
-    }
-
-    /// Show a system message in chat (not sent to server).
-    fn show_chat_system(&mut self, text: &str) {
-        if let Some(chat) = &mut self.chat {
-            chat.handle_system_message(text.to_string());
-        }
-    }
-
-    // ── Device hot-reload ───────────────────────────────────────────
-
-    /// Called by the 2.5 s polling timer whenever the device list or
-    /// default identity has changed.  Produces chat messages and, when
-    /// the active device has disappeared (or the system default changed
-    /// underneath us), re-triggers the stream rebuild on the voice thread.
-    fn handle_devices_changed(
-        &mut self,
-        new_input: Vec<(String, bool)>,
-        new_output: Vec<(String, bool)>,
-    ) {
-        // Collect owned names so we don't borrow self.last_*_devices as &str
-        // (which would conflict with &mut self for show_chat_system later).
-        let old_input_names: std::collections::HashSet<String> = self
-            .last_input_devices
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        let new_input_names: std::collections::HashSet<String> =
-            new_input.iter().map(|(n, _)| n.clone()).collect();
-
-        let old_output_names: std::collections::HashSet<String> = self
-            .last_output_devices
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        let new_output_names: std::collections::HashSet<String> =
-            new_output.iter().map(|(n, _)| n.clone()).collect();
-
-        let old_input_default = Self::default_device(&self.last_input_devices);
-        let old_output_default = Self::default_device(&self.last_output_devices);
-        let new_input_default = Self::default_device(&new_input);
-        let new_output_default = Self::default_device(&new_output);
-
-        // Nothing changed — early out.
-        if old_input_names == new_input_names
-            && old_output_names == new_output_names
-            && old_input_default == new_input_default
-            && old_output_default == new_output_default
-        {
-            return;
-        }
-
-        // ── Chat notifications ──────────────────────────────────────
-
-        for name in new_input_names.difference(&old_input_names) {
-            self.show_chat_system(&t!("chat-mic-connected", "name" => name.as_str()));
-        }
-        for name in old_input_names.difference(&new_input_names) {
-            self.show_chat_system(&t!("chat-mic-disconnected", "name" => name.as_str()));
-        }
-        for name in new_output_names.difference(&old_output_names) {
-            self.show_chat_system(&t!("chat-speaker-connected", "name" => name.as_str()));
-        }
-        for name in old_output_names.difference(&new_output_names) {
-            self.show_chat_system(&t!("chat-speaker-disconnected", "name" => name.as_str()));
-        }
-
-        // ── Input device: detect if a rebuild is needed ─────────────
-
-        let need_input_rebuild = if let Some(ref selected) = self.settings.audio.input.device {
-            !new_input_names.contains(selected)
-        } else {
-            old_input_default != new_input_default
-        };
-
-        if need_input_rebuild {
-            if self.settings.audio.input.device.is_some() {
-                self.show_chat_system(&t!("chat-input-lost"));
-            } else {
-                let fallback = t!("unknown-device");
-                let new_default = new_input_default.as_deref().unwrap_or(&fallback);
-                self.show_chat_system(&t!("chat-input-default-changed", "name" => new_default));
-            }
-            self.settings.audio.input.device = None;
-            self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
-        }
-
-        // ── Output device: same logic ───────────────────────────────
-
-        let need_output_rebuild = if let Some(ref selected) = self.settings.audio.output.device {
-            !new_output_names.contains(selected)
-        } else {
-            old_output_default != new_output_default
-        };
-
-        if need_output_rebuild {
-            if self.settings.audio.output.device.is_some() {
-                self.show_chat_system(&t!("chat-output-lost"));
-            } else {
-                let fallback = t!("unknown-device");
-                let new_default = new_output_default.as_deref().unwrap_or(&fallback);
-                self.show_chat_system(&t!("chat-output-default-changed", "name" => new_default));
-            }
-            self.settings.audio.output.device = None;
-            self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
-
-            // WASAPI loopback captures from the default output device,
-            // so when that device changes the capture stream dies too.
-            // Restart it if a screen share is currently active.
-            if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                self.screen
-                    .tx
-                    .send(client::screen::ScreenControl::RestartSystemAudio)
-                    .ok();
-            }
-        }
-
-        // ── Update the snapshot ─────────────────────────────────────
-
-        self.last_input_devices = new_input;
-        self.last_output_devices = new_output;
-
-        self.refresh_device_warning();
-    }
-
-    /// Extract the name of whichever device is marked as the OS default.
-    fn default_device(devices: &[(String, bool)]) -> Option<String> {
-        devices
-            .iter()
-            .find(|(_, is_default)| *is_default)
-            .map(|(name, _)| name.clone())
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    //  CONNECTION HANDLERS
-    // ════════════════════════════════════════════════════════════════════
-
-    fn handle_connect(&mut self, nickname: String, password: String) {
-        self.settings.user.nickname = nickname.clone();
+    fn handle_connect(&mut self, nickname: &str, password: &str) {
+        self.settings.user.nickname = nickname.to_string();
         let password = password.trim();
-        self.settings.server.token_password = (!password.is_empty()).then(|| password.to_string());
+        self.settings.server.token_password =
+            (!password.is_empty()).then(|| password.to_string());
         self.settings.save();
 
-        let addr = match self.settings.server.address.trim().parse::<SocketAddr>() {
-            Ok(a) => a,
-            Err(_) => {
-                self.show_error(&t!("error-invalid-address"));
-                return;
-            }
+        let Ok(addr) = self.settings.server.address.trim().parse::<SocketAddr>() else {
+            self.show_error(&t!("error-invalid-address"));
+            return;
         };
 
         self.network
             .tx
             .send(NetworkControl::Connect {
                 addr,
-                nickname,
+                nickname: nickname.to_string(),
                 token_url: self.settings.server.token_url.clone(),
                 token_password: self.settings.server.token_password.clone(),
             })
             .ok();
     }
 
-    fn handle_connection_established(&mut self) {
-        self.connected = true;
-        if let Some(frame) = &mut self.error_frame {
-            frame.set_label("");
-        }
-    }
-    fn setup_tray_icon(&mut self) {
-        let icon_data: &'static [u8] = include_bytes!("../../../assets/icons/icon.ico");
-        let sender = self.sender;
-
-        let tray = TrayIconBuilder::new()
-            .sender(move |e: &UiMessage| {
-                sender.send(e.clone());
-                fltk::app::awake(); // nudge FLTK loop
-            })
-            .icon_from_buffer(icon_data)
-            .tooltip("baucord")
-            .on_click(UiMessage::RestoreFromTray)
-            .menu(
-                MenuBuilder::new()
-                    .item(&t!("tray-show"), UiMessage::RestoreFromTray)
-                    .separator()
-                    .item(&t!("tray-quit"), UiMessage::QuitFromTray),
-            )
-            .build()
-            .unwrap();
-
-        self.tray_icon = Some(tray);
-    }
-
     fn handle_init_client(
         &mut self,
         client_id: u64,
-        users: HashMap<renet::ClientId, String>,
-        server_name: String,
-        greeting: String,
+        users: &HashMap<u64, String>,
+        server_name: &str,
+        greeting: &str,
     ) {
-        self.show_main_screen();
-        self.setup_tray_icon();
+        // Fresh chat per connection — same semantics as the old
+        // rebuild-the-main-view path.
+        self.history.clear();
+        self.chat_model.set_vec(Vec::new());
+        self.images.clear();
+        self.gifs.clear();
 
-        // Invisible off-screen sentinel window. FLTK's event loop exits
-        // when no windows are shown; this keeps it alive while the main
-        // window is hidden to the tray. Do not remove without replacing
-        // that mechanism (e.g. fltk::app::program_should_quit).
-        // Created once — reconnects used to stack a new one per session.
-        if self.sentinel_window.is_none() {
-            let mut sentinel = window::Window::new(-10000, -10000, 1, 1, None);
-            sentinel.end();
-            sentinel.set_border(false);
-            sentinel.show();
-            self.sentinel_window = Some(sentinel);
-        }
+        self.main.global::<State>().set_phase(Phase::Main);
+        #[cfg(feature = "tray")]
+        crate::app::tray::setup(self);
 
         self.our_client_id = Some(client_id);
-        for (&id, name) in &users {
+        let default_audio = PeerAudioSettings::default();
+        for (&id, name) in users {
             self.users.insert(
                 id,
                 UserState {
                     username: name.clone(),
                     is_speaking: false,
-                    audio_settings: self
-                        .settings
-                        .peer_settings
-                        .get(&peer_key(name))
-                        .cloned()
-                        .unwrap_or_default(),
+                    audio: peer_audio_from(
+                        self.settings
+                            .peer_settings
+                            .get(&peer_key(name))
+                            .unwrap_or(&default_audio),
+                    ),
                     is_self_muted: false,
                     is_self_deafened: false,
                 },
@@ -1270,42 +1027,39 @@ impl App {
         }
 
         // Start voice engine
-        if let Some(id) = self.our_client_id {
-            self.voice
-                .tx
-                .send(VoiceControl::Start {
-                    settings: self.settings.clone(),
-                    our_client_id: id,
-                })
-                .ok();
-            // Join ding, queued behind Start on the same channel so it
-            // plays on the freshly started (or still-running) engine.
-            // Tied to joining rather than VoiceEvent::Started so mic
-            // tests stay silent and fast reconnects still ding even if
-            // the deferred-stop kept the engine alive.
-            self.voice
-                .tx
-                .send(VoiceControl::PlaySound(SoundType::UserJoined))
-                .ok();
-        }
+        self.voice
+            .tx
+            .send(VoiceControl::Start {
+                settings: self.settings.clone(),
+                our_client_id: client_id,
+            })
+            .ok();
+        // Join ding, queued behind Start on the same channel so it
+        // plays on the freshly started (or still-running) engine.
+        self.voice
+            .tx
+            .send(VoiceControl::PlaySound(SoundType::UserJoined))
+            .ok();
 
         // Sync per-user audio settings to voice engine
         for (&id, user) in &self.users {
             self.voice.tx.send(VoiceControl::AddPeer(id)).ok();
             self.voice
                 .tx
-                .send(VoiceControl::SetPeerAudio(id, user.audio_settings.clone()))
+                .send(VoiceControl::SetPeerAudio(id, peer_audio_to(user.audio)))
                 .ok();
         }
 
-        if let Some(chat) = &mut self.chat {
-            chat.handle_connected(server_name, greeting);
-        }
+        let s = self.main.global::<State>();
+        s.set_status_text(format!("●  {}", t!("status-connected")).into());
+        s.set_status_color(slint::Color::from_rgb_u8(0x2B, 0xAC, 0x76));
+        self.push_chat_system(&format!("{server_name}: {greeting}"));
         self.update_user_list();
+        let _ = self.main.show();
     }
 
-    fn handle_user_joined(&mut self, client_id: renet::ClientId, username: String) {
-        let audio = self
+    fn handle_user_joined(&mut self, client_id: u64, username: String) {
+        let saved = self
             .settings
             .peer_settings
             .get(&peer_key(&username))
@@ -1315,23 +1069,12 @@ impl App {
         self.voice.tx.send(VoiceControl::AddPeer(client_id)).ok();
         self.voice
             .tx
-            .send(VoiceControl::SetPeerAudio(client_id, audio.clone()))
+            .send(VoiceControl::SetPeerAudio(client_id, saved.clone()))
             .ok();
 
-        self.users.insert(
-            client_id,
-            UserState {
-                username: username.clone(),
-                is_speaking: false,
-                audio_settings: audio,
-                is_self_muted: false,
-                is_self_deafened: false,
-            },
-        );
-
-        if let Some(chat) = &mut self.chat {
-            chat.handle_user_joined(username);
-        }
+        self.push_chat_system(&t!("chat-user-joined", "name" => username.as_str()));
+        self.users
+            .insert(client_id, UserState::new(username, peer_audio_from(&saved)));
         self.voice
             .tx
             .send(VoiceControl::PlaySound(SoundType::UserJoined))
@@ -1339,26 +1082,108 @@ impl App {
         self.update_user_list();
     }
 
-    fn handle_user_left(&mut self, client_id: renet::ClientId, username: String) {
+    fn handle_user_left(&mut self, client_id: u64, username: &str) {
         self.voice.tx.send(VoiceControl::RemovePeer(client_id)).ok();
         self.users.remove(&client_id);
         self.active_sharers.remove(&client_id);
-        self.sync_sharers_to_sidebar();
+        self.sharer_ids = self.active_sharers.keys().copied().collect();
 
         // Close viewer if we were watching this user
-        if let Some(mut viewer) = self.viewer_windows.remove(&client_id) {
+        if let Some(viewer) = self.viewers.remove(&client_id) {
             viewer.close();
         }
 
-        if let Some(chat) = &mut self.chat {
-            chat.handle_user_left(username);
-        }
+        self.push_chat_system(&t!("chat-user-left", "name" => username));
         self.voice
             .tx
             .send(VoiceControl::PlaySound(SoundType::UserLeft))
             .ok();
         self.update_user_list();
     }
+
+    /// Shared teardown for both user-initiated and server-initiated
+    /// disconnects.
+    fn teardown_connection(&mut self) {
+        self.connected = false;
+        self.is_testing_mic = false;
+        // Also clear the shared flag the voice loop reads — leaving it
+        // set (disconnect during a mic test) kept the loop gating
+        // outgoing audio after the next connect.
+        self.is_testing_mic_shared.store(false, Ordering::Relaxed);
+
+        // Play the leave sound for ourselves too. The server's UserLeft
+        // broadcast is never sent to the leaver — and stopping the
+        // engine immediately would cut the sound off, so the Stop is
+        // deferred. Its closure skips the Stop if a new session or mic
+        // test started in the meantime.
+        self.voice
+            .tx
+            .send(VoiceControl::PlaySound(SoundType::UserLeft))
+            .ok();
+        let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+        if let Some(weak) = weak {
+            slint::Timer::single_shot(Duration::from_millis(900), move || {
+                with_app(&weak, |app| {
+                    if !app.connected && !app.is_testing_mic {
+                        app.voice.tx.send(VoiceControl::Stop).ok();
+                    }
+                });
+            });
+        }
+
+        // Stop our screen share if active
+        if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+            self.screen.tx.send(ScreenControl::StopSharing).ok();
+        }
+        self.active_sharers.clear();
+        self.sharer_ids.clear();
+        for (_, viewer) in self.viewers.drain() {
+            viewer.close();
+        }
+        crate::viewers::close_gallery(self);
+        self.gifs.clear();
+
+        self.users.clear();
+        self.our_client_id = None;
+        self.is_muted = false;
+        self.is_deafened = false;
+
+        let s = self.main.global::<State>();
+        s.set_muted(false);
+        s.set_deafened(false);
+        s.set_sharing(false);
+        s.set_user_popup_open(false);
+        s.set_stream_stats("".into());
+        s.set_status_text(format!("●  {}", t!("status-disconnected")).into());
+        s.set_status_color(slint::Color::from_rgb_u8(0xE0, 0x1E, 0x5A));
+        s.set_latency_line(
+            t!("latency-line",
+                "audio" => "--", "network" => "--", "up" => "--", "down" => "--")
+            .into(),
+        );
+        s.set_resource_line(" ".into());
+        s.set_users_count_label(t!("users-count", "count" => 0u32).into());
+        self.users_model.set_vec(Vec::new());
+    }
+
+    fn handle_disconnect(&mut self) {
+        self.network.tx.send(NetworkControl::Disconnect).ok();
+        self.push_chat_system(
+            &t!("chat-disconnected", "reason" => t!("disconnect-reason-user")),
+        );
+        self.teardown_connection();
+        self.show_connect_phase();
+    }
+
+    pub fn show_connect_phase(&mut self) {
+        self.refresh_device_warning();
+        self.main.global::<State>().set_phase(Phase::Connect);
+        let _ = self.main.show();
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  VOICE CONTROLS
+    // ════════════════════════════════════════════════════════════════
 
     fn handle_toggle_mute(&mut self) {
         self.is_muted = !self.is_muted;
@@ -1373,10 +1198,8 @@ impl App {
                 deafened: self.is_deafened,
             })
             .ok();
-
-        if let Some(sidebar) = &mut self.sidebar {
-            sidebar.set_mute_state(self.is_muted);
-        }
+        self.main.global::<State>().set_muted(self.is_muted);
+        self.update_user_list();
     }
 
     fn handle_toggle_deafen(&mut self) {
@@ -1392,24 +1215,52 @@ impl App {
                 deafened: self.is_deafened,
             })
             .ok();
-
-        if let Some(sidebar) = &mut self.sidebar {
-            sidebar.set_deafen_state(self.is_deafened);
-        }
+        self.main.global::<State>().set_deafened(self.is_deafened);
+        self.update_user_list();
     }
+
     fn handle_toggle_screenshare(&mut self) {
         if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
             self.screen.tx.send(ScreenControl::StopSharing).ok();
-        } else if let Some(ref main_win) = self.main_window {
-            screenshare::show(self.sender, main_win);
+        } else {
+            let monitors = video::capture::list_monitors().unwrap_or_default();
+            if monitors.is_empty() {
+                self.show_error(&t!("error-no-monitors"));
+                return;
+            }
+            let labels: Vec<slint::SharedString> = monitors
+                .iter()
+                .map(|m| {
+                    let primary = if m.is_primary {
+                        format!(" {}", t!("monitor-primary"))
+                    } else {
+                        String::new()
+                    };
+                    format!("{} — {}x{}{}", m.name, m.width, m.height, primary).into()
+                })
+                .collect();
+            let qualities: Vec<slint::SharedString> = video::Quality::ALL
+                .iter()
+                .map(|q| q.to_string().into())
+                .collect();
+            let primary_idx = monitors.iter().position(|m| m.is_primary).unwrap_or(0);
+            let default_q = video::Quality::ALL
+                .iter()
+                .position(|q| *q == video::Quality::FHD30)
+                .unwrap_or(0);
+            let s = self.main.global::<State>();
+            s.set_monitors(ModelRc::new(VecModel::from(labels)));
+            s.set_qualities(ModelRc::new(VecModel::from(qualities)));
+            s.set_default_monitor(i32::try_from(primary_idx).unwrap_or(0));
+            s.set_default_quality(i32::try_from(default_q).unwrap_or(0));
+            self.main.invoke_open_share_dialog();
         }
     }
 
-    fn handle_test_microphone(&mut self, enabled: bool) {
-        // Capture this BEFORE flipping is_testing_mic — the old code
-        // checked afterwards, which made the "start the engine for a mic
-        // test while disconnected" branch unreachable, so Start was
-        // never sent and the test silently did nothing.
+    pub fn handle_test_microphone(&mut self, enabled: bool) {
+        // Capture this BEFORE flipping is_testing_mic — checking
+        // afterwards made the "start the engine for a mic test while
+        // disconnected" branch unreachable.
         let voice_already_running = self.connected || self.is_testing_mic;
 
         self.is_testing_mic = enabled;
@@ -1434,21 +1285,73 @@ impl App {
         }
     }
 
-    fn handle_mute_user(&mut self, client_id: renet::ClientId, username: String, muted: bool) {
+    /// Send the composer draft: shortcodes rendered, control chars
+    /// scrubbed, char cap enforced. The server echoes `TextMessage` back
+    /// to everyone (sender included), so there is no local append here.
+    fn send_current_message(&mut self) {
+        let s = self.main.global::<State>();
+        let raw = s.get_draft().to_string();
+        let rendered = app_core::emoji::replace_shortcodes(
+            &app_core::chat::scrub_control_chars(raw.trim()),
+        );
+        let text: String = rendered
+            .chars()
+            .take(app_core::chat::MAX_MESSAGE_CHARS)
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        self.network
+            .tx
+            .send(NetworkControl::SendMessage(text))
+            .ok();
+        s.set_draft("".into());
+        self.main.invoke_focus_composer();
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  PER-USER AUDIO
+    // ════════════════════════════════════════════════════════════════
+
+    /// The client id behind roster row `index`, if it still exists.
+    pub fn user_id_at(&self, index: i32) -> Option<u64> {
+        let row = self.users_model.row_data(usize::try_from(index).ok()?)?;
+        Some(roster::join_id(row.client_id_lo, row.client_id_hi))
+    }
+
+    pub fn username_of(&self, client_id: u64) -> String {
+        self.users
+            .get(&client_id).map_or_else(|| t!("fallback-username", "id" => client_id.to_string()), |u| u.username.clone())
+    }
+
+    fn open_user_popup(&mut self, index: i32) {
+        let Some(id) = self.user_id_at(index) else {
+            return;
+        };
+        if Some(id) == self.our_client_id {
+            return;
+        }
+        let volume = self.users.get(&id).map_or(1.0, |u| u.audio.volume);
+        let s = self.main.global::<State>();
+        s.set_popup_user_index(index);
+        s.set_popup_volume(volume);
+        s.set_user_popup_open(true);
+    }
+
+    fn handle_mute_user(&mut self, client_id: u64, username: &str, muted: bool) {
         if let Some(user) = self.users.get_mut(&client_id) {
-            user.audio_settings.is_muted = muted;
+            user.audio.is_muted = muted;
             self.settings
                 .peer_settings
-                .insert(peer_key(&username), user.audio_settings.clone());
+                .insert(peer_key(username), peer_audio_to(user.audio));
         }
-
         self.voice
             .tx
             .send(VoiceControl::SetPeerAudio(
                 client_id,
                 self.users
                     .get(&client_id)
-                    .map(|u| u.audio_settings.clone())
+                    .map(|u| peer_audio_to(u.audio))
                     .unwrap_or_default(),
             ))
             .ok();
@@ -1456,39 +1359,32 @@ impl App {
         self.update_user_list();
     }
 
-    fn handle_set_user_volume(
-        &mut self,
-        client_id: renet::ClientId,
-        username: String,
-        volume: f32,
-    ) {
+    fn handle_set_user_volume(&mut self, client_id: u64, username: &str, volume: f32) {
         if let Some(user) = self.users.get_mut(&client_id) {
-            user.audio_settings.volume = volume;
+            user.audio.volume = volume;
             self.settings
                 .peer_settings
-                .insert(peer_key(&username), user.audio_settings.clone());
+                .insert(peer_key(username), peer_audio_to(user.audio));
         }
-
         self.voice
             .tx
             .send(VoiceControl::SetPeerAudio(
                 client_id,
                 self.users
                     .get(&client_id)
-                    .map(|u| u.audio_settings.clone())
+                    .map(|u| peer_audio_to(u.audio))
                     .unwrap_or_default(),
             ))
             .ok();
         self.settings.save();
+        self.update_user_list();
     }
 
-    fn handle_reset_peer_audio(&mut self, client_id: renet::ClientId, username: String) {
-        self.settings.peer_settings.remove(&peer_key(&username));
-
+    fn handle_reset_peer_audio(&mut self, client_id: u64, username: &str) {
+        self.settings.peer_settings.remove(&peer_key(username));
         if let Some(user) = self.users.get_mut(&client_id) {
-            user.audio_settings = PeerAudioSettings::default();
+            user.audio = PeerAudio::default();
         }
-
         self.voice
             .tx
             .send(VoiceControl::SetPeerAudio(
@@ -1500,391 +1396,705 @@ impl App {
         self.update_user_list();
     }
 
-    /// Shared teardown for both user-initiated and server-initiated disconnects.
-    fn teardown_connection(&mut self) {
-        self.connected = false;
-        self.is_testing_mic = false;
-        // Also clear the shared flag the voice loop reads — leaving it
-        // set (disconnect during a mic test) kept the loop gating
-        // outgoing audio after the next connect.
-        self.is_testing_mic_shared.store(false, Ordering::Relaxed);
-
-        // Play the leave sound for ourselves too. The server's UserLeft
-        // broadcast (which triggers it for everyone else) is never sent
-        // to the leaver — and stopping the engine immediately would cut
-        // the sound off, so the Stop is deferred. Its handler skips the
-        // Stop if a new session or mic test started in the meantime.
-        self.voice
-            .tx
-            .send(VoiceControl::PlaySound(SoundType::UserLeft))
-            .ok();
-        let sender = self.sender;
-        app::add_timeout3(0.9, move |_| {
-            sender.send(UiMessage::StopVoiceAfterDisconnect);
-        });
-
-        // Stop our screen share if active
-        if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-            self.screen.tx.send(ScreenControl::StopSharing).ok();
+    fn handle_watch_peer(&mut self, client_id: u64) {
+        if self.viewers.contains_key(&client_id) {
+            return;
         }
-        self.active_sharers.clear();
-        // Close all viewer windows
-        for (_, mut viewer) in self.viewer_windows.drain() {
+        let username = self.username_of(client_id);
+        // Open at the sharer's announced dimensions so a 1080p stream
+        // doesn't flash open as a 720p window before the first frame.
+        let (share_w, share_h) = self
+            .active_sharers
+            .get(&client_id)
+            .copied()
+            .unwrap_or((1280, 720));
+        info!("📺 Watch {username} ({client_id}): opening viewer at {share_w}x{share_h}");
+        // Window creation + show() runs OUTSIDE the app borrow: on
+        // macOS, ordering a window front can dispatch events
+        // synchronously, and a callback re-entering the app state
+        // while it is borrowed would abort the process.
+        let _ = slint::invoke_from_event_loop(move || {
+            with_current(move |app| {
+                if app.viewers.contains_key(&client_id) {
+                    return;
+                }
+                match Viewer::open(client_id, &username, share_w, share_h) {
+                    Ok(viewer) => {
+                        app.viewers.insert(client_id, viewer);
+                        app.network
+                            .tx
+                            .send(NetworkControl::SubscribeScreen {
+                                target_id: client_id,
+                            })
+                            .ok();
+                        app.push_chat_system(
+                            &t!("chat-watching", "name" => username.as_str()),
+                        );
+                        info!("📺 Viewer open + subscribed to {client_id}");
+                    }
+                    Err(e) => {
+                        warn!("📺 Viewer open failed: {e}");
+                        app.show_error(&e.to_string());
+                    }
+                }
+            });
+        });
+    }
+
+    pub fn handle_unwatch_peer(&mut self, client_id: u64) {
+        if let Some(viewer) = self.viewers.remove(&client_id) {
             viewer.close();
         }
-
-        if let Some(sidebar) = &mut self.sidebar {
-            sidebar.handle_disconnected();
-        }
-
-        self.users.clear();
-        self.our_client_id = None;
-        self.is_muted = false;
-        self.is_deafened = false;
-
-        // The window itself persists — callers switch the Wizard back
-        // to the connect view (handle_disconnect / handle_disconnect_event
-        // both call show_connection_screen right after this).
+        self.network
+            .tx
+            .send(NetworkControl::UnsubscribeScreen {
+                target_id: client_id,
+            })
+            .ok();
+        let username = self.username_of(client_id);
+        self.push_chat_system(&t!("chat-stopped-watching", "name" => username.as_str()));
     }
 
-    fn handle_disconnect(&mut self) {
-        self.network.tx.send(NetworkControl::Disconnect).ok();
-
-        if let Some(chat) = &mut self.chat {
-            chat.handle_disconnected(t!("disconnect-reason-user"));
-        }
-
-        self.teardown_connection();
-        self.show_connection_screen();
+    pub fn set_stream_volume(&mut self, client_id: u64, volume: f32) {
+        self.screen
+            .tx
+            .send(ScreenControl::SetStreamVolume { client_id, volume })
+            .ok();
     }
 
-    fn handle_disconnect_event(&mut self, reason: &str) {
-        if let Some(chat) = &mut self.chat {
-            chat.handle_disconnected(reason.to_string());
-        }
-
-        self.teardown_connection();
-        self.show_connection_screen();
-        self.show_error(reason);
+    pub fn set_stream_muted(&mut self, client_id: u64, muted: bool) {
+        self.screen
+            .tx
+            .send(ScreenControl::MuteStream { client_id, muted })
+            .ok();
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    //  UI
-    // ════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════
+    //  DEVICES
+    // ════════════════════════════════════════════════════════════════
 
-    fn update_user_list(&mut self) {
-        // Speaking state is purely edge-triggered now. The old 500 ms
-        // "stale speaking" timeout here cleared the light mid-speech for
-        // anyone talking longer than 500 ms (events only arrive on
-        // transitions, so last_activity never refreshed) — the light then
-        // stayed off until their next stop/start edge.
-        if let Some(sidebar) = &mut self.sidebar {
-            sidebar.update_users(&self.users, self.our_client_id);
-        }
-    }
+    /// Called by the 2.5 s polling timer. All diff logic lives in
+    /// app-core; this applies the side effects.
+    pub fn handle_devices_changed(
+        &mut self,
+        new_input: Vec<(String, bool)>,
+        new_output: Vec<(String, bool)>,
+    ) {
+        use app_core::devices::{self, DeviceNotice};
 
-    /// Dismiss any update-flow windows (splash or update) and show connect.
-    fn dismiss_update_flow_and_connect(&mut self) {
-        if let Some(mut w) = self.splash_window.take() {
-            w.hide();
-        }
-        if let Some(mut w) = self.update_window.take() {
-            w.hide();
-        }
-        self.show_connection_screen();
-    }
-
-    fn show_connection_screen(&mut self) {
-        self.ensure_main_window();
-        self.refresh_device_warning();
-        if let (Some(wizard), Some(view)) = (&mut self.wizard, &self.connect_view) {
-            wizard.set_current_widget(view);
-        }
-        if let Some(w) = &mut self.main_window {
-            // May be hidden in the tray when a disconnect arrives.
-            w.show();
-            w.redraw();
-        }
-    }
-
-    /// Tear down and rebuild the connect view. FLTK widgets copy
-    /// their labels at construction, so a language change needs a
-    /// rebuild; this is the cheap view, and it keeps showing if it was
-    /// the active one.
-    fn rebuild_connect_view(&mut self) {
-        let Some(wizard) = &mut self.wizard else {
+        let diff = devices::diff(
+            &self.last_input_devices,
+            &new_input,
+            &self.last_output_devices,
+            &new_output,
+            self.settings.audio.input.device.as_deref(),
+            self.settings.audio.output.device.as_deref(),
+        );
+        if diff.unchanged {
             return;
-        };
-        let old = self.connect_view.take();
-
-        wizard.begin();
-        let connect = crate::ui::connect::build_view(self.sender, &self.settings);
-        wizard.end();
-        // end() sets the current group to the wizard's PARENT (the main
-        // window) — reset it, same trap as show_main_screen.
-        group::Group::set_current(None::<&group::Group>);
-
-        if let Some(mut old) = old {
-            wizard.remove(&old);
-            old.hide();
         }
 
-        self.error_frame = Some(connect.error_frame);
-        self.device_warning = Some(connect.device_warning);
-        self.connect_view = Some(connect.group);
+        for notice in &diff.notices {
+            let text = match notice {
+                DeviceNotice::MicConnected(n) => t!("chat-mic-connected", "name" => n.as_str()),
+                DeviceNotice::MicDisconnected(n) => {
+                    t!("chat-mic-disconnected", "name" => n.as_str())
+                }
+                DeviceNotice::SpeakerConnected(n) => {
+                    t!("chat-speaker-connected", "name" => n.as_str())
+                }
+                DeviceNotice::SpeakerDisconnected(n) => {
+                    t!("chat-speaker-disconnected", "name" => n.as_str())
+                }
+                DeviceNotice::InputLost => t!("chat-input-lost"),
+                DeviceNotice::InputDefaultChanged(name) => {
+                    let fallback = t!("unknown-device");
+                    t!("chat-input-default-changed",
+                        "name" => name.as_deref().unwrap_or(&fallback))
+                }
+                DeviceNotice::OutputLost => t!("chat-output-lost"),
+                DeviceNotice::OutputDefaultChanged(name) => {
+                    let fallback = t!("unknown-device");
+                    t!("chat-output-default-changed",
+                        "name" => name.as_deref().unwrap_or(&fallback))
+                }
+            };
+            self.push_chat_system(&text);
+        }
+
+        if diff.rebuild_input {
+            self.settings.audio.input.device = None;
+            self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
+        }
+        if diff.rebuild_output {
+            self.settings.audio.output.device = None;
+            self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
+            // WASAPI loopback captures from the default output device,
+            // so when that device changes the capture stream dies too.
+            // Restart it if a screen share is currently active.
+            if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+                self.screen
+                    .tx
+                    .send(ScreenControl::RestartSystemAudio)
+                    .ok();
+            }
+        }
+
+        self.last_input_devices = new_input;
+        self.last_output_devices = new_output;
         self.refresh_device_warning();
-
-        if !self.connected
-            && let (Some(wizard), Some(view)) = (&mut self.wizard, &self.connect_view)
-        {
-            wizard.set_current_widget(view);
-        }
-        app::redraw();
     }
 
     /// Compare the devices saved in settings against what's connected
-    /// right now and surface the result on the connect view. Runtime
-    /// unplugs already fall back to the system default with a chat
-    /// notice — this covers the silent case: the app launched (or sits
-    /// on the connect view) with a saved device that isn't there.
-    fn refresh_device_warning(&mut self) {
-        let Some(frame) = &mut self.device_warning else {
-            return;
-        };
-
+    /// right now and surface the result on the connect view.
+    pub fn refresh_device_warning(&self) {
+        let (missing_in, missing_out) = app_core::devices::missing_saved(
+            self.settings.audio.input.device.as_deref(),
+            self.settings.audio.output.device.as_deref(),
+            &self.last_input_devices,
+            &self.last_output_devices,
+        );
         let mut missing: Vec<String> = Vec::new();
-        if let Some(name) = &self.settings.audio.input.device
-            && !self.last_input_devices.iter().any(|(n, _)| n == name)
-        {
-            missing.push(i18n::t!("device-missing-mic", "name" => name.as_str()));
+        if let Some(name) = missing_in {
+            missing.push(t!("device-missing-mic", "name" => name));
         }
-        if let Some(name) = &self.settings.audio.output.device
-            && !self.last_output_devices.iter().any(|(n, _)| n == name)
-        {
-            missing.push(i18n::t!("device-missing-output", "name" => name.as_str()));
+        if let Some(name) = missing_out {
+            missing.push(t!("device-missing-output", "name" => name));
         }
-
-        if missing.is_empty() {
-            frame.set_label("");
+        let text = if missing.is_empty() {
+            String::new()
         } else {
-            let joiner = format!(" {} ", i18n::t!("list-and"));
-            frame.set_label(&format!(
+            let joiner = format!(" {} ", t!("list-and"));
+            format!(
                 "{}\n{}",
-                i18n::t!("device-warning", "devices" => missing.join(&joiner)),
-                i18n::t!("device-warning-hint"),
-            ));
-        }
-        frame.redraw();
-    }
-
-    /// Create the single application window (once): saved geometry, a
-    /// Wizard hosting the connect view, and an (initially empty) main
-    /// view container that show_main_screen() fills per connection.
-    fn ensure_main_window(&mut self) {
-        if self.main_window.is_some() {
-            return;
-        }
-
-        let mut wind = window::Window::default()
-            .with_size(self.settings.window.width, self.settings.window.height)
-            .with_label("baucord");
-        if let (Some(x), Some(y)) = (self.settings.window.x, self.settings.window.y) {
-            wind.set_pos(x, y);
-        } else {
-            let (sw, sh) = app::screen_size();
-            let cx = (sw as i32 - self.settings.window.width) / 2;
-            let cy = (sh as i32 - self.settings.window.height) / 2;
-            wind.set_pos(cx, cy);
-        }
-        wind.make_resizable(true);
-        wind.size_range(500, 400, 0, 0);
-        wind.set_color(theme::BG_PRIMARY);
-        crate::ui::set_window_icon(&mut wind);
-
-        let wizard = group::Wizard::default_fill();
-
-        // View 1: connect form. Built once — it keeps typed values
-        // across failed attempts and reconnects, and error_frame stays
-        // valid for the app's lifetime.
-        let connect = crate::ui::connect::build_view(self.sender, &self.settings);
-
-        // View 2: main screen container, filled by show_main_screen().
-        let main_view = group::Group::default_fill();
-        main_view.end();
-
-        wizard.end();
-        wind.end();
-
-        // The OS close button means different things per view; route
-        // the decision through App, which knows the connection state.
-        let sender = self.sender;
-        wind.set_callback(move |_| {
-            if app::event() == enums::Event::Close {
-                sender.send(UiMessage::MainWindowClose);
-            }
-        });
-
-        // Floating helpers (emoji picker, volume popup) are separate
-        // top-level windows: minimizing or closing the main window
-        // would strand them on the desktop. FL_HIDE covers both.
-        // (Deliberately NOT Unfocus/Push: those fire while *opening* a
-        // popup and would close it in the same breath.)
-        let popup_sender = self.sender;
-        wind.handle(move |_, ev| {
-            if ev == enums::Event::Hide {
-                popup_sender.send(UiMessage::CloseFloatingPopups);
-            }
-            false
-        });
-        wind.show();
-
-        self.error_frame = Some(connect.error_frame);
-        self.device_warning = Some(connect.device_warning);
-        self.wizard = Some(wizard);
-        self.connect_view = Some(connect.group);
-        self.main_view = Some(main_view);
-        self.main_window = Some(wind);
-    }
-
-    fn show_main_screen(&mut self) {
-        self.ensure_main_window();
-
-        // (Re)build the main view fresh for this connection — same
-        // semantics as the old per-connection window: clean chat and
-        // clean sidebar every time. Drop the old handles BEFORE clear()
-        // so nothing holds references to deleted widgets.
-        self.sidebar = None;
-        self.chat = None;
-        if let Some(view) = &mut self.main_view {
-            view.clear();
-            view.begin();
-
-            let mut main_row = group::Flex::default_fill().row();
-            main_row.set_color(theme::BG_PRIMARY);
-
-            let mut sidebar = Sidebar::new(self.sender);
-            let sidebar_group = sidebar.create_ui();
-            main_row.fixed(&sidebar_group, 250);
-            sidebar.set_mute_state(self.is_muted);
-
-            let mut chat = Chat::new(self.sender);
-            let chat_group = chat.create_ui();
-            main_row.add(&chat_group);
-
-            main_row.end();
-            view.end();
-            // CRITICAL: Fl_Group::end() sets the current group to the
-            // widget's PARENT — for `view` that's the Wizard, not null.
-            // Without this reset, every window created afterwards
-            // (settings, audio popups, viewers, the tray sentinel) is
-            // silently adopted as an embedded child of the Wizard.
-            group::Group::set_current(None::<&group::Group>);
-
-            self.sidebar = Some(sidebar);
-            self.chat = Some(chat);
-        }
-
-        if let (Some(wizard), Some(view)) = (&mut self.wizard, &self.main_view) {
-            wizard.set_current_widget(view);
-        }
-        if let Some(w) = &mut self.main_window {
-            w.show();
-            w.redraw();
-        }
-    }
-
-    fn show_settings_window(&mut self) {
-        use crate::ui::settings::SettingsWindow;
-        use audio::VoiceChat;
-
-        let input_devices = VoiceChat::list_input_devices()
-            .inspect_err(|e| warn!("Failed to list input devices: {e}"))
-            .unwrap_or_default();
-        let output_devices = VoiceChat::list_output_devices()
-            .inspect_err(|e| warn!("Failed to list output devices: {e}"))
-            .unwrap_or_default();
-
-        // Center settings window on the main window
-        let (px, py, pw, ph) = if let Some(ref w) = self.main_window {
-            (w.x(), w.y(), w.w(), w.h())
-        } else {
-            let (sw, sh) = app::screen_size();
-            (0, 0, sw as i32, sh as i32)
+                t!("device-warning", "devices" => missing.join(&joiner)),
+                t!("device-warning-hint"),
+            )
         };
+        self.main.global::<State>().set_device_warning(text.into());
+    }
 
-        SettingsWindow::show(
-            self.sender,
-            self.settings.clone(),
-            input_devices,
-            output_devices,
+    pub fn set_input_device(&mut self, device: Option<String>) {
+        self.settings.audio.input.device.clone_from(&device);
+        self.voice.tx.send(VoiceControl::SetInputDevice(device)).ok();
+        self.refresh_device_warning();
+    }
+
+    pub fn set_output_device(&mut self, device: Option<String>) {
+        self.settings.audio.output.device.clone_from(&device);
+        self.voice
+            .tx
+            .send(VoiceControl::SetOutputDevice(device))
+            .ok();
+        self.refresh_device_warning();
+    }
+
+    pub fn voice_tx(&self) -> &crossbeam_channel::Sender<VoiceControl> {
+        &self.voice.tx
+    }
+
+    pub fn voice_levels(&self) -> (Arc<std::sync::atomic::AtomicU32>, Arc<std::sync::atomic::AtomicU32>) {
+        (
             self.voice.shared.output_level.clone(),
             self.voice.shared.denoised_level.clone(),
-            px,
-            py,
-            pw,
-            ph,
+        )
+    }
+
+    pub fn apply_reset_defaults(&mut self) {
+        self.settings.reset();
+        // Push the defaults to the running subsystems so behavior
+        // matches the file immediately.
+        self.voice
+            .tx
+            .send(VoiceControl::SetGateThreshold(
+                self.settings.audio.gate_threshold,
+            ))
+            .ok();
+        self.voice
+            .tx
+            .send(VoiceControl::SetInputGain(self.settings.audio.input.gain))
+            .ok();
+        self.voice
+            .tx
+            .send(VoiceControl::SetOutputGain(self.settings.audio.output.gain))
+            .ok();
+        self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
+        self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
+        if let Some(hotkeys) = &mut self.hotkeys {
+            hotkeys.update(&self.settings);
+        }
+        i18n::set_locale(self.settings.language.as_deref());
+        self.push_tr();
+        self.push_connect_fields();
+        self.refresh_device_warning();
+    }
+
+    pub fn set_language(&mut self, lang: Option<String>) {
+        self.settings.language = lang;
+        i18n::set_locale(self.settings.language.as_deref());
+        // Labels are properties — pushing new strings re-renders every
+        // view live, chat history stays as-is. (The FLTK build had to
+        // rebuild views for this.)
+        self.push_tr();
+        self.push_connect_fields();
+    }
+
+    pub fn set_keybind(&mut self, action: BindableAction, bind: String) {
+        self.settings.set_bind(action, bind);
+        if let Some(hotkeys) = &mut self.hotkeys {
+            hotkeys.update(&self.settings);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  CHAT MODEL
+    // ════════════════════════════════════════════════════════════════
+
+    fn chat_at_bottom(&self) -> bool {
+        self.main.invoke_chat_at_bottom()
+    }
+
+    fn after_append(&self, was_at_bottom: bool) {
+        if was_at_bottom {
+            self.main.invoke_chat_scroll_to_end();
+        }
+    }
+
+    /// Mirror a history delta into the `VecModel` (drop from front, append
+    /// the converted new rows).
+    fn sync_history_tail(&mut self, delta: &app_core::chat::HistoryDelta) {
+        for _ in 0..delta.dropped_front {
+            if self.chat_model.row_count() > 0 {
+                let old = self.chat_model.row_data(0);
+                self.chat_model.remove(0);
+                if let Some(old) = old {
+                    // Free any GIF/image state owned by the dropped row.
+                    self.gifs.remove(&old.row_id);
+                    self.images.remove(&old.row_id);
+                }
+            }
+        }
+        // Pre-draw the ids (next_id needs &mut history; rows() holds &).
+        // Truncating u64→i32 is deliberate: ids only need uniqueness
+        // within the 500-row window, and 2^31 messages per session is
+        // out of scope by ~six orders of magnitude.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let ids: Vec<i32> = (0..delta.appended)
+            .map(|_| self.history.next_id() as i32)
+            .collect();
+        let rows = self.history.rows();
+        let start = rows.len() - delta.appended;
+        for (item, row_id) in rows[start..].iter().zip(ids) {
+            self.chat_model.push(ui::convert::chat_row(item, row_id));
+        }
+    }
+
+    /// Public mirror-sync for media.rs (image rows).
+    pub fn sync_delta(&mut self, delta: &app_core::chat::HistoryDelta) {
+        self.sync_history_tail(delta);
+    }
+
+    pub fn push_chat_system(&mut self, text: &str) {
+        let at_bottom = self.chat_at_bottom();
+        let delta = self.history.push_system(text);
+        self.sync_history_tail(&delta);
+        self.after_append(at_bottom);
+    }
+
+    pub fn push_chat_message(&mut self, ts: &str, user: &str, body: &str) {
+        let at_bottom = self.chat_at_bottom();
+        let delta = self.history.push_message(ts, user, body);
+        self.sync_history_tail(&delta);
+        self.after_append(at_bottom);
+    }
+
+    /// Media-row plumbing lives in `media.rs`; these expose the model
+    /// internals it needs.
+    pub fn chat_model(&self) -> &Rc<VecModel<ChatRow>> {
+        &self.chat_model
+    }
+
+    pub fn history_mut(&mut self) -> &mut ChatHistory {
+        &mut self.history
+    }
+
+    pub fn chat_scroll_state(&self) -> bool {
+        self.chat_at_bottom()
+    }
+
+    pub fn chat_appended(&self, was_at_bottom: bool) {
+        self.after_append(was_at_bottom);
+    }
+
+    pub fn gifs_mut(&mut self) -> &mut HashMap<i32, GifPlayer> {
+        &mut self.gifs
+    }
+
+    pub fn set_pending_preview(&mut self, png: Vec<u8>) {
+        self.pending_preview = Some(png);
+    }
+
+    fn gif_hover(&mut self, row_id: i32, entering: bool) {
+        let needs_ticker = self
+            .gifs
+            .get_mut(&row_id)
+            .is_some_and(|player| player.hover(entering));
+        if needs_ticker {
+            self.ensure_gif_ticker();
+        }
+    }
+
+    /// Start the 33 ms animation ticker if it isn't already running.
+    pub fn ensure_gif_ticker(&mut self) {
+        if self.gif_ticker.running() {
+            return;
+        }
+        let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+        if let Some(weak) = weak {
+            self.gif_ticker.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(33),
+                move || with_app(&weak, AppState::gif_tick),
+            );
+        }
+    }
+
+    /// One animation tick: advance every playing chat GIF and the
+    /// overlay GIF; stop the ticker when nothing is playing.
+    fn gif_tick(&mut self) {
+        use crate::media::GifStep;
+        const DT_MS: f64 = 33.0;
+
+        let mut any_playing = false;
+        let mut blits: Vec<(i32, Rc<app_core::gif::GifAnimation>, usize, bool)> = Vec::new();
+        for (&row_id, player) in &mut self.gifs {
+            match player.step(DT_MS) {
+                GifStep::Idle => {}
+                GifStep::Blit { anim, idx } => blits.push((row_id, anim, idx, false)),
+                GifStep::Freeze { anim } => blits.push((row_id, anim, 0, true)),
+            }
+            any_playing |= player.playing();
+        }
+        for (row_id, anim, idx, _) in &blits {
+            let frame = &anim.frames[*idx];
+            for i in 0..self.chat_model.row_count() {
+                if let Some(mut row) = self.chat_model.row_data(i)
+                    && row.row_id == *row_id {
+                        row.image =
+                            ui::convert::rgba_image(&frame.rgba, anim.width, anim.height);
+                        self.chat_model.set_row_data(i, row);
+                        break;
+                    }
+            }
+        }
+
+        if let Some(g) = &mut self.gallery_gif {
+            any_playing = true;
+            g.in_frame_ms += DT_MS;
+            let mut advanced = false;
+            for _ in 0..g.anim.frames.len() {
+                let delay = f64::from(g.anim.frames[g.idx].delay_ms);
+                if g.in_frame_ms < delay {
+                    break;
+                }
+                g.in_frame_ms -= delay;
+                g.idx = (g.idx + 1) % g.anim.frames.len();
+                advanced = true;
+            }
+            if advanced {
+                let frame = &g.anim.frames[g.idx];
+                self.main.global::<State>().set_viewer_image(
+                    ui::convert::rgba_image(&frame.rgba, g.anim.width, g.anim.height),
+                );
+            }
+        }
+
+        if !any_playing {
+            self.gif_ticker.stop();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  ROSTER / STATUS
+    // ════════════════════════════════════════════════════════════════
+
+    fn update_user_list(&mut self) {
+        let rows = roster::rows(
+            &self.users,
+            self.our_client_id,
+            &self.sharer_ids,
+            self.is_muted,
+            self.is_deafened,
+        );
+        // In-place update: write rows positionally, growing/shrinking
+        // only when membership changed — preserves the ListView's
+        // scroll offset exactly like the FLTK incremental path.
+        let converted: Vec<UserRow> = rows.iter().map(ui::convert::user_row).collect();
+        let current = self.users_model.row_count();
+        for (i, row) in converted.iter().enumerate() {
+            if i < current {
+                self.users_model.set_row_data(i, row.clone());
+            } else {
+                self.users_model.push(row.clone());
+            }
+        }
+        for i in (converted.len()..current).rev() {
+            self.users_model.remove(i);
+        }
+        self.main
+            .global::<State>()
+            .set_users_count_label(t!("users-count", "count" => self.users.len()).into());
+    }
+
+    fn update_latency(
+        &self,
+        rtt_ms: f64,
+        loss_pct: f64,
+        audio_latency_ms: Option<u32>,
+        kbps_up: f64,
+        kbps_down: f64,
+    ) {
+        use app_core::stats::{LatencyGrade, latency_grade, net_str};
+        let s = self.main.global::<State>();
+        s.set_status_text(format!("●  {}", t!("status-connected")).into());
+        s.set_status_color(match latency_grade(rtt_ms) {
+            LatencyGrade::Good => slint::Color::from_rgb_u8(0x2B, 0xAC, 0x76),
+            LatencyGrade::Fair => slint::Color::from_rgb_u8(0xEC, 0xB2, 0x2E),
+            LatencyGrade::Bad => slint::Color::from_rgb_u8(0xE0, 0x1E, 0x5A),
+        });
+        let audio_str = match audio_latency_ms {
+            Some(ms) => format!("{ms}ms"),
+            None => "--".to_string(),
+        };
+        s.set_latency_line(
+            t!("latency-line",
+                "audio" => audio_str,
+                "network" => net_str(rtt_ms, loss_pct),
+                "up" => format!("{:.1}", kbps_up / 1000.0),
+                "down" => format!("{:.1}", kbps_down / 1000.0))
+            .into(),
         );
     }
 
-    fn show_error(&mut self, error: &str) {
-        if let Some(frame) = &mut self.error_frame {
-            frame.set_label(error);
-            frame.set_label_color(theme::DANGER);
+    #[allow(clippy::cast_precision_loss)]
+    fn update_stream_stats(&mut self) {
+        if !self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+            return;
         }
-
-        let sender = self.sender;
-        app::add_timeout3(5.0, move |_| {
-            sender.send(UiMessage::ClearError);
-        });
+        let sh = &self.screen.shared;
+        let frame_bytes = sh.last_frame_bytes.load(Ordering::Relaxed);
+        let encode_us = sh.last_encode_us.load(Ordering::Relaxed);
+        let viewers = sh.stream_viewers.load(Ordering::Relaxed);
+        let fps_scale_pct = sh.fps_scale_pct.load(Ordering::Relaxed);
+        let loss_pct = f32::from_bits(sh.stream_loss_pct.load(Ordering::Relaxed));
+        let quality_str = sh
+            .current_quality
+            .lock()
+            .ok()
+            .and_then(|q| *q)
+            .map_or_else(|| t!("unknown"), |q| q.to_string());
+        if !self.main_on_screen() {
+            return;
+        }
+        let stats = app_core::stats::StreamStats {
+            quality: quality_str,
+            avg_frame_kb: frame_bytes as f32 / 1024.0,
+            encode_ms: encode_us as f32 / 1000.0,
+            viewers,
+            fps_scale_pct,
+            loss_pct,
+        };
+        let line1 = t!("stream-stats-quality",
+            "quality" => stats.quality.as_str(), "viewers" => stats.viewers);
+        let mut line2 = t!("stream-stats-frame",
+            "kb" => format!("{:.0}", stats.avg_frame_kb),
+            "ms" => format!("{:.1}", stats.encode_ms));
+        if stats.degraded() {
+            line2.push_str(" · ");
+            line2.push_str(&t!("stream-stats-degraded",
+                "fps" => stats.fps_scale_pct,
+                "loss" => format!("{:.1}", stats.loss_pct)));
+        }
+        let s = self.main.global::<State>();
+        s.set_stream_stats(format!("{line1}\n{line2}").into());
+        s.set_stream_degraded(stats.degraded());
     }
 
-    fn get_username(&self, client_id: renet::ClientId) -> String {
-        self.users
-            .get(&client_id)
-            .map(|u| u.username.clone())
-            // ClientId is u64 — pass it pre-formatted so Fluent's f64-backed
-            // numbers can't lose precision on large ids.
-            .unwrap_or_else(|| t!("fallback-username", "id" => client_id.to_string()))
+    /// Whether the main screen is actually being rendered: false on the
+    /// connect view, hidden to the tray, or minimized. Stats updates
+    /// and resource sampling are skipped while this is false.
+    fn main_on_screen(&self) -> bool {
+        self.main.global::<State>().get_phase() == Phase::Main
+            && self.main.window().is_visible()
+            && !self.main.window().is_minimized()
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn sample_resources(&mut self) {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+
+        // Sample only when someone can actually see the result. The
+        // check comes first so a hidden/minimized app pays nothing —
+        // not even the process-table refresh.
+        let Some(pid) = self.pid else { return };
+        if !self.main_on_screen() {
+            return;
+        }
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::nothing().with_memory().with_cpu(),
+        );
+        if let Some(proc) = self.sys.process(pid) {
+            // cpu_usage() is % of one core; normalize to % of the whole
+            // machine (task-manager style).
+            let cores = std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get) as f32;
+            let cpu_pct = proc.cpu_usage() / cores;
+            // Memory: the platform-native figure (what the user's own
+            // task monitor shows), with sysinfo's RSS as the fallback.
+            let mem_bytes =
+                crate::resources::native_monitor_memory().unwrap_or_else(|| proc.memory());
+            let mem_mb = mem_bytes as f64 / (1024.0 * 1024.0);
+            self.main.global::<State>().set_resource_line(
+                t!("resource-line",
+                    "cpu" => format!("{cpu_pct:.1}"),
+                    "mem" => format!("{mem_mb:.0}"))
+                .into(),
+            );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  MISC
+    // ════════════════════════════════════════════════════════════════
+
+    /// Keep a timer alive for the app's lifetime.
+    pub fn hold_timer(&mut self, timer: slint::Timer) {
+        self.timers.push(timer);
+    }
+
+    pub fn show_error(&mut self, error: &str) {
+        self.main
+            .global::<State>()
+            .set_error_text(error.into());
+        let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+        if let Some(weak) = weak {
+            self.error_timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_secs(5),
+                move || {
+                    with_app(&weak, |app| {
+                        app.main.global::<State>().set_error_text("".into());
+                    });
+                },
+            );
+        }
+    }
+
+    /// Update-flow state transitions (called from `updater.rs`).
+    pub fn set_update_available(&mut self, remote_version: String) {
+        let s = self.main.global::<State>();
+        s.set_update_heading(t!("update-available-heading").into());
+        s.set_update_body(
+            t!("update-version-info",
+                "current" => CURRENT_VERSION,
+                "latest" => remote_version.as_str())
+            .into(),
+        );
+        s.set_phase(Phase::UpdatePrompt);
+        self.update_version = Some(remote_version);
+    }
+
+    pub fn update_version(&self) -> Option<&str> {
+        self.update_version.as_deref()
+    }
+
+    pub fn download_cancel_flag(&self) -> Arc<AtomicBool> {
+        self.download_cancelled.clone()
+    }
+
+    pub fn set_download_done(&mut self, path: String) {
+        let s = self.main.global::<State>();
+        s.set_update_heading(t!("update-downloaded-heading").into());
+        s.set_update_body(t!("update-ready-info").into());
+        s.set_update_progress(1.0);
+        s.set_update_progress_text("".into());
+        s.set_phase(Phase::DownloadDone);
+        self.update_zip_path = Some(path);
+    }
+
+    pub fn set_download_failed(&mut self, error: &str) {
+        let s = self.main.global::<State>();
+        s.set_update_heading(t!("update-failed-heading").into());
+        s.set_update_body(error.into());
+        s.set_phase(Phase::DownloadFailed);
+    }
+
+    // Window px values fit comfortably in every one of these casts.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn save_window_geometry(&mut self) {
+        let size = self.main.window().size();
+        let pos = self.main.window().position();
+        let scale = self.main.window().scale_factor();
+        self.settings.window.width = (size.width as f32 / scale) as i32;
+        self.settings.window.height = (size.height as f32 / scale) as i32;
+        self.settings.window.x = Some(pos.x);
+        self.settings.window.y = Some(pos.y);
+    }
+
+    /// Push every localized static label into the Tr global (called at
+    /// startup and on language change — this is live language
+    /// switching, no rebuilds).
+    #[allow(clippy::too_many_lines)]
+    pub fn push_tr(&self) {
+        fill_tr(&self.main.global::<Tr>());
+        if let Some(win) = &self.settings_win {
+            fill_tr(&win.global::<Tr>());
+        }
+    }
+
+    fn push_connect_fields(&self) {
+        let s = self.main.global::<State>();
+        s.set_nickname(self.settings.user.nickname.as_str().into());
+        s.set_password(
+            self.settings
+                .server
+                .token_password
+                .as_deref()
+                .unwrap_or("")
+                .into(),
+        );
+        s.set_server_note(
+            t!("connect-server-note", "server" => self.settings.server.address.as_str()).into(),
+        );
     }
 
     /// Clean shutdown: signal threads, join with timeout, save settings.
     ///
     /// Order matters:
-    /// 1. Save settings (while windows still exist for geometry)
-    /// 2. Stop voice engine (drops audio devices, closes internal threads)
+    /// 1. Save settings (while the window still exists for geometry)
+    /// 2. Stop voice engine (drops audio devices, closes threads)
     /// 3. Disconnect network (sends goodbye to server)
-    /// 4. Signal both worker threads to exit
+    /// 4. Signal all worker threads to exit
     /// 5. Join with hard timeout — never hang forever
     fn shutdown(&mut self) {
         info!("Shutting down");
 
-        // 1. Save window geometry while the window still exists
-        if let Some(ref w) = self.main_window {
-            self.settings.window.width = w.w();
-            self.settings.window.height = w.h();
-            self.settings.window.x = Some(w.x());
-            self.settings.window.y = Some(w.y());
-        }
+        self.save_window_geometry();
         self.settings.save();
 
-        // 2. Stop the voice engine (releases audio devices + internal threads)
         self.voice.tx.send(VoiceControl::Stop).ok();
 
-        // 3. Disconnect from server cleanly. No delay needed: the
-        //    control channel is FIFO, so the network thread flushes the
-        //    disconnect packet (synchronously, inside its Disconnect
-        //    handler) before it ever sees the Shutdown queued below —
-        //    and step 5 joins the thread regardless.
+        // No delay needed: the control channel is FIFO, so the network
+        // thread flushes the disconnect packet before it ever sees the
+        // Shutdown queued below — and step 5 joins the thread regardless.
         self.network.tx.send(NetworkControl::Disconnect).ok();
 
-        // 4. Signal all threads to exit their loops
         self.voice.tx.send(VoiceControl::Shutdown).ok();
         self.network.tx.send(NetworkControl::Shutdown).ok();
         self.screen.tx.send(ScreenControl::Shutdown).ok();
 
-        // 5. Join with hard timeout — take handles so Drop won't try again.
-        //    If a thread is stuck (cpal deadlock, etc.), we bail after 2s
-        //    and let the OS clean up on process exit.
         let voice_handle = self.voice.join_handle.take();
         let network_handle = self.network.join_handle.take();
         let screen_handle = self.screen.join_handle.take();
@@ -1902,11 +2112,115 @@ impl App {
             }
             let _ = done_tx.send(());
         });
-        self.tray_icon.take();
 
         match done_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(()) => info!("Shutdown complete"),
             Err(_) => warn!("Shutdown timed out — threads still running, exiting anyway"),
         }
+    }
+}
+
+/// `audio::PeerAudioSettings` ↔ app-core's `PeerAudio` mirror.
+fn peer_audio_from(a: &PeerAudioSettings) -> PeerAudio {
+    PeerAudio {
+        volume: a.volume,
+        is_muted: a.is_muted,
+    }
+}
+
+fn peer_audio_to(a: PeerAudio) -> PeerAudioSettings {
+    PeerAudioSettings {
+        volume: a.volume,
+        is_muted: a.is_muted,
+    }
+}
+
+/// Fill a `Tr` global instance from fluent. Each window component tree
+/// carries its own global storage, so this runs per window.
+#[allow(clippy::too_many_lines)]
+pub fn fill_tr(tr: &Tr) {
+    tr.set_app_tagline(t!("app-tagline").into());
+    tr.set_nickname(t!("nickname").into());
+    tr.set_server_password(t!("server-password").into());
+    tr.set_connect(t!("connect").into());
+    tr.set_settings(t!("settings").into());
+    tr.set_quit(t!("quit").into());
+    tr.set_mute(t!("mute").into());
+    tr.set_unmute(t!("unmute").into());
+    tr.set_deafen(t!("deafen").into());
+    tr.set_undeafen(t!("undeafen").into());
+    tr.set_share_screen(t!("share-screen").into());
+    tr.set_stop_sharing(t!("stop-sharing").into());
+    tr.set_disconnect(t!("disconnect").into());
+    tr.set_live(t!("live").into());
+    tr.set_user_volume(t!("user-volume").into());
+    tr.set_watch_stream(t!("watch-stream").into());
+    tr.set_reset_audio(t!("reset-audio").into());
+    tr.set_send(t!("send").into());
+    tr.set_cancel(t!("cancel").into());
+    tr.set_chat_emoji_tooltip(t!("chat-emoji-tooltip").into());
+    tr.set_chat_attach_tooltip(t!("chat-attach-tooltip").into());
+    tr.set_image_preview_title(t!("image-preview-title").into());
+    tr.set_menu_cut(t!("menu-cut").into());
+    tr.set_menu_copy(t!("menu-copy").into());
+    tr.set_menu_paste(t!("menu-paste").into());
+    tr.set_menu_copy_message(t!("menu-copy-message").into());
+    tr.set_menu_copy_link(t!("menu-copy-link").into());
+    tr.set_menu_open_link(t!("menu-open-link").into());
+    tr.set_menu_save_image(t!("menu-save-image").into());
+    tr.set_menu_open_image(t!("menu-open-image").into());
+    tr.set_monitor(t!("monitor").into());
+    tr.set_quality(t!("quality").into());
+    tr.set_start_sharing(t!("start-sharing").into());
+    tr.set_stop_watching(t!("stop-watching").into());
+    tr.set_settings_title(t!("settings-title").into());
+    tr.set_tab_general(t!("tab-general").into());
+    tr.set_tab_audio(t!("tab-audio").into());
+    tr.set_tab_keyboard(t!("tab-keyboard").into());
+    tr.set_tab_credits(t!("tab-credits").into());
+    tr.set_tab_about(t!("tab-about").into());
+    tr.set_save_and_close(t!("save-and-close").into());
+    tr.set_reset_defaults(t!("reset-defaults").into());
+    tr.set_language(t!("language").into());
+    tr.set_language_note(t!("language-note").into());
+    tr.set_settings_server(t!("settings-server").into());
+    tr.set_server_address(t!("server-address").into());
+    tr.set_server_token_url(t!("server-token-url").into());
+    tr.set_server_config_note(t!("server-config-note").into());
+    tr.set_audio_devices_header(t!("audio-devices-header").into());
+    tr.set_audio_input_device(t!("audio-input-device").into());
+    tr.set_audio_output_device(t!("audio-output-device").into());
+    tr.set_audio_system_default(t!("audio-system-default").into());
+    tr.set_audio_input_header(t!("audio-input-header").into());
+    tr.set_audio_capture_level(t!("audio-capture-level").into());
+    tr.set_audio_input_gain(t!("audio-input-gain").into());
+    tr.set_audio_input_sensitivity(t!("audio-input-sensitivity").into());
+    tr.set_audio_gate_hint(t!("audio-gate-hint").into());
+    tr.set_audio_test_mic(t!("audio-test-mic").into());
+    tr.set_audio_stop_testing(t!("audio-stop-testing").into());
+    tr.set_audio_output_header(t!("audio-output-header").into());
+    tr.set_audio_master_volume(t!("audio-master-volume").into());
+    tr.set_keybinds_header(t!("keybinds-header").into());
+    tr.set_keybinds_hint(t!("keybinds-hint").into());
+    tr.set_keybind_record(t!("keybind-record").into());
+    tr.set_keybind_press_combo(t!("keybind-press-combo").into());
+    tr.set_keybind_not_set(t!("keybind-not-set").into());
+    tr.set_update_now(t!("update-now").into());
+    tr.set_update_skip(t!("update-skip").into());
+    tr.set_update_not_now(t!("update-not-now").into());
+    tr.set_update_continue(t!("update-continue").into());
+    tr.set_update_install_restart(t!("update-install-restart").into());
+    tr.set_splash_checking(t!("splash-checking").into());
+}
+
+#[cfg(feature = "tray")]
+pub mod tray {
+    //! System tray via the trayicon crate (same dependency as the FLTK
+    //! build; the fork is re-enabled in the real workspace manifest).
+    use super::AppState;
+    pub fn setup(_app: &mut AppState) {
+        // Wire TrayIconBuilder with Show/Quit entries → wake() +
+        // main.show() / quit_event_loop(). Kept behind the `tray`
+        // feature so default builds don't depend on the git fork.
     }
 }

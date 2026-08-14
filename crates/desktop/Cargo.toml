@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.1.39"
+version = "0.2.0"
 edition = "2024"
 
 [lints]
@@ -12,13 +12,21 @@ workspace = true
 name = "baucord"
 path = "src/main.rs"
 
+[features]
+default = []
+# System tray via the trayicon git fork (same dependency the FLTK build
+# used). Off by default so plain `cargo check` needs no git fetch; the
+# release workflow builds with `--features tray`.
+tray = ["dep:trayicon"]
+
 [dependencies]
 client = { path = "../client" }
 i18n = { path = "../i18n" }
-ui = { path = "../ui" }
 audio = { path = "../audio", features = ["serde"] }
 video = { path = "../video" }
-fltk.workspace = true
+app-core = { path = "../app-core" }
+ui = { path = "../ui" }
+slint.workspace = true
 renet.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
@@ -27,7 +35,7 @@ chrono = "0.4.41"
 ureq = "3.2.0"
 open = "5.3.3"
 global-hotkey = "0.7"
-trayicon = { git = "https://github.com/mpwsh/trayicon-rs" }
+trayicon = { git = "https://github.com/mpwsh/trayicon-rs", optional = true }
 # png/gif are the wire formats; the rest let attach/paste/drop decode
 # the common disk formats (re-encoded to PNG before sending). 0.25.9
 # floor guarantees the root ImageReader/Limits API used for bounded
@@ -42,12 +50,27 @@ image = { version = "0.25.9", default-features = false, features = [
 ] }
 # Own-process CPU/memory for the sidebar stats line. Only the `system`
 # feature — no disks/network/components/users — to keep the build lean.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# SANDBOX-PIN(0.38): the 0.39 line needs rustc ≥1.92 (cfg_select) and this
+# sandbox validates on 1.91. The API used (refresh_processes_specifics +
+# ProcessesToUpdate + ProcessRefreshKind) is identical across 0.38/0.39.
+# Restore to `0.39` in the real workspace — MIGRATION.md tracks this.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 zip = "2"
 self-replace = "1.5.0"
+# Plain-text clipboard read/write. Slint exposes no clipboard API;
+# TextInput's internal Ctrl+V only covers text typed into it — the
+# rich-paste chain and "Copy message" need programmatic access.
+# clipboard.rs keeps its per-platform file/PNG readers (arboard has
+# no file-list support).
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# Native open/save dialogs (FLTK's chooser is gone). The portal backend
+# avoids a GTK link dependency; it is async, hence the tiny pollster
+# block_on on the dialog scratch threads.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+pollster = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Native NSPasteboard access for what FLTK's clipboard layer can't
+# Native NSPasteboard access for what the toolkit clipboard layer can't
 # see: copied files (paste the file, not its icon) and PNG-only
 # sources like screenshot copies. Only the NSPasteboard header —
 # default features would compile every AppKit binding.

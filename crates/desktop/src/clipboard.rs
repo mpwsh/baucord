@@ -27,7 +27,7 @@ pub fn clipboard_file() -> Option<std::path::PathBuf> {
     // SAFETY: extern statics from AppKit; reading a framework constant.
     let data = pb.dataForType(unsafe { NSPasteboardTypeFileURL })?;
     let url = String::from_utf8(data.to_vec()).ok()?;
-    let path = crate::ui::chat::file_url_to_path(url.trim())?;
+    let path = app_core::images::file_url_to_path(url.trim())?;
     Some(path)
 }
 
@@ -163,4 +163,21 @@ pub fn clipboard_file() -> Option<std::path::PathBuf> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn clipboard_png() -> Option<Vec<u8>> {
     None
+}
+
+
+// ── Plain text (all platforms, via arboard) ─────────────────────────────
+
+/// Read the clipboard as plain text.
+pub fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+/// Put plain text on the clipboard (the "Copy message"/"Copy link"
+/// menu actions).
+pub fn set_clipboard_text(text: &str) {
+    if let Ok(mut cb) = arboard::Clipboard::new()
+        && let Err(e) = cb.set_text(text) {
+            log::warn!("Clipboard write failed: {e}");
+        }
 }

@@ -212,3 +212,9 @@ chat-gif-too-large = O GIF ultrapassa o limite de { $mb } MB
 chat-gif-too-big = GIFs animados podem ter no máximo { $dim } px de largura ou altura
 image-save-filter-gif = Imagem GIF
 chat-upload-progress = Enviando imagem… { $pct }%
+
+# ── Adições da migração para Slint ──────────────────────────────────────
+tech-slint = Slint - Interface de usuário
+chat-image-too-large = A imagem é grande demais para enviar ({ $kb } KB após redimensionar)
+chat-image-save-error = Não foi possível salvar a imagem: { $error }
+chat-downloading-image = Baixando imagem…

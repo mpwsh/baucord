@@ -1,0 +1,281 @@
+// main.slint — the application window.
+//
+// One Window hosting all phases (splash/update → connect → main), plus
+// the in-window overlays: image send preview, screen-share dialog, and
+// the per-user audio popover. Every FLTK floating helper window becomes
+// an overlay here — which retires the orphaned-popup / focus-churn
+// machinery wholesale (there is nothing to strand on the desktop).
+
+import { Theme } from "theme.slint";
+import { Tr } from "tr.slint";
+import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow } from "globals.slint";
+import { ConnectView } from "connect.slint";
+import { StartupView } from "startup.slint";
+import { Sidebar } from "sidebar.slint";
+import { ChatPane } from "chat.slint";
+import { Btn, IconBtn, Card, HSlider, Sep, FieldLabel, Dropdown } from "widgets.slint";
+import { SettingsWindow, SettingsState, SettingsLogic } from "settings.slint";
+import { StreamViewerWindow } from "viewer.slint";
+
+export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow }
+
+export component MainWindow inherits Window {
+    title: "baucord";
+    background: Theme.bg-primary;
+    preferred-width: 1000px;
+    preferred-height: 640px;
+    min-width: 500px;
+    min-height: 400px;
+    icon: @image-url("icons/monitor.svg");   // replaced by the shell's window icon on supported platforms
+
+    // Share-dialog local state
+    in-out property <bool> share-dialog-open: false;
+    property <int> share-monitor: State.default-monitor;
+    property <int> share-quality: State.default-quality;
+
+    public function chat-at-bottom() -> bool { return chat-pane.at-bottom(); }
+    public function chat-scroll-to-end() { chat-pane.scroll-to-end(); }
+    public function focus-composer() { chat-pane.focus-composer(); }
+    public function open-share-dialog() {
+        share-monitor = State.default-monitor;
+        share-quality = State.default-quality;
+        share-dialog-open = true;
+    }
+
+    // ── Phases ─────────────────────────────────────────────────────
+    // The main screen is a persistent instance (visible-gated, not
+    // `if`-gated) so the shell can query/drive chat scroll state at any
+    // time; the model is cleared per connection, matching the FLTK
+    // build's fresh-chat-per-session semantics.
+    if State.phase != Phase.connect && State.phase != Phase.main : StartupView { }
+    if State.phase == Phase.connect : ConnectView { }
+    main-screen := HorizontalLayout {
+        visible: State.phase == Phase.main;
+        Rectangle {
+            width: 260px;
+            Sidebar { }
+        }
+        chat-pane := ChatPane {
+            horizontal-stretch: 1;
+        }
+    }
+
+    // ── Error toast (any phase; connect view also shows inline) ────
+    if State.error-text != "" && State.phase == Phase.main : Rectangle {
+        x: (root.width - self.width) / 2;
+        y: Theme.gap-lg;
+        width: Math.min(toast.preferred-width + 32px, root.width - 2 * Theme.gap-lg);
+        height: toast.preferred-height + 20px;
+        border-radius: Theme.radius-md;
+        background: #2E1C23;
+        border-width: 1px;
+        border-color: Theme.danger;
+        toast := Text {
+            text: State.error-text;
+            color: Theme.danger;
+            font-size: Theme.font-body;
+            wrap: word-wrap;
+        }
+    }
+
+    // ── Image send preview (modal overlay) ─────────────────────────
+    if State.preview-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { Logic.preview-cancel(); } }
+        Card {
+            width: Math.min(520px, root.width - 48px);
+            height: pv.preferred-height;
+            TouchArea { }   // swallow clicks inside the card
+            pv := VerticalLayout {
+                padding: Theme.gap-lg;
+                spacing: Theme.gap-md;
+                Text {
+                    text: Tr.image-preview-title;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Rectangle {
+                    height: 300px;
+                    border-radius: Theme.radius-md;
+                    background: Theme.surface;
+                    clip: true;
+                    Image {
+                        width: parent.width - 2 * Theme.gap-sm;
+                        height: parent.height - 2 * Theme.gap-sm;
+                        source: State.preview-image;
+                        image-fit: contain;
+                    }
+                }
+                Text {
+                    text: State.preview-caption;
+                    color: Theme.text-muted;
+                    font-size: Theme.font-sm;
+                    horizontal-alignment: center;
+                }
+                HorizontalLayout {
+                    spacing: Theme.gap-sm;
+                    Btn { text: Tr.cancel; clicked => { Logic.preview-cancel(); } }
+                    Btn { text: Tr.send; accent: true; clicked => { Logic.preview-send(); } }
+                }
+            }
+        }
+    }
+
+
+    // ── Image viewer (modal overlay; darkened scrim like the preview) ──
+    if State.viewer-open : Rectangle {
+        background: #000000CC;
+        TouchArea { clicked => { Logic.viewer-close(); } }
+        VerticalLayout {
+            padding: Theme.gap-lg;
+            spacing: Theme.gap-md;
+            HorizontalLayout {
+                height: 32px;
+                Text {
+                    text: State.viewer-heading;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                IconBtn {
+                    icon: @image-url("icons/download.svg");
+                    tooltip: Tr.menu-save-image;
+                    clicked => { Logic.viewer-save(); }
+                }
+                IconBtn {
+                    icon: @image-url("icons/x.svg");
+                    clicked => { Logic.viewer-close(); }
+                }
+            }
+            HorizontalLayout {
+                spacing: Theme.gap-md;
+                vertical-stretch: 1;
+                IconBtn {
+                    y: (parent.height - self.height) / 2;
+                    icon: @image-url("icons/chevron-left.svg");
+                    opacity: State.viewer-has-prev ? 1.0 : 0.25;
+                    clicked => { if (State.viewer-has-prev) { Logic.viewer-step(-1); } }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    TouchArea { }   // swallow clicks over the picture
+                    Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: State.viewer-image;
+                        image-fit: contain;
+                    }
+                }
+                IconBtn {
+                    y: (parent.height - self.height) / 2;
+                    icon: @image-url("icons/chevron-right.svg");
+                    opacity: State.viewer-has-next ? 1.0 : 0.25;
+                    clicked => { if (State.viewer-has-next) { Logic.viewer-step(1); } }
+                }
+            }
+        }
+    }
+
+    // ── Screen-share dialog (modal overlay) ────────────────────────
+    if root.share-dialog-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { root.share-dialog-open = false; } }
+        Card {
+            width: 380px;
+            height: sh.preferred-height;
+            TouchArea { }
+            sh := VerticalLayout {
+                padding: Theme.gap-lg;
+                spacing: Theme.gap-md;
+                Text {
+                    text: Tr.share-screen;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: 600;
+                }
+                FieldLabel { text: Tr.monitor; }
+                Dropdown {
+                    options: State.monitors;
+                    current <=> root.share-monitor;
+                }
+                FieldLabel { text: Tr.quality; }
+                Dropdown {
+                    options: State.qualities;
+                    current <=> root.share-quality;
+                }
+                Btn {
+                    text: Tr.start-sharing;
+                    accent: true;
+                    clicked => {
+                        root.share-dialog-open = false;
+                        Logic.start-share(root.share-monitor, root.share-quality);
+                    }
+                }
+            }
+        }
+    }
+    // ── Per-user audio popover ─────────────────────────────────────
+    if State.user-popup-open && State.popup-user-index >= 0
+        && State.popup-user-index < State.users.length : Rectangle {
+        background: #00000055;
+        TouchArea { clicked => { Logic.popup-closed(); } }
+        Card {
+            width: 260px;
+            height: up.preferred-height;
+            background: Theme.bg-tertiary;
+            border-width: 1px;
+            border-color: Theme.border;
+            TouchArea { }
+            up := VerticalLayout {
+                padding: Theme.gap-lg;
+                spacing: Theme.gap-md;
+                Text {
+                    text: State.users[State.popup-user-index].name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                FieldLabel { text: Tr.user-volume; }
+                HorizontalLayout {
+                    spacing: Theme.gap-sm;
+                    HSlider {
+                        horizontal-stretch: 1;
+                        minimum: 0.0; maximum: 2.0;
+                        value <=> State.popup-volume;
+                        released(v) => {
+                            Logic.popup-set-volume(State.popup-user-index, v);
+                        }
+                    }
+                    Text {
+                        width: 44px;
+                        text: "\{Math.round(State.popup-volume * 100)}%";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-sm;
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                    }
+                }
+                Sep { }
+                Btn {
+                    text: State.users[State.popup-user-index].local-muted ? Tr.unmute : Tr.mute;
+                    danger: State.users[State.popup-user-index].local-muted;
+                    clicked => { Logic.popup-toggle-mute(State.popup-user-index); }
+                }
+                Btn {
+                    text: Tr.reset-audio;
+                    clicked => { Logic.popup-reset-audio(State.popup-user-index); }
+                }
+                if State.users[State.popup-user-index].sharing : Btn {
+                    text: Tr.watch-stream;
+                    accent: true;
+                    clicked => { Logic.popup-watch(State.popup-user-index); }
+                }
+            }
+        }
+    }
+}

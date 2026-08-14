@@ -1,0 +1,322 @@
+// settings.slint — the settings window.
+//
+// Left nav (General / Audio / Keyboard / Credits / About), scrollable
+// content, Save & close + Reset row — the FLTK layout, rounded.
+//
+// Live semantics carry over: every control applies immediately through
+// a callback (per keystroke / per tick), persistence happens when the
+// window closes. Meters read levels the shell pushes at 8 Hz while the
+// window is open (the shell stops the timer on close — the FLTK build
+// leaked one timer per open until its alive-probe fired).
+
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Tr } from "tr.slint";
+import { KeybindRow } from "globals.slint";
+import { Btn, Field, FieldLabel, Hint, SectionHeader, Sep, HSlider, VuMeter, GateMeter, Dropdown } from "widgets.slint";
+
+export global SettingsState {
+    // General
+    in property <[string]> languages;         // ["System", "English", …]
+    in-out property <int> language-index: 0;
+    in-out property <string> server-address;
+    in-out property <string> token-url;
+
+    // Audio
+    in property <[string]> input-devices;     // index 0 = "System default"
+    in property <[string]> output-devices;
+    in-out property <int> input-index: 0;
+    in-out property <int> output-index: 0;
+    in property <float> mic-level: 0.0;       // denoised, gate-scaled
+    in property <float> out-level: 0.0;
+    in-out property <float> gate-threshold: 0.02;
+    in-out property <float> input-gain: 1.0;
+    in-out property <float> output-gain: 1.0;
+    in property <string> sensitivity-line;    // localized, host-formatted
+    in property <bool> testing-mic: false;
+    in property <string> test-hint;
+
+    // Keyboard
+    in property <[KeybindRow]> keybinds;
+    /// True while some row is recording — arms the window's key capture.
+    in property <bool> capturing: false;
+
+    // Credits / About — host-formatted blocks
+    in property <string> credits-text;
+    in property <string> about-text;
+}
+
+export global SettingsLogic {
+    callback language-selected(int);
+    callback server-address-edited(string);
+    callback token-url-edited(string);
+    callback input-device-selected(int);
+    callback output-device-selected(int);
+    callback gate-threshold-changed(float);
+    callback input-gain-changed(float);
+    callback output-gain-changed(float);
+    callback toggle-test-mic();
+    callback record-keybind(int);
+    /// A key landed while recording: (key-text, ctrl, alt, shift).
+    /// The host filters bare modifiers and maps text → key codes.
+    callback capture-key(string, bool, bool, bool);
+    callback capture-cancel();
+    callback capture-clear();
+    callback open-config-folder();
+    callback save-and-close();
+    callback reset-defaults();
+    callback closed();
+}
+
+component NavItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    height: 36px;
+    border-radius: Theme.radius-md;
+    background: active ? Theme.accent : t.has-hover ? Theme.hover : transparent;
+    animate background { duration: 150ms; }
+    Text {
+        x: Theme.gap-md;
+        width: parent.width - 2 * Theme.gap-md;
+        height: 100%;
+        vertical-alignment: center;
+        text: root.text;
+        color: root.active ? Theme.on-accent : Theme.text-secondary;
+        font-size: Theme.font-body;
+        font-weight: root.active ? 600 : 400;
+    }
+    t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component GeneralPanel inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    SectionHeader { text: Tr.tab-general; }
+    FieldLabel { text: Tr.language; }
+    Dropdown {
+        options: SettingsState.languages;
+        current <=> SettingsState.language-index;
+        selected(i) => { SettingsLogic.language-selected(i); }
+    }
+    Hint { text: Tr.language-note; }
+    Sep { }
+    SectionHeader { text: Tr.settings-server; }
+    FieldLabel { text: Tr.server-address; }
+    Field {
+        text <=> SettingsState.server-address;
+        edited => { SettingsLogic.server-address-edited(self.text); }
+    }
+    FieldLabel { text: Tr.server-token-url; }
+    Field {
+        text <=> SettingsState.token-url;
+        edited => { SettingsLogic.token-url-edited(self.text); }
+    }
+    Hint { text: Tr.server-config-note; }
+    Rectangle { }
+}
+
+component AudioPanel inherits VerticalLayout {
+    spacing: Theme.gap-sm;
+    SectionHeader { text: Tr.audio-devices-header; }
+    FieldLabel { text: Tr.audio-input-device; }
+    Dropdown {
+        options: SettingsState.input-devices;
+        current <=> SettingsState.input-index;
+        selected(i) => { SettingsLogic.input-device-selected(i); }
+    }
+    FieldLabel { text: Tr.audio-output-device; }
+    Dropdown {
+        options: SettingsState.output-devices;
+        current <=> SettingsState.output-index;
+        selected(i) => { SettingsLogic.output-device-selected(i); }
+    }
+    Sep { }
+    SectionHeader { text: Tr.audio-input-header; }
+    FieldLabel { text: Tr.audio-capture-level; }
+    GateMeter {
+        level: SettingsState.mic-level;
+        threshold: SettingsState.gate-threshold;
+    }
+    FieldLabel { text: Tr.audio-input-gain; }
+    HorizontalLayout {
+        spacing: Theme.gap-sm;
+        HSlider {
+            horizontal-stretch: 1;
+            minimum: 0.0; maximum: 2.0;
+            value <=> SettingsState.input-gain;
+            live-changed(v) => { SettingsLogic.input-gain-changed(v); }
+        }
+        Text {
+            width: 44px;
+            text: "\{Math.round(SettingsState.input-gain * 100)}%";
+            color: Theme.text-muted; font-size: Theme.font-sm;
+            vertical-alignment: center; horizontal-alignment: right;
+        }
+    }
+    FieldLabel { text: Tr.audio-input-sensitivity; }
+    HSlider {
+        minimum: 0.005; maximum: 0.10;
+        value <=> SettingsState.gate-threshold;
+        live-changed(v) => { SettingsLogic.gate-threshold-changed(v); }
+    }
+    Hint { text: SettingsState.sensitivity-line; }
+    Hint { text: Tr.audio-gate-hint; }
+    Btn {
+        text: SettingsState.testing-mic ? Tr.audio-stop-testing : Tr.audio-test-mic;
+        engaged: SettingsState.testing-mic;
+        clicked => { SettingsLogic.toggle-test-mic(); }
+    }
+    Hint {
+        text: SettingsState.test-hint;
+        color: SettingsState.testing-mic ? Theme.warning : Theme.text-muted;
+    }
+    Sep { }
+    SectionHeader { text: Tr.audio-output-header; }
+    VuMeter { level: SettingsState.out-level; }
+    FieldLabel { text: Tr.audio-master-volume; }
+    HorizontalLayout {
+        spacing: Theme.gap-sm;
+        HSlider {
+            horizontal-stretch: 1;
+            minimum: 0.0; maximum: 2.0;
+            value <=> SettingsState.output-gain;
+            live-changed(v) => { SettingsLogic.output-gain-changed(v); }
+        }
+        Text {
+            width: 44px;
+            text: "\{Math.round(SettingsState.output-gain * 100)}%";
+            color: Theme.text-muted; font-size: Theme.font-sm;
+            vertical-alignment: center; horizontal-alignment: right;
+        }
+    }
+    Rectangle { }
+}
+
+component KeyboardPanel inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    SectionHeader { text: Tr.keybinds-header; }
+    Hint { text: Tr.keybinds-hint; }
+    for kb[i] in SettingsState.keybinds : HorizontalLayout {
+        spacing: Theme.gap-sm;
+        height: 40px;
+        Text {
+            text: kb.action-label;
+            color: Theme.text-primary;
+            font-size: Theme.font-body;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Btn {
+            width: 180px;
+            text: kb.recording ? Tr.keybind-press-combo
+                : kb.bind == "" ? Tr.keybind-not-set : kb.bind;
+            engaged: kb.recording;
+            clicked => { SettingsLogic.record-keybind(i); }
+        }
+    }
+    Rectangle { }
+}
+
+component TextPanel inherits VerticalLayout {
+    in property <string> heading;
+    in property <string> body;
+    in property <bool> show-config-btn: false;
+    spacing: Theme.gap-md;
+    SectionHeader { text: root.heading; }
+    Text {
+        text: root.body;
+        color: Theme.text-secondary;
+        font-size: Theme.font-body;
+        wrap: word-wrap;
+    }
+    if root.show-config-btn : Btn {
+        text: "📁  " + Tr.tab-about;   // relabeled by host via Tr if needed
+        clicked => { SettingsLogic.open-config-folder(); }
+    }
+    Rectangle { }
+}
+
+export component SettingsWindow inherits Window {
+    title: Tr.settings-title;
+    background: Theme.bg-primary;
+    preferred-width: 720px;
+    preferred-height: 640px;
+    min-width: 620px;
+    min-height: 520px;
+
+    in-out property <int> tab: 0;
+
+    public function focus-capture() { keys.focus(); }
+
+    keys := FocusScope {
+        // While a keybind is recording, swallow everything here —
+        // Escape cancels, Backspace clears, anything else is the new
+        // bind. Outside recording, keys flow normally.
+        capture-key-pressed(ev) => {
+            if (!SettingsState.capturing) { return reject; }
+            if (ev.text == Key.Escape) { SettingsLogic.capture-cancel(); return accept; }
+            if (ev.text == Key.Backspace) { SettingsLogic.capture-clear(); return accept; }
+            SettingsLogic.capture-key(ev.text, ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+            accept
+        }
+
+    HorizontalLayout {
+        // Nav
+        Rectangle {
+            width: 168px;
+            background: Theme.surface;
+            VerticalLayout {
+                padding: Theme.gap-md;
+                spacing: Theme.gap-xs;
+                NavItem { text: Tr.tab-general;  active: root.tab == 0; clicked => { root.tab = 0; } }
+                NavItem { text: Tr.tab-audio;    active: root.tab == 1; clicked => { root.tab = 1; } }
+                NavItem { text: Tr.tab-keyboard; active: root.tab == 2; clicked => { root.tab = 2; } }
+                NavItem { text: Tr.tab-credits;  active: root.tab == 3; clicked => { root.tab = 3; } }
+                NavItem { text: Tr.tab-about;    active: root.tab == 4; clicked => { root.tab = 4; } }
+                Rectangle { }
+            }
+        }
+        // Content + button row
+        VerticalLayout {
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding: Theme.gap-xl;
+                    if root.tab == 0 : GeneralPanel { }
+                    if root.tab == 1 : AudioPanel { }
+                    if root.tab == 2 : KeyboardPanel { }
+                    if root.tab == 3 : TextPanel {
+                        heading: Tr.tab-credits;
+                        body: SettingsState.credits-text;
+                    }
+                    if root.tab == 4 : TextPanel {
+                        heading: Tr.tab-about;
+                        body: SettingsState.about-text;
+                        show-config-btn: true;
+                    }
+                }
+            }
+            Rectangle {
+                height: 64px;
+                background: Theme.bg-primary;
+                HorizontalLayout {
+                    padding: Theme.gap-md;
+                    spacing: Theme.gap-sm;
+                    Rectangle { }
+                    Btn {
+                        width: 170px;
+                        text: Tr.reset-defaults;
+                        clicked => { SettingsLogic.reset-defaults(); }
+                    }
+                    Btn {
+                        width: 170px;
+                        text: Tr.save-and-close;
+                        accent: true;
+                        clicked => { SettingsLogic.save-and-close(); }
+                    }
+                }
+            }
+        }
+    }
+    }
+}
