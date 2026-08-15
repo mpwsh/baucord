@@ -187,12 +187,34 @@ fn spawn_workers(
 /// can't rasterize many color-emoji glyph formats, which shows as tofu
 /// boxes in the emoji palette. Skia renders them all.
 fn select_renderer() {
-    #[cfg(feature = "skia")]
+    // An explicit SLINT_BACKEND still wins — the no-rebuild escape
+    // hatch (`winit-software` forces the basic software renderer;
+    // testing backends work too).
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return;
+    }
+
+    // Skia on its CPU raster backend ("skia-software"): presents via
+    // softbuffer, so no OpenGL/Metal/D3D surface ever exists — nothing
+    // for Windows Game Mode or GPU driver suites to classify as a game
+    // — while Skia's text stack still rasterizes color-emoji glyphs
+    // (palette AND inline chat text) and hints fonts properly, the two
+    // things Slint's basic software renderer cannot do. The ~150 MB
+    // RSS overhead measured with the old GPU Skia build came from the
+    // GL context + Ganesh caches; the raster backend skips all of it.
+    if slint::BackendSelector::new()
+        .renderer_name("skia-software".into())
+        .select()
+        .is_ok()
+    {
+        return;
+    }
+    warn!("Skia raster renderer unavailable, falling back to the basic software renderer");
     if let Err(e) = slint::BackendSelector::new()
-        .renderer_name("skia".into())
+        .renderer_name("software".into())
         .select()
     {
-        warn!("Skia renderer unavailable, using default: {e}");
+        warn!("Software renderer unavailable, using the default: {e}");
     }
 }
 
@@ -1675,15 +1697,12 @@ impl AppState {
     //  CHAT MODEL
     // ════════════════════════════════════════════════════════════════
 
-    fn chat_at_bottom(&self) -> bool {
-        self.main.invoke_chat_at_bottom()
-    }
-
-    fn after_append(&self, was_at_bottom: bool) {
-        if was_at_bottom {
-            self.main.invoke_chat_scroll_to_end();
-        }
-    }
+    // NOTE: there is deliberately no scroll-after-append here. The
+    // ListView pins itself to the bottom reactively (chat.slint's
+    // stick-to-bottom `changed` handlers), which runs AFTER layout —
+    // a host-side invoke right after a model push reads a stale
+    // viewport-height and lands short (or permanently unsticks once an
+    // image row overshoots the at-bottom slack).
 
     /// Mirror a history delta into the `VecModel` (drop from front, append
     /// the converted new rows).
@@ -1720,17 +1739,13 @@ impl AppState {
     }
 
     pub fn push_chat_system(&mut self, text: &str) {
-        let at_bottom = self.chat_at_bottom();
         let delta = self.history.push_system(text);
         self.sync_history_tail(&delta);
-        self.after_append(at_bottom);
     }
 
     pub fn push_chat_message(&mut self, ts: &str, user: &str, body: &str) {
-        let at_bottom = self.chat_at_bottom();
         let delta = self.history.push_message(ts, user, body);
         self.sync_history_tail(&delta);
-        self.after_append(at_bottom);
     }
 
     /// Media-row plumbing lives in `media.rs`; these expose the model
@@ -1741,14 +1756,6 @@ impl AppState {
 
     pub fn history_mut(&mut self) -> &mut ChatHistory {
         &mut self.history
-    }
-
-    pub fn chat_scroll_state(&self) -> bool {
-        self.chat_at_bottom()
-    }
-
-    pub fn chat_appended(&self, was_at_bottom: bool) {
-        self.after_append(was_at_bottom);
     }
 
     pub fn gifs_mut(&mut self) -> &mut HashMap<i32, GifPlayer> {
@@ -2225,6 +2232,7 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_tab_keyboard(t!("tab-keyboard").into());
     tr.set_tab_credits(t!("tab-credits").into());
     tr.set_tab_about(t!("tab-about").into());
+    tr.set_about_open_config(t!("about-open-config").into());
     tr.set_save_and_close(t!("save-and-close").into());
     tr.set_reset_defaults(t!("reset-defaults").into());
     tr.set_language(t!("language").into());
@@ -2261,78 +2269,47 @@ pub fn fill_tr(tr: &Tr) {
 
 #[cfg(feature = "tray")]
 pub mod tray {
-    //! System tray via the `tray-icon` crate (crates.io — no git dep).
-    //! With this feature on, closing the main window hides it and the
-    //! tray keeps the app reachable: Show reopens, Quit exits.
-    use std::sync::OnceLock;
-
+    //! System tray via Slint's builtin `SystemTrayIcon` (the `tray`
+    //! cargo feature adds `slint/system-tray`; native backends on all
+    //! three desktop platforms). With this feature on, closing the
+    //! main window hides it and the tray keeps the app reachable:
+    //! left-clicking the icon or its Show entry reopens the window,
+    //! Quit exits. Everything runs in-process on the Slint event loop
+    //! — no cross-thread event hop like the old `tray-icon` crate,
+    //! and a visible tray icon by itself keeps
+    //! `run_event_loop_until_quit` alive.
     use log::warn;
     use slint::ComponentHandle;
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
     use super::{with_current, AppState};
     use i18n::t;
 
-    /// Keeps the OS tray item alive for the app's lifetime.
-    struct TrayState {
-        _tray: TrayIcon,
-    }
-
     thread_local! {
-        static TRAY: std::cell::RefCell<Option<TrayState>> =
+        /// Keeps the OS tray item alive for the app's lifetime —
+        /// dropping the component removes the icon.
+        static TRAY: std::cell::RefCell<Option<ui::BaucordTray>> =
             const { std::cell::RefCell::new(None) };
-    }
-    static IDS: OnceLock<(tray_icon::menu::MenuId, tray_icon::menu::MenuId)> = OnceLock::new();
-
-    /// The app icon, decoded from the same .ico `build.rs` embeds on
-    /// Windows. Compile-time include, so the shipped binary stays
-    /// self-contained.
-    fn icon() -> Option<Icon> {
-        let bytes: &[u8] = include_bytes!("../../../assets/icons/icon.ico");
-        let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-        let (w, h) = (img.width(), img.height());
-        Icon::from_rgba(img.into_raw(), w, h).ok()
     }
 
     pub fn setup(_app: &mut AppState) {
-        let show = MenuItem::new(t!("tray-show"), true, None);
-        let quit = MenuItem::new(t!("tray-quit"), true, None);
-        let show_id = show.id().clone();
-        let quit_id = quit.id().clone();
-        let menu = Menu::new();
-        if let Err(e) = menu.append_items(&[&show, &quit]) {
-            warn!("Tray menu build failed: {e}");
-            return;
-        }
-
-        // Menu events arrive on an arbitrary thread — hop to the loop.
-        let _ = IDS.set((show_id, quit_id));
-        MenuEvent::set_event_handler(Some(|event: MenuEvent| {
-            let _ = slint::invoke_from_event_loop(move || {
-                let Some((show_id, quit_id)) = IDS.get() else { return };
-                if event.id() == show_id {
-                    with_current(|app| {
-                        let _ = app.main.show();
-                    });
-                } else if event.id() == quit_id {
-                    with_current(AppState::save_settings_now);
-                    let _ = slint::quit_event_loop();
-                }
+        let tray = match ui::BaucordTray::new() {
+            Ok(tray) => tray,
+            Err(e) => {
+                warn!("Tray icon unavailable: {e}");
+                return;
+            }
+        };
+        tray.set_show_label(t!("tray-show").into());
+        tray.set_quit_label(t!("tray-quit").into());
+        tray.on_show_app(|| {
+            with_current(|app| {
+                let _ = app.main.show();
             });
-        }));
-
-        let mut builder = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("baucord");
-        if let Some(icon) = icon() {
-            builder = builder.with_icon(icon);
-        }
-        match builder.build() {
-            Ok(tray) => TRAY.with(|slot| {
-                *slot.borrow_mut() = Some(TrayState { _tray: tray });
-            }),
-            Err(e) => warn!("Tray icon unavailable: {e}"),
-        }
+        });
+        tray.on_quit_app(|| {
+            with_current(AppState::save_settings_now);
+            let _ = slint::quit_event_loop();
+        });
+        TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
     }
 }

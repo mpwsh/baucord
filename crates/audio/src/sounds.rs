@@ -17,7 +17,6 @@ use crate::OPUS_SAMPLE_RATE;
 
 const JOIN_WAV: &[u8] = include_bytes!("../../../assets/sounds/join.wav");
 const LEAVE_WAV: &[u8] = include_bytes!("../../../assets/sounds/leave.wav");
-const CHAT_WAV: &[u8] = include_bytes!("../../../assets/sounds/chat.wav");
 
 // ── Sound types ─────────────────────────────────────────────────────────
 
@@ -28,7 +27,6 @@ const CHAT_WAV: &[u8] = include_bytes!("../../../assets/sounds/chat.wav");
 pub enum SoundType {
     UserJoined,
     UserLeft,
-    UserChat,
 }
 
 // ── Sound bank ──────────────────────────────────────────────────────────
@@ -37,7 +35,6 @@ pub enum SoundType {
 pub struct SoundBank {
     join: Vec<f32>,
     leave: Vec<f32>,
-    chat: Vec<f32>,
 }
 impl Default for SoundBank {
     fn default() -> Self {
@@ -50,7 +47,6 @@ impl SoundBank {
         Self {
             join: decode_wav("join", JOIN_WAV),
             leave: decode_wav("leave", LEAVE_WAV),
-            chat: decode_wav("chat", CHAT_WAV),
         }
     }
 
@@ -59,7 +55,6 @@ impl SoundBank {
         match sound {
             SoundType::UserJoined => &self.join,
             SoundType::UserLeft => &self.leave,
-            SoundType::UserChat => &self.chat,
         }
     }
 }

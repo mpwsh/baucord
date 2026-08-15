@@ -54,7 +54,6 @@ pub fn push_image_row(app: &mut AppState, ts: &str, user: &str, data: Vec<u8>) -
     };
     let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);
 
-    let at_bottom = app.chat_scroll_state();
     let delta = app
         .history_mut()
         .push_image(ts, user, data.clone(), w, h, is_gif);
@@ -88,7 +87,6 @@ pub fn push_image_row(app: &mut AppState, ts: &str, user: &str, data: Vec<u8>) -
         }
     }
 
-    app.chat_appended(at_bottom);
     true
 }
 

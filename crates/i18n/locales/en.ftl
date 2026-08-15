@@ -144,6 +144,7 @@ credits-beta-testers = BETA TESTERS
 about-header = ABOUT
 about-running-from = Running from:
 about-config-file = Config file:
+about-open-config = Open config location
 about-open-folder = Open install folder
 about-built-with = BUILT WITH
 tech-rust = Rust - Programming Language

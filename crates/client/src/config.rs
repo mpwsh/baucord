@@ -269,21 +269,13 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Canonical settings location: the platform config directory
-    /// (`%APPDATA%\baucord`, `~/.config/baucord`, `~/Library/Application
-    /// Support/baucord`). The old location — next to the executable —
-    /// broke under any install layout where the exe directory isn't
-    /// writable (Program Files, /usr/bin, macOS app bundles) and made
-    /// every new build directory silently reset the user's settings.
     fn get_settings_path() -> PathBuf {
-        match dirs::config_dir() {
-            Some(dir) => dir.join("baucord").join("settings.json"),
-            None => Self::legacy_settings_path(),
-        }
+        config_base_dir().join("settings.json")
     }
 
-    /// Pre-0.2 location: next to the executable.
-    fn legacy_settings_path() -> PathBuf {
+    /// The pre-0.2 file next to the executable — still probed by
+    /// `load` so ancient installs migrate.
+    fn exe_adjacent_settings_path() -> PathBuf {
         let mut path = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -307,16 +299,22 @@ impl Settings {
             return settings;
         }
 
-        // One-time migration from the old exe-adjacent location, so
-        // upgrading users keep their nickname, keybinds, and per-peer
-        // audio settings.
-        let legacy = Self::legacy_settings_path();
-        if legacy != path
-            && let Some(settings) = Self::read_from(&legacy)
-        {
-            info!("Migrating settings from {:?} to {:?}", legacy, path);
-            settings.save();
-            return settings;
+        // One-time migration from previous locations, newest scheme
+        // first — the 0.2 platform config dir, then the pre-0.2
+        // exe-adjacent file — so upgrading users keep their nickname,
+        // keybinds, and per-peer audio settings.
+        let old_paths = [
+            platform_config_dir().map(|d| d.join("settings.json")),
+            Some(Self::exe_adjacent_settings_path()),
+        ];
+        for old in old_paths.into_iter().flatten() {
+            if old != path
+                && let Some(settings) = Self::read_from(&old)
+            {
+                info!("Migrating settings from {:?} to {:?}", old, path);
+                settings.save();
+                return settings;
+            }
         }
 
         info!("Using default settings");
@@ -365,6 +363,60 @@ impl Settings {
     }
 }
 
+// ── Storage location ────────────────────────────────────────────────────
+
+/// Directory holding baucord's config files (settings.json,
+/// windows.json).
+///
+/// Release builds prefer the executable's directory so users can find
+/// their config next to the app (baucord installs are portable-style;
+/// the platform config dir is invisible to most users). When the exe
+/// directory isn't writable — Program Files, /usr/bin, a macOS app
+/// bundle — fall back to the platform config dir (`%APPDATA%\baucord`,
+/// `~/.config/baucord`, `~/Library/Application Support/baucord`) so
+/// settings still persist instead of erroring on every save. Debug
+/// builds always use the platform config dir, keeping state out of
+/// target/.
+fn config_base_dir() -> PathBuf {
+    #[cfg(not(debug_assertions))]
+    {
+        if let Some(dir) = writable_exe_dir() {
+            return dir;
+        }
+    }
+    platform_config_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn platform_config_dir() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("baucord"))
+}
+
+/// The executable's directory, if files can actually be created there.
+/// Probing with a real write is the only reliable check — directory
+/// metadata reflects neither Windows ACLs nor read-only mounts. Cached
+/// for the run: the answer can't change, and `Settings::save` runs on
+/// every settings-window keystroke path.
+#[cfg(not(debug_assertions))]
+fn writable_exe_dir() -> Option<PathBuf> {
+    static WRITABLE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    WRITABLE
+        .get_or_init(|| {
+            let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+            let probe = dir.join(".baucord-write-probe");
+            fs::write(&probe, b"").ok()?;
+            let _ = fs::remove_file(&probe);
+            Some(dir)
+        })
+        .clone()
+}
+
+/// Absolute path of the live settings file (shown on the About tab;
+/// its folder is what "open config location" opens).
+#[must_use]
+pub fn settings_file_path() -> PathBuf {
+    Settings::get_settings_path()
+}
+
 // ── Window-position store ───────────────────────────────────────────────
 //
 // Deliberately a separate tiny file, NOT part of `Settings`: dialogs
@@ -372,14 +424,23 @@ impl Settings {
 // through Settings would race the app's own in-memory copy (whichever
 // saved last would clobber the other's changes).
 
-fn window_positions_path() -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("baucord").join("windows.json"))
+fn window_positions_path() -> PathBuf {
+    config_base_dir().join("windows.json")
 }
 
 fn read_window_positions() -> HashMap<String, (i32, i32)> {
-    window_positions_path()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+    let read = |p: PathBuf| -> Option<HashMap<String, (i32, i32)>> {
+        serde_json::from_str(&fs::read_to_string(p).ok()?).ok()
+    };
+    read(window_positions_path())
+        // Positions written before the storage move (or by a debug
+        // build) live in the platform config dir — read them as a
+        // fallback rather than forgetting every window position once.
+        .or_else(|| {
+            platform_config_dir()
+                .map(|d| d.join("windows.json"))
+                .and_then(read)
+        })
         .unwrap_or_default()
 }
 
@@ -393,9 +454,7 @@ pub fn window_pos(key: &str) -> Option<(i32, i32)> {
 /// Persist the named window's position. Failures are silent — losing a
 /// window position is not worth an error dialog.
 pub fn set_window_pos(key: &str, pos: (i32, i32)) {
-    let Some(path) = window_positions_path() else {
-        return;
-    };
+    let path = window_positions_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }

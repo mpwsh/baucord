@@ -10,10 +10,6 @@ mod settingsui;
 mod updater;
 mod viewers;
 
-/// How many timestamped log files to keep (including the current run's).
-#[cfg(not(debug_assertions))]
-const LOG_FILES_TO_KEEP: usize = 5;
-
 fn main() {
     #[cfg(debug_assertions)]
     {
@@ -25,41 +21,38 @@ fn main() {
         use env_logger::Target;
         use std::fs::{self, OpenOptions};
 
-        // One log file per run: baucord-YYYYmmdd-HHMMSS.log
-        let log_path = format!(
-            "baucord-{}.log",
-            chrono::Local::now().format("%Y%m%d-%H%M%S")
-        );
-
-        // Remove the legacy single log file from older versions.
-        let _ = fs::remove_file("baucord.log");
-
-        // Prune old run logs, keeping the most recent few. The timestamp
-        // format sorts lexicographically, so a plain sort is chronological.
+        // Single append-mode log: every run keeps writing baucord.log.
+        // One-time migration: sweep the per-run baucord-<timestamp>.log
+        // files an older scheme left behind (exact prefix + suffix, so
+        // nothing else can match).
         if let Ok(entries) = fs::read_dir(".") {
-            let mut logs: Vec<String> = entries
+            for name in entries
                 .flatten()
                 .filter_map(|e| e.file_name().into_string().ok())
                 .filter(|n| n.starts_with("baucord-") && n.ends_with(".log"))
-                .collect();
-            logs.sort();
-            if logs.len() + 1 > LOG_FILES_TO_KEEP {
-                let excess = logs.len() + 1 - LOG_FILES_TO_KEEP;
-                for old in logs.iter().take(excess) {
-                    let _ = fs::remove_file(old);
-                }
+            {
+                let _ = fs::remove_file(name);
             }
         }
 
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .unwrap();
-
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .target(Target::Pipe(Box::new(log_file)))
-            .init();
+        match OpenOptions::new().create(true).append(true).open("baucord.log") {
+            Ok(log_file) => {
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("info"),
+                )
+                .target(Target::Pipe(Box::new(log_file)))
+                .init();
+            }
+            Err(e) => {
+                // Read-only install dir etc. — run without file logging
+                // rather than dying before the window exists.
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("info"),
+                )
+                .init();
+                log::warn!("could not open baucord.log ({e}); logging to stderr");
+            }
+        }
     }
 
     app::run();

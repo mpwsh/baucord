@@ -57,12 +57,18 @@ component MessageRow inherits Rectangle {
                 font-size: Theme.font-body;
                 font-weight: 700;
             }
-            body := Text {
+            // Read-only TextInput instead of Text: mouse selection and
+            // Ctrl/Cmd+C come built in (Text is not selectable).
+            body := TextInput {
                 text: data.body;
+                read-only: true;
+                single-line: false;
                 color: Theme.text-secondary;
                 font-size: Theme.font-body;
                 wrap: word-wrap;
                 horizontal-stretch: 1;
+                selection-background-color: Theme.accent;
+                selection-foreground-color: Theme.on-accent;
             }
         }
     }
@@ -71,15 +77,17 @@ component MessageRow inherits Rectangle {
 component SystemRow inherits Rectangle {
     in property <ChatRow> data;
     height: body.preferred-height + 6px;
-    body := Text {
-        x: Theme.gap-sm;
-        y: 3px;
-        width: parent.width - 2 * Theme.gap-sm;
-        text: data.body;
-        color: Theme.text-muted;
-        font-size: Theme.font-sm;
-        font-italic: true;
-        wrap: word-wrap;
+    HorizontalLayout {
+        padding-left: Theme.gap-sm;
+        padding-right: Theme.gap-sm;
+        padding-top: 3px;
+        body := Text {
+            text: data.body;
+            color: Theme.text-muted;
+            font-size: Theme.font-sm;
+            font-italic: true;
+            wrap: word-wrap;
+        }
     }
 }
 
@@ -200,6 +208,18 @@ export component ChatPane inherits Rectangle {
 
         list := ListView {
             vertical-stretch: 1;
+            // Follow the tail reactively: while the user sits at the
+            // bottom, content growth (new rows, GIF reflow) and window
+            // resizes keep the newest message in view; scrolling up
+            // unpins, scrolling back to within 40px re-pins. These fire
+            // AFTER the layout recomputes, unlike a host-side
+            // scroll-after-push, which reads stale viewport-height and
+            // lands short (permanently, once an image row overshoots
+            // the 40px slack).
+            private property <bool> stick-to-bottom: true;
+            changed viewport-y => { self.stick-to-bottom = root.at-bottom(); }
+            changed viewport-height => { if (self.stick-to-bottom) { root.scroll-to-end(); } }
+            changed visible-height => { if (self.stick-to-bottom) { root.scroll-to-end(); } }
             for row[i] in State.chat : Rectangle {
                 // One delegate hosting all four kinds; only the matching
                 // one is visible and the wrapper takes its height.
@@ -285,9 +305,9 @@ export component ChatPane inherits Rectangle {
     // ── Emoji palette (in-window popover) ──────────────────────────
     emoji-pop := PopupWindow {
         x: Theme.gap-md;
-        y: root.height - 380px;
-        width: Math.min(360px, root.width - 2 * Theme.gap-md);
-        height: 320px;
+        y: root.height - 400px;
+        width: Math.min(392px, root.width - 2 * Theme.gap-md);
+        height: 340px;
         Rectangle {
             background: Theme.bg-tertiary;
             border-radius: Theme.radius-lg;
@@ -300,18 +320,20 @@ export component ChatPane inherits Rectangle {
                 height: parent.height - 2 * Theme.gap-sm;
                 viewport-height: grid.preferred-height;
                 grid := VerticalLayout {
-                    // 9 columns of 36px cells
-                    property <int> cols: 9;
+                    // 8 columns of 40px cells, gap-xs breathing room
+                    property <int> cols: 8;
+                    spacing: Theme.gap-xs;
                     for r in Math.ceil(State.emoji.length / self.cols) : HorizontalLayout {
-                        height: 36px;
+                        height: 40px;
+                        spacing: Theme.gap-xs;
                         for c in grid.cols : Rectangle {
-                            width: 36px;
+                            width: 40px;
                             property <int> idx: r * grid.cols + c;
                             border-radius: Theme.radius-sm;
                             background: et.has-hover ? Theme.hover : transparent;
                             if idx < State.emoji.length : Text {
                                 text: State.emoji[idx].glyph;
-                                font-size: 20px;
+                                font-size: 24px;
                             }
                             et := TouchArea {
                                 mouse-cursor: pointer;

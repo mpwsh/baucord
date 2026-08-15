@@ -42,8 +42,12 @@ export global SettingsState {
     in property <bool> capturing: false;
 
     // Credits / About — host-formatted blocks
-    in property <string> credits-text;
-    in property <string> about-text;
+    in property <string> credits-super-heading;
+    in property <[string]> credits-super;     // gold-highlighted honors
+    in property <string> credits-beta-heading;
+    in property <[string]> credits-testers;
+    in property <string> about-head;      // version, url, paths
+    in property <string> about-tech;      // "built with" roster
 }
 
 export global SettingsLogic {
@@ -217,21 +221,62 @@ component KeyboardPanel inherits VerticalLayout {
     Rectangle { }
 }
 
-component TextPanel inherits VerticalLayout {
-    in property <string> heading;
-    in property <string> body;
-    in property <bool> show-config-btn: false;
+component CreditsPanel inherits VerticalLayout {
     spacing: Theme.gap-md;
-    SectionHeader { text: root.heading; }
+    SectionHeader { text: Tr.tab-credits; }
+    VerticalLayout {
+        spacing: 2px;
+        Text {
+            text: SettingsState.credits-super-heading;
+            color: Theme.text-secondary;
+            font-size: Theme.font-body;
+        }
+        for name in SettingsState.credits-super : Text {
+            text: name;
+            color: Theme.gold;
+            font-size: Theme.font-body;
+            font-weight: 700;
+        }
+    }
+    VerticalLayout {
+        spacing: 2px;
+        Text {
+            text: SettingsState.credits-beta-heading;
+            color: Theme.text-secondary;
+            font-size: Theme.font-body;
+        }
+        for name in SettingsState.credits-testers : Text {
+            text: name;
+            color: Theme.text-secondary;
+            font-size: Theme.font-body;
+        }
+    }
+    Rectangle { }
+}
+
+component AboutPanel inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    SectionHeader { text: Tr.tab-about; }
     Text {
-        text: root.body;
+        text: SettingsState.about-head;
         color: Theme.text-secondary;
         font-size: Theme.font-body;
         wrap: word-wrap;
     }
-    if root.show-config-btn : Btn {
-        text: "📁  " + Tr.tab-about;   // relabeled by host via Tr if needed
-        clicked => { SettingsLogic.open-config-folder(); }
+    // Right under the config-file line: settings live next to the
+    // executable (no appdata), and this opens that folder.
+    HorizontalLayout {
+        Btn {
+            text: "📁  " + Tr.about-open-config;
+            clicked => { SettingsLogic.open-config-folder(); }
+        }
+        Rectangle { }   // keep the button its natural width
+    }
+    Text {
+        text: SettingsState.about-tech;
+        color: Theme.text-secondary;
+        font-size: Theme.font-body;
+        wrap: word-wrap;
     }
     Rectangle { }
 }
@@ -285,15 +330,8 @@ export component SettingsWindow inherits Window {
                     if root.tab == 0 : AudioPanel { }
                     if root.tab == 1 : KeyboardPanel { }
                     if root.tab == 2 : GeneralPanel { }
-                    if root.tab == 3 : TextPanel {
-                        heading: Tr.tab-credits;
-                        body: SettingsState.credits-text;
-                    }
-                    if root.tab == 4 : TextPanel {
-                        heading: Tr.tab-about;
-                        body: SettingsState.about-text;
-                        show-config-btn: true;
-                    }
+                    if root.tab == 3 : CreditsPanel { }
+                    if root.tab == 4 : AboutPanel { }
                 }
             }
             Rectangle {

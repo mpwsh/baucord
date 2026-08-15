@@ -146,6 +146,7 @@ credits-beta-testers = BETA TESTERS
 about-header = ACERCA DE
 about-running-from = Ejecutando desde:
 about-config-file = Archivo de configuración:
+about-open-config = Abrir carpeta de configuración
 about-open-folder = Abrir carpeta de instalación
 about-built-with = HECHO CON
 tech-rust = Rust - Lenguaje de programación

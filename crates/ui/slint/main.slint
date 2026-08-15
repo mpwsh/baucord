@@ -17,7 +17,9 @@ import { Btn, IconBtn, Card, HSlider, Sep, FieldLabel, Dropdown } from "widgets.
 import { SettingsWindow, SettingsState, SettingsLogic } from "settings.slint";
 import { StreamViewerWindow } from "viewer.slint";
 
-export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow }
+import { BaucordTray } from "tray.slint";
+
+export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow }
 
 export component MainWindow inherits Window {
     title: "baucord";
@@ -26,7 +28,7 @@ export component MainWindow inherits Window {
     preferred-height: 640px;
     min-width: 500px;
     min-height: 400px;
-    icon: @image-url("icons/monitor.svg");   // replaced by the shell's window icon on supported platforms
+    icon: @image-url("../../../assets/icons/icon.png");   // app icon (workspace assets/); Windows exe/taskbar icon is embedded by desktop/build.rs
 
     // Share-dialog local state
     in-out property <bool> share-dialog-open: false;
@@ -82,42 +84,54 @@ export component MainWindow inherits Window {
     if State.preview-open : Rectangle {
         background: #000000AA;
         TouchArea { clicked => { Logic.preview-cancel(); } }
-        Card {
-            width: Math.min(520px, root.width - 48px);
-            height: pv.preferred-height;
-            TouchArea { }   // swallow clicks inside the card
-            pv := VerticalLayout {
-                padding: Theme.gap-lg;
-                spacing: Theme.gap-md;
-                Text {
-                    text: Tr.image-preview-title;
-                    color: Theme.text-primary;
-                    font-size: Theme.font-md;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                }
-                Rectangle {
-                    height: 300px;
-                    border-radius: Theme.radius-md;
-                    background: Theme.surface;
-                    clip: true;
-                    Image {
-                        width: parent.width - 2 * Theme.gap-sm;
-                        height: parent.height - 2 * Theme.gap-sm;
-                        source: State.preview-image;
-                        image-fit: contain;
+        // Enter = Send, Escape = Cancel — same paths as the buttons;
+        // the shell refocuses the composer after the dialog closes.
+        preview-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Return) { Logic.preview-send(); return accept; }
+                if (ev.text == Key.Escape) { Logic.preview-cancel(); return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: Math.min(520px, root.width - 48px);
+                height: pv.preferred-height;
+                TouchArea { }   // swallow clicks inside the card
+                pv := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: Tr.image-preview-title;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        horizontal-alignment: center;
                     }
-                }
-                Text {
-                    text: State.preview-caption;
-                    color: Theme.text-muted;
-                    font-size: Theme.font-sm;
-                    horizontal-alignment: center;
-                }
-                HorizontalLayout {
-                    spacing: Theme.gap-sm;
-                    Btn { text: Tr.cancel; clicked => { Logic.preview-cancel(); } }
-                    Btn { text: Tr.send; accent: true; clicked => { Logic.preview-send(); } }
+                    Rectangle {
+                        height: 300px;
+                        border-radius: Theme.radius-md;
+                        background: Theme.surface;
+                        clip: true;
+                        Image {
+                            width: parent.width - 2 * Theme.gap-sm;
+                            height: parent.height - 2 * Theme.gap-sm;
+                            source: State.preview-image;
+                            image-fit: contain;
+                        }
+                    }
+                    Text {
+                        text: State.preview-caption;
+                        color: Theme.text-muted;
+                        font-size: Theme.font-sm;
+                        horizontal-alignment: center;
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn { text: Tr.cancel; clicked => { Logic.preview-cancel(); } }
+                        Btn { text: Tr.send; accent: true; clicked => { Logic.preview-send(); } }
+                    }
                 }
             }
         }
@@ -128,69 +142,107 @@ export component MainWindow inherits Window {
     if State.viewer-open : Rectangle {
         background: #000000CC;
         TouchArea { clicked => { Logic.viewer-close(); } }
-        VerticalLayout {
-            // A layout inside a plain element sizes to its preferred
-            // height unless told otherwise — pin it to the scrim so
-            // the picture row actually stretches.
-            width: 100%;
-            height: 100%;
-            padding: Theme.gap-lg;
-            spacing: Theme.gap-md;
-            HorizontalLayout {
-                height: 32px;
-                Text {
-                    text: State.viewer-heading;
-                    color: Theme.text-primary;
-                    font-size: Theme.font-md;
-                    font-weight: 600;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                }
-                IconBtn {
-                    icon: @image-url("icons/download.svg");
-                    tooltip: Tr.menu-save-image;
-                    clicked => { Logic.viewer-save(); }
-                }
-                IconBtn {
-                    icon: @image-url("icons/x.svg");
-                    clicked => { Logic.viewer-close(); }
-                }
+        // Keyboard: Escape closes, ◀ ▶ step the gallery. The scope
+        // grabs focus on creation and hands it back to the composer on
+        // close, so typing resumes without an extra click.
+        viewer-keys := FocusScope {
+            init => { self.focus(); }
+            function close() {
+                Logic.viewer-close();
+                chat-pane.focus-composer();
             }
-            HorizontalLayout {
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { close(); return accept; }
+                if (ev.text == Key.LeftArrow) {
+                    if (State.viewer-has-prev) { Logic.viewer-step(-1); }
+                    return accept;
+                }
+                if (ev.text == Key.RightArrow) {
+                    if (State.viewer-has-next) { Logic.viewer-step(1); }
+                    return accept;
+                }
+                reject
+            }
+            VerticalLayout {
+                // A layout inside a plain element sizes to its preferred
+                // height unless told otherwise — pin it to the scrim so
+                // the picture row actually stretches.
+                width: 100%;
+                height: 100%;
+                padding: Theme.gap-lg;
                 spacing: Theme.gap-md;
-                vertical-stretch: 1;
-                // The chevrons must not sit directly in this row:
-                // IconBtn pins `height: size` (40px), and a fixed-height
-                // child caps a HorizontalLayout's max-height — the whole
-                // row collapsed to 40px and the picture rendered as a
-                // thumbnail. Height-unconstrained wrappers keep the row
-                // stretchable; each button centers itself inside.
-                Rectangle {
-                    width: nav-l.width;
-                    nav-l := IconBtn {
-                        y: (parent.height - self.height) / 2;
-                        icon: @image-url("icons/chevron-left.svg");
-                        opacity: State.viewer-has-prev ? 1.0 : 0.25;
-                        clicked => { if (State.viewer-has-prev) { Logic.viewer-step(-1); } }
+                HorizontalLayout {
+                    height: 32px;
+                    Text {
+                        text: State.viewer-heading;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    IconBtn {
+                        icon: @image-url("icons/download.svg");
+                        tooltip: Tr.menu-save-image;
+                        clicked => { Logic.viewer-save(); }
+                    }
+                    IconBtn {
+                        icon: @image-url("icons/x.svg");
+                        clicked => { viewer-keys.close(); }
                     }
                 }
-                Rectangle {
-                    horizontal-stretch: 1;
-                    TouchArea { }   // swallow clicks over the picture
-                    viewer-img := Image {
-                        width: parent.width;
-                        height: parent.height;
-                        source: State.viewer-image;
-                        image-fit: contain;
+                HorizontalLayout {
+                    spacing: Theme.gap-md;
+                    vertical-stretch: 1;
+                    // The chevrons must not sit directly in this row:
+                    // IconBtn pins `height: size` (40px), and a fixed-height
+                    // child caps a HorizontalLayout's max-height — the whole
+                    // row collapsed to 40px and the picture rendered as a
+                    // thumbnail. Height-unconstrained wrappers keep the row
+                    // stretchable; each button centers itself inside.
+                    Rectangle {
+                        width: nav-l.width;
+                        nav-l := IconBtn {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/chevron-left.svg");
+                            opacity: State.viewer-has-prev ? 1.0 : 0.25;
+                            clicked => { if (State.viewer-has-prev) { Logic.viewer-step(-1); } }
+                        }
                     }
-                }
-                Rectangle {
-                    width: nav-r.width;
-                    nav-r := IconBtn {
-                        y: (parent.height - self.height) / 2;
-                        icon: @image-url("icons/chevron-right.svg");
-                        opacity: State.viewer-has-next ? 1.0 : 0.25;
-                        clicked => { if (State.viewer-has-next) { Logic.viewer-step(1); } }
+                    picture := Rectangle {
+                        horizontal-stretch: 1;
+                        // contain-fitted bounds of the displayed image —
+                        // the swallow area matches the pixels, so clicks
+                        // on the letterbox fall through to the scrim and
+                        // close the viewer.
+                        property <float> src-w: Math.max(1, State.viewer-image.width);
+                        property <float> src-h: Math.max(1, State.viewer-image.height);
+                        property <float> fit: Math.min(
+                            self.width / 1px / self.src-w,
+                            self.height / 1px / self.src-h);
+                        property <length> fit-w: self.src-w * self.fit * 1px;
+                        property <length> fit-h: self.src-h * self.fit * 1px;
+                        viewer-img := Image {
+                            width: parent.width;
+                            height: parent.height;
+                            source: State.viewer-image;
+                            image-fit: contain;
+                        }
+                        TouchArea {   // swallow clicks over the picture itself
+                            x: (parent.width - parent.fit-w) / 2;
+                            y: (parent.height - parent.fit-h) / 2;
+                            width: parent.fit-w;
+                            height: parent.fit-h;
+                        }
+                    }
+                    Rectangle {
+                        width: nav-r.width;
+                        nav-r := IconBtn {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/chevron-right.svg");
+                            opacity: State.viewer-has-next ? 1.0 : 0.25;
+                            clicked => { if (State.viewer-has-next) { Logic.viewer-step(1); } }
+                        }
                     }
                 }
             }
@@ -201,35 +253,44 @@ export component MainWindow inherits Window {
     if root.share-dialog-open : Rectangle {
         background: #000000AA;
         TouchArea { clicked => { root.share-dialog-open = false; } }
-        Card {
-            width: 380px;
-            height: sh.preferred-height;
-            TouchArea { }
-            sh := VerticalLayout {
-                padding: Theme.gap-lg;
-                spacing: Theme.gap-md;
-                Text {
-                    text: Tr.share-screen;
-                    color: Theme.text-primary;
-                    font-size: Theme.font-md;
-                    font-weight: 600;
-                }
-                FieldLabel { text: Tr.monitor; }
-                Dropdown {
-                    options: State.monitors;
-                    current <=> root.share-monitor;
-                }
-                FieldLabel { text: Tr.quality; }
-                Dropdown {
-                    options: State.qualities;
-                    current <=> root.share-quality;
-                }
-                Btn {
-                    text: Tr.start-sharing;
-                    accent: true;
-                    clicked => {
-                        root.share-dialog-open = false;
-                        Logic.start-share(root.share-monitor, root.share-quality);
+        share-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { root.share-dialog-open = false; return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 380px;
+                height: sh.preferred-height;
+                TouchArea { }
+                sh := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: Tr.share-screen;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                    }
+                    FieldLabel { text: Tr.monitor; }
+                    Dropdown {
+                        options: State.monitors;
+                        current <=> root.share-monitor;
+                    }
+                    FieldLabel { text: Tr.quality; }
+                    Dropdown {
+                        options: State.qualities;
+                        current <=> root.share-quality;
+                    }
+                    Btn {
+                        text: Tr.start-sharing;
+                        accent: true;
+                        clicked => {
+                            root.share-dialog-open = false;
+                            Logic.start-share(root.share-monitor, root.share-quality);
+                        }
                     }
                 }
             }
@@ -240,57 +301,66 @@ export component MainWindow inherits Window {
         && State.popup-user-index < State.users.length : Rectangle {
         background: #00000055;
         TouchArea { clicked => { Logic.popup-closed(); } }
-        Card {
-            width: 260px;
-            height: up.preferred-height;
-            background: Theme.bg-tertiary;
-            border-width: 1px;
-            border-color: Theme.border;
-            TouchArea { }
-            up := VerticalLayout {
-                padding: Theme.gap-lg;
-                spacing: Theme.gap-md;
-                Text {
-                    text: State.users[State.popup-user-index].name;
-                    color: Theme.text-primary;
-                    font-size: Theme.font-md;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                }
-                FieldLabel { text: Tr.user-volume; }
-                HorizontalLayout {
-                    spacing: Theme.gap-sm;
-                    HSlider {
-                        horizontal-stretch: 1;
-                        minimum: 0.0; maximum: 2.0;
-                        value <=> State.popup-volume;
-                        released(v) => {
-                            Logic.popup-set-volume(State.popup-user-index, v);
+        popup-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { Logic.popup-closed(); return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 260px;
+                height: up.preferred-height;
+                background: Theme.bg-tertiary;
+                border-width: 1px;
+                border-color: Theme.border;
+                TouchArea { }
+                up := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: State.users[State.popup-user-index].name;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                    }
+                    FieldLabel { text: Tr.user-volume; }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        HSlider {
+                            horizontal-stretch: 1;
+                            minimum: 0.0; maximum: 2.0;
+                            value <=> State.popup-volume;
+                            released(v) => {
+                                Logic.popup-set-volume(State.popup-user-index, v);
+                            }
+                        }
+                        Text {
+                            width: 44px;
+                            text: "\{Math.round(State.popup-volume * 100)}%";
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
                         }
                     }
-                    Text {
-                        width: 44px;
-                        text: "\{Math.round(State.popup-volume * 100)}%";
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-sm;
-                        vertical-alignment: center;
-                        horizontal-alignment: right;
+                    Sep { }
+                    Btn {
+                        text: State.users[State.popup-user-index].local-muted ? Tr.unmute : Tr.mute;
+                        danger: State.users[State.popup-user-index].local-muted;
+                        clicked => { Logic.popup-toggle-mute(State.popup-user-index); }
                     }
-                }
-                Sep { }
-                Btn {
-                    text: State.users[State.popup-user-index].local-muted ? Tr.unmute : Tr.mute;
-                    danger: State.users[State.popup-user-index].local-muted;
-                    clicked => { Logic.popup-toggle-mute(State.popup-user-index); }
-                }
-                Btn {
-                    text: Tr.reset-audio;
-                    clicked => { Logic.popup-reset-audio(State.popup-user-index); }
-                }
-                if State.users[State.popup-user-index].sharing : Btn {
-                    text: Tr.watch-stream;
-                    accent: true;
-                    clicked => { Logic.popup-watch(State.popup-user-index); }
+                    Btn {
+                        text: Tr.reset-audio;
+                        clicked => { Logic.popup-reset-audio(State.popup-user-index); }
+                    }
+                    if State.users[State.popup-user-index].sharing : Btn {
+                        text: Tr.watch-stream;
+                        accent: true;
+                        clicked => { Logic.popup-watch(State.popup-user-index); }
+                    }
                 }
             }
         }

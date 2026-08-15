@@ -1,0 +1,28 @@
+// tray.slint — the system-tray icon (Slint's builtin SystemTrayIcon,
+// 1.17+; native backends: Shell_NotifyIconW / AppKit / StatusNotifier).
+//
+// A SystemTrayIcon is a top-level component: the shell instantiates it
+// alongside MainWindow, and the icon lives exactly as long as the
+// instance. A tray component gets its OWN copy of every global (it
+// shares nothing with MainWindow), so the localized labels arrive
+// through plain properties instead of Tr.
+
+export component BaucordTray inherits SystemTrayIcon {
+    in property <string> show-label: "Show";
+    in property <string> quit-label: "Quit";
+    callback show-app();
+    callback quit-app();
+
+    icon: @image-url("../../../assets/icons/icon.png");
+    tooltip: "baucord";
+
+    // Left-click restores the window (Windows: WM_LBUTTONUP, Linux:
+    // StatusNotifier Activate, macOS: AppKit click); right-click opens
+    // the menu — covers both the single- and double-click habits.
+    clicked => { root.show-app(); }
+
+    Menu {
+        MenuItem { title: root.show-label; activated => { root.show-app(); } }
+        MenuItem { title: root.quit-label; activated => { root.quit-app(); } }
+    }
+}

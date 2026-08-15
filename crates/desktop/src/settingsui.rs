@@ -144,8 +144,8 @@ pub fn populate(app: &mut AppState) {
         .collect();
     s.set_keybinds(ModelRc::new(VecModel::from(rows)));
 
-    s.set_credits_text(credits_text().into());
-    s.set_about_text(about_text().into());
+    set_credits(&s);
+    set_about(&s);
 }
 
 /// Wire `SettingsLogic` callbacks (once per window instance).
@@ -266,14 +266,13 @@ fn wire(win: &SettingsWindow) {
     });
 
     logic.on_open_config_folder(|| {
-        // settings.json lives next to the executable — open that
-        // folder (the original About panel's "Open install folder").
-        if let Some(dir) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-            && let Err(e) = open::that_detached(&dir)
+        // Open the folder that actually holds settings.json — the exe
+        // directory for portable installs, or the platform config dir
+        // when the exe directory isn't writable (client::config picks).
+        if let Some(dir) = client::config::settings_file_path().parent()
+            && let Err(e) = open::that_detached(dir)
         {
-            log::warn!("Failed to open install folder: {e}");
+            log::warn!("Failed to open config folder: {e}");
         }
     });
 
@@ -480,35 +479,44 @@ fn close(app: &mut AppState) {
     }
 }
 
-/// Compose the Credits tab text from the catalog + the tester roster
-/// (same names the FLTK panel carried).
-fn credits_text() -> String {
+/// Push the Credits tab roster (same names the FLTK panel carried).
+/// Super-testers render gold in the UI, hence the structured models
+/// instead of one preformatted text blob.
+fn set_credits(s: &ui::SettingsState) {
     const SUPER_TESTERS: &[&str] = &["empe"];
     const TESTERS: &[&str] = &[
         "Bartrix", "BDK", "ChichoV3", "Cholo", "willybal", "Nachovsky",
         "naqel", "Nicky21", "oveer", "Patitutitu", "piksel", "Pin0",
         "Scryer",
     ];
-    format!(
-        "{}\n{}\n\n{}\n{}",
-        t!("credits-super-testers"),
-        SUPER_TESTERS.join("\n"),
-        t!("credits-beta-testers"),
-        TESTERS.join("\n"),
-    )
+    let to_model = |names: &[&str]| {
+        ModelRc::new(VecModel::from(
+            names
+                .iter()
+                .map(|n| slint::SharedString::from(*n))
+                .collect::<Vec<_>>(),
+        ))
+    };
+    s.set_credits_super_heading(t!("credits-super-testers").into());
+    s.set_credits_super(to_model(SUPER_TESTERS));
+    s.set_credits_beta_heading(t!("credits-beta-testers").into());
+    s.set_credits_testers(to_model(TESTERS));
 }
 
-/// Compose the About tab text: paths + the built-with list (Slint
-/// replaces FLTK in the tech roster).
-fn about_text() -> String {
+/// Push the About tab: head (version, url, paths) and the built-with
+/// roster as separate blocks — the "open config location" button sits
+/// between them, right under the config-file line.
+fn set_about(s: &ui::SettingsState) {
     let exe_path = std::env::current_exe().map_or_else(|_| t!("unknown"), |p| p.display().to_string());
-    let config_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| {
-            p.parent()
-                .map(|d| d.join("settings.json").display().to_string())
-        })
-        .unwrap_or_else(|| t!("unknown"));
+    let config_path = client::config::settings_file_path().display().to_string();
+    let head = format!(
+        "baucord {}\nhttps://baucord.mpw.sh\n\n{} {}\n{} {}",
+        app::CURRENT_VERSION,
+        t!("about-running-from"),
+        exe_path,
+        t!("about-config-file"),
+        config_path,
+    );
     let tech: Vec<String> = [
         "tech-rust",
         "tech-slint",
@@ -523,14 +531,6 @@ fn about_text() -> String {
     .iter()
     .map(|key| t!(key))
     .collect();
-    format!(
-        "baucord {}\nhttps://baucord.mpw.sh\n\n{} {}\n{} {}\n\n{}\n{}",
-        app::CURRENT_VERSION,
-        t!("about-running-from"),
-        exe_path,
-        t!("about-config-file"),
-        config_path,
-        t!("about-built-with"),
-        tech.join("\n"),
-    )
+    s.set_about_head(head.into());
+    s.set_about_tech(format!("{}\n{}", t!("about-built-with"), tech.join("\n")).into());
 }
