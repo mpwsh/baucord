@@ -497,6 +497,9 @@ export component ChatPane inherits Rectangle {
         y: root.height - 400px;
         width: Math.min(392px, root.width - 2 * Theme.gap-md);
         height: 340px;
+        // Shortcode of the hovered cell, shown in the footer bar
+        // (Slack-style): ":heart:" while the heart is under the mouse.
+        property <string> hovered-code;
         Rectangle {
             background: Theme.bg-tertiary;
             border-radius: Theme.radius-lg;
@@ -506,7 +509,7 @@ export component ChatPane inherits Rectangle {
             Flickable {
                 x: Theme.gap-sm; y: Theme.gap-sm;
                 width: parent.width - 2 * Theme.gap-sm;
-                height: parent.height - 2 * Theme.gap-sm;
+                height: parent.height - 2 * Theme.gap-sm - 26px;
                 viewport-height: grid.preferred-height;
                 grid := VerticalLayout {
                     // 8 columns of 40px cells, gap-xs breathing room
@@ -523,9 +526,26 @@ export component ChatPane inherits Rectangle {
                             if idx < State.emoji.length : Text {
                                 text: State.emoji[idx].glyph;
                                 font-size: 24px;
+                                // Ask the platform's color-emoji face
+                                // directly: generic fallback mishandles
+                                // VS16 sequences on the Skia raster
+                                // path (the palette's tofu boxes).
+                                font-family: Platform.os == OperatingSystemType.macos
+                                    ? "Apple Color Emoji"
+                                    : Platform.os == OperatingSystemType.windows
+                                        ? "Segoe UI Emoji"
+                                        : "Noto Color Emoji";
                             }
                             et := TouchArea {
                                 mouse-cursor: pointer;
+                                changed has-hover => {
+                                    if (self.has-hover && idx < State.emoji.length) {
+                                        emoji-pop.hovered-code = ":\{State.emoji[idx].code}:";
+                                    } else if (!self.has-hover && idx < State.emoji.length
+                                        && emoji-pop.hovered-code == ":\{State.emoji[idx].code}:") {
+                                        emoji-pop.hovered-code = "";
+                                    }
+                                }
                                 clicked => {
                                     if (idx < State.emoji.length) {
                                         Logic.emoji-picked(State.emoji[idx].glyph);
@@ -534,6 +554,22 @@ export component ChatPane inherits Rectangle {
                             }
                         }
                     }
+                }
+            }
+            // Footer bar: hovered shortcode.
+            Rectangle {
+                x: 1px;
+                y: parent.height - 25px;
+                width: parent.width - 2px;
+                height: 24px;
+                background: Theme.surface;
+                Text {
+                    x: Theme.gap-sm;
+                    height: 100%;
+                    vertical-alignment: center;
+                    text: emoji-pop.hovered-code;
+                    color: Theme.text-muted;
+                    font-size: Theme.font-sm;
                 }
             }
         }

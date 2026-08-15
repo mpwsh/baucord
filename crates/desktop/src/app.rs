@@ -257,7 +257,8 @@ pub fn run() {
     // The emoji palette — straight from the shared catalog.
     let emoji_rows: Vec<ui::EmojiRow> = app_core::EMOJI
         .iter()
-        .map(|(_, glyph, section)| ui::EmojiRow {
+        .map(|(name, glyph, section)| ui::EmojiRow {
+            code: (*name).into(),
             glyph: (*glyph).into(),
             section: (*section).into(),
         })
