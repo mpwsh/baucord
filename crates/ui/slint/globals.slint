@@ -41,7 +41,7 @@ export struct ChatRow {
     kind: int,
     ts: string,
     user: string,
-    body: string,        // message text / system text / link URL (kind 3) / code (kind 4)
+    body: string,        // message text / system text / code (kind 3); links render inline
     styled: bool,        // kind 0 — body carries *bold*/_italic_/`code` markup
     body-styled: styled-text, // kind 0 when styled — pre-parsed by the shell
     image: image,        // kind 2 — current frame (Rust swaps for GIFs)

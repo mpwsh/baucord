@@ -88,6 +88,8 @@ component MessageRow inherits Rectangle {
                     text: data.body-styled;
                     default-color: Theme.text-secondary;
                     default-font-size: Theme.font-body;
+                    link-color: Theme.accent;
+                    link-clicked(url) => { Logic.link-clicked(url); }
                 }
             }
         }
@@ -107,38 +109,6 @@ component SystemRow inherits Rectangle {
             font-size: Theme.font-sm;
             font-italic: true;
             wrap: word-wrap;
-        }
-    }
-}
-
-component LinkRow inherits Rectangle {
-    in property <ChatRow> data;
-    height: 24px;
-    ContextMenuArea {
-        Menu {
-            MenuItem {
-                title: Tr.menu-open-link;
-                activated => { Logic.link-clicked(data.body); }
-            }
-            MenuItem {
-                title: Tr.menu-copy-link;
-                activated => { Logic.copy-text(data.body); }
-            }
-        }
-        HorizontalLayout {
-            padding-left: 28px;   // indent under the message body
-            link := Text {
-                text: data.body;
-                color: touch.has-hover ? Theme.accent.brighter(0.3) : Theme.accent;
-                font-size: Theme.font-body;
-                vertical-alignment: center;
-                overflow: elide;
-                touch := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { Logic.link-clicked(data.body); }
-                }
-            }
-            Rectangle { }   // spacer — keep the hit target on the text
         }
     }
 }
@@ -383,13 +353,11 @@ export component ChatPane inherits Rectangle {
                 height: row.kind == 0 ? msg.height
                     : row.kind == 1 ? sys.height
                     : row.kind == 2 ? img.height
-                    : row.kind == 3 ? lnk.height
                     : cod.height;
                 msg := MessageRow { data: row; visible: row.kind == 0; }
                 sys := SystemRow  { data: row; visible: row.kind == 1; }
                 img := ImageRow   { data: row; visible: row.kind == 2; }
-                lnk := LinkRow    { data: row; visible: row.kind == 3; }
-                cod := CodeRow    { data: row; visible: row.kind == 4; }
+                cod := CodeRow    { data: row; visible: row.kind == 3; }
             }
         }
 

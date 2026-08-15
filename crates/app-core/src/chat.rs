@@ -3,7 +3,7 @@
 //! [`ChatHistory`] is the source of truth the UI model mirrors: rows of
 //! [`ChatItem`], capped at [`MAX_ROWS`] (oldest dropped). Link detection
 //! is ported verbatim from the FLTK `chat_view.rs` (with its tests);
-//! detected links become their own [`ChatItem::Link`] rows right after
+//! links render inline inside message text (linkified for StyledText)
 //! the message that carried them — Slint renders them as dedicated
 //! tappable rows.
 
@@ -23,10 +23,6 @@ pub enum ChatItem {
     },
     System {
         body: String,
-    },
-    /// A link detected inside the preceding message.
-    Link {
-        url: String,
     },
     /// A ```-fenced code block extracted from a message.
     Code {
@@ -80,25 +76,20 @@ impl ChatHistory {
     }
 
     /// Append a user message. ```-fenced blocks become their own
-    /// [`ChatItem::Code`] rows (monospace panels in the UI), and any
-    /// links in the text parts become their own rows right after —
-    /// links inside code blocks stay code.
+    /// [`ChatItem::Code`] rows (monospace panels in the UI); links
+    /// render inline inside the message text (the markdown translator
+    /// linkifies them for StyledText).
     pub fn push_message(&mut self, ts: &str, user: &str, body: &str) -> HistoryDelta {
         let mut appended = 0;
         for segment in crate::markdown::split_fences(body) {
             match segment {
                 crate::markdown::Segment::Text(text) => {
-                    let links = detect_links(&text);
                     self.rows.push(ChatItem::Message {
                         ts: ts.into(),
                         user: user.into(),
                         body: text,
                     });
                     appended += 1;
-                    for url in links {
-                        self.rows.push(ChatItem::Link { url });
-                        appended += 1;
-                    }
                 }
                 crate::markdown::Segment::Code(code) => {
                     self.rows.push(ChatItem::Code {
@@ -150,61 +141,6 @@ impl ChatHistory {
     }
 }
 
-/// Detect http(s):// and www. links in a message.
-///
-/// Behavior carried over from the FLTK build: trailing punctuation is
-/// trimmed out of the link, bare `http://` isn't a link, and `www.`
-/// links get an `https://` prefix.
-#[must_use]
-pub fn detect_links(text: &str) -> Vec<String> {
-    let mut links = Vec::new();
-    for piece in split_keep_whitespace(text) {
-        if piece.chars().next().is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let lower = piece.to_ascii_lowercase();
-        let is_url = lower.starts_with("http://") || lower.starts_with("https://");
-        let is_www = !is_url && lower.starts_with("www.") && piece.len() > 4;
-        if !(is_url || is_www) {
-            continue;
-        }
-        let trimmed = piece.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'']);
-        if trimmed.len() < 8 && !is_www {
-            // "http://" with nothing behind it — not a real link.
-            continue;
-        }
-        links.push(if is_www {
-            format!("https://{trimmed}")
-        } else {
-            trimmed.to_string()
-        });
-    }
-    links
-}
-
-/// Split into alternating word / whitespace pieces (both preserved).
-fn split_keep_whitespace(s: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut in_ws: Option<bool> = None;
-    for (i, c) in s.char_indices() {
-        let ws = c.is_whitespace();
-        match in_ws {
-            None => in_ws = Some(ws),
-            Some(prev) if prev != ws => {
-                out.push(&s[start..i]);
-                start = i;
-                in_ws = Some(ws);
-            }
-            _ => {}
-        }
-    }
-    if start < s.len() {
-        out.push(&s[start..]);
-    }
-    out
-}
-
 /// Strip control characters (e.g. the literal ^V Windows synthesizes
 /// around Ctrl+V) — the reactive backstop the input had in FLTK.
 #[must_use]
@@ -218,38 +154,6 @@ pub fn scrub_control_chars(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_http_links() {
-        assert_eq!(
-            detect_links("see https://example.com/x for details"),
-            vec!["https://example.com/x"]
-        );
-    }
-
-    #[test]
-    fn trims_trailing_punctuation() {
-        assert_eq!(
-            detect_links("go to https://example.com/x."),
-            vec!["https://example.com/x"]
-        );
-    }
-
-    #[test]
-    fn www_gets_https_prefix() {
-        assert_eq!(detect_links("www.example.com rocks"), vec!["https://www.example.com"]);
-    }
-
-    #[test]
-    fn plain_text_has_no_links() {
-        assert!(detect_links("no links here, just http talk").is_empty());
-    }
-
-    #[test]
-    fn whitespace_splitter_roundtrips() {
-        let s = "a  b\tc \n d";
-        assert_eq!(split_keep_whitespace(s).concat(), s);
-    }
 
     #[test]
     fn history_caps_at_max_rows() {
@@ -268,11 +172,12 @@ mod tests {
     fn code_fences_become_rows() {
         let mut h = ChatHistory::new();
         let d = h.push_message("12:00", "a", "look:\n```\nlet x = 1;\n```\nand https://x.test");
-        assert_eq!(d.appended, 4);
+        // Links stay inline in the message text (linkified at render
+        // time) — no extra rows.
+        assert_eq!(d.appended, 3);
         assert!(matches!(&h.rows()[0], ChatItem::Message { body, .. } if body == "look:"));
         assert!(matches!(&h.rows()[1], ChatItem::Code { code, .. } if code == "let x = 1;"));
         assert!(matches!(&h.rows()[2], ChatItem::Message { body, .. } if body.contains("https")));
-        assert!(matches!(&h.rows()[3], ChatItem::Link { url } if url == "https://x.test"));
     }
 
     #[test]
@@ -284,12 +189,12 @@ mod tests {
     }
 
     #[test]
-    fn message_links_become_rows() {
+    fn message_links_stay_inline() {
         let mut h = ChatHistory::new();
         let d = h.push_message("12:00", "a", "see https://x.test/a and www.y.test");
-        assert_eq!(d.appended, 3);
-        assert!(matches!(h.rows()[1], ChatItem::Link { .. }));
-        assert!(matches!(h.rows()[2], ChatItem::Link { .. }));
+        // One row: links render inline via the markdown translator.
+        assert_eq!(d.appended, 1);
+        assert!(matches!(&h.rows()[0], ChatItem::Message { body, .. } if body.contains("www.y.test")));
     }
 
     #[test]

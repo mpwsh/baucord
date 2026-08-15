@@ -105,6 +105,27 @@ fn find_close(chars: &[char], open: usize, tok: char) -> Option<usize> {
         .find(|&j| chars[j] == tok && can_close(chars, j))
 }
 
+/// If `chars` starts with a URL, return the destination (with the
+/// `https://` prefix supplied for bare `www.` links) and how many
+/// chars the visible label spans. Mirrors the old link-row detector:
+/// trailing sentence punctuation is not part of the link, and a bare
+/// scheme with nothing behind it doesn't count.
+fn match_url(chars: &[char]) -> Option<(String, usize)> {
+    let piece: String = chars.iter().take_while(|c| !c.is_whitespace()).collect();
+    let lower = piece.to_ascii_lowercase();
+    let is_url = lower.starts_with("http://") || lower.starts_with("https://");
+    let is_www = !is_url && lower.starts_with("www.") && piece.len() > 4;
+    if !(is_url || is_www) {
+        return None;
+    }
+    let trimmed = piece.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'']);
+    if trimmed.len() < 8 && !is_www {
+        return None; // "http://" with nothing behind it
+    }
+    let dest = if is_www { format!("https://{trimmed}") } else { trimmed.to_string() };
+    Some((dest, trimmed.chars().count()))
+}
+
 /// Escape one char into CommonMark-inert output.
 fn push_escaped(out: &mut String, c: char) {
     if c == '\n' {
@@ -205,6 +226,24 @@ pub fn to_commonmark(text: &str, code_color: Option<&str>) -> (String, bool) {
                 i += 1;
             }
             _ => {
+                // Linkify URLs at word starts: emitted as CommonMark
+                // links so StyledText renders them blue and clickable
+                // inline (the old design appended a separate link row
+                // under the message, duplicating the text).
+                if (i == 0 || chars[i - 1].is_whitespace())
+                    && let Some((url, label_len)) = match_url(&chars[i..])
+                {
+                    out.push('[');
+                    for &lc in &chars[i..i + label_len] {
+                        push_escaped(&mut out, lc);
+                    }
+                    out.push_str("](<");
+                    out.push_str(&url);
+                    out.push_str(">)");
+                    styled = true;
+                    i += label_len;
+                    continue;
+                }
                 push_escaped(&mut out, c);
                 i += 1;
             }
@@ -329,6 +368,32 @@ mod tests {
     fn newlines_become_hard_breaks() {
         let (cm, _) = to_commonmark_none("one\ntwo");
         assert_eq!(cm, "one\\\ntwo");
+    }
+
+    #[test]
+    fn urls_become_inline_links() {
+        let (cm, styled) = to_commonmark_none("see https://x.com/home now");
+        assert!(styled);
+        assert_eq!(cm, r"see [https\:\/\/x\.com\/home](<https://x.com/home>) now");
+    }
+
+    #[test]
+    fn url_trailing_punctuation_stays_out() {
+        let (cm, _) = to_commonmark_none("go to www.example.com, ok?");
+        assert_eq!(cm, r"go to [www\.example\.com](<https://www.example.com>)\, ok\?");
+    }
+
+    #[test]
+    fn url_in_code_span_stays_code() {
+        let (cm, _) = to_commonmark_none("`https://x.com` raw");
+        assert_eq!(cm, "`https://x.com` raw");
+    }
+
+    #[test]
+    fn bare_scheme_is_not_a_link() {
+        let (cm, styled) = to_commonmark_none("http:// nope");
+        assert!(!styled);
+        assert_eq!(cm, r"http\:\/\/ nope");
     }
 
     #[test]
