@@ -405,6 +405,12 @@ export component ChatPane inherits Rectangle {
             // text-only default. Everything else falls through.
             paste-scope := FocusScope {
                 horizontal-stretch: 1;
+                // FocusScope/ContextMenuArea are not layouts, so they
+                // don't report the field's grown height to the row —
+                // without this the row stays 40px and the field spills
+                // past the window bottom. With it, the row grows and
+                // the history shrinks: the composer expands upward.
+                height: input.height;
                 capture-key-pressed(ev) => {
                     if (ev.text == Key.Return && !ev.modifiers.shift) {
                         Logic.send-message();
