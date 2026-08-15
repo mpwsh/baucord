@@ -119,16 +119,31 @@ export component Field inherits Rectangle {
     public function do-paste() { input.paste(); }
 
     height: 40px;
+    // Never let content inflate the layout: a single-line TextInput's
+    // minimum width tracks its text, and inside a layout that minimum
+    // propagates all the way up — a long draft used to push the
+    // composer's counter and send button off-window.
+    min-width: 120px;
     border-radius: Theme.radius-md;
     background: Theme.surface;
     border-width: 1px;
     border-color: input.has-focus ? Theme.accent : Theme.border;
     animate border-color { duration: 150ms; }
 
-    HorizontalLayout {
-        padding-left: Theme.gap-md;
-        padding-right: Theme.gap-md;
+    // The TextInput sits OUTSIDE any layout, positioned manually, so
+    // its content-derived size constraints go nowhere; the viewport
+    // clips, and the cursor-follow math slides the input so the caret
+    // stays visible. This mirrors std-widgets' LineEditBase.
+    viewport := Rectangle {
+        x: Theme.gap-md;
+        width: parent.width - 2 * Theme.gap-md;
+        height: 100%;
+        clip: true;
         input := TextInput {
+            property <length> computed-x;
+            x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.computed-x));
+            width: max(parent.width - self.text-cursor-width, self.preferred-width);
+            height: 100%;
             single-line: true;
             vertical-alignment: center;
             font-size: Theme.font-body;
@@ -137,6 +152,13 @@ export component Field inherits Rectangle {
             input-type: root.input-type;
             accepted => { root.accepted(); }
             edited => { root.edited(); }
+            cursor-position-changed(pos) => {
+                if (pos.x + self.computed-x < 0px) {
+                    self.computed-x = -pos.x;
+                } else if (pos.x + self.computed-x > parent.width - self.text-cursor-width) {
+                    self.computed-x = parent.width - pos.x - self.text-cursor-width;
+                }
+            }
         }
     }
     if input.text == "" && !input.has-focus : Text {
