@@ -655,6 +655,32 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 fn start_timers(state: &Rc<RefCell<AppState>>) {
     let mut timers = Vec::new();
 
+    // Minimize→restore watcher — 250 ms. On Windows the OS repaints
+    // the restored window white while the renderer's damage tracking
+    // still trusts its back buffer, so partial presents only patch
+    // regions that change afterwards (hover slivers). Toggling
+    // repaint-flip flips an imperceptible full-window overlay, which
+    // dirties everything and forces one complete repaint. (A cheap
+    // bool poll; not wired to raw winit events to avoid a backend
+    // dependency.)
+    let w = Rc::downgrade(state);
+    let t = slint::Timer::default();
+    let mut was_minimized = false;
+    t.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(250),
+        move || {
+            with_app(&w, |app| {
+                let minimized = app.main.window().is_minimized();
+                if was_minimized && !minimized {
+                    app.main.set_repaint_flip(!app.main.get_repaint_flip());
+                }
+                was_minimized = minimized;
+            });
+        },
+    );
+    timers.push(t);
+
     // Device poll — 2.5 s. Enumeration is cheap; all diffing logic
     // lives in app-core's reducer.
     let w = Rc::downgrade(state);

@@ -225,6 +225,9 @@ pub(crate) struct NetworkClient {
     /// Whether we've announced `NetworkMessage::Connected` to the app.
     /// Set once the netcode handshake actually completes.
     announced_connected: bool,
+    /// Warn about OS send-buffer pressure once per connection, not per
+    /// tick — bursts can repeat every frame during a stream.
+    send_pressure_warned: bool,
 }
 
 impl NetworkClient {
@@ -245,6 +248,12 @@ impl NetworkClient {
         sock_ref
             .set_recv_buffer_size(protocol::UDP_SOCKET_BUFFER_BYTES)
             .ok();
+        // The sets above are best-effort; log what the OS actually
+        // granted so a clamped buffer (firewall LSPs, policy) is
+        // visible in baucord.log when diagnosing ENOBUFS reports.
+        if let (Ok(snd), Ok(rcv)) = (sock_ref.send_buffer_size(), sock_ref.recv_buffer_size()) {
+            log::info!("UDP socket buffers: send {} KB, recv {} KB", snd / 1024, rcv / 1024);
+        }
 
         let current_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -296,6 +305,7 @@ impl NetworkClient {
             upload_last_pct: 255,
             last_stats_check: Instant::now(),
             announced_connected: false,
+            send_pressure_warned: false,
         })
     }
 
@@ -336,20 +346,48 @@ impl NetworkClient {
         self.process_system_audio_messages();
 
         if let Err(e) = self.transport.send_packets(&mut self.client) {
-            // Primary check: the typed IO error kind. The string probe
-            // is a fallback for WouldBlock surfacing through a wrapped
-            // variant (WSAEWOULDBLOCK = 10035 on Windows) — computed
-            // once, only on the (rare) error path.
-            let is_would_block = matches!(
+            // Transient send-buffer pressure. Two flavors, same
+            // meaning for UDP as congestion loss — drop the datagrams
+            // and let renet's reliability layer re-send; never a
+            // reason to tear the connection down:
+            //   * WouldBlock — the socket's own queue is full
+            //     (WSAEWOULDBLOCK = 10035 on Windows).
+            //   * ENOBUFS "no buffer space available" — the OS or
+            //     interface queue is full (WSAENOBUFS = 10055 on
+            //     Windows, errno 105 on Linux, 55 on macOS). Windows
+            //     raises this routinely during video keyframe bursts,
+            //     especially on Wi-Fi, even with a large SO_SNDBUF.
+            // If pressure persists long enough to matter, keepalives
+            // stop landing and netcode's own timeout produces a real
+            // disconnect. The typed check is primary; the string probe
+            // is a fallback for errors surfacing through wrapped
+            // variants — computed once, only on the (rare) error path.
+            #[cfg(windows)]
+            const ENOBUFS: i32 = 10055;
+            #[cfg(target_os = "macos")]
+            const ENOBUFS: i32 = 55;
+            #[cfg(not(any(windows, target_os = "macos")))]
+            const ENOBUFS: i32 = 105;
+            let is_transient = matches!(
                 &e,
                 NetcodeTransportError::IO(io_err)
                     if io_err.kind() == std::io::ErrorKind::WouldBlock
+                        || io_err.raw_os_error() == Some(ENOBUFS)
             ) || {
                 let msg = e.to_string();
-                msg.contains("10035") || msg.contains("WouldBlock")
+                msg.contains("10035")
+                    || msg.contains("10055")
+                    || msg.contains("WouldBlock")
+                    || msg.contains("buffer space")
             };
-            if is_would_block {
-                log::debug!("send_packets: WouldBlock (OS buffer full), will retry next tick");
+            if is_transient {
+                if !self.send_pressure_warned {
+                    self.send_pressure_warned = true;
+                    log::warn!(
+                        "send_packets: OS send buffer pressure ({e}); dropping this batch and continuing (logged once per connection)"
+                    );
+                }
+                log::debug!("send_packets: transient buffer pressure, will retry next tick");
             } else {
                 self.message_queue
                     .push(NetworkMessage::Disconnected(format!(
