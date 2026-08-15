@@ -483,6 +483,33 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         media::attach_image_from_disk();
     });
     let w = Rc::downgrade(state);
+    logic.on_composer_newline(move |cursor, anchor| {
+        with_app(&w, |app| {
+            let s = app.main.global::<State>();
+            let (text, pos) = app_core::composer::insert_newline(
+                s.get_draft().as_str(),
+                usize::try_from(cursor).unwrap_or(0),
+                usize::try_from(anchor).unwrap_or(0),
+            );
+            s.set_draft(text.into());
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            app.main.invoke_composer_set_cursor(pos as i32);
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_composer_line_edge(move |cursor, to_end| {
+        with_app(&w, |app| {
+            let s = app.main.global::<State>();
+            let pos = app_core::composer::line_edge(
+                s.get_draft().as_str(),
+                usize::try_from(cursor).unwrap_or(0),
+                to_end,
+            );
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            app.main.invoke_composer_set_cursor(pos as i32);
+        });
+    });
+    let w = Rc::downgrade(state);
     logic.on_emoji_picked(move |glyph| {
         with_app(&w, |app| {
             let s = app.main.global::<State>();
@@ -1729,7 +1756,22 @@ impl AppState {
         let rows = self.history.rows();
         let start = rows.len() - delta.appended;
         for (item, row_id) in rows[start..].iter().zip(ids) {
-            self.chat_model.push(ui::convert::chat_row(item, row_id));
+            let mut row = ui::convert::chat_row(item, row_id);
+            // Message rows carrying WhatsApp-style markup (*bold*,
+            // _italic_, `code`) get a pre-parsed StyledText; plain
+            // ones skip it and stay mouse-selectable. to_commonmark
+            // escapes everything else, so from_markdown can only fail
+            // on pathological input — which then renders plain.
+            if row.kind == 0 {
+                // Tint matches Theme.mono-text in theme.slint.
+                let (cm, styled) =
+                    app_core::markdown::to_commonmark(row.body.as_str(), Some("#86AA90"));
+                if styled && let Ok(st) = slint::StyledText::from_markdown(&cm) {
+                    row.body_styled = st;
+                    row.styled = true;
+                }
+            }
+            self.chat_model.push(row);
         }
     }
 

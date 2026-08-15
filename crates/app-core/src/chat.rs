@@ -28,6 +28,12 @@ pub enum ChatItem {
     Link {
         url: String,
     },
+    /// A ```-fenced code block extracted from a message.
+    Code {
+        ts: String,
+        user: String,
+        code: String,
+    },
     Image {
         ts: String,
         user: String,
@@ -73,19 +79,36 @@ impl ChatHistory {
         self.next_row_id
     }
 
-    /// Append a user message; any links it contains become their own
-    /// rows right after it.
+    /// Append a user message. ```-fenced blocks become their own
+    /// [`ChatItem::Code`] rows (monospace panels in the UI), and any
+    /// links in the text parts become their own rows right after —
+    /// links inside code blocks stay code.
     pub fn push_message(&mut self, ts: &str, user: &str, body: &str) -> HistoryDelta {
-        let links = detect_links(body);
-        let mut appended = 1;
-        self.rows.push(ChatItem::Message {
-            ts: ts.into(),
-            user: user.into(),
-            body: body.into(),
-        });
-        for url in links {
-            self.rows.push(ChatItem::Link { url });
-            appended += 1;
+        let mut appended = 0;
+        for segment in crate::markdown::split_fences(body) {
+            match segment {
+                crate::markdown::Segment::Text(text) => {
+                    let links = detect_links(&text);
+                    self.rows.push(ChatItem::Message {
+                        ts: ts.into(),
+                        user: user.into(),
+                        body: text,
+                    });
+                    appended += 1;
+                    for url in links {
+                        self.rows.push(ChatItem::Link { url });
+                        appended += 1;
+                    }
+                }
+                crate::markdown::Segment::Code(code) => {
+                    self.rows.push(ChatItem::Code {
+                        ts: ts.into(),
+                        user: user.into(),
+                        code,
+                    });
+                    appended += 1;
+                }
+            }
         }
         self.cap(appended)
     }
@@ -186,7 +209,10 @@ fn split_keep_whitespace(s: &str) -> Vec<&str> {
 /// around Ctrl+V) — the reactive backstop the input had in FLTK.
 #[must_use]
 pub fn scrub_control_chars(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    // Newlines are legitimate since the composer went multi-line
+    // (Shift+Enter); every other control char still gets dropped —
+    // including \r, so CRLF pastes normalize to \n.
+    s.chars().filter(|c| *c == '\n' || !c.is_control()).collect()
 }
 
 #[cfg(test)]
@@ -239,6 +265,25 @@ mod tests {
     }
 
     #[test]
+    fn code_fences_become_rows() {
+        let mut h = ChatHistory::new();
+        let d = h.push_message("12:00", "a", "look:\n```\nlet x = 1;\n```\nand https://x.test");
+        assert_eq!(d.appended, 4);
+        assert!(matches!(&h.rows()[0], ChatItem::Message { body, .. } if body == "look:"));
+        assert!(matches!(&h.rows()[1], ChatItem::Code { code, .. } if code == "let x = 1;"));
+        assert!(matches!(&h.rows()[2], ChatItem::Message { body, .. } if body.contains("https")));
+        assert!(matches!(&h.rows()[3], ChatItem::Link { url } if url == "https://x.test"));
+    }
+
+    #[test]
+    fn links_inside_code_stay_code() {
+        let mut h = ChatHistory::new();
+        let d = h.push_message("12:00", "a", "```\nhttps://not-a-link.test\n```");
+        assert_eq!(d.appended, 1);
+        assert!(matches!(&h.rows()[0], ChatItem::Code { .. }));
+    }
+
+    #[test]
     fn message_links_become_rows() {
         let mut h = ChatHistory::new();
         let d = h.push_message("12:00", "a", "see https://x.test/a and www.y.test");
@@ -250,5 +295,6 @@ mod tests {
     #[test]
     fn scrub_removes_control_chars() {
         assert_eq!(scrub_control_chars("a\u{16}b\u{7}c"), "abc");
+        assert_eq!(scrub_control_chars("one\r\ntwo\nthree"), "one\ntwo\nthree");
     }
 }

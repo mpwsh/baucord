@@ -41,7 +41,9 @@ export struct ChatRow {
     kind: int,
     ts: string,
     user: string,
-    body: string,        // message text / system text / link URL (kind 3)
+    body: string,        // message text / system text / link URL (kind 3) / code (kind 4)
+    styled: bool,        // kind 0 — body carries *bold*/_italic_/`code` markup
+    body-styled: styled-text, // kind 0 when styled — pre-parsed by the shell
     image: image,        // kind 2 — current frame (Rust swaps for GIFs)
     img-w: float,        // native px, for aspect layout
     img-h: float,
@@ -140,6 +142,11 @@ export global Logic {
     // Chat
     callback send-message();
     callback draft-edited();              // host enforces the char cap
+    /// Shift+Enter: splice a newline at the caret (byte offsets; the
+    /// host owns string surgery — .slint has no substring ops).
+    callback composer-newline(cursor: int, anchor: int);
+    /// macOS Ctrl+A / Ctrl+E: move the caret to the line start/end.
+    callback composer-line-edge(cursor: int, to-end: bool);
     callback attach-image();
     callback emoji-picked(string);
     callback paste-rich();                // Ctrl/Cmd+V — host runs the paste chain

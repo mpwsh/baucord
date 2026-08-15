@@ -38,6 +38,7 @@ export component MainWindow inherits Window {
     public function chat-at-bottom() -> bool { return chat-pane.at-bottom(); }
     public function chat-scroll-to-end() { chat-pane.scroll-to-end(); }
     public function focus-composer() { chat-pane.focus-composer(); }
+    public function composer-set-cursor(pos: int) { chat-pane.composer-set-cursor(pos); }
     public function open-share-dialog() {
         share-monitor = State.default-monitor;
         share-quality = State.default-quality;

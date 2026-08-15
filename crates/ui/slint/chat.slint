@@ -26,13 +26,13 @@ import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, ChatRow } from "globals.slint";
-import { IconBtn, Btn, Field } from "widgets.slint";
+import { IconBtn } from "widgets.slint";
 
 // ── Rows ────────────────────────────────────────────────────────────────
 
 component MessageRow inherits Rectangle {
     in property <ChatRow> data;
-    height: body.preferred-height + 8px;
+    height: cell.height + 8px;
 
     ContextMenuArea {
         Menu {
@@ -57,18 +57,38 @@ component MessageRow inherits Rectangle {
                 font-size: Theme.font-body;
                 font-weight: 700;
             }
-            // Read-only TextInput instead of Text: mouse selection and
-            // Ctrl/Cmd+C come built in (Text is not selectable).
-            body := TextInput {
-                text: data.body;
-                read-only: true;
-                single-line: false;
-                color: Theme.text-secondary;
-                font-size: Theme.font-body;
-                wrap: word-wrap;
+            // Plain messages render in a read-only TextInput (mouse
+            // selection + Ctrl/Cmd+C); styled ones in a StyledText
+            // (inline bold/italic/code — not selectable, but the
+            // right-click Copy still grabs the raw text). Both live in
+            // one stretch cell; `visible` picks the active one and the
+            // cell tracks its height.
+            cell := Rectangle {
                 horizontal-stretch: 1;
-                selection-background-color: Theme.accent;
-                selection-foreground-color: Theme.on-accent;
+                height: data.styled ? styled-body.preferred-height : body.preferred-height;
+                body := TextInput {
+                    x: 0;
+                    y: 0;
+                    width: 100%;
+                    visible: !data.styled;
+                    text: data.body;
+                    read-only: true;
+                    single-line: false;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-body;
+                    wrap: word-wrap;
+                    selection-background-color: Theme.accent;
+                    selection-foreground-color: Theme.on-accent;
+                }
+                styled-body := StyledText {
+                    x: 0;
+                    y: 0;
+                    width: 100%;
+                    visible: data.styled;
+                    text: data.body-styled;
+                    default-color: Theme.text-secondary;
+                    default-font-size: Theme.font-body;
+                }
             }
         }
     }
@@ -119,6 +139,56 @@ component LinkRow inherits Rectangle {
                 }
             }
             Rectangle { }   // spacer — keep the hit target on the text
+        }
+    }
+}
+
+component CodeRow inherits Rectangle {
+    in property <ChatRow> data;
+    height: 24px + panel.height + 10px;
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: Tr.menu-copy;
+                activated => { Logic.copy-text(data.body); }
+            }
+        }
+        VerticalLayout {
+            padding-left: Theme.gap-sm;
+            padding-right: Theme.gap-sm;
+            padding-top: 4px;
+            spacing: 4px;
+            // Same sender header the image rows carry.
+            HorizontalLayout {
+                spacing: Theme.gap-sm;
+                Text { text: "[\{data.ts}]"; color: Theme.text-muted; font-size: Theme.font-sm; }
+                Text { text: data.user; color: Theme.accent; font-size: Theme.font-body; font-weight: 700; }
+                Rectangle { }
+            }
+            panel := Rectangle {
+                height: code.preferred-height + 2 * Theme.gap-sm;
+                background: Theme.surface;
+                border-radius: Theme.radius-md;
+                border-width: 1px;
+                border-color: Theme.border;
+                // Manually positioned (no layout) so long lines can't
+                // inflate ancestors; read-only TextInput keeps code
+                // selectable — the thing people copy most.
+                code := TextInput {
+                    x: Theme.gap-sm;
+                    y: Theme.gap-sm;
+                    width: parent.width - 2 * Theme.gap-sm;
+                    text: data.body;
+                    read-only: true;
+                    single-line: false;
+                    wrap: word-wrap;
+                    color: Theme.mono-text;
+                    font-family: "monospace";
+                    font-size: Theme.font-sm;
+                    selection-background-color: Theme.accent;
+                    selection-foreground-color: Theme.on-accent;
+                }
+            }
         }
     }
 }
@@ -188,6 +258,64 @@ component ImageRow inherits Rectangle {
 
 // ── Composer + history ──────────────────────────────────────────────────
 
+component ComposerField inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    // UTF-8 byte offsets, the unit set-selection-offsets consumes —
+    // forwarded to the host for cursor-relative edits.
+    out property <int> cursor-offset <=> input.cursor-position-byte-offset;
+    out property <int> anchor-offset <=> input.anchor-position-byte-offset;
+    callback edited;
+    public function focus-input() { input.focus(); }
+    public function set-cursor(pos: int) { input.set-selection-offsets(pos, pos); }
+    public function do-cut() { input.cut(); }
+    public function do-copy() { input.copy(); }
+    public function do-paste() { input.paste(); }
+
+    // Grows with the draft like Discord: one line at rest, up to ~5
+    // lines, then scrolls internally with the caret kept visible.
+    // Wrapping means content pressure is vertical only, and the
+    // explicit clamp caps it — nothing can inflate the composer row
+    // sideways (Enter/Shift+Enter routing lives in the enclosing
+    // FocusScope's capture handler).
+    height: clamp(input.preferred-height + 16px, 40px, 124px);
+    min-width: 120px;
+    border-radius: Theme.radius-md;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    animate border-color { duration: 150ms; }
+
+    fl := Flickable {
+        x: Theme.gap-md;
+        y: 8px;
+        width: parent.width - 2 * Theme.gap-md;
+        height: parent.height - 16px;
+        viewport-height: max(self.height, input.preferred-height);
+        input := TextInput {
+            width: fl.width;
+            // Fill the field when the draft fits so a single line
+            // centers vertically; taller drafts take their natural
+            // height and scroll.
+            height: max(fl.height, self.preferred-height);
+            vertical-alignment: center;
+            single-line: false;
+            wrap: word-wrap;
+            font-size: Theme.font-body;
+            color: Theme.text-primary;
+            selection-background-color: Theme.accent;
+            selection-foreground-color: Theme.on-accent;
+            edited => { root.edited(); }
+            cursor-position-changed(pos) => {
+                if (pos.y + fl.viewport-y < 0px) {
+                    fl.viewport-y = -pos.y;
+                } else if (pos.y + fl.viewport-y + 20px > fl.height) {
+                    fl.viewport-y = fl.height - pos.y - 20px;
+                }
+            }
+        }
+    }
+}
+
 export component ChatPane inherits Rectangle {
     background: Theme.bg-primary;
 
@@ -201,8 +329,13 @@ export component ChatPane inherits Rectangle {
             || list.viewport-y <= -(list.viewport-height - list.visible-height - 40px);
     }
     public function focus-composer() { input.focus-input(); }
+    public function composer-set-cursor(pos: int) { input.set-cursor(pos); }
 
-    VerticalLayout {
+    // Maintained by the ListView's changed-handlers below; also drives
+    // the jump-to-latest button.
+    private property <bool> stick-to-bottom: true;
+
+    col := VerticalLayout {
         padding: Theme.gap-md;
         spacing: Theme.gap-sm;
 
@@ -216,10 +349,24 @@ export component ChatPane inherits Rectangle {
             // scroll-after-push, which reads stale viewport-height and
             // lands short (permanently, once an image row overshoots
             // the 40px slack).
-            private property <bool> stick-to-bottom: true;
-            changed viewport-y => { self.stick-to-bottom = root.at-bottom(); }
-            changed viewport-height => { if (self.stick-to-bottom) { root.scroll-to-end(); } }
-            changed visible-height => { if (self.stick-to-bottom) { root.scroll-to-end(); } }
+            // Unpin ONLY on upward movement (user scrolling back);
+            // re-pin whenever the bottom is reached. Downward or
+            // programmatic movement never unpins — sampling
+            // at-bottom() indiscriminately here used to unpin during
+            // layout transitions (e.g. the composer growing a line
+            // while messages arrive), where geometry is briefly
+            // inconsistent.
+            private property <length> last-viewport-y;
+            changed viewport-y => {
+                if (root.at-bottom()) {
+                    root.stick-to-bottom = true;
+                } else if (self.viewport-y > self.last-viewport-y) {
+                    root.stick-to-bottom = false;
+                }
+                self.last-viewport-y = self.viewport-y;
+            }
+            changed viewport-height => { if (root.stick-to-bottom) { root.scroll-to-end(); } }
+            changed visible-height => { if (root.stick-to-bottom) { root.scroll-to-end(); } }
             for row[i] in State.chat : Rectangle {
                 // One delegate hosting all four kinds; only the matching
                 // one is visible and the wrapper takes its height.
@@ -227,11 +374,13 @@ export component ChatPane inherits Rectangle {
                 height: row.kind == 0 ? msg.height
                     : row.kind == 1 ? sys.height
                     : row.kind == 2 ? img.height
-                    : lnk.height;
+                    : row.kind == 3 ? lnk.height
+                    : cod.height;
                 msg := MessageRow { data: row; visible: row.kind == 0; }
                 sys := SystemRow  { data: row; visible: row.kind == 1; }
                 img := ImageRow   { data: row; visible: row.kind == 2; }
                 lnk := LinkRow    { data: row; visible: row.kind == 3; }
+                cod := CodeRow    { data: row; visible: row.kind == 4; }
             }
         }
 
@@ -248,13 +397,47 @@ export component ChatPane inherits Rectangle {
                 tooltip: Tr.chat-attach-tooltip;
                 clicked => { Logic.attach-image(); }
             }
-            // capture-key-pressed runs BEFORE the focused TextInput, so
-            // Ctrl/Cmd+V reaches the host's paste chain (copied file →
-            // native PNG → toolkit image → text) instead of the plain
+            // capture-key-pressed runs BEFORE the focused TextInput:
+            // Enter sends (Shift+Enter falls through and inserts the
+            // newline — the input is multi-line now), and Ctrl/Cmd+V
+            // reaches the host's paste chain (copied file → native
+            // PNG → toolkit image → text) instead of the plain
             // text-only default. Everything else falls through.
             paste-scope := FocusScope {
                 horizontal-stretch: 1;
                 capture-key-pressed(ev) => {
+                    if (ev.text == Key.Return && !ev.modifiers.shift) {
+                        Logic.send-message();
+                        return accept;
+                    }
+                    // Deterministic Shift+Enter: splice the newline
+                    // ourselves (platforms disagree on whether a
+                    // shifted Return reaches the TextInput's insert
+                    // path).
+                    if (ev.text == Key.Return && ev.modifiers.shift) {
+                        Logic.composer-newline(input.cursor-offset, input.anchor-offset);
+                        return accept;
+                    }
+                    // macOS line navigation (Ctrl+A / Ctrl+E, like
+                    // every NSTextView). Slint swaps Apple modifiers —
+                    // Cmd arrives as `control`, the physical Ctrl key
+                    // as `meta` — so the physical-Ctrl test is `meta`.
+                    // Cmd+A stays untouched and falls through to the
+                    // TextInput's built-in select-all. Elsewhere
+                    // Ctrl+A must remain select-all, hence the OS
+                    // gate.
+                    if (Platform.os == OperatingSystemType.macos
+                        && ev.modifiers.meta && !ev.modifiers.control
+                        && (ev.text == "a" || ev.text == "A")) {
+                        Logic.composer-line-edge(input.cursor-offset, false);
+                        return accept;
+                    }
+                    if (Platform.os == OperatingSystemType.macos
+                        && ev.modifiers.meta && !ev.modifiers.control
+                        && (ev.text == "e" || ev.text == "E")) {
+                        Logic.composer-line-edge(input.cursor-offset, true);
+                        return accept;
+                    }
                     if ((ev.modifiers.control || ev.modifiers.meta) && (ev.text == "v" || ev.text == "V")) {
                         Logic.paste-rich();
                         return accept;
@@ -267,9 +450,8 @@ export component ChatPane inherits Rectangle {
                         MenuItem { title: Tr.menu-copy;  activated => { input.do-copy(); } }
                         MenuItem { title: Tr.menu-paste; activated => { Logic.paste-rich(); } }
                     }
-                    input := Field {
+                    input := ComposerField {
                         text <=> State.draft;
-                        accepted => { Logic.send-message(); }
                         edited => { Logic.draft-edited(); }
                     }
                 }
@@ -299,6 +481,30 @@ export component ChatPane inherits Rectangle {
                     clicked => { Logic.send-message(); }
                 }
             }
+        }
+    }
+
+    // ── Jump to latest (WhatsApp-style) ────────────────────────────
+    if !root.stick-to-bottom : jump-btn := Rectangle {
+        width: 36px;
+        height: 36px;
+        border-radius: 18px;
+        x: col.x + list.x + list.width - self.width - Theme.gap-sm;
+        y: col.y + list.y + list.height - self.height - Theme.gap-sm;
+        background: jt.has-hover ? Theme.subtle : Theme.bg-tertiary;
+        border-width: 1px;
+        border-color: Theme.border;
+        animate background { duration: 150ms; }
+        Image {
+            width: 18px;
+            height: 18px;
+            source: @image-url("icons/chevron-right.svg");
+            transform-rotation: 90deg;
+            colorize: Theme.text-secondary;
+        }
+        jt := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.scroll-to-end(); }
         }
     }
 

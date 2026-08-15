@@ -17,12 +17,14 @@
 //! remains a shell concern and this crate has no message catalog.
 
 pub mod chat;
+pub mod composer;
 pub mod devices;
 pub mod emoji;
 mod emoji_table;
 pub mod fps;
 pub mod gif;
 pub mod images;
+pub mod markdown;
 pub mod roster;
 pub mod stats;
 pub mod update;
