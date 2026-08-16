@@ -333,6 +333,14 @@ pub fn run() {
     crate::updater::spawn_version_check();
 
     state.borrow().main.show().expect("failed to show the main window");
+    {
+        let weak = state.borrow().main.as_weak();
+        repaint_on_reveal(state.borrow().main.window(), move || {
+            if let Some(main) = weak.upgrade() {
+                main.set_repaint_flip(!main.get_repaint_flip());
+            }
+        });
+    }
 
     // Tray icon: created from inside the running event loop (macOS
     // wants the NSApplication loop live before status items appear).
@@ -651,57 +659,32 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     });
 }
 
+/// Force one full repaint of `win` whenever the OS signals the window
+/// surface may have been invalidated: focus gain (restore — however
+/// fast, alt-tab back, show-from-tray, the first map after creation)
+/// or un-occlusion. Windows repaints revealed surfaces with the
+/// background brush while the renderer's damage tracking still trusts
+/// its back buffer; partial presents then patch only what changed
+/// since. `flip` toggles the window's imperceptible full-window
+/// overlay, dirtying everything for exactly one frame. Event-driven —
+/// unlike the earlier is_minimized() polling (lost fast
+/// minimize/restore races) and flip-on-show (fired before the OS
+/// mapped and cleared the real surface).
+pub fn repaint_on_reveal(win: &slint::Window, flip: impl Fn() + 'static) {
+    use i_slint_backend_winit::WinitWindowAccessor;
+    win.on_winit_window_event(move |_w, ev| {
+        use i_slint_backend_winit::winit::event::WindowEvent;
+        if matches!(ev, WindowEvent::Focused(true) | WindowEvent::Occluded(false)) {
+            flip();
+        }
+        i_slint_backend_winit::EventResult::Propagate
+    });
+}
+
 // ── Timers ──────────────────────────────────────────────────────────────
 
 fn start_timers(state: &Rc<RefCell<AppState>>) {
     let mut timers = Vec::new();
-
-    // Minimize→restore watcher — 250 ms. On Windows the OS repaints
-    // the restored window white while the renderer's damage tracking
-    // still trusts its back buffer, so partial presents only patch
-    // regions that change afterwards (hover slivers). Toggling
-    // repaint-flip flips an imperceptible full-window overlay, which
-    // dirties everything and forces one complete repaint. (A cheap
-    // bool poll; not wired to raw winit events to avoid a backend
-    // dependency.)
-    let w = Rc::downgrade(state);
-    let t = slint::Timer::default();
-    let mut main_was_minimized = false;
-    let mut settings_was_minimized = false;
-    let mut viewers_were_minimized: HashMap<u64, bool> = HashMap::new();
-    t.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(250),
-        move || {
-            with_app(&w, |app| {
-                let minimized = app.main.window().is_minimized();
-                if main_was_minimized && !minimized {
-                    app.main.set_repaint_flip(!app.main.get_repaint_flip());
-                }
-                main_was_minimized = minimized;
-
-                if let Some(sw) = &app.settings_win {
-                    let minimized = sw.window().is_minimized();
-                    if settings_was_minimized && !minimized {
-                        sw.set_repaint_flip(!sw.get_repaint_flip());
-                    }
-                    settings_was_minimized = minimized;
-                } else {
-                    settings_was_minimized = false;
-                }
-
-                viewers_were_minimized.retain(|id, _| app.viewers.contains_key(id));
-                for (id, viewer) in &app.viewers {
-                    let minimized = viewer.is_minimized();
-                    let was = viewers_were_minimized.insert(*id, minimized).unwrap_or(false);
-                    if was && !minimized {
-                        viewer.flip_repaint();
-                    }
-                }
-            });
-        },
-    );
-    timers.push(t);
 
     // Device poll — 2.5 s. Enumeration is cheap; all diffing logic
     // lives in app-core's reducer.
@@ -2369,7 +2352,7 @@ pub mod tray {
     //! and a visible tray icon by itself keeps
     //! `run_event_loop_until_quit` alive.
     use log::warn;
-    use slint::ComponentHandle;
+    use slint::ComponentHandle; // for main.show()
 
     use super::{with_current, AppState};
     use i18n::t;

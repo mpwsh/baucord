@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "app-core",
  "arboard",
@@ -1772,6 +1772,7 @@ dependencies = [
  "crossbeam-channel",
  "env_logger",
  "global-hotkey",
+ "i-slint-backend-winit",
  "i18n",
  "image",
  "log",

@@ -26,17 +26,6 @@ pub struct Viewer {
 }
 
 impl Viewer {
-    /// Whether the OS has this viewer window minimized.
-    pub fn is_minimized(&self) -> bool {
-        self.win.window().is_minimized()
-    }
-
-    /// Force one full repaint (Windows minimize→restore workaround —
-    /// see the watcher in app.rs).
-    pub fn flip_repaint(&self) {
-        self.win.set_repaint_flip(!self.win.get_repaint_flip());
-    }
-
     /// Open a viewer window for `client_id`, sized to the sharer's
     /// announced dimensions.
     // Pixel dimensions (≤ 8K) fit losslessly in f32.
@@ -74,6 +63,12 @@ impl Viewer {
         });
 
         win.set_stats("--".into());
+        let weak = win.as_weak();
+        crate::app::repaint_on_reveal(win.window(), move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_repaint_flip(!w.get_repaint_flip());
+            }
+        });
         win.show()?;
 
         Ok(Self {

@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 
 [lints]
@@ -29,6 +29,12 @@ video = { path = "../video" }
 app-core = { path = "../app-core" }
 ui = { path = "../ui" }
 slint.workspace = true
+# Raw winit window events: the OS invalidates window surfaces on
+# focus/reveal transitions that Slint's damage tracking can't see;
+# app.rs::repaint_on_reveal hooks them. Default features are empty —
+# this only pulls the accessor trait; cargo unifies the version with
+# slint's own internal dependency.
+i-slint-backend-winit = "1.17"
 renet.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
@@ -42,13 +48,13 @@ global-hotkey = "0.7"
 # floor guarantees the root ImageReader/Limits API used for bounded
 # decoding.
 image = { version = "0.25.9", default-features = false, features = [
-  "png",
-  "jpeg",
-  "gif",
-  "webp",
-  "bmp",
-  "tiff",
-  "ico",  # decodes assets/icons/icon.ico for the tray (feature `tray`)
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+    "ico", # decodes assets/icons/icon.ico for the tray (feature `tray`)
 ] }
 # Own-process CPU/memory for the sidebar stats line. Only the `system`
 # feature — no disks/network/components/users — to keep the build lean.
@@ -64,16 +70,11 @@ self-replace = "1.5.0"
 # rich-paste chain and "Copy message" need programmatic access.
 # clipboard.rs keeps its per-platform file/PNG readers (arboard has
 # no file-list support).
-arboard = { version = "3", default-features = false, features = [
-  "wayland-data-control",
-] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 # Native open/save dialogs (FLTK's chooser is gone). The portal backend
 # avoids a GTK link dependency; it is async, hence the tiny pollster
 # block_on on the dialog scratch threads.
-rfd = { version = "0.15", default-features = false, features = [
-  "xdg-portal",
-  "tokio",
-] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 pollster = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -82,8 +83,8 @@ pollster = "0.4"
 # sources like screenshot copies. Only the NSPasteboard header —
 # default features would compile every AppKit binding.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
-  "std",
-  "NSPasteboard",
+    "std",
+    "NSPasteboard",
 ] }
 
 [build-dependencies]

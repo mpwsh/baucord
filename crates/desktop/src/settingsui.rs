@@ -52,6 +52,12 @@ pub fn open(app: &mut AppState) {
             }
         };
         wire(&win);
+        let weak = win.as_weak();
+        crate::app::repaint_on_reveal(win.window(), move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_repaint_flip(!w.get_repaint_flip());
+            }
+        });
         app.settings_win = Some(win);
     }
 
