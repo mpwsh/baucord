@@ -1,6 +1,6 @@
 [package]
 name = "audio"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "audio components for baucord"
 
@@ -49,6 +49,16 @@ serde = { workspace = true, optional = true }
 
 # Logging
 log.workspace = true
+
+# ── Windows: process-exclusive system audio loopback ────────────────────
+# `wasapi` wraps ActivateAudioInterfaceAsync process loopback
+# (EXCLUDE_TARGET_PROCESS_TREE), which cpal cannot express. Used only by
+# `stream::process_loopback`; the cpal endpoint loopback stays as the
+# runtime fallback for Windows builds that predate the API (< 10 2004).
+# Cost note: pulls `windows` 0.62 — compile-time only on Windows targets,
+# zero footprint elsewhere (target-gated).
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.24"
 
 [dev-dependencies]
 # examples only — the library itself never initializes a logger

@@ -5,11 +5,26 @@
 //!
 //! ## Platform support
 //!
-//! | Platform | Backend            | Status      |
-//! |----------|--------------------|-------------|
-//! | Windows  | WASAPI loopback    | ✅ Working  |
-//! | macOS    | ScreenCaptureKit   | 🚧 Stub     |
-//! | Linux    | PipeWire / PulseAudio | 🚧 Stub  |
+//! | Platform | Backend                                                  | Status      |
+//! |----------|----------------------------------------------------------|-------------|
+//! | Windows  | WASAPI process loopback (own audio excluded)             | ✅ Working  |
+//! | Windows  | WASAPI endpoint loopback (fallback, includes own audio)  | ✅ Working  |
+//! | macOS    | ScreenCaptureKit                                         | 🚧 Stub     |
+//! | Linux    | PipeWire / PulseAudio                                    | 🚧 Stub     |
+//!
+//! ## Own-audio exclusion (echo prevention)
+//!
+//! The stream must not contain what *we* play — above all the decoded
+//! peer voices — or every viewer hears themselves echoed back roughly
+//! one stream-latency later. On Windows this is solved at capture time:
+//! the preferred backend asks WASAPI for the system mix *minus our own
+//! process tree* (see `stream::process_loopback`). Where that API is
+//! unavailable (pre-2004 Windows 10) the endpoint-loopback fallback
+//! still captures everything, and the receiver-side
+//! `processor::voice_cancel` ducking remains the only mitigation.
+//! Future macOS/Linux backends should follow the same rule: exclude at
+//! capture time (`SCStreamConfiguration.excludesCurrentProcessAudio`,
+//! PipeWire routing), never filter after the fact.
 //!
 //! ## Architecture
 //!
@@ -113,7 +128,7 @@ pub struct SystemAudioPacket {
     not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
     allow(dead_code)
 )]
-trait SystemAudioBackend {
+pub(crate) trait SystemAudioBackend {
     /// Start capturing. Spawns platform callbacks that push into the ring buffer.
     fn start(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 
@@ -126,6 +141,10 @@ trait SystemAudioBackend {
     /// Human-readable name of the capture source.
     fn device_name(&self) -> String;
 }
+
+/// A started backend paired with the ring consumer the worker drains.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+type StartedBackend = (Box<dyn SystemAudioBackend>, Consumer<f32>);
 
 // ── Windows: WASAPI loopback ─────────────────────────────────────────────────
 
@@ -159,6 +178,14 @@ mod wasapi_loopback {
         /// - Zero latency (same buffer the audio engine uses)
         /// - No virtual device needed (unlike macOS)
         /// - System-level (captures all apps mixed together)
+        ///
+        /// # Fallback status
+        ///
+        /// "All apps mixed together" includes *us* — the peer voices we
+        /// play get captured and streamed back to their speakers. That is
+        /// why this backend is only the fallback for Windows builds where
+        /// process loopback activation fails (pre-2004 Windows 10); see
+        /// `stream::process_loopback` for the preferred backend.
         pub fn new(
             ring_producer: Producer<f32>,
             stats: Arc<AudioStats>,
@@ -492,13 +519,13 @@ pub struct SystemAudioCapture {
     )]
     stats: Arc<AudioStats>,
 
-    /// Platform backend handle — kept alive to maintain capture stream.
-    #[cfg(target_os = "windows")]
-    backend: Option<wasapi_loopback::WasapiLoopback>,
-    #[cfg(target_os = "macos")]
-    backend: Option<coreaudio_loopback::CoreAudioLoopback>,
-    #[cfg(target_os = "linux")]
-    backend: Option<linux_loopback::LinuxLoopback>,
+    /// Platform backend handle — kept alive to maintain the capture
+    /// stream. Boxed so a single field serves every desktop platform and
+    /// so Windows can pick between backends (process loopback vs endpoint
+    /// loopback) at runtime. `!Send` like the cpal stream it may hold —
+    /// `SystemAudioCapture` lives and dies on the screen thread.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    backend: Option<Box<dyn SystemAudioBackend>>,
 }
 
 impl SystemAudioCapture {
@@ -543,24 +570,13 @@ impl SystemAudioCapture {
             return Ok(());
         }
 
-        // Ring buffer: 200ms at device rate, stereo interleaved (2x mono size).
-        // Sized generously because WASAPI can deliver in large chunks.
-        let (ring_producer, ring_consumer) = RingBuffer::new(48000 * 2 * 200 / 1000);
-
-        // Create platform backend
-        #[cfg(target_os = "windows")]
-        let mut backend = wasapi_loopback::WasapiLoopback::new(ring_producer, self.stats.clone())?;
-        #[cfg(target_os = "macos")]
-        let mut backend =
-            coreaudio_loopback::CoreAudioLoopback::new(ring_producer, self.stats.clone())?;
-        #[cfg(target_os = "linux")]
-        let mut backend = linux_loopback::LinuxLoopback::new(ring_producer, self.stats.clone())?;
+        // Backend and ring buffer creation are fused: on Windows a failed
+        // process-loopback start falls back to endpoint loopback with a
+        // fresh ring (the failed attempt consumed the first producer).
+        let (backend, ring_consumer) = Self::create_started_backend(&self.stats)?;
 
         let device_sample_rate = backend.sample_rate();
         let device_name = backend.device_name();
-
-        // Start the platform capture stream
-        backend.start()?;
 
         // Create the encoded packet channel
         let (packet_tx, packet_rx) = bounded(8);
@@ -594,6 +610,82 @@ impl SystemAudioCapture {
         );
 
         Ok(())
+    }
+
+    /// Ring buffer sizing: 200 ms at the 48 kHz capture rate, stereo
+    /// interleaved (2× the mono sample count). Sized generously because
+    /// WASAPI can deliver in large chunks.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn new_ring() -> (Producer<f32>, Consumer<f32>) {
+        RingBuffer::new(48000 * 2 * 200 / 1000)
+    }
+
+    /// Create and start the platform capture backend, returning it
+    /// together with the ring consumer the worker reads from.
+    ///
+    /// Windows tries two backends in order:
+    /// 1. Process loopback (`stream::process_loopback`) — the system mix
+    ///    *excluding our own process tree*, so the peer voices we play
+    ///    never enter the stream. Windows 10 2004+.
+    /// 2. cpal endpoint loopback — the classic full mix of the default
+    ///    output device. Our own playback (incl. peer voices) is audible
+    ///    in the stream; the receiver-side `voice_cancel` ducking is the
+    ///    only mitigation.
+    #[cfg(target_os = "windows")]
+    fn create_started_backend(
+        stats: &Arc<AudioStats>,
+    ) -> Result<StartedBackend, Box<dyn std::error::Error>> {
+        let (ring_producer, ring_consumer) = Self::new_ring();
+        let mut preferred =
+            super::process_loopback::ProcessLoopback::new(ring_producer, stats.clone());
+        match preferred.start() {
+            Ok(()) => {
+                info!("🔊🎤 System audio backend: process loopback (own audio excluded)");
+                let backend: Box<dyn SystemAudioBackend> = Box::new(preferred);
+                return Ok((backend, ring_consumer));
+            }
+            Err(e) => warn!(
+                "🔊 Process loopback unavailable ({e}) — falling back to endpoint \
+                 loopback; our own playback (incl. peer voices) will be audible \
+                 in the stream"
+            ),
+        }
+
+        // Fresh ring: the failed attempt consumed the first producer.
+        let (ring_producer, ring_consumer) = Self::new_ring();
+        let mut fallback = wasapi_loopback::WasapiLoopback::new(ring_producer, stats.clone())?;
+        fallback.start()?;
+        let backend: Box<dyn SystemAudioBackend> = Box::new(fallback);
+        Ok((backend, ring_consumer))
+    }
+
+    /// Create and start the platform capture backend (stub — errors until
+    /// the ScreenCaptureKit backend lands; use
+    /// `excludesCurrentProcessAudio` when it does).
+    #[cfg(target_os = "macos")]
+    fn create_started_backend(
+        stats: &Arc<AudioStats>,
+    ) -> Result<StartedBackend, Box<dyn std::error::Error>> {
+        let (ring_producer, ring_consumer) = Self::new_ring();
+        let mut backend =
+            coreaudio_loopback::CoreAudioLoopback::new(ring_producer, stats.clone())?;
+        backend.start()?;
+        let backend: Box<dyn SystemAudioBackend> = Box::new(backend);
+        Ok((backend, ring_consumer))
+    }
+
+    /// Create and start the platform capture backend (stub — errors until
+    /// the PipeWire backend lands; route our own playback to an
+    /// unmonitored node when it does).
+    #[cfg(target_os = "linux")]
+    fn create_started_backend(
+        stats: &Arc<AudioStats>,
+    ) -> Result<StartedBackend, Box<dyn std::error::Error>> {
+        let (ring_producer, ring_consumer) = Self::new_ring();
+        let mut backend = linux_loopback::LinuxLoopback::new(ring_producer, stats.clone())?;
+        backend.start()?;
+        let backend: Box<dyn SystemAudioBackend> = Box::new(backend);
+        Ok((backend, ring_consumer))
     }
 
     /// Stop capturing system audio and release all resources.
