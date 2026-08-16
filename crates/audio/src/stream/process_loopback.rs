@@ -24,10 +24,14 @@
 //! - **We choose the format**: `GetMixFormat` is unimplemented for process
 //!   loopback; the engine converts to whatever we request. We request
 //!   48 kHz stereo f32 so the encode worker's resampler is bypassed.
-//! - **Silence is empty, not zeros**: the capture event only fires while
-//!   non-excluded sessions render. When the system is quiet no packets
-//!   arrive, the worker has nothing to encode, and no network packets are
-//!   sent (seq doesn't advance, so the receiver sees no loss).
+//! - **Silence is empty, not zeros**: when the engine idles the capture
+//!   event stops firing, and when other sessions keep the engine alive
+//!   with a silent mix, buffers arrive SILENT-flagged and are *dropped*
+//!   here rather than zero-filled. Either way silence contributes
+//!   nothing to the ring: the worker has nothing to encode and no
+//!   network packets are sent (seq doesn't advance, so the receiver
+//!   sees no loss). The 2026-08 wake audit showed the zero-fill
+//!   approach kept the whole encode pipeline running on silence.
 //!
 //! ## Threading
 //!
@@ -94,6 +98,9 @@ pub(crate) struct ProcessLoopback {
     should_stop: Arc<AtomicBool>,
     /// Ring producer, held until `start()` hands it to the pump thread.
     ring_producer: Option<Producer<f32>>,
+    /// Wake latch to the encode worker — pinged after pushing samples so
+    /// the worker can block instead of polling an empty ring.
+    wake_tx: Option<Sender<()>>,
     /// Stats (shared with voice chat engine for unified reporting).
     stats: Arc<AudioStats>,
 }
@@ -103,11 +110,16 @@ impl ProcessLoopback {
     /// activation) happens in [`SystemAudioBackend::start`] so the caller
     /// can fall back to another backend when this build of Windows lacks
     /// process loopback.
-    pub(crate) fn new(ring_producer: Producer<f32>, stats: Arc<AudioStats>) -> Self {
+    pub(crate) fn new(
+        ring_producer: Producer<f32>,
+        wake_tx: Sender<()>,
+        stats: Arc<AudioStats>,
+    ) -> Self {
         Self {
             pump: None,
             should_stop: Arc::new(AtomicBool::new(false)),
             ring_producer: Some(ring_producer),
+            wake_tx: Some(wake_tx),
             stats,
         }
     }
@@ -122,6 +134,7 @@ impl SystemAudioBackend for ProcessLoopback {
             .ring_producer
             .take()
             .ok_or("Ring producer already taken")?;
+        let wake_tx = self.wake_tx.take().ok_or("Wake sender already taken")?;
         self.should_stop.store(false, Ordering::Relaxed);
 
         let should_stop = self.should_stop.clone();
@@ -134,7 +147,7 @@ impl SystemAudioBackend for ProcessLoopback {
 
         let pump = thread::Builder::new()
             .name("sysaudio-procloop".into())
-            .spawn(move || pump_thread(ring_producer, &stats, &should_stop, &setup_tx))?;
+            .spawn(move || pump_thread(ring_producer, &wake_tx, &stats, &should_stop, &setup_tx))?;
 
         // Blocking recv with no timeout needed: the pump always reports
         // (a panic disconnects the channel, surfacing as RecvError).
@@ -184,6 +197,7 @@ impl Drop for ProcessLoopback {
 /// object from activation to teardown.
 fn pump_thread(
     ring_producer: Producer<f32>,
+    wake_tx: &Sender<()>,
     stats: &AudioStats,
     should_stop: &AtomicBool,
     setup_tx: &Sender<SetupReport>,
@@ -200,7 +214,7 @@ fn pump_thread(
             // Audio-class scheduling (MMCSS "Pro Audio"), same as the
             // encode worker.
             let _mmcss = crate::platform::promote_current_thread();
-            run_pump(&capture, &event, ring_producer, stats, should_stop);
+            run_pump(&capture, &event, ring_producer, wake_tx, stats, should_stop);
             if let Err(e) = client.stop_stream() {
                 debug!("System audio process loopback: stop_stream failed: {e}");
             }
@@ -272,6 +286,7 @@ fn run_pump(
     capture: &AudioCaptureClient,
     event: &Handle,
     mut ring_producer: Producer<f32>,
+    wake_tx: &Sender<()>,
     stats: &AudioStats,
     should_stop: &AtomicBool,
 ) {
@@ -320,13 +335,22 @@ fn run_pump(
                     if buffer_info.flags.data_discontinuity {
                         debug!("System audio capture discontinuity");
                     }
+                    // SILENT-flagged buffers may hold garbage per WASAPI
+                    // docs, and silence has nothing to contribute anyway:
+                    // drop the packet entirely so the encode worker stays
+                    // parked instead of encoding zeros. Seq only advances
+                    // on sent packets, so the receiver sees no loss.
+                    if buffer_info.flags.silent {
+                        continue;
+                    }
                     let got_bytes = got as usize * BYTES_PER_FRAME;
-                    push_interleaved(
-                        &mut ring_producer,
-                        &packet_buf[..got_bytes],
-                        buffer_info.flags.silent,
-                        stats,
-                    );
+                    let pushed =
+                        push_interleaved(&mut ring_producer, &packet_buf[..got_bytes], stats);
+                    if pushed > 0 {
+                        // Wake the encode worker; bounded(1) makes this a
+                        // latch — a pending token means no send occurs.
+                        let _ = wake_tx.try_send(());
+                    }
                 }
                 Err(e) => {
                     consecutive_errors += 1;
@@ -348,19 +372,17 @@ fn run_pump(
     info!("🔊🎤 System audio process-loopback pump stopped");
 }
 
-/// Push one packet of interleaved stereo f32 into the ring.
+/// Push one packet of interleaved stereo f32 into the ring, returning
+/// how many samples were pushed.
 ///
 /// The engine already delivers the exact layout the ring contract wants
-/// (L R L R … f32 at 48 kHz), so this is a straight byte→f32 copy. A
-/// SILENT-flagged buffer may hold garbage per the WASAPI docs, so it
-/// becomes zeros — keeping the timeline continuous instead of injecting
-/// noise.
+/// (L R L R … f32 at 48 kHz), so this is a straight byte→f32 copy.
+/// SILENT-flagged buffers never reach here — the pump drops them.
 fn push_interleaved(
     ring_producer: &mut Producer<f32>,
     bytes: &[u8],
-    silent: bool,
     stats: &AudioStats,
-) {
+) -> usize {
     let total = bytes.len() / BYTES_PER_SAMPLE;
     // Never split a stereo pair across a full-ring drop: an odd push
     // count would permanently swap L/R for everything that follows.
@@ -370,12 +392,9 @@ fn push_interleaved(
         stats.input_overruns.fetch_add(1, Ordering::Relaxed);
     }
     for sample in bytes.chunks_exact(BYTES_PER_SAMPLE).take(n) {
-        let value = if silent {
-            0.0
-        } else {
-            f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]])
-        };
+        let value = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
         // Cannot fail: n ≤ free slots and this thread is the sole producer.
         let _ = ring_producer.push(value);
     }
+    n
 }

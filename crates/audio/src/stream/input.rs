@@ -26,6 +26,15 @@
 //! capture time (`SCStreamConfiguration.excludesCurrentProcessAudio`,
 //! PipeWire routing), never filter after the fact.
 //!
+//! ## Footprint (silence)
+//!
+//! Silence costs ~nothing end to end: the process-loopback backend
+//! contributes no samples for silent capture (SILENT-flagged buffers are
+//! dropped), the worker parks on a wake latch instead of polling the
+//! ring (the 2026-08 audit measured ~500 wakes/s from the 2 ms polling
+//! sleep this replaced), and the post-volume silence gate stops Opus
+//! encoding and packet output when nothing audible is playing.
+//!
 //! ## Architecture
 //!
 //! The capture runs on a dedicated thread, separate from mic input.
@@ -37,7 +46,9 @@
 //! ```
 //!
 //! The worker thread is modeled after `input.rs` but simplified:
-//! no noise gate, no VAD, no denoise — system audio is clean.
+//! no VAD, no denoise — system audio is clean. The one gate is a cheap
+//! post-volume *silence* gate that stops encoding and packet output
+//! entirely when nothing audible is playing.
 //!
 //! ## Encoding strategy
 //!
@@ -45,7 +56,9 @@
 //! different settings optimized for music/game audio:
 //! - 128 kbps stereo (vs 24 kbps mono for voice)
 //! - `Application::Audio` (vs `Application::Voip`)
-//! - No DTX (continuous transmission while sharing)
+//! - No DTX — the worker-level silence gate replaces it, stopping
+//!   packets entirely during silence (seq only advances on sent
+//!   packets, so receivers see silence, not loss)
 //!
 //! The encoded packets are tagged with a sentinel SSRC so the receiver
 //! knows to decode them with music-optimized settings and route them
@@ -87,6 +100,22 @@ const SYSTEM_AUDIO_CHANNELS: usize = 2;
 /// the 10ms voice frames — system audio doesn't need ultra-low latency.
 /// The interleaved buffer size is `SYSTEM_AUDIO_FRAME_SIZE * SYSTEM_AUDIO_CHANNELS`.
 const SYSTEM_AUDIO_FRAME_SIZE: usize = 960;
+
+/// Peak amplitude below which a frame counts as silent (≈ −80 dBFS,
+/// under half a 16-bit LSB). Applied *after* volume, so volume 0 gates
+/// the stream too.
+const SILENCE_THRESHOLD: f32 = 1e-4;
+
+/// Consecutive silent frames before the encoder gate closes:
+/// 25 × 20 ms = 500 ms of hangover, so reverb tails and short pauses
+/// aren't clipped and the gate doesn't chatter at track boundaries.
+const SILENCE_HANGOVER_FRAMES: u32 = 25;
+
+/// Cap on the worker's block while waiting for capture data. Wakes come
+/// from the backend's wake latch the moment samples land; this timeout
+/// only bounds `stop()` latency and the mute-drain cadence. This is an
+/// OS wait — zero CPU while blocked, ≤10 wakes/s during total silence.
+const WORKER_WAIT_CAP: Duration = Duration::from_millis(100);
 
 /// Encoded system audio packet, ready for network transport.
 ///
@@ -160,6 +189,9 @@ mod wasapi_loopback {
         device_config: SupportedStreamConfig,
         stream: Option<Stream>,
         ring_producer: Option<Producer<f32>>,
+        /// Wake latch to the encode worker, pinged from the capture
+        /// callback after pushing samples.
+        wake_tx: Option<Sender<()>>,
         stats: Arc<AudioStats>,
     }
 
@@ -188,6 +220,7 @@ mod wasapi_loopback {
         /// `stream::process_loopback` for the preferred backend.
         pub fn new(
             ring_producer: Producer<f32>,
+            wake_tx: Sender<()>,
             stats: Arc<AudioStats>,
         ) -> Result<Self, Box<dyn std::error::Error>> {
             // Use the WASAPI host specifically (not the default host which
@@ -217,6 +250,7 @@ mod wasapi_loopback {
                 device_config,
                 stream: None,
                 ring_producer: Some(ring_producer),
+                wake_tx: Some(wake_tx),
                 stats,
             })
         }
@@ -225,6 +259,7 @@ mod wasapi_loopback {
             device: &cpal::Device,
             config: &StreamConfig,
             mut ring_producer: Producer<f32>,
+            wake_tx: Sender<()>,
             stats: Arc<AudioStats>,
             channels: usize,
         ) -> Result<Stream, Box<dyn std::error::Error>>
@@ -245,7 +280,17 @@ mod wasapi_loopback {
                     //   2ch → pass through
                     //   3+ch → take first two channels
                     let ch = channels;
+                    // Whole stereo pairs only: budgeting free slots up
+                    // front (rounded down to even) means a full ring can
+                    // never split an L/R pair — an odd push count would
+                    // permanently swap channels for everything after it.
+                    let mut budget = ring_producer.slots() & !1_usize;
+                    let mut pushed = false;
                     for frame in data.chunks(ch) {
+                        if budget < 2 {
+                            stats.input_overruns.fetch_add(1, Ordering::Relaxed);
+                            break; // ring full — drop the rest of this callback
+                        }
                         let left: f32 = frame[0].to_sample::<f32>();
                         let right: f32 = if ch >= 2 {
                             frame[1].to_sample::<f32>()
@@ -253,14 +298,16 @@ mod wasapi_loopback {
                             left // mono → duplicate
                         };
 
-                        if ring_producer.push(left).is_err() {
-                            stats.input_overruns.fetch_add(1, Ordering::Relaxed);
-                            return; // ring full, bail out of this callback
-                        }
-                        if ring_producer.push(right).is_err() {
-                            stats.input_overruns.fetch_add(1, Ordering::Relaxed);
-                            return;
-                        }
+                        // Cannot fail: budget ≤ free slots, sole producer.
+                        let _ = ring_producer.push(left);
+                        let _ = ring_producer.push(right);
+                        budget -= 2;
+                        pushed = true;
+                    }
+                    if pushed {
+                        // Wake the encode worker; bounded(1) = latch, so
+                        // a pending token means this send is a no-op.
+                        let _ = wake_tx.try_send(());
                     }
                 },
                 move |err| {
@@ -290,12 +337,14 @@ mod wasapi_loopback {
                 .ring_producer
                 .take()
                 .ok_or("Ring producer already taken")?;
+            let wake_tx = self.wake_tx.take().ok_or("Wake sender already taken")?;
 
             let stream = match format {
                 SampleFormat::I16 => Self::build_stream_typed::<i16>(
                     &self.device,
                     &config,
                     ring_producer,
+                    wake_tx,
                     self.stats.clone(),
                     channels as usize,
                 )?,
@@ -303,6 +352,7 @@ mod wasapi_loopback {
                     &self.device,
                     &config,
                     ring_producer,
+                    wake_tx,
                     self.stats.clone(),
                     channels as usize,
                 )?,
@@ -310,6 +360,7 @@ mod wasapi_loopback {
                     &self.device,
                     &config,
                     ring_producer,
+                    wake_tx,
                     self.stats.clone(),
                     channels as usize,
                 )?,
@@ -378,6 +429,7 @@ mod coreaudio_loopback {
     impl CoreAudioLoopback {
         pub fn new(
             _ring_producer: Producer<f32>,
+            _wake_tx: Sender<()>,
             _stats: Arc<AudioStats>,
         ) -> Result<Self, Box<dyn std::error::Error>> {
             Err("System audio capture not yet implemented on macOS. \
@@ -439,6 +491,7 @@ mod linux_loopback {
     impl LinuxLoopback {
         pub fn new(
             _ring_producer: Producer<f32>,
+            _wake_tx: Sender<()>,
             _stats: Arc<AudioStats>,
         ) -> Result<Self, Box<dyn std::error::Error>> {
             Err("System audio capture not yet implemented on Linux. \
@@ -570,10 +623,15 @@ impl SystemAudioCapture {
             return Ok(());
         }
 
+        // Wake latch: capture backends ping it after pushing samples so
+        // the worker blocks instead of polling an empty ring. bounded(1)
+        // coalesces pings — a pending token makes further sends no-ops.
+        let (wake_tx, wake_rx) = bounded::<()>(1);
+
         // Backend and ring buffer creation are fused: on Windows a failed
         // process-loopback start falls back to endpoint loopback with a
         // fresh ring (the failed attempt consumed the first producer).
-        let (backend, ring_consumer) = Self::create_started_backend(&self.stats)?;
+        let (backend, ring_consumer) = Self::create_started_backend(&self.stats, &wake_tx)?;
 
         let device_sample_rate = backend.sample_rate();
         let device_name = backend.device_name();
@@ -598,6 +656,7 @@ impl SystemAudioCapture {
             volume,
             stats,
             device_sample_rate,
+            wake_rx,
         );
 
         self.worker_thread = Some(worker);
@@ -634,10 +693,14 @@ impl SystemAudioCapture {
     #[cfg(target_os = "windows")]
     fn create_started_backend(
         stats: &Arc<AudioStats>,
+        wake_tx: &Sender<()>,
     ) -> Result<StartedBackend, Box<dyn std::error::Error>> {
         let (ring_producer, ring_consumer) = Self::new_ring();
-        let mut preferred =
-            super::process_loopback::ProcessLoopback::new(ring_producer, stats.clone());
+        let mut preferred = super::process_loopback::ProcessLoopback::new(
+            ring_producer,
+            wake_tx.clone(),
+            stats.clone(),
+        );
         match preferred.start() {
             Ok(()) => {
                 info!("🔊🎤 System audio backend: process loopback (own audio excluded)");
@@ -651,9 +714,11 @@ impl SystemAudioCapture {
             ),
         }
 
-        // Fresh ring: the failed attempt consumed the first producer.
+        // Fresh ring: the failed attempt consumed the first producer
+        // (and its wake sender clone — harmless, the latch has clones).
         let (ring_producer, ring_consumer) = Self::new_ring();
-        let mut fallback = wasapi_loopback::WasapiLoopback::new(ring_producer, stats.clone())?;
+        let mut fallback =
+            wasapi_loopback::WasapiLoopback::new(ring_producer, wake_tx.clone(), stats.clone())?;
         fallback.start()?;
         let backend: Box<dyn SystemAudioBackend> = Box::new(fallback);
         Ok((backend, ring_consumer))
@@ -665,10 +730,14 @@ impl SystemAudioCapture {
     #[cfg(target_os = "macos")]
     fn create_started_backend(
         stats: &Arc<AudioStats>,
+        wake_tx: &Sender<()>,
     ) -> Result<StartedBackend, Box<dyn std::error::Error>> {
         let (ring_producer, ring_consumer) = Self::new_ring();
-        let mut backend =
-            coreaudio_loopback::CoreAudioLoopback::new(ring_producer, stats.clone())?;
+        let mut backend = coreaudio_loopback::CoreAudioLoopback::new(
+            ring_producer,
+            wake_tx.clone(),
+            stats.clone(),
+        )?;
         backend.start()?;
         let backend: Box<dyn SystemAudioBackend> = Box::new(backend);
         Ok((backend, ring_consumer))
@@ -680,9 +749,11 @@ impl SystemAudioCapture {
     #[cfg(target_os = "linux")]
     fn create_started_backend(
         stats: &Arc<AudioStats>,
+        wake_tx: &Sender<()>,
     ) -> Result<StartedBackend, Box<dyn std::error::Error>> {
         let (ring_producer, ring_consumer) = Self::new_ring();
-        let mut backend = linux_loopback::LinuxLoopback::new(ring_producer, stats.clone())?;
+        let mut backend =
+            linux_loopback::LinuxLoopback::new(ring_producer, wake_tx.clone(), stats.clone())?;
         backend.start()?;
         let backend: Box<dyn SystemAudioBackend> = Box::new(backend);
         Ok((backend, ring_consumer))
@@ -758,6 +829,7 @@ impl SystemAudioCapture {
         not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
         allow(dead_code)
     )]
+    #[allow(clippy::too_many_arguments)] // matches stream/output.rs precedent
     fn spawn_worker(
         ring_consumer: Consumer<f32>,
         packet_tx: Sender<SystemAudioPacket>,
@@ -766,12 +838,13 @@ impl SystemAudioCapture {
         volume: Arc<AtomicU32>,
         stats: Arc<AudioStats>,
         device_sample_rate: u32,
+        wake_rx: Receiver<()>,
     ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
+        crate::platform::spawn_named("sysaudio-encode", move || {
             // Audio-class scheduling (MMCSS "Pro Audio" on Windows).
             // The capture side lives in platform backends; the worker's
-            // short sleeps also benefit from the process-wide 1 ms timer
-            // held by VoiceChat's TimerResolutionGuard.
+            // timed waits benefit from the process-wide 1 ms timer held
+            // by VoiceChat's TimerResolutionGuard.
             let _mmcss = crate::platform::promote_current_thread();
             Self::worker_loop(
                 ring_consumer,
@@ -781,10 +854,12 @@ impl SystemAudioCapture {
                 volume,
                 stats,
                 device_sample_rate,
+                wake_rx,
             );
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // matches stream/output.rs precedent
     fn worker_loop(
         mut ring_consumer: Consumer<f32>,
         packet_tx: Sender<SystemAudioPacket>,
@@ -793,6 +868,7 @@ impl SystemAudioCapture {
         volume: Arc<AtomicU32>,
         _stats: Arc<AudioStats>,
         device_sample_rate: u32,
+        wake_rx: Receiver<()>,
     ) {
         // ── Opus encoder (stereo, music-optimized) ──────────────────────
         let mut encoder = match opus::Encoder::new(
@@ -871,6 +947,10 @@ impl SystemAudioCapture {
             Vec::with_capacity(SYSTEM_AUDIO_FRAME_SIZE * SYSTEM_AUDIO_CHANNELS * 4);
         let mut encode_buf = vec![0u8; 4096]; // Opus output buffer
         let mut seq: u32 = 0;
+        // Silence-gate state: frames since the last audible one. Starts
+        // at 0 so a share always primes the receiver with a few frames
+        // before the gate can close.
+        let mut silent_frames: u32 = 0;
 
         // Interleaved frame size (what Opus expects)
         let interleaved_frame_size = SYSTEM_AUDIO_FRAME_SIZE * SYSTEM_AUDIO_CHANNELS;
@@ -884,7 +964,9 @@ impl SystemAudioCapture {
             // ── Mute: drain ring buffer but don't encode ────────────────
             if is_muted.load(Ordering::Relaxed) {
                 while ring_consumer.pop().is_ok() {}
-                thread::sleep(Duration::from_millis(10));
+                // Block until more data lands (or the cap elapses for a
+                // stop check) — replaces a 10 ms polling sleep.
+                crate::platform::wait_for_wake(&wake_rx, WORKER_WAIT_CAP);
                 accumulator.clear();
                 resampler_accum_l.clear();
                 resampler_accum_r.clear();
@@ -898,25 +980,31 @@ impl SystemAudioCapture {
                 interleaved_frame_size
             };
 
+            // Read whole stereo pairs only. Capping by the ring's
+            // readable count (rounded down to even) means a producer
+            // caught mid-pair leaves its lone half in the ring for the
+            // next pass — popping and discarding it (the old behavior)
+            // permanently swapped L/R for everything that followed.
+            let available_even = ring_consumer.slots() & !1_usize;
+            let to_read = target_interleaved.min(read_buf.len()).min(available_even) & !1_usize;
+
             let mut n_read = 0;
-            for i in 0..target_interleaved.min(read_buf.len()) {
+            for i in 0..to_read {
                 match ring_consumer.pop() {
                     Ok(s) => {
                         read_buf[i] = s;
                         n_read += 1;
                     }
-                    Err(_) => break,
+                    Err(_) => break, // unreachable: readable count only grows
                 }
             }
 
             if n_read == 0 {
-                thread::sleep(Duration::from_millis(2));
-                continue;
-            }
-
-            // Ensure we have complete stereo pairs
-            let n_read = n_read - (n_read % SYSTEM_AUDIO_CHANNELS);
-            if n_read == 0 {
+                // Empty ring: block until the capture backend pings the
+                // wake latch (or the cap elapses for a stop check). This
+                // replaces a 2 ms polling sleep that the 2026-08 audit
+                // predicted at ~500 wakes/s during engine-idle silence.
+                crate::platform::wait_for_wake(&wake_rx, WORKER_WAIT_CAP);
                 continue;
             }
 
@@ -992,12 +1080,37 @@ impl SystemAudioCapture {
             while accumulator.len() >= interleaved_frame_size {
                 let mut frame: Vec<f32> = accumulator.drain(..interleaved_frame_size).collect();
 
-                // ── Apply volume ────────────────────────────────────────
+                // ── Apply volume & measure peak ─────────────────────────
                 let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                if (vol - 1.0).abs() > f32::EPSILON {
-                    for s in frame.iter_mut() {
+                let apply_vol = (vol - 1.0).abs() > f32::EPSILON;
+                let mut peak = 0.0f32;
+                for s in frame.iter_mut() {
+                    if apply_vol {
                         *s = (*s * vol).clamp(-0.99, 0.99);
                     }
+                    peak = peak.max(s.abs());
+                }
+
+                // ── Silence gate ────────────────────────────────────────
+                // Measured 2026-08: without this, a silent share kept the
+                // whole encode+network path busy shipping Opus-encoded
+                // zeros (~50 pkts/s per viewer). Gated after the volume
+                // stage so volume 0 counts as silence. Seq only advances
+                // on sent packets, so the receiver sees no loss — its
+                // playback ring simply underruns to silence by design.
+                if peak < SILENCE_THRESHOLD {
+                    silent_frames = silent_frames.saturating_add(1);
+                    if silent_frames == SILENCE_HANGOVER_FRAMES {
+                        info!("🔊🎤 System audio gate closed (silence)");
+                    }
+                    if silent_frames >= SILENCE_HANGOVER_FRAMES {
+                        continue; // hangover elapsed — skip encode + send
+                    }
+                } else {
+                    if silent_frames >= SILENCE_HANGOVER_FRAMES {
+                        info!("🔊🎤 System audio gate opened (audio resumed)");
+                    }
+                    silent_frames = 0;
                 }
 
                 // ── Opus encode (stereo interleaved) ────────────────────

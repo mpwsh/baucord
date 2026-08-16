@@ -119,16 +119,19 @@ impl VoiceThreadHandle {
         let shared = SharedAudioState::new();
 
         let shared_clone = shared.clone();
-        let join_handle = thread::spawn(move || {
-            run_voice_loop(
-                control_rx,
-                event_tx,
-                network_tx,
-                shared_clone,
-                is_testing_mic,
-                wake,
-            );
-        });
+        let join_handle = thread::Builder::new()
+            .name("client-voice".into())
+            .spawn(move || {
+                run_voice_loop(
+                    control_rx,
+                    event_tx,
+                    network_tx,
+                    shared_clone,
+                    is_testing_mic,
+                    wake,
+                );
+            })
+            .expect("failed to spawn voice thread");
 
         Self {
             tx,

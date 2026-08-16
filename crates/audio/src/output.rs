@@ -255,7 +255,7 @@ impl AudioOutput {
         output_gain: Arc<AtomicU32>,
         deafened: Arc<AtomicBool>,
     ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
+        crate::platform::spawn_named("voice-output", move || {
             let mut jitter_buffer =
                 AdaptiveJitterBuffer::new(OPUS_SAMPLE_RATE as usize, 10, peer_settings);
 

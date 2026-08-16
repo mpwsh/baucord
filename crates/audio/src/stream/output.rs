@@ -271,8 +271,19 @@ impl StreamAudioOutput {
                 let stereo_frames_needed = data.len() / ch;
 
                 for frame_idx in 0..stereo_frames_needed {
-                    let left = ring_consumer.pop().unwrap_or(0.0).clamp(-0.99, 0.99);
-                    let right = ring_consumer.pop().unwrap_or(0.0).clamp(-0.99, 0.99);
+                    // Pop whole pairs only: draining the ring mid-pair
+                    // (producer between its L and R push) would orphan
+                    // the R sample and permanently swap channels for the
+                    // rest of the stream. A lone half-pair stays in the
+                    // ring; this frame renders silence instead.
+                    let (left, right) = if ring_consumer.slots() >= 2 {
+                        (
+                            ring_consumer.pop().unwrap_or(0.0).clamp(-0.99, 0.99),
+                            ring_consumer.pop().unwrap_or(0.0).clamp(-0.99, 0.99),
+                        )
+                    } else {
+                        (0.0, 0.0) // underrun — render silence
+                    };
 
                     let base = frame_idx * ch;
                     match ch {
@@ -322,7 +333,7 @@ impl StreamAudioOutput {
         is_muted: Arc<AtomicBool>,
         voice_energy: Option<Arc<AtomicU32>>,
     ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
+        crate::platform::spawn_named("stream-audio-out", move || {
             // Audio-class scheduling (MMCSS "Pro Audio" on Windows).
             let _mmcss = crate::platform::promote_current_thread();
 
@@ -466,13 +477,17 @@ impl StreamAudioOutput {
 
                         match r.process_into_buffer(&in_adapter, &mut out_adapter, None) {
                             Ok((_in_len, out_len)) => {
+                                // Whole stereo pairs only — a split pair
+                                // on a full ring permanently swaps L/R
+                                // downstream. Budget free slots up front.
+                                let mut budget = ring_producer.slots() & !1_usize;
                                 for i in 0..out_len {
-                                    if ring_producer.push(resampler_output[0][i]).is_err() {
-                                        break;
+                                    if budget < 2 {
+                                        break; // ring full — drop remainder
                                     }
-                                    if ring_producer.push(resampler_output[1][i]).is_err() {
-                                        break;
-                                    }
+                                    let _ = ring_producer.push(resampler_output[0][i]);
+                                    let _ = ring_producer.push(resampler_output[1][i]);
+                                    budget -= 2;
                                 }
                             }
                             Err(e) => {
@@ -485,13 +500,17 @@ impl StreamAudioOutput {
                     let current_fill = ring_capacity - ring_producer.slots();
                     if current_fill < high_wm {
                         let frames = accum_l.len().min(accum_r.len());
+                        // Whole stereo pairs only (see resample path).
+                        // Unpushed remainder is still drained/dropped —
+                        // same policy as before, now without pair splits.
+                        let mut budget = ring_producer.slots() & !1_usize;
                         for i in 0..frames {
-                            if ring_producer.push(accum_l[i]).is_err() {
-                                break;
+                            if budget < 2 {
+                                break; // ring full — drop remainder
                             }
-                            if ring_producer.push(accum_r[i]).is_err() {
-                                break;
-                            }
+                            let _ = ring_producer.push(accum_l[i]);
+                            let _ = ring_producer.push(accum_r[i]);
+                            budget -= 2;
                         }
                         accum_l.drain(..frames);
                         accum_r.drain(..frames);

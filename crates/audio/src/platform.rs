@@ -152,6 +152,24 @@ pub fn wait_for_wake(wake_rx: &Receiver<()>, timeout: Duration) {
     }
 }
 
+/// `thread::spawn` with a name.
+///
+/// Names surface in debuggers, `GetThreadDescription`-based tooling, and
+/// crash dumps — anonymous threads made the 2026-08 wake-rate audit
+/// nearly impossible, hence: every worker gets a name. Same
+/// panic-on-spawn-failure semantics as `std::thread::spawn` (which also
+/// aborts the process if the OS can't create a thread).
+pub(crate) fn spawn_named<F, T>(name: &str, f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(f)
+        .expect("failed to spawn thread")
+}
+
 // ── Windows FFI (no extra crates) ───────────────────────────────────────
 
 #[cfg(windows)]

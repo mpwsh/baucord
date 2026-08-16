@@ -186,7 +186,7 @@ pub fn spawn(
     tx: Sender<AudioPacket>,
     stats: Arc<AudioStats>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || match EncoderWorker::new(rx, tx, stats) {
+    crate::platform::spawn_named("voice-encode", move || match EncoderWorker::new(rx, tx, stats) {
         Ok(mut worker) => worker.run(),
         Err(e) => error!("Failed to create Opus encoder: {e}"),
     })

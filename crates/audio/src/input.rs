@@ -266,7 +266,7 @@ impl AudioInput {
         chain.add(Box::new(LevelMeter::new(MeterTarget::Pipeline)));
         chain.add(Box::new(vad));
 
-        self.worker_thread = Some(thread::spawn(move || {
+        self.worker_thread = Some(crate::platform::spawn_named("voice-capture", move || {
             // ── Resampler setup ─────────────────────────────────────
             let needs_resample = device_sample_rate != 48_000;
             let mut resampler: Option<Async<f32>> = None;

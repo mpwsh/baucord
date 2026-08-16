@@ -442,7 +442,7 @@ pub fn spawn(
     should_stop: Arc<AtomicBool>,
     removed_peers: Arc<Mutex<HashSet<u64>>>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    crate::platform::spawn_named("voice-decode", move || {
         let mut thread = DecoderThread {
             rx: network_rx,
             tx: decoded_tx,

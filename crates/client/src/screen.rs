@@ -201,16 +201,19 @@ impl ScreenThreadHandle {
 
         let shared_clone = shared.clone();
         let voice_energy_clone = voice_energy.clone();
-        let join_handle = thread::spawn(move || {
-            run_screen_loop(
-                control_rx,
-                event_tx,
-                network_tx,
-                shared_clone,
-                wake,
-                voice_energy_clone,
-            );
-        });
+        let join_handle = thread::Builder::new()
+            .name("screen-share".into())
+            .spawn(move || {
+                run_screen_loop(
+                    control_rx,
+                    event_tx,
+                    network_tx,
+                    shared_clone,
+                    wake,
+                    voice_energy_clone,
+                );
+            })
+            .expect("failed to spawn screen thread");
 
         Self {
             tx,

@@ -885,9 +885,12 @@ impl NetworkThreadHandle {
         screen_tx: Sender<ScreenControl>,
         wake: WakeFn,
     ) -> Self {
-        let join_handle = thread::spawn(move || {
-            run_network_loop(control_rx, msg_tx, voice_tx, screen_tx, wake);
-        });
+        let join_handle = thread::Builder::new()
+            .name("client-network".into())
+            .spawn(move || {
+                run_network_loop(control_rx, msg_tx, voice_tx, screen_tx, wake);
+            })
+            .expect("failed to spawn network thread");
 
         Self {
             tx,

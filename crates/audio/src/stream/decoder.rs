@@ -237,7 +237,8 @@ pub fn spawn(
 
     let stop = should_stop.clone();
     let decoder_thread =
-        std::thread::spawn(
+        crate::platform::spawn_named(
+            "stream-decode",
             move || match StreamDecoderWorker::new(packet_rx, frame_tx, stop) {
                 Ok(mut worker) => worker.run(),
                 Err(e) => error!("Failed to create stream Opus decoder: {e}"),
