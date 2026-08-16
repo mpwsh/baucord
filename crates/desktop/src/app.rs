@@ -23,7 +23,7 @@
 //
 // Speaking state is driven by voice events, not inferred from packet flow.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::rc::{Rc, Weak};
@@ -112,6 +112,9 @@ pub struct AppState {
 
     // Windows
     pub main: MainWindow,
+    /// One-shot for repaint_on_reveal: set before showing a hidden
+    /// main window (tray Show, reconnect paths).
+    main_repaint_arm: Rc<Cell<bool>>,
     pub settings_win: Option<ui::SettingsWindow>,
     viewers: HashMap<u64, Viewer>,
     /// Image-viewer overlay: the chat row shown, and GIF playback
@@ -287,6 +290,7 @@ pub fn run() {
         pending_preview: None,
         users_model,
         main,
+        main_repaint_arm: Rc::new(Cell::new(false)),
         settings_win: None,
         viewers: HashMap::new(),
         gallery_row: None,
@@ -335,7 +339,8 @@ pub fn run() {
     state.borrow().main.show().expect("failed to show the main window");
     {
         let weak = state.borrow().main.as_weak();
-        repaint_on_reveal(state.borrow().main.window(), move || {
+        let armed = state.borrow().main_repaint_arm.clone();
+        repaint_on_reveal(state.borrow().main.window(), armed, move || {
             if let Some(main) = weak.upgrade() {
                 main.set_repaint_flip(!main.get_repaint_flip());
             }
@@ -670,11 +675,27 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 /// unlike the earlier is_minimized() polling (lost fast
 /// minimize/restore races) and flip-on-show (fired before the OS
 /// mapped and cleared the real surface).
-pub fn repaint_on_reveal(win: &slint::Window, flip: impl Fn() + 'static) {
+/// Two trigger classes:
+/// * Focus gain / un-occlusion — restore (however fast), alt-tab
+///   back, activating a newly created window.
+/// * `armed` — a one-shot consumed on the first OS-driven paint
+///   (`RedrawRequested`) after the app shows a hidden window. Windows
+///   does NOT activate a window shown from a tray interaction
+///   (foreground-lock rules), so no Focused event arrives there; and
+///   flipping at the `show()` call itself fires before the OS maps
+///   and clears the real surface. The first paint of the fresh
+///   surface is the exact right moment.
+pub fn repaint_on_reveal(
+    win: &slint::Window,
+    armed: Rc<Cell<bool>>,
+    flip: impl Fn() + 'static,
+) {
     use i_slint_backend_winit::WinitWindowAccessor;
     win.on_winit_window_event(move |_w, ev| {
         use i_slint_backend_winit::winit::event::WindowEvent;
-        if matches!(ev, WindowEvent::Focused(true) | WindowEvent::Occluded(false)) {
+        let reveal = matches!(ev, WindowEvent::Focused(true) | WindowEvent::Occluded(false))
+            || (matches!(ev, WindowEvent::RedrawRequested) && armed.take());
+        if reveal {
             flip();
         }
         i_slint_backend_winit::EventResult::Propagate
@@ -1160,7 +1181,7 @@ impl AppState {
         s.set_status_color(slint::Color::from_rgb_u8(0x2B, 0xAC, 0x76));
         self.push_chat_system(&format!("{server_name}: {greeting}"));
         self.update_user_list();
-        let _ = self.main.show();
+        self.show_main();
     }
 
     fn handle_user_joined(&mut self, client_id: u64, username: String) {
@@ -1283,7 +1304,7 @@ impl AppState {
     pub fn show_connect_phase(&mut self) {
         self.refresh_device_warning();
         self.main.global::<State>().set_phase(Phase::Connect);
-        let _ = self.main.show();
+        self.show_main();
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -1754,6 +1775,14 @@ impl AppState {
     // ════════════════════════════════════════════════════════════════
     //  CHAT MODEL
     // ════════════════════════════════════════════════════════════════
+
+    /// Show the main window, arming the reveal hook so the full
+    /// repaint lands on the first OS paint of the (possibly fresh)
+    /// surface — see [`repaint_on_reveal`].
+    pub fn show_main(&self) {
+        self.main_repaint_arm.set(true);
+        let _ = self.main.show();
+    }
 
     // NOTE: there is deliberately no scroll-after-append here. The
     // ListView pins itself to the bottom reactively (chat.slint's
@@ -2352,7 +2381,6 @@ pub mod tray {
     //! and a visible tray icon by itself keeps
     //! `run_event_loop_until_quit` alive.
     use log::warn;
-    use slint::ComponentHandle; // for main.show()
 
     use super::{with_current, AppState};
     use i18n::t;
@@ -2375,9 +2403,7 @@ pub mod tray {
         tray.set_show_label(t!("tray-show").into());
         tray.set_quit_label(t!("tray-quit").into());
         tray.on_show_app(|| {
-            with_current(|app| {
-                let _ = app.main.show();
-            });
+            with_current(|app| app.show_main());
         });
         tray.on_quit_app(|| {
             with_current(AppState::save_settings_now);

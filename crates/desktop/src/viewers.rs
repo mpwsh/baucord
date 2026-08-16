@@ -64,7 +64,8 @@ impl Viewer {
 
         win.set_stats("--".into());
         let weak = win.as_weak();
-        crate::app::repaint_on_reveal(win.window(), move || {
+        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+        crate::app::repaint_on_reveal(win.window(), armed, move || {
             if let Some(w) = weak.upgrade() {
                 w.set_repaint_flip(!w.get_repaint_flip());
             }
