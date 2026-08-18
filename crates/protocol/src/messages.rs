@@ -74,6 +74,9 @@ pub enum DenyReason {
     NotSharing,
     /// The announced share dimensions were out of range.
     InvalidDimensions,
+    /// The stream is channel-scoped and the viewer is in a different
+    /// voice channel.
+    NotInChannel,
 }
 
 impl DenyReason {
@@ -85,6 +88,64 @@ impl DenyReason {
             DenyReason::ViewerLimitReached => "this stream is at its viewer limit",
             DenyReason::NotSharing => "that user is not sharing their screen",
             DenyReason::InvalidDimensions => "the share dimensions were rejected",
+            DenyReason::NotInChannel => "this stream is only visible in its voice channel",
+        }
+    }
+}
+
+// ── Voice channels (rooms) ──────────────────────────────────────────────
+//
+// Not to be confused with renet transport channels (`crate::channels`):
+// a voice channel is a server-defined *room* that scopes voice routing
+// and (optionally) screen-share visibility. Rooms are static per server
+// run, defined in server.yaml, and identified on the wire by their
+// index in that list.
+
+/// One voice channel (room) as announced to clients in
+/// [`ServerMessage::Init`]. The password itself never crosses the wire
+/// server→client — only the fact that one is required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelInfo {
+    /// Stable id for this server run: the index in the config list.
+    pub id: u16,
+    pub name: String,
+    /// Whether [`ClientMessage::JoinChannel`] must carry a password.
+    pub has_password: bool,
+    /// Maximum members, `None` = unlimited. The default channel never
+    /// has a limit (enforced by server config validation).
+    pub user_limit: Option<u16>,
+}
+
+/// Who may see (and subscribe to) a screen share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareScope {
+    /// Only members of the sharer's current voice channel. The stream
+    /// follows the sharer across channel moves.
+    Channel,
+    /// Every user on the server, regardless of voice channel.
+    Everyone,
+}
+
+/// Why the server refused a [`ClientMessage::JoinChannel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelDenyReason {
+    /// The channel id does not exist on this server.
+    NoSuchChannel,
+    /// The channel requires a password and the supplied one was missing
+    /// or wrong.
+    WrongPassword,
+    /// The channel is at its user limit.
+    ChannelFull,
+}
+
+impl ChannelDenyReason {
+    /// Human-readable form for UI display.
+    #[must_use]
+    pub fn describe(&self) -> &'static str {
+        match self {
+            ChannelDenyReason::NoSuchChannel => "that channel does not exist",
+            ChannelDenyReason::WrongPassword => "wrong channel password",
+            ChannelDenyReason::ChannelFull => "the channel is full",
         }
     }
 }
@@ -107,7 +168,12 @@ pub enum ClientMessage {
     // ── Screen share signaling ──────────────────────────────────────
     /// We started sharing our screen. Dimensions are the quality preset
     /// bounds; per-frame actual dimensions travel in the video headers.
-    ScreenShareStart { width: u16, height: u16 },
+    /// `scope` decides who may see and subscribe to the stream.
+    ScreenShareStart {
+        width: u16,
+        height: u16,
+        scope: ShareScope,
+    },
 
     /// We stopped sharing our screen.
     ScreenShareStop,
@@ -129,6 +195,16 @@ pub enum ClientMessage {
     /// Send an image chat message (encoded PNG, ≤
     /// [`MAX_CHAT_IMAGE_BYTES`]) to the room.
     ChatImage(Vec<u8>),
+
+    // ── Voice channels ──────────────────────────────────────────────
+    /// Move to another voice channel. `password` is required when the
+    /// channel's [`ChannelInfo::has_password`] is set. The server
+    /// answers with [`ServerMessage::UserMovedChannel`] (broadcast,
+    /// including to us) or [`ServerMessage::JoinChannelDenied`].
+    JoinChannel {
+        channel_id: u16,
+        password: Option<String>,
+    },
 }
 
 impl ClientMessage {
@@ -151,18 +227,23 @@ impl ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
     /// Initialization payload for a newly connected client: the current
-    /// user list, our authoritative client id, server name and greeting.
+    /// user list, our authoritative client id, server name and greeting,
+    /// plus the voice-channel roster: every channel this server defines
+    /// and which channel each connected user (including us) is in.
     Init {
         usernames: HashMap<ClientId, String>,
         client_id: ClientId,
         server_name: String,
         greeting: String,
+        channels: Vec<ChannelInfo>,
+        memberships: HashMap<ClientId, u16>,
     },
 
-    /// A new client connected.
+    /// A new client connected (always into the default channel).
     UserJoined {
         client_id: ClientId,
         username: String,
+        channel_id: u16,
     },
 
     /// A client disconnected.
@@ -185,14 +266,20 @@ pub enum ServerMessage {
     },
 
     // ── Screen share signaling ──────────────────────────────────────
-    /// A client started sharing their screen.
+    /// A client started sharing their screen. Channel-scoped shares are
+    /// only announced to the sharer's channel; receiving this means the
+    /// stream is watchable from where you are.
     ScreenShareStarted {
         client_id: ClientId,
         width: u16,
         height: u16,
+        scope: ShareScope,
     },
 
-    /// A client stopped sharing their screen.
+    /// A client stopped sharing their screen — or, for channel-scoped
+    /// streams, the stream became invisible to *you* (the sharer or you
+    /// moved channels). Either way: clear the LIVE badge and close any
+    /// viewer window for this stream.
     ScreenShareStopped { client_id: ClientId },
 
     /// The server refused our `ScreenShareStart`.
@@ -225,6 +312,30 @@ pub enum ServerMessage {
     // discriminants are untouched.)
     /// An image chat message from a client.
     ChatImage(ChatImageMessage),
+
+    // ── Voice channels ──────────────────────────────────────────────
+    /// A client moved to another voice channel. Broadcast to everyone
+    /// including the mover — the UI treats the echo as authoritative
+    /// for its own position (same contract as `Speaking`).
+    UserMovedChannel {
+        client_id: ClientId,
+        channel_id: u16,
+    },
+
+    /// The server refused our `JoinChannel`.
+    JoinChannelDenied {
+        channel_id: u16,
+        reason: ChannelDenyReason,
+    },
+
+    /// The server's channel list changed (hot-reloaded server.yaml).
+    /// Carries the full new list *and* authoritative memberships —
+    /// channel ids are list indexes, so a reload renumbers them and
+    /// clients must resync wholesale rather than patch incrementally.
+    ChannelListUpdated {
+        channels: Vec<ChannelInfo>,
+        memberships: HashMap<ClientId, u16>,
+    },
 }
 
 impl ServerMessage {
@@ -401,16 +512,124 @@ mod tests {
     }
 
     #[test]
-    fn chat_image_uses_control_channel() {
-        assert_eq!(ClientMessage::ChatImage(Vec::new()).channel(), CONTROL_CHANNEL);
+    fn chat_image_uses_media_channel() {
+        assert_eq!(ClientMessage::ChatImage(Vec::new()).channel(), MEDIA_CHANNEL);
         assert_eq!(
             ServerMessage::ChatImage(ChatImageMessage {
                 client_id: 0,
                 data: Vec::new(),
             })
             .channel(),
-            CONTROL_CHANNEL
+            MEDIA_CHANNEL
         );
+    }
+
+    #[test]
+    fn join_channel_roundtrips_on_control() {
+        let msg = ClientMessage::JoinChannel {
+            channel_id: 3,
+            password: Some("hunter2".to_string()),
+        };
+        assert_eq!(msg.channel(), CONTROL_CHANNEL);
+        let bytes = encode_client_message(&msg).unwrap();
+        let back = decode_client_message(&bytes).unwrap();
+        assert!(matches!(
+            back,
+            ClientMessage::JoinChannel { channel_id: 3, password: Some(p) } if p == "hunter2"
+        ));
+    }
+
+    #[test]
+    fn init_with_channels_roundtrips() {
+        let msg = ServerMessage::Init {
+            usernames: HashMap::from([(1, "empe".to_string())]),
+            client_id: 1,
+            server_name: "baucord".to_string(),
+            greeting: "hi".to_string(),
+            channels: vec![
+                ChannelInfo {
+                    id: 0,
+                    name: "Lobby".to_string(),
+                    has_password: false,
+                    user_limit: None,
+                },
+                ChannelInfo {
+                    id: 1,
+                    name: "Gaming".to_string(),
+                    has_password: true,
+                    user_limit: Some(8),
+                },
+            ],
+            memberships: HashMap::from([(1, 0)]),
+        };
+        let bytes = encode_server_message(&msg).unwrap();
+        let back = decode_server_message(&bytes).unwrap();
+        let ServerMessage::Init { channels, memberships, .. } = back else {
+            panic!("wrong variant");
+        };
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[1].user_limit, Some(8));
+        assert!(channels[1].has_password);
+        assert_eq!(memberships.get(&1), Some(&0));
+    }
+
+    #[test]
+    fn moved_and_denied_roundtrip() {
+        let bytes = encode_server_message(&ServerMessage::UserMovedChannel {
+            client_id: 9,
+            channel_id: 2,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes).unwrap(),
+            ServerMessage::UserMovedChannel { client_id: 9, channel_id: 2 }
+        ));
+
+        let bytes = encode_server_message(&ServerMessage::JoinChannelDenied {
+            channel_id: 2,
+            reason: ChannelDenyReason::WrongPassword,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes).unwrap(),
+            ServerMessage::JoinChannelDenied { reason: ChannelDenyReason::WrongPassword, .. }
+        ));
+    }
+
+    #[test]
+    fn channel_list_update_roundtrips() {
+        let msg = ServerMessage::ChannelListUpdated {
+            channels: vec![ChannelInfo {
+                id: 0,
+                name: "Lobby".to_string(),
+                has_password: false,
+                user_limit: None,
+            }],
+            memberships: HashMap::from([(7, 0)]),
+        };
+        assert_eq!(msg.channel(), CONTROL_CHANNEL);
+        let bytes = encode_server_message(&msg).unwrap();
+        let ServerMessage::ChannelListUpdated { channels, memberships } =
+            decode_server_message(&bytes).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(channels[0].name, "Lobby");
+        assert_eq!(memberships.get(&7), Some(&0));
+    }
+
+    #[test]
+    fn share_start_carries_scope() {
+        let bytes = encode_client_message(&ClientMessage::ScreenShareStart {
+            width: 1920,
+            height: 1080,
+            scope: ShareScope::Channel,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_client_message(&bytes).unwrap(),
+            ClientMessage::ScreenShareStart { scope: ShareScope::Channel, .. }
+        ));
     }
 
     #[test]

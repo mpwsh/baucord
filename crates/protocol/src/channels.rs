@@ -55,7 +55,7 @@ use renet::{ChannelConfig, ConnectionConfig, SendType};
 /// **Bump this on every breaking wire change** — that is the whole
 /// versioning story: old peers are rejected at the door rather than
 /// misparsing packets mid-session.
-pub const PROTOCOL_ID: u64 = 30;
+pub const PROTOCOL_ID: u64 = 32;
 
 // ── Channel IDs ─────────────────────────────────────────────────────────
 

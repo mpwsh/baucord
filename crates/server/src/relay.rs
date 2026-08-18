@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use protocol::{
-    SYSTEM_AUDIO_CHANNEL, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_CHANNEL, parse_system_audio,
-    parse_video_header, parse_voice, wrap_sender,
+    SYSTEM_AUDIO_CHANNEL, ShareScope, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_CHANNEL,
+    parse_system_audio, parse_video_header, parse_voice, wrap_sender,
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -36,9 +36,13 @@ pub struct VoiceStats {
     pub packets_dropped_malformed: u64,
     /// Per-recipient sends skipped because the recipient is deafened.
     pub sends_skipped_deafened: u64,
+    /// Per-recipient sends skipped because the recipient is in a
+    /// different voice channel than the speaker.
+    pub sends_skipped_other_channel: u64,
     pub bytes_relayed: u64,
 }
 
+#[derive(Default)]
 pub struct VoiceRelay {
     pub stats: VoiceStats,
 }
@@ -50,14 +54,28 @@ impl VoiceRelay {
         }
     }
 
-    /// Read voice packets from all clients and forward to everyone else,
-    /// skipping deafened recipients — they discard the audio anyway, so
-    /// relaying it is pure wasted egress (a deafened client in a busy
-    /// room was previously still downloading every speaker's stream).
-    pub fn process(&mut self, server: &mut RenetServer, deafened: &HashSet<ClientId>) {
+    /// Read voice packets from all clients and forward to the *speaker's
+    /// voice channel*, skipping deafened recipients — they discard the
+    /// audio anyway, so relaying it is pure wasted egress (a deafened
+    /// client in a busy room was previously still downloading every
+    /// speaker's stream).
+    ///
+    /// `channel_of` is the membership map owned by the server. Rooms
+    /// are routing policy, not transport: everything still rides the
+    /// one renet `VOICE_CHANNEL`; this filter is what makes a room a
+    /// room. A client somehow missing from the map (should be
+    /// impossible — connect events run before the relay each tick)
+    /// hears and reaches nobody rather than everybody: fail closed.
+    pub fn process(
+        &mut self,
+        server: &mut RenetServer,
+        deafened: &HashSet<ClientId>,
+        channel_of: &HashMap<ClientId, u16>,
+    ) {
         let clients: Vec<ClientId> = server.clients_id();
 
         for sender in &clients {
+            let sender_channel = channel_of.get(sender);
             while let Some(message) = server.receive_message(*sender, VOICE_CHANNEL) {
                 self.stats.packets_received += 1;
 
@@ -72,6 +90,10 @@ impl VoiceRelay {
                 let mut sent = 0u64;
                 for recipient in &clients {
                     if recipient == sender {
+                        continue;
+                    }
+                    if sender_channel.is_none() || channel_of.get(recipient) != sender_channel {
+                        self.stats.sends_skipped_other_channel += 1;
                         continue;
                     }
                     if deafened.contains(recipient) {
@@ -101,10 +123,15 @@ impl VoiceRelay {
             self.stats.packets_forwarded,
             self.stats.bytes_relayed as f64 / 1_048_576.0,
         );
-        if self.stats.packets_dropped_malformed > 0 || self.stats.sends_skipped_deafened > 0 {
+        if self.stats.packets_dropped_malformed > 0
+            || self.stats.sends_skipped_deafened > 0
+            || self.stats.sends_skipped_other_channel > 0
+        {
             info!(
-                "Voice — malformed drops: {}, deafened skips: {}",
-                self.stats.packets_dropped_malformed, self.stats.sends_skipped_deafened,
+                "Voice — malformed drops: {}, deafened skips: {}, other-channel skips: {}",
+                self.stats.packets_dropped_malformed,
+                self.stats.sends_skipped_deafened,
+                self.stats.sends_skipped_other_channel,
             );
         }
     }
@@ -166,9 +193,19 @@ const VIDEO_QUEUE_SUSPEND_BYTES: usize = 1_000_000;
 /// queue has drained below this.
 const VIDEO_QUEUE_RESUME_BYTES: usize = 256 * 1024;
 
+/// Everything the relay knows about one active share.
+#[derive(Debug, Clone, Copy)]
+pub struct ShareInfo {
+    pub width: u16,
+    pub height: u16,
+    /// Who may see this stream — enforced by the server at subscribe
+    /// time and re-validated on channel moves.
+    pub scope: ShareScope,
+}
+
 pub struct VideoRelay {
-    /// Currently sharing clients: client_id → announced (width, height).
-    sharers: HashMap<ClientId, (u16, u16)>,
+    /// Currently sharing clients and their announced share parameters.
+    sharers: HashMap<ClientId, ShareInfo>,
     /// streamer_id → set of viewer client_ids.
     subscribers: HashMap<ClientId, HashSet<ClientId>>,
     /// Last time a keyframe request was forwarded to each sharer.
@@ -180,6 +217,12 @@ pub struct VideoRelay {
     /// tick (subject to the gate): `(sharer, viewer)`.
     pending_pokes: Vec<(ClientId, ClientId)>,
     pub stats: VideoStats,
+}
+
+impl Default for VideoRelay {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VideoRelay {
@@ -197,10 +240,26 @@ impl VideoRelay {
     // ── Subscription management (called from the control handler) ───
 
     /// A client started (or re-announced) sharing their screen.
-    pub fn start_sharing(&mut self, client_id: ClientId, width: u16, height: u16) {
-        info!("Screen share started: {client_id} ({width}x{height})");
-        self.sharers.insert(client_id, (width, height));
+    pub fn start_sharing(&mut self, client_id: ClientId, info: ShareInfo) {
+        info!(
+            "Screen share started: {client_id} ({}x{}, {:?} scope)",
+            info.width, info.height, info.scope
+        );
+        self.sharers.insert(client_id, info);
         self.subscribers.entry(client_id).or_default();
+    }
+
+    /// Share parameters for `client_id`, if they are sharing.
+    pub fn share_info(&self, client_id: ClientId) -> Option<ShareInfo> {
+        self.sharers.get(&client_id).copied()
+    }
+
+    /// Snapshot of the viewers subscribed to `streamer`.
+    pub fn subscribers_of(&self, streamer: ClientId) -> Vec<ClientId> {
+        self.subscribers
+            .get(&streamer)
+            .map(|subs| subs.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// A client stopped sharing their screen.
@@ -288,7 +347,7 @@ impl VideoRelay {
     }
 
     /// Active sharers (for the join snapshot sent to new clients).
-    pub fn sharers(&self) -> &HashMap<ClientId, (u16, u16)> {
+    pub fn sharers(&self) -> &HashMap<ClientId, ShareInfo> {
         &self.sharers
     }
 

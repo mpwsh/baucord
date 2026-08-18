@@ -38,6 +38,12 @@ export global Tr {
     // Chat
     in property <string> send: "Send";
     in property <string> cancel: "Cancel";
+
+    // Voice channels
+    in property <string> channel-password-title: "Channel password";
+    in property <string> share-visibility: "Visible to";
+    in property <string> share-channel-only: "My channel";
+    in property <string> share-everyone: "Everyone";
     in property <string> chat-emoji-tooltip: "Emoji";
     in property <string> chat-attach-tooltip: "Attach image";
     in property <string> image-preview-title: "Send image?";
@@ -61,9 +67,9 @@ export global Tr {
     // Settings
     in property <string> settings-title: "Settings";
     in property <string> tab-general: "General";
-    in property <string> tab-misc: "Misc";
     in property <string> tab-audio: "Audio";
     in property <string> tab-keyboard: "Keyboard";
+    in property <string> tab-servers: "Servers";
     in property <string> tab-credits: "Credits";
     in property <string> tab-about: "About";
     in property <string> about-open-config: "Open config location";
@@ -72,7 +78,15 @@ export global Tr {
     in property <string> language: "Language";
     in property <string> language-note: "Chat history keeps its language; new labels apply immediately.";
     in property <string> settings-server: "Server";
-    in property <string> server-address: "Server address";
+    in property <string> server-name: "Name";
+    in property <string> server-ip: "IP / host";
+    in property <string> server-port: "Port";
+    in property <string> server-default: "Default";
+    in property <string> server-add: "Add server";
+    in property <string> server-remove: "Remove";
+    in property <string> server-manage: "Manage servers";
+    in property <string> save: "Save";
+    in property <string> connect-access-denied: "Access denied: password";
     in property <string> server-token-url: "Token URL (secure servers)";
     in property <string> server-config-note: "These are deployment constants — set once and shared by everyone on your server. They apply on the next connect.";
     in property <string> audio-devices-header: "Devices";

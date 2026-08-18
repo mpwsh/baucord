@@ -2,23 +2,36 @@ server:
   name: Baucord Server
   host: 0.0.0.0
   port: 5000
-  public_address: "127.0.0.1:5000"
+  public_address: null
   greeting_message: Welcome to the server!
 network:
   max_clients: 64
   bytes_per_tick: 4194304
-channels:
-  reliable_channel_id: 2
-  voice_channel_id: 3
-  voice_buffer_size_mb: 5
-  video_channel_id: 4
-  video_buffer_size_mb: 10
-logging:
-  level: info
-  stats_interval_secs: 60
+limits:
+  max_sharers: 2
+  max_viewers_per_stream: 8
+  max_chat_bytes: 2000
+  max_images_per_minute: 12
 authentication:
-  secure: true
+  secure: false
   private_key_file: netcode.key
   issuer:
-    bind: "127.0.0.1:5001"
-    #password: somepw
+    bind: 127.0.0.1:5001
+    password: null
+logging:
+  level: info
+  stats_interval_secs: 3600
+channels:
+  - name: Lobby
+    default: true
+    password: null
+    user_limit: null
+  - name: Faceit-1234
+    password: 331
+    user_limit: null
+  - name: Dark And Darker
+    password: null
+    user_limit: null
+  - name: Pummel are
+    password: null
+    user_limit: null

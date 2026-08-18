@@ -6,12 +6,100 @@ use std::time::Duration;
 
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
-use client::config::{BindableAction, build_bind_string};
+use client::config::{BindableAction, ServerEntry, build_bind_string};
 use client::voice::VoiceControl;
 use i18n::t;
-use ui::{KeybindRow, SettingsLogic, SettingsState, SettingsWindow};
+use ui::{KeybindRow, ServerRow, SettingsLogic, SettingsState, SettingsWindow};
 
 use crate::app::{self, AppState};
+
+/// Nav index of the Servers tab (Audio 0, General 1, Keyboard 2,
+/// Servers 3, Credits 4, About 5) — the connect view's pencil jumps
+/// here.
+pub const TAB_SERVERS: i32 = 3;
+
+/// `"ip:port"` → (ip, port). Splits on the *last* colon so
+/// `[::1]:5000` keeps its bracketed v6 host; no colon → all ip.
+fn split_address(address: &str) -> (String, String) {
+    match address.rsplit_once(':') {
+        Some((ip, port)) => (ip.to_string(), port.to_string()),
+        None => (address.to_string(), String::new()),
+    }
+}
+
+/// (ip, port) → `"ip:port"`, degrading gracefully around blanks.
+fn join_address(ip: &str, port: &str) -> String {
+    let (ip, port) = (ip.trim(), port.trim());
+    if port.is_empty() {
+        ip.to_string()
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+/// The Servers tab's selected row as a usable index, if any.
+fn selected_server(app: &AppState) -> Option<usize> {
+    let win = app.settings_win.as_ref()?;
+    let index = usize::try_from(win.global::<SettingsState>().get_server_index()).ok()?;
+    (index < app.settings.servers.len()).then_some(index)
+}
+
+/// Rebuild the Servers tab's row model from settings.
+fn push_server_rows(app: &AppState) {
+    let Some(win) = &app.settings_win else { return };
+    let default_pos = app
+        .settings
+        .servers
+        .iter()
+        .position(|e| e.name == app.settings.server)
+        .unwrap_or(0);
+    let rows: Vec<ServerRow> = app
+        .settings
+        .servers
+        .iter()
+        .enumerate()
+        .map(|(i, e)| ServerRow {
+            name: e.name.as_str().into(),
+            address: e.address.as_str().into(),
+            is_default: i == default_pos,
+        })
+        .collect();
+    win.global::<SettingsState>()
+        .set_servers(ModelRc::new(VecModel::from(rows)));
+}
+
+/// Fill the editor fields from the selected entry.
+fn fill_server_editor(app: &AppState) {
+    let Some(win) = &app.settings_win else { return };
+    let s = win.global::<SettingsState>();
+    let entry = selected_server(app).and_then(|i| app.settings.servers.get(i));
+    let (ip, port) = entry.map_or_else(Default::default, |e| split_address(&e.address));
+    s.set_server_name(entry.map_or("", |e| e.name.as_str()).into());
+    s.set_server_ip(ip.into());
+    s.set_server_port(port.into());
+    s.set_server_token_url(
+        entry
+            .and_then(|e| e.token_url.as_deref())
+            .unwrap_or("")
+            .into(),
+    );
+    s.set_server_token_password(
+        entry
+            .and_then(|e| e.token_password.as_deref())
+            .unwrap_or("")
+            .into(),
+    );
+}
+
+/// Refresh the Servers tab (rows + editor) after an external change —
+/// the connect view's dropdown pick or 403 password save. No-op while
+/// the settings window was never created.
+pub fn refresh_servers(app: &AppState) {
+    if app.settings_win.is_some() {
+        push_server_rows(app);
+        fill_server_editor(app);
+    }
+}
 
 /// Localized label for a bindable action.
 fn action_label(action: BindableAction) -> String {
@@ -90,15 +178,16 @@ pub fn populate(app: &mut AppState) {
     s.set_languages(ModelRc::new(VecModel::from(langs)));
     s.set_language_index(i32::try_from(lang_index).unwrap_or(0));
 
-    s.set_server_address(settings.server.address.as_str().into());
-    s.set_token_url(
-        settings
-            .server
-            .token_url
-            .as_deref()
-            .unwrap_or("")
-            .into(),
-    );
+    // Servers tab: rows + editor, selection starting on the default.
+    let default_pos = app
+        .settings
+        .servers
+        .iter()
+        .position(|e| e.name == app.settings.server)
+        .unwrap_or(0);
+    s.set_server_index(i32::try_from(default_pos).unwrap_or(0));
+    push_server_rows(app);
+    fill_server_editor(app);
 
     // Device lists: "System default" first, saved selection restored.
     let sys_default = t!("audio-system-default");
@@ -175,15 +264,122 @@ fn wire(win: &SettingsWindow) {
         });
     });
 
-    logic.on_server_address_edited(|text| {
+    // ── Servers tab ─────────────────────────────────────────────
+    logic.on_server_selected(|_index| {
+        // The row click already wrote SettingsState.server-index.
+        app::with_current(|app| fill_server_editor(app));
+    });
+
+    logic.on_server_set_default(|index| {
         app::with_current(move |app| {
-            app.settings.server.address = text.to_string();
+            if let Some(entry) = usize::try_from(index)
+                .ok()
+                .and_then(|i| app.settings.servers.get(i))
+            {
+                app.settings.server = entry.name.clone();
+                app.settings.save();
+            }
+            push_server_rows(app);
+            fill_server_editor(app);
+            app.push_connect_servers();
         });
     });
-    logic.on_token_url_edited(|text| {
+
+    logic.on_server_add(|| {
+        app::with_current(|app| {
+            // Unique display name: "New server", "New server 2", …
+            let base = t!("server-new-name");
+            let mut name = base.clone();
+            let mut n = 1u32;
+            while app.settings.servers.iter().any(|s| s.name == name) {
+                n += 1;
+                name = format!("{base} {n}");
+            }
+            app.settings.servers.push(ServerEntry {
+                name,
+                address: String::new(),
+                token_url: None,
+                token_password: None,
+                channel_passwords: std::collections::HashMap::new(),
+            });
+            app.settings.save();
+            if let Some(win) = &app.settings_win {
+                let last = app.settings.servers.len() - 1;
+                win.global::<SettingsState>()
+                    .set_server_index(i32::try_from(last).unwrap_or(0));
+            }
+            push_server_rows(app);
+            fill_server_editor(app);
+            app.push_connect_servers();
+        });
+    });
+
+    logic.on_server_remove(|| {
+        app::with_current(|app| {
+            // Never below one entry — connect needs a server to point at.
+            if app.settings.servers.len() <= 1 {
+                return;
+            }
+            let Some(index) = selected_server(app) else { return };
+            let removed = app.settings.servers.remove(index);
+            if app.settings.server == removed.name {
+                app.settings.server = app.settings.servers[0].name.clone();
+            }
+            app.settings.normalize_servers();
+            app.settings.save();
+            if let Some(win) = &app.settings_win {
+                let clamped = index.min(app.settings.servers.len() - 1);
+                win.global::<SettingsState>()
+                    .set_server_index(i32::try_from(clamped).unwrap_or(0));
+            }
+            push_server_rows(app);
+            fill_server_editor(app);
+            app.push_connect_servers();
+        });
+    });
+
+    logic.on_server_name_edited(|text| {
         app::with_current(move |app| {
+            let Some(index) = selected_server(app) else { return };
+            let was_default = app
+                .settings
+                .servers
+                .iter()
+                .position(|s| s.name == app.settings.server)
+                == Some(index);
+            let name = text.trim().to_string();
+            app.settings.servers[index].name = name.clone();
+            if was_default {
+                // The default pointer follows its entry's rename.
+                app.settings.server = name;
+            }
+            // Rows only — rewriting the editor's text property while
+            // the user types would fight the caret.
+            push_server_rows(app);
+            app.push_connect_servers();
+        });
+    });
+
+    logic.on_server_ip_edited(|_| {
+        app::with_current(update_selected_address);
+    });
+    logic.on_server_port_edited(|_| {
+        app::with_current(update_selected_address);
+    });
+
+    logic.on_server_token_url_edited(|text| {
+        app::with_current(move |app| {
+            let Some(index) = selected_server(app) else { return };
             let trimmed = text.trim().to_string();
-            app.settings.server.token_url = (!trimmed.is_empty()).then_some(trimmed);
+            app.settings.servers[index].token_url = (!trimmed.is_empty()).then_some(trimmed);
+        });
+    });
+    logic.on_server_token_password_edited(|text| {
+        app::with_current(move |app| {
+            let Some(index) = selected_server(app) else { return };
+            let trimmed = text.trim().to_string();
+            app.settings.servers[index].token_password =
+                (!trimmed.is_empty()).then_some(trimmed);
         });
     });
 
@@ -302,6 +498,17 @@ fn wire(win: &SettingsWindow) {
         app::with_current(close);
         slint::CloseRequestResponse::HideWindow
     });
+}
+
+/// Recompute the selected entry's `address` from the editor's IP and
+/// port fields (both are read fresh — either one may have changed).
+fn update_selected_address(app: &mut AppState) {
+    let Some(index) = selected_server(app) else { return };
+    let Some(win) = &app.settings_win else { return };
+    let s = win.global::<SettingsState>();
+    let address = join_address(&s.get_server_ip(), &s.get_server_port());
+    app.settings.servers[index].address = address;
+    push_server_rows(app);
 }
 
 /// `index` 0 = system default; otherwise the (index-1)-th device.
@@ -482,7 +689,11 @@ fn close(app: &mut AppState) {
         }
     }
     app.meter_timer.stop();
+    // Collapse blank token fields and repair the default pointer
+    // before the edits hit disk.
+    app.settings.normalize_servers();
     app.settings.save();
+    app.push_connect_servers();
     if let Some(win) = &app.settings_win {
         let _ = win.hide();
     }

@@ -1,7 +1,8 @@
 // settings.slint — the settings window.
 //
-// Left nav (Audio / Keyboard / Misc / Credits / About), scrollable
-// content, Save & close + Reset row — the FLTK layout, rounded.
+// Left nav (Audio / General / Keyboard / Servers / Credits / About),
+// scrollable content, Save & close + Reset row — the FLTK layout,
+// rounded.
 //
 // Live semantics carry over: every control applies immediately through
 // a callback (per keystroke / per tick), persistence happens when the
@@ -12,15 +13,23 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { KeybindRow } from "globals.slint";
+import { KeybindRow, ServerRow } from "globals.slint";
 import { Btn, Field, FieldLabel, Hint, SectionHeader, Sep, HSlider, VuMeter, GateMeter, Dropdown } from "widgets.slint";
 
 export global SettingsState {
     // General
     in property <[string]> languages;         // ["System", "English", …]
     in-out property <int> language-index: 0;
-    in-out property <string> server-address;
-    in-out property <string> token-url;
+
+    // Servers — the list plus the editor for the selected entry. The
+    // host mirrors edits into settings and rebuilds `servers` rows.
+    in property <[ServerRow]> servers;
+    in-out property <int> server-index: 0;    // selected for editing
+    in-out property <string> server-name;
+    in-out property <string> server-ip;
+    in-out property <string> server-port;
+    in-out property <string> server-token-url;
+    in-out property <string> server-token-password;
 
     // Audio
     in property <[string]> input-devices;     // index 0 = "System default"
@@ -52,8 +61,18 @@ export global SettingsState {
 
 export global SettingsLogic {
     callback language-selected(int);
-    callback server-address-edited(string);
-    callback token-url-edited(string);
+
+    // Servers tab
+    callback server-selected(int);
+    callback server-set-default(int);
+    callback server-add();
+    callback server-remove();
+    callback server-name-edited(string);
+    callback server-ip-edited(string);
+    callback server-port-edited(string);
+    callback server-token-url-edited(string);
+    callback server-token-password-edited(string);
+
     callback input-device-selected(int);
     callback output-device-selected(int);
     callback gate-threshold-changed(float);
@@ -95,7 +114,7 @@ component NavItem inherits Rectangle {
 
 component GeneralPanel inherits VerticalLayout {
     spacing: Theme.gap-md;
-    SectionHeader { text: Tr.tab-misc; }
+    SectionHeader { text: Tr.tab-general; }
     FieldLabel { text: Tr.language; }
     Dropdown {
         options: SettingsState.languages;
@@ -103,17 +122,145 @@ component GeneralPanel inherits VerticalLayout {
         selected(i) => { SettingsLogic.language-selected(i); }
     }
     Hint { text: Tr.language-note; }
+    Rectangle { }
+}
+
+component ServersPanel inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    SectionHeader { text: Tr.tab-servers; }
+
+    // Saved servers. Clicking a row selects it for the editor below;
+    // the radio dot on the left marks/sets the default (the entry the
+    // connect screen preselects at startup).
+    for srv[i] in SettingsState.servers : Rectangle {
+        height: 48px;
+        border-radius: Theme.radius-md;
+        background: i == SettingsState.server-index ? Theme.bg-tertiary
+            : row-t.has-hover ? Theme.hover : transparent;
+        animate background { duration: 150ms; }
+        row-t := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                SettingsState.server-index = i;
+                SettingsLogic.server-selected(i);
+            }
+        }
+        HorizontalLayout {
+            padding-left: Theme.gap-md;
+            padding-right: Theme.gap-md;
+            spacing: Theme.gap-md;
+            // Default radio dot — sits above the row's TouchArea, so
+            // its clicks don't also reselect… they do both, which is
+            // what you want anyway (see callback).
+            Rectangle {
+                width: 18px;
+                ring := Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 9px;
+                    border-width: 2px;
+                    border-color: srv.is-default ? Theme.accent
+                        : dot-t.has-hover ? Theme.text-secondary : Theme.border;
+                    if srv.is-default : Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: Theme.accent;
+                    }
+                    dot-t := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            SettingsState.server-index = i;
+                            SettingsLogic.server-set-default(i);
+                        }
+                    }
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 1px;
+                Text {
+                    text: srv.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-body;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+                Text {
+                    text: srv.address;
+                    color: Theme.text-muted;
+                    font-size: Theme.font-sm;
+                    overflow: elide;
+                }
+            }
+            if srv.is-default : Text {
+                text: Tr.server-default;
+                color: Theme.accent;
+                font-size: Theme.font-sm;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: Theme.gap-sm;
+        Btn {
+            width: Math.max(120px, self.preferred-width + 2 * Theme.gap-lg);
+            text: Tr.server-add;
+            clicked => { SettingsLogic.server-add(); }
+        }
+        Btn {
+            width: Math.max(100px, self.preferred-width + 2 * Theme.gap-lg);
+            text: Tr.server-remove;
+            danger: true;
+            enabled: SettingsState.servers.length > 1;
+            clicked => { SettingsLogic.server-remove(); }
+        }
+        Rectangle { }
+    }
+
     Sep { }
-    SectionHeader { text: Tr.settings-server; }
-    FieldLabel { text: Tr.server-address; }
+
+    // Editor for the selected entry — live like every other settings
+    // control; the host mirrors keystrokes into the settings model.
+    FieldLabel { text: Tr.server-name; }
     Field {
-        text <=> SettingsState.server-address;
-        edited => { SettingsLogic.server-address-edited(self.text); }
+        text <=> SettingsState.server-name;
+        edited => { SettingsLogic.server-name-edited(self.text); }
+    }
+    HorizontalLayout {
+        spacing: Theme.gap-sm;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.server-ip; }
+            Field {
+                text <=> SettingsState.server-ip;
+                edited => { SettingsLogic.server-ip-edited(self.text); }
+            }
+        }
+        VerticalLayout {
+            width: 110px;
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.server-port; }
+            Field {
+                text <=> SettingsState.server-port;
+                edited => { SettingsLogic.server-port-edited(self.text); }
+            }
+        }
     }
     FieldLabel { text: Tr.server-token-url; }
     Field {
-        text <=> SettingsState.token-url;
-        edited => { SettingsLogic.token-url-edited(self.text); }
+        text <=> SettingsState.server-token-url;
+        edited => { SettingsLogic.server-token-url-edited(self.text); }
+    }
+    FieldLabel { text: Tr.server-password; }
+    Field {
+        text <=> SettingsState.server-token-password;
+        secret: true;
+        edited => { SettingsLogic.server-token-password-edited(self.text); }
     }
     Hint { text: Tr.server-config-note; }
     Rectangle { }
@@ -324,10 +471,11 @@ export component SettingsWindow inherits Window {
                 padding: Theme.gap-md;
                 spacing: Theme.gap-xs;
                 NavItem { text: Tr.tab-audio;    active: root.tab == 0; clicked => { root.tab = 0; } }
-                NavItem { text: Tr.tab-keyboard; active: root.tab == 1; clicked => { root.tab = 1; } }
-                NavItem { text: Tr.tab-misc;     active: root.tab == 2; clicked => { root.tab = 2; } }
-                NavItem { text: Tr.tab-credits;  active: root.tab == 3; clicked => { root.tab = 3; } }
-                NavItem { text: Tr.tab-about;    active: root.tab == 4; clicked => { root.tab = 4; } }
+                NavItem { text: Tr.tab-general;  active: root.tab == 1; clicked => { root.tab = 1; } }
+                NavItem { text: Tr.tab-keyboard; active: root.tab == 2; clicked => { root.tab = 2; } }
+                NavItem { text: Tr.tab-servers;  active: root.tab == 3; clicked => { root.tab = 3; } }
+                NavItem { text: Tr.tab-credits;  active: root.tab == 4; clicked => { root.tab = 4; } }
+                NavItem { text: Tr.tab-about;    active: root.tab == 5; clicked => { root.tab = 5; } }
                 Rectangle { }
             }
         }
@@ -338,10 +486,11 @@ export component SettingsWindow inherits Window {
                 VerticalLayout {
                     padding: Theme.gap-xl;
                     if root.tab == 0 : AudioPanel { }
-                    if root.tab == 1 : KeyboardPanel { }
-                    if root.tab == 2 : GeneralPanel { }
-                    if root.tab == 3 : CreditsPanel { }
-                    if root.tab == 4 : AboutPanel { }
+                    if root.tab == 1 : GeneralPanel { }
+                    if root.tab == 2 : KeyboardPanel { }
+                    if root.tab == 3 : ServersPanel { }
+                    if root.tab == 4 : CreditsPanel { }
+                    if root.tab == 5 : AboutPanel { }
                 }
             }
             Rectangle {

@@ -1,0 +1,10 @@
+basic:
+  enable: false
+hook_conf:
+  enable: false
+  name: hook_test
+  log_level: warn
+  is_global: false
+http_filter:
+  enable: false
+#END

@@ -19,6 +19,46 @@ pub struct Config {
     pub limits: LimitSettings,
     pub authentication: AuthSettings,
     pub logging: LoggingSettings,
+    /// Voice channels (rooms). Omitting the key gives a single open
+    /// "Lobby" default channel, so pre-channels configs keep working.
+    pub channels: Vec<ChannelSettings>,
+}
+
+/// One voice channel (room). Designed to grow: every field except
+/// `name` is `#[serde(default)]`, so future per-channel options (topic,
+/// bitrate caps, ACLs…) can be added without breaking existing YAML.
+///
+/// `PartialEq` backs hot-reload: the watcher only re-applies when the
+/// channel list actually changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelSettings {
+    pub name: String,
+    /// The channel new clients land in on connect. Exactly one channel
+    /// must set this, and it may carry neither `password` nor
+    /// `user_limit` — everyone must be able to land there.
+    #[serde(default)]
+    pub default: bool,
+    /// Optional join password. Never sent to clients — they only learn
+    /// that one is required.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Maximum members; absent = unlimited.
+    #[serde(default)]
+    pub user_limit: Option<u16>,
+}
+
+/// Hard cap on configured channels: keeps the `Init` payload bounded
+/// and the sidebar sane. (Wire ids are u16, so the format allows more;
+/// this is policy, not protocol.)
+pub const MAX_CHANNELS: usize = 256;
+
+fn default_channels() -> Vec<ChannelSettings> {
+    vec![ChannelSettings {
+        name: "Lobby".to_string(),
+        default: true,
+        password: None,
+        user_limit: None,
+    }]
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,7 +164,100 @@ impl Config {
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         format!("{}:{}", self.server.host, self.server.port).parse()
     }
+
+    /// Validate the channel list and return the default channel's index.
+    ///
+    /// Enforced here (at startup, loudly) rather than tolerated at join
+    /// time: empty/duplicate names, zero or multiple `default: true`,
+    /// a password or user limit on the default channel, `user_limit: 0`,
+    /// and more than [`MAX_CHANNELS`] channels are all config mistakes
+    /// the operator should fix, not states the server should limp
+    /// through.
+    pub fn validate_channels(&self) -> Result<u16, String> {
+        validate_channel_list(&self.channels)
+    }
+
+    /// The channel list as announced to clients (passwords reduced to
+    /// a `has_password` flag; they never cross the wire).
+    #[must_use]
+    pub fn channel_infos(&self) -> Vec<protocol::ChannelInfo> {
+        self.channels
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| protocol::ChannelInfo {
+                #[allow(clippy::cast_possible_truncation)] // validated ≤ MAX_CHANNELS
+                id: i as u16,
+                name: ch.name.trim().to_string(),
+                has_password: ch.password.is_some(),
+                user_limit: ch.user_limit,
+            })
+            .collect()
+    }
 }
+
+/// Validate a candidate channel list and return the default channel's
+/// index. Shared by startup ([`Config::validate_channels`]) and hot
+/// reload, which must vet a new list *before* swapping it in — a bad
+/// edit to a running server is rejected here and never applied.
+pub fn validate_channel_list(channels: &[ChannelSettings]) -> Result<u16, String> {
+        if channels.is_empty() {
+            return Err(
+                "channels: list is empty — omit the key entirely for a single default Lobby"
+                    .to_string(),
+            );
+        }
+        if channels.len() > MAX_CHANNELS {
+            return Err(format!(
+                "channels: {} channels configured, maximum is {MAX_CHANNELS}",
+                channels.len()
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut default_index: Option<usize> = None;
+        for (i, ch) in channels.iter().enumerate() {
+            let name = ch.name.trim();
+            if name.is_empty() {
+                return Err(format!("channels[{i}]: name must not be empty"));
+            }
+            if !seen.insert(name.to_string()) {
+                return Err(format!("channels[{i}]: duplicate channel name '{name}'"));
+            }
+            if ch.user_limit == Some(0) {
+                return Err(format!(
+                    "channels[{i}] '{name}': user_limit 0 makes the channel unjoinable — \
+                     omit the key for unlimited"
+                ));
+            }
+            if ch.default {
+                if let Some(first) = default_index {
+                    return Err(format!(
+                        "channels[{i}] '{name}': 'default: true' is already set on \
+                         channels[{first}] '{}' — exactly one channel may be the default",
+                        channels[first].name
+                    ));
+                }
+                if ch.password.is_some() {
+                    return Err(format!(
+                        "channels[{i}] '{name}': the default channel cannot have a password — \
+                         every client lands there on connect"
+                    ));
+                }
+                if ch.user_limit.is_some() {
+                    return Err(format!(
+                        "channels[{i}] '{name}': the default channel cannot have a user_limit — \
+                         a full default channel would block all new connections"
+                    ));
+                }
+                default_index = Some(i);
+            }
+        }
+        let default_index = default_index.ok_or_else(|| {
+            "channels: no channel has 'default: true' — mark exactly one (typically the Lobby)"
+                .to_string()
+        })?;
+        #[allow(clippy::cast_possible_truncation)] // len ≤ MAX_CHANNELS ≤ u16::MAX
+        Ok(default_index as u16)
+    }
 
 impl Default for Config {
     fn default() -> Self {
@@ -134,6 +267,7 @@ impl Default for Config {
             limits: LimitSettings::default(),
             authentication: AuthSettings::default(),
             logging: LoggingSettings::default(),
+            channels: default_channels(),
         }
     }
 }

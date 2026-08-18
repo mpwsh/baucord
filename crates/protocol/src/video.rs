@@ -517,11 +517,12 @@ mod tests {
     #[test]
     fn non_last_chunk_with_short_payload_rejected() {
         // Hand-build a 2-chunk frame where chunk 0 is undersized.
-        let mut bad = Vec::new();
-        bad.push(VIDEO_PROTOCOL_VERSION);
-        bad.push(0);
-        bad.push(0); // idx 0
-        bad.push(2); // count 2 ⇒ chunk 0 must be exactly VIDEO_CHUNK_PAYLOAD
+        let mut bad = vec![
+            VIDEO_PROTOCOL_VERSION,
+            0,
+            0, // idx 0
+            2, // count 2 ⇒ chunk 0 must be exactly VIDEO_CHUNK_PAYLOAD
+        ];
         bad.extend_from_slice(&1u32.to_le_bytes());
         bad.extend_from_slice(&800u16.to_le_bytes());
         bad.extend_from_slice(&600u16.to_le_bytes());

@@ -1,0 +1,89 @@
+services:
+  apisix:
+    container_name: apisix
+    image: apache/apisix:3.15.0-debian
+    restart: always
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      sh -c "rm -f /usr/local/apisix/logs/*.sock && /docker-entrypoint.sh docker-start"
+    links:
+      - etcd
+    volumes:
+      - ./config/routes.yml:/usr/local/apisix/conf/apisix.yaml
+      - ./config/apisix.yml:/usr/local/apisix/conf/config.yaml
+      - ./config/debug.yml:/usr/local/apisix/conf/debug.yaml
+    ports:
+      - "${APISIX_PORT:-80}:9080/tcp"
+      - "443:9443/tcp"
+      - "5000:5000/udp"
+      - "5000:5000/tcp"
+    networks:
+      apisix:
+      baucord:
+      etcd:
+
+  certer:
+    container_name: certer
+    build:
+      context: .
+      dockerfile: config/certer.Dockerfile
+    environment:
+      DOMAIN: "auth.baucord.com"
+      CERT_TYPE: "production"
+      FORCE_RENEW: "false"
+      AGREE_TOS: "true"
+      APISIX_KEY: v0GVVQjPCEgMx6yvgjf4qqUx7M5qdOb6
+      APISIX_URL: http://apisix:9180
+      YAML_CONFIG: "/apisix/routes.yml"
+      MAIL: x@mpw.sh
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - ./config:/apisix
+    networks:
+      apisix:
+
+  etcd:
+    image: bitnamilegacy/etcd:3.5.17
+    container_name: etcd
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_AUTO_COMPACTION_MODE: periodic
+      ETCD_AUTO_COMPACTION_RETENTION: "1h"
+      ETCD_QUOTA_BACKEND_BYTES: "8589934592"
+      ETCD_HEARTBEAT_INTERVAL: "500"
+      ETCD_ELECTION_TIMEOUT: "5000"
+      ETCD_SNAPSHOT_COUNT: "10000"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      etcd:
+    volumes:
+      - etcd_data:/bitnami/etcd
+
+  baucord:
+    container_name: baucord
+    image: mpwsh/baucord:latest
+    environment:
+      - RUST_LOG=warn
+      - PORT=5002
+    volumes:
+      - ./config/baucord.yaml:/app/server.yaml
+    networks:
+      baucord:
+
+networks:
+  etcd:
+  baucord:
+  apisix:
+    driver: bridge
+
+volumes:
+  etcd_data:
+    driver: local

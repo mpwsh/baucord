@@ -42,7 +42,7 @@ use client::{
 };
 
 use app_core::chat::ChatHistory;
-use app_core::roster::{self, PeerAudio, UserState};
+use app_core::roster::{self, ChannelMeta, PeerAudio, UserState};
 use audio::{PeerAudioSettings, SoundType};
 use i18n::t;
 use ui::{ChatRow, Logic, MainWindow, Phase, State, Tr, UserRow};
@@ -86,6 +86,14 @@ pub struct AppState {
     // Domain state
     users: HashMap<u64, UserState>,
     our_client_id: Option<u64>,
+    /// Server display name (from Init) — prefixes server-originated
+    /// system chat lines, same style as the greeting.
+    server_name: String,
+    /// Voice channels this server defines (from Init), in id order.
+    channels: Vec<ChannelMeta>,
+    /// Channel a JoinChannel is in flight for (the password prompt's
+    /// target; also lets a WrongPassword reply reopen the prompt).
+    pending_channel_join: Option<u16>,
     connected: bool,
     pub settings: Settings,
     is_muted: bool,
@@ -275,6 +283,9 @@ pub fn run() {
         screen,
         users: HashMap::new(),
         our_client_id: None,
+        server_name: String::new(),
+        channels: Vec::new(),
+        pending_channel_join: None,
         connected: false,
         settings,
         is_muted: false,
@@ -390,14 +401,47 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_connect_clicked(move || {
         with_app(&w, |app| {
-            let s = app.main.global::<State>();
-            let nickname = s.get_nickname().to_string();
-            let password = s.get_password().to_string();
+            let nickname = app.main.global::<State>().get_nickname().to_string();
             if nickname.trim().is_empty() {
                 app.show_error(&t!("error-nickname-empty"));
             } else {
-                app.handle_connect(&nickname, &password);
+                app.handle_connect(&nickname);
             }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_connect_server_selected(move |index| {
+        with_app(&w, |app| {
+            // The dropdown pick becomes the default server — one
+            // source of truth with the Servers tab's radio.
+            if let Some(entry) = usize::try_from(index)
+                .ok()
+                .and_then(|i| app.settings.servers.get(i))
+            {
+                app.settings.server = entry.name.clone();
+                app.settings.save();
+            }
+            // A pending 403 prompt referred to the previous server.
+            let s = app.main.global::<State>();
+            s.set_password_prompt(false);
+            s.set_password("".into());
+            crate::settingsui::refresh_servers(app);
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_edit_servers(move || {
+        with_app(&w, |app| {
+            crate::settingsui::open(app);
+            if let Some(win) = &app.settings_win {
+                win.set_tab(crate::settingsui::TAB_SERVERS);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_save_password(move || {
+        with_app(&w, |app| {
+            let typed = app.main.global::<State>().get_password().to_string();
+            app.save_prompt_password(&typed);
         });
     });
     let w = Rc::downgrade(state);
@@ -599,7 +643,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 
     // ── Screen share dialog ─────────────────────────────────────
     let w = Rc::downgrade(state);
-    logic.on_start_share(move |monitor_index, quality_index| {
+    logic.on_start_share(move |monitor_index, quality_index, everyone| {
         with_app(&w, |app| {
             let quality = usize::try_from(quality_index)
                 .ok()
@@ -611,9 +655,32 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 .send(ScreenControl::StartSharing {
                     quality,
                     monitor_index: usize::try_from(monitor_index).unwrap_or(0),
+                    scope: if everyone {
+                        client::ShareScope::Everyone
+                    } else {
+                        client::ShareScope::Channel
+                    },
                 })
                 .ok();
         });
+    });
+
+    // ── Voice channels ──────────────────────────────────────────
+    let w = Rc::downgrade(state);
+    logic.on_channel_clicked(move |channel_id| {
+        with_app(&w, |app| {
+            if let Ok(id) = u16::try_from(channel_id) {
+                app.channel_clicked(id);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_channel_password_ok(move || {
+        with_app(&w, AppState::channel_password_ok);
+    });
+    let w = Rc::downgrade(state);
+    logic.on_channel_password_cancel(move || {
+        with_app(&w, AppState::channel_password_cancel);
     });
 
     // ── Update flow ─────────────────────────────────────────────
@@ -958,7 +1025,19 @@ impl AppState {
         match msg {
             NetworkMessage::Connected => {
                 self.connected = true;
-                self.main.global::<State>().set_error_text("".into());
+                let s = self.main.global::<State>();
+                s.set_error_text("".into());
+                s.set_password_prompt(false);
+            }
+            NetworkMessage::AccessDenied => {
+                // Token issuer said 403: surface the inline password
+                // prompt on the connect card (persistent, unlike the
+                // 5s error toast) so the user can save the password
+                // and hit Connect again.
+                info!("Connect denied by the token issuer (403)");
+                let s = self.main.global::<State>();
+                s.set_password_prompt(true);
+                s.set_password("".into());
             }
             NetworkMessage::Disconnected(reason) => {
                 if self.connected {
@@ -975,13 +1054,34 @@ impl AppState {
                 client_id,
                 server_name,
                 greeting,
+                channels,
+                memberships,
             } => {
-                self.handle_init_client(client_id, &users, &server_name, &greeting);
+                self.handle_init_client(
+                    client_id,
+                    &users,
+                    &server_name,
+                    &greeting,
+                    &channels,
+                    &memberships,
+                );
             }
             NetworkMessage::UserJoined {
                 client_id,
                 username,
-            } => self.handle_user_joined(client_id, username),
+                channel_id,
+            } => self.handle_user_joined(client_id, username, channel_id),
+            NetworkMessage::UserMovedChannel {
+                client_id,
+                channel_id,
+            } => self.handle_user_moved(client_id, channel_id),
+            NetworkMessage::ChannelJoinDenied { channel_id, reason } => {
+                self.handle_channel_join_denied(channel_id, reason);
+            }
+            NetworkMessage::ChannelListUpdated {
+                channels,
+                memberships,
+            } => self.handle_channels_updated(&channels, &memberships),
             NetworkMessage::UserLeft {
                 client_id,
                 username,
@@ -1068,6 +1168,7 @@ impl AppState {
                 client_id,
                 width,
                 height,
+                scope: _,
             } => {
                 self.active_sharers.insert(client_id, (width, height));
                 self.sharer_ids = self.active_sharers.keys().copied().collect();
@@ -1093,14 +1194,25 @@ impl AppState {
     //  CONNECTION FLOW
     // ════════════════════════════════════════════════════════════════
 
-    fn handle_connect(&mut self, nickname: &str, password: &str) {
+    fn handle_connect(&mut self, nickname: &str) {
         self.settings.user.nickname = nickname.to_string();
-        let password = password.trim();
-        self.settings.server.token_password =
-            (!password.is_empty()).then(|| password.to_string());
+
+        // A password typed into the 403 prompt but not yet saved still
+        // counts — clicking Connect means "use what I typed".
+        let s = self.main.global::<State>();
+        if s.get_password_prompt() {
+            let typed = s.get_password().trim().to_string();
+            if !typed.is_empty() {
+                self.save_prompt_password(&typed);
+            }
+        }
         self.settings.save();
 
-        let Ok(addr) = self.settings.server.address.trim().parse::<SocketAddr>() else {
+        let Some(server) = self.settings.default_server().cloned() else {
+            self.show_error(&t!("error-invalid-address"));
+            return;
+        };
+        let Ok(addr) = server.address.trim().parse::<SocketAddr>() else {
             self.show_error(&t!("error-invalid-address"));
             return;
         };
@@ -1110,10 +1222,25 @@ impl AppState {
             .send(NetworkControl::Connect {
                 addr,
                 nickname: nickname.to_string(),
-                token_url: self.settings.server.token_url.clone(),
-                token_password: self.settings.server.token_password.clone(),
+                token_url: server.token_url,
+                token_password: server.token_password,
             })
             .ok();
+    }
+
+    /// Store `password` on the default (= dropdown-selected) server
+    /// and dismiss the 403 prompt. Empty input clears the saved one.
+    fn save_prompt_password(&mut self, password: &str) {
+        let password = password.trim();
+        if let Some(server) = self.settings.default_server_mut() {
+            server.token_password = (!password.is_empty()).then(|| password.to_string());
+        }
+        self.settings.save();
+        let s = self.main.global::<State>();
+        s.set_password_prompt(false);
+        s.set_password("".into());
+        // Mirror into the settings window's editor if it's open.
+        crate::settingsui::refresh_servers(self);
     }
 
     fn handle_init_client(
@@ -1122,6 +1249,8 @@ impl AppState {
         users: &HashMap<u64, String>,
         server_name: &str,
         greeting: &str,
+        channels: &[client::ChannelInfo],
+        memberships: &HashMap<u64, u16>,
     ) {
         // Fresh chat per connection — same semantics as the old
         // rebuild-the-main-view path.
@@ -1133,6 +1262,17 @@ impl AppState {
         self.main.global::<State>().set_phase(Phase::Main);
 
         self.our_client_id = Some(client_id);
+        self.server_name = server_name.to_string();
+        self.channels = channels
+            .iter()
+            .map(|c| ChannelMeta {
+                id: c.id,
+                name: c.name.clone(),
+                locked: c.has_password,
+                user_limit: c.user_limit,
+            })
+            .collect();
+        self.pending_channel_join = None;
         let default_audio = PeerAudioSettings::default();
         for (&id, name) in users {
             self.users.insert(
@@ -1148,6 +1288,7 @@ impl AppState {
                     ),
                     is_self_muted: false,
                     is_self_deafened: false,
+                    channel_id: memberships.get(&id).copied().unwrap_or_default(),
                 },
             );
         }
@@ -1184,7 +1325,7 @@ impl AppState {
         self.show_main();
     }
 
-    fn handle_user_joined(&mut self, client_id: u64, username: String) {
+    fn handle_user_joined(&mut self, client_id: u64, username: String, channel_id: u16) {
         let saved = self
             .settings
             .peer_settings
@@ -1199,18 +1340,27 @@ impl AppState {
             .ok();
 
         self.push_chat_system(&t!("chat-user-joined", "name" => username.as_str()));
-        self.users
-            .insert(client_id, UserState::new(username, peer_audio_from(&saved)));
-        self.voice
-            .tx
-            .send(VoiceControl::PlaySound(SoundType::UserJoined))
-            .ok();
+        self.users.insert(
+            client_id,
+            UserState::new(username, peer_audio_from(&saved), channel_id),
+        );
+        // Join ding only for arrivals into *our* channel — like the
+        // classics, other rooms come and go silently.
+        if Some(channel_id) == self.our_channel() {
+            self.voice
+                .tx
+                .send(VoiceControl::PlaySound(SoundType::UserJoined))
+                .ok();
+        }
         self.update_user_list();
     }
 
     fn handle_user_left(&mut self, client_id: u64, username: &str) {
         self.voice.tx.send(VoiceControl::RemovePeer(client_id)).ok();
-        self.users.remove(&client_id);
+        let was_in_our_channel = self
+            .users
+            .remove(&client_id)
+            .is_some_and(|u| Some(u.channel_id) == self.our_channel());
         self.active_sharers.remove(&client_id);
         self.sharer_ids = self.active_sharers.keys().copied().collect();
 
@@ -1220,11 +1370,221 @@ impl AppState {
         }
 
         self.push_chat_system(&t!("chat-user-left", "name" => username));
-        self.voice
-            .tx
-            .send(VoiceControl::PlaySound(SoundType::UserLeft))
-            .ok();
+        if was_in_our_channel {
+            self.voice
+                .tx
+                .send(VoiceControl::PlaySound(SoundType::UserLeft))
+                .ok();
+        }
         self.update_user_list();
+    }
+
+    /// The channel we are currently in, per server echo.
+    fn our_channel(&self) -> Option<u16> {
+        self.our_client_id
+            .and_then(|id| self.users.get(&id))
+            .map(|u| u.channel_id)
+    }
+
+    fn channel_name(&self, channel_id: u16) -> String {
+        self.channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map_or_else(|| format!("#{channel_id}"), |c| c.name.clone())
+    }
+
+    fn handle_user_moved(&mut self, client_id: u64, channel_id: u16) {
+        let our_channel_before = self.our_channel();
+        let old = if let Some(user) = self.users.get_mut(&client_id) {
+            let old = user.channel_id;
+            user.channel_id = channel_id;
+            Some(old)
+        } else {
+            None
+        };
+
+        if Some(client_id) == self.our_client_id {
+            // Our own move confirmed — close the prompt if it drove
+            // this, and ding into the new room.
+            self.pending_channel_join = None;
+            let state = self.main.global::<State>();
+            state.set_channel_prompt_open(false);
+            state.set_channel_password("".into());
+            self.voice
+                .tx
+                .send(VoiceControl::PlaySound(SoundType::UserJoined))
+                .ok();
+        } else if Some(channel_id) == our_channel_before {
+            // Someone stepped into our room.
+            self.voice
+                .tx
+                .send(VoiceControl::PlaySound(SoundType::UserJoined))
+                .ok();
+        } else if old.is_some() && old == our_channel_before {
+            // Someone stepped out of our room.
+            self.voice
+                .tx
+                .send(VoiceControl::PlaySound(SoundType::UserLeft))
+                .ok();
+        }
+        self.update_user_list();
+    }
+
+    /// The server hot-reloaded its channel list: resync wholesale.
+    /// Ids are renumbered, so an open password prompt is re-targeted by
+    /// channel *name* (and closed if that channel is gone). Deliberately
+    /// no join/leave sounds — an admin edit shouldn't set off a chorus.
+    fn handle_channels_updated(
+        &mut self,
+        channels: &[client::ChannelInfo],
+        memberships: &HashMap<u64, u16>,
+    ) {
+        let pending_name = self.pending_channel_join.and_then(|id| {
+            self.channels
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone())
+        });
+
+        self.channels = channels
+            .iter()
+            .map(|c| ChannelMeta {
+                id: c.id,
+                name: c.name.clone(),
+                locked: c.has_password,
+                user_limit: c.user_limit,
+            })
+            .collect();
+        for (id, channel_id) in memberships {
+            if let Some(user) = self.users.get_mut(id) {
+                user.channel_id = *channel_id;
+            }
+        }
+
+        self.pending_channel_join = pending_name
+            .as_ref()
+            .and_then(|name| self.channels.iter().find(|c| &c.name == name))
+            .map(|c| c.id);
+        if pending_name.is_some() && self.pending_channel_join.is_none() {
+            // The channel the prompt was for no longer exists.
+            self.channel_password_cancel();
+        }
+
+        self.push_chat_system(&format!(
+            "{}: {}",
+            self.server_name,
+            t!("chat-channels-updated"),
+        ));
+        self.update_user_list();
+    }
+
+    fn handle_channel_join_denied(&mut self, channel_id: u16, reason: client::ChannelDenyReason) {
+        match reason {
+            client::ChannelDenyReason::WrongPassword => {
+                // A saved password can go stale; whatever was stored is
+                // wrong now, so re-prompt (and overwrite on OK).
+                self.open_channel_prompt(channel_id, true);
+            }
+            client::ChannelDenyReason::ChannelFull => {
+                self.pending_channel_join = None;
+                self.show_error(&t!("channel-full"));
+            }
+            client::ChannelDenyReason::NoSuchChannel => {
+                self.pending_channel_join = None;
+                self.show_error(reason.describe());
+            }
+        }
+    }
+
+    /// Open the channel password prompt for `channel_id`.
+    fn open_channel_prompt(&mut self, channel_id: u16, wrong: bool) {
+        self.pending_channel_join = Some(channel_id);
+        let name = self.channel_name(channel_id);
+        let state = self.main.global::<State>();
+        state.set_channel_prompt_name(name.into());
+        state.set_channel_prompt_error(if wrong {
+            t!("channel-wrong-password").into()
+        } else {
+            "".into()
+        });
+        state.set_channel_password("".into());
+        state.set_channel_prompt_open(true);
+    }
+
+    /// A channel header was clicked: join directly, or via saved /
+    /// prompted password for locked channels.
+    fn channel_clicked(&mut self, channel_id: u16) {
+        if Some(channel_id) == self.our_channel() {
+            return;
+        }
+        let Some(meta) = self.channels.iter().find(|c| c.id == channel_id) else {
+            return;
+        };
+        if !meta.locked {
+            self.pending_channel_join = Some(channel_id);
+            self.network
+                .tx
+                .send(NetworkControl::JoinChannel {
+                    channel_id,
+                    password: None,
+                })
+                .ok();
+            return;
+        }
+        // Locked: try the saved password first; the server's
+        // WrongPassword answer reopens the prompt if it went stale.
+        let name = meta.name.clone();
+        let saved = self
+            .settings
+            .default_server()
+            .and_then(|server| server.channel_passwords.get(&name).cloned());
+        match saved {
+            Some(password) => {
+                self.pending_channel_join = Some(channel_id);
+                self.network
+                    .tx
+                    .send(NetworkControl::JoinChannel {
+                        channel_id,
+                        password: Some(password),
+                    })
+                    .ok();
+            }
+            None => self.open_channel_prompt(channel_id, false),
+        }
+    }
+
+    /// OK on the password prompt: save the password on the server
+    /// entry, then retry the join. The prompt closes when the server
+    /// echoes our move (or reopens on WrongPassword).
+    fn channel_password_ok(&mut self) {
+        let Some(channel_id) = self.pending_channel_join else {
+            self.main.global::<State>().set_channel_prompt_open(false);
+            return;
+        };
+        let password = self.main.global::<State>().get_channel_password().to_string();
+        if password.is_empty() {
+            return;
+        }
+        let name = self.channel_name(channel_id);
+        if let Some(server) = self.settings.default_server_mut() {
+            server.channel_passwords.insert(name, password.clone());
+            self.settings.save();
+        }
+        self.main.global::<State>().set_channel_prompt_open(false);
+        self.network
+            .tx
+            .send(NetworkControl::JoinChannel {
+                channel_id,
+                password: Some(password),
+            })
+            .ok();
+    }
+
+    fn channel_password_cancel(&mut self) {
+        self.pending_channel_join = None;
+        let state = self.main.global::<State>();
+        state.set_channel_prompt_open(false);
+        state.set_channel_password("".into());
     }
 
     /// Shared teardown for both user-initiated and server-initiated
@@ -1232,6 +1592,13 @@ impl AppState {
     fn teardown_connection(&mut self) {
         self.connected = false;
         self.is_testing_mic = false;
+        self.channels.clear();
+        self.pending_channel_join = None;
+        {
+            let state = self.main.global::<State>();
+            state.set_channel_prompt_open(false);
+            state.set_channel_password("".into());
+        }
         // Also clear the shared flag the voice loop reads — leaving it
         // set (disconnect during a mic test) kept the loop gating
         // outgoing audio after the next connect.
@@ -1442,6 +1809,9 @@ impl AppState {
     /// The client id behind roster row `index`, if it still exists.
     pub fn user_id_at(&self, index: i32) -> Option<u64> {
         let row = self.users_model.row_data(usize::try_from(index).ok()?)?;
+        if row.is_channel {
+            return None;
+        }
         Some(roster::join_id(row.client_id_lo, row.client_id_hi))
     }
 
@@ -1965,7 +2335,8 @@ impl AppState {
     // ════════════════════════════════════════════════════════════════
 
     fn update_user_list(&mut self) {
-        let rows = roster::rows(
+        let items = roster::grouped_rows(
+            &self.channels,
             &self.users,
             self.our_client_id,
             &self.sharer_ids,
@@ -1975,7 +2346,7 @@ impl AppState {
         // In-place update: write rows positionally, growing/shrinking
         // only when membership changed — preserves the ListView's
         // scroll offset exactly like the FLTK incremental path.
-        let converted: Vec<UserRow> = rows.iter().map(ui::convert::user_row).collect();
+        let converted: Vec<UserRow> = items.iter().map(ui::convert::roster_item).collect();
         let current = self.users_model.row_count();
         for (i, row) in converted.iter().enumerate() {
             if i < current {
@@ -2211,17 +2582,29 @@ impl AppState {
     fn push_connect_fields(&self) {
         let s = self.main.global::<State>();
         s.set_nickname(self.settings.user.nickname.as_str().into());
-        s.set_password(
-            self.settings
-                .server
-                .token_password
-                .as_deref()
-                .unwrap_or("")
-                .into(),
-        );
-        s.set_server_note(
-            t!("connect-server-note", "server" => self.settings.server.address.as_str()).into(),
-        );
+        s.set_password("".into());
+        s.set_password_prompt(false);
+        self.push_connect_servers();
+    }
+
+    /// Refresh the connect view's server dropdown (names + which entry
+    /// is selected). Called whenever the Servers tab mutates the list.
+    pub fn push_connect_servers(&self) {
+        let s = self.main.global::<State>();
+        let names: Vec<slint::SharedString> = self
+            .settings
+            .servers
+            .iter()
+            .map(|e| e.name.as_str().into())
+            .collect();
+        let default_pos = self
+            .settings
+            .servers
+            .iter()
+            .position(|e| e.name == self.settings.server)
+            .unwrap_or(0);
+        s.set_server_names(ModelRc::new(VecModel::from(names)));
+        s.set_server_index(i32::try_from(default_pos).unwrap_or(0));
     }
 
     /// Clean shutdown: signal threads, join with timeout, save settings.
@@ -2304,6 +2687,10 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_deafen(t!("deafen").into());
     tr.set_undeafen(t!("undeafen").into());
     tr.set_share_screen(t!("share-screen").into());
+    tr.set_channel_password_title(t!("channel-password-title").into());
+    tr.set_share_visibility(t!("share-visibility").into());
+    tr.set_share_channel_only(t!("share-channel-only").into());
+    tr.set_share_everyone(t!("share-everyone").into());
     tr.set_stop_sharing(t!("stop-sharing").into());
     tr.set_disconnect(t!("disconnect").into());
     tr.set_live(t!("live").into());
@@ -2329,9 +2716,9 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_stop_watching(t!("stop-watching").into());
     tr.set_settings_title(t!("settings-title").into());
     tr.set_tab_general(t!("tab-general").into());
-    tr.set_tab_misc(t!("tab-misc").into());
     tr.set_tab_audio(t!("tab-audio").into());
     tr.set_tab_keyboard(t!("tab-keyboard").into());
+    tr.set_tab_servers(t!("tab-servers").into());
     tr.set_tab_credits(t!("tab-credits").into());
     tr.set_tab_about(t!("tab-about").into());
     tr.set_about_open_config(t!("about-open-config").into());
@@ -2340,7 +2727,15 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_language(t!("language").into());
     tr.set_language_note(t!("language-note").into());
     tr.set_settings_server(t!("settings-server").into());
-    tr.set_server_address(t!("server-address").into());
+    tr.set_server_name(t!("server-name").into());
+    tr.set_server_ip(t!("server-ip").into());
+    tr.set_server_port(t!("server-port").into());
+    tr.set_server_default(t!("server-default").into());
+    tr.set_server_add(t!("server-add").into());
+    tr.set_server_remove(t!("server-remove").into());
+    tr.set_server_manage(t!("server-manage").into());
+    tr.set_save(t!("save").into());
+    tr.set_connect_access_denied(t!("connect-access-denied").into());
     tr.set_server_token_url(t!("server-token-url").into());
     tr.set_server_config_note(t!("server-config-note").into());
     tr.set_audio_devices_header(t!("audio-devices-header").into());

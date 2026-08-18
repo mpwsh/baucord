@@ -5,14 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod auth;
-mod config;
-mod relay;
-mod server;
-
-use config::Config;
 use env_logger::Builder;
-use server::ChatServer;
+use server::config::Config;
+use server::server::ChatServer;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 
@@ -97,6 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting {}", config.server.name);
 
     let mut server = ChatServer::new(config)?;
+    // Hot reload: edits to the [channels] section of the config file
+    // apply live; everything else still needs a restart.
+    server.watch_config_file(std::path::PathBuf::from(&args.config));
 
     info!("Server listening on:");
     for addr in server.addresses() {

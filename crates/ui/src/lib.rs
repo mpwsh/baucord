@@ -19,7 +19,7 @@ pub mod convert {
 
     use super::{ChatRow, UserRow};
     use app_core::chat::ChatItem;
-    use app_core::roster::{split_id, RosterRow};
+    use app_core::roster::{split_id, ChannelRow, RosterItem, RosterRow};
 
     /// Roster row → sidebar model row.
     #[must_use]
@@ -36,6 +36,46 @@ pub mod convert {
             self_muted: r.self_muted,
             self_deafened: r.self_deafened,
             sharing: r.sharing,
+            is_channel: false,
+            channel_id: -1,
+            locked: false,
+            member_label: "".into(),
+            is_our_channel: false,
+        }
+    }
+
+    /// Channel header → sidebar model row. Only the channel fields
+    /// carry meaning; user fields are inert defaults.
+    #[must_use]
+    pub fn channel_row(c: &ChannelRow) -> UserRow {
+        UserRow {
+            client_id_lo: 0,
+            client_id_hi: 0,
+            name: c.name.as_str().into(),
+            volume_pct: 100,
+            is_us: false,
+            speaking: false,
+            local_muted: false,
+            self_muted: false,
+            self_deafened: false,
+            sharing: false,
+            is_channel: true,
+            channel_id: i32::from(c.id),
+            locked: c.locked,
+            member_label: match c.user_limit {
+                Some(limit) => format!("{}/{limit}", c.members).into(),
+                None => c.members.to_string().into(),
+            },
+            is_our_channel: c.is_ours,
+        }
+    }
+
+    /// Grouped roster item → sidebar model row.
+    #[must_use]
+    pub fn roster_item(item: &RosterItem) -> UserRow {
+        match item {
+            RosterItem::Channel(c) => channel_row(c),
+            RosterItem::User(u) => user_row(u),
         }
     }
 

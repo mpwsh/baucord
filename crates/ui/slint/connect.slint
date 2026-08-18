@@ -1,14 +1,19 @@
 // connect.slint — the connect view.
 //
-// Same shape as the FLTK build (nickname + optional password, server
-// note, Settings/Quit, error + device-warning lines), redressed as a
-// centered rounded card. Values live in State so they survive failed
-// attempts and reconnects.
+// Nickname + the saved-server dropdown (which server to join, shown by
+// name; the pencil jumps to Settings → Servers), Connect,
+// Settings/Quit, error + device-warning lines — as a centered rounded
+// card. Values live in State so they survive failed attempts and
+// reconnects.
+//
+// When the token issuer answers 403, the host flips
+// `State.password-prompt` and an inline box appears: type the server
+// password, Save stores it on the selected server, Connect retries.
 
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic } from "globals.slint";
-import { Btn, Field, FieldLabel, Hint } from "widgets.slint";
+import { Btn, Field, FieldLabel, IconBtn, Dropdown } from "widgets.slint";
 
 export component ConnectView inherits Rectangle {
     background: Theme.bg-primary;
@@ -53,18 +58,49 @@ export component ConnectView inherits Rectangle {
                 accepted => { Logic.connect-clicked(); }
             }
 
-            FieldLabel { text: Tr.server-password; }
-            Field {
-                text <=> State.password;
-                secret: true;
-                accepted => { Logic.connect-clicked(); }
+            FieldLabel { text: Tr.settings-server; }
+            HorizontalLayout {
+                spacing: Theme.gap-sm;
+                Dropdown {
+                    horizontal-stretch: 1;
+                    options: State.server-names;
+                    current <=> State.server-index;
+                    selected(i) => { Logic.connect-server-selected(i); }
+                }
+                IconBtn {
+                    size: 36px;
+                    icon: @image-url("icons/pencil.svg");
+                    tooltip: Tr.server-manage;
+                    clicked => { Logic.edit-servers(); }
+                }
             }
 
-            Text {
-                text: State.server-note;
-                color: Theme.text-muted;
-                font-size: Theme.font-sm;
-                horizontal-alignment: center;
+            // Token issuer said 403: ask for the server password and
+            // save it on the selected entry, then Connect retries.
+            if State.password-prompt : VerticalLayout {
+                spacing: Theme.gap-sm;
+                Text {
+                    text: Tr.connect-access-denied;
+                    color: Theme.danger;
+                    font-size: Theme.font-sm;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: Theme.gap-sm;
+                    Field {
+                        horizontal-stretch: 1;
+                        text <=> State.password;
+                        secret: true;
+                        accepted => { Logic.save-password(); }
+                    }
+                    Btn {
+                        width: 84px;
+                        height: 40px;
+                        text: Tr.save;
+                        accent: true;
+                        clicked => { Logic.save-password(); }
+                    }
+                }
             }
 
             Btn {

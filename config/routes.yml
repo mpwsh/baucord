@@ -1,0 +1,47 @@
+routes:
+  - uri: /*
+    host: auth.baucord.com
+    upstream:
+      type: roundrobin
+      nodes:
+        "baucord:5001": 1
+
+stream_routes:
+  - id: 1
+    server_port: 5000
+    plugins:
+      prometheus: {}
+    upstream:
+      nodes:
+        "baucord:5000": 1
+      type: roundrobin
+      scheme: udp
+  - id: 2
+    server_port: 5000
+    plugins:
+      prometheus: {}
+    upstream:
+      nodes:
+        "baucord:5000": 1
+      type: roundrobin
+      scheme: tcp
+      checks:
+        active:
+          type: tcp
+          interval: 5
+          timeout: 3
+          concurrency: 10
+          healthy:
+            successes: 2
+            interval: 1
+          unhealthy:
+            failures: 2
+            interval: 1
+            tcp_failures: 2
+            timeouts: 3
+global_rules:
+  - id: "1"
+    plugins:
+      prometheus:
+        disable: true
+#END

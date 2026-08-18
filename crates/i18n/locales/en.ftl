@@ -1,7 +1,6 @@
 # ── Connect view ────────────────────────────────────────────────────────
 app-tagline = We have discord at home
 nickname = Nickname
-server-address = Server Address:Port
 connect = Connect
 settings = Settings
 quit = Quit
@@ -32,8 +31,18 @@ language-note =
     reopened, and chat history keeps its original language.
 # ── Server config (connect + settings) ──────────────────────────────────
 server-password = Server password (optional)
-connect-server-note = Connecting to { $server } — change in Settings
 settings-server = Server
+tab-servers = Servers
+server-name = Name
+server-ip = IP / host
+server-port = Port
+server-default = Default
+server-add = Add server
+server-remove = Remove
+server-manage = Manage servers
+server-new-name = New server
+save = Save
+connect-access-denied = Access denied: password — enter it below and Save, then Connect again
 server-token-url = Token URL (secure servers only)
 server-config-note =
     Leave the token URL empty for open/LAN servers.
@@ -219,4 +228,12 @@ tech-slint = Slint - User Interface
 chat-image-too-large = Image is too large to send ({ $kb } KB after downscaling)
 chat-image-save-error = Couldn't save image: { $error }
 chat-downloading-image = Downloading image…
-tab-misc = Misc
+
+# ── Voice channels ──
+channel-password-title = Channel password
+channel-wrong-password = Wrong password — try again
+channel-full = That channel is full
+share-visibility = Visible to
+share-channel-only = My channel
+share-everyone = Everyone
+chat-channels-updated = voice channels were updated

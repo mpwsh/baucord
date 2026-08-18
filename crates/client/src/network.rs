@@ -33,10 +33,10 @@ use std::time::{Duration, Instant, SystemTime};
 use audio::AudioPacket;
 
 use protocol::{
-    CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ClientMessage, DenyReason, MEDIA_CHANNEL, PROTOCOL_ID,
-    SIGNAL_CHANNEL,
-    SYSTEM_AUDIO_CHANNEL, ServerMessage, VIDEO_CHANNEL, VOICE_CHANNEL, VideoReassembler,
-    pack_system_audio, pack_video_frame, pack_voice, parse_system_audio, parse_voice, split_sender,
+    CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ChannelDenyReason, ChannelInfo, ClientMessage,
+    DenyReason, MEDIA_CHANNEL, PROTOCOL_ID, SIGNAL_CHANNEL, SYSTEM_AUDIO_CHANNEL, ServerMessage,
+    ShareScope, VIDEO_CHANNEL, VOICE_CHANNEL, VideoReassembler, pack_system_audio,
+    pack_video_frame, pack_voice, parse_system_audio, parse_voice, split_sender,
 };
 
 use crate::WakeFn;
@@ -62,15 +62,40 @@ pub enum NetworkMessage {
     UploadProgress { pct: u8 },
     Connected,
     Disconnected(String),
+    /// The token issuer answered HTTP 403 during connect — the server
+    /// password is missing or wrong. The UI prompts for it and offers
+    /// to save it on the server entry.
+    AccessDenied,
     InitClient {
         users: HashMap<ClientId, String>,
         client_id: u64,
         server_name: String,
         greeting: String,
+        /// Voice channels this server defines, in id order.
+        channels: Vec<ChannelInfo>,
+        /// Which channel every connected user (including us) is in.
+        memberships: HashMap<ClientId, u16>,
     },
     UserJoined {
         client_id: ClientId,
         username: String,
+        channel_id: u16,
+    },
+    /// A user (possibly us — the echo is authoritative) moved channel.
+    UserMovedChannel {
+        client_id: ClientId,
+        channel_id: u16,
+    },
+    /// The server refused our channel join.
+    ChannelJoinDenied {
+        channel_id: u16,
+        reason: ChannelDenyReason,
+    },
+    /// The server hot-reloaded its channel list. Ids are renumbered, so
+    /// this carries the full new list plus authoritative memberships.
+    ChannelListUpdated {
+        channels: Vec<ChannelInfo>,
+        memberships: HashMap<ClientId, u16>,
     },
     UserLeft {
         client_id: ClientId,
@@ -121,6 +146,7 @@ pub enum NetworkMessage {
         client_id: ClientId,
         width: u32,
         height: u32,
+        scope: ShareScope,
     },
     /// A remote user stopped sharing their screen.
     ScreenShareStopped {
@@ -166,6 +192,18 @@ pub enum NetworkMessage {
 
 // ── Token fetch ─────────────────────────────────────────────────────────
 
+/// Why a connect attempt never produced a session.
+#[derive(Debug)]
+pub(crate) enum ConnectError {
+    /// The token issuer refused us with HTTP 403 — wrong or missing
+    /// server password. Other statuses stay [`ConnectError::Failed`]:
+    /// the issuer's contract reserves 403 for the password check.
+    AccessDenied,
+    /// Anything else (socket, HTTP, token decode…), preformatted for
+    /// the error toast.
+    Failed(String),
+}
+
 /// Fetch a netcode ConnectToken from the issuer.
 ///
 /// Blocking (runs on the network thread during connect). The URL should
@@ -174,7 +212,7 @@ fn fetch_connect_token(
     url: &str,
     username: &str,
     password: Option<&str>,
-) -> Result<ConnectToken, String> {
+) -> Result<ConnectToken, ConnectError> {
     let mut request = ureq::post(url).timeout(TOKEN_FETCH_TIMEOUT);
     if let Some(pass) = password {
         request = request.set("x-baucord-pass", pass);
@@ -182,11 +220,15 @@ fn fetch_connect_token(
 
     let response = match request.send_string(username) {
         Ok(response) => response,
+        Err(ureq::Error::Status(403, _)) => return Err(ConnectError::AccessDenied),
         Err(ureq::Error::Status(code, response)) => {
             let body = response.into_string().unwrap_or_default();
-            return Err(format!("token server returned {code}: {}", body.trim()));
+            return Err(ConnectError::Failed(format!(
+                "token server returned {code}: {}",
+                body.trim()
+            )));
         }
-        Err(e) => return Err(format!("token request failed: {e}")),
+        Err(e) => return Err(ConnectError::Failed(format!("token request failed: {e}"))),
     };
 
     let mut bytes = Vec::new();
@@ -194,9 +236,10 @@ fn fetch_connect_token(
         .into_reader()
         .take(MAX_TOKEN_RESPONSE_BYTES)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("failed to read token response: {e}"))?;
+        .map_err(|e| ConnectError::Failed(format!("failed to read token response: {e}")))?;
 
-    ConnectToken::read(&mut bytes.as_slice()).map_err(|e| format!("invalid connect token: {e}"))
+    ConnectToken::read(&mut bytes.as_slice())
+        .map_err(|e| ConnectError::Failed(format!("invalid connect token: {e}")))
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -236,11 +279,11 @@ impl NetworkClient {
         username: &str,
         token_url: Option<&str>,
         token_password: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ConnectError> {
         let client = RenetClient::new(protocol::connection_config(CLIENT_BYTES_PER_TICK));
 
-        let socket =
-            UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind socket: {e}"))?;
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| ConnectError::Failed(format!("Failed to bind socket: {e}")))?;
         let sock_ref = socket2::SockRef::from(&socket);
         sock_ref
             .set_send_buffer_size(protocol::UDP_SOCKET_BUFFER_BYTES)
@@ -257,7 +300,7 @@ impl NetworkClient {
 
         let current_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| format!("System time error: {e}"))?;
+            .map_err(|e| ConnectError::Failed(format!("System time error: {e}")))?;
 
         let authentication = match token_url {
             Some(url) => {
@@ -291,7 +334,7 @@ impl NetworkClient {
         };
 
         let transport = NetcodeClientTransport::new(current_time, authentication, socket)
-            .map_err(|e| format!("Failed to create transport: {e}"))?;
+            .map_err(|e| ConnectError::Failed(format!("Failed to create transport: {e}")))?;
 
         Ok(NetworkClient {
             client,
@@ -433,6 +476,8 @@ impl NetworkClient {
                 client_id,
                 server_name,
                 greeting,
+                channels,
+                memberships,
             } => {
                 self.usernames = usernames.clone();
                 self.message_queue.push(NetworkMessage::InitClient {
@@ -440,16 +485,48 @@ impl NetworkClient {
                     users: usernames,
                     server_name,
                     greeting,
+                    channels,
+                    memberships,
                 });
             }
             ServerMessage::UserJoined {
                 client_id,
                 username,
+                channel_id,
             } => {
                 self.usernames.insert(client_id, username.clone());
                 self.message_queue.push(NetworkMessage::UserJoined {
                     client_id,
                     username,
+                    channel_id,
+                });
+            }
+            ServerMessage::UserMovedChannel {
+                client_id,
+                channel_id,
+            } => {
+                self.message_queue.push(NetworkMessage::UserMovedChannel {
+                    client_id,
+                    channel_id,
+                });
+            }
+            ServerMessage::JoinChannelDenied { channel_id, reason } => {
+                warn!(
+                    "Server denied joining channel {channel_id}: {}",
+                    reason.describe()
+                );
+                self.message_queue.push(NetworkMessage::ChannelJoinDenied {
+                    channel_id,
+                    reason,
+                });
+            }
+            ServerMessage::ChannelListUpdated {
+                channels,
+                memberships,
+            } => {
+                self.message_queue.push(NetworkMessage::ChannelListUpdated {
+                    channels,
+                    memberships,
                 });
             }
             ServerMessage::UserLeft { client_id } => {
@@ -508,11 +585,13 @@ impl NetworkClient {
                 client_id,
                 width,
                 height,
+                scope,
             } => {
                 self.message_queue.push(NetworkMessage::ScreenShareStarted {
                     client_id,
                     width: u32::from(width),
                     height: u32::from(height),
+                    scope,
                 });
             }
             ServerMessage::ScreenShareStopped { client_id } => {
@@ -735,10 +814,22 @@ impl NetworkClient {
 
     /// Send screen share signaling. Dimensions are clamped into the
     /// wire format's u16 range (the server validates 16..=4096 anyway).
-    pub fn send_screen_share_start(&mut self, width: u32, height: u32) {
+    pub fn send_screen_share_start(&mut self, width: u32, height: u32, scope: ShareScope) {
         let width = u16::try_from(width.min(4096)).unwrap_or(u16::MAX);
         let height = u16::try_from(height.min(4096)).unwrap_or(u16::MAX);
-        self.send_control(&ClientMessage::ScreenShareStart { width, height });
+        self.send_control(&ClientMessage::ScreenShareStart {
+            width,
+            height,
+            scope,
+        });
+    }
+
+    /// Ask to move to `channel_id` (with the channel password, if any).
+    pub fn send_join_channel(&mut self, channel_id: u16, password: Option<String>) {
+        self.send_control(&ClientMessage::JoinChannel {
+            channel_id,
+            password,
+        });
     }
 
     pub fn send_screen_share_stop(&mut self) {
@@ -819,11 +910,21 @@ pub enum NetworkControl {
         deafened: bool,
     },
 
+    // ── Voice channels ──────────────────────────────────────────────
+    /// Move to another voice channel (answered by `UserMovedChannel`
+    /// or `ChannelJoinDenied`).
+    JoinChannel {
+        channel_id: u16,
+        password: Option<String>,
+    },
+
     // ── Screen share ────────────────────────────────────────────────
-    /// Signal that we started sharing (control → server → all clients).
+    /// Signal that we started sharing (control → server → the audience
+    /// the scope allows).
     ScreenShareStart {
         width: u32,
         height: u32,
+        scope: ShareScope,
     },
     /// Signal that we stopped sharing.
     ScreenShareStop,
@@ -946,7 +1047,11 @@ fn handle_control(
                 // Connected is announced by NetworkClient::update()
                 // once the handshake actually completes.
                 Ok(c) => *client = Some(c),
-                Err(e) => {
+                Err(ConnectError::AccessDenied) => {
+                    msg_tx.send(NetworkMessage::AccessDenied).ok();
+                    wake();
+                }
+                Err(ConnectError::Failed(e)) => {
                     msg_tx.send(NetworkMessage::Disconnected(e)).ok();
                     wake();
                 }
@@ -993,10 +1098,23 @@ fn handle_control(
             }
         }
 
-        // ── Screen share controls ───────────────────────────────────
-        NetworkControl::ScreenShareStart { width, height } => {
+        NetworkControl::JoinChannel {
+            channel_id,
+            password,
+        } => {
             if let Some(c) = client {
-                c.send_screen_share_start(width, height);
+                c.send_join_channel(channel_id, password);
+            }
+        }
+
+        // ── Screen share controls ───────────────────────────────────
+        NetworkControl::ScreenShareStart {
+            width,
+            height,
+            scope,
+        } => {
+            if let Some(c) = client {
+                c.send_screen_share_start(width, height, scope);
             }
         }
         NetworkControl::ScreenShareStop => {
@@ -1161,6 +1279,7 @@ fn run_network_loop(
                         client_id,
                         width,
                         height,
+                        scope,
                     } => {
                         let _ = screen_tx.try_send(ScreenControl::PeerStartedSharing {
                             client_id,
@@ -1171,6 +1290,7 @@ fn run_network_loop(
                             client_id,
                             width,
                             height,
+                            scope,
                         });
                         wake();
                     }

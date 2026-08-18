@@ -32,6 +32,15 @@ export struct UserRow {
     self-muted: bool,       // their broadcast state
     self-deafened: bool,
     sharing: bool,          // "LIVE" badge + Watch stream in popover
+    // Voice channels: the roster is one flat model of channel header
+    // rows with their members beneath (keeps ListView virtualization
+    // and the in-place row-update contract). When is-channel is set,
+    // only the channel-* / locked / member-label / name fields matter.
+    is-channel: bool,
+    channel-id: int,
+    locked: bool,           // channel requires a password
+    member-label: string,   // "3" or "3/8" with a user limit
+    is-our-channel: bool,   // the channel we are in (highlight, no-op click)
 }
 
 /// One chat row. `kind`: 0 = message, 1 = system, 2 = image, 3 = link
@@ -53,6 +62,7 @@ export struct ChatRow {
 
 export struct EmojiRow  { glyph: string, code: string, section: string }
 export struct KeybindRow { action-label: string, bind: string, recording: bool }
+export struct ServerRow { name: string, address: string, is-default: bool }
 
 // ── State (host → UI) ───────────────────────────────────────────────────
 
@@ -67,8 +77,12 @@ export global State {
 
     // Connect view
     in-out property <string> nickname;
+    /// Typed into the 403 prompt; Save writes it onto the selected
+    /// server's token-password.
     in-out property <string> password;
-    in property <string> server-note;      // "Connecting to 1.2.3.4:5000"
+    in property <[string]> server-names;   // saved servers, by name
+    in-out property <int> server-index: 0; // dropdown pick = default server
+    in property <bool> password-prompt: false; // 403 → show the save box
     in property <string> error-text;       // 5s toast, cleared by host
     in property <string> device-warning;   // "saved mic missing" notice
 
@@ -105,6 +119,12 @@ export global State {
     in property <image> preview-image;
     in property <string> preview-caption;  // "1280×720 — 412 KB"
 
+    // Channel password prompt (locked channel clicked / wrong password)
+    in property <bool> channel-prompt-open: false;
+    in property <string> channel-prompt-name;
+    in property <string> channel-prompt-error;   // "" when none
+    in-out property <string> channel-password;
+
     // Per-user audio popover (opened by Logic.user-menu)
     in property <bool> user-popup-open: false;
 
@@ -124,6 +144,12 @@ export global State {
 export global Logic {
     // Connect view
     callback connect-clicked();
+    /// Dropdown pick — the host persists it as the default server.
+    callback connect-server-selected(int);
+    /// Pencil icon — open Settings on the Servers tab.
+    callback edit-servers();
+    /// Save the typed password onto the selected server (403 prompt).
+    callback save-password();
     callback open-settings();
     callback quit();
 
@@ -165,7 +191,12 @@ export global Logic {
     callback preview-cancel();
 
     // Screen share dialog
-    callback start-share(int, int);       // monitor index, quality index
+    callback start-share(int, int, bool); // monitor index, quality index, everyone?
+
+    // Voice channels
+    callback channel-clicked(int);        // channel id (header row tapped)
+    callback channel-password-ok();       // reads State.channel-password
+    callback channel-password-cancel();
 
     // Startup / update flow
     callback update-now();

@@ -115,8 +115,12 @@ pub struct UserSettings {
     pub nickname: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerSettings {
+/// One saved server the user can connect to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerEntry {
+    /// Display name, and what `Settings::server` points at.
+    pub name: String,
+    /// `ip:port` (or `[v6]:port`) — parsed as a `SocketAddr` on connect.
     pub address: String,
     /// Token issuer URL for secure servers, e.g.
     /// `https://vc.example.com/token` (the deployment's reverse proxy
@@ -137,17 +141,48 @@ pub struct ServerSettings {
     /// per-platform dependency for a secret every member knows.
     #[serde(default)]
     pub token_password: Option<String>,
+    /// Saved voice-channel passwords for this server, keyed by channel
+    /// *name* (channel ids are per-server-run indexes; names are the
+    /// stable handle an operator gives a room). Filled when a join with
+    /// a typed password succeeds path-wise (we save on OK — a wrong
+    /// password just re-opens the prompt). Same plain-text rationale as
+    /// `token_password` above.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub channel_passwords: HashMap<String, String>,
 }
 
-impl Default for ServerSettings {
-    fn default() -> Self {
+impl ServerEntry {
+    /// The official baucord server — the out-of-the-box entry.
+    #[must_use]
+    pub fn official() -> Self {
         Self {
-            address: "64.176.16.18:5000".to_string(),
-            token_url: Some("https://key.mpw.sh/token".to_string()),
+            name: "baucord".to_string(),
+            address: "216.238.121.18:5000".to_string(),
+            token_url: Some("http://token.baucord.com/token".to_string()),
             token_password: None,
+            channel_passwords: HashMap::new(),
         }
     }
 }
+
+fn default_servers() -> Vec<ServerEntry> {
+    vec![ServerEntry::official()]
+}
+
+/// The pre-0.3 single inline `server` object, kept so old settings.json
+/// files still deserialize (they migrate to a `servers` entry on load).
+#[derive(Debug, Deserialize)]
+struct LegacyServer {
+    address: String,
+    #[serde(default)]
+    token_url: Option<String>,
+    #[serde(default)]
+    token_password: Option<String>,
+}
+
+/// Address of the retired official server: a legacy file pointing there
+/// migrates to [`ServerEntry::official`] instead of keeping dead config.
+const LEGACY_OFFICIAL_ADDRESS: &str = "64.176.16.18:5000";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioInputSettings {
@@ -235,11 +270,14 @@ fn default_keybinds() -> Vec<KeybindEntry> {
 // ── Root settings ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "SettingsDe")]
 pub struct Settings {
     #[serde(default)]
     pub user: UserSettings,
-    #[serde(default)]
-    pub server: ServerSettings,
+    /// Name of the default server in [`Self::servers`] — the entry
+    /// preselected on the connect screen at startup.
+    pub server: String,
+    pub servers: Vec<ServerEntry>,
     #[serde(default)]
     pub audio: AudioSettings,
     #[serde(default)]
@@ -254,11 +292,92 @@ pub struct Settings {
     pub language: Option<String>,
 }
 
+/// Deserialization shadow of [`Settings`]: `server` accepts both the
+/// current name string and the pre-0.3 inline object, so upgrading
+/// users keep their custom server instead of falling back to defaults
+/// (a parse failure would discard the whole file — nickname, keybinds,
+/// per-peer audio and all).
+#[derive(Deserialize)]
+struct SettingsDe {
+    #[serde(default)]
+    user: UserSettings,
+    #[serde(default)]
+    server: ServerField,
+    #[serde(default)]
+    servers: Vec<ServerEntry>,
+    #[serde(default)]
+    audio: AudioSettings,
+    #[serde(default)]
+    window: WindowSettings,
+    #[serde(default = "default_keybinds")]
+    keybinds: Vec<KeybindEntry>,
+    #[serde(default)]
+    peer_settings: HashMap<String, PeerAudioSettings>,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ServerField {
+    Name(String),
+    Legacy(LegacyServer),
+}
+
+impl Default for ServerField {
+    fn default() -> Self {
+        ServerField::Name(String::new())
+    }
+}
+
+impl From<SettingsDe> for Settings {
+    fn from(de: SettingsDe) -> Self {
+        let mut servers = de.servers;
+        let server = match de.server {
+            ServerField::Name(name) => name,
+            ServerField::Legacy(legacy) => {
+                // Pre-0.3 file. The retired official default becomes
+                // the new official entry; a custom server is preserved
+                // under its address as the name.
+                let entry = if legacy.address == LEGACY_OFFICIAL_ADDRESS {
+                    ServerEntry::official()
+                } else {
+                    ServerEntry {
+                        name: legacy.address.clone(),
+                        address: legacy.address,
+                        token_url: legacy.token_url,
+                        token_password: legacy.token_password,
+                        channel_passwords: HashMap::new(),
+                    }
+                };
+                let name = entry.name.clone();
+                if !servers.iter().any(|s| s.name == entry.name) {
+                    servers.insert(0, entry);
+                }
+                name
+            }
+        };
+        let mut settings = Settings {
+            user: de.user,
+            server,
+            servers,
+            audio: de.audio,
+            window: de.window,
+            keybinds: de.keybinds,
+            peer_settings: de.peer_settings,
+            language: de.language,
+        };
+        settings.normalize_servers();
+        settings
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             user: UserSettings::default(),
-            server: ServerSettings::default(),
+            server: ServerEntry::official().name,
+            servers: default_servers(),
             audio: AudioSettings::default(),
             window: WindowSettings::default(),
             keybinds: default_keybinds(),
@@ -344,6 +463,48 @@ impl Settings {
     pub fn reset(&mut self) {
         *self = Settings::default();
         self.save();
+    }
+
+    /// Repair the server list invariants after load or mutation: at
+    /// least one entry exists, blank optional fields collapse to
+    /// `None`, and `server` names an existing entry (first entry wins
+    /// when the pointer is dangling).
+    pub fn normalize_servers(&mut self) {
+        if self.servers.is_empty() {
+            self.servers = default_servers();
+        }
+        for entry in &mut self.servers {
+            let blank = |v: &Option<String>| v.as_deref().is_some_and(|s| s.trim().is_empty());
+            if blank(&entry.token_url) {
+                entry.token_url = None;
+            }
+            if blank(&entry.token_password) {
+                entry.token_password = None;
+            }
+        }
+        if !self.servers.iter().any(|s| s.name == self.server) {
+            self.server = self.servers[0].name.clone();
+        }
+    }
+
+    /// The default server — the entry named by `server` (first name
+    /// match when names collide), falling back to the first entry.
+    #[must_use]
+    pub fn default_server(&self) -> Option<&ServerEntry> {
+        self.servers
+            .iter()
+            .find(|s| s.name == self.server)
+            .or_else(|| self.servers.first())
+    }
+
+    /// Mutable variant of [`Self::default_server`].
+    pub fn default_server_mut(&mut self) -> Option<&mut ServerEntry> {
+        let index = self
+            .servers
+            .iter()
+            .position(|s| s.name == self.server)
+            .unwrap_or(0);
+        self.servers.get_mut(index)
     }
 
     pub fn bind_for(&self, action: BindableAction) -> &str {
@@ -462,5 +623,136 @@ pub fn set_window_pos(key: &str, pos: (i32, i32)) {
     map.insert(key.to_string(), pos);
     if let Ok(contents) = serde_json::to_string_pretty(&map) {
         let _ = fs::write(&path, contents);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Settings {
+        serde_json::from_str(json).expect("settings should deserialize")
+    }
+
+    #[test]
+    fn legacy_custom_server_migrates_to_entry_named_by_address() {
+        let s = parse(
+            r#"{
+            "user": { "nickname": "empe" },
+            "server": {
+                "address": "10.0.0.7:6000",
+                "token_url": "https://vc.example.com/token",
+                "token_password": "sekrit"
+            },
+            "keybinds": [ { "action": "toggle_mute", "bind": "F2" } ]
+        }"#,
+        );
+        assert_eq!(s.server, "10.0.0.7:6000");
+        assert_eq!(s.servers.len(), 1);
+        let e = &s.servers[0];
+        assert_eq!(e.address, "10.0.0.7:6000");
+        assert_eq!(e.token_url.as_deref(), Some("https://vc.example.com/token"));
+        assert_eq!(e.token_password.as_deref(), Some("sekrit"));
+        // Pre-existing settings survive the migration.
+        assert_eq!(s.user.nickname, "empe");
+        assert_eq!(s.keybinds[0].bind, "F2");
+    }
+
+    #[test]
+    fn legacy_official_server_becomes_new_official_entry() {
+        let s = parse(
+            r#"{ "server": { "address": "64.176.16.18:5000",
+                "token_url": "https://key.mpw.sh/token", "token_password": null } }"#,
+        );
+        assert_eq!(s.server, "baucord");
+        assert_eq!(s.servers, vec![ServerEntry::official()]);
+    }
+
+    #[test]
+    fn new_format_round_trips_and_normalizes_blank_password() {
+        let s = parse(
+            r#"{
+            "server": "baucord",
+            "servers": [{
+                "name": "baucord",
+                "address": "216.238.121.18:5000",
+                "token_url": "http://token.baucord.com/token",
+                "token_password": ""
+            }]
+        }"#,
+        );
+        assert_eq!(s.server, "baucord");
+        assert_eq!(s.servers[0].token_password, None);
+
+        let json = serde_json::to_string_pretty(&s).expect("serialize");
+        let back: Settings = serde_json::from_str(&json).expect("re-parse");
+        assert_eq!(back.server, "baucord");
+        assert_eq!(back.servers, s.servers);
+    }
+
+    #[test]
+    fn dangling_default_name_falls_back_to_first_entry() {
+        let s = parse(
+            r#"{ "server": "gone",
+                 "servers": [ { "name": "a", "address": "1.2.3.4:1" },
+                              { "name": "b", "address": "1.2.3.4:2" } ] }"#,
+        );
+        assert_eq!(s.server, "a");
+    }
+
+    #[test]
+    fn empty_file_gets_official_default() {
+        let s = parse("{}");
+        assert_eq!(s.server, "baucord");
+        assert_eq!(s.servers, vec![ServerEntry::official()]);
+    }
+
+    #[test]
+    fn default_server_accessors_follow_the_name() {
+        let mut s = parse(
+            r#"{ "server": "b",
+                 "servers": [ { "name": "a", "address": "1.1.1.1:1" },
+                              { "name": "b", "address": "2.2.2.2:2" } ] }"#,
+        );
+        assert_eq!(
+            s.default_server().map(|e| e.address.as_str()),
+            Some("2.2.2.2:2")
+        );
+        if let Some(server) = s.default_server_mut() {
+            server.token_password = Some("pw".to_string());
+        }
+        assert_eq!(s.servers[1].token_password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn channel_passwords_round_trip_and_default_empty() {
+        // Old files without the key: empty map, no error.
+        let s = parse(r#"{ "servers": [ { "name": "x", "address": "1.2.3.4:5" } ] }"#);
+        assert!(s.servers[0].channel_passwords.is_empty());
+
+        // Saved passwords survive a serialize/deserialize cycle.
+        let mut s = Settings::default();
+        s.default_server_mut()
+            .expect("default entry exists")
+            .channel_passwords
+            .insert("Gaming".to_string(), "hunter2".to_string());
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back = parse(&json);
+        assert_eq!(
+            back.servers[0].channel_passwords.get("Gaming").map(String::as_str),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn legacy_object_is_not_duplicated_when_servers_list_also_present() {
+        // A half-migrated / hand-edited file: legacy object AND a list
+        // already containing the same name — the object must not dupe.
+        let s = parse(
+            r#"{ "server": { "address": "64.176.16.18:5000" },
+                 "servers": [ { "name": "baucord", "address": "216.238.121.18:5000" } ] }"#,
+        );
+        assert_eq!(s.servers.len(), 1);
+        assert_eq!(s.server, "baucord");
     }
 }

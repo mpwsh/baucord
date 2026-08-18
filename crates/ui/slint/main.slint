@@ -8,18 +8,18 @@
 
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow } from "globals.slint";
+import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow } from "globals.slint";
 import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
-import { Btn, IconBtn, Card, HSlider, Sep, FieldLabel, Dropdown } from "widgets.slint";
+import { Btn, IconBtn, Card, HSlider, Sep, Field, FieldLabel, Dropdown } from "widgets.slint";
 import { SettingsWindow, SettingsState, SettingsLogic } from "settings.slint";
 import { StreamViewerWindow } from "viewer.slint";
 
 import { BaucordTray } from "tray.slint";
 
-export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow }
+export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow }
 
 export component MainWindow inherits Window {
     title: "baucord";
@@ -34,6 +34,7 @@ export component MainWindow inherits Window {
     in-out property <bool> share-dialog-open: false;
     property <int> share-monitor: State.default-monitor;
     property <int> share-quality: State.default-quality;
+    property <int> share-scope: 0;   // 0 = my channel (default), 1 = everyone
 
     public function chat-at-bottom() -> bool { return chat-pane.at-bottom(); }
     public function chat-scroll-to-end() { chat-pane.scroll-to-end(); }
@@ -56,6 +57,7 @@ export component MainWindow inherits Window {
     public function open-share-dialog() {
         share-monitor = State.default-monitor;
         share-quality = State.default-quality;
+        share-scope = 0;   // channel-only by default, every time
         share-dialog-open = true;
     }
 
@@ -299,18 +301,82 @@ export component MainWindow inherits Window {
                         options: State.qualities;
                         current <=> root.share-quality;
                     }
+                    FieldLabel { text: Tr.share-visibility; }
+                    Dropdown {
+                        options: [Tr.share-channel-only, Tr.share-everyone];
+                        current <=> root.share-scope;
+                    }
                     Btn {
                         text: Tr.start-sharing;
                         accent: true;
                         clicked => {
                             root.share-dialog-open = false;
-                            Logic.start-share(root.share-monitor, root.share-quality);
+                            Logic.start-share(root.share-monitor, root.share-quality,
+                                root.share-scope == 1);
                         }
                     }
                 }
             }
         }
     }
+    // ── Channel password prompt (modal overlay) ────────────────────
+    // Opened by the shell when a locked channel is clicked with no
+    // saved password, or when the server answers WrongPassword. OK
+    // saves the password on the server entry and retries the join.
+    if State.channel-prompt-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { Logic.channel-password-cancel(); } }
+        chp-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { Logic.channel-password-cancel(); return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 340px;
+                height: chp.preferred-height;
+                TouchArea { }
+                chp := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: "\{Tr.channel-password-title} — \{State.channel-prompt-name}";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    chp-field := Field {
+                        placeholder: Tr.channel-password-title;
+                        secret: true;
+                        text <=> State.channel-password;
+                        init => { self.focus-input(); }
+                        accepted => { Logic.channel-password-ok(); }
+                    }
+                    if State.channel-prompt-error != "" : Text {
+                        text: State.channel-prompt-error;
+                        color: Theme.danger;
+                        font-size: Theme.font-xs;
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn {
+                            text: Tr.cancel;
+                            clicked => { Logic.channel-password-cancel(); }
+                        }
+                        Btn {
+                            text: Tr.save;
+                            accent: true;
+                            clicked => { Logic.channel-password-ok(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Per-user audio popover ─────────────────────────────────────
     if State.user-popup-open && State.popup-user-index >= 0
         && State.popup-user-index < State.users.length : Rectangle {

@@ -6,6 +6,7 @@ diagnostics*.txt
 .DS_Store
 prompt.md
 baucord-*.log
+baucord.log
 server.log
 netcode.key
 fltk-ui

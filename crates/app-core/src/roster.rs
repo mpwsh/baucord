@@ -32,18 +32,33 @@ pub struct UserState {
     /// Remote user's self-reported mute state (distinct from local per-user mute).
     pub is_self_muted: bool,
     pub is_self_deafened: bool,
+    /// Voice channel this user is in (server-authoritative).
+    pub channel_id: u16,
 }
 
 impl UserState {
-    pub fn new(username: impl Into<String>, audio: PeerAudio) -> Self {
+    pub fn new(username: impl Into<String>, audio: PeerAudio, channel_id: u16) -> Self {
         Self {
             username: username.into(),
             is_speaking: false,
             audio,
             is_self_muted: false,
             is_self_deafened: false,
+            channel_id,
         }
     }
+}
+
+/// One voice channel as the roster needs it (mirror of the wire
+/// `ChannelInfo` — this crate stays free of networking deps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelMeta {
+    pub id: u16,
+    pub name: String,
+    /// Joining requires a password (shown as a lock).
+    pub locked: bool,
+    /// Member cap, `None` = unlimited.
+    pub user_limit: Option<u16>,
 }
 
 /// Snapshot row for the UI, in display order.
@@ -62,46 +77,99 @@ pub struct RosterRow {
     pub sharing: bool,
 }
 
-/// Project the user map into sorted display rows (by username, same
-/// order the FLTK sidebar used). `our_id` marks the self row; for it,
-/// `local_*` state substitutes the broadcast state (which is always
-/// stale for ourselves).
+/// A channel header row for the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRow {
+    pub id: u16,
+    pub name: String,
+    pub locked: bool,
+    /// Current member count.
+    pub members: u16,
+    pub user_limit: Option<u16>,
+    /// This is the channel we are in (highlighted; clicking is a no-op).
+    pub is_ours: bool,
+}
+
+/// One sidebar row: a channel header or a user beneath one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RosterItem {
+    Channel(ChannelRow),
+    User(RosterRow),
+}
+
+/// Project channels + users into the TeamSpeak-style grouped sidebar:
+/// every channel (occupied or not, in config order) as a header row,
+/// its members sorted by username beneath it. `our_id` marks the self
+/// row; for it, `local_*` state substitutes the broadcast state (which
+/// is always stale for ourselves).
+///
+/// Users pointing at a channel id with no metadata (a server bug, but
+/// hiding people would make it worse) are appended at the end without
+/// a header.
 #[allow(clippy::cast_possible_truncation)]
 // implicit_hasher: the shell hands us its std maps; genericizing the
 // hasher buys nothing here.
 #[allow(clippy::implicit_hasher)]
 #[must_use]
-pub fn rows(
+pub fn grouped_rows(
+    channels: &[ChannelMeta],
     users: &HashMap<ClientId, UserState>,
     our_id: Option<ClientId>,
     sharers: &HashSet<ClientId>,
     local_muted: bool,
     local_deafened: bool,
-) -> Vec<RosterRow> {
+) -> Vec<RosterItem> {
+    let user_row = |id: ClientId, st: &UserState| {
+        let is_us = Some(id) == our_id;
+        let (self_muted, self_deafened) = if is_us {
+            (local_muted, local_deafened)
+        } else {
+            (st.is_self_muted, st.is_self_deafened)
+        };
+        RosterRow {
+            client_id: id,
+            name: st.username.clone(),
+            volume_pct: (st.audio.volume * 100.0).round() as i32,
+            is_us,
+            speaking: st.is_speaking,
+            local_muted: st.audio.is_muted,
+            self_muted,
+            self_deafened,
+            sharing: sharers.contains(&id),
+        }
+    };
+
+    let our_channel = our_id.and_then(|id| users.get(&id)).map(|u| u.channel_id);
     let mut sorted: Vec<_> = users.iter().collect();
     sorted.sort_by(|(_, a), (_, b)| a.username.cmp(&b.username));
-    sorted
-        .into_iter()
-        .map(|(&id, st)| {
-            let is_us = Some(id) == our_id;
-            let (self_muted, self_deafened) = if is_us {
-                (local_muted, local_deafened)
-            } else {
-                (st.is_self_muted, st.is_self_deafened)
-            };
-            RosterRow {
-                client_id: id,
-                name: st.username.clone(),
-                volume_pct: (st.audio.volume * 100.0).round() as i32,
-                is_us,
-                speaking: st.is_speaking,
-                local_muted: st.audio.is_muted,
-                self_muted,
-                self_deafened,
-                sharing: sharers.contains(&id),
-            }
-        })
-        .collect()
+
+    let mut items = Vec::with_capacity(channels.len() + users.len());
+    for channel in channels {
+        let members: Vec<_> = sorted
+            .iter()
+            .filter(|(_, st)| st.channel_id == channel.id)
+            .collect();
+        items.push(RosterItem::Channel(ChannelRow {
+            id: channel.id,
+            name: channel.name.clone(),
+            locked: channel.locked,
+            members: members.len() as u16,
+            user_limit: channel.user_limit,
+            is_ours: our_channel == Some(channel.id),
+        }));
+        for (id, st) in members {
+            items.push(RosterItem::User(user_row(**id, st)));
+        }
+    }
+
+    // Defensive: users in a channel the metadata doesn't know.
+    let known: HashSet<u16> = channels.iter().map(|c| c.id).collect();
+    for (id, st) in &sorted {
+        if !known.contains(&st.channel_id) {
+            items.push(RosterItem::User(user_row(**id, st)));
+        }
+    }
+    items
 }
 
 /// Split a u64 client id into two i32 halves for a Slint struct (which
@@ -134,15 +202,59 @@ mod tests {
         }
     }
 
+    fn meta(id: u16, name: &str) -> ChannelMeta {
+        ChannelMeta {
+            id,
+            name: name.to_string(),
+            locked: false,
+            user_limit: None,
+        }
+    }
+
     #[test]
-    fn rows_sort_by_username_and_mark_self() {
+    fn grouped_rows_order_channels_then_sorted_members() {
+        let channels = [meta(0, "Lobby"), meta(1, "Gaming")];
         let mut users = HashMap::new();
-        users.insert(2, UserState::new("zoe", PeerAudio::default()));
-        users.insert(1, UserState::new("amy", PeerAudio::default()));
-        let rows = rows(&users, Some(2), &HashSet::default(), true, false);
-        assert_eq!(rows[0].name, "amy");
-        assert_eq!(rows[1].name, "zoe");
-        assert!(rows[1].is_us);
-        assert!(rows[1].self_muted, "self row uses local state");
+        users.insert(2, UserState::new("zoe", PeerAudio::default(), 0));
+        users.insert(1, UserState::new("amy", PeerAudio::default(), 0));
+        users.insert(3, UserState::new("bob", PeerAudio::default(), 1));
+        let items = grouped_rows(&channels, &users, Some(2), &HashSet::default(), true, false);
+
+        // Lobby header, amy, zoe(us), Gaming header, bob.
+        assert_eq!(items.len(), 5);
+        let RosterItem::Channel(lobby) = &items[0] else { panic!("expected header") };
+        assert_eq!(lobby.name, "Lobby");
+        assert_eq!(lobby.members, 2);
+        assert!(lobby.is_ours, "we are in the Lobby");
+        assert!(matches!(&items[1], RosterItem::User(u) if u.name == "amy"));
+        let RosterItem::User(us) = &items[2] else { panic!("expected user") };
+        assert_eq!(us.name, "zoe");
+        assert!(us.is_us);
+        assert!(us.self_muted, "self row uses local state");
+        let RosterItem::Channel(gaming) = &items[3] else { panic!("expected header") };
+        assert_eq!(gaming.name, "Gaming");
+        assert!(!gaming.is_ours);
+        assert!(matches!(&items[4], RosterItem::User(u) if u.name == "bob"));
+    }
+
+    #[test]
+    fn empty_channels_still_render_headers() {
+        let channels = [meta(0, "Lobby"), meta(1, "AFK")];
+        let mut users = HashMap::new();
+        users.insert(1, UserState::new("amy", PeerAudio::default(), 0));
+        let items = grouped_rows(&channels, &users, Some(1), &HashSet::default(), false, false);
+        assert_eq!(items.len(), 3);
+        let RosterItem::Channel(afk) = &items[2] else { panic!("expected header") };
+        assert_eq!(afk.members, 0);
+    }
+
+    #[test]
+    fn unknown_channel_users_are_not_hidden() {
+        let channels = [meta(0, "Lobby")];
+        let mut users = HashMap::new();
+        users.insert(1, UserState::new("ghost", PeerAudio::default(), 42));
+        let items = grouped_rows(&channels, &users, None, &HashSet::default(), false, false);
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[1], RosterItem::User(u) if u.name == "ghost"));
     }
 }

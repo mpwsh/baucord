@@ -1,7 +1,6 @@
 # ── Connect view ────────────────────────────────────────────────────────
 app-tagline = Temos discord em casa
 nickname = Apelido
-server-address = Endereço do servidor:Porta
 connect = Conectar
 settings = Configurações
 quit = Sair
@@ -32,8 +31,18 @@ language-note =
     forem reabertas, e o histórico do chat mantém seu idioma original.
 # ── Server config (connect + settings) ──────────────────────────────────
 server-password = Senha do servidor (opcional)
-connect-server-note = Conectando a { $server } — altere em Configurações
 settings-server = Servidor
+tab-servers = Servidores
+server-name = Nome
+server-ip = IP / host
+server-port = Porta
+server-default = Padrão
+server-add = Adicionar servidor
+server-remove = Remover
+server-manage = Gerenciar servidores
+server-new-name = Novo servidor
+save = Salvar
+connect-access-denied = Acesso negado: senha — digite abaixo, Salve e Conecte de novo
 server-token-url = URL de token (somente servidores seguros)
 server-config-note =
     Deixe a URL de token vazia para servidores abertos ou de LAN.
@@ -219,4 +228,12 @@ tech-slint = Slint - Interface de usuário
 chat-image-too-large = A imagem é grande demais para enviar ({ $kb } KB após redimensionar)
 chat-image-save-error = Não foi possível salvar a imagem: { $error }
 chat-downloading-image = Baixando imagem…
-tab-misc = Diversos
+
+# ── Canais de voz ──
+channel-password-title = Senha do canal
+channel-wrong-password = Senha incorreta — tente de novo
+channel-full = Esse canal está cheio
+share-visibility = Visível para
+share-channel-only = Meu canal
+share-everyone = Todos
+chat-channels-updated = os canais de voz foram atualizados

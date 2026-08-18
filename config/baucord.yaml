@@ -1,0 +1,24 @@
+server:
+  name: Baucord Server
+  host: 0.0.0.0
+  port: 5000
+  public_address: "216.238.121.18:5000"
+  greeting_message: Welcome to the server!
+network:
+  max_clients: 64
+  bytes_per_tick: 4194304
+channels:
+  reliable_channel_id: 2
+  voice_channel_id: 3
+  voice_buffer_size_mb: 5
+  video_channel_id: 4
+  video_buffer_size_mb: 10
+logging:
+  level: info
+  stats_interval_secs: 60
+authentication:
+  secure: true
+  private_key_file: netcode.key
+  issuer:
+    bind: "0.0.0.0:5001"
+    password: conos

@@ -51,6 +51,8 @@ pub enum ScreenControl {
     StartSharing {
         quality: Quality,
         monitor_index: usize,
+        /// Who may see the stream (channel-only or the whole server).
+        scope: protocol::ShareScope,
     },
     /// Stop sharing our screen.
     StopSharing,
@@ -653,6 +655,7 @@ fn handle_control(
         ScreenControl::StartSharing {
             quality,
             monitor_index,
+            scope,
         } => {
             // Create capturer
             let capturer = match ScreenCapturer::new(monitor_index, quality) {
@@ -726,6 +729,7 @@ fn handle_control(
             let _ = network_tx.send(NetworkControl::ScreenShareStart {
                 width: quality.width(),
                 height: quality.height(),
+                scope,
             });
 
             event_tx.send(ScreenEvent::SharingStarted { quality }).ok();

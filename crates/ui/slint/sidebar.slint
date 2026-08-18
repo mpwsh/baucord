@@ -23,9 +23,12 @@ component UserRowView inherits Rectangle {
     in property <UserRow> user;
     in property <int> index;
 
-    height: 40px;
+    height: user.is-channel ? 32px : 40px;
     border-radius: Theme.radius-md;
-    background: touch.has-hover ? Theme.hover
+    background: user.is-channel
+        ? (user.is-our-channel ? Theme.row-volume-tint
+            : touch.has-hover ? Theme.hover : transparent)
+        : touch.has-hover ? Theme.hover
         : user.local-muted ? Theme.row-muted-tint
         : user.volume-pct != 100 ? Theme.row-volume-tint
         : transparent;
@@ -33,20 +36,57 @@ component UserRowView inherits Rectangle {
 
     // The whole row is the click target — a hover-gated button was
     // impossible to hit (its own TouchArea stole the hover that made
-    // it visible). Left or right click anywhere opens the menu.
+    // it visible). Channel headers join on click; user rows open the
+    // per-user menu on left or right click.
     touch := TouchArea {
-        mouse-cursor: user.is-us ? MouseCursor.default : MouseCursor.pointer;
-        clicked => { if (!user.is-us) { Logic.user-menu(root.index); } }
+        mouse-cursor: (user.is-channel && !user.is-our-channel) || (!user.is-channel && !user.is-us)
+            ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            if (user.is-channel) {
+                if (!user.is-our-channel) { Logic.channel-clicked(user.channel-id); }
+            } else if (!user.is-us) {
+                Logic.user-menu(root.index);
+            }
+        }
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right
-                && !user.is-us) {
+                && !user.is-channel && !user.is-us) {
                 Logic.user-menu(root.index);
             }
         }
     }
 
-    HorizontalLayout {
-        padding-left: Theme.gap-sm;
+    // ── Channel header row ──────────────────────────────────────────
+    if user.is-channel : HorizontalLayout {
+        padding-left: Theme.gap-xs;
+        padding-right: Theme.gap-xs;
+        spacing: Theme.gap-xs;
+
+        Text {
+            text: user.name;
+            color: user.is-our-channel ? Theme.accent : Theme.text-secondary;
+            font-size: Theme.font-body;
+            font-weight: 700;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if user.locked : Image {
+            width: 12px;
+            source: @image-url("icons/lock.svg");
+            colorize: Theme.text-muted;
+        }
+        Text {
+            text: user.member-label;
+            color: Theme.text-muted;
+            font-size: Theme.font-xs;
+            vertical-alignment: center;
+        }
+    }
+
+    // ── User row ────────────────────────────────────────────────────
+    if !user.is-channel : HorizontalLayout {
+        padding-left: Theme.gap-md;   // indent members under their channel
         padding-right: Theme.gap-xs;
         spacing: Theme.gap-sm;
 

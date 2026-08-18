@@ -12,13 +12,17 @@ use renet_netcode::{
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use protocol::{ChatImageMessage, ChatMessage, ClientMessage, DenyReason, ServerMessage};
+use protocol::{
+    ChannelDenyReason, ChannelInfo, ChatImageMessage, ChatMessage, ClientMessage, DenyReason,
+    ServerMessage, ShareScope,
+};
 
 use crate::auth;
-use crate::config::Config;
-use crate::relay::{VideoRelay, VoiceRelay};
+use crate::config::{ChannelSettings, Config, validate_channel_list};
+use crate::relay::{ShareInfo, VideoRelay, VoiceRelay};
 
 // The protocol crate defines the user-data layout against its own
 // constant so it doesn't depend on the transport crate; make sure the
@@ -42,6 +46,10 @@ const PRESSURE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// voice/video/system-audio packet arrived within this window.
 const MEDIA_ACTIVE_WINDOW: Duration = Duration::from_millis(500);
 
+/// How often to stat the config file for hot reload. A stat every few
+/// seconds is free; anything file-watcher-fancier buys nothing here.
+const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+
 // ── Stats ───────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -62,6 +70,19 @@ pub struct ChatServer {
     audio_states: HashMap<ClientId, (bool, bool)>,
     /// Clients currently deafened (voice relay skips them).
     deafened: HashSet<ClientId>,
+    /// Voice-channel membership: client → channel id (index into
+    /// `channel_infos`). Every connected client has an entry.
+    channel_of: HashMap<ClientId, u16>,
+    /// The channel list announced to clients, built once from config.
+    channel_infos: Vec<ChannelInfo>,
+    /// Where new clients land (config `default: true`).
+    default_channel: u16,
+    /// Config file to watch for hot reload (None = watching disabled,
+    /// e.g. in tests that drive `apply_channel_config` directly).
+    config_path: Option<PathBuf>,
+    /// Last observed mtime of `config_path`.
+    config_mtime: Option<SystemTime>,
+    last_config_check: Instant,
     /// Recent chat-image send times per client, pruned to the last
     /// minute — the sliding window behind `limits.max_images_per_minute`.
     image_stamps: HashMap<ClientId, Vec<Instant>>,
@@ -108,6 +129,21 @@ impl ChatServer {
 
         let local_addr = socket.local_addr()?;
         info!("{} starting on {local_addr}", config.server.name);
+
+        // ── Voice channels ──────────────────────────────────────────
+        let default_channel = config
+            .validate_channels()
+            .map_err(|e| format!("invalid server.yaml: {e}"))?;
+        let channel_infos = config.channel_infos();
+        info!(
+            "Voice channels: {} (default: '{}')",
+            channel_infos
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            channel_infos[default_channel as usize].name,
+        );
 
         // ── Authentication ──────────────────────────────────────────
         let (authentication, public_addr) = if config.authentication.secure {
@@ -163,6 +199,12 @@ impl ChatServer {
             usernames: HashMap::new(),
             audio_states: HashMap::new(),
             deafened: HashSet::new(),
+            channel_of: HashMap::new(),
+            channel_infos,
+            default_channel,
+            config_path: None,
+            config_mtime: None,
+            last_config_check: now,
             image_stamps: HashMap::new(),
             last_updated: now,
             last_stats: now,
@@ -188,7 +230,7 @@ impl ChatServer {
         self.process_control_messages();
 
         let media_before = self.media_packet_count();
-        self.voice.process(&mut self.server, &self.deafened);
+        self.voice.process(&mut self.server, &self.deafened, &self.channel_of);
         self.video.process(&mut self.server);
         self.video.process_system_audio(&mut self.server);
         if self.media_packet_count() != media_before {
@@ -205,6 +247,11 @@ impl ChatServer {
         if now.duration_since(self.last_pressure_check) >= PRESSURE_CHECK_INTERVAL {
             self.monitor_channel_pressure();
             self.last_pressure_check = now;
+        }
+
+        if now.duration_since(self.last_config_check) >= CONFIG_CHECK_INTERVAL {
+            self.check_config_reload();
+            self.last_config_check = now;
         }
 
         self.transport.send_packets(&mut self.server);
@@ -322,34 +369,46 @@ impl ChatServer {
 
         info!("{username} ({client_id}) connected");
         self.usernames.insert(client_id, username.clone());
+        // Everyone lands in the default channel (config guarantees it
+        // is open and unlimited).
+        self.channel_of.insert(client_id, self.default_channel);
 
-        // Full state snapshot for the new client: user list, active
-        // shares, and current audio states — so a client joining an
-        // in-progress session renders it correctly instead of assuming
-        // everyone is unmuted and nobody is streaming.
+        // Full state snapshot for the new client: user list, channel
+        // roster and memberships, active shares, and current audio
+        // states — so a client joining an in-progress session renders
+        // it correctly instead of assuming everyone is unmuted, nobody
+        // is streaming, and the world is one big room.
         let init = ServerMessage::Init {
             usernames: self.usernames.clone(),
             client_id,
             server_name: self.config.server.name.clone(),
             greeting: self.config.server.greeting_message.clone(),
+            channels: self.channel_infos.clone(),
+            memberships: self.channel_of.clone(),
         };
         self.send_msg(client_id, &init);
 
-        let sharers: Vec<(ClientId, (u16, u16))> = self
+        // Only announce streams the new client may actually watch:
+        // channel-scoped shares outside the default channel are
+        // invisible from where they land.
+        let sharers: Vec<(ClientId, ShareInfo)> = self
             .video
             .sharers()
             .iter()
-            .map(|(id, dims)| (*id, *dims))
+            .map(|(id, info)| (*id, *info))
             .collect();
-        for (sharer_id, (width, height)) in sharers {
-            self.send_msg(
-                client_id,
-                &ServerMessage::ScreenShareStarted {
-                    client_id: sharer_id,
-                    width,
-                    height,
-                },
-            );
+        for (sharer_id, info) in sharers {
+            if self.share_visible_from(info, sharer_id, self.default_channel) {
+                self.send_msg(
+                    client_id,
+                    &ServerMessage::ScreenShareStarted {
+                        client_id: sharer_id,
+                        width: info.width,
+                        height: info.height,
+                        scope: info.scope,
+                    },
+                );
+            }
         }
 
         let states: Vec<(ClientId, (bool, bool))> =
@@ -370,6 +429,7 @@ impl ChatServer {
             &ServerMessage::UserJoined {
                 client_id,
                 username,
+                channel_id: self.default_channel,
             },
         );
     }
@@ -381,6 +441,7 @@ impl ChatServer {
             .unwrap_or_else(|| format!("User{client_id}"));
         self.audio_states.remove(&client_id);
         self.deafened.remove(&client_id);
+        self.channel_of.remove(&client_id);
         self.image_stamps.remove(&client_id);
 
         warn!(
@@ -513,8 +574,12 @@ impl ChatServer {
             }
 
             // ── Screen share signaling ──────────────────────────────
-            ClientMessage::ScreenShareStart { width, height } => {
-                self.handle_share_start(client_id, width, height);
+            ClientMessage::ScreenShareStart {
+                width,
+                height,
+                scope,
+            } => {
+                self.handle_share_start(client_id, width, height, scope);
             }
             ClientMessage::ScreenShareStop => {
                 let username = self.get_username(client_id);
@@ -539,10 +604,18 @@ impl ChatServer {
                     self.send_keyframe_request(target_id, client_id);
                 }
             }
+
+            // ── Voice channels ──────────────────────────────────────
+            ClientMessage::JoinChannel {
+                channel_id,
+                password,
+            } => {
+                self.handle_join_channel(client_id, channel_id, password.as_deref());
+            }
         }
     }
 
-    fn handle_share_start(&mut self, client_id: ClientId, width: u16, height: u16) {
+    fn handle_share_start(&mut self, client_id: ClientId, width: u16, height: u16, scope: ShareScope) {
         let dims_ok = (MIN_SHARE_DIMENSION..=MAX_SHARE_DIMENSION).contains(&width)
             && (MIN_SHARE_DIMENSION..=MAX_SHARE_DIMENSION).contains(&height);
         if !dims_ok {
@@ -575,23 +648,402 @@ impl ChatServer {
             return;
         }
 
+        // A re-announce that narrows scope Everyone → Channel must
+        // evict out-of-channel viewers, exactly like a channel move.
+        let previous_scope = self.video.share_info(client_id).map(|info| info.scope);
+
         let username = self.get_username(client_id);
-        info!("{username} started screen share ({width}x{height})");
-        self.video.start_sharing(client_id, width, height);
-        self.broadcast_msg(&ServerMessage::ScreenShareStarted {
+        info!("{username} started screen share ({width}x{height}, {scope:?})");
+        self.video.start_sharing(
+            client_id,
+            ShareInfo {
+                width,
+                height,
+                scope,
+            },
+        );
+
+        let started = ServerMessage::ScreenShareStarted {
             client_id,
             width,
             height,
+            scope,
+        };
+        match scope {
+            ShareScope::Everyone => self.broadcast_msg(&started),
+            ShareScope::Channel => {
+                // Only the sharer's channel learns about the stream —
+                // for everyone else it doesn't exist. The sharer is a
+                // member of their own channel, so this covers them too.
+                let channel = self.channel_of.get(&client_id).copied();
+                for peer in self.peers_in_channel(channel) {
+                    self.send_msg(peer, &started);
+                }
+                if previous_scope == Some(ShareScope::Everyone) {
+                    self.evict_out_of_channel_viewers(client_id, channel);
+                    // Other channels saw this stream while it was
+                    // public; tell them it's gone from their view.
+                    let stopped = ServerMessage::ScreenShareStopped { client_id };
+                    let outside: Vec<ClientId> = self
+                        .server
+                        .clients_id()
+                        .into_iter()
+                        .filter(|peer| {
+                            *peer != client_id && self.channel_of.get(peer).copied() != channel
+                        })
+                        .collect();
+                    for peer in outside {
+                        self.send_msg(peer, &stopped);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Voice channels ──────────────────────────────────────────────
+
+    /// Watch `path` for changes and hot-apply the `channels` section.
+    /// Called once from main after startup; everything else in the
+    /// file requires a restart (and says so in the log).
+    pub fn watch_config_file(&mut self, path: PathBuf) {
+        self.config_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        info!(
+            "Watching {} for channel changes (checked every {}s; only the \
+             [channels] section hot-applies)",
+            path.display(),
+            CONFIG_CHECK_INTERVAL.as_secs(),
+        );
+        self.config_path = Some(path);
+    }
+
+    /// If the watched config file's mtime moved, re-read it and apply
+    /// the channel list. A file that fails to parse or validate is
+    /// logged and ignored — a live server never dies or degrades from
+    /// a bad edit.
+    fn check_config_reload(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if mtime.is_none() || mtime == self.config_mtime {
+            return;
+        }
+        self.config_mtime = mtime;
+
+        let fresh = match Config::from_file(&path) {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                warn!("Config reload: {} is not valid YAML — keeping current config: {e}", path.display());
+                return;
+            }
+        };
+        if fresh.channels == self.config.channels {
+            info!(
+                "Config reload: {} changed but the [channels] section did not — \
+                 other sections require a restart to apply",
+                path.display(),
+            );
+            return;
+        }
+        match self.apply_channel_config(fresh.channels) {
+            Ok(()) => info!("Config reload: channel list applied from {}", path.display()),
+            Err(e) => warn!("Config reload: invalid [channels] — keeping current list: {e}"),
+        }
+    }
+
+    /// Swap in a new channel list on a live server.
+    ///
+    /// Channels are matched **by name**: a channel that keeps its name
+    /// keeps its members (even if it moved position, or its password /
+    /// user limit changed — nobody is ever kicked by a reload). Members
+    /// of a removed or renamed channel are moved to the new default.
+    /// Clients get one authoritative [`ServerMessage::ChannelListUpdated`]
+    /// (ids are list indexes, so a reload renumbers them and clients
+    /// must resync wholesale), and channel-scoped share visibility is
+    /// re-derived with exactly-once corrective Started/Stopped messages.
+    pub fn apply_channel_config(&mut self, channels: Vec<ChannelSettings>) -> Result<(), String> {
+        let new_default = validate_channel_list(&channels)?;
+
+        #[allow(clippy::cast_possible_truncation)] // validated ≤ MAX_CHANNELS
+        let new_id_of: HashMap<String, u16> = channels
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| (ch.name.trim().to_string(), i as u16))
+            .collect();
+
+        // Snapshot who-was-where by *name* before renumbering.
+        let old_name_of: HashMap<ClientId, String> = self
+            .channel_of
+            .iter()
+            .map(|(client, id)| {
+                let name = self
+                    .channel_infos
+                    .get(usize::from(*id))
+                    .map(|info| info.name.clone())
+                    .unwrap_or_default();
+                (*client, name)
+            })
+            .collect();
+
+        let mut moved_to_default = 0usize;
+        let new_channel_of: HashMap<ClientId, u16> = old_name_of
+            .iter()
+            .map(|(client, name)| {
+                let new_id = new_id_of.get(name).copied().unwrap_or_else(|| {
+                    moved_to_default += 1;
+                    new_default
+                });
+                (*client, new_id)
+            })
+            .collect();
+
+        self.config.channels = channels;
+        self.channel_infos = self.config.channel_infos();
+        self.default_channel = new_default;
+        self.channel_of = new_channel_of;
+
+        info!(
+            "Channel list updated: {} (default: '{}'); {} member(s) moved to the default",
+            self.channel_infos
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.channel_infos[usize::from(new_default)].name,
+            moved_to_default,
+        );
+
+        self.broadcast_msg(&ServerMessage::ChannelListUpdated {
+            channels: self.channel_infos.clone(),
+            memberships: self.channel_of.clone(),
         });
+
+        // ── Re-derive channel-scoped share visibility ───────────────
+        // For each channel-scoped stream, compare each client's view
+        // before (same channel *name* as the sharer) and after (same
+        // new channel id): gained → Started, lost → Stopped, exactly
+        // once. Out-of-channel subscriptions are dropped silently here;
+        // the delta loop delivers their Stopped.
+        let sharers: Vec<(ClientId, ShareInfo)> = self
+            .video
+            .sharers()
+            .iter()
+            .filter(|(_, info)| info.scope == ShareScope::Channel)
+            .map(|(id, info)| (*id, *info))
+            .collect();
+        for (sharer, info) in sharers {
+            let Some(sharer_channel) = self.channel_of.get(&sharer).copied() else {
+                continue;
+            };
+            for viewer in self.video.subscribers_of(sharer) {
+                if self.channel_of.get(&viewer).copied() != Some(sharer_channel) {
+                    self.video.unsubscribe(viewer, sharer);
+                }
+            }
+
+            let sharer_old_name = old_name_of.get(&sharer).cloned().unwrap_or_default();
+            let started = ServerMessage::ScreenShareStarted {
+                client_id: sharer,
+                width: info.width,
+                height: info.height,
+                scope: info.scope,
+            };
+            let stopped = ServerMessage::ScreenShareStopped { client_id: sharer };
+            for peer in self.server.clients_id() {
+                if peer == sharer {
+                    continue;
+                }
+                let saw_before = old_name_of.get(&peer) == Some(&sharer_old_name);
+                let sees_now = self.channel_of.get(&peer).copied() == Some(sharer_channel);
+                if sees_now && !saw_before {
+                    self.send_msg(peer, &started);
+                } else if saw_before && !sees_now {
+                    self.send_msg(peer, &stopped);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate and execute a channel move. Password and capacity
+    /// checks run here; on success the move is broadcast (including to
+    /// the mover) and channel-scoped share visibility is re-validated.
+    fn handle_join_channel(&mut self, client_id: ClientId, channel_id: u16, password: Option<&str>) {
+        let Some(target) = self.config.channels.get(usize::from(channel_id)) else {
+            self.deny_join(client_id, channel_id, ChannelDenyReason::NoSuchChannel);
+            return;
+        };
+        let old_channel = self.channel_of.get(&client_id).copied();
+        if old_channel == Some(channel_id) {
+            return; // already there — nothing to do
+        }
+        if let Some(expected) = target.password.as_deref()
+            && password != Some(expected)
+        {
+            info!(
+                "{} denied joining '{}': bad or missing password",
+                self.get_username(client_id),
+                target.name,
+            );
+            self.deny_join(client_id, channel_id, ChannelDenyReason::WrongPassword);
+            return;
+        }
+        if let Some(limit) = target.user_limit
+            && self.members_in(channel_id) >= usize::from(limit)
+        {
+            self.deny_join(client_id, channel_id, ChannelDenyReason::ChannelFull);
+            return;
+        }
+
+        info!(
+            "{} moved to channel '{}'",
+            self.get_username(client_id),
+            target.name,
+        );
+        self.channel_of.insert(client_id, channel_id);
+        self.broadcast_msg(&ServerMessage::UserMovedChannel {
+            client_id,
+            channel_id,
+        });
+        self.revalidate_shares_after_move(client_id, old_channel, channel_id);
+    }
+
+    fn deny_join(&mut self, client_id: ClientId, channel_id: u16, reason: ChannelDenyReason) {
+        self.send_msg(
+            client_id,
+            &ServerMessage::JoinChannelDenied { channel_id, reason },
+        );
+    }
+
+    /// Members currently in `channel_id`.
+    fn members_in(&self, channel_id: u16) -> usize {
+        self.channel_of.values().filter(|c| **c == channel_id).count()
+    }
+
+    /// Connected clients in `channel` (None never matches anyone).
+    fn peers_in_channel(&self, channel: Option<u16>) -> Vec<ClientId> {
+        self.server
+            .clients_id()
+            .into_iter()
+            .filter(|peer| channel.is_some() && self.channel_of.get(peer).copied() == channel)
+            .collect()
+    }
+
+    /// Can a client in `viewer_channel` see this stream?
+    fn share_visible_from(&self, info: ShareInfo, sharer: ClientId, viewer_channel: u16) -> bool {
+        match info.scope {
+            ShareScope::Everyone => true,
+            ShareScope::Channel => self.channel_of.get(&sharer).copied() == Some(viewer_channel),
+        }
+    }
+
+    /// Unsubscribe every viewer of `sharer` who is not in `channel`,
+    /// telling each their view of the stream ended.
+    fn evict_out_of_channel_viewers(&mut self, sharer: ClientId, channel: Option<u16>) {
+        let stopped = ServerMessage::ScreenShareStopped { client_id: sharer };
+        for viewer in self.video.subscribers_of(sharer) {
+            if self.channel_of.get(&viewer).copied() != channel {
+                self.video.unsubscribe(viewer, sharer);
+                self.send_msg(viewer, &stopped);
+            }
+        }
+    }
+
+    /// Channel-scoped share visibility follows membership. After
+    /// `mover` goes `old` → `new`:
+    /// - if the mover is sharing channel-scoped: the stream leaves the
+    ///   old channel (badge cleared, viewers evicted) and appears in
+    ///   the new one;
+    /// - any channel-scoped stream the mover was watching or could see
+    ///   in the old channel disappears for them, and streams in the new
+    ///   channel are announced to them.
+    ///
+    /// Everyone-scoped streams are unaffected throughout.
+    fn revalidate_shares_after_move(&mut self, mover: ClientId, old: Option<u16>, new: u16) {
+        // ── The mover as a sharer ───────────────────────────────────
+        if let Some(info) = self.video.share_info(mover)
+            && info.scope == ShareScope::Channel
+        {
+            // Old channel: stream gone (this also reaches evicted
+            // viewers, closing their windows).
+            let stopped = ServerMessage::ScreenShareStopped { client_id: mover };
+            for peer in self.peers_in_channel(old) {
+                if peer != mover {
+                    self.send_msg(peer, &stopped);
+                }
+            }
+            self.evict_out_of_channel_viewers(mover, Some(new));
+            // New channel: stream appears.
+            let started = ServerMessage::ScreenShareStarted {
+                client_id: mover,
+                width: info.width,
+                height: info.height,
+                scope: info.scope,
+            };
+            for peer in self.peers_in_channel(Some(new)) {
+                if peer != mover {
+                    self.send_msg(peer, &started);
+                }
+            }
+        }
+
+        // ── The mover as a viewer / potential viewer ────────────────
+        let sharers: Vec<(ClientId, ShareInfo)> = self
+            .video
+            .sharers()
+            .iter()
+            .map(|(id, info)| (*id, *info))
+            .collect();
+        for (sharer, info) in sharers {
+            if sharer == mover || info.scope != ShareScope::Channel {
+                continue;
+            }
+            let sharer_channel = self.channel_of.get(&sharer).copied();
+            if sharer_channel == Some(new) {
+                // Snapshot semantics, like connecting: a stream lives
+                // in the channel the mover just entered.
+                self.send_msg(
+                    mover,
+                    &ServerMessage::ScreenShareStarted {
+                        client_id: sharer,
+                        width: info.width,
+                        height: info.height,
+                        scope: info.scope,
+                    },
+                );
+            } else if sharer_channel == old {
+                // The mover left this stream behind.
+                if self.video.is_subscribed(mover, sharer) {
+                    self.video.unsubscribe(mover, sharer);
+                }
+                self.send_msg(mover, &ServerMessage::ScreenShareStopped { client_id: sharer });
+            }
+        }
     }
 
     fn handle_subscribe(&mut self, client_id: ClientId, target_id: ClientId) {
-        if !self.video.is_sharing(target_id) {
+        let Some(info) = self.video.share_info(target_id) else {
             self.send_msg(
                 client_id,
                 &ServerMessage::SubscribeDenied {
                     target_id,
                     reason: DenyReason::NotSharing,
+                },
+            );
+            return;
+        };
+
+        // Channel-scoped streams are watchable only from the sharer's
+        // channel. (The stream is normally invisible from elsewhere —
+        // this closes the modified-client path.)
+        if info.scope == ShareScope::Channel
+            && self.channel_of.get(&client_id) != self.channel_of.get(&target_id)
+        {
+            self.send_msg(
+                client_id,
+                &ServerMessage::SubscribeDenied {
+                    target_id,
+                    reason: DenyReason::NotInChannel,
                 },
             );
             return;
