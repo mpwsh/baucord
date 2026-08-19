@@ -33,8 +33,6 @@ pub enum ChatItem {
     Image {
         ts: String,
         user: String,
-        /// Original PNG/GIF bytes — kept for save/viewer/GIF replay.
-        bytes: Vec<u8>,
         width: u32,
         height: u32,
         is_gif: bool,
@@ -109,11 +107,16 @@ impl ChatHistory {
         self.cap(1)
     }
 
+    /// Note: the compressed bytes deliberately do **not** live here.
+    /// The shell keeps exactly one copy (its viewer/save map, keyed by
+    /// row id and evicted with the row); history only needs the
+    /// metadata to lay the row out. Storing bytes here too used to
+    /// double every image's footprint for nothing — no code ever read
+    /// them back.
     pub fn push_image(
         &mut self,
         ts: &str,
         user: &str,
-        bytes: Vec<u8>,
         width: u32,
         height: u32,
         is_gif: bool,
@@ -121,7 +124,6 @@ impl ChatHistory {
         self.rows.push(ChatItem::Image {
             ts: ts.into(),
             user: user.into(),
-            bytes,
             width,
             height,
             is_gif,

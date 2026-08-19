@@ -182,4 +182,32 @@ pub mod convert {
         let (w, h) = (rgba.width(), rgba.height());
         Ok((rgba_image(rgba.as_raw(), w, h), w, h))
     }
+
+    /// Longest edge of a chat-row preview texture. Chat displays
+    /// images in at most a 360×280 box (chat.slint), so 720 px covers
+    /// a 2× hidpi scale exactly; the full-resolution decode happens
+    /// only when the gallery viewer opens.
+    pub const PREVIEW_MAX_EDGE: u32 = 720;
+
+    /// Decode for a chat row: the returned dimensions are the
+    /// *original* image's (the row's layout box is computed from
+    /// them), but the texture is downscaled to
+    /// [`PREVIEW_MAX_EDGE`] — a 1280² PNG is 6.5 MB of RGBA that
+    /// would otherwise stay resident for the row's whole life just to
+    /// be drawn at 360 px.
+    pub fn decode_to_preview(
+        bytes: &[u8],
+    ) -> Result<(slint::Image, u32, u32), app_core::images::ImageError> {
+        let decoded = app_core::images::decode_bounded(bytes)?;
+        let (w, h) = (decoded.width(), decoded.height());
+        let rgba = if w.max(h) > PREVIEW_MAX_EDGE {
+            decoded
+                .thumbnail(PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE)
+                .to_rgba8()
+        } else {
+            decoded.to_rgba8()
+        };
+        let (tw, th) = (rgba.width(), rgba.height());
+        Ok((rgba_image(rgba.as_raw(), tw, th), w, h))
+    }
 }

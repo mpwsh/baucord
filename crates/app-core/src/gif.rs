@@ -1,15 +1,42 @@
 //! GIF playback support.
 //!
 //! Slint's `Image` has no animation, so the shell drives GIFs itself:
-//! decode the frames once (bounded — the wire pipeline already capped
-//! animated GIFs at 800px / the byte budget), then swap the row's image
-//! on a `slint::Timer` using each frame's own delay.
+//! decode the frames once, then swap the row's image on a
+//! `slint::Timer` using each frame's own delay.
+//!
+//! The wire pipeline caps animated GIFs at 800px / the byte budget,
+//! but neither caps the *frame count* — and every frame decodes to a
+//! full logical-screen RGBA buffer. A legitimate 1 MB, 480px,
+//! 150-frame GIF is ~140 MB of frames and seconds of synchronous
+//! decode on every receiving client at once (which also stalls each
+//! client's event loop long enough for the server to start
+//! retransmitting at them). [`decode_animation`] therefore enforces
+//! its own ceilings — frame count, total RGBA bytes, and wall-clock
+//! decode time — and simply truncates: the animation loops over the
+//! decoded prefix instead of the whole file.
 //!
 //! Autoplay policy is unchanged from the FLTK build: play ~3 loops
 //! (from [`loop_secs`]) but never more than 30 s, freeze to the first
 //! frame, replay on hover.
 
+use std::time::Instant;
+
 use crate::images::{gif_gct_len, skip_gif_subblocks, ImageError};
+
+/// Most frames a decoded animation may hold. At a typical 100 ms/frame
+/// this is ~24 s of loop — beyond any chat reaction.
+pub const MAX_GIF_FRAMES: usize = 240;
+
+/// Total decoded RGBA budget across all frames. 48 MB ≈ 52 frames at
+/// the 800px wire cap, or 150+ frames of a typical 320–480px GIF.
+pub const MAX_GIF_RGBA_BYTES: usize = 48 * 1024 * 1024;
+
+/// Wall-clock budget for one animation decode. This runs on the UI
+/// thread when a GIF arrives (or is hovered), and every connected
+/// client decodes the same GIF at the same moment — a long stall here
+/// freezes the whole room and stops the network thread's consumer,
+/// which is exactly the failure this bounds.
+pub const MAX_GIF_DECODE_MS: u64 = 150;
 
 /// One decoded frame: packed RGBA at the GIF's logical screen size.
 pub struct GifFrame {
@@ -34,26 +61,51 @@ impl GifAnimation {
     }
 }
 
-/// Decode every frame of an animated GIF to RGBA. `image`'s GIF decoder
-/// composites disposal/partial frames onto the logical screen, so each
-/// returned frame is complete — exactly what an `Image` swap needs.
+/// Decode an animated GIF to RGBA frames, within hard ceilings.
+///
+/// `image`'s GIF decoder composites disposal/partial frames onto the
+/// logical screen, so each returned frame is complete — exactly what an
+/// `Image` swap needs. Frames are pulled *incrementally* and decoding
+/// stops at [`MAX_GIF_FRAMES`], [`MAX_GIF_RGBA_BYTES`], or
+/// [`MAX_GIF_DECODE_MS`], whichever comes first: the animation then
+/// loops over the decoded prefix. A decode error after at least one
+/// good frame also just ends the animation early rather than dropping
+/// the GIF entirely.
 ///
 /// # Errors
-/// [`ImageError::Codec`] on undecodable input.
+/// [`ImageError::Codec`] on undecodable input (no frame decoded).
 pub fn decode_animation(bytes: &[u8]) -> Result<GifAnimation, ImageError> {
-    use image::codecs::gif::GifDecoder;
     use image::AnimationDecoder;
+    use image::ImageDecoder;
+    use image::codecs::gif::GifDecoder;
 
-    let decoder = GifDecoder::new(std::io::Cursor::new(bytes))
+    let mut decoder = GifDecoder::new(std::io::Cursor::new(bytes))
         .map_err(|e| ImageError::Codec(e.to_string()))?;
-    let frames = decoder
-        .into_frames()
-        .collect_frames()
+    // Same bomb limits as the still-image path: dimension and
+    // per-allocation caps inside the codec itself.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    decoder
+        .set_limits(limits)
         .map_err(|e| ImageError::Codec(e.to_string()))?;
 
+    let started = Instant::now();
     let (mut width, mut height) = (0u32, 0u32);
-    let mut out = Vec::with_capacity(frames.len());
-    for frame in frames {
+    let mut out = Vec::new();
+    let mut rgba_total = 0usize;
+
+    for frame in decoder.into_frames() {
+        let frame = match frame {
+            Ok(frame) => frame,
+            // Mid-stream decode error: play what we have.
+            Err(e) if !out.is_empty() => {
+                log::warn!("GIF frame {} undecodable, truncating: {e}", out.len());
+                break;
+            }
+            Err(e) => return Err(ImageError::Codec(e.to_string())),
+        };
         let (num, den) = frame.delay().numer_denom_ms();
         // Browser convention (matched by Fl_Anim_GIF too): a zero delay
         // plays as ~100 ms.
@@ -62,10 +114,22 @@ pub fn decode_animation(bytes: &[u8]) -> Result<GifAnimation, ImageError> {
         let buf = frame.into_buffer();
         width = buf.width();
         height = buf.height();
-        out.push(GifFrame {
-            rgba: buf.into_raw(),
-            delay_ms,
-        });
+        let rgba = buf.into_raw();
+        rgba_total += rgba.len();
+        out.push(GifFrame { rgba, delay_ms });
+
+        if out.len() >= MAX_GIF_FRAMES
+            || rgba_total >= MAX_GIF_RGBA_BYTES
+            || started.elapsed().as_millis() >= u128::from(MAX_GIF_DECODE_MS)
+        {
+            log::debug!(
+                "GIF decode truncated at {} frames / {} MB / {:?}",
+                out.len(),
+                rgba_total / 1_048_576,
+                started.elapsed(),
+            );
+            break;
+        }
     }
     Ok(GifAnimation {
         width,
@@ -121,3 +185,72 @@ pub fn loop_secs(bytes: &[u8]) -> f64 {
         }
     }
 }
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use image::codecs::gif::GifEncoder;
+    use image::{Delay, Frame, RgbaImage};
+
+    /// Encode `n` frames of `size`×`size` — alternating solid colors, so
+    /// LZW crushes them and the file stays far under the 1 MB wire
+    /// budget while the *decoded* form is n·size²·4 bytes.
+    fn synth_gif(size: u32, n: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut bytes);
+            enc.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+            for i in 0..n {
+                let c = if i % 2 == 0 { [40, 40, 60, 255] } else { [200, 120, 40, 255] };
+                let img = RgbaImage::from_pixel(size, size, image::Rgba(c));
+                let frame = Frame::from_parts(
+                    img,
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(40, 1),
+                );
+                enc.encode_frame(frame).unwrap();
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn small_gif_decodes_fully() {
+        let bytes = synth_gif(64, 5);
+        let anim = decode_animation(&bytes).expect("decodes");
+        assert_eq!(anim.frames.len(), 5);
+        assert_eq!((anim.width, anim.height), (64, 64));
+        assert!(anim.frames.iter().all(|f| f.delay_ms == 40));
+    }
+
+    #[test]
+    fn pathological_gif_is_truncated_within_budgets() {
+        // 480×480 × 200 frames = ~184 MB decoded if unbounded — the
+        // exact shape that took real clients to ~150 MB and froze every
+        // event loop in the room at once. Wire size stays tiny (solid
+        // frames), so every sender-side check passes.
+        let bytes = synth_gif(480, 200);
+        assert!(bytes.len() < 1024 * 1024, "must pass the wire budget");
+
+        let anim = decode_animation(&bytes).expect("decodes");
+        let total: usize = anim.frames.iter().map(|f| f.rgba.len()).sum();
+        assert!(!anim.frames.is_empty(), "keeps a playable prefix");
+        assert!(anim.frames.len() < 200, "must not decode every frame");
+        assert!(
+            total <= MAX_GIF_RGBA_BYTES + 480 * 480 * 4,
+            "decoded bytes stay within budget (+ at most the frame that crossed it): {total}"
+        );
+        assert!(anim.frames.len() <= MAX_GIF_FRAMES);
+    }
+
+    #[test]
+    fn frame_count_ceiling_holds_for_tiny_frames() {
+        // Tiny frames never hit the byte or time budget — the frame
+        // ceiling must still stop the decode.
+        let bytes = synth_gif(16, 600);
+        let anim = decode_animation(&bytes).expect("decodes");
+        assert_eq!(anim.frames.len(), MAX_GIF_FRAMES);
+    }
+}
+

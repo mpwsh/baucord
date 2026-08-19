@@ -72,9 +72,11 @@ impl TestClient {
         self.transport
             .update(dt, &mut self.client)
             .expect("client transport update");
-        while let Some(raw) = self.client.receive_message(CONTROL_CHANNEL) {
-            if let Some(msg) = protocol::decode_server_message(&raw) {
-                self.inbox.push(msg);
+        for channel in [CONTROL_CHANNEL, protocol::MEDIA_CHANNEL] {
+            while let Some(raw) = self.client.receive_message(channel) {
+                if let Some(msg) = protocol::decode_server_message(&raw) {
+                    self.inbox.push(msg);
+                }
             }
         }
         self.transport
@@ -85,6 +87,10 @@ impl TestClient {
     fn send(&mut self, msg: &ClientMessage) {
         let bytes = protocol::encode_client_message(msg).expect("encode");
         self.client.send_message(msg.channel(), bytes);
+    }
+
+    fn send_raw(&mut self, channel: u8, bytes: Vec<u8>) {
+        self.client.send_message(channel, bytes);
     }
 
     /// Pump server + clients until `pred` finds a match in this
@@ -601,3 +607,93 @@ fn hot_reload_rejects_invalid_lists_and_keeps_state() {
         "state changed after rejected reloads"
     );
 }
+
+#[test]
+fn per_client_image_byte_budget_brakes_one_spammer() {
+    let mut config = test_config(vec![open_channel("Lobby", true)]);
+    config.limits.max_image_kb_per_minute = 100; // 100 KiB/min per client
+    config.limits.max_image_kb_per_minute_global = 100_000; // loose
+    let mut server = ChatServer::new(config).expect("server start");
+    let addr = server.addresses()[0];
+
+    let mut a = TestClient::connect(addr, "alice", 1);
+    let mut b = TestClient::connect(addr, "bob", 2);
+    a.wait_for(&mut server, &mut [&mut b], |m| {
+        matches!(m, ServerMessage::Init { .. }).then_some(())
+    });
+    b.wait_for(&mut server, &mut [&mut a], |m| {
+        matches!(m, ServerMessage::Init { .. }).then_some(())
+    });
+
+    // Three ~40 KiB images from alice: 40+40 fits the 100 KiB window,
+    // the third (120 KiB total) must be dropped. Bob's own budget is
+    // untouched — his image still relays.
+    for seed in 0..3u8 {
+        let msg = ClientMessage::ChatImage(png_blob(seed, 40 * 1024));
+        let bytes = protocol::encode_client_message(&msg).expect("encode");
+        a.send_raw(msg.channel(), bytes);
+    }
+    let msg = ClientMessage::ChatImage(png_blob(9, 40 * 1024));
+    let bytes = protocol::encode_client_message(&msg).expect("encode");
+    b.send_raw(msg.channel(), bytes);
+
+    settle(&mut server, &mut a, &mut b, Duration::from_secs(2));
+    let relayed = count_images(&a);
+    assert_eq!(relayed, 3, "2 of alice's 3 + bob's 1 must relay");
+}
+
+#[test]
+fn global_image_byte_budget_brakes_coordinated_bursts() {
+    let mut config = test_config(vec![open_channel("Lobby", true)]);
+    config.limits.max_image_kb_per_minute = 100_000; // loose
+    config.limits.max_image_kb_per_minute_global = 100; // 100 KiB/min room-wide
+    let mut server = ChatServer::new(config).expect("server start");
+    let addr = server.addresses()[0];
+
+    let mut a = TestClient::connect(addr, "alice", 1);
+    let mut b = TestClient::connect(addr, "bob", 2);
+    a.wait_for(&mut server, &mut [&mut b], |m| {
+        matches!(m, ServerMessage::Init { .. }).then_some(())
+    });
+    b.wait_for(&mut server, &mut [&mut a], |m| {
+        matches!(m, ServerMessage::Init { .. }).then_some(())
+    });
+
+    // 40 KiB from each side, alternating: the room window admits two
+    // (80 KiB) and must drop the third and fourth.
+    for (i, who) in [0u8, 1, 0, 1].iter().enumerate() {
+        let msg = ClientMessage::ChatImage(png_blob(u8::try_from(i).unwrap(), 40 * 1024));
+        let bytes = protocol::encode_client_message(&msg).expect("encode");
+        match who {
+            0 => a.send_raw(msg.channel(), bytes),
+            _ => b.send_raw(msg.channel(), bytes),
+        }
+    }
+
+    settle(&mut server, &mut a, &mut b, Duration::from_secs(2));
+    assert_eq!(count_images(&a), 2, "room budget must stop the burst at 2");
+}
+
+fn png_blob(seed: u8, len: usize) -> Vec<u8> {
+    let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    v.extend(std::iter::repeat_n(seed, len.saturating_sub(v.len())));
+    v
+}
+
+fn settle(server: &mut ChatServer, a: &mut TestClient, b: &mut TestClient, d: Duration) {
+    let until = std::time::Instant::now() + d;
+    while std::time::Instant::now() < until {
+        server.update().expect("tick");
+        a.tick();
+        b.tick();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn count_images(c: &TestClient) -> usize {
+    c.inbox
+        .iter()
+        .filter(|m| matches!(m, ServerMessage::ChatImage(_)))
+        .count()
+}
+

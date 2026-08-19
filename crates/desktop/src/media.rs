@@ -49,14 +49,15 @@ fn describe(err: &ImageError) -> String {
 /// Append an image message to chat. Returns false if the bytes don't
 /// decode (the caller posts a system-row notice instead).
 pub fn push_image_row(app: &mut AppState, ts: &str, user: &str, data: Vec<u8>) -> bool {
-    let Ok((frame, w, h)) = ui::convert::decode_to_image(&data) else {
+    // Preview-sized texture for the row (the layout box still comes
+    // from the original dimensions); the gallery viewer decodes the
+    // full resolution from `app.images` on demand.
+    let Ok((frame, w, h)) = ui::convert::decode_to_preview(&data) else {
         return false;
     };
     let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);
 
-    let delta = app
-        .history_mut()
-        .push_image(ts, user, data.clone(), w, h, is_gif);
+    let delta = app.history_mut().push_image(ts, user, w, h, is_gif);
     // sync_history_tail equivalent: history rows were appended; mirror
     // them (push_image appends exactly one row and may drop from front).
     app.sync_delta(&delta);
