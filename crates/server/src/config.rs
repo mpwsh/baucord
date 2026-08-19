@@ -112,8 +112,10 @@ pub struct LimitSettings {
     /// image relay entirely. Note the amplification: every accepted
     /// KiB is relayed to every connected client, so per-client egress
     /// pressure ≈ this budget × connected clients. A budget smaller
-    /// than an image rejects that image outright — set it under
-    /// 1024 to forbid full-size images.
+    /// than an image rejects that image outright: the wire allows
+    /// images up to 10 MiB (10240 KiB), so the default of 4096 also
+    /// acts as a per-image size ceiling of ~4 MiB — raise it past
+    /// 10240 if you want single full-size images through.
     pub max_image_kb_per_minute: usize,
     /// Same budget across the *whole server* (all senders combined,
     /// same sliding minute). The per-client budget bounds one chatty

@@ -109,25 +109,44 @@ impl ChatServer {
 
         // Increase OS-level UDP buffers: pacing smooths most bursts, but
         // the OS buffer is the last line of defense before send_to fails
-        // and keepalives get dropped.
+        // and keepalives get dropped. The *send* side is sized from
+        // `max_clients`, because the worst burst is a relayed chat
+        // image fanned out to everyone at once — `clients × 1 MiB` of
+        // datagrams enqueued nearly together (video keyframes, the old
+        // sizing basis, are ~6× smaller per unit). The kernel commits
+        // this memory only while data is actually queued, so a large
+        // limit costs nothing when idle.
+        let send_target = send_buffer_target(config.network.max_clients);
         let sock_ref = socket2::SockRef::from(&socket);
-        sock_ref
-            .set_send_buffer_size(protocol::UDP_SOCKET_BUFFER_BYTES)
-            .ok();
+        sock_ref.set_send_buffer_size(send_target).ok();
         sock_ref
             .set_recv_buffer_size(protocol::UDP_SOCKET_BUFFER_BYTES)
             .ok();
         info!(
-            "UDP buffers — send: {} KB, recv: {} KB",
+            "UDP buffers — send: {} KB (target {} KB for {} clients), recv: {} KB",
             sock_ref.send_buffer_size().unwrap_or(0) / 1024,
+            send_target / 1024,
+            config.network.max_clients,
             sock_ref.recv_buffer_size().unwrap_or(0) / 1024,
         );
+        // Linux silently caps setsockopt at net.core.wmem_max (and
+        // reports double the granted value); when short, print the
+        // exact host-side fix. In Docker this must run on the HOST —
+        // net.core.* is not network-namespaced, so per-container
+        // `sysctls:` cannot set it, and the host value applies to the
+        // container automatically.
         let actual_send = sock_ref.send_buffer_size().unwrap_or(0);
-        if actual_send < protocol::UDP_SOCKET_BUFFER_BYTES {
+        if actual_send < send_target {
             warn!(
-                "UDP send buffer is {} KB, wanted {} KB — apply sysctl tuning on the host",
+                "UDP send buffer capped at {} KB (wanted {} KB): a single chat \
+                 image relayed to {} clients can overflow it and cause drops. \
+                 Fix on the host (not the container): \
+                 sysctl -w net.core.wmem_max={} net.core.rmem_max={}",
                 actual_send / 1024,
-                protocol::UDP_SOCKET_BUFFER_BYTES / 1024,
+                send_target / 1024,
+                config.network.max_clients,
+                send_target,
+                protocol::UDP_SOCKET_BUFFER_BYTES,
             );
         }
 
@@ -1260,4 +1279,33 @@ fn resolve_public_addr(
         );
     }
     Ok(local_addr)
+}
+
+/// OS send-buffer target for the relay socket: the worst burst is one
+/// full-size chat image (up to [`protocol::MAX_CHAT_IMAGE_BYTES`],
+/// 10 MiB) fanned out to every client at once, so scale with
+/// `max_clients`. Floor: the 8 MiB video tuning. Ceiling: 64 MiB —
+/// the buffer doesn't have to hold the entire fan-out, only the gap
+/// between per-tick enqueue and NIC drain; past 64 MiB, renet's
+/// per-client pacing spreads the rest across ticks.
+fn send_buffer_target(max_clients: usize) -> usize {
+    (max_clients * protocol::MAX_CHAT_IMAGE_BYTES)
+        .clamp(protocol::UDP_SOCKET_BUFFER_BYTES, 64 * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::send_buffer_target;
+
+    #[test]
+    fn send_buffer_scales_with_clients() {
+        // A solo room keeps the 8 MiB floor.
+        assert_eq!(send_buffer_target(0), 8 * 1024 * 1024);
+        // Images are 10 MiB units: even a 4-user room wants 40 MiB.
+        assert_eq!(send_buffer_target(4), 40 * 1024 * 1024);
+        // 12 users — the room size that broke for real — hits the
+        // ceiling, as does anything larger.
+        assert_eq!(send_buffer_target(12), 64 * 1024 * 1024);
+        assert_eq!(send_buffer_target(64), 64 * 1024 * 1024);
+    }
 }

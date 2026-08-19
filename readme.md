@@ -120,10 +120,8 @@ the handshake instead of misbehaving mid-call.
 # 8 MB send/recv gives headroom for multiple concurrent streams.
 cat > /etc/sysctl.d/99-baucord-udp.conf <<EOF
 # Baucord — UDP socket buffer tuning for video relay
-net.core.wmem_max     = 8388608
-net.core.wmem_default = 8388608
-net.core.rmem_max     = 8388608
-net.core.rmem_default = 1048576
+net.core.wmem_max = 67108864
+net.core.rmem_max = 8388608
 EOF
 
 systemctl disable --now docker 2>/dev/null || true
