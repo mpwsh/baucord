@@ -19,6 +19,7 @@
 //! (from [`loop_secs`]) but never more than 30 s, freeze to the first
 //! frame, replay on hover.
 
+use std::rc::Rc;
 use std::time::Instant;
 
 use crate::images::{gif_gct_len, skip_gif_subblocks, ImageError};
@@ -138,6 +139,109 @@ pub fn decode_animation(bytes: &[u8]) -> Result<GifAnimation, ImageError> {
     })
 }
 
+/// `Cursor` needs `AsRef<[u8]>`; this lets one refcounted buffer back
+/// any number of sequential decoders without copying the compressed
+/// bytes per playback.
+struct RcBytes(Rc<Vec<u8>>);
+impl AsRef<[u8]> for RcBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// A GIF being decoded *frame by frame* during playback, instead of
+/// all frames upfront: memory is one frame at a time (a playing 800px
+/// GIF holds ~2.5 MB instead of the 48 MB budget), at the cost of
+/// ~1–4 ms of decode per frame advance — comfortably inside a 33 ms
+/// animation tick. Looping reopens the decoder over the same
+/// refcounted bytes.
+pub struct GifStream {
+    bytes: Rc<Vec<u8>>,
+    frames: image::Frames<'static>,
+    width: u32,
+    height: u32,
+}
+
+impl GifStream {
+    /// Open a stream over encoded GIF bytes. Applies the same codec
+    /// bomb limits as every other decode path.
+    ///
+    /// # Errors
+    /// [`ImageError::Codec`] when the header/limits are refused.
+    pub fn open(bytes: Rc<Vec<u8>>) -> Result<Self, ImageError> {
+        let frames = Self::reopen(&bytes)?;
+        Ok(Self {
+            bytes,
+            frames,
+            width: 0,
+            height: 0,
+        })
+    }
+
+    fn reopen(bytes: &Rc<Vec<u8>>) -> Result<image::Frames<'static>, ImageError> {
+        use image::AnimationDecoder;
+        use image::ImageDecoder;
+        use image::codecs::gif::GifDecoder;
+
+        let mut decoder = GifDecoder::new(std::io::Cursor::new(RcBytes(Rc::clone(bytes))))
+            .map_err(|e| ImageError::Codec(e.to_string()))?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(16_384);
+        limits.max_image_height = Some(16_384);
+        limits.max_alloc = Some(512 * 1024 * 1024);
+        decoder
+            .set_limits(limits)
+            .map_err(|e| ImageError::Codec(e.to_string()))?;
+        Ok(decoder.into_frames())
+    }
+
+    /// Decode the next frame, composited to the full logical screen.
+    /// `None` at end of stream — and on a mid-stream decode error,
+    /// which truncates playback the same way [`decode_animation`]
+    /// truncates its prefix.
+    pub fn next_frame(&mut self) -> Option<GifFrame> {
+        let frame = match self.frames.next()? {
+            Ok(frame) => frame,
+            Err(e) => {
+                log::warn!("GIF stream frame undecodable, ending loop early: {e}");
+                return None;
+            }
+        };
+        let (num, den) = frame.delay().numer_denom_ms();
+        let ms = if den == 0 { 100 } else { num / den };
+        let delay_ms = if ms == 0 { 100 } else { ms };
+        let buf = frame.into_buffer();
+        self.width = buf.width();
+        self.height = buf.height();
+        Some(GifFrame {
+            rgba: buf.into_raw(),
+            delay_ms,
+        })
+    }
+
+    /// Restart from frame 0 for the next loop. `false` when the bytes
+    /// no longer open (shouldn't happen — they opened once).
+    pub fn rewind(&mut self) -> bool {
+        match Self::reopen(&self.bytes) {
+            Ok(frames) => {
+                self.frames = frames;
+                true
+            }
+            Err(e) => {
+                log::warn!("GIF stream rewind failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Logical screen size, known after the first decoded frame
+    /// (`(0, 0)` before that).
+    #[must_use]
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
 /// Total duration of one animation loop, from the GIF's own Graphic
 /// Control Extension delays (centiseconds) — no pixel decoding. Delays
 /// of 0 render as ~100 ms everywhere (browser convention), so they
@@ -252,5 +356,42 @@ mod decode_tests {
         let anim = decode_animation(&bytes).expect("decodes");
         assert_eq!(anim.frames.len(), MAX_GIF_FRAMES);
     }
-}
 
+    #[test]
+    fn stream_decodes_frame_by_frame_and_rewinds() {
+        let bytes = std::rc::Rc::new(synth_gif(64, 5));
+        let mut stream = GifStream::open(std::rc::Rc::clone(&bytes)).expect("opens");
+        let mut n = 0;
+        while let Some(frame) = stream.next_frame() {
+            assert_eq!(frame.delay_ms, 40);
+            assert_eq!(frame.rgba.len(), 64 * 64 * 4);
+            n += 1;
+        }
+        assert_eq!(n, 5, "all frames stream out");
+        assert_eq!(stream.dimensions(), (64, 64));
+        assert!(stream.next_frame().is_none(), "exhausted until rewound");
+
+        assert!(stream.rewind(), "rewind reopens");
+        let mut again = 0;
+        while stream.next_frame().is_some() {
+            again += 1;
+        }
+        assert_eq!(again, 5, "full second loop after rewind");
+    }
+
+    #[test]
+    fn stream_truncated_bytes_end_early_not_panic() {
+        let full = synth_gif(64, 10);
+        // Chop the file mid-stream: some frames must still come out,
+        // then a clean end instead of an error or panic.
+        let cut = std::rc::Rc::new(full[..full.len() * 2 / 3].to_vec());
+        let mut stream = GifStream::open(cut).expect("header intact");
+        let mut n = 0;
+        while stream.next_frame().is_some() {
+            n += 1;
+            assert!(n <= 10, "cannot yield more than encoded");
+        }
+        assert!(n >= 1, "prefix frames still play");
+        assert!(n < 10, "truncation must lose the tail");
+    }
+}

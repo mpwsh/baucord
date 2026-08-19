@@ -199,6 +199,7 @@ unknown = Unknown
 # ── Chat input, image attach & context menus ────────────────────────────
 chat-emoji-tooltip = Emoji — or type :name: codes like :joy:
 chat-attach-tooltip = Send an image from your computer
+chat-clear-tooltip = Clear chat (just for you)
 chat-image-filter = Images
 chat-image-load-error = Couldn't load image: { $error }
 chat-image-undisplayable = { $name } sent an image that could not be displayed

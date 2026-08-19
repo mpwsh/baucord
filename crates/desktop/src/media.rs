@@ -67,6 +67,7 @@ pub fn push_image_row(app: &mut AppState, ts: &str, user: &str, data: Vec<u8>) -
     let model = app.chat_model().clone();
     let last = model.row_count() - 1;
     if let Some(mut row) = model.row_data(last) {
+        let preview = frame.clone();
         row.image = frame;
         let row_id = row.row_id;
         model.set_row_data(last, row);
@@ -81,7 +82,7 @@ pub fn push_image_row(app: &mut AppState, ts: &str, user: &str, data: Vec<u8>) -
         );
 
         if is_gif {
-            let mut player = GifPlayer::new(bytes);
+            let mut player = GifPlayer::new(bytes, preview);
             player.start_autoplay();
             app.gifs_mut().insert(row_id, player);
             app.ensure_gif_ticker();
@@ -106,55 +107,73 @@ enum GifMode {
 pub enum GifStep {
     /// Nothing to draw (frozen, or the current frame hasn't elapsed).
     Idle,
-    /// Draw this frame.
-    Blit { anim: Rc<GifAnimation>, idx: usize },
-    /// Budget expired: draw frame 0 and release the animation.
-    Freeze { anim: Rc<GifAnimation> },
+    /// Draw this freshly decoded frame (full logical screen).
+    Blit {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    /// Playback ended: restore the row's static preview texture.
+    Freeze { first: slint::Image },
 }
 
 /// Chat-row GIF playback state, advanced by the app's single 33 ms
 /// animation ticker (`AppState::gif_tick`) instead of per-player
 /// timers — one repeating timer for any number of playing GIFs, and
 /// no timer-restarted-from-its-own-callback patterns.
+///
+/// Frames are decoded *as they play* ([`gif::GifStream`]): a playing
+/// GIF holds one frame instead of the whole animation, so several
+/// playing at once cost megabytes, not the old 48 MB-per-GIF budget.
+/// Frozen players hold nothing but the compressed bytes (shared with
+/// the viewer map) and the row's preview texture handle.
 pub struct GifPlayer {
     bytes: Rc<Vec<u8>>,
-    /// Present only while playing — frozen players hold no frames.
-    anim: Option<Rc<GifAnimation>>,
-    frame_idx: usize,
+    /// The row's static preview — the freeze target. Cloning a
+    /// `slint::Image` clones a handle, not pixels, and this buffer is
+    /// alive anyway (it's what the frozen row displays).
+    first: slint::Image,
+    /// Present only while playing.
+    stream: Option<gif::GifStream>,
     in_frame_ms: f64,
+    current_delay_ms: f64,
     mode: GifMode,
 }
 
 impl GifPlayer {
-    pub fn new(bytes: Rc<Vec<u8>>) -> Self {
+    pub fn new(bytes: Rc<Vec<u8>>, first: slint::Image) -> Self {
         Self {
             bytes,
-            anim: None,
-            frame_idx: 0,
+            first,
+            stream: None,
             in_frame_ms: 0.0,
+            current_delay_ms: 0.0,
             mode: GifMode::Frozen,
         }
     }
 
-    fn decode(&mut self) -> bool {
-        if self.anim.is_none() {
-            match gif::decode_animation(&self.bytes) {
-                Ok(anim) if !anim.frames.is_empty() => self.anim = Some(Rc::new(anim)),
-                Ok(_) => return false,
-                Err(e) => {
-                    warn!("GIF decode failed: {e}");
-                    return false;
-                }
+    /// Open the frame stream. Frame 0's pixels are discarded (the
+    /// preview already shows it) but its delay starts the clock.
+    fn open_stream(&mut self) -> bool {
+        let mut stream = match gif::GifStream::open(Rc::clone(&self.bytes)) {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!("GIF stream open failed: {e}");
+                return false;
             }
-        }
-        self.frame_idx = 0;
+        };
+        let Some(first) = stream.next_frame() else {
+            return false;
+        };
+        self.current_delay_ms = f64::from(first.delay_ms);
         self.in_frame_ms = 0.0;
+        self.stream = Some(stream);
         true
     }
 
     pub fn start_autoplay(&mut self) {
         let budget = GifAnimation::autoplay_budget_secs(&self.bytes);
-        if self.decode() {
+        if self.open_stream() {
             self.mode = GifMode::Autoplay {
                 deadline: Instant::now() + Duration::from_secs_f64(budget),
             };
@@ -165,11 +184,11 @@ impl GifPlayer {
     /// therefore the ticker) should be running.
     pub fn hover(&mut self, entering: bool) -> bool {
         if entering {
-            if matches!(self.mode, GifMode::Frozen) && self.decode() {
+            if matches!(self.mode, GifMode::Frozen) && self.open_stream() {
                 self.mode = GifMode::Hover;
             }
         } else if matches!(self.mode, GifMode::Hover) {
-            // Next tick freezes (draws frame 0, releases frames).
+            // Next tick freezes (restores the preview, drops the stream).
             self.mode = GifMode::Autoplay {
                 deadline: Instant::now(),
             };
@@ -181,41 +200,87 @@ impl GifPlayer {
         !matches!(self.mode, GifMode::Frozen)
     }
 
-    /// Advance by `dt_ms` of wall time.
+    /// Stop playback immediately and release the stream, returning the
+    /// preview to restore — used when the window hides to the tray.
+    pub fn force_freeze(&mut self) -> Option<slint::Image> {
+        if !self.playing() {
+            return None;
+        }
+        self.mode = GifMode::Frozen;
+        self.stream = None;
+        self.in_frame_ms = 0.0;
+        Some(self.first.clone())
+    }
+
+    /// Advance by `dt_ms` of wall time, decoding at most a few frames
+    /// of catch-up so a stall slows playback instead of spiraling.
     pub fn step(&mut self, dt_ms: f64) -> GifStep {
-        let Some(anim) = self.anim.clone() else {
+        if !self.playing() {
             return GifStep::Idle;
-        };
+        }
         if let GifMode::Autoplay { deadline } = self.mode
             && Instant::now() >= deadline
         {
             self.mode = GifMode::Frozen;
-            self.anim = None;
-            self.frame_idx = 0;
+            self.stream = None;
             self.in_frame_ms = 0.0;
-            return GifStep::Freeze { anim };
+            return GifStep::Freeze {
+                first: self.first.clone(),
+            };
         }
+        let Some(stream) = &mut self.stream else {
+            return GifStep::Idle;
+        };
 
         self.in_frame_ms += dt_ms;
-        let mut advanced = false;
-        // Catch up through short frames; bail after one loop's worth so
-        // a stall can't spiral.
-        for _ in 0..anim.frames.len() {
-            let delay = f64::from(anim.frames[self.frame_idx].delay_ms);
-            if self.in_frame_ms < delay {
+        if self.in_frame_ms < self.current_delay_ms {
+            return GifStep::Idle;
+        }
+        let mut latest = None;
+        for _ in 0..4 {
+            self.in_frame_ms -= self.current_delay_ms;
+            let frame = match stream.next_frame() {
+                Some(frame) => frame,
+                None => {
+                    // End of stream: loop.
+                    if !stream.rewind() {
+                        break;
+                    }
+                    match stream.next_frame() {
+                        Some(frame) => frame,
+                        None => break,
+                    }
+                }
+            };
+            self.current_delay_ms = f64::from(frame.delay_ms);
+            latest = Some(frame);
+            if self.in_frame_ms < self.current_delay_ms {
                 break;
             }
-            self.in_frame_ms -= delay;
-            self.frame_idx = (self.frame_idx + 1) % anim.frames.len();
-            advanced = true;
         }
-        if advanced {
-            GifStep::Blit {
-                anim,
-                idx: self.frame_idx,
+        match latest {
+            Some(frame) => {
+                // Drop any remaining catch-up debt: decoding more than
+                // a few frames per tick would stall the UI thread.
+                self.in_frame_ms = self.in_frame_ms.min(self.current_delay_ms);
+                let (width, height) = self
+                    .stream
+                    .as_ref()
+                    .map_or((0, 0), gif::GifStream::dimensions);
+                GifStep::Blit {
+                    rgba: frame.rgba,
+                    width,
+                    height,
+                }
             }
-        } else {
-            GifStep::Idle
+            None => {
+                // Rewind failed or stream empty: end playback cleanly.
+                self.mode = GifMode::Frozen;
+                self.stream = None;
+                GifStep::Freeze {
+                    first: self.first.clone(),
+                }
+            }
         }
     }
 }

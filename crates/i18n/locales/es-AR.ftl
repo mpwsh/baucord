@@ -201,6 +201,7 @@ unknown = Desconocido
 # ── Chat input, image attach & context menus ────────────────────────────
 chat-emoji-tooltip = Emojis — o escribí códigos :nombre: como :joy:
 chat-attach-tooltip = Enviá una imagen desde tu computadora
+chat-clear-tooltip = Limpiar el chat (solo para vos)
 chat-image-filter = Imágenes
 chat-image-load-error = No se pudo cargar la imagen: { $error }
 chat-image-undisplayable = { $name } envió una imagen que no se pudo mostrar

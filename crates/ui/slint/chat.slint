@@ -374,6 +374,11 @@ export component ChatPane inherits Rectangle {
                 tooltip: Tr.chat-attach-tooltip;
                 clicked => { Logic.attach-image(); }
             }
+            IconBtn {
+                icon: @image-url("icons/broom.svg");
+                tooltip: Tr.chat-clear-tooltip;
+                clicked => { Logic.clear-chat(); }
+            }
             // capture-key-pressed runs BEFORE the focused TextInput:
             // Enter sends (Shift+Enter falls through and inserts the
             // newline — the input is multi-line now), and Ctrl/Cmd+V

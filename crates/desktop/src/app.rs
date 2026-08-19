@@ -541,6 +541,10 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         media::attach_image_from_disk();
     });
     let w = Rc::downgrade(state);
+    logic.on_clear_chat(move || {
+        with_app(&w, AppState::clear_chat);
+    });
+    let w = Rc::downgrade(state);
     logic.on_composer_newline(move |cursor, anchor| {
         with_app(&w, |app| {
             let s = app.main.global::<State>();
@@ -720,6 +724,9 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         let mut response = slint::CloseRequestResponse::HideWindow;
         with_app(&w, |app| {
             if cfg!(feature = "tray") {
+                // Going to the tray: stop all GIF work right now rather
+                // than on the next tick — nothing is visible anymore.
+                app.freeze_chat_gifs();
                 response = slint::CloseRequestResponse::HideWindow;
             } else {
                 app.save_window_geometry();
@@ -2248,6 +2255,43 @@ impl AppState {
         }
     }
 
+    /// Stop every chat-row GIF and the in-window preview overlay,
+    /// restoring row previews and releasing frame streams. Called when
+    /// the main window hides to the tray (there is nothing to animate)
+    /// and from the hidden-window guard in
+    /// [`gif_tick`](Self::gif_tick).
+    pub fn freeze_chat_gifs(&mut self) {
+        let mut restores: Vec<(i32, slint::Image)> = Vec::new();
+        for (&row_id, player) in &mut self.gifs {
+            if let Some(first) = player.force_freeze() {
+                restores.push((row_id, first));
+            }
+        }
+        for (row_id, image) in restores {
+            for i in 0..self.chat_model.row_count() {
+                if let Some(mut row) = self.chat_model.row_data(i)
+                    && row.row_id == row_id {
+                        row.image = image.clone();
+                        self.chat_model.set_row_data(i, row);
+                        break;
+                    }
+            }
+        }
+        self.preview_gif = None;
+    }
+
+    /// Wipe the local chat: history, rows, image bytes, GIF players,
+    /// textures. Purely local — everyone clears their own scrollback
+    /// (people were reconnecting just to get an empty chat). Also the
+    /// bluntest memory-release lever the user has.
+    pub fn clear_chat(&mut self) {
+        self.history_mut().clear();
+        self.chat_model.set_vec(Vec::new());
+        self.images.clear();
+        self.gifs.clear();
+        self.gif_ticker.stop();
+    }
+
     /// Start the 33 ms animation ticker if it isn't already running.
     pub fn ensure_gif_ticker(&mut self) {
         if self.gif_ticker.running() {
@@ -2288,23 +2332,33 @@ impl AppState {
             })
         }
 
+        // Tray/minimized: chat rows and the in-window preview are
+        // invisible — stop paying decode for them. The gallery viewer
+        // is its own window and may still be on screen, so it keeps
+        // animating; the ticker dies below once nothing plays.
+        if !self.main.window().is_visible() {
+            self.freeze_chat_gifs();
+        }
+
         let mut any_playing = false;
-        let mut blits: Vec<(i32, Rc<app_core::gif::GifAnimation>, usize, bool)> = Vec::new();
+        let mut blits: Vec<(i32, slint::Image)> = Vec::new();
         for (&row_id, player) in &mut self.gifs {
             match player.step(DT_MS) {
                 GifStep::Idle => {}
-                GifStep::Blit { anim, idx } => blits.push((row_id, anim, idx, false)),
-                GifStep::Freeze { anim } => blits.push((row_id, anim, 0, true)),
+                GifStep::Blit {
+                    rgba,
+                    width,
+                    height,
+                } => blits.push((row_id, ui::convert::rgba_image(&rgba, width, height))),
+                GifStep::Freeze { first } => blits.push((row_id, first)),
             }
             any_playing |= player.playing();
         }
-        for (row_id, anim, idx, _) in &blits {
-            let frame = &anim.frames[*idx];
+        for (row_id, image) in blits {
             for i in 0..self.chat_model.row_count() {
                 if let Some(mut row) = self.chat_model.row_data(i)
-                    && row.row_id == *row_id {
-                        row.image =
-                            ui::convert::rgba_image(&frame.rgba, anim.width, anim.height);
+                    && row.row_id == row_id {
+                        row.image = image.clone();
                         self.chat_model.set_row_data(i, row);
                         break;
                     }
@@ -2701,6 +2755,7 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_cancel(t!("cancel").into());
     tr.set_chat_emoji_tooltip(t!("chat-emoji-tooltip").into());
     tr.set_chat_attach_tooltip(t!("chat-attach-tooltip").into());
+    tr.set_chat_clear_tooltip(t!("chat-clear-tooltip").into());
     tr.set_image_preview_title(t!("image-preview-title").into());
     tr.set_menu_cut(t!("menu-cut").into());
     tr.set_menu_copy(t!("menu-copy").into());
