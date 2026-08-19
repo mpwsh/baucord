@@ -93,6 +93,43 @@ impl TestClient {
         self.client.send_message(channel, bytes);
     }
 
+    /// Send an image the way the real client does — chunked — but all
+    /// at once: server-side reassembly doesn't care about arrival
+    /// pacing, only the relay side paces.
+    fn send_image(&mut self, upload_id: u32, blob: &[u8]) {
+        let count = u32::try_from(blob.len().div_ceil(protocol::IMAGE_CHUNK_BYTES)).unwrap();
+        for (i, chunk) in blob.chunks(protocol::IMAGE_CHUNK_BYTES).enumerate() {
+            let msg = ClientMessage::ChatImageChunk {
+                upload_id,
+                index: u32::try_from(i).unwrap(),
+                count,
+                data: chunk.to_vec(),
+            };
+            let bytes = protocol::encode_client_message(&msg).expect("encode chunk");
+            self.send_raw(msg.channel(), bytes);
+        }
+    }
+
+    /// Completed relayed images seen so far: fold the chunk stream in
+    /// the inbox into per-(sender, upload) tallies.
+    fn images_completed(&self) -> usize {
+        let mut got: std::collections::HashMap<(u64, u32), (u32, u32)> =
+            std::collections::HashMap::new();
+        for msg in &self.inbox {
+            if let ServerMessage::ChatImageChunk {
+                client_id,
+                upload_id,
+                count,
+                ..
+            } = msg
+            {
+                let e = got.entry((*client_id, *upload_id)).or_insert((0, *count));
+                e.0 += 1;
+            }
+        }
+        got.values().filter(|(received, count)| received >= count).count()
+    }
+
     /// Pump server + clients until `pred` finds a match in this
     /// client's inbox (returned), or panic after 5 s.
     fn wait_for<T>(
@@ -628,17 +665,13 @@ fn per_client_image_byte_budget_brakes_one_spammer() {
     // Three ~40 KiB images from alice: 40+40 fits the 100 KiB window,
     // the third (120 KiB total) must be dropped. Bob's own budget is
     // untouched — his image still relays.
-    for seed in 0..3u8 {
-        let msg = ClientMessage::ChatImage(png_blob(seed, 40 * 1024));
-        let bytes = protocol::encode_client_message(&msg).expect("encode");
-        a.send_raw(msg.channel(), bytes);
+    for seed in 0..3u32 {
+        a.send_image(seed, &png_blob(u8::try_from(seed).unwrap(), 40 * 1024));
     }
-    let msg = ClientMessage::ChatImage(png_blob(9, 40 * 1024));
-    let bytes = protocol::encode_client_message(&msg).expect("encode");
-    b.send_raw(msg.channel(), bytes);
+    b.send_image(0, &png_blob(9, 40 * 1024));
 
     settle(&mut server, &mut a, &mut b, Duration::from_secs(2));
-    let relayed = count_images(&a);
+    let relayed = a.images_completed();
     assert_eq!(relayed, 3, "2 of alice's 3 + bob's 1 must relay");
 }
 
@@ -662,16 +695,58 @@ fn global_image_byte_budget_brakes_coordinated_bursts() {
     // 40 KiB from each side, alternating: the room window admits two
     // (80 KiB) and must drop the third and fourth.
     for (i, who) in [0u8, 1, 0, 1].iter().enumerate() {
-        let msg = ClientMessage::ChatImage(png_blob(u8::try_from(i).unwrap(), 40 * 1024));
-        let bytes = protocol::encode_client_message(&msg).expect("encode");
+        let blob = png_blob(u8::try_from(i).unwrap(), 40 * 1024);
+        let upload_id = u32::try_from(i).unwrap();
         match who {
-            0 => a.send_raw(msg.channel(), bytes),
-            _ => b.send_raw(msg.channel(), bytes),
+            0 => a.send_image(upload_id, &blob),
+            _ => b.send_image(upload_id, &blob),
         }
     }
 
     settle(&mut server, &mut a, &mut b, Duration::from_secs(2));
-    assert_eq!(count_images(&a), 2, "room budget must stop the burst at 2");
+    assert_eq!(a.images_completed(), 2, "room budget must stop the burst at 2");
+}
+
+#[test]
+fn relay_paces_large_images_instead_of_bursting() {
+    let mut config = test_config(vec![open_channel("Lobby", true)]);
+    config.limits.max_image_kb_per_minute = 100_000;
+    config.limits.max_image_kb_per_minute_global = 100_000;
+    config.limits.media_relay_kb_per_sec = 1024; // 1 MiB/s per receiver
+    let mut server = ChatServer::new(config).expect("server start");
+    let addr = server.addresses()[0];
+
+    let mut a = TestClient::connect(addr, "alice", 1);
+    let mut b = TestClient::connect(addr, "bob", 2);
+    a.wait_for(&mut server, &mut [&mut b], |m| {
+        matches!(m, ServerMessage::Init { .. }).then_some(())
+    });
+    b.wait_for(&mut server, &mut [&mut a], |m| {
+        matches!(m, ServerMessage::Init { .. }).then_some(())
+    });
+
+    // A 1 MiB image at 1 MiB/s must be *spread* over roughly a second
+    // per receiver — the whole point is that it no longer lands as one
+    // burst that queues ahead of voice.
+    a.send_image(1, &png_blob(3, 1024 * 1024));
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(15);
+    while b.images_completed() == 0 {
+        server.update().expect("tick");
+        a.tick();
+        b.tick();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(std::time::Instant::now() < deadline, "image never completed");
+    }
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(500),
+        "1 MiB at 1 MiB/s must be paced, not burst (took {took:?})"
+    );
+    assert!(
+        took <= Duration::from_secs(10),
+        "pacing should finish in ~1 s, not stall (took {took:?})"
+    );
 }
 
 fn png_blob(seed: u8, len: usize) -> Vec<u8> {
@@ -688,12 +763,5 @@ fn settle(server: &mut ChatServer, a: &mut TestClient, b: &mut TestClient, d: Du
         b.tick();
         std::thread::sleep(Duration::from_millis(2));
     }
-}
-
-fn count_images(c: &TestClient) -> usize {
-    c.inbox
-        .iter()
-        .filter(|m| matches!(m, ServerMessage::ChatImage(_)))
-        .count()
 }
 

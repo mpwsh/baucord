@@ -113,20 +113,72 @@ pub fn load_image_bytes(bytes: Vec<u8>, max_bytes: usize) -> Result<Vec<u8>, Ima
         // static pipeline below.
     }
 
-    let is_png = image::guess_format(&bytes)
-        .map(|f| f == image::ImageFormat::Png)
-        .unwrap_or(false);
+    let format = image::guess_format(&bytes).ok();
+    let is_png = format == Some(image::ImageFormat::Png);
+    let is_jpeg = format == Some(image::ImageFormat::Jpeg);
 
     let decoded = decode_bounded(&bytes)?;
 
-    if is_png
+    // Already-encoded PNGs and JPEGs inside both budgets pass through
+    // untouched — receivers sniff the magic and decode either.
+    if (is_png || is_jpeg)
         && bytes.len() <= max_bytes
         && decoded.width().max(decoded.height()) <= MAX_IMAGE_DIM
     {
         return Ok(bytes);
     }
 
-    encode_bounded_png(&decoded.to_rgb8(), max_bytes)
+    // Photographs (anything that arrived as JPEG) re-encode as JPEG:
+    // a photo transcoded to PNG balloons 5–10×, which used to turn a
+    // 500 KB camera shot into a multi-MB upload that stalled voice for
+    // everyone. Screenshots and everything else keep the sharp-edged
+    // PNG path.
+    if is_jpeg {
+        encode_bounded_jpeg(&decoded.to_rgb8(), max_bytes)
+    } else {
+        encode_bounded_png(&decoded.to_rgb8(), max_bytes)
+    }
+}
+
+/// [`encode_bounded_png`]'s photographic sibling: JPEG at quality 85,
+/// halving dimensions until the budget fits. Only used for sources
+/// that were already JPEG — lossy re-encoding is fair game there.
+///
+/// # Errors
+/// [`ImageError::TooLargeAfterDownscale`] below 320 px, or
+/// [`ImageError::Codec`] from the encoder.
+pub fn encode_bounded_jpeg(
+    buf: &image::RgbImage,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ImageError> {
+    let mut bound = MAX_IMAGE_DIM;
+    loop {
+        let scaled = if buf.width().max(buf.height()) > bound {
+            image::imageops::resize(
+                buf,
+                (buf.width() * bound / buf.width().max(buf.height())).max(1),
+                (buf.height() * bound / buf.width().max(buf.height())).max(1),
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            buf.clone()
+        };
+
+        let mut out = Cursor::new(Vec::new());
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+        image::DynamicImage::ImageRgb8(scaled)
+            .write_with_encoder(encoder)
+            .map_err(|e| ImageError::Codec(e.to_string()))?;
+        let bytes = out.into_inner();
+
+        if bytes.len() <= max_bytes {
+            return Ok(bytes);
+        }
+        if bound <= 320 {
+            return Err(ImageError::TooLargeAfterDownscale(bytes.len() / 1024));
+        }
+        bound /= 2;
+    }
 }
 
 /// Decode with explicit limits so a crafted file (e.g. a 30000×30000
@@ -325,5 +377,43 @@ mod tests {
         g.extend_from_slice(&[0x01, 0x00, 0x00]); // one data sub-block + terminator
         g.push(0x3B); // trailer
         assert!(!gif_is_animated(&g));
+    }
+
+    #[test]
+    fn jpeg_within_budgets_passes_through_untouched() {
+        let img = image::RgbImage::from_fn(640, 480, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 100])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(enc)
+            .unwrap();
+        let jpeg = out.into_inner();
+
+        let wire = load_image_bytes(jpeg.clone(), 10 * 1024 * 1024).expect("accepted");
+        assert_eq!(wire, jpeg, "small jpeg must not be transcoded");
+        assert!(wire.starts_with(&[0xFF, 0xD8, 0xFF]), "still a jpeg");
+    }
+
+    #[test]
+    fn oversized_jpeg_reencodes_as_jpeg_not_png() {
+        // 4000 px photo-like input: over MAX_IMAGE_DIM, must come back
+        // downscaled AND still JPEG — the whole point is that photos
+        // never balloon through a PNG transcode again.
+        let img = image::RgbImage::from_fn(4000, 3000, |x, y| {
+            image::Rgb([(x * 7 % 256) as u8, (y * 3 % 256) as u8, ((x + y) % 256) as u8])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(enc)
+            .unwrap();
+        let jpeg = out.into_inner();
+
+        let wire = load_image_bytes(jpeg, 10 * 1024 * 1024).expect("accepted");
+        assert!(wire.starts_with(&[0xFF, 0xD8, 0xFF]), "photo stays jpeg");
+        let back = decode_bounded(&wire).unwrap();
+        assert!(back.width().max(back.height()) <= MAX_IMAGE_DIM);
     }
 }

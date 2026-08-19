@@ -246,6 +246,22 @@ fn fetch_connect_token(
 //  NetworkClient — protocol + state
 // ════════════════════════════════════════════════════════════════════════
 
+/// A chat image being paced onto the wire, chunk by chunk.
+struct OutgoingImage {
+    upload_id: u32,
+    chunks: Vec<Vec<u8>>,
+    next: usize,
+}
+
+/// A relayed chat image being reassembled from paced chunks.
+struct IncomingImage {
+    count: u32,
+    received: u32,
+    bytes: usize,
+    chunks: Vec<Option<Vec<u8>>>,
+    started: Instant,
+}
+
 pub(crate) struct NetworkClient {
     client: RenetClient,
     transport: NetcodeClientTransport,
@@ -261,7 +277,15 @@ pub(crate) struct NetworkClient {
     /// draining back toward zero — renet exposes no per-message acks,
     /// but with one upload at a time the channel's memory usage IS the
     /// unacked remainder.
-    upload_total: Option<usize>,
+    /// In-flight paced image upload (chunks not yet handed to renet).
+    upload: Option<OutgoingImage>,
+    /// Wrapping id so the server can tell uploads apart.
+    upload_next_id: u32,
+    /// Token bucket for upload pacing, in bytes.
+    upload_tokens: f64,
+    upload_last_tick: Instant,
+    /// Reassembly of relayed images, keyed by (sender, upload id).
+    incoming_images: HashMap<(u64, u32), IncomingImage>,
     /// Last percentage reported to the UI (255 = force first emit).
     upload_last_pct: u8,
     last_stats_check: Instant,
@@ -344,7 +368,11 @@ impl NetworkClient {
             last_updated: Instant::now(),
             reassembler: VideoReassembler::new(),
             last_speaking_sent: false,
-            upload_total: None,
+            upload: None,
+            upload_next_id: 0,
+            upload_tokens: 0.0,
+            upload_last_tick: Instant::now(),
+            incoming_images: HashMap::new(),
             upload_last_pct: 255,
             last_stats_check: Instant::now(),
             announced_connected: false,
@@ -375,7 +403,7 @@ impl NetworkClient {
             return;
         }
 
-        self.sample_upload_progress();
+        self.pump_upload();
 
         // Announce Connected exactly once, when the handshake completes.
         if !self.announced_connected && self.client.is_connected() {
@@ -550,16 +578,25 @@ impl NetworkClient {
                     text: msg.text,
                 });
             }
-            ServerMessage::ChatImage(img) => {
-                let username = self
-                    .usernames
-                    .get(&img.client_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("User{}", img.client_id));
-                self.message_queue.push(NetworkMessage::ImageMessage {
-                    username,
-                    data: img.data,
-                });
+            ServerMessage::ChatImageChunk {
+                client_id,
+                upload_id,
+                index,
+                count,
+                data,
+            } => {
+                if let Some(image) = self.accept_image_chunk(client_id, upload_id, index, count, data)
+                {
+                    let username = self
+                        .usernames
+                        .get(&client_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("User{client_id}"));
+                    self.message_queue.push(NetworkMessage::ImageMessage {
+                        username,
+                        data: image,
+                    });
+                }
             }
             ServerMessage::Speaking {
                 client_id,
@@ -695,38 +732,6 @@ impl NetworkClient {
 
     // ── Outbound messages ───────────────────────────────────────────
 
-    /// Send a control-plane message on its designated channel.
-    /// Report outbound image progress from the media channel's
-    /// buffered-bytes drain (see `upload_total`). Emits only on change,
-    /// so this is a handful of messages per upload, not per tick.
-    fn sample_upload_progress(&mut self) {
-        let Some(total) = self.upload_total else {
-            return;
-        };
-        let available = self
-            .client
-            .channel_available_memory(protocol::MEDIA_CHANNEL);
-        let used = protocol::channels::MEDIA_BUFFER_BYTES.saturating_sub(available);
-        let pct = if used == 0 {
-            100
-        } else {
-            // `used` can momentarily exceed `total` (envelope bytes);
-            // clamp so progress never goes negative.
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                (total.saturating_sub(used.min(total)) * 100 / total.max(1)) as u8
-            }
-        };
-        if pct != self.upload_last_pct {
-            self.upload_last_pct = pct;
-            self.message_queue
-                .push(NetworkMessage::UploadProgress { pct });
-        }
-        if pct == 100 {
-            self.upload_total = None;
-        }
-    }
-
     fn send_control(&mut self, msg: &ClientMessage) {
         match protocol::encode_client_message(msg) {
             Some(encoded) => self.client.send_message(msg.channel(), encoded),
@@ -738,12 +743,150 @@ impl NetworkClient {
         self.send_control(&ClientMessage::Chat(text));
     }
 
-    /// Send a chat image. `send_control` refuses (with a warning) if the
-    /// payload somehow exceeds the protocol budget.
+    /// Queue a chat image for a *paced* upload: split into
+    /// [`protocol::IMAGE_CHUNK_BYTES`] chunks, then [`pump_upload`]
+    /// trickles them out at [`protocol::MEDIA_UPLOAD_PACE`] so the
+    /// router queue voice shares never backs up behind bulk. A new
+    /// image replaces any upload still in flight (matching the UI,
+    /// which sends one at a time).
+    ///
+    /// [`pump_upload`]: Self::pump_upload
     pub fn send_image(&mut self, data: Vec<u8>) {
-        self.upload_total = Some(data.len());
+        if data.len() > protocol::MAX_CHAT_IMAGE_BYTES {
+            warn!("Refusing oversized image ({} KB)", data.len() / 1024);
+            return;
+        }
+        let chunks: Vec<Vec<u8>> = data
+            .chunks(protocol::IMAGE_CHUNK_BYTES)
+            .map(<[u8]>::to_vec)
+            .collect();
+        if chunks.is_empty() {
+            return;
+        }
+        self.upload_next_id = self.upload_next_id.wrapping_add(1);
+        self.upload = Some(OutgoingImage {
+            upload_id: self.upload_next_id,
+            chunks,
+            next: 0,
+        });
         self.upload_last_pct = 255;
-        self.send_control(&ClientMessage::ChatImage(data));
+        self.upload_tokens = 0.0;
+        self.upload_last_tick = Instant::now();
+    }
+
+    /// Fold one relayed chunk into its image; `Some(bytes)` when the
+    /// image completes. Bounds mirror the codec's: chunk counts and
+    /// total size are capped, a fresh `upload_id` from the same sender
+    /// abandons the old partial, and partials older than two minutes
+    /// are pruned (their sender vanished or gave up mid-pace).
+    fn accept_image_chunk(
+        &mut self,
+        client_id: u64,
+        upload_id: u32,
+        index: u32,
+        count: u32,
+        data: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        if count == 0 || count > protocol::MAX_IMAGE_CHUNKS || index >= count {
+            return None;
+        }
+        self.incoming_images
+            .retain(|_, img| img.started.elapsed() < Duration::from_secs(120));
+        // A newer upload from the same sender obsoletes any partial.
+        self.incoming_images
+            .retain(|(sender, id), _| *sender != client_id || *id == upload_id);
+
+        let entry = self
+            .incoming_images
+            .entry((client_id, upload_id))
+            .or_insert_with(|| IncomingImage {
+                count,
+                received: 0,
+                bytes: 0,
+                chunks: vec![None; count as usize],
+                started: Instant::now(),
+            });
+        if entry.count != count || entry.chunks[index as usize].is_some() {
+            return None; // inconsistent or duplicate — drop
+        }
+        entry.bytes += data.len();
+        if entry.bytes > protocol::MAX_CHAT_IMAGE_BYTES {
+            self.incoming_images.remove(&(client_id, upload_id));
+            return None;
+        }
+        entry.chunks[index as usize] = Some(data);
+        entry.received += 1;
+        if entry.received < entry.count {
+            return None;
+        }
+        let entry = self.incoming_images.remove(&(client_id, upload_id))?;
+        let mut image = Vec::with_capacity(entry.bytes);
+        for chunk in entry.chunks {
+            image.extend_from_slice(&chunk?);
+        }
+        Some(image)
+    }
+
+    /// Emit queued upload chunks as the token bucket allows. Called
+    /// every tick; a no-op without an upload in flight.
+    fn pump_upload(&mut self) {
+        let Some(upload) = &mut self.upload else {
+            return;
+        };
+        let now = Instant::now();
+        let dt = now.duration_since(self.upload_last_tick).as_secs_f64();
+        self.upload_last_tick = now;
+        // Cap the bucket at a two-chunk burst: after an idle stretch we
+        // must not blast the backlog we were pacing to avoid.
+        let burst = 2.0 * protocol::IMAGE_CHUNK_BYTES as f64;
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.upload_tokens =
+                (self.upload_tokens + dt * protocol::MEDIA_UPLOAD_PACE as f64).min(burst);
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let count = upload.chunks.len() as u32;
+        while upload.next < upload.chunks.len() {
+            let chunk = &upload.chunks[upload.next];
+            #[allow(clippy::cast_precision_loss)]
+            if self.upload_tokens < chunk.len() as f64 {
+                break;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            {
+                self.upload_tokens -= chunk.len() as f64;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let msg = ClientMessage::ChatImageChunk {
+                upload_id: upload.upload_id,
+                index: upload.next as u32,
+                count,
+                data: chunk.clone(),
+            };
+            match protocol::encode_client_message(&msg) {
+                Some(encoded) => self.client.send_message(msg.channel(), encoded),
+                None => {
+                    warn!("Image chunk failed to encode; aborting upload");
+                    self.upload = None;
+                    return;
+                }
+            }
+            upload.next += 1;
+        }
+
+        // Real progress: chunks handed to the transport / total.
+        #[allow(clippy::cast_possible_truncation)]
+        let pct = (upload.next * 100 / upload.chunks.len()) as u8;
+        let done = upload.next >= upload.chunks.len();
+        if pct != self.upload_last_pct {
+            self.upload_last_pct = pct;
+            self.message_queue
+                .push(NetworkMessage::UploadProgress { pct });
+        }
+        if done {
+            self.upload = None;
+        }
     }
 
     pub fn send_speaking_status(&mut self, is_speaking: bool) {

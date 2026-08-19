@@ -6,17 +6,17 @@
 //! about their viewers' network health.
 
 use log::{debug, info, warn};
-use renet::{ClientId, RenetServer, ServerEvent};
+use renet::{Bytes, ClientId, RenetServer, ServerEvent};
 use renet_netcode::{
     NETCODE_USER_DATA_BYTES, NetcodeServerTransport, ServerAuthentication, ServerConfig,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use protocol::{
-    ChannelDenyReason, ChannelInfo, ChatImageMessage, ChatMessage, ClientMessage, DenyReason,
+    ChannelDenyReason, ChannelInfo, ChatMessage, ClientMessage, DenyReason,
     ServerMessage, ShareScope,
 };
 
@@ -61,6 +61,16 @@ struct ServerStats {
 
 // ── ChatServer ──────────────────────────────────────────────────────────
 
+/// One client's in-flight chunked image upload.
+struct IncomingUpload {
+    upload_id: u32,
+    count: u32,
+    received: u32,
+    bytes: usize,
+    chunks: Vec<Option<Vec<u8>>>,
+    started: Instant,
+}
+
 pub struct ChatServer {
     config: Config,
     server: RenetServer,
@@ -87,6 +97,16 @@ pub struct ChatServer {
     /// pruned to the last minute — the sliding window behind
     /// `limits.max_image_kb_per_minute`.
     image_bytes: HashMap<ClientId, Vec<(Instant, usize)>>,
+    /// In-progress image uploads, at most one per client — a chunk
+    /// with a fresh `upload_id` abandons the old partial.
+    uploads: HashMap<ClientId, IncomingUpload>,
+    /// Pre-encoded relay chunks queued per receiver. `Bytes` clones
+    /// are refcounts, so a 10 MB image queued to 12 receivers costs
+    /// one copy, not twelve.
+    media_out: HashMap<ClientId, VecDeque<Bytes>>,
+    /// Token bucket (bytes) per receiver for media relay pacing.
+    media_tokens: HashMap<ClientId, f64>,
+    last_media_pump: Instant,
     /// Server-wide window of accepted image bytes — the aggregate
     /// budget the per-client one can't provide.
     image_bytes_global: Vec<(Instant, usize)>,
@@ -230,6 +250,10 @@ impl ChatServer {
             last_config_check: now,
             image_bytes: HashMap::new(),
             image_bytes_global: Vec::new(),
+            uploads: HashMap::new(),
+            media_out: HashMap::new(),
+            media_tokens: HashMap::new(),
+            last_media_pump: now,
             last_updated: now,
             last_stats: now,
             last_pressure_check: now,
@@ -275,8 +299,14 @@ impl ChatServer {
 
         if now.duration_since(self.last_config_check) >= CONFIG_CHECK_INTERVAL {
             self.check_config_reload();
+            // Same lazy cadence: drop uploads whose sender stalled
+            // mid-pace for two minutes (crashed, gave up, vanished).
+            self.uploads
+                .retain(|_, u| u.started.elapsed() < Duration::from_secs(120));
             self.last_config_check = now;
         }
+
+        self.pump_media_out();
 
         self.transport.send_packets(&mut self.server);
 
@@ -320,6 +350,174 @@ impl ChatServer {
             self.stats.bytes_sent += encoded.len() as u64;
             self.server.send_message(client_id, msg.channel(), encoded);
         }
+    }
+
+    /// Fold one upload chunk into the sender's in-flight image; on
+    /// completion, validate (magic, size, bandwidth budgets) and hand
+    /// the image to the paced relay. Bounds mirror the codec's, plus:
+    /// one upload per client (a fresh `upload_id` abandons the old
+    /// partial), a projected-size check on the claimed chunk count so
+    /// an absurd upload dies on its first chunk, and a running byte
+    /// cap so lying `count` values can't overshoot.
+    fn handle_image_chunk(
+        &mut self,
+        client_id: ClientId,
+        upload_id: u32,
+        index: u32,
+        count: u32,
+        data: Vec<u8>,
+    ) {
+        if count == 0
+            || count > protocol::MAX_IMAGE_CHUNKS
+            || index >= count
+            || (count as usize - 1) * protocol::IMAGE_CHUNK_BYTES > protocol::MAX_CHAT_IMAGE_BYTES
+        {
+            warn!(
+                "Dropping malformed image chunk from {} (count {count}, index {index})",
+                self.get_username(client_id),
+            );
+            return;
+        }
+
+        let stale = self
+            .uploads
+            .get(&client_id)
+            .is_some_and(|u| u.upload_id != upload_id);
+        if stale {
+            self.uploads.remove(&client_id);
+        }
+        let upload = self.uploads.entry(client_id).or_insert_with(|| IncomingUpload {
+            upload_id,
+            count,
+            received: 0,
+            bytes: 0,
+            chunks: vec![None; count as usize],
+            started: Instant::now(),
+        });
+        if upload.count != count || upload.chunks[index as usize].is_some() {
+            return; // inconsistent or duplicate — drop silently
+        }
+        upload.bytes += data.len();
+        if upload.bytes > protocol::MAX_CHAT_IMAGE_BYTES {
+            let kb = upload.bytes / 1024;
+            self.uploads.remove(&client_id);
+            warn!(
+                "Dropping oversized image upload from {} ({kb} KB and counting)",
+                self.get_username(client_id),
+            );
+            return;
+        }
+        upload.chunks[index as usize] = Some(data);
+        upload.received += 1;
+        if upload.received < upload.count {
+            return;
+        }
+
+        // Complete: assemble and validate.
+        let Some(upload) = self.uploads.remove(&client_id) else {
+            return;
+        };
+        let mut image = Vec::with_capacity(upload.bytes);
+        for chunk in upload.chunks {
+            let Some(chunk) = chunk else { return };
+            image.extend_from_slice(&chunk);
+        }
+
+        // Relay only what claims to be a PNG, JPEG, or GIF — the
+        // desktop encodes exactly these, so anything else is a
+        // modified client wasting everyone's bandwidth. Receivers
+        // sniff the same magic to pick a decoder. Checked *before*
+        // the bandwidth budget so junk never consumes anyone's window.
+        const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let is_png = image.starts_with(&PNG_MAGIC);
+        let is_jpeg = image.starts_with(&[0xFF, 0xD8, 0xFF]);
+        let is_gif = image.starts_with(b"GIF87a") || image.starts_with(b"GIF89a");
+        if !is_png && !is_jpeg && !is_gif {
+            warn!(
+                "Dropping non-PNG/JPEG/GIF chat image ({} bytes) from {}",
+                image.len(),
+                self.get_username(client_id),
+            );
+            return;
+        }
+        if !self.allow_image(client_id, image.len()) {
+            return;
+        }
+        info!(
+            "[{}] sent an image ({} KB)",
+            self.get_username(client_id),
+            image.len() / 1024,
+        );
+        self.stats.messages_count += 1;
+        self.relay_image(client_id, upload_id, &image);
+    }
+
+    /// Queue a validated image for relay: re-chunk, pre-encode each
+    /// chunk *once*, and append refcounted handles to every receiver's
+    /// outbox. [`pump_media_out`](Self::pump_media_out) then trickles
+    /// the outboxes at the configured pace so a big image never floods
+    /// a receiver's downlink queue — voice shares that queue.
+    fn relay_image(&mut self, client_id: ClientId, upload_id: u32, image: &[u8]) {
+        #[allow(clippy::cast_possible_truncation)] // bounded by MAX_IMAGE_CHUNKS
+        let count = image.len().div_ceil(protocol::IMAGE_CHUNK_BYTES) as u32;
+        let mut encoded: Vec<Bytes> = Vec::with_capacity(count as usize);
+        for (i, chunk) in image.chunks(protocol::IMAGE_CHUNK_BYTES).enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let msg = ServerMessage::ChatImageChunk {
+                client_id,
+                upload_id,
+                index: i as u32,
+                count,
+                data: chunk.to_vec(),
+            };
+            match protocol::encode_server_message(&msg) {
+                Some(bytes) => encoded.push(Bytes::from(bytes)),
+                None => {
+                    warn!("Image relay chunk failed to encode; dropping image");
+                    return;
+                }
+            }
+        }
+        for peer in self.server.clients_id() {
+            self.media_out
+                .entry(peer)
+                .or_default()
+                .extend(encoded.iter().cloned());
+        }
+    }
+
+    /// Drain the per-receiver media outboxes as their token buckets
+    /// allow. `limits.media_relay_kb_per_sec` per receiver (min 64),
+    /// with a four-chunk burst cap so an idle bucket can't blast a
+    /// backlog we were pacing to avoid.
+    fn pump_media_out(&mut self) {
+        if self.media_out.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_media_pump).as_secs_f64();
+        self.last_media_pump = now;
+        #[allow(clippy::cast_precision_loss)]
+        let rate = (self.config.limits.media_relay_kb_per_sec.max(64) * 1024) as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let burst = 4.0 * protocol::IMAGE_CHUNK_BYTES as f64;
+
+        for (peer, queue) in &mut self.media_out {
+            let tokens = self.media_tokens.entry(*peer).or_insert(0.0);
+            *tokens = (*tokens + dt * rate).min(burst);
+            while let Some(front) = queue.front() {
+                #[allow(clippy::cast_precision_loss)]
+                let cost = front.len() as f64;
+                if *tokens < cost {
+                    break;
+                }
+                *tokens -= cost;
+                let bytes = queue.pop_front().expect("front existed");
+                self.server
+                    .send_message(*peer, protocol::MEDIA_CHANNEL, bytes);
+            }
+        }
+        self.media_out.retain(|_, q| !q.is_empty());
     }
 
     /// Sliding-window *bandwidth* budget for chat images: admit the
@@ -499,6 +697,9 @@ impl ChatServer {
         self.deafened.remove(&client_id);
         self.channel_of.remove(&client_id);
         self.image_bytes.remove(&client_id);
+        self.uploads.remove(&client_id);
+        self.media_out.remove(&client_id);
+        self.media_tokens.remove(&client_id);
 
         warn!(
             "CLIENT DISCONNECTED: {username} ({client_id}) reason={reason:?} display=\"{reason}\""
@@ -571,41 +772,13 @@ impl ChatServer {
                 self.stats.messages_count += 1;
                 self.broadcast_msg(&ServerMessage::Chat(ChatMessage { client_id, text }));
             }
-            ClientMessage::ChatImage(data) => {
-                // Size is already enforced: decode_client_message refuses
-                // payloads over MAX_CHAT_IMAGE_BYTES, so `data` is bounded
-                // before this arm can run. This arm owns policy only.
-                //
-                // Relay only what claims to be a PNG or GIF — the
-                // desktop encodes exactly these two, so anything else is
-                // a modified client wasting everyone's bandwidth.
-                // Receivers sniff the same magic to pick a decoder.
-                // Checked *before* the bandwidth budget so junk never
-                // consumes anyone's window.
-                const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-                let is_png = data.starts_with(&PNG_MAGIC);
-                let is_gif = data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a");
-                if !is_png && !is_gif {
-                    warn!(
-                        "Dropping non-PNG/GIF chat image ({} bytes) from {}",
-                        data.len(),
-                        self.get_username(client_id),
-                    );
-                    return;
-                }
-                if !self.allow_image(client_id, data.len()) {
-                    return;
-                }
-                info!(
-                    "[{}] sent an image ({} KB)",
-                    self.get_username(client_id),
-                    data.len() / 1024,
-                );
-                self.stats.messages_count += 1;
-                self.broadcast_msg(&ServerMessage::ChatImage(ChatImageMessage {
-                    client_id,
-                    data,
-                }));
+            ClientMessage::ChatImageChunk {
+                upload_id,
+                index,
+                count,
+                data,
+            } => {
+                self.handle_image_chunk(client_id, upload_id, index, count, data);
             }
             ClientMessage::Speaking(is_speaking) => {
                 // Broadcast to everyone including the sender: the UI

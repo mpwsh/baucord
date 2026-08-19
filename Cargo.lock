@@ -340,7 +340,7 @@ checksum = "fb5dfbc6d8d2675589ccbe4d0fd61df2419075625f8c1a62325e718e2b0049f9"
 
 [[package]]
 name = "app-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "image",
  "log",
@@ -1196,7 +1196,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "audio",
  "crossbeam-channel",
@@ -6068,7 +6068,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "clap 4.6.5",

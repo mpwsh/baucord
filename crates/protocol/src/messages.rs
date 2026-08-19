@@ -27,11 +27,17 @@ use crate::channels::{CONTROL_CHANNEL, MEDIA_CHANNEL, SIGNAL_CHANNEL};
 /// bound (see [`decode_client_message`] / [`decode_server_message`]).
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 
-/// Maximum payload of a chat image (PNG) or animated GIF, enforced on
-/// both ends: the sending client downscales/rejects until it fits, and
-/// the codec refuses to encode or decode anything larger — so a
+/// Maximum payload of a chat image (PNG, JPEG, or animated GIF),
+/// enforced on both ends: the sending client downscales/rejects until
+/// it fits, and both reassembly paths refuse anything larger — so a
 /// modified client can't spray relay memory. Sized for memes: static
 /// images rarely approach this, animated GIFs do.
+///
+/// Images never travel as one wire message: they are sliced into
+/// [`IMAGE_CHUNK_BYTES`] chunks and *paced* onto the wire (see
+/// [`MEDIA_UPLOAD_PACE`] / server relay pacing), so bulk media never
+/// floods the queues that voice shares — that flooding, not raw size,
+/// is what breaks calls during uploads.
 pub const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Upper bound for a serialized chat-image message: the payload cap
@@ -39,7 +45,26 @@ pub const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// a handful of bytes). This is the pre-deserialization length guard
 /// for the image path, and the worst transient allocation `decode_*`
 /// can be tricked into.
-pub const MAX_IMAGE_MESSAGE_BYTES: usize = MAX_CHAT_IMAGE_BYTES + 1024;
+pub const MAX_IMAGE_MESSAGE_BYTES: usize = IMAGE_CHUNK_BYTES + 1024;
+
+/// Payload of one image chunk. Small on purpose: a voice packet that
+/// lands mid-chunk waits at most `chunk / uplink_rate` behind it
+/// (16 KiB at 5 Mbit/s ≈ 25 ms — inside what the jitter buffer
+/// absorbs), where a whole 10 MiB message would park voice behind
+/// seconds of queue.
+pub const IMAGE_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Most chunks a single image may span (ceil of the size cap, plus one
+/// for the remainder). Reassemblers refuse anything claiming more.
+#[allow(clippy::cast_possible_truncation)] // 641 with current constants
+pub const MAX_IMAGE_CHUNKS: u32 =
+    (MAX_CHAT_IMAGE_BYTES / IMAGE_CHUNK_BYTES + 1) as u32;
+
+/// Client upload pacing for image chunks, bytes per second. Chosen to
+/// sit under typical home uplinks so the router queue stays shallow
+/// and voice never waits behind bulk: a 1 MiB image takes ~2 s, the
+/// 10 MiB worst case ~20 s (with live progress in the UI).
+pub const MEDIA_UPLOAD_PACE: usize = 512 * 1024;
 
 // ── Shared payload types ────────────────────────────────────────────────
 
@@ -52,17 +77,6 @@ pub struct ChatMessage {
 
 /// An image chat message attributed to a specific client.
 ///
-/// `data` is an encoded PNG or animated GIF (receivers sniff the magic
-/// bytes) no larger than [`MAX_CHAT_IMAGE_BYTES`]; the codec refuses
-/// oversized payloads in both directions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatImageMessage {
-    /// Authoritative sender id, stamped by the server on relay.
-    pub client_id: ClientId,
-    /// Encoded PNG bytes.
-    pub data: Vec<u8>,
-}
-
 /// Why the server refused a screen-share request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DenyReason {
@@ -190,11 +204,21 @@ pub enum ClientMessage {
     RequestKeyframe { target_id: ClientId },
 
     // ── Chat, continued ─────────────────────────────────────────────
-    // (Appended after the original variants so existing postcard
-    // discriminants are untouched.)
-    /// Send an image chat message (encoded PNG, ≤
-    /// [`MAX_CHAT_IMAGE_BYTES`]) to the room.
-    ChatImage(Vec<u8>),
+    /// One slice of a chat image upload (PNG/JPEG/GIF, total ≤
+    /// [`MAX_CHAT_IMAGE_BYTES`]). The client paces these onto the wire
+    /// at [`MEDIA_UPLOAD_PACE`]; the server reassembles, validates,
+    /// and relays the image re-chunked and paced per receiver. A new
+    /// `upload_id` from the same client abandons any incomplete one.
+    ChatImageChunk {
+        /// Sender-scoped upload identifier (wrapping counter).
+        upload_id: u32,
+        /// 0-based chunk index.
+        index: u32,
+        /// Total chunks in this upload; constant across its chunks and
+        /// bounded by [`MAX_IMAGE_CHUNKS`].
+        count: u32,
+        data: Vec<u8>,
+    },
 
     // ── Voice channels ──────────────────────────────────────────────
     /// Move to another voice channel. `password` is required when the
@@ -215,7 +239,7 @@ impl ClientMessage {
             ClientMessage::RequestKeyframe { .. } => SIGNAL_CHANNEL,
             // Bulk media rides its own reliable-unordered channel so it
             // can never head-of-line block ordered chat text.
-            ClientMessage::ChatImage(_) => MEDIA_CHANNEL,
+            ClientMessage::ChatImageChunk { .. } => MEDIA_CHANNEL,
             _ => CONTROL_CHANNEL,
         }
     }
@@ -308,10 +332,20 @@ pub enum ServerMessage {
     },
 
     // ── Chat, continued ─────────────────────────────────────────────
-    // (Appended after the original variants so existing postcard
-    // discriminants are untouched.)
-    /// An image chat message from a client.
-    ChatImage(ChatImageMessage),
+    /// One slice of a relayed chat image. The server paces these per
+    /// receiver so a big image never floods anyone's downlink queue —
+    /// the receiving side of the same voice-protection scheme as
+    /// [`ClientMessage::ChatImageChunk`].
+    ChatImageChunk {
+        /// The client whose image this is.
+        client_id: ClientId,
+        /// The sender's upload id — `(client_id, upload_id)` keys the
+        /// receiver's reassembly.
+        upload_id: u32,
+        index: u32,
+        count: u32,
+        data: Vec<u8>,
+    },
 
     // ── Voice channels ──────────────────────────────────────────────
     /// A client moved to another voice channel. Broadcast to everyone
@@ -346,7 +380,7 @@ impl ServerMessage {
             ServerMessage::KeyframeRequested { .. } | ServerMessage::StreamHealth { .. } => {
                 SIGNAL_CHANNEL
             }
-            ServerMessage::ChatImage(_) => MEDIA_CHANNEL,
+            ServerMessage::ChatImageChunk { .. } => MEDIA_CHANNEL,
             _ => CONTROL_CHANNEL,
         }
     }
@@ -368,7 +402,9 @@ impl ServerMessage {
 /// Does this client message respect the length budget for its variant?
 fn client_message_len_ok(msg: &ClientMessage, wire_len: usize) -> bool {
     match msg {
-        ClientMessage::ChatImage(data) => data.len() <= MAX_CHAT_IMAGE_BYTES,
+        ClientMessage::ChatImageChunk { data, count, .. } => {
+            data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_IMAGE_CHUNKS
+        }
         _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
     }
 }
@@ -376,7 +412,9 @@ fn client_message_len_ok(msg: &ClientMessage, wire_len: usize) -> bool {
 /// Does this server message respect the length budget for its variant?
 fn server_message_len_ok(msg: &ServerMessage, wire_len: usize) -> bool {
     match msg {
-        ServerMessage::ChatImage(img) => img.data.len() <= MAX_CHAT_IMAGE_BYTES,
+        ServerMessage::ChatImageChunk { data, count, .. } => {
+            data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_IMAGE_CHUNKS
+        }
         _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
     }
 }
@@ -459,52 +497,66 @@ mod tests {
     }
 
     #[test]
-    fn chat_image_roundtrips_past_the_control_cap() {
-        // 200 KB: comfortably over MAX_CONTROL_MESSAGE_BYTES, under the
-        // image budget — the whole point of the split.
-        let payload = vec![0xA5u8; 200 * 1024];
-        let msg = ClientMessage::ChatImage(payload.clone());
+    fn image_chunk_roundtrips_both_directions() {
+        let data = vec![0xA5u8; IMAGE_CHUNK_BYTES];
+        let msg = ClientMessage::ChatImageChunk {
+            upload_id: 3,
+            index: 7,
+            count: 40,
+            data: data.clone(),
+        };
         let bytes = encode_client_message(&msg).unwrap();
-        assert!(bytes.len() > MAX_CONTROL_MESSAGE_BYTES);
         let back = decode_client_message(&bytes).unwrap();
-        assert!(matches!(back, ClientMessage::ChatImage(d) if d == payload));
+        assert!(matches!(
+            back,
+            ClientMessage::ChatImageChunk { upload_id: 3, index: 7, count: 40, data: d } if d == data
+        ));
 
-        let msg = ServerMessage::ChatImage(ChatImageMessage {
-            client_id: 7,
-            data: payload.clone(),
-        });
+        let msg = ServerMessage::ChatImageChunk {
+            client_id: 9,
+            upload_id: 3,
+            index: 7,
+            count: 40,
+            data: data.clone(),
+        };
         let bytes = encode_server_message(&msg).unwrap();
         let back = decode_server_message(&bytes).unwrap();
         assert!(matches!(
             back,
-            ServerMessage::ChatImage(img) if img.client_id == 7 && img.data == payload
+            ServerMessage::ChatImageChunk { client_id: 9, upload_id: 3, data: d, .. } if d == data
         ));
     }
 
     #[test]
-    fn oversized_image_refused_both_ways() {
-        let too_big = vec![0u8; MAX_CHAT_IMAGE_BYTES + 1];
+    fn oversized_or_overcounted_chunks_refused_both_ways() {
+        // Payload over the chunk size: encode refuses locally…
+        let big = ClientMessage::ChatImageChunk {
+            upload_id: 0,
+            index: 0,
+            count: 1,
+            data: vec![0u8; IMAGE_CHUNK_BYTES + 1],
+        };
+        assert!(encode_client_message(&big).is_none());
+        // …and a hostile peer serializing it anyway is dropped at decode.
+        let raw = postcard::to_allocvec(&big).unwrap();
+        assert!(decode_client_message(&raw).is_none());
 
-        // Encode refuses locally…
-        assert!(encode_client_message(&ClientMessage::ChatImage(too_big.clone())).is_none());
-        assert!(
-            encode_server_message(&ServerMessage::ChatImage(ChatImageMessage {
-                client_id: 1,
-                data: too_big.clone(),
-            }))
-            .is_none()
-        );
-
-        // …and a hostile peer that serializes it anyway is dropped at
-        // decode (post-decode payload check).
-        let raw = postcard::to_allocvec(&ClientMessage::ChatImage(too_big)).unwrap();
+        // A chunk *claiming* an absurd total is refused outright, so
+        // reassemblers never even see it.
+        let overcount = ClientMessage::ChatImageChunk {
+            upload_id: 0,
+            index: 0,
+            count: MAX_IMAGE_CHUNKS + 1,
+            data: Vec::new(),
+        };
+        let raw = postcard::to_allocvec(&overcount).unwrap();
         assert!(decode_client_message(&raw).is_none());
     }
 
     #[test]
     fn huge_non_image_message_still_rejected() {
-        // The relaxed pre-decode bound must not open the door for other
-        // variants to balloon: a 500 KB text chat is refused post-decode.
+        // The pre-decode bound must not let other variants balloon:
+        // a 500 KB text chat is refused post-decode.
         let msg = ClientMessage::Chat("x".repeat(500 * 1024));
         assert!(encode_client_message(&msg).is_none());
         let raw = postcard::to_allocvec(&msg).unwrap();
@@ -512,16 +564,22 @@ mod tests {
     }
 
     #[test]
-    fn chat_image_uses_media_channel() {
-        assert_eq!(ClientMessage::ChatImage(Vec::new()).channel(), MEDIA_CHANNEL);
-        assert_eq!(
-            ServerMessage::ChatImage(ChatImageMessage {
-                client_id: 0,
-                data: Vec::new(),
-            })
-            .channel(),
-            MEDIA_CHANNEL
-        );
+    fn image_chunks_use_media_channel() {
+        let c = ClientMessage::ChatImageChunk {
+            upload_id: 0,
+            index: 0,
+            count: 1,
+            data: Vec::new(),
+        };
+        assert_eq!(c.channel(), MEDIA_CHANNEL);
+        let s = ServerMessage::ChatImageChunk {
+            client_id: 0,
+            upload_id: 0,
+            index: 0,
+            count: 1,
+            data: Vec::new(),
+        };
+        assert_eq!(s.channel(), MEDIA_CHANNEL);
     }
 
     #[test]

@@ -123,6 +123,13 @@ pub struct LimitSettings {
     /// bursting together multiply into `clients × bytes` of relay
     /// egress. `0` disables image relay entirely.
     pub max_image_kb_per_minute_global: usize,
+    /// Relay pacing for chat images, KiB per second *per receiver*.
+    /// Images are re-chunked and trickled out at this rate so a big
+    /// image never floods a receiver's downlink queue — that queue is
+    /// shared with voice, and flooding it is what made calls stutter
+    /// during uploads. Values below 64 are treated as 64. At the
+    /// default 1024, a 2.5 MB image takes ~2.5 s per receiver.
+    pub media_relay_kb_per_sec: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -319,6 +326,7 @@ impl Default for LimitSettings {
             // can't multiply into hundreds of MB/min of relay egress.
             max_image_kb_per_minute: 4096,
             max_image_kb_per_minute_global: 16_384,
+            media_relay_kb_per_sec: 1024,
         }
     }
 }

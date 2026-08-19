@@ -31,10 +31,10 @@ pub use channels::{
     VOICE_CHANNEL, connection_config,
 };
 pub use messages::{
-    ChannelDenyReason, ChannelInfo, ChatImageMessage, ChatMessage, ClientMessage, DenyReason,
-    MAX_CHAT_IMAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_IMAGE_MESSAGE_BYTES, ServerMessage,
-    ShareScope, decode_client_message, decode_server_message, encode_client_message,
-    encode_server_message,
+    ChannelDenyReason, ChannelInfo, ChatMessage, ClientMessage, DenyReason, IMAGE_CHUNK_BYTES,
+    MAX_CHAT_IMAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_IMAGE_CHUNKS, MAX_IMAGE_MESSAGE_BYTES,
+    MEDIA_UPLOAD_PACE, ServerMessage, ShareScope, decode_client_message, decode_server_message,
+    encode_client_message, encode_server_message,
 };
 pub use relayed::{RELAY_SENDER_BYTES, split_sender, wrap_sender};
 pub use system_audio::{
