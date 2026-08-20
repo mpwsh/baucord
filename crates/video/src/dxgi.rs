@@ -34,7 +34,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HMODULE, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -50,6 +49,7 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::core::{BOOL, Interface};
 
 use crate::CaptureError;
@@ -59,14 +59,12 @@ use crate::CaptureError;
 /// iteration).
 const ACQUIRE_TIMEOUT_MS: u32 = 200;
 
-/// Delay between duplication rebuild attempts after `ACCESS_LOST`.
-const REBUILD_BACKOFF: Duration = Duration::from_millis(250);
-
-/// Give up rebuilding after this long and report permanent failure —
-/// the caller falls back to the screenshot backend. Mode changes
-/// resolve within a second or two; anything longer is systemic
-/// (secure desktop, driver reset loop, monitor gone).
-const REBUILD_GIVE_UP: Duration = Duration::from_secs(15);
+// NOTE: there is deliberately no rebuild loop in this module. Field
+// evidence (see capture.rs) shows duplications created from the capture
+// worker thread die instantly while a fullscreen app owns the output,
+// while duplications created from the consumer thread work — so on any
+// fatal error the worker reports Lost and exits, and the *consumer*
+// recreates the whole duplicator on its own thread.
 
 /// One captured desktop frame, tightly packed **BGRA**, top-down.
 pub struct CapturedFrame {
@@ -80,16 +78,17 @@ pub struct CapturedFrame {
 pub enum Health {
     /// Capturing (or waiting for the screen to change).
     Running,
-    /// Duplication lost (mode change etc.) — rebuilding with backoff.
-    /// The consumer should keep showing its held frame.
-    Rebuilding,
-    /// Permanently failed; see [`DxgiDuplicator::failure`]. The worker
-    /// has exited. Fall back to another backend.
+    /// Duplication lost (mode change etc.); the worker has exited.
+    /// Drop this duplicator and create a new one **from the consumer
+    /// thread** — see the module note on why the thread matters.
+    Lost,
+    /// Permanently failed (unsupported/HDR desktop format); see
+    /// [`DxgiDuplicator::failure`]. Fall back to another backend.
     Failed,
 }
 
 const HEALTH_RUNNING: u8 = 0;
-const HEALTH_REBUILDING: u8 = 1;
+const HEALTH_LOST: u8 = 1;
 const HEALTH_FAILED: u8 = 2;
 
 struct Shared {
@@ -101,14 +100,16 @@ struct Shared {
 }
 
 impl Shared {
-    fn set_health(&self, h: u8) {
-        self.health.store(h, Ordering::Release);
+    fn lost(&self, msg: String) {
+        log::info!("dxgi capture: duplication lost ({msg}) — worker exiting for recreate");
+        *self.failure.lock().unwrap() = Some(msg);
+        self.health.store(HEALTH_LOST, Ordering::Release);
     }
 
     fn fail(&self, msg: String) {
         log::warn!("dxgi capture failed permanently: {msg}");
         *self.failure.lock().unwrap() = Some(msg);
-        self.set_health(HEALTH_FAILED);
+        self.health.store(HEALTH_FAILED, Ordering::Release);
     }
 }
 
@@ -133,8 +134,7 @@ impl DxgiDuplicator {
     /// Returns [`CaptureError`] if the monitor can't be found or the
     /// OS refuses the duplication.
     pub fn new(monitor_index: usize) -> Result<Self, CaptureError> {
-        let h_monitor_raw = hmonitor_at(monitor_index)?;
-        let (device, context, duplication) = open_duplication(h_monitor_raw)?;
+        let (device, context, duplication) = open_duplication(hmonitor_at(monitor_index)?)?;
 
         let shared = Arc::new(Shared {
             exit: AtomicBool::new(false),
@@ -146,7 +146,7 @@ impl DxgiDuplicator {
         let worker_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("dxgi-capture".into())
-            .spawn(move || worker_loop(worker_shared, h_monitor_raw, device, context, duplication))
+            .spawn(move || worker_loop(worker_shared, monitor_index, device, context, duplication))
             .map_err(|e| CaptureError::Capture(format!("spawn capture worker: {e}")))?;
 
         Ok(Self {
@@ -164,12 +164,12 @@ impl DxgiDuplicator {
     pub fn health(&self) -> Health {
         match self.shared.health.load(Ordering::Acquire) {
             HEALTH_RUNNING => Health::Running,
-            HEALTH_REBUILDING => Health::Rebuilding,
+            HEALTH_LOST => Health::Lost,
             _ => Health::Failed,
         }
     }
 
-    /// The permanent failure message, once [`Health::Failed`].
+    /// The loss/failure message, once not [`Health::Running`].
     pub fn failure(&self) -> Option<String> {
         self.shared.failure.lock().unwrap().clone()
     }
@@ -189,11 +189,16 @@ impl Drop for DxgiDuplicator {
 
 fn worker_loop(
     shared: Arc<Shared>,
-    h_monitor_raw: isize,
-    mut _device: ID3D11Device,
-    mut context: ID3D11DeviceContext,
-    mut duplication: IDXGIOutputDuplication,
+    _monitor_index: usize,
+    _device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    duplication: IDXGIOutputDuplication,
 ) {
+    // Belt-and-braces COM init for DXGI interop from a bare thread.
+    // Cheap, and one plausible mechanism for why worker-created
+    // duplications behaved worse than consumer-created ones.
+    let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+
     // Persistent staging texture, recreated only when the source
     // dimensions change (mode switches).
     let mut staging: Option<(ID3D11Texture2D, u32, u32)> = None;
@@ -216,39 +221,14 @@ fn worker_loop(
                 continue;
             }
             Err(e) => {
-                // ACCESS_LOST and friends: the duplication is dead.
-                // Routine around games (mode changes, fullscreen
-                // transitions) — rebuild in place with backoff.
+                // ACCESS_LOST and friends: the duplication is dead
+                // (mode changes, fullscreen transitions). Report and
+                // exit — the consumer recreates the whole duplicator on
+                // its own thread, where creation demonstrably works
+                // even while a fullscreen app owns the output.
                 let _ = unsafe { duplication.ReleaseFrame() };
-                log::info!("dxgi capture: duplication lost ({e}) — rebuilding");
-                shared.set_health(HEALTH_REBUILDING);
-                staging = None;
-
-                let deadline = Instant::now() + REBUILD_GIVE_UP;
-                loop {
-                    if shared.exit.load(Ordering::Acquire) {
-                        break 'outer;
-                    }
-                    std::thread::sleep(REBUILD_BACKOFF);
-                    match open_duplication(h_monitor_raw) {
-                        Ok((d, c, dup)) => {
-                            _device = d;
-                            context = c;
-                            duplication = dup;
-                            shared.set_health(HEALTH_RUNNING);
-                            log::info!("dxgi capture: duplication rebuilt");
-                            continue 'outer;
-                        }
-                        Err(err) => {
-                            if Instant::now() >= deadline {
-                                shared.fail(format!(
-                                    "could not re-establish desktop duplication: {err}"
-                                ));
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
+                shared.lost(e.to_string());
+                break 'outer;
             }
             Ok(()) => {
                 // The frame present at duplication creation reports
@@ -277,15 +257,19 @@ fn worker_loop(
                         break 'outer;
                     }
                     Err(GrabError::Windows(e)) => {
-                        // Treat like a lost duplication: release and let
-                        // the next acquire hit the rebuild path.
+                        // Treat like a lost duplication: report + exit
+                        // so the consumer recreates us.
                         let _ = unsafe { duplication.ReleaseFrame() };
-                        log::warn!("dxgi capture: frame readback failed ({e}) — will rebuild");
-                        continue;
+                        shared.lost(format!("frame readback failed: {e}"));
+                        break 'outer;
                     }
                 }
             }
         }
+    }
+
+    if com.is_ok() {
+        unsafe { CoUninitialize() };
     }
 }
 

@@ -197,8 +197,9 @@ impl Capturer {
     pub fn poll(&mut self) -> Result<CaptureStatus, CaptureError> {
         #[cfg(target_os = "windows")]
         {
-            let switch = if let Self::Stream(s) = &mut *self {
-                s.take_failure().map(|msg| (msg, s.monitor_index, s.quality))
+            let switch = if let Self::Stream(s) = &*self {
+                s.failure_message()
+                    .map(|msg| (msg, s.monitor_index, s.quality))
             } else {
                 None
             };
@@ -266,6 +267,20 @@ const fn concat_backend_name() -> &'static str {
 
 // ── Streaming backend (Windows, vendored DXGI) ──────────────────────────
 
+/// Minimum spacing between duplicator recreations after a loss. Games
+/// kill freshly built duplications several times during a fullscreen
+/// transition storm; recreation is cheap, so retry briskly but not in
+/// a busy loop.
+#[cfg(target_os = "windows")]
+const RECREATE_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Give up after this long without a single *real* streamed frame
+/// despite recreations, and fall back to the screenshot backend. A
+/// transition storm resolves within a few seconds; a sustained drought
+/// means this output genuinely can't be duplicated right now.
+#[cfg(target_os = "windows")]
+const STREAM_DROUGHT_GIVE_UP: Duration = Duration::from_secs(12);
+
 /// How long the streaming backend tolerates total silence before the
 /// GDI belt-and-braces probe runs. The vendored module reports its own
 /// health, so unlike the xcap era this probe should never find a
@@ -282,7 +297,8 @@ const SILENCE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// so every frame this backend emits has one consistent format.
 #[cfg(target_os = "windows")]
 pub struct StreamCapturer {
-    dup: crate::dxgi::DxgiDuplicator,
+    /// `None` between a loss and a successful recreation.
+    dup: Option<crate::dxgi::DxgiDuplicator>,
     monitor_index: usize,
     quality: Quality,
     /// Most recent frame (BGRA), retained for repeat-encodes.
@@ -295,8 +311,17 @@ pub struct StreamCapturer {
     last_rx: Instant,
     /// Last GDI probe (rate limiting).
     last_probe: Option<Instant>,
-    /// Permanent failure already handed to the caller.
-    failure_reported: bool,
+    /// Set at the first duplicator loss without a delivered frame,
+    /// cleared by any real streamed frame. Sustained past
+    /// [`STREAM_DROUGHT_GIVE_UP`] => fall back to screenshots.
+    stream_drought_since: Option<Instant>,
+    /// Last recreation attempt (rate limiting).
+    last_recreate: Option<Instant>,
+    /// When the current duplicator was built, for first-frame latency
+    /// logging (proof in the log that real streaming resumed).
+    dup_built_at: Instant,
+    /// Whether the current duplicator has delivered a frame yet.
+    dup_delivered: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -313,7 +338,7 @@ impl StreamCapturer {
         info!("StreamCapturer: monitor {monitor_index}, target={quality}");
 
         let mut cap = Self {
-            dup,
+            dup: Some(dup),
             monitor_index,
             quality,
             last: None,
@@ -321,7 +346,10 @@ impl StreamCapturer {
             start_time: Instant::now(),
             last_rx: Instant::now(),
             last_probe: None,
-            failure_reported: false,
+            stream_drought_since: None,
+            last_recreate: None,
+            dup_built_at: Instant::now(),
+            dup_delivered: false,
         };
         // DXGI only delivers on *change* — on a static screen the first
         // real frame may be a long way off. Seed with one screenshot so
@@ -355,23 +383,50 @@ impl StreamCapturer {
     /// `Unchanged` (freeze-frame) or `Empty`; permanent failure is
     /// surfaced via [`Self::take_failure`].
     pub fn poll(&mut self) -> CaptureStatus {
-        if let Some(cf) = self.dup.take_frame() {
-            self.last = Some(Frame {
-                data: cf.data,
-                width: cf.width,
-                height: cf.height,
-                timestamp_ms: self.start_time.elapsed().as_millis() as u64,
-                format: PixelFormat::Bgra,
-            });
-            self.fresh_pending = false;
-            self.last_rx = Instant::now();
-            return CaptureStatus::Fresh;
+        if let Some(dup) = &self.dup {
+            if let Some(cf) = dup.take_frame() {
+                if !self.dup_delivered {
+                    self.dup_delivered = true;
+                    info!(
+                        "dxgi streaming: first frame {} ms after duplicator build                          ({}x{})",
+                        self.dup_built_at.elapsed().as_millis(),
+                        cf.width,
+                        cf.height
+                    );
+                }
+                self.stream_drought_since = None;
+                self.last = Some(Frame {
+                    data: cf.data,
+                    width: cf.width,
+                    height: cf.height,
+                    timestamp_ms: self.start_time.elapsed().as_millis() as u64,
+                    format: PixelFormat::Bgra,
+                });
+                self.fresh_pending = false;
+                self.last_rx = Instant::now();
+                return CaptureStatus::Fresh;
+            }
+        }
+
+        // A lost duplicator is recreated HERE, on the consumer thread —
+        // duplications created from the capture worker die instantly
+        // while a fullscreen app owns the output (field-observed),
+        // while consumer-thread creation works. Rate-limited; a
+        // transition storm just means a few recreations in a row.
+        let lost = self
+            .dup
+            .as_ref()
+            .is_none_or(|d| d.health() == crate::dxgi::Health::Lost);
+        if lost {
+            self.stream_drought_since.get_or_insert_with(Instant::now);
+            self.try_recreate();
         }
 
         // Belt-and-braces: if the screen moved while the backend was
         // silent for a while, deliver a probe frame so the stream can't
-        // freeze regardless of what went wrong underneath.
-        if self.dup.health() == crate::dxgi::Health::Running && self.probe_finds_change() {
+        // freeze regardless of what went wrong underneath — including
+        // during recreation gaps.
+        if self.probe_finds_change() {
             return CaptureStatus::Fresh;
         }
 
@@ -384,6 +439,31 @@ impl StreamCapturer {
             CaptureStatus::Unchanged
         } else {
             CaptureStatus::Empty
+        }
+    }
+
+    /// Drop the dead duplicator (joining its worker, releasing the
+    /// duplication) and build a fresh one on this thread.
+    fn try_recreate(&mut self) {
+        if let Some(t) = self.last_recreate {
+            if t.elapsed() < RECREATE_INTERVAL {
+                return;
+            }
+        }
+        self.last_recreate = Some(Instant::now());
+        // Old one must be fully gone before the new DuplicateOutput
+        // (one duplication per output per process).
+        self.dup = None;
+        match crate::dxgi::DxgiDuplicator::new(self.monitor_index) {
+            Ok(d) => {
+                info!("dxgi streaming: duplicator recreated");
+                self.dup = Some(d);
+                self.dup_built_at = Instant::now();
+                self.dup_delivered = false;
+            }
+            Err(e) => {
+                warn!("dxgi streaming: recreate failed (will retry): {e}");
+            }
         }
     }
 
@@ -448,18 +528,31 @@ impl StreamCapturer {
         self.quality
     }
 
-    /// Permanent failure message, once — the [`Capturer`] uses it to
-    /// switch to the screenshot backend.
-    fn take_failure(&mut self) -> Option<String> {
-        if self.failure_reported || self.dup.health() != crate::dxgi::Health::Failed {
-            return None;
+    /// Reason to abandon streaming (side-effect-free peek): the module
+    /// failed permanently (unsupported/HDR format), or recreations have
+    /// produced no real frame for [`STREAM_DROUGHT_GIVE_UP`]. The
+    /// [`Capturer`] switches to the screenshot backend on seeing it —
+    /// and because this variant is destroyed by a successful switch,
+    /// while a failed switch leaves it in place, the switch naturally
+    /// retries every poll until it lands.
+    fn failure_message(&self) -> Option<String> {
+        if let Some(d) = &self.dup {
+            if d.health() == crate::dxgi::Health::Failed {
+                return Some(
+                    d.failure()
+                        .unwrap_or_else(|| "unknown capture failure".into()),
+                );
+            }
         }
-        self.failure_reported = true;
-        Some(
-            self.dup
-                .failure()
-                .unwrap_or_else(|| "unknown capture failure".into()),
-        )
+        if let Some(since) = self.stream_drought_since {
+            if since.elapsed() >= STREAM_DROUGHT_GIVE_UP {
+                return Some(format!(
+                    "no streamed frames for {:.0}s despite duplicator recreations",
+                    since.elapsed().as_secs_f32()
+                ));
+            }
+        }
+        None
     }
 }
 
