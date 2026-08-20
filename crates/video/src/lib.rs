@@ -270,6 +270,18 @@ pub trait VideoEncoder {
     fn keyframe_pending(&self) -> bool {
         false
     }
+
+    /// Whether [`VideoEncoder::force_keyframe`] can actually produce an
+    /// IDR on demand.
+    ///
+    /// FFmpeg's AMF wrapper (through 7.1) ignores frame-level keyframe
+    /// requests — IDRs only appear when the encoder's own period
+    /// elapses, counted in *submitted frames*. When this is `false`,
+    /// the capture loop must keep frames flowing (even on a static
+    /// screen) after a keyframe request so that period actually passes.
+    fn supports_forced_keyframes(&self) -> bool {
+        true
+    }
 }
 
 /// Decoder that converts H.264 bitstream back into RGBA frames.

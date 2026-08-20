@@ -290,6 +290,12 @@ impl FfmpegEncoder {
         self.force_next_keyframe
     }
 
+    /// See [`VideoEncoder::supports_forced_keyframes`]: everything we
+    /// use honors `pict_type=I` except FFmpeg's AMF wrapper (<= 7.1).
+    pub fn supports_forced_keyframes(&self) -> bool {
+        self.enc_name != "h264_amf"
+    }
+
     pub fn quality(&self) -> Quality {
         self.quality
     }
@@ -320,6 +326,10 @@ impl VideoEncoder for FfmpegEncoder {
 
     fn keyframe_pending(&self) -> bool {
         self.keyframe_pending()
+    }
+
+    fn supports_forced_keyframes(&self) -> bool {
+        self.supports_forced_keyframes()
     }
 }
 
@@ -609,7 +619,19 @@ fn open_session(
     // Backstop GOP only — the real cadence is the time-based IDR forcing
     // in encode(). Keeping this much longer than KEYFRAME_INTERVAL_MS
     // means exactly one mechanism decides where keyframes go.
-    ctx.set_gop(quality.fps() * GOP_BACKSTOP_SECS);
+    //
+    // EXCEPT h264_amf: FFmpeg's AMF wrapper (through 7.1) ignores
+    // frame-level pict_type entirely — there is NO way to force an IDR
+    // mid-stream. The manual cadence silently produces P-frames, so the
+    // encoder-side IDR period is the only keyframe mechanism AMF has;
+    // set it to the design cadence instead of the backstop. (FFmpeg 8's
+    // rewritten amfenc honors forced_idr — revisit on upgrade.)
+    let gop_secs = if name == "h264_amf" {
+        (KEYFRAME_INTERVAL_MS / 1000) as u32
+    } else {
+        GOP_BACKSTOP_SECS
+    };
+    ctx.set_gop(quality.fps() * gop_secs);
     ctx.set_max_b_frames(0);
 
     // Signal BT.709 limited-range in the bitstream VUI so any decoder —
@@ -773,6 +795,10 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
             opts.set("low_power", "1");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
+            // No-op on FFmpeg <= 7.1 (the option doesn't exist there;
+            // unknown dict keys are silently ignored) but honored by
+            // FFmpeg 8's rewritten amfenc — kept so an ffmpeg upgrade
+            // restores on-demand IDRs without a code change.
             opts.set("forced_idr", "1");
         }
         "h264_amf" => {
@@ -783,7 +809,19 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
             opts.set("quality", "balanced");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
+            // No-op on FFmpeg <= 7.1 (the option doesn't exist there;
+            // unknown dict keys are silently ignored) but honored by
+            // FFmpeg 8's rewritten amfenc — kept so an ffmpeg upgrade
+            // restores on-demand IDRs without a code change.
             opts.set("forced_idr", "1");
+            // CRITICAL for this pipeline: AMF only emits SPS/PPS at
+            // stream start by default, so a viewer who joins mid-stream
+            // receives IDRs they can never decode — observed as an
+            // endless keyframe-request loop. x264 repeats headers
+            // before every IDR by default; header_spacing=1 makes AMF
+            // attach them to every AU (~50 bytes/frame, noise at our
+            // bitrates), so any IDR primes a fresh decoder instantly.
+            opts.set("header_spacing", "1");
         }
         _ => {}
     }

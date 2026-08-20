@@ -252,6 +252,12 @@ struct CaptureState {
     /// joiners, live-looking stats) while the screen is static. With
     /// the screenshot backend every poll is Fresh and this never fires.
     next_refresh: Instant,
+    /// While `Some` and not yet expired, the static-screen encode skip
+    /// is suspended: a viewer asked for a keyframe and this encoder
+    /// (AMF) can only emit IDRs after enough *submitted* frames, so
+    /// frames must keep flowing until one ships. Cleared when a
+    /// keyframe AU is sent.
+    keyframe_burst_until: Option<Instant>,
     /// System audio capture — started alongside video, sends Opus stereo
     /// packets to the network. `None` if platform doesn't support it.
     system_audio: Option<SystemAudioCapture>,
@@ -318,6 +324,14 @@ const PACE_DISTRESS_HOLD: Duration = Duration::from_secs(30);
 /// A pending forced keyframe (viewer waiting on an IDR) bypasses this
 /// and encodes on the next tick.
 const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Upper bound on a keyframe "burst" (see CaptureState::keyframe_burst_until):
+/// when the encoder can't force IDRs (AMF), a viewer's keyframe request
+/// makes us encode every tick — static screen or not — until the
+/// encoder's own IDR period elapses. At the 2 s AMF IDR period a burst
+/// resolves within ~2 s of full-rate frames; this cap just guarantees a
+/// misbehaving encoder can't pin us at full rate forever.
+const KEYFRAME_BURST_MAX: Duration = Duration::from_secs(5);
 
 /// The capture interval at the current pace.
 fn effective_frame_interval(state: &CaptureState) -> Duration {
@@ -741,6 +755,7 @@ fn handle_control(
                 quality,
                 seq: 0,
                 next_refresh: Instant::now(),
+                keyframe_burst_until: None,
                 system_audio,
                 pace_idx: 0,
                 pace_changed: Instant::now(),
@@ -939,6 +954,11 @@ fn handle_control(
                 state.encoder.force_keyframe();
 
                 let now = Instant::now();
+                if !state.encoder.supports_forced_keyframes() {
+                    // This encoder only emits IDRs on its own frame-counted
+                    // period — keep frames flowing so it actually elapses.
+                    state.keyframe_burst_until = Some(now + KEYFRAME_BURST_MAX);
+                }
                 state.kf_request_times.push(now);
                 state
                     .kf_request_times
@@ -1018,7 +1038,10 @@ fn capture_and_encode(
             // is waiting on a forced IDR or the periodic refresh is due
             // — otherwise skip entirely: no swscale, no encoder work,
             // no bytes on the wire, and no seq consumed.
-            if !state.encoder.keyframe_pending() && now < state.next_refresh {
+            let bursting = state
+                .keyframe_burst_until
+                .is_some_and(|until| now < until);
+            if !state.encoder.keyframe_pending() && !bursting && now < state.next_refresh {
                 shared.last_capture_us.store(capture_us, Ordering::Relaxed);
                 return;
             }
@@ -1086,9 +1109,16 @@ fn capture_and_encode(
                 protocol::MAX_VIDEO_FRAME_BYTES,
             );
             state.encoder.force_keyframe();
+            if !state.encoder.supports_forced_keyframes() {
+                state.keyframe_burst_until = Some(Instant::now() + KEYFRAME_BURST_MAX);
+            }
             continue;
         }
 
+        if encoded.is_keyframe {
+            // A real IDR is going out — any burst has done its job.
+            state.keyframe_burst_until = None;
+        }
         let _ = network_tx.try_send(NetworkControl::SendVideoFrame {
             seq,
             is_keyframe: encoded.is_keyframe,
