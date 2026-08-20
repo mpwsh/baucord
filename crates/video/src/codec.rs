@@ -57,6 +57,12 @@ use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder
 /// Time between IDR keyframes, in milliseconds of *capture time*.
 pub const KEYFRAME_INTERVAL_MS: u64 = 2_000;
 
+/// Minimum spacing between IDR-via-session-reopen events (see the
+/// reopen logic in [`FfmpegEncoder::encode`]): each reopen costs a
+/// rate-control reset and ~10-30 ms, so even under a keyframe-request
+/// storm we cap it at roughly one per interval.
+const MIN_IDR_REOPEN_INTERVAL_MS: u64 = 700;
+
 /// Codec-level GOP backstop, in seconds. The primary keyframe cadence is
 /// the time-based forcing above; this only guarantees an eventual refresh
 /// if that logic ever fails. Kept long so the two mechanisms don't fight.
@@ -88,6 +94,13 @@ pub struct FfmpegEncoder {
     enc_name: &'static str,
     quality: Quality,
     force_next_keyframe: bool,
+    /// Capture timestamp of the most recent keyframe AU this encoder
+    /// actually emitted — ground truth, independent of what the codec
+    /// promised. Drives the reopen-for-IDR backstop in [`Self::encode`].
+    last_idr_out_ms: Option<u64>,
+    /// Last time [`Self::encode`] reopened the session to force an IDR
+    /// (rate limiting, capture-timestamp clock).
+    last_idr_reopen_ms: Option<u64>,
     /// Capture timestamp of the last IDR we forced (drives cadence).
     last_keyframe_ms: Option<u64>,
     /// Last PTS handed to the encoder — used to keep PTS strictly increasing.
@@ -148,6 +161,8 @@ impl FfmpegEncoder {
                         enc_name: name,
                         quality,
                         force_next_keyframe: false,
+                        last_idr_out_ms: None,
+                        last_idr_reopen_ms: None,
                         last_keyframe_ms: None,
                         last_pts: None,
                         session: None,
@@ -205,6 +220,41 @@ impl FfmpegEncoder {
     /// Encode one RGBA frame. See [`VideoEncoder::encode`] for the output
     /// contract (zero or more access units, one `EncodedFrame` each).
     pub fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        // Reopen-for-IDR backstop. Some encoders (FFmpeg's AMF wrapper
+        // <= 7.1) cannot force an IDR: frame-level pict_type is ignored
+        // and the IDR-period property is assigned after component init,
+        // where it can fail silently — leaving the session's first
+        // frame as the only IDR it will ever emit. The one mechanism
+        // that provably works everywhere is that a *fresh session
+        // always starts with an IDR carrying parameter sets. So when an
+        // IDR is demanded (a viewer asked, or none has been emitted for
+        // 2x the cadence interval) and this encoder can't force one,
+        // reopen the session: one rate-control reset and ~10-30 ms
+        // (rate limited) buys a guaranteed, immediate keyframe. Frames
+        // in flight inside the old session are discarded — they consume
+        // no sequence numbers, so viewers see no loss signal.
+        if !self.supports_forced_keyframes() && self.session.is_some() {
+            let idr_overdue = match self.last_idr_out_ms {
+                Some(t) => frame.timestamp_ms.saturating_sub(t) >= 2 * KEYFRAME_INTERVAL_MS,
+                // The running session opened with an IDR; None just
+                // means the async pipeline hasn't produced output yet.
+                None => false,
+            };
+            let recently_reopened = match self.last_idr_reopen_ms {
+                Some(t) => frame.timestamp_ms.saturating_sub(t) < MIN_IDR_REOPEN_INTERVAL_MS,
+                None => false,
+            };
+            if (self.force_next_keyframe || idr_overdue) && !recently_reopened {
+                log::info!(
+                    "encoder can't force IDRs — reopening session for one \
+                     (viewer_forced={}, cadence_overdue={})",
+                    self.force_next_keyframe,
+                    idr_overdue
+                );
+                self.last_idr_reopen_ms = Some(frame.timestamp_ms);
+                self.session = None;
+            }
+        }
         self.ensure_session(frame.width, frame.height)?;
 
         // Strictly increasing PTS in the 1/1000 time base. Capture
@@ -274,6 +324,13 @@ impl FfmpegEncoder {
         }
 
         drain_packets(session, &mut out)?;
+        if out.iter().any(|f| f.is_keyframe) {
+            // Ground truth for the reopen-for-IDR backstop: a keyframe
+            // actually left this encoder (stamped with the submitting
+            // frame's clock; pipeline delay of a few frames is noise at
+            // the 2 s cadence scale).
+            self.last_idr_out_ms = Some(frame.timestamp_ms);
+        }
         Ok(out)
     }
 
@@ -802,7 +859,15 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
             opts.set("forced_idr", "1");
         }
         "h264_amf" => {
-            opts.set("usage", "ultralowlatency");
+            // NO usage preset — deliberately. FFmpeg's AMF wrapper
+            // (<= 7.1) assigns IDR_PERIOD *after* the AMF component is
+            // initialized; under usage presets (observed with
+            // ultralowlatency) that late assignment fails silently and
+            // the stream never gets another IDR after frame 0. The
+            // default (transcoding) usage is the well-trodden path, and
+            // everything the preset tuned is set explicitly below
+            // (CBR + HRD, no filler, no frame skipping, bf=0 via
+            // max_b_frames).
             // "balanced", not "speed": AMD's encode block also has
             // headroom to spare at these resolutions — same trade as
             // NVENC p4 above.
