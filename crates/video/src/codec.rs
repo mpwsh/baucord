@@ -807,6 +807,19 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
             // headroom to spare at these resolutions — same trade as
             // NVENC p4 above.
             opts.set("quality", "balanced");
+            // Explicit CBR + HRD: left on auto, amfenc picks
+            // peak-constrained VBR (because max_bit_rate is set) with
+            // HRD enforcement OFF — VBV becomes advisory and IDRs
+            // overshoot the transport's per-frame cap (observed: 359 KB
+            // against a 275 KB limit → dropped keyframes). enforce_hrd
+            // makes bufsize binding, like x264's VBV. filler_data off:
+            // CBR padding on static scenes would defeat the capture
+            // loop's skip-encode entirely. frame_skipping off: keep
+            // one-AU-per-frame semantics predictable for the transport.
+            opts.set("rc", "cbr");
+            opts.set("enforce_hrd", "1");
+            opts.set("filler_data", "0");
+            opts.set("frame_skipping", "0");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
             // No-op on FFmpeg <= 7.1 (the option doesn't exist there;

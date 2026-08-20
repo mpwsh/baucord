@@ -237,6 +237,49 @@ pub enum CodecError {
 // ---------------------------------------------------------------------------
 
 /// Encoder that converts RGBA frames into an H.264 bitstream.
+/// Human-readable list of H.264 NAL unit types in an Annex-B access
+/// unit, e.g. `"SPS,PPS,IDR"` — a diagnostic aid for verifying what an
+/// encoder actually emitted. Hardware encoder wrappers have quirks
+/// (missing in-band parameter sets, I-slices flagged as keyframes),
+/// and this makes them visible from the sender's log alone.
+pub fn describe_annexb_nals(data: &[u8]) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i + 3 < data.len() {
+        if data[i] != 0 || data[i + 1] != 0 {
+            i += 1;
+            continue;
+        }
+        let hdr = if data[i + 2] == 1 {
+            i + 3
+        } else if data[i + 2] == 0 && i + 4 < data.len() && data[i + 3] == 1 {
+            i + 4
+        } else {
+            i += 1;
+            continue;
+        };
+        if hdr >= data.len() {
+            break;
+        }
+        let name = match data[hdr] & 0x1F {
+            1 => "slice".to_string(),
+            5 => "IDR".to_string(),
+            6 => "SEI".to_string(),
+            7 => "SPS".to_string(),
+            8 => "PPS".to_string(),
+            9 => "AUD".to_string(),
+            t => format!("nal{t}"),
+        };
+        names.push(name);
+        i = hdr + 1;
+    }
+    if names.is_empty() {
+        "no start codes found".to_string()
+    } else {
+        names.join(",")
+    }
+}
+
 pub trait VideoEncoder {
     /// Encode one RGBA frame.
     ///

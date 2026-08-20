@@ -258,6 +258,10 @@ struct CaptureState {
     /// frames must keep flowing until one ships. Cleared when a
     /// keyframe AU is sent.
     keyframe_burst_until: Option<Instant>,
+    /// Keyframe AUs whose NAL layout has been logged this session (the
+    /// first few are logged at INFO as a bitstream self-check — makes
+    /// hardware-encoder quirks visible from the sender's log alone).
+    keyframes_logged: u8,
     /// System audio capture — started alongside video, sends Opus stereo
     /// packets to the network. `None` if platform doesn't support it.
     system_audio: Option<SystemAudioCapture>,
@@ -756,6 +760,7 @@ fn handle_control(
                 seq: 0,
                 next_refresh: Instant::now(),
                 keyframe_burst_until: None,
+                keyframes_logged: 0,
                 system_audio,
                 pace_idx: 0,
                 pace_changed: Instant::now(),
@@ -1118,6 +1123,18 @@ fn capture_and_encode(
         if encoded.is_keyframe {
             // A real IDR is going out — any burst has done its job.
             state.keyframe_burst_until = None;
+            // Bitstream self-check: prove (or disprove) that keyframe
+            // AUs carry what viewers need to prime — parameter sets and
+            // an actual IDR slice.
+            if state.keyframes_logged < 3 {
+                state.keyframes_logged += 1;
+                info!(
+                    "keyframe AU check #{}: seq={seq}, {} bytes, NALs: {}",
+                    state.keyframes_logged,
+                    encoded.data.len(),
+                    video::describe_annexb_nals(&encoded.data)
+                );
+            }
         }
         let _ = network_tx.try_send(NetworkControl::SendVideoFrame {
             seq,
