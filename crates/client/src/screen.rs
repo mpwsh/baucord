@@ -29,7 +29,7 @@ use log::{info, warn};
 use video::{
     CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
     buffer::{BufferedPacket, VideoJitterBuffer},
-    capture::{CaptureStatus, Capturer},
+    capture::{CaptureStatus, Capturer, StreamCapturer},
     codec::{FfmpegDecoder, FfmpegEncoder},
 };
 
@@ -403,6 +403,12 @@ struct PeerStream {
 struct ScreenState {
     /// Our own capture + encode pipeline while sharing.
     capture: Option<CaptureState>,
+    /// Streaming capturer parked between shares. Windows allows one
+    /// desktop duplication per output per process and xcap can't
+    /// release it on drop, so the recorder is paused and reused —
+    /// otherwise every second share silently falls back to GDI with
+    /// `video_recorder: E_INVALIDARG`.
+    parked_stream: Option<StreamCapturer>,
     /// Decode pipelines for remote streams we're watching.
     peer_streams: HashMap<u64, PeerStream>,
     /// Peers whose decoder failed to initialize. Their frames are dropped
@@ -423,6 +429,7 @@ fn run_screen_loop(
 ) {
     let mut st = ScreenState {
         capture: None,
+        parked_stream: None,
         peer_streams: HashMap::new(),
         decoder_failed: HashSet::new(),
         running: true,
@@ -672,10 +679,17 @@ fn handle_control(
             monitor_index,
             scope,
         } => {
-            // Create capturer — Capturer::new picks the best backend
-            // for the platform (streaming on Windows, screenshots
-            // elsewhere / as fallback) and logs the choice.
-            let capturer = match Capturer::new(monitor_index, quality) {
+            // Restart-while-sharing replaces the pipeline; park the old
+            // capturer first so its duplication stays reusable.
+            if let Some(old) = st.capture.take() {
+                st.parked_stream = old.capturer.park();
+            }
+            // Create capturer — picks the best backend for the platform
+            // (streaming on Windows, screenshots elsewhere / as
+            // fallback), reusing the parked streaming session when the
+            // monitor matches, and logs the choice.
+            let capturer =
+                match Capturer::resume_or_new(st.parked_stream.take(), monitor_index, quality) {
                 Ok(c) => c,
                 Err(e) => {
                     event_tx
@@ -758,7 +772,10 @@ fn handle_control(
         }
 
         ScreenControl::StopSharing => {
-            if st.capture.take().is_some() {
+            if let Some(state) = st.capture.take() {
+                // Keep the streaming recorder for the next share (see
+                // ScreenState::parked_stream).
+                st.parked_stream = state.capturer.park();
                 shared.is_sharing.store(false, Ordering::Relaxed);
                 shared.fps_scale_pct.store(100, Ordering::Relaxed);
                 shared.stream_loss_pct.store(0, Ordering::Relaxed);

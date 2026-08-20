@@ -73,16 +73,35 @@ jobs:
         run: |
           brew install opus ffmpeg pkg-config
 
-      - name: Download and setup prebuilt FFmpeg (Windows)
+      # No prebuilt static-md binary exists anywhere with this exact codec
+      # feature set (x264, gpl, nvcodec, amf, qsv) plus the headers/.lib
+      # files needed to link into a Rust binary, so we build it with vcpkg
+      # like a local dev machine would. The `installed` tree is cached by
+      # feature set below, so this only compiles from scratch when that
+      # set changes (or the cache is evicted) — otherwise it's a fast
+      # cache restore + vcpkg no-op.
+      - name: Clone and bootstrap vcpkg (Windows)
         if: runner.os == 'Windows'
         run: |
-          aws s3 cp s3://baucord/ffmpeg-vcpkg-x64-windows-static-md.zip ffmpeg-vcpkg.zip --endpoint-url https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com
-          7z x ffmpeg-vcpkg.zip -oC:\ffmpeg-prebuilt
-          echo "FFMPEG_DIR=C:\ffmpeg-prebuilt\x64-windows-static-md" >> $env:GITHUB_ENV
+          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat
         shell: pwsh
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Cache vcpkg installed packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          # Bump the trailing version number if the feature list or
+          # triplet below ever changes, to force a rebuild.
+          key: vcpkg-ffmpeg-x64-windows-static-md-x264-gpl-nvcodec-amf-qsv-v1
+
+      - name: Install FFmpeg via vcpkg (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          C:\vcpkg\vcpkg.exe install ffmpeg[x264,gpl,nvcodec,amf,qsv]:x64-windows-static-md
+          echo "FFMPEG_DIR=C:\vcpkg\installed\x64-windows-static-md" >> $env:GITHUB_ENV
+        shell: pwsh
 
       # ── Build ───────────────────────────────────────────────────────
 

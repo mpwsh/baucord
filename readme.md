@@ -61,6 +61,34 @@ server is a simple relay — no mixing, no transcoding.
 - Rust 1.95+ (workspace uses edition 2024)
 - FFmpeg shared libraries (for screen share encode/decode)
 
+#### Windows: building FFmpeg with vcpkg
+
+Windows doesn't have a system package manager for FFmpeg, so it's built
+locally via [vcpkg](https://github.com/microsoft/vcpkg) with the codec
+feature set baucord needs (H.264 via x264, plus hardware encode paths
+for NVIDIA/AMD/Intel):
+
+```powershell
+git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+cd C:\vcpkg
+.\bootstrap-vcpkg.bat
+.\vcpkg.exe install ffmpeg[x264,gpl,nvcodec,amf,qsv]:x64-windows-static-md
+```
+
+This can take 30+ minutes the first time — it's compiling x264 and the
+hardware codec bindings from source, not just fetching a binary.
+
+Add vcpkg to your `PATH` (or point `FFMPEG_DIR` at the built output) so
+the build can find it:
+
+```powershell
+$env:FFMPEG_DIR = "C:\vcpkg\installed\x64-windows-static-md"
+```
+
+Add that line to your PowerShell profile if you don't want to set it
+every session. Once it's set, `cargo build` / `cargo run -p desktop`
+will pick up the libraries automatically.
+
 ### Server
 
 ```bash

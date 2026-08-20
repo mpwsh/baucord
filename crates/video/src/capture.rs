@@ -178,6 +178,57 @@ impl Capturer {
         Ok(Self::Screenshot(s))
     }
 
+    /// Like [`Capturer::new`], but first tries to reuse a parked
+    /// streaming capturer from a previous share of the same monitor
+    /// (see [`Capturer::park`]). This matters on Windows: creating a
+    /// second desktop duplication for an output whose previous (parked)
+    /// duplication is still alive fails with E_INVALIDARG, which would
+    /// silently degrade every follow-up share to the GDI fallback.
+    ///
+    /// A parked capturer for a *different* monitor is dropped (its
+    /// output stays blocked for streaming until a display-mode change —
+    /// xcap limitation; the newly requested monitor is unaffected).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Capturer::new`].
+    pub fn resume_or_new(
+        parked: Option<StreamCapturer>,
+        monitor_index: usize,
+        quality: Quality,
+    ) -> Result<Self, CaptureError> {
+        if let Some(mut s) = parked {
+            if s.monitor_index() == monitor_index {
+                match s.resume(quality) {
+                    Ok(()) => {
+                        info!(
+                            "video capture backend: STREAMING — resumed parked DXGI \
+                             desktop duplication (xcap VideoRecorder)"
+                        );
+                        return Ok(Self::Stream(s));
+                    }
+                    Err(e) => warn!("parked streaming capturer failed to resume: {e}"),
+                }
+            }
+        }
+        Self::new(monitor_index, quality)
+    }
+
+    /// Park this capturer for reuse by a later share session. Returns
+    /// the paused streaming backend (hold it and hand it back to
+    /// [`Capturer::resume_or_new`]); `None` for the screenshot backend,
+    /// which has nothing worth keeping.
+    #[must_use]
+    pub fn park(self) -> Option<StreamCapturer> {
+        match self {
+            Self::Stream(mut s) => {
+                s.pause();
+                Some(s)
+            }
+            Self::Screenshot(_) => None,
+        }
+    }
+
     /// Pump the backend once. See [`CaptureStatus`] for what the caller
     /// should do with each result.
     ///
@@ -390,6 +441,66 @@ impl StreamCapturer {
         self.quality
     }
 
+    /// Park the recorder for later reuse instead of dropping it.
+    ///
+    /// Windows permits **one** desktop-duplication instance per output
+    /// per process, and xcap cannot join its capture thread — so a
+    /// *dropped* recorder leaves a parked thread still holding the
+    /// duplication, and every later `video_recorder()` on the same
+    /// output fails with E_INVALIDARG (0x80070057) until a display-mode
+    /// change invalidates the zombie. Parking and resuming reuses the
+    /// one allowed duplication instead of colliding with it.
+    pub fn pause(&mut self) {
+        if let Err(e) = self.recorder.stop() {
+            warn!("failed to pause video recorder: {e}");
+        }
+        // The capture thread may be blocked mid-send on the rendezvous
+        // channel; drain so it can reach its park point.
+        while self.rx.try_recv().is_ok() {}
+        // Whatever we held is stale by the time anyone resumes.
+        self.last = None;
+        self.fresh_pending = false;
+    }
+
+    /// Resume a paused recorder for a new share session.
+    ///
+    /// Restarts the capture thread, discards anything produced around
+    /// the previous pause, resets the timestamp base (each session gets
+    /// a fresh encoder), and re-seeds — the screen almost certainly
+    /// changed while parked. If the duplication was invalidated while
+    /// parked (display-mode change), `start` still succeeds and the
+    /// thread dies on its first acquire; `poll` then detects the
+    /// disconnect and rebuilds a fresh recorder, which works precisely
+    /// because the dead thread released the old duplication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::Capture`] if the recorder refuses to
+    /// restart; the capturer should be discarded in that case.
+    pub fn resume(&mut self, quality: Quality) -> Result<(), CaptureError> {
+        self.recorder
+            .start()
+            .map_err(|e| CaptureError::Capture(format!("recorder restart: {e}")))?;
+        // Discard any frame that slipped in around the pause. (A frame
+        // can theoretically land just after this drain; it shows the
+        // pre-pause screen for a single frame before real ones arrive.)
+        while self.rx.try_recv().is_ok() {}
+        self.quality = quality;
+        self.start_time = Instant::now();
+        self.alive = true;
+        self.last_rebuild_attempt = None;
+        match monitor_at(self.monitor_index) {
+            Ok(monitor) => self.seed(&monitor),
+            Err(e) => warn!("resume seed skipped (no monitor): {e}"),
+        }
+        Ok(())
+    }
+
+    /// Which monitor index this capturer was created for.
+    pub fn monitor_index(&self) -> usize {
+        self.monitor_index
+    }
+
     /// Attempt to recreate the recorder after the capture thread died.
     /// Rate-limited by [`REBUILD_RETRY_INTERVAL`]; retried on every
     /// `poll` tick until it succeeds. Until then viewers keep seeing
@@ -409,10 +520,17 @@ impl StreamCapturer {
                 self.alive = true;
                 self.last_rebuild_attempt = None;
                 info!("streaming capture backend rebuilt");
-                // The screen likely changed during the gap (that's what
-                // killed the recorder) — re-seed so a now-static screen
-                // still shows its new content.
-                self.seed(&monitor);
+                // Seed only when we hold nothing to show: the seed is a
+                // synchronous GDI BitBlt — the exact stutter source the
+                // streaming backend exists to avoid — and rebuilds fire
+                // mid-game (fullscreen transitions), where real frames
+                // arrive within milliseconds anyway. With a held frame,
+                // viewers see a freeze-frame until then.
+                if self.last.is_none() {
+                    self.seed(&monitor);
+                } else {
+                    drop(monitor);
+                }
             }
             Err(e) => warn!("streaming capture rebuild failed (will retry): {e}"),
         }
@@ -422,15 +540,31 @@ impl StreamCapturer {
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 impl Drop for StreamCapturer {
     fn drop(&mut self) {
-        // Parks xcap's capture thread. xcap offers no way to *join* it,
-        // so one parked OS thread outlives each streaming session —
-        // known upstream limitation, harmless at "shares per app run"
-        // scale. Without this stop() the thread would keep doing full
-        // GPU readbacks at display rate with nobody receiving.
+        // Parks xcap's capture thread; without this it would keep doing
+        // full GPU readbacks at display rate with nobody receiving.
+        // NOTE: the parked thread still holds the DXGI duplication, and
+        // Windows allows one per output per process — a *dropped*
+        // StreamCapturer therefore blocks new streaming sessions on the
+        // same monitor until a display-mode change invalidates the
+        // zombie (observed as `video_recorder: E_INVALIDARG`). Prefer
+        // `pause()` + `Capturer::park()` and reuse via
+        // `Capturer::resume_or_new` — only drop when switching monitors
+        // or shutting down.
         if let Err(e) = self.recorder.stop() {
             warn!("failed to stop video recorder: {e}");
         }
     }
+}
+
+/// Look up a monitor by index (fresh enumeration each call — monitor
+/// handles go stale across display changes).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn monitor_at(monitor_index: usize) -> Result<Monitor, CaptureError> {
+    let monitors = Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
+    monitors
+        .into_iter()
+        .nth(monitor_index)
+        .ok_or(CaptureError::MonitorNotFound(monitor_index))
 }
 
 /// Enumerate monitors and start a recorder on `monitor_index`.
@@ -438,11 +572,7 @@ impl Drop for StreamCapturer {
 fn open_recorder(
     monitor_index: usize,
 ) -> Result<(Monitor, xcap::VideoRecorder, Receiver<xcap::Frame>), CaptureError> {
-    let monitors = Monitor::all().map_err(|e| CaptureError::MonitorList(e.to_string()))?;
-    let monitor = monitors
-        .into_iter()
-        .nth(monitor_index)
-        .ok_or(CaptureError::MonitorNotFound(monitor_index))?;
+    let monitor = monitor_at(monitor_index)?;
 
     let (recorder, rx) = monitor
         .video_recorder()
@@ -640,6 +770,12 @@ impl ScreenCapturer {
     }
 }
 
+/// Stub streaming capturer for platforms without a capture backend.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub struct StreamCapturer {
+    _private: (),
+}
+
 /// Stub unified capturer for platforms without a capture backend.
 #[cfg(any(target_os = "ios", target_os = "android"))]
 pub struct Capturer {
@@ -652,6 +788,19 @@ impl Capturer {
         Err(CaptureError::Capture(
             "screen capture is not supported on this platform".into(),
         ))
+    }
+
+    pub fn resume_or_new(
+        _parked: Option<StreamCapturer>,
+        monitor_index: usize,
+        quality: Quality,
+    ) -> Result<Self, CaptureError> {
+        Self::new(monitor_index, quality)
+    }
+
+    #[must_use]
+    pub fn park(self) -> Option<StreamCapturer> {
+        unreachable!("stub Capturer cannot be constructed")
     }
 
     pub fn poll(&mut self) -> Result<CaptureStatus, CaptureError> {
