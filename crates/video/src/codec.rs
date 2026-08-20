@@ -220,6 +220,8 @@ impl FfmpegEncoder {
     /// Encode one RGBA frame. See [`VideoEncoder::encode`] for the output
     /// contract (zero or more access units, one `EncodedFrame` each).
     pub fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        let mut out = Vec::new();
+
         // Reopen-for-IDR backstop. Some encoders (FFmpeg's AMF wrapper
         // <= 7.1) cannot force an IDR: frame-level pict_type is ignored
         // and the IDR-period property is assigned after component init,
@@ -251,7 +253,22 @@ impl FfmpegEncoder {
                     self.force_next_keyframe,
                     idr_overdue
                 );
+                // Salvage whatever the dying session already has ready
+                // — with sparse input (static-screen refresh at ~1 fps)
+                // the previous submission's AU, often the IDR we
+                // reopened for last time, is sitting in the encoder and
+                // would otherwise be destroyed with the session.
+                if let Some(s) = self.session.as_mut() {
+                    let _ = drain_packets(s, &mut out);
+                }
                 self.last_idr_reopen_ms = Some(frame.timestamp_ms);
+                // Optimistically count the reopen as an IDR emission:
+                // the new session's first output *is* one, but it may
+                // surface a tick or two later — without this stamp the
+                // overdue check re-fires before that happens and the
+                // backstop reopens in a loop, killing every session
+                // before it can produce anything.
+                self.last_idr_out_ms = Some(frame.timestamp_ms);
                 self.session = None;
             }
         }
@@ -306,7 +323,6 @@ impl FfmpegEncoder {
             session.yuv_frame.set_kind(ffmpeg::picture::Type::None);
         }
 
-        let mut out = Vec::new();
         match session.encoder.send_frame(&session.yuv_frame) {
             Ok(()) => {
                 session.pending_ts.push_back(frame.timestamp_ms);

@@ -295,6 +295,16 @@ const fn concat_backend_name() -> &'static str {
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 const REBUILD_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long the streaming backend tolerates total silence before it
+/// probes whether the recorder is secretly dead. xcap's `VideoRecorder`
+/// keeps a clone of the channel Sender inside the struct we hold, so a
+/// dead capture thread can NEVER be observed as a channel disconnect —
+/// the channel just goes quiet, which is indistinguishable from a
+/// static screen. The probe (one screenshot, compared against the held
+/// frame) is the only reliable liveness signal.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const SILENCE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Streaming capture via xcap's `Monitor::video_recorder()`.
 ///
 /// Frames arrive on a rendezvous channel from a capture thread xcap
@@ -305,8 +315,22 @@ const REBUILD_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 pub struct StreamCapturer {
     monitor_index: usize,
     quality: Quality,
-    recorder: xcap::VideoRecorder,
-    rx: Receiver<xcap::Frame>,
+    /// `None` between a detected recorder death and a successful
+    /// rebuild. Dropping the old recorder *before* creating the new one
+    /// matters: the struct holds clones of the DXGI duplication, and
+    /// Windows allows one duplication per output per process.
+    recorder: Option<xcap::VideoRecorder>,
+    rx: Option<Receiver<xcap::Frame>>,
+    /// Source dimensions of the most recent frame (or the monitor at
+    /// open). A display-mode change while parked is detected by
+    /// comparing these against the monitor on resume.
+    src_w: u32,
+    src_h: u32,
+    /// When a frame (real, seed, or probe) last arrived — silence
+    /// beyond [`SILENCE_PROBE_INTERVAL`] triggers the liveness probe.
+    last_rx: Instant,
+    /// Last liveness probe (rate limiting).
+    last_probe: Option<Instant>,
     /// Most recent frame, retained for repeat-encodes while static.
     last: Option<Frame>,
     /// `last` holds content the caller hasn't been handed as Fresh yet
@@ -338,12 +362,16 @@ impl StreamCapturer {
         let mut cap = Self {
             monitor_index,
             quality,
-            recorder,
-            rx,
+            recorder: Some(recorder),
+            rx: Some(rx),
+            src_w: w,
+            src_h: h,
             last: None,
             fresh_pending: false,
             alive: true,
             start_time: Instant::now(),
+            last_rx: Instant::now(),
+            last_probe: None,
             last_rebuild_attempt: None,
         };
         // DXGI only delivers on *change* — on a static screen the first
@@ -361,6 +389,8 @@ impl StreamCapturer {
             Ok(image) => {
                 let width = image.width();
                 let height = image.height();
+                self.src_w = width;
+                self.src_h = height;
                 self.last = Some(Frame {
                     data: image.into_raw(),
                     width,
@@ -368,6 +398,7 @@ impl StreamCapturer {
                     timestamp_ms: self.start_time.elapsed().as_millis() as u64,
                 });
                 self.fresh_pending = true;
+                self.last_rx = Instant::now();
             }
             Err(e) => warn!("seed screenshot failed (stream starts on first change): {e}"),
         }
@@ -382,29 +413,45 @@ impl StreamCapturer {
         // channel is a rendezvous (capacity 0), so at most one frame is
         // pending — the loop is belt-and-braces.
         let mut newest: Option<xcap::Frame> = None;
-        loop {
-            match self.rx.try_recv() {
-                Ok(f) => newest = Some(f),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if self.alive {
-                        self.alive = false;
-                        warn!(
-                            "streaming capture thread died (display mode change, \
-                             fullscreen transition, or UAC prompt are the usual \
-                             causes) — will rebuild"
-                        );
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(f) => newest = Some(f),
+                    Err(TryRecvError::Empty) => break,
+                    // Cannot actually happen with xcap 0.9.8 — the
+                    // VideoRecorder struct holds a Sender clone, so the
+                    // channel outlives the capture thread. Kept for a
+                    // future xcap that fixes this; the silence probe
+                    // below is the real liveness detector.
+                    Err(TryRecvError::Disconnected) => {
+                        if self.alive {
+                            self.alive = false;
+                            warn!("streaming capture channel disconnected — will rebuild");
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
 
-        if !self.alive {
+        // Silence watchdog. A dead capture thread and a static screen
+        // look identical from the channel (see SILENCE_PROBE_INTERVAL
+        // docs), so after enough silence, take one screenshot and
+        // compare it to the held frame: any difference means the screen
+        // moved while the recorder said nothing — it's dead. Static
+        // screens compare equal and cost one cheap capture every probe
+        // interval.
+        if newest.is_none() && self.alive && self.recorder.is_some() {
+            self.probe_if_silent();
+        }
+
+        if !self.alive || self.recorder.is_none() {
             self.try_rebuild();
         }
 
         if let Some(f) = newest {
+            self.src_w = f.width;
+            self.src_h = f.height;
             self.last = Some(Frame {
                 data: f.raw,
                 width: f.width,
@@ -412,6 +459,7 @@ impl StreamCapturer {
                 timestamp_ms: self.start_time.elapsed().as_millis() as u64,
             });
             self.fresh_pending = false;
+            self.last_rx = Instant::now();
             return CaptureStatus::Fresh;
         }
 
@@ -451,12 +499,16 @@ impl StreamCapturer {
     /// change invalidates the zombie. Parking and resuming reuses the
     /// one allowed duplication instead of colliding with it.
     pub fn pause(&mut self) {
-        if let Err(e) = self.recorder.stop() {
-            warn!("failed to pause video recorder: {e}");
+        if let Some(r) = &self.recorder {
+            if let Err(e) = r.stop() {
+                warn!("failed to pause video recorder: {e}");
+            }
         }
         // The capture thread may be blocked mid-send on the rendezvous
         // channel; drain so it can reach its park point.
-        while self.rx.try_recv().is_ok() {}
+        if let Some(rx) = &self.rx {
+            while rx.try_recv().is_ok() {}
+        }
         // Whatever we held is stale by the time anyone resumes.
         self.last = None;
         self.fresh_pending = false;
@@ -478,27 +530,120 @@ impl StreamCapturer {
     /// Returns [`CaptureError::Capture`] if the recorder refuses to
     /// restart; the capturer should be discarded in that case.
     pub fn resume(&mut self, quality: Quality) -> Result<(), CaptureError> {
-        self.recorder
+        // A display-mode change while parked (game launched between
+        // shares) kills the parked duplication *silently* — the thread
+        // errors out on its first acquire but the channel never
+        // disconnects (xcap holds a Sender clone), so a naive resume
+        // freezes on the seed frame forever. Detect it up front and
+        // refuse: the caller drops us (releasing the dead duplication)
+        // and builds a fresh capturer, which succeeds precisely because
+        // the mode change invalidated the old one.
+        let monitor = monitor_at(self.monitor_index)?;
+        let (mw, mh) = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
+        if mw != 0 && self.src_w != 0 && (mw != self.src_w || mh != self.src_h) {
+            return Err(CaptureError::Capture(format!(
+                "display mode changed while parked ({}x{} → {mw}x{mh}) — parked \
+                 recorder is dead, need a fresh one",
+                self.src_w, self.src_h
+            )));
+        }
+        let recorder = self
+            .recorder
+            .as_ref()
+            .ok_or_else(|| CaptureError::Capture("no recorder to resume".into()))?;
+        recorder
             .start()
             .map_err(|e| CaptureError::Capture(format!("recorder restart: {e}")))?;
         // Discard any frame that slipped in around the pause. (A frame
         // can theoretically land just after this drain; it shows the
         // pre-pause screen for a single frame before real ones arrive.)
-        while self.rx.try_recv().is_ok() {}
+        if let Some(rx) = &self.rx {
+            while rx.try_recv().is_ok() {}
+        }
         self.quality = quality;
         self.start_time = Instant::now();
         self.alive = true;
         self.last_rebuild_attempt = None;
-        match monitor_at(self.monitor_index) {
-            Ok(monitor) => self.seed(&monitor),
-            Err(e) => warn!("resume seed skipped (no monitor): {e}"),
-        }
+        self.last_probe = None;
+        self.seed(&monitor);
         Ok(())
     }
 
     /// Which monitor index this capturer was created for.
     pub fn monitor_index(&self) -> usize {
         self.monitor_index
+    }
+
+    /// The liveness probe (see the call site in [`Self::poll`]): after
+    /// [`SILENCE_PROBE_INTERVAL`] without frames, screenshot the
+    /// monitor and compare against the held frame. A mismatch (size or
+    /// pixels) means the screen changed while the recorder was silent —
+    /// the capture thread is dead. The probe then *becomes* the fresh
+    /// frame and the recorder is torn down for rebuild.
+    fn probe_if_silent(&mut self) {
+        if self.last_rx.elapsed() < SILENCE_PROBE_INTERVAL {
+            return;
+        }
+        if let Some(t) = self.last_probe {
+            if t.elapsed() < SILENCE_PROBE_INTERVAL {
+                return;
+            }
+        }
+        self.last_probe = Some(Instant::now());
+
+        let image = match monitor_at(self.monitor_index).and_then(|m| {
+            m.capture_image()
+                .map_err(|e| CaptureError::Capture(e.to_string()))
+        }) {
+            Ok(i) => i,
+            // Can't probe — leave the recorder be; retried next interval.
+            Err(e) => {
+                warn!("capture liveness probe failed: {e}");
+                return;
+            }
+        };
+
+        let (pw, ph) = (image.width(), image.height());
+        let unchanged = self
+            .last
+            .as_ref()
+            .is_some_and(|f| f.width == pw && f.height == ph && f.data == image.as_raw()[..]);
+        if unchanged {
+            // Genuinely static screen — recorder presumed fine.
+            return;
+        }
+
+        warn!(
+            "screen changed ({}x{} → {pw}x{ph}) while the streaming recorder was \
+             silent for {:.1}s — capture thread presumed dead, rebuilding",
+            self.src_w,
+            self.src_h,
+            self.last_rx.elapsed().as_secs_f32()
+        );
+        self.kill_recorder();
+        // The probe is real, current screen content — deliver it.
+        self.src_w = pw;
+        self.src_h = ph;
+        self.last = Some(Frame {
+            data: image.into_raw(),
+            width: pw,
+            height: ph,
+            timestamp_ms: self.start_time.elapsed().as_millis() as u64,
+        });
+        self.fresh_pending = true;
+        self.last_rx = Instant::now();
+    }
+
+    /// Tear the recorder down for rebuild. `stop()` first parks a
+    /// still-alive thread (harmless if it's dead); dropping the struct
+    /// then releases its clones of the DXGI duplication so a rebuild's
+    /// `DuplicateOutput` isn't blocked by our own corpse.
+    fn kill_recorder(&mut self) {
+        if let Some(r) = self.recorder.take() {
+            let _ = r.stop();
+        }
+        self.rx = None;
+        self.alive = false;
     }
 
     /// Attempt to recreate the recorder after the capture thread died.
@@ -513,12 +658,18 @@ impl StreamCapturer {
         }
         self.last_rebuild_attempt = Some(Instant::now());
 
+        // Release our own hold on the old duplication first (one per
+        // output per process) — otherwise the rebuild fights our corpse.
+        self.kill_recorder();
+
         match open_recorder(self.monitor_index) {
             Ok((monitor, recorder, rx)) => {
-                self.recorder = recorder;
-                self.rx = rx;
+                self.recorder = Some(recorder);
+                self.rx = Some(rx);
                 self.alive = true;
                 self.last_rebuild_attempt = None;
+                self.last_rx = Instant::now();
+                self.last_probe = None;
                 info!("streaming capture backend rebuilt");
                 // Seed only when we hold nothing to show: the seed is a
                 // synchronous GDI BitBlt — the exact stutter source the
@@ -550,8 +701,10 @@ impl Drop for StreamCapturer {
         // `pause()` + `Capturer::park()` and reuse via
         // `Capturer::resume_or_new` — only drop when switching monitors
         // or shutting down.
-        if let Err(e) = self.recorder.stop() {
-            warn!("failed to stop video recorder: {e}");
+        if let Some(r) = &self.recorder {
+            if let Err(e) = r.stop() {
+                warn!("failed to stop video recorder: {e}");
+            }
         }
     }
 }
