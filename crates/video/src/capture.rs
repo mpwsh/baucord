@@ -388,7 +388,7 @@ impl StreamCapturer {
                 if !self.dup_delivered {
                     self.dup_delivered = true;
                     info!(
-                        "dxgi streaming: first frame {} ms after duplicator build                          ({}x{})",
+                        "dxgi streaming: first frame {} ms after duplicator build ({}x{})",
                         self.dup_built_at.elapsed().as_millis(),
                         cf.width,
                         cf.height

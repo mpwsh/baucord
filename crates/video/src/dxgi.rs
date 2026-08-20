@@ -239,6 +239,22 @@ fn worker_loop(
                     continue;
                 }
 
+                // Demand pacing: the desktop presents at display
+                // refresh rate, but the consumer only takes frames at
+                // the stream rate. If the previous frame is still
+                // sitting unconsumed in the slot, this one would just
+                // overwrite it — so skip the expensive part (GPU copy,
+                // synchronizing Map, multi-MB memcpy) entirely and
+                // release. Acquire+release without readback is nearly
+                // free, and readback throughput then automatically
+                // matches consumption instead of the display's refresh
+                // rate (a 144 Hz desktop feeding a 30 fps stream would
+                // otherwise waste ~80% of its readbacks).
+                if shared.slot.lock().unwrap().is_some() {
+                    let _ = unsafe { duplication.ReleaseFrame() };
+                    continue;
+                }
+
                 let grabbed = unsafe {
                     grab_frame(&_device, &context, &duplication, resource, &mut staging)
                 };

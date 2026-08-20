@@ -10,6 +10,17 @@ on:
   push:
     branches:
       - "chunk" # ← must be the repo's default branch for releases to see the caches
+env:
+  # FFmpeg comes from vcpkg PINNED to the last ffmpeg 7.1.2 port. vcpkg
+  # HEAD ships FFmpeg 9.x, which ffmpeg-next 8.1 cannot build against
+  # (FFmpeg 8 deleted the deprecated AVCodec field API the crate's
+  # fallback path uses, and its version detection is unreliable under
+  # vcpkg). Do NOT bump this without re-testing the full Windows build
+  # AND a real stream — encoder options are validated at runtime, not
+  # compile time. The macOS ffmpeg@7 pin below exists for the same
+  # reason (plain `brew install ffmpeg` is now v8/9).
+  VCPKG_COMMIT: 34823ada10080ddca99b60e85f80f55e18a44eea # ffmpeg 7.1.2
+
 jobs:
   build:
     strategy:
@@ -28,12 +39,12 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             suffix: macos-arm64
-            pkg_config_path: /opt/homebrew/opt/ffmpeg/lib/pkgconfig
+            pkg_config_path: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
           - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: macos-intel
             rustflags: "-C target-cpu=x86-64-v2"
-            pkg_config_path: /usr/local/opt/ffmpeg/lib/pkgconfig
+            pkg_config_path: /usr/local/opt/ffmpeg@7/lib/pkgconfig
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -70,21 +81,32 @@ jobs:
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
+        # ffmpeg@7, not ffmpeg: plain brew ffmpeg is now v8/9 — the same
+        # ffmpeg-next breakage the vcpkg pin exists for. The @7 keg is
+        # keg-only, hence the pkg_config_path entries in the matrix.
         run: |
-          brew install opus ffmpeg pkg-config
+          brew install opus ffmpeg@7 pkg-config
 
       # No prebuilt static-md binary exists anywhere with this exact codec
-      # feature set (x264, gpl, nvcodec, amf, qsv) plus the headers/.lib
+      # feature set (x264, gpl, nvcodec, amf) plus the headers/.lib
       # files needed to link into a Rust binary, so we build it with vcpkg
-      # like a local dev machine would. The `installed` tree is cached by
+      # like a local dev machine would. qsv is deliberately absent: at the
+      # pinned port it pulls the legacy mfx dispatch (the vpl switch came
+      # later) and is untested with our static-md link; the runtime
+      # encoder probe handles its absence. Re-add only with a full retest. The `installed` tree is cached by
       # feature set below, so this only compiles from scratch when that
       # set changes (or the cache is evicted) — otherwise it's a fast
       # cache restore + vcpkg no-op.
-      - name: Clone and bootstrap vcpkg (Windows)
+      - name: Clone and bootstrap vcpkg (Windows, pinned)
         if: runner.os == 'Windows'
+        # Shallow-fetch exactly the pinned commit instead of cloning HEAD
+        # (HEAD's ffmpeg port is 9.x — see VCPKG_COMMIT above).
         run: |
-          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-          C:\vcpkg\bootstrap-vcpkg.bat
+          git init C:\vcpkg
+          git -C C:\vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C C:\vcpkg fetch --depth 1 origin $env:VCPKG_COMMIT
+          git -C C:\vcpkg checkout FETCH_HEAD
+          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
         shell: pwsh
 
       - name: Cache vcpkg installed packages (Windows)
@@ -92,14 +114,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\vcpkg\installed
-          # Bump the trailing version number if the feature list or
-          # triplet below ever changes, to force a rebuild.
-          key: vcpkg-ffmpeg-x64-windows-static-md-x264-gpl-nvcodec-amf-qsv-v1
+          # The pinned commit is part of the key, so bumping VCPKG_COMMIT
+          # auto-invalidates (and any tree cached by earlier UNPINNED runs
+          # can never be restored). Bump the trailing version number only
+          # if the feature list or triplet changes.
+          key: vcpkg-ffmpeg-${{ env.VCPKG_COMMIT }}-x64-windows-static-md-x264-gpl-nvcodec-amf-v2
 
       - name: Install FFmpeg via vcpkg (Windows)
         if: runner.os == 'Windows'
         run: |
-          C:\vcpkg\vcpkg.exe install ffmpeg[x264,gpl,nvcodec,amf,qsv]:x64-windows-static-md
+          C:\vcpkg\vcpkg.exe install ffmpeg[x264,gpl,nvcodec,amf]:x64-windows-static-md --recurse
           echo "FFMPEG_DIR=C:\vcpkg\installed\x64-windows-static-md" >> $env:GITHUB_ENV
         shell: pwsh
 
@@ -188,6 +212,18 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Guard — release tag must match crate version
+        # The R2 `version` file and asset names come from Cargo.toml; a
+        # mismatched tag ships a release whose name disagrees with what
+        # the in-app updater announces. Fail here, before anything is
+        # published.
+        run: |
+          VERSION=$(grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAG="${{ github.event.release.tag_name }}"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::Release tag $TAG != crates/desktop version v$VERSION — retag or bump the crate."
+            exit 1
+          fi
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:

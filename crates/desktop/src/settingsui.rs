@@ -705,7 +705,7 @@ fn close(app: &mut AppState) {
 fn set_credits(s: &ui::SettingsState) {
     const SUPER_TESTERS: &[&str] = &["empe"];
     const TESTERS: &[&str] = &[
-        "Bartrix", "BDK", "ChichoV3", "Cholo", "willybal", "Nachovsky",
+        "Bartrix", "BDK", "ChichoV3", "Cholo", "EltotoPA", "willybal", "Nachovsky",
         "naqel", "Nicky21", "oveer", "Patitutitu", "piksel", "Pin0",
         "Scryer",
     ];
