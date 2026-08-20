@@ -649,16 +649,24 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_start_share(move |monitor_index, quality_index, everyone| {
         with_app(&w, |app| {
+            let monitor_index = usize::try_from(monitor_index).unwrap_or(0);
             let quality = usize::try_from(quality_index)
                 .ok()
                 .and_then(|i| video::Quality::ALL.get(i))
                 .copied()
                 .unwrap_or(video::Quality::FHD30);
+            // Remember the choices: the dialog pre-fills from these
+            // next time, and the share hotkey starts a stream with
+            // them directly when Baucord isn't the focused window.
+            app.settings.share.quality = quality.key().to_string();
+            app.settings.share.monitor = u32::try_from(monitor_index).ok();
+            app.settings.share.everyone = everyone;
+            app.settings.save();
             app.screen
                 .tx
                 .send(ScreenControl::StartSharing {
                     quality,
-                    monitor_index: usize::try_from(monitor_index).unwrap_or(0),
+                    monitor_index,
                     scope: if everyone {
                         client::ShareScope::Everyone
                     } else {
@@ -1722,39 +1730,101 @@ impl AppState {
     fn handle_toggle_screenshare(&mut self) {
         if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
             self.screen.tx.send(ScreenControl::StopSharing).ok();
-        } else {
-            let monitors = video::capture::list_monitors().unwrap_or_default();
-            if monitors.is_empty() {
-                self.show_error(&t!("error-no-monitors"));
-                return;
-            }
-            let labels: Vec<slint::SharedString> = monitors
-                .iter()
-                .map(|m| {
-                    let primary = if m.is_primary {
-                        format!(" {}", t!("monitor-primary"))
-                    } else {
-                        String::new()
-                    };
-                    format!("{} — {}x{}{}", m.name, m.width, m.height, primary).into()
-                })
-                .collect();
-            let qualities: Vec<slint::SharedString> = video::Quality::ALL
-                .iter()
-                .map(|q| q.to_string().into())
-                .collect();
-            let primary_idx = monitors.iter().position(|m| m.is_primary).unwrap_or(0);
-            let default_q = video::Quality::ALL
-                .iter()
-                .position(|q| *q == video::Quality::FHD30)
-                .unwrap_or(0);
-            let s = self.main.global::<State>();
-            s.set_monitors(ModelRc::new(VecModel::from(labels)));
-            s.set_qualities(ModelRc::new(VecModel::from(qualities)));
-            s.set_default_monitor(i32::try_from(primary_idx).unwrap_or(0));
-            s.set_default_quality(i32::try_from(default_q).unwrap_or(0));
-            self.main.invoke_open_share_dialog();
+            return;
         }
+        // Hotkey UX: when the user is in another app (typically a
+        // game), don't steal focus with a picker — start streaming
+        // immediately with the saved settings. The dialog shows only
+        // when Baucord itself is focused (which covers the in-app
+        // share button — clicking it focuses us) or when focus can't
+        // be determined (never start a stream on a guess).
+        let baucord_focused = video::capture::focused_pid()
+            .map(|pid| pid == std::process::id());
+        match baucord_focused {
+            Some(false) => self.start_share_with_saved(),
+            _ => self.open_share_dialog(),
+        }
+    }
+
+    /// Start sharing immediately with the last-used settings (falls
+    /// back to primary monitor / FHD30 / channel-only). Hotkey path
+    /// while another app is focused.
+    fn start_share_with_saved(&mut self) {
+        let monitors = video::capture::list_monitors().unwrap_or_default();
+        if monitors.is_empty() {
+            self.show_error(&t!("error-no-monitors"));
+            return;
+        }
+        let monitor_index = self.saved_or_primary_monitor(&monitors);
+        let quality = video::Quality::from_key(&self.settings.share.quality)
+            .unwrap_or(video::Quality::FHD30);
+        let everyone = self.settings.share.everyone;
+        log::info!(
+            "share hotkey pressed outside Baucord — starting immediately with saved \
+             settings: {quality}, monitor {monitor_index}, everyone={everyone}"
+        );
+        self.screen
+            .tx
+            .send(ScreenControl::StartSharing {
+                quality,
+                monitor_index,
+                scope: if everyone {
+                    client::ShareScope::Everyone
+                } else {
+                    client::ShareScope::Channel
+                },
+            })
+            .ok();
+    }
+
+    /// Open the share picker, pre-filled with the last-used settings.
+    fn open_share_dialog(&mut self) {
+        let monitors = video::capture::list_monitors().unwrap_or_default();
+        if monitors.is_empty() {
+            self.show_error(&t!("error-no-monitors"));
+            return;
+        }
+        let labels: Vec<slint::SharedString> = monitors
+            .iter()
+            .map(|m| {
+                let primary = if m.is_primary {
+                    format!(" {}", t!("monitor-primary"))
+                } else {
+                    String::new()
+                };
+                format!("{} — {}x{}{}", m.name, m.width, m.height, primary).into()
+            })
+            .collect();
+        let qualities: Vec<slint::SharedString> = video::Quality::ALL
+            .iter()
+            .map(|q| q.to_string().into())
+            .collect();
+        let default_monitor = self.saved_or_primary_monitor(&monitors);
+        let saved_quality = video::Quality::from_key(&self.settings.share.quality)
+            .unwrap_or(video::Quality::FHD30);
+        let default_q = video::Quality::ALL
+            .iter()
+            .position(|q| *q == saved_quality)
+            .unwrap_or(0);
+        let s = self.main.global::<State>();
+        s.set_monitors(ModelRc::new(VecModel::from(labels)));
+        s.set_qualities(ModelRc::new(VecModel::from(qualities)));
+        s.set_default_monitor(i32::try_from(default_monitor).unwrap_or(0));
+        s.set_default_quality(i32::try_from(default_q).unwrap_or(0));
+        s.set_default_scope(i32::from(self.settings.share.everyone));
+        self.main.invoke_open_share_dialog();
+    }
+
+    /// The saved monitor index if that monitor still exists, otherwise
+    /// the primary (monitors come and go between sessions).
+    fn saved_or_primary_monitor(&self, monitors: &[video::capture::MonitorInfo]) -> usize {
+        let primary_idx = monitors.iter().position(|m| m.is_primary).unwrap_or(0);
+        self.settings
+            .share
+            .monitor
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|i| *i < monitors.len())
+            .unwrap_or(primary_idx)
     }
 
     pub fn handle_test_microphone(&mut self, enabled: bool) {

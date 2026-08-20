@@ -29,7 +29,7 @@ use log::{info, warn};
 use video::{
     CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
     buffer::{BufferedPacket, VideoJitterBuffer},
-    capture::ScreenCapturer,
+    capture::{CaptureStatus, Capturer},
     codec::{FfmpegDecoder, FfmpegEncoder},
 };
 
@@ -242,10 +242,16 @@ impl Drop for ScreenThreadHandle {
 // ── Capture + encode state ──────────────────────────────────────────────
 
 struct CaptureState {
-    capturer: ScreenCapturer,
+    capturer: Capturer,
     encoder: Box<dyn VideoEncoder + Send>,
     quality: Quality,
     seq: u32,
+    /// Next time an *unchanged* frame gets encoded anyway. Streaming
+    /// capture only delivers frames when the screen changes, so this
+    /// low-rate refresh keeps the stream primed (periodic IDRs for
+    /// joiners, live-looking stats) while the screen is static. With
+    /// the screenshot backend every poll is Fresh and this never fires.
+    next_refresh: Instant,
     /// System audio capture — started alongside video, sends Opus stereo
     /// packets to the network. `None` if platform doesn't support it.
     system_audio: Option<SystemAudioCapture>,
@@ -303,6 +309,15 @@ const PACE_DISTRESS_WINDOW: Duration = Duration::from_secs(5);
 /// Don't step back up for this long after viewer distress — stepping up
 /// the moment the viewer recovers just re-chokes them in a slow cycle.
 const PACE_DISTRESS_HOLD: Duration = Duration::from_secs(30);
+
+/// While the screen is static (streaming backend reports Unchanged),
+/// re-encode the held frame this often. Identical-content P-frames are
+/// near-zero bytes and the encoder's 2 s IDR cadence rides on top, so a
+/// static share costs a tiny fraction of full-rate encoding while
+/// joining viewers still get a picture within the keyframe interval.
+/// A pending forced keyframe (viewer waiting on an IDR) bypasses this
+/// and encodes on the next tick.
+const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The capture interval at the current pace.
 fn effective_frame_interval(state: &CaptureState) -> Duration {
@@ -657,8 +672,10 @@ fn handle_control(
             monitor_index,
             scope,
         } => {
-            // Create capturer
-            let capturer = match ScreenCapturer::new(monitor_index, quality) {
+            // Create capturer — Capturer::new picks the best backend
+            // for the platform (streaming on Windows, screenshots
+            // elsewhere / as fallback) and logs the choice.
+            let capturer = match Capturer::new(monitor_index, quality) {
                 Ok(c) => c,
                 Err(e) => {
                     event_tx
@@ -681,7 +698,10 @@ fn handle_control(
                 }
             };
 
-            info!("Screen share started: {quality}, monitor {monitor_index}");
+            info!(
+                "Screen share started: {quality}, monitor {monitor_index}, capture backend: {}",
+                capturer.backend_name()
+            );
 
             // Start system audio capture (best-effort — non-fatal if unsupported)
             let system_audio = match SystemAudioCapture::new(Arc::new(AudioStats::new())) {
@@ -706,6 +726,7 @@ fn handle_control(
                 encoder,
                 quality,
                 seq: 0,
+                next_refresh: Instant::now(),
                 system_audio,
                 pace_idx: 0,
                 pace_changed: Instant::now(),
@@ -955,10 +976,12 @@ fn capture_and_encode(
     network_tx: &Sender<NetworkControl>,
     shared: &SharedScreenState,
 ) {
-    // Capture
+    // Capture. For the streaming backend this is a non-blocking channel
+    // drain (the OS captures on its own thread); for the screenshot
+    // backend it performs the actual capture here.
     let t0 = Instant::now();
-    let frame = match state.capturer.capture() {
-        Ok(f) => f,
+    let status = match state.capturer.poll() {
+        Ok(s) => s,
         Err(e) => {
             warn!("Capture failed: {e}");
             return;
@@ -970,13 +993,41 @@ fn capture_and_encode(
         log::debug!("Slow capture: {capture_ms:.1}ms");
     }
 
+    let now = Instant::now();
+    let repeat = match status {
+        CaptureStatus::Fresh => false,
+        CaptureStatus::Unchanged => {
+            // Nothing changed on screen. Encode anyway only if a viewer
+            // is waiting on a forced IDR or the periodic refresh is due
+            // — otherwise skip entirely: no swscale, no encoder work,
+            // no bytes on the wire, and no seq consumed.
+            if !state.encoder.keyframe_pending() && now < state.next_refresh {
+                shared.last_capture_us.store(capture_us, Ordering::Relaxed);
+                return;
+            }
+            true
+        }
+        // Nothing captured yet (streaming backend rebuilding with no
+        // held frame) — nothing to encode this tick.
+        CaptureStatus::Empty => {
+            shared.last_capture_us.store(capture_us, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    // A repeated frame gets its timestamp advanced to "now" so PTS,
+    // keyframe cadence, and rate control keep tracking real time.
+    let Some(frame) = state.capturer.frame(repeat) else {
+        return;
+    };
+
     // Encode. Returns zero or more access units: zero while a hardware
     // encoder's pipeline fills (first few frames on NVENC/QSV/AMF), and
     // occasionally more than one when it flushes pending output. Each AU
     // gets its own sequence number — the receiver's jitter buffer treats
     // seq gaps as loss, so skipped/empty encodes must not consume seqs.
     let t1 = Instant::now();
-    let encoded_frames = match state.encoder.encode(&frame) {
+    let encoded_frames = match state.encoder.encode(frame) {
         Ok(e) => e,
         Err(e) => {
             warn!("Encode failed: {e}");
@@ -984,6 +1035,7 @@ fn capture_and_encode(
         }
     };
     let encode_us = t1.elapsed().as_micros() as u32;
+    state.next_refresh = now + STATIC_REFRESH_INTERVAL;
 
     shared.last_capture_us.store(capture_us, Ordering::Relaxed);
     shared.last_encode_us.store(encode_us, Ordering::Relaxed);

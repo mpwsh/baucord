@@ -250,6 +250,34 @@ impl Default for WindowSettings {
     }
 }
 
+/// Last-used screen-share choices. The share dialog opens pre-filled
+/// with these, and the global share hotkey starts a stream with them
+/// directly when Baucord is not the focused window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShareSettings {
+    /// Quality preset key (`video::Quality::key()`, e.g. "fhd30").
+    /// Stored as a string so settings files survive preset reordering
+    /// in future versions; unknown keys fall back to the default.
+    pub quality: String,
+    /// Last selected monitor index. `None` = use the primary monitor.
+    /// Validated against the current monitor list at use time (monitors
+    /// come and go); out-of-range falls back to primary.
+    pub monitor: Option<u32>,
+    /// Share visibility: `true` = everyone on the server, `false` =
+    /// current voice channel only.
+    pub everyone: bool,
+}
+
+impl Default for ShareSettings {
+    fn default() -> Self {
+        Self {
+            quality: "fhd30".to_string(),
+            monitor: None,
+            everyone: false,
+        }
+    }
+}
+
 fn default_keybinds() -> Vec<KeybindEntry> {
     vec![
         KeybindEntry {
@@ -290,6 +318,8 @@ pub struct Settings {
     /// OS locale. Which locales exist is the frontends' business.
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub share: ShareSettings,
 }
 
 /// Deserialization shadow of [`Settings`]: `server` accepts both the
@@ -315,6 +345,8 @@ struct SettingsDe {
     peer_settings: HashMap<String, PeerAudioSettings>,
     #[serde(default)]
     language: Option<String>,
+    #[serde(default)]
+    share: ShareSettings,
 }
 
 #[derive(Deserialize)]
@@ -366,6 +398,7 @@ impl From<SettingsDe> for Settings {
             keybinds: de.keybinds,
             peer_settings: de.peer_settings,
             language: de.language,
+            share: de.share,
         };
         settings.normalize_servers();
         settings
@@ -383,6 +416,7 @@ impl Default for Settings {
             keybinds: default_keybinds(),
             peer_settings: HashMap::new(),
             language: None,
+            share: ShareSettings::default(),
         }
     }
 }

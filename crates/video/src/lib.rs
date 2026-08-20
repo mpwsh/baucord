@@ -139,6 +139,26 @@ impl Quality {
         Self::FHD60,
         Self::QHD30,
     ];
+
+    /// Stable string key for persisting a preset in settings files.
+    ///
+    /// Unlike an index into [`Quality::ALL`], these survive reordering
+    /// or insertion of new presets in future versions.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::HD30 => "hd30",
+            Self::HD60 => "hd60",
+            Self::FHD30 => "fhd30",
+            Self::FHD60 => "fhd60",
+            Self::QHD30 => "qhd30",
+        }
+    }
+
+    /// Inverse of [`Quality::key`]. Returns `None` for unknown keys
+    /// (e.g. a settings file written by a newer version).
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|q| q.key() == key)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +260,16 @@ pub trait VideoEncoder {
     /// unrecoverable gap — they need an IDR with SPS/PPS parameter sets
     /// before they can decode any P-frames.
     fn force_keyframe(&mut self);
+
+    /// Whether a forced keyframe is queued but not yet encoded.
+    ///
+    /// With change-driven capture backends, no frames flow while the
+    /// screen is static — the capture loop uses this to know it must
+    /// re-encode the held frame *now* (a viewer is waiting on an IDR)
+    /// instead of waiting for the next refresh tick.
+    fn keyframe_pending(&self) -> bool {
+        false
+    }
 }
 
 /// Decoder that converts H.264 bitstream back into RGBA frames.

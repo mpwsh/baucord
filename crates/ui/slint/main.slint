@@ -34,7 +34,7 @@ export component MainWindow inherits Window {
     in-out property <bool> share-dialog-open: false;
     property <int> share-monitor: State.default-monitor;
     property <int> share-quality: State.default-quality;
-    property <int> share-scope: 0;   // 0 = my channel (default), 1 = everyone
+    property <int> share-scope: State.default-scope;   // 0 = my channel, 1 = everyone
 
     public function chat-at-bottom() -> bool { return chat-pane.at-bottom(); }
     public function chat-scroll-to-end() { chat-pane.scroll-to-end(); }
@@ -57,7 +57,9 @@ export component MainWindow inherits Window {
     public function open-share-dialog() {
         share-monitor = State.default-monitor;
         share-quality = State.default-quality;
-        share-scope = 0;   // channel-only by default, every time
+        // Prefilled from the last share (saved settings) — the dialog
+        // shows exactly what the share hotkey would start.
+        share-scope = State.default-scope;
         share-dialog-open = true;
     }
 

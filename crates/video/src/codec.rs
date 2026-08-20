@@ -285,6 +285,11 @@ impl FfmpegEncoder {
         self.force_next_keyframe = true;
     }
 
+    /// Whether a forced keyframe is queued but not yet encoded.
+    pub fn keyframe_pending(&self) -> bool {
+        self.force_next_keyframe
+    }
+
     pub fn quality(&self) -> Quality {
         self.quality
     }
@@ -311,6 +316,10 @@ impl VideoEncoder for FfmpegEncoder {
 
     fn force_keyframe(&mut self) {
         self.force_keyframe();
+    }
+
+    fn keyframe_pending(&self) -> bool {
+        self.keyframe_pending()
     }
 }
 
@@ -742,10 +751,19 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
             opts.set("forced-idr", "1");
         }
         "h264_nvenc" => {
-            opts.set("preset", "p1");
+            // p4 (default/"medium"), not p1: NVENC runs on a dedicated
+            // ASIC block with enormous headroom at 1080p60 — p1 trades
+            // visible quality for speed nobody needs, and the encode
+            // block is separate from the 3D units, so a slower preset
+            // does not touch game performance.
+            opts.set("preset", "p4");
             opts.set("tune", "ull");
             opts.set("rc", "cbr");
             opts.set("zerolatency", "1");
+            // Same job as x264's aq-mode: shift bits toward detailed
+            // regions (text, UI edges) — the content screen share is
+            // mostly made of.
+            opts.set("spatial-aq", "1");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
             opts.set("forced-idr", "1");
@@ -759,7 +777,10 @@ fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
         }
         "h264_amf" => {
             opts.set("usage", "ultralowlatency");
-            opts.set("quality", "speed");
+            // "balanced", not "speed": AMD's encode block also has
+            // headroom to spare at these resolutions — same trade as
+            // NVENC p4 above.
+            opts.set("quality", "balanced");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
             opts.set("forced_idr", "1");

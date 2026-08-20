@@ -113,6 +113,8 @@ export global State {
     in property <[string]> qualities;
     in property <int> default-monitor: 0;
     in property <int> default-quality: 0;
+    // 0 = my channel, 1 = everyone — prefilled from saved settings.
+    in property <int> default-scope: 0;
 
     // Image send preview overlay
     in property <bool> preview-open: false;

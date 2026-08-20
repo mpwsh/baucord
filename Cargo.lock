@@ -1196,7 +1196,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "audio",
  "crossbeam-channel",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "app-core",
  "arboard",
@@ -7026,7 +7026,7 @@ dependencies = [
 
 [[package]]
 name = "ui"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "app-core",
  "log",
@@ -7304,7 +7304,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "env_logger",
  "ffmpeg-next",
