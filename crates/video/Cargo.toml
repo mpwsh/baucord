@@ -1,6 +1,6 @@
 [package]
 name = "video"
-version = "0.3.6"
+version = "0.4.0"
 edition = "2021"
 
 [lints]
@@ -13,6 +13,18 @@ thiserror = "2"
 # Desktop-only backends. iOS/Android builds get stub implementations
 # whose constructors fail cleanly (see src/capture.rs, src/codec_stub.rs);
 # the pure types, traits and jitter buffer compile on every target.
+# Vendored DXGI capture (src/dxgi.rs). Same windows-crate version as
+# xcap so the two coexist without duplicate windows-sys trees.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 #xcap = { git = "https://github.com/nashaofu/xcap" }
 xcap = "0.9.8"

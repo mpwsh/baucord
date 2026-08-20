@@ -18,6 +18,8 @@
 
 pub mod buffer;
 pub mod capture;
+#[cfg(target_os = "windows")]
+pub mod dxgi;
 
 // The real codec module is FFmpeg top to bottom, so it's swapped
 // wholesale on targets without an FFmpeg build. The stub exposes the
@@ -165,9 +167,22 @@ impl Quality {
 // Frame types
 // ---------------------------------------------------------------------------
 
-/// An RGBA frame ready for encoding or display.
+/// Byte layout of a [`Frame`]'s pixel data (4 bytes per pixel either way).
 ///
-/// Not `Clone` by design — RGBA buffers are large (3.7 MB at 1080p).
+/// The DXGI streaming backend delivers **BGRA** exactly as the desktop
+/// stores it; converting to RGBA on the CPU would be a wasted full-frame
+/// pass, since swscale accepts BGRA input directly. The screenshot
+/// backend (and everything else) stays RGBA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    Rgba,
+    Bgra,
+}
+
+/// A raw captured frame ready for encoding (see [`PixelFormat`] for the
+/// byte layout).
+///
+/// Not `Clone` by design — pixel buffers are large (3.7 MB at 1080p).
 /// Pass by reference or transfer ownership explicitly.
 pub struct Frame {
     pub data: Vec<u8>,
@@ -177,6 +192,7 @@ pub struct Frame {
     /// Used as the encoder PTS, so it also drives keyframe cadence and
     /// rate control under variable capture rates.
     pub timestamp_ms: u64,
+    pub format: PixelFormat,
 }
 
 /// Encoded H.264 data for one frame (one access unit).

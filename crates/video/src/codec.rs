@@ -52,7 +52,7 @@ use ffmpeg::software::scaling::{Context as SwsContext, Flags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg::{Dictionary, Rational};
 
-use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder, VideoEncoder};
+use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, PixelFormat, Quality, VideoDecoder, VideoEncoder};
 
 /// Time between IDR keyframes, in milliseconds of *capture time*.
 pub const KEYFRAME_INTERVAL_MS: u64 = 2_000;
@@ -114,6 +114,7 @@ struct EncSession {
     sws: SwsContext,
     src_w: u32,
     src_h: u32,
+    src_format: PixelFormat,
     out_w: u32,
     out_h: u32,
     /// Reusable FFmpeg frame for RGBA input (source resolution).
@@ -152,8 +153,17 @@ impl FfmpegEncoder {
 
             // The probe: actually open a session. `find_by_name` succeeding
             // only means the encoder was compiled in, not that the hardware
-            // behind it exists.
-            match open_session(codec, name, quality, quality.width(), quality.height()) {
+            // behind it exists. (The probe's pixel format is arbitrary —
+            // this session is discarded; the real one opens lazily from
+            // the first frame's actual dimensions and format.)
+            match open_session(
+                codec,
+                name,
+                quality,
+                quality.width(),
+                quality.height(),
+                PixelFormat::Rgba,
+            ) {
                 Ok(_probe) => {
                     log::info!("Using FFmpeg encoder: {name}");
                     return Ok(Self {
@@ -180,9 +190,14 @@ impl FfmpegEncoder {
 
     /// Ensure the session matches the input frame dimensions, creating or
     /// recreating it as needed.
-    fn ensure_session(&mut self, src_w: u32, src_h: u32) -> Result<(), CodecError> {
+    fn ensure_session(
+        &mut self,
+        src_w: u32,
+        src_h: u32,
+        src_format: PixelFormat,
+    ) -> Result<(), CodecError> {
         if let Some(s) = &self.session {
-            if s.src_w == src_w && s.src_h == src_h {
+            if s.src_w == src_w && s.src_h == src_h && s.src_format == src_format {
                 return Ok(());
             }
             log::info!(
@@ -196,7 +211,7 @@ impl FfmpegEncoder {
             );
         }
 
-        let session = open_session(self.codec, self.enc_name, self.quality, src_w, src_h)?;
+        let session = open_session(self.codec, self.enc_name, self.quality, src_w, src_h, src_format)?;
         log::info!(
             "encoder session: {}x{} → {}x{} ({})",
             src_w,
@@ -272,7 +287,7 @@ impl FfmpegEncoder {
                 self.session = None;
             }
         }
-        self.ensure_session(frame.width, frame.height)?;
+        self.ensure_session(frame.width, frame.height, frame.format)?;
 
         // Strictly increasing PTS in the 1/1000 time base. Capture
         // timestamps are ms-resolution, so a burst can repeat a value.
@@ -661,9 +676,17 @@ fn open_session(
     quality: Quality,
     src_w: u32,
     src_h: u32,
+    src_format: PixelFormat,
 ) -> Result<EncSession, CodecError> {
     let (out_w, out_h) = fit_dimensions(src_w, src_h, quality);
     let pix_fmt = encoder_pix_fmt(name);
+    // swscale takes either 4-byte layout natively — BGRA straight from
+    // DXGI costs the same as RGBA and saves the capture side a
+    // full-frame swizzle pass.
+    let in_pix = match src_format {
+        PixelFormat::Rgba => Pixel::RGBA,
+        PixelFormat::Bgra => Pixel::BGRA,
+    };
 
     // new_with_codec (allocation *with* the codec) is required, not
     // cosmetic: it applies the codec's own default table. Allocating a
@@ -730,7 +753,7 @@ fn open_session(
     } else {
         Flags::BICUBIC
     };
-    let mut sws = SwsContext::get(Pixel::RGBA, src_w, src_h, pix_fmt, out_w, out_h, flags)
+    let mut sws = SwsContext::get(in_pix, src_w, src_h, pix_fmt, out_w, out_h, flags)
         .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
     set_sws_colorspace(
         &mut sws,
@@ -739,7 +762,7 @@ fn open_session(
         0, // YUV output is limited range
     );
 
-    let rgba_frame = VideoFrame::new(Pixel::RGBA, src_w, src_h);
+    let rgba_frame = VideoFrame::new(in_pix, src_w, src_h);
     let mut yuv_frame = VideoFrame::new(pix_fmt, out_w, out_h);
     // Tag the frames we hand to the encoder with the same colorimetry.
     unsafe {
@@ -755,6 +778,7 @@ fn open_session(
         sws,
         src_w,
         src_h,
+        src_format,
         out_w,
         out_h,
         rgba_frame,
