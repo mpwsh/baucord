@@ -72,8 +72,8 @@ pub const OPUS_SAMPLE_RATE: u32 = 48_000;
 /// Samples per 10 ms frame at 48 kHz.
 pub const FRAME_SIZE: usize = 480;
 
-/// Default Opus bitrate (bits/s). 24 kbps for 10 ms VoIP frames.
-const OPUS_BITRATE: i32 = 24_000;
+/// Default Opus bitrate (bits/s)
+const OPUS_BITRATE: i32 = 48_000;
 
 /// Maximum expected peers. Used for channel sizing.
 const DEFAULT_MAX_PEERS: usize = 32;

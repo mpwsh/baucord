@@ -354,7 +354,7 @@ impl AudioInput {
                         if now.duration_since(last_skew_log) >= Duration::from_secs(60) {
                             last_skew_log = now;
                             info!(
-                                "🎤 capture clock skew {:+.0} ppm (applying {:+.0} ppm correction)",
+                                "capture clock skew {:+.0} ppm (applying {:+.0} ppm correction)",
                                 s * 1e6,
                                 slip.correction_ppm(),
                             );

@@ -60,7 +60,7 @@ impl EncoderWorker {
         let _ = encoder.set_vbr(true);
         // Complexity 7: encoder runs on one thread (local user only),
         // so we can afford slightly more CPU for better sibilant quality.
-        let _ = encoder.set_complexity(7);
+        let _ = encoder.set_complexity(10);
         let _ = encoder.set_bandwidth(opus::Bandwidth::Superwideband);
         let _ = encoder.set_inband_fec(true);
         let _ = encoder.set_packet_loss_perc(5);
@@ -186,8 +186,10 @@ pub fn spawn(
     tx: Sender<AudioPacket>,
     stats: Arc<AudioStats>,
 ) -> std::thread::JoinHandle<()> {
-    crate::platform::spawn_named("voice-encode", move || match EncoderWorker::new(rx, tx, stats) {
-        Ok(mut worker) => worker.run(),
-        Err(e) => error!("Failed to create Opus encoder: {e}"),
+    crate::platform::spawn_named("voice-encode", move || {
+        match EncoderWorker::new(rx, tx, stats) {
+            Ok(mut worker) => worker.run(),
+            Err(e) => error!("Failed to create Opus encoder: {e}"),
+        }
     })
 }
