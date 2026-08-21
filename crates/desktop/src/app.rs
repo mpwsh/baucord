@@ -82,6 +82,10 @@ pub struct AppState {
     network: NetworkThreadHandle,
     voice: VoiceThreadHandle,
     screen: ScreenThreadHandle,
+    /// Prepared frames + the forward channel from the present-prep
+    /// thread (see present.rs), which owns `screen.event_rx` now.
+    present: Arc<crate::present::PresentShared>,
+    ui_screen_rx: crossbeam_channel::Receiver<ScreenEvent>,
 
     // Domain state
     users: HashMap<u64, UserState>,
@@ -141,7 +145,6 @@ pub struct AppState {
     // Device hot-reload polling
     last_input_devices: Vec<(String, bool)>,
     last_output_devices: Vec<(String, bool)>,
-    frames_coalesced: u64,
 
     // Own-process resource sampling (sidebar stats line)
     sys: sysinfo::System,
@@ -165,9 +168,16 @@ pub struct AppState {
 /// route hot-path packets, so channels are created up front. The wake
 /// callback is how workers nudge the Slint loop — the only reference
 /// to the wake mechanism they ever get.
+#[allow(clippy::type_complexity)] // one-shot startup plumbing
 fn spawn_workers(
     is_testing_mic_shared: &Arc<AtomicBool>,
-) -> (VoiceThreadHandle, ScreenThreadHandle, NetworkThreadHandle) {
+) -> (
+    VoiceThreadHandle,
+    ScreenThreadHandle,
+    NetworkThreadHandle,
+    Arc<crate::present::PresentShared>,
+    crossbeam_channel::Receiver<ScreenEvent>,
+) {
     let wake_fn: client::voice::WakeFn = Arc::new(wake);
     let (network_tx, network_control_rx) = crossbeam_channel::bounded::<NetworkControl>(256);
     let (network_msg_tx, network_msg_rx) = crossbeam_channel::bounded::<NetworkMessage>(256);
@@ -182,6 +192,17 @@ fn spawn_workers(
         wake_fn.clone(),
         voice.shared.output_level.clone(),
     );
+    // Present-prep thread: takes over screen.event_rx (the UI drain
+    // must not read it), pays the per-frame pixel copy off the UI
+    // thread, forwards non-frame events back via this channel.
+    let present_shared = Arc::new(crate::present::PresentShared::default());
+    let (screen_fwd_tx, screen_fwd_rx) = crossbeam_channel::unbounded();
+    crate::present::spawn(
+        screen.event_rx.clone(),
+        screen_fwd_tx,
+        Arc::clone(&present_shared),
+        wake_fn.clone(),
+    );
     let network = NetworkThreadHandle::spawn(
         network_tx,
         network_control_rx,
@@ -191,7 +212,7 @@ fn spawn_workers(
         screen.tx.clone(),
         wake_fn,
     );
-    (voice, screen, network)
+    (voice, screen, network, present_shared, screen_fwd_rx)
 }
 
 /// Prefer the Skia renderer when compiled in: femtovg (the default)
@@ -233,7 +254,8 @@ fn select_renderer() {
 pub fn run() {
     select_renderer();
     let is_testing_mic_shared = Arc::new(AtomicBool::new(false));
-    let (voice, screen, network) = spawn_workers(&is_testing_mic_shared);
+    let (voice, screen, network, present_shared, screen_fwd_rx) =
+        spawn_workers(&is_testing_mic_shared);
 
     let settings = Settings::load();
 
@@ -312,7 +334,8 @@ pub fn run() {
         download_cancelled: Arc::new(AtomicBool::new(false)),
         last_input_devices: Vec::new(),
         last_output_devices: Vec::new(),
-        frames_coalesced: 0,
+        present: present_shared,
+        ui_screen_rx: screen_fwd_rx,
         sys: sysinfo::System::new(),
         pid: sysinfo::get_current_pid().ok(),
         hotkeys: None,
@@ -865,27 +888,24 @@ impl AppState {
             }
         }
 
-        let mut latest_frames: HashMap<u64, ScreenEvent> = HashMap::new();
+        // Non-frame screen events, forwarded by the present-prep
+        // thread (which owns screen.event_rx now — see present.rs).
         for _ in 0..64 {
-            match st.screen.event_rx.try_recv() {
-                Ok(evt @ ScreenEvent::FrameReady { .. }) => {
-                    if let ScreenEvent::FrameReady { client_id, .. } = &evt
-                        && latest_frames.insert(*client_id, evt).is_some() {
-                            st.frames_coalesced += 1;
-                            if st.frames_coalesced.is_multiple_of(60) {
-                                warn!(
-                                    "UI coalescing has skipped {} frames — main thread slower than stream",
-                                    st.frames_coalesced
-                                );
-                            }
-                        }
-                }
+            match st.ui_screen_rx.try_recv() {
                 Ok(evt) => st.handle_screen_event(evt),
                 Err(_) => break,
             }
         }
-        for (_, evt) in latest_frames.drain() {
-            st.handle_screen_event(evt);
+        // Frames arrive as ready-made SharedPixelBuffers: the copy was
+        // paid on the prep thread; presenting is an Image wrap + a
+        // property set. Newest-per-stream (older frames were coalesced
+        // prep-side, before anyone paid for their conversion).
+        let prepared: Vec<crate::present::PreparedFrame> = {
+            let mut slots = st.present.slots.lock().unwrap();
+            slots.drain().map(|(_, f)| f).collect()
+        };
+        for frame in prepared {
+            st.present_frame(frame);
         }
     }
 
@@ -914,6 +934,41 @@ impl AppState {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Present one prepared frame: wrap the (already-copied) pixel
+    /// buffer in an Image handle and hand it to the viewer window. The
+    /// heavy work happened on the prep thread; this path stays well
+    /// under a millisecond, which is what lets the UI keep up with
+    /// 60 fps streams.
+    fn present_frame(&mut self, f: crate::present::PreparedFrame) {
+        let present_at = Instant::now();
+        let net_to_decode_ms = f.decoded_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
+        let decode_to_present_ms =
+            present_at.duration_since(f.decoded_at).as_secs_f32() * 1000.0;
+        let total_ms = present_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
+        if total_ms > 25.0 {
+            warn!(
+                "SLOW FRAME seq={}: {total_ms:.1}ms total (net→decode: {net_to_decode_ms:.1}ms, decode→present: {decode_to_present_ms:.1}ms)",
+                f.seq
+            );
+        }
+        if let Some(viewer) = self.viewers.get_mut(&f.client_id) {
+            let set_start = Instant::now();
+            viewer.update_frame(
+                f.buffer,
+                f.width,
+                f.height,
+                f.frame_bytes,
+                f.buffer_depth_ms,
+                f.buffer_target_ms,
+                f.buffer_jitter_ms,
+            );
+            let set_ms = set_start.elapsed().as_secs_f32() * 1000.0;
+            if set_ms > 5.0 {
+                warn!("Slow present: {set_ms:.1}ms for seq {}", f.seq);
+            }
+        }
+    }
+
     fn handle_screen_event(&mut self, evt: ScreenEvent) {
         match evt {
             ScreenEvent::SharingStarted { quality } => {
@@ -964,56 +1019,12 @@ impl AppState {
             ScreenEvent::Error(e) => {
                 self.show_error(&t!("error-screen-share", "error" => e.as_str()));
             }
-            ScreenEvent::FrameReady {
-                client_id,
-                width,
-                height,
-                rgba,
-                frame_bytes,
-                seq,
-                is_keyframe,
-                enqueued_at,
-                decoded_at,
-                buffer_depth_ms,
-                buffer_target_ms,
-                buffer_jitter_ms,
-            } => {
-                let app_drain_at = Instant::now();
-                let net_to_screen_ms =
-                    decoded_at.duration_since(enqueued_at).as_secs_f32() * 1000.0;
-                let screen_to_app_ms =
-                    app_drain_at.duration_since(decoded_at).as_secs_f32() * 1000.0;
-                let total_ms = app_drain_at.duration_since(enqueued_at).as_secs_f32() * 1000.0;
-                let frame_type = if is_keyframe { "K" } else { "P" };
-                #[allow(clippy::cast_precision_loss)] // KB for a log line
-                let frame_kb = frame_bytes as f64 / 1024.0;
-                log::debug!(
-                    "[seq={seq} {frame_type} {frame_kb:.0}KB] net→decode: {net_to_screen_ms:.1}ms | \
-        decode→app: {screen_to_app_ms:.1}ms | total: {total_ms:.1}ms | \
-        buf: {buffer_depth_ms:.0}/{buffer_target_ms:.0}ms jit: {buffer_jitter_ms:.0}ms",
-                );
-                if total_ms > 25.0 {
-                    warn!(
-                        "SLOW FRAME seq={seq}: {total_ms:.1}ms total \
-            (net→decode: {net_to_screen_ms:.1}ms, decode→app: {screen_to_app_ms:.1}ms)"
-                    );
-                }
-                if let Some(viewer) = self.viewers.get_mut(&client_id) {
-                    let blit_start = Instant::now();
-                    viewer.update_frame(
-                        &rgba,
-                        width,
-                        height,
-                        frame_bytes,
-                        buffer_depth_ms,
-                        buffer_target_ms,
-                        buffer_jitter_ms,
-                    );
-                    let blit_ms = blit_start.elapsed().as_secs_f32() * 1000.0;
-                    if blit_ms > 5.0 {
-                        warn!("Slow blit: {blit_ms:.1}ms for seq {seq}");
-                    }
-                }
+            // Frames never reach this handler anymore: the
+            // present-prep thread consumes them from screen.event_rx
+            // and the UI receives PreparedFrames through the slot map
+            // instead (see present.rs / present_frame below).
+            ScreenEvent::FrameReady { .. } => {
+                debug_assert!(false, "FrameReady is consumed by the present-prep thread");
             }
             ScreenEvent::PeerStartedSharing {
                 client_id,

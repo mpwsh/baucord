@@ -31,6 +31,7 @@
 //! reported with `LastPresentTime == 0` and skipped (matching xcap) —
 //! callers seed the first picture from a screenshot.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -66,6 +67,19 @@ const ACQUIRE_TIMEOUT_MS: u32 = 200;
 // fatal error the worker reports Lost and exits, and the *consumer*
 // recreates the whole duplicator on its own thread.
 
+/// Frames buffered between worker and consumer. Depth 2 (not 1): a
+/// 60 fps source on a higher-refresh display presents on an uneven
+/// vsync cadence (60-in-144 alternates ~14/21 ms), so a fixed-rate
+/// consumer against a single slot loses frames to phase jitter — the
+/// tick finds the slot empty a hair early, and the *next* source frame
+/// is then discarded because the slot is occupied (field-measured:
+/// ~50 fresh/s from a 60 fps video). One extra slot absorbs the
+/// misalignment at the cost of ≤1 frame of latency, while readback
+/// stays demand-paced: the worker still skips the expensive copy
+/// whenever the queue is full, so readback tracks consumption rather
+/// than display refresh.
+const FRAME_QUEUE_DEPTH: usize = 2;
+
 /// One captured desktop frame, tightly packed **BGRA**, top-down.
 pub struct CapturedFrame {
     pub data: Vec<u8>,
@@ -95,8 +109,9 @@ struct Shared {
     exit: AtomicBool,
     health: AtomicU8,
     failure: Mutex<Option<String>>,
-    /// Latest-frame slot: worker replaces, consumer takes.
-    slot: Mutex<Option<CapturedFrame>>,
+    /// Frame queue (depth [`FRAME_QUEUE_DEPTH`]): worker pushes,
+    /// consumer pops oldest-first.
+    slot: Mutex<VecDeque<CapturedFrame>>,
 }
 
 impl Shared {
@@ -140,7 +155,7 @@ impl DxgiDuplicator {
             exit: AtomicBool::new(false),
             health: AtomicU8::new(HEALTH_RUNNING),
             failure: Mutex::new(None),
-            slot: Mutex::new(None),
+            slot: Mutex::new(VecDeque::with_capacity(FRAME_QUEUE_DEPTH)),
         });
 
         let worker_shared = Arc::clone(&shared);
@@ -155,9 +170,9 @@ impl DxgiDuplicator {
         })
     }
 
-    /// Take the newest captured frame, if one arrived since last call.
+    /// Take the oldest buffered frame, if any arrived since last call.
     pub fn take_frame(&self) -> Option<CapturedFrame> {
-        self.shared.slot.lock().unwrap().take()
+        self.shared.slot.lock().unwrap().pop_front()
     }
 
     /// Current worker health.
@@ -241,16 +256,17 @@ fn worker_loop(
 
                 // Demand pacing: the desktop presents at display
                 // refresh rate, but the consumer only takes frames at
-                // the stream rate. If the previous frame is still
-                // sitting unconsumed in the slot, this one would just
-                // overwrite it — so skip the expensive part (GPU copy,
-                // synchronizing Map, multi-MB memcpy) entirely and
-                // release. Acquire+release without readback is nearly
-                // free, and readback throughput then automatically
-                // matches consumption instead of the display's refresh
-                // rate (a 144 Hz desktop feeding a 30 fps stream would
-                // otherwise waste ~80% of its readbacks).
-                if shared.slot.lock().unwrap().is_some() {
+                // the stream rate. If the queue is full, this frame
+                // would outpace consumption — skip the expensive part
+                // (GPU copy, synchronizing Map, multi-MB memcpy)
+                // entirely and release. Acquire+release without
+                // readback is nearly free, and readback throughput then
+                // automatically matches consumption instead of the
+                // display's refresh rate (a 144 Hz desktop feeding a
+                // 30 fps stream would otherwise waste ~80% of its
+                // readbacks). See FRAME_QUEUE_DEPTH for why the queue
+                // is 2 deep rather than a single slot.
+                if shared.slot.lock().unwrap().len() >= FRAME_QUEUE_DEPTH {
                     let _ = unsafe { duplication.ReleaseFrame() };
                     continue;
                 }
@@ -260,7 +276,7 @@ fn worker_loop(
                 };
                 match grabbed {
                     Ok(Some(frame)) => {
-                        *shared.slot.lock().unwrap() = Some(frame);
+                        shared.slot.lock().unwrap().push_back(frame);
                     }
                     Ok(None) => {}
                     Err(GrabError::UnsupportedFormat(fmt)) => {

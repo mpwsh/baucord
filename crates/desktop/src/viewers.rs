@@ -87,7 +87,7 @@ impl Viewer {
     #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
     pub fn update_frame(
         &mut self,
-        rgba: &[u8],
+        buffer: slint::SharedPixelBuffer<slint::Rgba8Pixel>,
         width: u32,
         height: u32,
         frame_bytes: usize,
@@ -109,8 +109,9 @@ impl Viewer {
             );
         }
 
-        self.win
-            .set_frame(ui::convert::rgba_image(rgba, width, height));
+        // The pixel copy already happened on the present-prep thread;
+        // this is a cheap handle wrap + property set.
+        self.win.set_frame(slint::Image::from_rgba8(buffer));
 
         self.total_bytes += frame_bytes as u64;
         self.ring.push(frame_bytes as u64);

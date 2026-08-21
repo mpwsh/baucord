@@ -241,6 +241,30 @@ impl Drop for ScreenThreadHandle {
 
 // ── Capture + encode state ──────────────────────────────────────────────
 
+/// Emit the rolling share telemetry line every 10 s: fresh capture
+/// rate, skipped (unchanged) tick rate, and encoded output rate. On a
+/// healthy 60 fps share of moving content, fresh and encode both read
+/// ~60/s; fresh well below the target while encode tracks it means the
+/// *source* isn't changing that fast (30 fps video content, display
+/// refresh cap) rather than a pipeline problem.
+fn report_share_telemetry(state: &mut CaptureState) {
+    const TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
+    let (start, fresh, skipped, encoded) = state.telemetry;
+    let elapsed = start.elapsed();
+    if elapsed < TELEMETRY_INTERVAL {
+        return;
+    }
+    let secs = elapsed.as_secs_f32();
+    info!(
+        "share telemetry: {:.1} fresh/s, {:.1} skipped/s, {:.1} encoded/s over {:.0}s",
+        fresh as f32 / secs,
+        skipped as f32 / secs,
+        encoded as f32 / secs,
+        secs
+    );
+    state.telemetry = (Instant::now(), 0, 0, 0);
+}
+
 struct CaptureState {
     capturer: Capturer,
     encoder: Box<dyn VideoEncoder + Send>,
@@ -258,6 +282,11 @@ struct CaptureState {
     /// frames must keep flowing until one ships. Cleared when a
     /// keyframe AU is sent.
     keyframe_burst_until: Option<Instant>,
+    /// Rolling 10 s telemetry: (window start, fresh captures, skipped
+    /// unchanged ticks, encoded AUs). Answers "what fps is this share
+    /// actually producing" straight from the log, so viewer-side fps
+    /// complaints can be split into sharer vs network vs viewer.
+    telemetry: (Instant, u32, u32, u32),
     /// Keyframe AUs whose NAL layout has been logged this session (the
     /// first few are logged at INFO as a bitstream self-check — makes
     /// hardware-encoder quirks visible from the sender's log alone).
@@ -405,6 +434,11 @@ struct PeerStream {
     decoder: Box<dyn VideoDecoder + Send>,
     width: u32,
     height: u32,
+    /// Rolling 10 s viewer telemetry: (window start, decoded frames).
+    /// Splits "viewer fps is low" into what actually *arrived and
+    /// decoded* vs what the sharer sent (compare against the sharer's
+    /// `share telemetry` line for the same wall-clock window).
+    rx_telemetry: (Instant, u32),
     /// Jitter buffer for this peer's video stream. Holds encoded packets
     /// and releases them in sequence order at a controlled rate.
     jitter_buffer: VideoJitterBuffer,
@@ -627,6 +661,16 @@ fn drain_and_decode(
                 Ok(Some(decoded)) => {
                     let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
                     let decoded_at = Instant::now();
+                    stream.rx_telemetry.1 += 1;
+                    let rx_elapsed = stream.rx_telemetry.0.elapsed();
+                    if rx_elapsed.as_secs() >= 10 {
+                        info!(
+                            "viewer telemetry peer {client_id}: {:.1} fps decoded over {:.0}s",
+                            stream.rx_telemetry.1 as f32 / rx_elapsed.as_secs_f32(),
+                            rx_elapsed.as_secs_f32()
+                        );
+                        stream.rx_telemetry = (decoded_at, 0);
+                    }
                     // 1080p keyframes cost 12–15 ms in software decode —
                     // that's normal and the jitter buffer absorbs it.
                     // Only flag decodes that actually threaten cadence.
@@ -750,6 +794,7 @@ fn handle_control(
                 seq: 0,
                 next_refresh: Instant::now(),
                 keyframe_burst_until: None,
+                telemetry: (Instant::now(), 0, 0, 0),
                 keyframes_logged: 0,
                 system_audio,
                 pace_idx: 0,
@@ -829,6 +874,7 @@ fn handle_control(
                                 height,
                                 jitter_buffer: VideoJitterBuffer::new(30),
                                 stream_audio: None,
+                                rx_telemetry: (Instant::now(), 0),
                             },
                         );
                     }
@@ -1023,6 +1069,10 @@ fn capture_and_encode(
     }
 
     let now = Instant::now();
+    if status == CaptureStatus::Fresh {
+        state.telemetry.1 += 1;
+    }
+    report_share_telemetry(state);
     let repeat = match status {
         CaptureStatus::Fresh => false,
         CaptureStatus::Unchanged => {
@@ -1034,6 +1084,7 @@ fn capture_and_encode(
                 .keyframe_burst_until
                 .is_some_and(|until| now < until);
             if !state.encoder.keyframe_pending() && !bursting && now < state.next_refresh {
+                state.telemetry.2 += 1;
                 shared.last_capture_us.store(capture_us, Ordering::Relaxed);
                 return;
             }
@@ -1079,6 +1130,7 @@ fn capture_and_encode(
 
         let seq = state.seq;
         state.seq = state.seq.wrapping_add(1);
+        state.telemetry.3 += 1;
 
         if encoded.is_keyframe {
             log::debug!("Sent keyframe #{seq}: {} bytes", encoded.data.len());

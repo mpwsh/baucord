@@ -5,6 +5,7 @@ mod app;
 mod clipboard;
 mod hotkeys;
 mod media;
+mod present;
 mod resources;
 mod settingsui;
 mod updater;
