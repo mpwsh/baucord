@@ -58,14 +58,14 @@ pub const EMOJI: &[(&str, &str, &str)] = &[
     ("man_facepalming", "🤦", "Gestures"), ("man_shrugging", "🤷", "Gestures"),
     ("shrug", "🤷", "Gestures"), ("facepalm", "🤦", "Gestures"),
     // ── Hearts ──────────────────────────────────────────────────────
-    ("heart", "❤️", "Hearts"), ("orange_heart", "🧡", "Hearts"), ("yellow_heart", "💛", "Hearts"),
+    ("<3", "❤️", "Hearts"), ("heart", "❤️", "Hearts"), ("orange_heart", "🧡", "Hearts"), ("yellow_heart", "💛", "Hearts"),
     ("green_heart", "💚", "Hearts"), ("blue_heart", "💙", "Hearts"), ("purple_heart", "💜", "Hearts"),
     ("black_heart", "🖤", "Hearts"), ("white_heart", "🤍", "Hearts"), ("brown_heart", "🤎", "Hearts"),
     ("broken_heart", "💔", "Hearts"), ("heavy_heart_exclamation", "❣️", "Hearts"),
     ("two_hearts", "💕", "Hearts"), ("sparkling_heart", "💖", "Hearts"),
     ("heartpulse", "💗", "Hearts"), ("heartbeat", "💓", "Hearts"), ("revolving_hearts", "💞", "Hearts"),
     // ── Animals & nature ────────────────────────────────────────────
-    ("dog", "🐶", "Nature"), ("cat", "🐱", "Nature"), ("mouse", "🐭", "Nature"),
+    ("horse", "🐴", "Nature"), ("dog", "🐶", "Nature"), ("cat", "🐱", "Nature"), ("mouse", "🐭", "Nature"),
     ("rabbit", "🐰", "Nature"), ("fox_face", "🦊", "Nature"), ("bear", "🐻", "Nature"),
     ("panda_face", "🐼", "Nature"), ("koala", "🐨", "Nature"), ("tiger", "🐯", "Nature"),
     ("lion", "🦁", "Nature"), ("cow", "🐮", "Nature"), ("pig", "🐷", "Nature"),

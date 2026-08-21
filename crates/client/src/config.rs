@@ -226,7 +226,7 @@ impl Default for AudioSettings {
         Self {
             input: AudioInputSettings::default(),
             output: AudioOutputSettings::default(),
-            gate_threshold: 0.005,
+            gate_threshold: 0.020,
         }
     }
 }
@@ -773,7 +773,10 @@ mod tests {
         let json = serde_json::to_string(&s).expect("serialize");
         let back = parse(&json);
         assert_eq!(
-            back.servers[0].channel_passwords.get("Gaming").map(String::as_str),
+            back.servers[0]
+                .channel_passwords
+                .get("Gaming")
+                .map(String::as_str),
             Some("hunter2")
         );
     }

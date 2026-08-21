@@ -150,7 +150,7 @@ impl HotkeyManager {
                     self.registered.push(hotkey);
                     self.bindings.insert(hotkey.id(), entry.action);
                     info!(
-                        "🔑 Registered global hotkey: {} → {}",
+                        "Registered global hotkey: {} → {}",
                         entry.bind,
                         entry.action.label()
                     );

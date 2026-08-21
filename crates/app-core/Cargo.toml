@@ -1,6 +1,6 @@
 [package]
 name = "app-core"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "Platform-agnostic application layer for baucord — view models, chat/image/GIF pipelines, and pure app logic shared by every shell (desktop today, mobile-android / mobile-ios later)."
 
@@ -12,12 +12,12 @@ workspace = true
 # crate used — png/gif are the wire formats, the rest cover
 # attach/paste/drop sources. No default features (no rayon etc.).
 image = { version = "0.25.9", default-features = false, features = [
-    "png",
-    "jpeg",
-    "gif",
-    "webp",
-    "bmp",
-    "tiff",
+  "png",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "tiff",
 ] }
 thiserror = "2"
 log.workspace = true

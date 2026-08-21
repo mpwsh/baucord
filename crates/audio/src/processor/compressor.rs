@@ -152,7 +152,13 @@ impl AudioProcessor for Compressor {
     }
 
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
-        self.process_inner(samples, ctx.gate_open, ctx.compressor_enabled);
+        // See AGC: the hold window carries only noise floor, so hold
+        // gain rather than releasing upward through the noise tail.
+        self.process_inner(
+            samples,
+            ctx.gate_open && !ctx.gate_holding,
+            ctx.compressor_enabled,
+        );
     }
 
     fn reset(&mut self) {

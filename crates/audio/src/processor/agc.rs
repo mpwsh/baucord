@@ -165,7 +165,12 @@ impl AudioProcessor for AutoGainControl {
             ctx.agc_gain = 1.0;
             return;
         }
-        ctx.agc_gain = self.process_inner(samples, ctx.gate_open);
+        // Treat the gate's hold window like a closed gate: only the
+        // residual noise floor is passing, and adapting to it ramps
+        // gain upward, amplifying the post-speech noise tail. The
+        // `!gate_open` path holds the current gain and still applies
+        // it, which is exactly the right behavior here too.
+        ctx.agc_gain = self.process_inner(samples, ctx.gate_open && !ctx.gate_holding);
     }
 
     fn reset(&mut self) {
@@ -176,6 +181,31 @@ impl AudioProcessor for AutoGainControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gain_holds_steady_during_gate_hold_window() {
+        let knobs = Arc::new(Knobs::default());
+        let mut agc = AutoGainControl::new(knobs, 30.0);
+        let mut ctx = crate::processor::FrameContext::default();
+        // Converge on quiet speech (gain rises toward target).
+        for _ in 0..200 {
+            let mut f = sine_frame(0.03, 300.0);
+            agc.process(&mut f, &mut ctx);
+        }
+        let converged = agc.current_gain();
+        assert!(converged > 1.5, "AGC should have boosted, got {converged}");
+        // Hold window: noise floor above the near-silence guard.
+        ctx.gate_holding = true;
+        for _ in 0..100 {
+            let mut f = sine_frame(0.005, 300.0);
+            agc.process(&mut f, &mut ctx);
+        }
+        let held = agc.current_gain();
+        assert!(
+            (held - converged).abs() < f32::EPSILON,
+            "gain moved during hold: {converged} -> {held}"
+        );
+    }
 
     fn sine_frame(amplitude: f32, freq_hz: f32) -> Vec<f32> {
         (0..480)

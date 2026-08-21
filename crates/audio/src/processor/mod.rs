@@ -103,6 +103,13 @@ pub struct FrameContext {
     /// Written by: `NoiseGate`. Read by: `Compressor`, `AGC`.
     pub gate_open: bool,
 
+    /// Whether the gate is in its post-speech hold window (open, but
+    /// the envelope has fallen below the close threshold). During the
+    /// hold only the residual noise floor is passing, so gain stages
+    /// must not adapt to it — adapting boosts the noise tail.
+    /// Written by: `NoiseGate`. Read by: `Compressor`, `AGC`.
+    pub gate_holding: bool,
+
     /// RNNoise VAD probability (0.0–1.0).
     /// Written by: `Denoiser`. Read by: `VADStage` pre-filter.
     pub rnnoise_vad_prob: f32,
@@ -143,6 +150,7 @@ impl Default for FrameContext {
             agc_enabled: true,
             input_gain: 1.0,
             gate_open: true,
+            gate_holding: false,
             rnnoise_vad_prob: 1.0,
             is_speech: false,
             fade_out_active: false,

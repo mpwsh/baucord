@@ -25,6 +25,16 @@
 //!   at 48 kHz) eliminate click/pop artifacts.
 //! - **Hold time** keeps the gate open after signal drops below
 //!   threshold, preventing clipping of natural speech pauses.
+//! - **Hold-window expansion**: during the hold the gate is not fully
+//!   transparent — a gentle downward expander attenuates the signal
+//!   by how far it sits below the close threshold (up to
+//!   [`HOLD_EXPANDER_FLOOR_DB`]). Trailing syllables live at or above
+//!   the threshold and pass untouched, but the residual noise floor
+//!   (post-denoise hiss, boosted upstream of nothing but the encoder)
+//!   is pushed down immediately instead of playing out as an audible
+//!   noise tail for the whole hold period. Attack is near-instant so
+//!   resuming speech is never dulled; release is smoothed to avoid
+//!   zipper noise.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -50,6 +60,27 @@ enum GateState {
 /// 256 samples at 48 kHz ≈ 5.2ms — inaudible but eliminates clicks.
 const FADE_SAMPLES: usize = 384;
 
+/// Downward-expansion ratio applied while the envelope is below the
+/// close threshold (the hold window). 2.0 means every dB below the
+/// threshold costs one extra dB of attenuation — gentle enough that
+/// word endings decay naturally, firm enough to sink the noise floor.
+const HOLD_EXPANDER_RATIO: f32 = 2.0;
+
+/// Maximum attenuation the hold-window expander applies. The point is
+/// to move the noise tail below audibility, not to hard-mute the hold
+/// (hard muting would defeat the hold's purpose).
+const HOLD_EXPANDER_FLOOR_DB: f32 = -15.0;
+
+/// Per-sample smoothing for expander gain *decreases* (~21 ms time
+/// constant at 48 kHz) — slow enough to be zipper-free and to average
+/// out frame-to-frame RMS wobble on the noise floor.
+const EXPANDER_RELEASE: f32 = 0.001;
+
+/// Per-sample smoothing for expander gain *increases* (~0.4 ms) —
+/// effectively instant so a resumed speech onset is never dulled;
+/// upward gain steps are masked by the onset itself.
+const EXPANDER_ATTACK: f32 = 0.05;
+
 /// Real-time noise gate processor.
 ///
 /// Call [`process`](AudioProcessor::process) once per 480-sample frame
@@ -70,6 +101,9 @@ pub struct NoiseGate {
     fade_step: f32,
     hold_remaining: usize,
     hold_samples: usize,
+    /// Smoothed hold-window expander gain (1.0 while speech is at or
+    /// above the close threshold).
+    expander_gain: f32,
 }
 
 impl NoiseGate {
@@ -93,6 +127,7 @@ impl NoiseGate {
             fade_step: 1.0 / FADE_SAMPLES as f32,
             hold_remaining: 0,
             hold_samples,
+            expander_gain: 1.0,
         }
     }
 
@@ -120,8 +155,29 @@ impl NoiseGate {
             self.envelope = self.envelope * 0.95 + rms * 0.05;
         }
 
+        // Hold-window expander target for this frame: unity at or above
+        // the close threshold, then (rms/threshold)^(ratio-1) below it,
+        // floored. Keyed off the *instantaneous* frame RMS, not the
+        // smoothed envelope — the envelope's slow release exists for
+        // open/close hysteresis and would delay the expander past the
+        // hold window; the per-sample smoother below handles zipper
+        // safety instead.
+        let floor_gain = 10.0_f32.powf(HOLD_EXPANDER_FLOOR_DB / 20.0);
+        let expander_target = if rms >= close_threshold {
+            1.0
+        } else {
+            let rel = (rms / close_threshold.max(1e-6)).max(1e-6);
+            rel.powf(HOLD_EXPANDER_RATIO - 1.0).clamp(floor_gain, 1.0)
+        };
+
         // Per-sample state machine for smooth fades and accurate hold timing.
         for s in samples.iter_mut() {
+            let coeff = if expander_target > self.expander_gain {
+                EXPANDER_ATTACK
+            } else {
+                EXPANDER_RELEASE
+            };
+            self.expander_gain += coeff * (expander_target - self.expander_gain);
             match self.state {
                 GateState::Closed => {
                     *s = 0.0;
@@ -131,7 +187,7 @@ impl NoiseGate {
                 }
                 GateState::Opening => {
                     self.fade_position = (self.fade_position + self.fade_step).min(1.0);
-                    *s *= smoothstep(self.fade_position);
+                    *s *= smoothstep(self.fade_position) * self.expander_gain;
                     if self.fade_position >= 1.0 {
                         self.state = GateState::Open;
                     } else if self.envelope < close_threshold {
@@ -139,12 +195,16 @@ impl NoiseGate {
                     }
                 }
                 GateState::Open => {
+                    // Unity while the envelope holds the threshold; the
+                    // expander only bites once the envelope falls below.
+                    *s *= self.expander_gain;
                     if self.envelope < close_threshold {
                         self.state = GateState::Holding;
                         self.hold_remaining = self.hold_samples;
                     }
                 }
                 GateState::Holding => {
+                    *s *= self.expander_gain;
                     if self.envelope >= close_threshold {
                         self.state = GateState::Open;
                         self.hold_remaining = 0;
@@ -156,7 +216,7 @@ impl NoiseGate {
                 }
                 GateState::Closing => {
                     self.fade_position = (self.fade_position - self.fade_step).max(0.0);
-                    *s *= smoothstep(self.fade_position);
+                    *s *= smoothstep(self.fade_position) * self.expander_gain;
                     if self.fade_position <= 0.0 {
                         self.state = GateState::Closed;
                     } else if self.envelope >= open_threshold {
@@ -177,6 +237,7 @@ impl AudioProcessor for NoiseGate {
 
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         ctx.gate_open = self.process_inner(samples);
+        ctx.gate_holding = matches!(self.state, GateState::Holding);
     }
 
     fn reset(&mut self) {
@@ -184,6 +245,7 @@ impl AudioProcessor for NoiseGate {
         self.envelope = 0.0;
         self.fade_position = 0.0;
         self.hold_remaining = 0;
+        self.expander_gain = 1.0;
     }
 }
 
@@ -215,4 +277,129 @@ impl Default for Knobs {
 /// Map linear fade position (0.0–1.0) to smoothstep gain.
 fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::processor::{AudioProcessor, FrameContext};
+    use std::sync::Arc;
+
+    /// One 10 ms frame of a ±`amp` square wave (RMS = `amp` exactly,
+    /// which makes envelope math deterministic).
+    fn frame(amp: f32) -> Vec<f32> {
+        (0..480)
+            .map(|i| if i % 2 == 0 { amp } else { -amp })
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    /// Gate with a 0.012 threshold and 200 ms hold, driven to fully
+    /// open with loud frames.
+    fn opened_gate() -> (NoiseGate, FrameContext) {
+        let mut gate = NoiseGate::new(Arc::new(Knobs::default()), 200);
+        let mut ctx = FrameContext::default();
+        for _ in 0..20 {
+            let mut f = frame(0.2);
+            gate.process(&mut f, &mut ctx);
+        }
+        assert!(ctx.gate_open && !ctx.gate_holding, "gate should be open");
+        (gate, ctx)
+    }
+
+    /// Feed quiet frames until the gate reports `Holding`, then return
+    /// how many frames that took. Panics if the hold never starts.
+    fn drive_into_hold(gate: &mut NoiseGate, ctx: &mut FrameContext, amp: f32) -> usize {
+        for n in 0..200 {
+            let mut f = frame(amp);
+            gate.process(&mut f, ctx);
+            if ctx.gate_holding {
+                return n;
+            }
+        }
+        panic!("gate never entered the hold window");
+    }
+
+    mod hold_window_expander {
+        use super::*;
+
+        #[test]
+        fn attenuates_the_noise_floor_during_the_hold_window() {
+            let (mut gate, mut ctx) = opened_gate();
+            // Noise floor: below close threshold (0.0072), above zero.
+            drive_into_hold(&mut gate, &mut ctx, 0.003);
+            // Let the expander release settle within the hold window.
+            let mut out = frame(0.003);
+            for _ in 0..5 {
+                out = frame(0.003);
+                gate.process(&mut out, &mut ctx);
+            }
+            assert!(ctx.gate_holding, "still inside the hold window");
+            let gain = rms(&out) / 0.003;
+            assert!(
+                gain < 0.6 && gain > 0.1,
+                "expected expander attenuation, got gain {gain}"
+            );
+        }
+
+        #[test]
+        fn deep_noise_floor_is_limited_by_the_expander_floor() {
+            let (mut gate, mut ctx) = opened_gate();
+            drive_into_hold(&mut gate, &mut ctx, 0.0005);
+            let mut out = frame(0.0005);
+            for _ in 0..8 {
+                out = frame(0.0005);
+                gate.process(&mut out, &mut ctx);
+                if !ctx.gate_holding {
+                    break;
+                }
+            }
+            let floor = 10.0_f32.powf(HOLD_EXPANDER_FLOOR_DB / 20.0);
+            let gain = rms(&out) / 0.0005;
+            assert!(
+                gain >= floor * 0.8,
+                "attenuation should not exceed the floor: gain {gain} vs floor {floor}"
+            );
+        }
+
+        #[test]
+        fn resumed_speech_returns_to_unity_within_a_frame() {
+            let (mut gate, mut ctx) = opened_gate();
+            drive_into_hold(&mut gate, &mut ctx, 0.003);
+            for _ in 0..5 {
+                let mut f = frame(0.003);
+                gate.process(&mut f, &mut ctx);
+            }
+            // Speech comes back mid-hold.
+            let mut first = frame(0.2);
+            gate.process(&mut first, &mut ctx);
+            let mut second = frame(0.2);
+            gate.process(&mut second, &mut ctx);
+            let gain = rms(&second) / 0.2;
+            assert!(gain > 0.95, "speech after hold should be unity, got {gain}");
+        }
+
+        #[test]
+        fn open_state_stays_unity_for_signal_above_threshold() {
+            let (mut gate, mut ctx) = opened_gate();
+            let mut out = frame(0.05);
+            gate.process(&mut out, &mut ctx);
+            let gain = rms(&out) / 0.05;
+            assert!(
+                (gain - 1.0).abs() < 0.01,
+                "open gate should be transparent, got gain {gain}"
+            );
+        }
+
+        #[test]
+        fn gate_holding_flag_tracks_the_hold_window() {
+            let (mut gate, mut ctx) = opened_gate();
+            assert!(!ctx.gate_holding);
+            drive_into_hold(&mut gate, &mut ctx, 0.003);
+            assert!(ctx.gate_holding && ctx.gate_open);
+        }
+    }
 }
