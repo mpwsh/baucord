@@ -107,7 +107,7 @@ impl AudioInput {
         let channels = device_config.channels();
 
         info!(
-            "🎤 Input device: {} @ {}Hz, {}ch, {:?}",
+            "Input device: {} @ {}Hz, {}ch, {:?}",
             crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
             sample_rate,
             channels,
@@ -335,7 +335,7 @@ impl AudioInput {
             let _mmcss = crate::platform::promote_current_thread();
 
             info!(
-                "🎤 Input worker started (device {}Hz, resample={})",
+                "Input worker started (device {}Hz, resample={})",
                 device_sample_rate, needs_resample
             );
 
@@ -354,7 +354,7 @@ impl AudioInput {
                         if now.duration_since(last_skew_log) >= Duration::from_secs(60) {
                             last_skew_log = now;
                             info!(
-                                "capture clock skew {:+.0} ppm (applying {:+.0} ppm correction)",
+                                "Capture clock skew {:+.0} ppm (applying {:+.0} ppm correction)",
                                 s * 1e6,
                                 slip.correction_ppm(),
                             );
