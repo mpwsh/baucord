@@ -338,6 +338,14 @@ impl FfmpegEncoder {
             session.yuv_frame.set_kind(ffmpeg::picture::Type::None);
         }
 
+        // Async encoders (AMF): collect finished output BEFORE this
+        // submission — see drain_before_submit() for the output-spacing
+        // rationale. Others: after, for minimum latency.
+        let drain_first = drain_before_submit(self.enc_name);
+        if drain_first {
+            drain_packets(session, &mut out)?;
+        }
+
         match session.encoder.send_frame(&session.yuv_frame) {
             Ok(()) => {
                 session.pending_ts.push_back(frame.timestamp_ms);
@@ -354,7 +362,9 @@ impl FfmpegEncoder {
             Err(e) => return Err(CodecError::Encode(e.to_string())),
         }
 
-        drain_packets(session, &mut out)?;
+        if !drain_first {
+            drain_packets(session, &mut out)?;
+        }
         if out.iter().any(|f| f.is_keyframe) {
             // Ground truth for the reopen-for-IDR backstop: a keyframe
             // actually left this encoder (stamped with the submitting
@@ -663,6 +673,22 @@ fn fit_dimensions(src_w: u32, src_h: u32, quality: Quality) -> (u32, u32) {
 /// Input pixel format for a given encoder. Most accept planar YUV420P;
 /// Intel QSV only takes the semi-planar NV12 layout (same 4:2:0 subsampling,
 /// interleaved chroma). swscale converts RGBA to either directly.
+/// Whether this encoder's output should be collected *before*
+/// submitting the new frame rather than after. AMF's asynchronous
+/// pipeline finishes an AU ~15-20 ms after submission — right at one
+/// 60 fps tick — so a submit-then-drain loop collects AUs in an
+/// alternating 0,2,0,2 pattern: sixty per second, but paired
+/// back-to-back thirty times a second. Viewers decode all sixty, then
+/// UI coalescing collapses each pair into one displayed frame — the
+/// sharer looks like 30 fps despite every rate counter reading 60.
+/// Draining at the top of the call gives every AU a full tick to
+/// become ready, restoring one-AU-per-tick spacing at the cost of ≤1
+/// tick (~17 ms) of extra latency. NVENC/QSV/x264 finish well inside a
+/// tick and keep the lower-latency submit-then-drain path.
+fn drain_before_submit(name: &str) -> bool {
+    name == "h264_amf"
+}
+
 fn encoder_pix_fmt(name: &str) -> Pixel {
     match name {
         "h264_qsv" => Pixel::NV12,

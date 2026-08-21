@@ -249,20 +249,22 @@ impl Drop for ScreenThreadHandle {
 /// refresh cap) rather than a pipeline problem.
 fn report_share_telemetry(state: &mut CaptureState) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
-    let (start, fresh, skipped, encoded) = state.telemetry;
+    let (start, fresh, skipped, encoded, single, multi) = state.telemetry;
     let elapsed = start.elapsed();
     if elapsed < TELEMETRY_INTERVAL {
         return;
     }
     let secs = elapsed.as_secs_f32();
     info!(
-        "share telemetry: {:.1} fresh/s, {:.1} skipped/s, {:.1} encoded/s over {:.0}s",
+        "share telemetry: {:.1} fresh/s, {:.1} skipped/s, {:.1} encoded/s over {:.0}s (spacing: {:.1} single/s, {:.1} bursty/s)",
         fresh as f32 / secs,
         skipped as f32 / secs,
         encoded as f32 / secs,
-        secs
+        secs,
+        single as f32 / secs,
+        multi as f32 / secs
     );
-    state.telemetry = (Instant::now(), 0, 0, 0);
+    state.telemetry = (Instant::now(), 0, 0, 0, 0, 0);
 }
 
 struct CaptureState {
@@ -283,10 +285,12 @@ struct CaptureState {
     /// keyframe AU is sent.
     keyframe_burst_until: Option<Instant>,
     /// Rolling 10 s telemetry: (window start, fresh captures, skipped
-    /// unchanged ticks, encoded AUs). Answers "what fps is this share
-    /// actually producing" straight from the log, so viewer-side fps
-    /// complaints can be split into sharer vs network vs viewer.
-    telemetry: (Instant, u32, u32, u32),
+    /// unchanged ticks, encoded AUs, single-AU encodes, multi-AU
+    /// encodes). The last two measure output *spacing*: multi-AU
+    /// encodes mean the encoder is emitting in bursts (pairs on the
+    /// wire), which viewers' UI coalescing collapses — the halved-fps
+    /// signature that rate counters alone can't see.
+    telemetry: (Instant, u32, u32, u32, u32, u32),
     /// Keyframe AUs whose NAL layout has been logged this session (the
     /// first few are logged at INFO as a bitstream self-check — makes
     /// hardware-encoder quirks visible from the sender's log alone).
@@ -794,7 +798,7 @@ fn handle_control(
                 seq: 0,
                 next_refresh: Instant::now(),
                 keyframe_burst_until: None,
-                telemetry: (Instant::now(), 0, 0, 0),
+                telemetry: (Instant::now(), 0, 0, 0, 0, 0),
                 keyframes_logged: 0,
                 system_audio,
                 pace_idx: 0,
@@ -1118,6 +1122,13 @@ fn capture_and_encode(
         }
     };
     let encode_us = t1.elapsed().as_micros() as u32;
+    // Output-spacing accounting (see the telemetry field docs): one AU
+    // per tick is healthy; 2+ means bursts that viewers will coalesce.
+    match encoded_frames.len() {
+        0 => {}
+        1 => state.telemetry.4 += 1,
+        _ => state.telemetry.5 += 1,
+    }
     state.next_refresh = now + STATIC_REFRESH_INTERVAL;
 
     shared.last_capture_us.store(capture_us, Ordering::Relaxed);
