@@ -226,7 +226,7 @@ impl Default for AudioSettings {
         Self {
             input: AudioInputSettings::default(),
             output: AudioOutputSettings::default(),
-            gate_threshold: 0.020,
+            gate_threshold: 0.010,
         }
     }
 }
