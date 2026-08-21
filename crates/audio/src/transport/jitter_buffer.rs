@@ -25,6 +25,20 @@
 //!   this buffer stores raw samples and cannot reorder them.
 //! - **Peer pruning**: Buffers for peers that have been silent for 30 s are
 //!   dropped instead of accumulating forever.
+//!
+//! ## v0.8 changes from v0.7
+//!
+//! - **Per-peer clock-drift compensation**: a sender whose capture
+//!   clock is slow drains this buffer at the drift rate and punctures
+//!   it every few tens of seconds during continuous speech — audible
+//!   holes indistinguishable from packet loss (the "same users always
+//!   break up" field report; the sender-side counterpart lives in
+//!   [`crate::clock`]). Each peer's skew is estimated from inflow vs
+//!   wall-paced consumption over clean 10 s windows and playout is
+//!   time-stretched by the same amount (≤ ±2000 ppm, inaudible), so
+//!   the buffer stays flat instead of draining or growing. Inert
+//!   (estimate 0.0, playout byte-identical to v0.7) for healthy
+//!   senders and until a skew above the dead zone is confirmed.
 
 use crate::config::PeerAudioSettings;
 use crate::processor::limiter::Limiter;
@@ -90,6 +104,21 @@ const UNDERRUN_MEDIA_CONTIGUITY_S: f32 = 0.025;
 /// Peers with no pushed audio for this long are pruned.
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Length of one clock-drift estimation window. Long enough that the
+/// slope measurement (samples in vs samples out) resolves tens of ppm
+/// above scheduler noise.
+const DRIFT_WINDOW: Duration = Duration::from_secs(10);
+
+/// Estimated per-peer skew below this is noise; treated as zero so
+/// healthy senders take the unmodified playout path.
+const DRIFT_DEADZONE: f64 = 10e-6;
+
+/// Ceiling on the applied per-peer rate correction (±2000 ppm — a
+/// ~3.5-cent time-scale change, below audibility; larger skews mean a
+/// broken sender, for which the underrun/drain machinery below stays
+/// as the safety net).
+const MAX_DRIFT_CORRECTION: f64 = 2_000e-6;
+
 /// Per-peer state inside the jitter buffer.
 struct PeerBuffer {
     /// Audio sample FIFO (decoded f32 at 48 kHz).
@@ -121,6 +150,24 @@ struct PeerBuffer {
     last_sample: f32,
     /// Remaining fade-in samples after resuming from priming.
     fade_in_remaining: usize,
+    /// Cumulative samples pushed for this peer (drift numerator).
+    pushed_samples: u64,
+    /// Cumulative wall-paced samples consumed while playing (drift
+    /// denominator). Their long-run ratio deviates from 1.0 by
+    /// exactly the sender's capture-clock skew.
+    consumed_samples: u64,
+    /// Open estimation window: (start, pushed at start, consumed at
+    /// start).
+    drift_window: Option<(Instant, u64, u64)>,
+    /// Windows containing an underrun, priming, concealment, drain,
+    /// or mute measure playout disruption, not clock rate — poisoned
+    /// windows restart instead of updating the estimate.
+    drift_window_dirty: bool,
+    /// Smoothed sender clock skew (`+` = sender fast, `-` = slow).
+    /// 0.0 = no correction; playout is byte-identical to v0.7.
+    drift_estimate: f64,
+    /// Fractional sample carry for the micro rate adjustment.
+    slip_frac: f64,
     /// Per-peer output limiter — protects listeners from loud transients
     /// from one peer without ducking everyone else in the mix.
     limiter: Limiter,
@@ -140,6 +187,12 @@ impl PeerBuffer {
             dry_at: None,
             last_sample: 0.0,
             fade_in_remaining: 0,
+            pushed_samples: 0,
+            consumed_samples: 0,
+            drift_window: None,
+            drift_window_dirty: false,
+            drift_estimate: 0.0,
+            slip_frac: 0.0,
             limiter: Limiter::new(),
         }
     }
@@ -156,6 +209,9 @@ pub struct AdaptiveJitterBuffer {
 
     /// Scratch buffer for per-peer volume/limiting, allocated once.
     scratch: Vec<f32>,
+    /// Scratch input for the per-peer micro rate adjustment,
+    /// allocated once like `scratch`.
+    scratch_in: Vec<f32>,
     /// Smoothed multi-speaker normalization gain (see `pull_mixed`).
     mix_scale: f32,
 
@@ -193,6 +249,7 @@ impl AdaptiveJitterBuffer {
             buffers: HashMap::new(),
             peer_settings,
             scratch: Vec::new(),
+            scratch_in: Vec::new(),
             mix_scale: 1.0,
             stable_ticks: 0,
             concealment_count: 0,
@@ -214,6 +271,7 @@ impl AdaptiveJitterBuffer {
     /// reordering, and loss concealment, and emits exactly one frame per
     /// 10 ms slot of each peer's active speech.
     pub fn push_frame(&mut self, frame: DecodedFrame) {
+        let pushed = frame.samples.len() as u64;
         // Check mute
         {
             let Ok(settings) = self.peer_settings.lock() else {
@@ -224,6 +282,7 @@ impl AdaptiveJitterBuffer {
                     // Clear any buffered audio for this peer
                     if let Some(peer) = self.buffers.get_mut(&frame.peer_id) {
                         peer.samples.clear();
+                        peer.drift_window_dirty = true;
                     }
                     return;
                 }
@@ -237,6 +296,9 @@ impl AdaptiveJitterBuffer {
 
         if frame.is_concealment {
             self.concealment_count += 1;
+            // Concealment covers loss/late delivery — inflow during it
+            // does not reflect the sender's clock rate.
+            peer.drift_window_dirty = true;
             // Concealment around a dry spell is packet loss, and the
             // concealment counter already charges the target for it —
             // don't let the next real frame double-charge it as an
@@ -329,6 +391,7 @@ impl AdaptiveJitterBuffer {
 
         // ── Push audio ───────────────────────────────────────────────
         peer.samples.extend(frame.samples);
+        peer.pushed_samples += pushed;
         peer.last_push = Instant::now();
 
         // Hard cap: prevent runaway growth (e.g., frozen output, paused app).
@@ -368,6 +431,7 @@ impl AdaptiveJitterBuffer {
             if peer_settings.is_muted {
                 peer.samples.clear();
                 peer.playing = false;
+                peer.drift_window_dirty = true;
                 continue;
             }
 
@@ -392,6 +456,7 @@ impl AdaptiveJitterBuffer {
                     peer.dry_at = Some(now);
                     peer.priming = true;
                     peer.playing = false;
+                    peer.drift_window_dirty = true;
                 }
                 continue;
             }
@@ -406,6 +471,7 @@ impl AdaptiveJitterBuffer {
             // conceal briefly and re-prime — a better trade than every
             // utterance on every network paying the worst case up front.
             if peer.priming {
+                peer.drift_window_dirty = true;
                 let prime_cap = (60 * self.sample_rate) / 1000;
                 let prime_target = self.target_samples.min(prime_cap);
                 if peer.samples.len() >= prime_target {
@@ -417,13 +483,55 @@ impl AdaptiveJitterBuffer {
                 }
             }
 
-            // Drain samples into the scratch buffer and apply volume.
-            let available = peer.samples.len().min(n);
-            for (slot, s) in self.scratch[..available]
-                .iter_mut()
-                .zip(peer.samples.drain(..available))
-            {
-                *slot = s * peer_settings.volume;
+            // ── Micro rate adjustment (sender clock drift) ──────────
+            // drift_estimate < 0: the sender's capture clock is slow —
+            // consume fractionally fewer buffered samples per wall
+            // hop and time-stretch them onto the full hop, so the
+            // buffer stops draining toward an audible underrun.
+            // > 0: the opposite, so the buffer stops growing into the
+            // splice-drain below. 0.0 (default, and every healthy
+            // sender): identical to the pre-v0.8 path.
+            peer.consumed_samples += n as u64;
+            let mut desired = n;
+            if peer.drift_estimate != 0.0 {
+                #[allow(clippy::cast_precision_loss)] // n is one hop (480)
+                {
+                    peer.slip_frac += n as f64 * peer.drift_estimate;
+                }
+                // One hop at the ±2000 ppm clamp moves the carry by at
+                // most 0.96, so the truncation is always -1, 0, or +1.
+                #[allow(clippy::cast_possible_truncation)]
+                let adj = peer.slip_frac.trunc() as i64;
+                peer.slip_frac -= adj as f64;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let base = n as i64;
+                #[allow(clippy::cast_sign_loss)] // .max(1) keeps it positive
+                {
+                    desired = (base + adj).max(1) as usize;
+                }
+            }
+
+            let available;
+            if desired != n && peer.samples.len() >= desired {
+                // Drain `desired` source samples, emit exactly `n`.
+                // The ratio is within ±0.2%, where linear
+                // interpolation is audibly transparent.
+                self.scratch_in.clear();
+                self.scratch_in.extend(peer.samples.drain(..desired));
+                resample_linear(&self.scratch_in, &mut self.scratch[..n]);
+                for slot in &mut self.scratch[..n] {
+                    *slot *= peer_settings.volume;
+                }
+                available = n;
+            } else {
+                // Unadjusted path — byte-identical to pre-v0.8.
+                available = peer.samples.len().min(n);
+                for (slot, s) in self.scratch[..available]
+                    .iter_mut()
+                    .zip(peer.samples.drain(..available))
+                {
+                    *slot = s * peer_settings.volume;
+                }
             }
 
             // Apply per-peer limiter (hearing protection)
@@ -501,6 +609,7 @@ impl AdaptiveJitterBuffer {
                     let excess = peer.samples.len() - headroom;
                     let drain_amount = (excess / 2).max(1);
                     peer.samples.drain(..drain_amount);
+                    peer.drift_window_dirty = true;
                     // Don't reset excess_ticks — keep draining until stable
                 }
             } else {
@@ -535,6 +644,42 @@ impl AdaptiveJitterBuffer {
             if let Some(last) = p.last_arrival {
                 if last.elapsed() > Duration::from_secs(1) {
                     p.jitter_estimate = (p.jitter_estimate * 0.99).max(0.001);
+                }
+            }
+        }
+
+        // ── Per-peer clock-drift estimation ─────────────────────────
+        // Inflow vs wall-paced consumption over a clean window is the
+        // sender's capture-clock skew. Poisoned windows (underrun,
+        // priming, concealment, drain, mute) restart without updating.
+        let now = Instant::now();
+        let min_window_consumed = (self.sample_rate as u64) * 8;
+        for p in self.buffers.values_mut() {
+            match p.drift_window {
+                None => {
+                    p.drift_window = Some((now, p.pushed_samples, p.consumed_samples));
+                    p.drift_window_dirty = false;
+                }
+                Some((t0, pushed0, consumed0)) => {
+                    if p.drift_window_dirty {
+                        p.drift_window = Some((now, p.pushed_samples, p.consumed_samples));
+                        p.drift_window_dirty = false;
+                    } else if now.duration_since(t0) >= DRIFT_WINDOW {
+                        let dp = p.pushed_samples - pushed0;
+                        let dc = p.consumed_samples - consumed0;
+                        if dc >= min_window_consumed {
+                            #[allow(clippy::cast_precision_loss)] // window sums ≪ 2^53
+                            let skew = (dp as f64 - dc as f64) / dc as f64;
+                            let blended = 0.5 * p.drift_estimate
+                                + 0.5 * skew.clamp(-MAX_DRIFT_CORRECTION, MAX_DRIFT_CORRECTION);
+                            p.drift_estimate = if blended.abs() < DRIFT_DEADZONE {
+                                0.0
+                            } else {
+                                blended
+                            };
+                        }
+                        p.drift_window = Some((now, p.pushed_samples, p.consumed_samples));
+                    }
                 }
             }
         }
@@ -687,5 +832,75 @@ impl AdaptiveJitterBuffer {
     )]
     fn ms_to_samples(&self, ms: f32) -> usize {
         ((ms * self.sample_rate as f32) / 1000.0) as usize
+    }
+}
+
+/// Linearly interpolate `input` onto `out`, preserving endpoints.
+/// Used only for length ratios within ±1%, where linear interpolation
+/// is audibly transparent for speech.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // hop-sized buffers; positions are non-negative and small
+fn resample_linear(input: &[f32], out: &mut [f32]) {
+    if input.is_empty() || out.is_empty() {
+        return;
+    }
+    if input.len() == out.len() {
+        out.copy_from_slice(input);
+        return;
+    }
+    let step = (input.len() - 1) as f64 / (out.len() - 1).max(1) as f64;
+    for (i, o) in out.iter_mut().enumerate() {
+        let pos = i as f64 * step;
+        let idx = pos as usize;
+        let frac = (pos - idx as f64) as f32;
+        let a = input[idx];
+        let b = input[(idx + 1).min(input.len() - 1)];
+        *o = a + (b - a) * frac;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    mod resample_linear {
+        use super::super::resample_linear;
+
+        #[test]
+        fn copies_input_when_lengths_match() {
+            let input = [1.0f32, 2.0, 3.0, 4.0];
+            let mut out = [0.0f32; 4];
+            resample_linear(&input, &mut out);
+            assert_eq!(out, input);
+        }
+
+        #[test]
+        fn preserves_endpoints_when_stretching_by_one_sample() {
+            let input: Vec<f32> = (0..479).map(|i| i as f32).collect();
+            let mut out = vec![0.0f32; 480];
+            resample_linear(&input, &mut out);
+            assert!(
+                out[0].abs() < 1e-4 && (out[479] - 478.0).abs() < 1e-3,
+                "endpoints ({}, {})",
+                out[0],
+                out[479]
+            );
+        }
+
+        #[test]
+        fn stays_close_to_a_sine_when_compressing_by_one_sample() {
+            let omega = 440.0 * std::f32::consts::TAU / 48_000.0;
+            let input: Vec<f32> = (0..481).map(|i| (i as f32 * omega).sin()).collect();
+            let mut out = vec![0.0f32; 480];
+            resample_linear(&input, &mut out);
+            let step = 480.0f32 / 479.0;
+            let worst = out
+                .iter()
+                .enumerate()
+                .map(|(i, &y)| (y - (i as f32 * step * omega).sin()).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 0.01, "worst deviation {worst}");
+        }
     }
 }

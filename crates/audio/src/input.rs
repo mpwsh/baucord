@@ -13,6 +13,7 @@
 //! Resamples to 48 kHz internally, downmixes to mono. Works with Bluetooth
 //! HFP (8/16 kHz), USB mics (44.1/48/96 kHz), audio interfaces, etc.
 
+use crate::clock::{CaptureClockEstimator, SampleSlip};
 use crate::input_config::InputConfig;
 use crate::processor::{
     agc::AutoGainControl,
@@ -38,7 +39,7 @@ use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
 use log::{error, info};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Async, Resampler};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,6 +70,12 @@ pub struct AudioInput {
     // ── Observable state (read-only from outside) ────────────────────
     input_level: Arc<AtomicU32>,
     is_speaking: Arc<AtomicBool>,
+
+    /// Cumulative mono frames delivered by the capture callback —
+    /// counted before the mute check and before the ring push, so mute
+    /// and overruns cannot bias the clock estimator (see
+    /// [`crate::clock`]).
+    captured_samples: Arc<AtomicU64>,
 
     stats: Arc<AudioStats>,
 }
@@ -130,6 +137,7 @@ impl AudioInput {
             config,
             input_level: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             is_speaking: Arc::new(AtomicBool::new(false)),
+            captured_samples: Arc::new(AtomicU64::new(0)),
             stats,
         })
     }
@@ -183,11 +191,16 @@ impl AudioInput {
         let stats = self.stats.clone();
         let stats_err = self.stats.clone();
         let input_level = self.input_level.clone();
+        let captured = self.captured_samples.clone();
         let ch = channels as usize;
 
         let stream = self.device.build_input_stream(
             stream_config,
             move |data: &[T], _: &_| {
+                // Count every frame the device produced — before the
+                // mute early-return and independent of ring overflow —
+                // so the clock estimator sees the raw device rate.
+                captured.fetch_add((data.len() / ch) as u64, Ordering::Relaxed);
                 if config.muted.load(Ordering::Relaxed) {
                     input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
                     return;
@@ -246,6 +259,7 @@ impl AudioInput {
         let encoder_tx = self.encoder_tx.clone();
         let loopback_tx = self.loopback_tx.clone();
         let config = self.config.clone();
+        let captured = self.captured_samples.clone();
 
         // ── Build the processor chain (the DAW view) ─────────────────
         let gate = NoiseGate::new(config.gate.clone(), 200);
@@ -305,6 +319,16 @@ impl AudioInput {
             // timestamp so the jitter buffer's estimator sees real deltas).
             let mut loopback_ts: u32 = 0;
 
+            // ── Capture-clock self-calibration (see clock.rs) ───────
+            // The device's crystal is not exactly nominal; measure it
+            // and slip-correct the 48 kHz stream so the transmitted
+            // media clock is true — receivers' jitter buffers for us
+            // then stay flat instead of draining into audible holes.
+            let mut clock = CaptureClockEstimator::new(device_sample_rate, Instant::now());
+            let mut slip = SampleSlip::new();
+            let mut last_slip_update = Instant::now();
+            let mut last_skew_log = Instant::now();
+
             // Ask the OS for audio-class scheduling (MMCSS "Pro Audio"
             // on Windows; no-op elsewhere). Keeps small buffers glitch-
             // free under load.
@@ -316,6 +340,27 @@ impl AudioInput {
             );
 
             while !should_stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                clock.observe(now, captured.load(Ordering::Relaxed));
+                if now.duration_since(last_slip_update) >= Duration::from_secs(1) {
+                    last_slip_update = now;
+                    let skew = clock.skew();
+                    slip.set_target_skew(skew);
+                    if let Some(s) = skew {
+                        #[allow(clippy::cast_possible_truncation)] // skew clamped to ±2000 ppm
+                        stats
+                            .capture_clock_skew_ppm
+                            .store((s * 1e6) as i64, Ordering::Relaxed);
+                        if now.duration_since(last_skew_log) >= Duration::from_secs(60) {
+                            last_skew_log = now;
+                            info!(
+                                "🎤 capture clock skew {:+.0} ppm (applying {:+.0} ppm correction)",
+                                s * 1e6,
+                                slip.correction_ppm(),
+                            );
+                        }
+                    }
+                }
                 if config.muted.load(Ordering::Relaxed) {
                     is_speaking_handle.store(false, Ordering::Relaxed);
                     while ring_consumer.pop().is_ok() {}
@@ -349,7 +394,7 @@ impl AudioInput {
                     continue;
                 }
 
-                let at_48k = if let Some(ref mut r) = resampler {
+                let mut at_48k = if let Some(ref mut r) = resampler {
                     resampler_accum.extend_from_slice(&read_buf[..n_read]);
 
                     if resampler_accum.len() >= r.input_frames_next() {
@@ -400,6 +445,9 @@ impl AudioInput {
                 if at_48k.is_empty() {
                     continue;
                 }
+
+                // Zero-latency rate correction toward true 48 kHz.
+                slip.process(&mut at_48k);
 
                 accumulator.extend_from_slice(&at_48k);
 

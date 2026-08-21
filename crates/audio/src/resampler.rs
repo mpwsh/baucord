@@ -8,12 +8,12 @@
 //! in/out) share one implementation instead of four drifting copies.
 //!
 //! Note on drift: the resamplers run at a fixed ratio
-//! (`max_resample_ratio_relative = 1.0`). Long-term clock drift between the
-//! capture/playback devices and the 48 kHz pipeline is absorbed by the ring
-//! fill targets and the jitter buffer's sustained-excess drain, not by ratio
-//! adjustment. If drift ever becomes audible on marathon sessions, raising
-//! `max_resample_ratio_relative` and steering the ratio from ring occupancy
-//! is the intended upgrade path.
+//! (`max_resample_ratio_relative = 1.0`) — deliberately. Capture-clock
+//! drift is now corrected upstream by [`crate::clock`] (zero-latency
+//! sample slip on the sender, which also covers native-48 kHz devices
+//! that have no resampler here at all), and residual playback-side
+//! drift by the jitter buffer's per-peer rate compensation. Steering
+//! these ratios instead would add sinc group delay for no benefit.
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use log::{error, info};

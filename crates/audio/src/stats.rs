@@ -4,7 +4,7 @@
 //! Tracks everything a TeamSpeak-style client needs for its debug overlay:
 //! packet rates, codec stats, bandwidth, latency budgets, and buffer health.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Shared, lock-free audio statistics.
@@ -27,6 +27,11 @@ pub struct AudioStats {
     // ── Buffer health ───────────────────────────────────────────────────
     pub input_overruns: AtomicU64,
     pub output_underruns: AtomicU64,
+    /// Measured capture-device clock skew vs nominal, signed ppm.
+    /// 0 until the estimator's warmup (~30 s of capture) completes.
+    /// A sustained large value here is the "why does everyone hear me
+    /// breaking up" diagnostic — see [`crate::clock`].
+    pub capture_clock_skew_ppm: AtomicI64,
 
     // ── Jitter buffer ───────────────────────────────────────────────────
     pub jitter_buffer_occupancy_ms: AtomicUsize,
@@ -90,6 +95,7 @@ impl AudioStats {
             plc_frames: AtomicU64::new(0),
             input_overruns: AtomicU64::new(0),
             output_underruns: AtomicU64::new(0),
+            capture_clock_skew_ppm: AtomicI64::new(0),
             jitter_buffer_occupancy_ms: AtomicUsize::new(0),
             jitter_buffer_target_ms: AtomicUsize::new(0),
             bytes_sent: AtomicU64::new(0),

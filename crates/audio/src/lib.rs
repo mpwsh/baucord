@@ -25,6 +25,7 @@
 //! Decoding is parallelised across a worker pool (dispatched by peer SSRC),
 //! allowing 30+ simultaneous speakers without garbling or starvation.
 
+pub mod clock;
 mod config;
 mod decoder;
 mod encoder;
