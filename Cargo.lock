@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "audio"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "audioadapter-buffers",
  "cpal",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "app-core",
  "arboard",
