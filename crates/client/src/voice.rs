@@ -45,6 +45,9 @@ pub enum VoiceControl {
     AddPeer(u64),
     RemovePeer(u64),
     SetPeerAudio(u64, PeerAudioSettings),
+    /// Loss on our outbound path in percent (0–49), from the network
+    /// thread's periodic renet sample. Feeds the encoder's FEC hint.
+    SetUplinkLoss(u32),
     IncomingVoicePacket(AudioPacket),
     PlaySound(SoundType),
     Shutdown,
@@ -293,6 +296,11 @@ impl VoiceLoopState {
             VoiceControl::SetPeerAudio(id, settings) => {
                 if let Some(v) = &self.vc {
                     v.set_peer_settings(id, settings);
+                }
+            }
+            VoiceControl::SetUplinkLoss(pct) => {
+                if let Some(v) = &self.vc {
+                    v.set_uplink_loss_pct(pct);
                 }
             }
             VoiceControl::IncomingVoicePacket(packet) => {

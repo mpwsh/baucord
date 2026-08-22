@@ -21,6 +21,17 @@
 //!
 //! Concealment frames are emitted with interpolated timestamps so the
 //! jitter buffer's estimator stays clean.
+//!
+//! ## Concealment frame length
+//!
+//! libopus sizes PLC and FEC output by the `frame_size` argument, which
+//! opus-rs derives from the length of the output slice — *not* from the
+//! packet. Every concealment decode therefore goes through
+//! [`conceal_slot`], which hands the decoder exactly [`FRAME_SIZE`]
+//! samples. Passing the full scratch buffer (2 × `FRAME_SIZE`) produced
+//! a 20 ms frame for every 10 ms hole: under sustained loss the jitter
+//! buffer grew by an extra frame per lost packet, then splice-drained
+//! the excess — an audible cut for each loss on top of the loss itself.
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use log::{error, info, warn};
@@ -287,7 +298,7 @@ fn decode_and_emit(
             stats.decode_errors.fetch_add(1, Ordering::Relaxed);
 
             // Corrupt payload — substitute PLC so the timeline stays intact.
-            if let Ok(n) = peer.decoder.decode_float(&[], buf, false) {
+            if let Ok(n) = conceal_slot(&mut peer.decoder, &[], buf) {
                 stats.plc_frames.fetch_add(1, Ordering::Relaxed);
                 emit(
                     packet.header.ssrc,
@@ -301,6 +312,18 @@ fn decode_and_emit(
             }
         }
     }
+}
+
+/// Synthesize exactly one [`FRAME_SIZE`]-sample slot.
+///
+/// Empty `data` → Opus PLC. Non-empty `data` → in-band FEC decode, which
+/// recovers the frame *preceding* `data`'s packet (libopus falls back to
+/// PLC itself if the packet carries no LBRR). Either way the output slice
+/// is trimmed to one frame so libopus cannot return more audio than the
+/// slot being concealed — see the module docs.
+fn conceal_slot(decoder: &mut Decoder, data: &[u8], buf: &mut [f32]) -> opus::Result<usize> {
+    let slot = &mut buf[..FRAME_SIZE];
+    decoder.decode_float(data, slot, !data.is_empty())
 }
 
 fn emit(
@@ -356,7 +379,7 @@ fn conceal_to_earliest_pending(
     // PLC for all missing frames except the one right before the held
     // packet — that one can often be recovered exactly from in-band FEC.
     for j in 0..gap.saturating_sub(1) {
-        match peer.decoder.decode_float(&[], buf, false) {
+        match conceal_slot(&mut peer.decoder, &[], buf) {
             Ok(n) => {
                 stats.plc_frames.fetch_add(1, Ordering::Relaxed);
                 let seq = expected.wrapping_add(j);
@@ -373,7 +396,7 @@ fn conceal_to_earliest_pending(
     // FEC recovery of the frame immediately before the held packet.
     let fec_seq = packet.header.seq.wrapping_sub(1);
     let fec_ts = packet.header.timestamp.wrapping_sub(FRAME_SIZE as u32);
-    match peer.decoder.decode_float(&packet.opus_data, buf, true) {
+    match conceal_slot(&mut peer.decoder, &packet.opus_data, buf) {
         Ok(n) => {
             stats.fec_recoveries.fetch_add(1, Ordering::Relaxed);
             emit(
@@ -387,7 +410,7 @@ fn conceal_to_earliest_pending(
             );
         }
         Err(_) => {
-            if let Ok(n) = peer.decoder.decode_float(&[], buf, false) {
+            if let Ok(n) = conceal_slot(&mut peer.decoder, &[], buf) {
                 stats.plc_frames.fetch_add(1, Ordering::Relaxed);
                 emit(
                     packet.header.ssrc,

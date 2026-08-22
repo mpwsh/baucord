@@ -14,8 +14,9 @@
 //! the timestamps let the jitter buffer tell a pause from network jitter.
 //!
 //! Owns the Opus encoder exclusively — no shared mutex needed.
-//! Adaptive FEC adjusts the packet-loss hint every ~2 seconds based on
-//! loss measured over that window (not lifetime totals).
+//! Adaptive FEC adjusts the packet-loss hint every ~2 seconds from the
+//! worse of (a) downlink loss measured over that window and (b) uplink
+//! loss the transport reports via `AudioStats::uplink_loss_pct`.
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use log::{error, info};
@@ -45,6 +46,9 @@ struct EncoderWorker {
     /// tracks the *recent* loss rate instead of the lifetime average.
     prev_received: u64,
     prev_lost: u64,
+    /// Hint currently applied to the encoder; avoids a libopus ctl call
+    /// every window when nothing changed.
+    current_fec_hint: i32,
 }
 
 impl EncoderWorker {
@@ -58,13 +62,16 @@ impl EncoderWorker {
         // ── Voice chat tuning ───────────────────────────────────────
         let _ = encoder.set_bitrate(Bitrate::Bits(OPUS_BITRATE));
         let _ = encoder.set_vbr(true);
-        // Complexity 7: encoder runs on one thread (local user only),
-        // so we can afford slightly more CPU for better sibilant quality.
+        // Complexity 10: encoder runs on one thread (local user only),
+        // so we can afford the CPU for better sibilant quality.
         let _ = encoder.set_complexity(10);
         let _ = encoder.set_bandwidth(opus::Bandwidth::Superwideband);
         let _ = encoder.set_inband_fec(true);
-        let _ = encoder.set_packet_loss_perc(5);
+        let _ = encoder.set_packet_loss_perc(FEC_LOSS_FLOOR_PCT);
         let _ = encoder.set_dtx(true);
+        stats
+            .fec_loss_hint_pct
+            .store(FEC_LOSS_FLOOR_PCT.unsigned_abs(), Ordering::Relaxed);
 
         Ok(Self {
             encoder,
@@ -77,6 +84,7 @@ impl EncoderWorker {
             packets_since_fec_update: 0,
             prev_received: 0,
             prev_lost: 0,
+            current_fec_hint: FEC_LOSS_FLOOR_PCT,
         })
     }
 
@@ -146,20 +154,61 @@ impl EncoderWorker {
         }
     }
 
-    /// Adjust the Opus FEC packet-loss hint every ~200 packets (~2 seconds),
-    /// based on loss over that window.
+    /// Adjust the Opus FEC packet-loss hint every ~200 frames (~2 seconds).
     ///
-    /// Note the hint is derived from *downlink* loss (what we observe on
-    /// received streams) — without receiver feedback for our own stream
-    /// it's the only signal available, and it's a reasonable proxy when
-    /// the path is roughly symmetric.
+    /// Two signals feed it, and the *larger* wins:
+    ///
+    /// - **Downlink** loss measured by our decoder over the last window.
+    ///   Only a proxy for our own stream (it assumes a symmetric path).
+    /// - **Uplink** loss reported by the transport via
+    ///   [`AudioStats::uplink_loss_pct`] — the loss our listeners actually
+    ///   suffer. Field case: a user whose uplink dropped >9% while his
+    ///   downlink was clean got a hint of 0 from the proxy alone, which
+    ///   makes libopus stop coding LBRR entirely, so every lost frame was
+    ///   pure PLC and he "broke up" for everyone else.
+    ///
+    /// The result never goes below [`FEC_LOSS_FLOOR_PCT`]: at 0 libopus
+    /// disables in-band FEC outright, and the first seconds of every loss
+    /// episode would then go unprotected until the next window closes.
     fn maybe_update_fec(&mut self) {
         self.packets_since_fec_update += 1;
-        if self.packets_since_fec_update < 200 {
+        if self.packets_since_fec_update < FEC_UPDATE_INTERVAL_FRAMES {
             return;
         }
         self.packets_since_fec_update = 0;
 
+        let downlink = self.downlink_loss_pct_since_last_update();
+        // Stored value is already clamped to 0..=100 by the setter;
+        // try_from keeps the cast lint-free without an unwrap.
+        let uplink = i32::try_from(self.stats.uplink_loss_pct.load(Ordering::Relaxed))
+            .unwrap_or(FEC_LOSS_CEIL_PCT);
+
+        let fec_hint = downlink
+            .unwrap_or(0)
+            .max(uplink)
+            .clamp(FEC_LOSS_FLOOR_PCT, FEC_LOSS_CEIL_PCT);
+
+        if fec_hint != self.current_fec_hint {
+            match self.encoder.set_packet_loss_perc(fec_hint) {
+                Ok(()) => {
+                    info!(
+                        "Opus FEC hint {}% → {}% (downlink {:?}%, uplink {uplink}%)",
+                        self.current_fec_hint, fec_hint, downlink
+                    );
+                    self.current_fec_hint = fec_hint;
+                    self.stats
+                        .fec_loss_hint_pct
+                        .store(fec_hint.unsigned_abs(), Ordering::Relaxed);
+                }
+                Err(e) => error!("set_packet_loss_perc({fec_hint}) failed: {e}"),
+            }
+        }
+    }
+
+    /// Downlink loss over the frames since the previous call, as a whole
+    /// percentage. `None` when the window held too few packets to mean
+    /// anything (nobody else was talking).
+    fn downlink_loss_pct_since_last_update(&mut self) -> Option<i32> {
         let received = self.stats.packets_received.load(Ordering::Relaxed);
         let lost = self.stats.packets_lost.load(Ordering::Relaxed);
         let d_received = received.saturating_sub(self.prev_received);
@@ -167,14 +216,32 @@ impl EncoderWorker {
         self.prev_received = received;
         self.prev_lost = lost;
 
-        if d_received + d_lost > 50 {
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            let loss_pct = ((d_lost as f32 / (d_received + d_lost) as f32) * 100.0) as i32;
-            let fec_hint = loss_pct.clamp(0, 20);
-            let _ = self.encoder.set_packet_loss_perc(fec_hint);
+        let total = d_received + d_lost;
+        if total <= FEC_MIN_WINDOW_PACKETS {
+            return None;
         }
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        Some(((d_lost as f32 / total as f32) * 100.0).round() as i32)
     }
 }
+
+/// Frames between FEC hint re-evaluations (~2 s at 10 ms frames; DTX
+/// frames count too, so this is wall-clock, not speech time).
+const FEC_UPDATE_INTERVAL_FRAMES: u32 = 200;
+
+/// Below this many packets in a window the downlink loss ratio is noise.
+const FEC_MIN_WINDOW_PACKETS: u64 = 50;
+
+/// Lowest hint ever applied. libopus codes no LBRR at all when the hint
+/// is 0 (`decide_fec` returns early), so a small floor keeps a redundant
+/// copy of every frame on the wire at the cost of a few kbit/s — cheap
+/// insurance that covers the onset of a loss episode before the
+/// estimators have caught up.
+const FEC_LOSS_FLOOR_PCT: i32 = 5;
+
+/// Highest hint applied. Above ~25% libopus stops increasing redundancy
+/// anyway; 20 keeps the bitrate trade-off sane on a merely bad link.
+const FEC_LOSS_CEIL_PCT: i32 = 20;
 
 // ── Public spawn function ───────────────────────────────────────────────
 

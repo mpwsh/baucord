@@ -300,6 +300,22 @@ impl VoiceChat {
         info!("Peer {peer_id} removed");
     }
 
+    /// Report the loss on our *outbound* path, as a percentage (0–100).
+    ///
+    /// The encoder folds this into its Opus FEC hint (see
+    /// `encoder::maybe_update_fec`). Without it the hint is derived only
+    /// from loss we *observe* on received streams, which says nothing
+    /// about what listeners hear when our own uplink is the lossy leg.
+    /// Callers should feed the transport's ack-derived loss estimate
+    /// here whenever it refreshes (every couple of seconds is plenty);
+    /// values the transport can't measure reliably (idle link, huge
+    /// implausible readings) should be withheld rather than passed.
+    pub fn set_uplink_loss_pct(&self, loss_pct: u32) {
+        self.stats
+            .uplink_loss_pct
+            .store(loss_pct.min(100), Ordering::Relaxed);
+    }
+
     pub fn set_noise_suppression(&self, enabled: bool) {
         self.input_config
             .denoise_enabled

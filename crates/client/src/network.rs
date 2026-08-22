@@ -43,8 +43,17 @@ use crate::WakeFn;
 use crate::screen::ScreenControl;
 use crate::voice::VoiceControl;
 
-/// How often to sample link statistics for the UI.
+/// How often to sample link statistics for the UI (and the voice
+/// encoder's uplink-loss feedback, which rides the same sample).
 const NETWORK_STATS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Uplink loss readings at or above this are not fed to the voice
+/// encoder. renet measures loss over a 6 s window of *sent* packets; on
+/// a quiet link (nobody talking, only keepalives) that window holds a
+/// handful of packets and the ratio is noise — the same artifact
+/// `screen.rs` guards against with `PACE_LOSS_IMPLAUSIBLE`. A link that
+/// really loses half its packets is beyond what FEC can fix anyway.
+const UPLINK_LOSS_IMPLAUSIBLE_PCT: f64 = 50.0;
 
 /// Timeout for the connect-token HTTP fetch.
 const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1312,6 +1321,16 @@ fn handle_control(
     true
 }
 
+/// Convert renet's percent loss into a whole-number hint for the voice
+/// encoder, or `None` if the reading is not worth acting on.
+fn plausible_uplink_loss_pct(loss_pct: f64) -> Option<u32> {
+    if !loss_pct.is_finite() || loss_pct < 0.0 || loss_pct >= UPLINK_LOSS_IMPLAUSIBLE_PCT {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // bounded to 0..50 above
+    Some(loss_pct.round() as u32)
+}
+
 fn run_network_loop(
     control_rx: Receiver<NetworkControl>,
     msg_tx: Sender<NetworkMessage>,
@@ -1450,6 +1469,27 @@ fn run_network_loop(
                         let _ = screen_tx.try_send(ScreenControl::ForceKeyframe);
                     }
 
+                    // Link stats → voice thread (drives the encoder's FEC
+                    // hint: renet's loss is *our uplink*, the leg the
+                    // decoder-side counters can't see) and → app (UI).
+                    NetworkMessage::NetworkStats {
+                        rtt_ms,
+                        loss_pct,
+                        kbps_up,
+                        kbps_down,
+                    } => {
+                        if let Some(pct) = plausible_uplink_loss_pct(loss_pct) {
+                            let _ = voice_tx.try_send(VoiceControl::SetUplinkLoss(pct));
+                        }
+                        let _ = msg_tx.send(NetworkMessage::NetworkStats {
+                            rtt_ms,
+                            loss_pct,
+                            kbps_up,
+                            kbps_down,
+                        });
+                        wake();
+                    }
+
                     // Viewer health for our stream → screen thread
                     // (drives fps adaptation while sharing)
                     NetworkMessage::StreamHealth {
@@ -1488,5 +1528,30 @@ fn run_network_loop(
                 wake();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plausible_uplink_loss_pct;
+
+    #[test]
+    fn plausible_uplink_loss_should_round_ordinary_readings() {
+        assert_eq!(plausible_uplink_loss_pct(9.4), Some(9));
+    }
+
+    #[test]
+    fn plausible_uplink_loss_should_pass_zero() {
+        assert_eq!(plausible_uplink_loss_pct(0.0), Some(0));
+    }
+
+    #[test]
+    fn plausible_uplink_loss_should_reject_idle_link_artifacts() {
+        assert_eq!(plausible_uplink_loss_pct(50.0), None);
+    }
+
+    #[test]
+    fn plausible_uplink_loss_should_reject_nan() {
+        assert_eq!(plausible_uplink_loss_pct(f64::NAN), None);
     }
 }

@@ -24,6 +24,17 @@ pub struct AudioStats {
     pub fec_recoveries: AtomicU64,
     pub plc_frames: AtomicU64,
 
+    // ── Uplink loss feedback (written by the app, read by the encoder) ──
+    /// Loss on *our outbound* path as a percentage (0–100), supplied by
+    /// the transport (renet's ack-derived estimate). The decoder-side
+    /// counters above only see the downlink; a user whose uplink drops
+    /// packets while the downlink is clean needs this to get any FEC at
+    /// all. See [`crate::VoiceChat::set_uplink_loss_pct`].
+    pub uplink_loss_pct: AtomicU32,
+    /// The packet-loss hint most recently applied to the Opus encoder
+    /// (0–100). Diagnostic: lets the overlay show whether FEC is armed.
+    pub fec_loss_hint_pct: AtomicU32,
+
     // ── Buffer health ───────────────────────────────────────────────────
     pub input_overruns: AtomicU64,
     pub output_underruns: AtomicU64,
@@ -93,6 +104,8 @@ impl AudioStats {
             decode_errors: AtomicU64::new(0),
             fec_recoveries: AtomicU64::new(0),
             plc_frames: AtomicU64::new(0),
+            uplink_loss_pct: AtomicU32::new(0),
+            fec_loss_hint_pct: AtomicU32::new(0),
             input_overruns: AtomicU64::new(0),
             output_underruns: AtomicU64::new(0),
             capture_clock_skew_ppm: AtomicI64::new(0),
@@ -179,7 +192,7 @@ impl AudioStats {
 
         format!(
             "Audio ({}s) | Sent {} Recv {} Lost {} ({:.1}%) | \
-             FEC {} PLC {} | Overruns {} Underruns {} | Jitter {}ms (target {}ms) | \
+             FEC {} PLC {} (hint {}%, uplink {}%) | Overruns {} Underruns {} | Jitter {}ms (target {}ms) | \
              BW ↑{:.1}kbps ↓{:.1}kbps | Pkt {}B (avg {:.0}B) | \
              Enc {}µs Dec {}µs | Errors: enc {} dec {}",
             elapsed,
@@ -189,6 +202,8 @@ impl AudioStats {
             loss_rate,
             self.fec_recoveries.load(Ordering::Relaxed),
             self.plc_frames.load(Ordering::Relaxed),
+            self.fec_loss_hint_pct.load(Ordering::Relaxed),
+            self.uplink_loss_pct.load(Ordering::Relaxed),
             self.input_overruns.load(Ordering::Relaxed),
             self.output_underruns.load(Ordering::Relaxed),
             self.jitter_buffer_occupancy_ms.load(Ordering::Relaxed),
