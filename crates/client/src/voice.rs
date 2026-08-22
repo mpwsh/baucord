@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, select};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::info;
 
@@ -161,6 +161,11 @@ impl Drop for VoiceThreadHandle {
 
 // ── Thread loop state ───────────────────────────────────────────────────
 
+/// Cadence of the engine-stats line in the log. Cheap (a few atomic
+/// loads) and the one place `outgoing_dropped`, PLC/FEC counts, the FEC
+/// hint and jitter depth are recorded for after-the-fact diagnosis.
+const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 struct VoiceLoopState {
     vc: Option<VoiceChat>,
     our_client_id: Option<u64>,
@@ -168,6 +173,7 @@ struct VoiceLoopState {
     /// Explicit mute set by the user (independent of deafen).
     user_muted: bool,
     running: bool,
+    last_stats_log: Instant,
 }
 
 impl VoiceLoopState {
@@ -178,7 +184,21 @@ impl VoiceLoopState {
             was_speaking: false,
             user_muted: false,
             running: true,
+            last_stats_log: Instant::now(),
         }
+    }
+
+    /// Write the audio engine's counters to the log every
+    /// [`STATS_LOG_INTERVAL`] while an engine is running.
+    fn maybe_log_stats(&mut self) {
+        let Some(voice) = self.vc.as_ref() else {
+            return;
+        };
+        if self.last_stats_log.elapsed() < STATS_LOG_INTERVAL {
+            return;
+        }
+        self.last_stats_log = Instant::now();
+        info!("audio stats: {}", voice.stats_summary());
     }
 
     /// Whether the mic should be muted — true if either user-muted or deafened.
@@ -438,5 +458,7 @@ fn run_voice_loop(
                 wake();
             }
         }
+
+        state.maybe_log_stats();
     }
 }

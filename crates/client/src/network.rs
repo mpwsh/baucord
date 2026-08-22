@@ -47,6 +47,29 @@ use crate::voice::VoiceControl;
 /// encoder's uplink-loss feedback, which rides the same sample).
 const NETWORK_STATS_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Longest the client goes without calling `send_packets()` when it has
+/// nothing queued. Outbound messages (voice, video, control) still flush
+/// on the very next 1 ms loop iteration, so media latency is untouched;
+/// this only bounds the cadence of ack-only packets.
+///
+/// Why it matters: renet emits a standalone `Ack` packet on every
+/// `send_packets()` call while `pending_acks` is non-empty, and that set
+/// only empties once the *server acknowledges our ack* — a round trip
+/// later. Calling `send_packets()` every 1 ms therefore produced ~1000
+/// ack packets/s on the uplink whenever anyone in the room was sharing
+/// (the server ticks at 1 ms then and its acks keep ours pending). The
+/// server's hourly stats show the mirror image: 81 kbit/s of 10-byte
+/// renet acks to *idle* clients, ~0.5 Mbit/s on the wire. Ten times the
+/// voice packet rate, and packets-per-second is what Wi-Fi uplinks,
+/// DOCSIS upstream schedulers and cheap NAT flow caches choke on.
+const IDLE_SEND_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Log link samples at or above this loss so a bad stretch is visible in
+/// the log file, not just the overlay. Sampled every
+/// [`NETWORK_STATS_INTERVAL`], so a sustained bad link costs one line
+/// per 2 s.
+const LINK_LOG_LOSS_PCT: f64 = 5.0;
+
 /// Uplink loss readings at or above this are not fed to the voice
 /// encoder. renet measures loss over a 6 s window of *sent* packets; on
 /// a quiet link (nobody talking, only keepalives) that window holds a
@@ -304,6 +327,12 @@ pub(crate) struct NetworkClient {
     /// Warn about OS send-buffer pressure once per connection, not per
     /// tick — bursts can repeat every frame during a stream.
     send_pressure_warned: bool,
+    /// A message was queued on some channel since the last
+    /// `send_packets()`; flush on this tick rather than waiting for
+    /// [`IDLE_SEND_INTERVAL`].
+    outbound_pending: bool,
+    /// When `send_packets()` last ran (idle-flush cadence).
+    last_send: Instant,
 }
 
 impl NetworkClient {
@@ -386,6 +415,8 @@ impl NetworkClient {
             last_stats_check: Instant::now(),
             announced_connected: false,
             send_pressure_warned: false,
+            outbound_pending: true,
+            last_send: Instant::now(),
         })
     }
 
@@ -424,6 +455,19 @@ impl NetworkClient {
         self.process_voice_messages();
         self.process_video_messages();
         self.process_system_audio_messages();
+
+        // Flush immediately when anything was queued this tick (media
+        // latency is unchanged); otherwise at most every
+        // IDLE_SEND_INTERVAL so ack-only traffic stays near 100 pps.
+        // The netcode handshake and keepalives are sent from
+        // `transport.update()` above and are unaffected.
+        let idle_flush_due = now.duration_since(self.last_send) >= IDLE_SEND_INTERVAL;
+        if !(self.outbound_pending || idle_flush_due) {
+            self.sample_link_stats(now);
+            return;
+        }
+        self.outbound_pending = false;
+        self.last_send = now;
 
         if let Err(e) = self.transport.send_packets(&mut self.client) {
             // Transient send-buffer pressure. Two flavors, same
@@ -476,21 +520,41 @@ impl NetworkClient {
             }
         }
 
-        // Sample link statistics for the UI every ~2 seconds. renet
-        // already measures loss and throughput alongside RTT — the old
-        // code exposed only RTT and left the rest unread.
-        if now.duration_since(self.last_stats_check) >= NETWORK_STATS_INTERVAL {
-            self.last_stats_check = now;
-            if self.client.is_connected() {
-                let info = self.client.network_info();
-                self.message_queue.push(NetworkMessage::NetworkStats {
-                    rtt_ms: info.rtt * 1000.0,
-                    loss_pct: info.packet_loss * 100.0,
-                    kbps_up: info.bytes_sent_per_second * 8.0 / 1000.0,
-                    kbps_down: info.bytes_received_per_second * 8.0 / 1000.0,
-                });
-            }
+        self.sample_link_stats(now);
+    }
+
+    /// Sample link statistics for the UI every ~2 seconds. renet
+    /// already measures loss and throughput alongside RTT — the old
+    /// code exposed only RTT and left the rest unread.
+    ///
+    /// Samples at or above [`LINK_LOG_LOSS_PCT`] are also written to the
+    /// log. Loss here is *uplink* (our sent packets the server never
+    /// acked); the throughput figures count renet payload only, so add
+    /// ~53 bytes/packet of netcode+UDP+IP to get wire rates.
+    fn sample_link_stats(&mut self, now: Instant) {
+        if now.duration_since(self.last_stats_check) < NETWORK_STATS_INTERVAL {
+            return;
         }
+        self.last_stats_check = now;
+        if !self.client.is_connected() {
+            return;
+        }
+        let info = self.client.network_info();
+        let rtt_ms = info.rtt * 1000.0;
+        let loss_pct = info.packet_loss * 100.0;
+        let kbps_up = info.bytes_sent_per_second * 8.0 / 1000.0;
+        let kbps_down = info.bytes_received_per_second * 8.0 / 1000.0;
+        if loss_pct >= LINK_LOG_LOSS_PCT {
+            log::info!(
+                "link: uplink loss {loss_pct:.1}%, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s, down {kbps_down:.0} kbit/s"
+            );
+        }
+        self.message_queue.push(NetworkMessage::NetworkStats {
+            rtt_ms,
+            loss_pct,
+            kbps_up,
+            kbps_down,
+        });
     }
 
     // ── Control channels (control + signal) ─────────────────────────
@@ -741,9 +805,17 @@ impl NetworkClient {
 
     // ── Outbound messages ───────────────────────────────────────────
 
+    /// The one place messages enter renet's send queues. Marks the
+    /// connection dirty so `update()` flushes on this tick instead of
+    /// waiting for the idle cadence.
+    fn queue_message(&mut self, channel: u8, message: impl Into<renet::Bytes>) {
+        self.client.send_message(channel, message);
+        self.outbound_pending = true;
+    }
+
     fn send_control(&mut self, msg: &ClientMessage) {
         match protocol::encode_client_message(msg) {
-            Some(encoded) => self.client.send_message(msg.channel(), encoded),
+            Some(encoded) => self.queue_message(msg.channel(), encoded),
             None => warn!("Failed to serialize client message"),
         }
     }
@@ -874,7 +946,12 @@ impl NetworkClient {
                 data: chunk.clone(),
             };
             match protocol::encode_client_message(&msg) {
-                Some(encoded) => self.client.send_message(msg.channel(), encoded),
+                Some(encoded) => {
+                        // Field-level borrows: `upload` is still live here, so the
+                        // `queue_message` helper (which takes `&mut self`) can't be used.
+                        self.client.send_message(msg.channel(), encoded);
+                        self.outbound_pending = true;
+                    }
                 None => {
                     warn!("Image chunk failed to encode; aborting upload");
                     self.upload = None;
@@ -917,7 +994,7 @@ impl NetworkClient {
     /// no added latency (see `protocol::voice`).
     pub fn send_voice_frame(&mut self, seq: u32, ts_48k: u32, opus_frame: &[u8]) {
         match pack_voice(seq, ts_48k, opus_frame) {
-            Some(packet) => self.client.send_message(VOICE_CHANNEL, packet),
+            Some(packet) => self.queue_message(VOICE_CHANNEL, packet),
             None => log::debug!(
                 "Dropping voice frame seq={seq}: invalid size {} bytes",
                 opus_frame.len()
@@ -942,7 +1019,7 @@ impl NetworkClient {
         match pack_video_frame(seq, is_keyframe, width, height, data) {
             Some(chunks) => {
                 for chunk in chunks {
-                    self.client.send_message(VIDEO_CHANNEL, chunk);
+                    self.queue_message(VIDEO_CHANNEL, chunk);
                 }
             }
             None => warn!(
@@ -956,7 +1033,7 @@ impl NetworkClient {
     /// Send an encoded system audio (Opus stereo) packet.
     pub fn send_system_audio(&mut self, seq: u32, channels: u8, duration_ms: u16, opus: &[u8]) {
         match pack_system_audio(seq, channels, duration_ms, opus) {
-            Some(packet) => self.client.send_message(SYSTEM_AUDIO_CHANNEL, packet),
+            Some(packet) => self.queue_message(SYSTEM_AUDIO_CHANNEL, packet),
             None => warn!(
                 "System audio packet not packable ({} bytes), dropping",
                 opus.len()

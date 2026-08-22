@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "app-core",
  "arboard",
@@ -5652,8 +5652,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "renet"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8535f2f4b5afe5e31fc37be4b8a1f167e61177f356b1c6ee8456b7045d6c74c0"
+source = "git+https://github.com/mpwsh/renet?rev=4ae0e12#4ae0e1258f40aea15b04e1899fef5e12ae1bf004"
 dependencies = [
  "bytes",
  "log",
