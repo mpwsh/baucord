@@ -65,7 +65,7 @@ jobs:
         # declare `shell: pwsh` explicitly are unaffected.
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         # No sudo: the ubuntu:22.04 container runs as root. The bare
@@ -106,7 +106,7 @@ jobs:
       - name: Cache PipeWire headers (Linux)
         if: runner.os == 'Linux'
         id: pipewire-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/pw
           key: pipewire-1.0.7-ubuntu2204-container-v1
@@ -133,7 +133,7 @@ jobs:
       - name: Cache static FFmpeg (Linux)
         if: runner.os == 'Linux'
         id: ffmpeg-static-linux-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/ffmpeg-static
           # -container suffix: the previous cache was compiled against
@@ -190,7 +190,7 @@ jobs:
       - name: Cache static FFmpeg (macOS)
         if: runner.os == 'macOS'
         id: ffmpeg-static-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/ffmpeg-static
           key: ffmpeg-static-7.1.1-x264-${{ runner.os }}-${{ runner.arch }}-v1
@@ -355,7 +355,7 @@ jobs:
 
       - name: Upload artifacts
         if: github.event_name == 'release'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: baucord-v${{ steps.version.outputs.version }}-${{ matrix.suffix }}
           path: baucord-v${{ steps.version.outputs.version }}-${{ matrix.suffix }}.zip
@@ -366,9 +366,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -385,7 +385,7 @@ jobs:
             exit 1
           fi
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.release.tag_name }}
           files: artifacts/*.zip

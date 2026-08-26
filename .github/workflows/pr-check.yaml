@@ -26,7 +26,7 @@ jobs:
   fast:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: System deps (cpal -> ALSA, opusic-sys -> cmake)
         run: |
           sudo apt-get update
@@ -49,7 +49,7 @@ jobs:
   full:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: System deps
         # The X11/Wayland/D-Bus/udev list is release.yml's, minus the
         # tools only its from-source FFmpeg/PipeWire builds need
