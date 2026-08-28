@@ -6,7 +6,7 @@
 //! ## Pipeline position
 //!
 //! ```text
-//! capture → resample → denoise → **gate** → compressor → AGC → gain → clamp → VAD → encode
+//! capture → resample → denoise → **gate** → AGC → compressor → gain → clamp → speaking → encode
 //! ```
 //!
 //! ## Context interaction
@@ -21,8 +21,8 @@
 //!   don't cause false opens and sustained low noise doesn't leak.
 //! - **Hysteresis** uses separate open/close thresholds to prevent
 //!   chatter at the boundary (close threshold is slightly below open).
-//! - **Smooth transitions** via linear fade over ~1.3ms (64 samples
-//!   at 48 kHz) eliminate click/pop artifacts.
+//! - **Smooth transitions** via linear fade over 8 ms (`FADE_SAMPLES`)
+//!   eliminate click/pop artifacts.
 //! - **Hold time** keeps the gate open after signal drops below
 //!   threshold, preventing clipping of natural speech pauses.
 //! - **Hold-window expansion**: during the hold the gate is not fully
@@ -57,7 +57,7 @@ enum GateState {
 }
 
 /// Number of samples for fade-in/fade-out transitions.
-/// 256 samples at 48 kHz ≈ 5.2ms — inaudible but eliminates clicks.
+/// 384 samples at 48 kHz = 8 ms — inaudible, eliminates clicks.
 const FADE_SAMPLES: usize = 384;
 
 /// Downward-expansion ratio applied while the envelope is below the
@@ -70,6 +70,10 @@ const HOLD_EXPANDER_RATIO: f32 = 2.0;
 /// to move the noise tail below audibility, not to hard-mute the hold
 /// (hard muting would defeat the hold's purpose).
 const HOLD_EXPANDER_FLOOR_DB: f32 = -15.0;
+
+/// `HOLD_EXPANDER_FLOOR_DB` as linear gain (10^(-15/20)), precomputed
+/// rather than `powf`'d on every frame.
+const HOLD_EXPANDER_FLOOR: f32 = 0.177_827_94;
 
 /// Per-sample smoothing for expander gain *decreases* (~21 ms time
 /// constant at 48 kHz) — slow enough to be zipper-free and to average
@@ -145,14 +149,16 @@ impl NoiseGate {
         let open_threshold = f32::from_bits(self.knobs.threshold.load(Ordering::Relaxed));
         let close_threshold = open_threshold * self.hysteresis_ratio;
 
-        // Update envelope from frame RMS (per-frame, not per-sample).
+        // Update envelope from frame RMS (per-frame, not per-sample;
+        // coefficients are for the 20 ms frame cadence).
         let rms = compute_rms(samples);
         if rms > self.envelope {
             // Rising — snap fast to catch speech onset (~1 frame attack).
             self.envelope = self.envelope * 0.2 + rms * 0.8;
         } else {
-            // Prevents mid-sentence cutoffs on low-gain mics.
-            self.envelope = self.envelope * 0.95 + rms * 0.05;
+            // ≈ 0.95 per 10 ms compounded: prevents mid-sentence cutoffs
+            // on low-gain mics without lengthening the tail.
+            self.envelope = self.envelope * 0.9 + rms * 0.1;
         }
 
         // Hold-window expander target for this frame: unity at or above
@@ -162,12 +168,12 @@ impl NoiseGate {
         // open/close hysteresis and would delay the expander past the
         // hold window; the per-sample smoother below handles zipper
         // safety instead.
-        let floor_gain = 10.0_f32.powf(HOLD_EXPANDER_FLOOR_DB / 20.0);
         let expander_target = if rms >= close_threshold {
             1.0
         } else {
             let rel = (rms / close_threshold.max(1e-6)).max(1e-6);
-            rel.powf(HOLD_EXPANDER_RATIO - 1.0).clamp(floor_gain, 1.0)
+            rel.powf(HOLD_EXPANDER_RATIO - 1.0)
+                .clamp(HOLD_EXPANDER_FLOOR, 1.0)
         };
 
         // Per-sample state machine for smooth fades and accurate hold timing.

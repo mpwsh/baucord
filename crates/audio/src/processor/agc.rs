@@ -7,14 +7,14 @@
 //! ## Pipeline position
 //!
 //! ```text
-//! capture → resample → denoise → gate → compressor → **AGC** → gain → clamp → VAD → encode
+//! capture → resample → denoise → gate → **AGC** → compressor → gain → clamp → speaking → encode
 //! ```
 //!
 //! ## Context interaction
 //!
 //! - **Reads**: `ctx.gate_open` (hold gain when closed),
 //!   `ctx.agc_enabled` (bypass when `false`)
-//! - **Writes**: `ctx.agc_gain` (current gain multiplier, for stats/debug)
+//! - **Writes**: nothing (its gain is internal state; `current_gain()` exposes it)
 //!
 //! ## How it works
 //!
@@ -78,19 +78,18 @@ impl AutoGainControl {
             knobs,
             max_gain,
             min_gain: 0.5,
-            attack_coeff: 0.1,
-            release_coeff: 0.005,
+            // Per-frame smoothing at a 20 ms frame cadence. These are the
+            // 10 ms-frame values (0.1 / 0.005) compounded twice, so the
+            // wall-clock behaviour is unchanged: gain drops quickly on
+            // loud input, rises over ~2 s on quiet input.
+            attack_coeff: 0.19,
+            release_coeff: 0.01,
             current_gain: 1.0,
         }
     }
 
     pub fn current_gain(&self) -> f32 {
         self.current_gain
-    }
-
-    /// Current gain in dB (for stats/UI).
-    pub fn current_gain_db(&self) -> f32 {
-        20.0 * self.current_gain.log10()
     }
 
     /// Inner processing: adjusts gain toward target RMS.
@@ -162,7 +161,6 @@ impl AudioProcessor for AutoGainControl {
 
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         if !ctx.agc_enabled {
-            ctx.agc_gain = 1.0;
             return;
         }
         // Treat the gate's hold window like a closed gate: only the
@@ -170,7 +168,7 @@ impl AudioProcessor for AutoGainControl {
         // gain upward, amplifying the post-speech noise tail. The
         // `!gate_open` path holds the current gain and still applies
         // it, which is exactly the right behavior here too.
-        ctx.agc_gain = self.process_inner(samples, ctx.gate_open && !ctx.gate_holding);
+        self.process_inner(samples, ctx.gate_open && !ctx.gate_holding);
     }
 
     fn reset(&mut self) {

@@ -1,72 +1,40 @@
 //! Adaptive jitter buffer with per-peer playout priming and mixing.
 //!
-//! Buffers decoded audio per-peer, mixes to mono, and adapts its target
-//! depth based on inter-arrival jitter estimation and buffer health feedback.
+//! Buffers **encoded packets** per peer, decodes them at playout time
+//! (see [`crate::transport::packet_buffer`]), mixes to mono, and adapts its
+//! target depth from inter-arrival jitter and buffer-health feedback.
 //!
-//! ## v0.7 changes from v0.6
+//! ## v0.9 changes from v0.8
 //!
-//! - **Timestamp-based jitter estimation**: The expected inter-arrival delta
-//!   is now derived from the packets' 48 kHz sample-clock timestamps instead
-//!   of assuming a continuous 10 ms stream. With DTX, the gap between two
-//!   utterances is visible in the timestamps, so pauses no longer register
-//!   as multi-second "jitter" spikes that pegged the target at its ceiling.
-//! - **Playout priming**: The target depth now actually delays playout.
-//!   A peer that starts (or resumes after running dry) contributes silence
-//!   until its buffer holds `target` worth of audio, giving late packets a
-//!   real window to arrive instead of only controlling when audio is
-//!   discarded.
-//! - **Smoothed mix normalization**: The multi-speaker scale ramps over
-//!   ~80 ms instead of stepping ±3 dB between adjacent frames when a third
-//!   speaker starts or stops contributing.
-//! - **Health signals from reality**: Adaptation feeds on concealment frames
-//!   (the decoder's loss/reorder recovery) and genuine mid-stream underruns,
-//!   rather than duplicated sequence bookkeeping. Packet reordering is
-//!   handled upstream in the decoder, which is the only place it can be —
-//!   this buffer stores raw samples and cannot reorder them.
-//! - **Peer pruning**: Buffers for peers that have been silent for 30 s are
-//!   dropped instead of accumulating forever.
+//! - **Packets, not PCM**: the per-peer store is a [`PacketBuffer`]. The
+//!   decoder thread is gone; the output worker decodes the slot it is
+//!   about to play. "Late" now means *behind the playhead*, so the
+//!   adaptive target is the one late-tolerance knob (the old decoder had
+//!   a fixed 30 ms reorder hold that this target could not reach), in-band
+//!   FEC is applied the moment a slot comes due, and reordering costs
+//!   nothing.
+//! - **No mid-spurt splice**: the "burst-safe drain" used to cut raw
+//!   samples out of the middle of speech. Sustained excess now drops one
+//!   *quiet* decoded frame per hop instead — Perkins ch. 6: adjust the
+//!   playout point where concealment is cheapest.
+//! - **PLC instead of a decay tail** when a peer runs dry mid-word: two
+//!   frames of Opus extrapolation, then the existing prime/underrun logic.
+//! - **Honest stats**: `fec` counts only slots recovered from LBRR that
+//!   was actually present (`opus_packet_has_lbrr`).
 //!
-//! ## v0.8 changes from v0.7
-//!
-//! - **Per-peer clock-drift compensation**: a sender whose capture
-//!   clock is slow drains this buffer at the drift rate and punctures
-//!   it every few tens of seconds during continuous speech — audible
-//!   holes indistinguishable from packet loss (the "same users always
-//!   break up" field report; the sender-side counterpart lives in
-//!   [`crate::clock`]). Each peer's skew is estimated from inflow vs
-//!   wall-paced consumption over clean 10 s windows and playout is
-//!   time-stretched by the same amount (≤ ±2000 ppm, inaudible), so
-//!   the buffer stays flat instead of draining or growing. Inert
-//!   (estimate 0.0, playout byte-identical to v0.7) for healthy
-//!   senders and until a skew above the dead zone is confirmed.
+//! Older history (timestamp-based jitter estimation, playout priming,
+//! deferred underrun classification, per-peer clock-drift compensation)
+//! is unchanged and lives on in the comments below.
 
 use crate::config::PeerAudioSettings;
 use crate::processor::limiter::Limiter;
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use crate::transport::packet::AudioPacket;
+use crate::transport::packet_buffer::{PacketBuffer, Push};
+use crate::{FRAME_SIZE, OPUS_SAMPLE_RATE};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// Decoded audio with metadata that survives the decoder→output channel.
-///
-/// The `arrival_time` is stamped when the packet reaches the decoder
-/// (at network receive), NOT when decoding finishes. Together with the
-/// 48 kHz `timestamp` from the packet header it gives the jitter buffer
-/// clean network timing that is robust to DTX gaps.
-#[derive(Debug, Clone)]
-pub struct DecodedFrame {
-    pub peer_id: u64,
-    pub seq: u32,
-    /// 48 kHz sample-clock timestamp from the packet header.
-    /// Concealment frames carry an interpolated timestamp.
-    pub timestamp: u32,
-    pub arrival_time: Instant,
-    pub samples: Vec<f32>,
-    /// True if this frame was generated by PLC/FEC (not a real packet).
-    /// Concealment frames don't carry valid arrival times and are not
-    /// used for jitter estimation.
-    pub is_concealment: bool,
-}
 
 /// Deferred underrun classification: a peer that ran dry and then receives
 /// audio again within this window was genuinely starved mid-stream (the
@@ -91,15 +59,12 @@ const RESUME_FADE_SAMPLES: usize = 144;
 ///
 /// A genuine delivery stall means the sender kept transmitting: every
 /// frame exists, so the frame that ends the dry spell is media-adjacent
-/// to the last one received — a gap of ONE frame (10 ms). A DTX pause
-/// tail looks different: Opus needs ~100 ms of silence before it starts
+/// to the last one received — a gap of ONE frame (20 ms). A DTX pause
+/// tail looks different: Opus needs ~200 ms of silence before it starts
 /// withholding, so by the time frames are actually missing, the media
-/// gap at speech resume is several frames wide. Two frames + margin
-/// separates the signatures. (The earlier 100 ms bound let the withheld
-/// tail of every ~250–500 ms speech pause count as an underrun — both
-/// clients logged the same rhythmic false positives against each other's
-/// streams on a clean LAN.)
-const UNDERRUN_MEDIA_CONTIGUITY_S: f32 = 0.025;
+/// gap at speech resume is many frames wide. Two frames + margin
+/// separates the signatures.
+const UNDERRUN_MEDIA_CONTIGUITY_S: f32 = 0.045;
 
 /// Peers with no pushed audio for this long are pruned.
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -115,25 +80,46 @@ const DRIFT_DEADZONE: f64 = 10e-6;
 
 /// Ceiling on the applied per-peer rate correction (±2000 ppm — a
 /// ~3.5-cent time-scale change, below audibility; larger skews mean a
-/// broken sender, for which the underrun/drain machinery below stays
+/// broken sender, for which the underrun/shrink machinery below stays
 /// as the safety net).
 const MAX_DRIFT_CORRECTION: f64 = 2_000e-6;
 
+/// Consecutive hops of sustained excess before a peer is asked to shrink.
+/// Burst arrivals after a jitter spike legitimately overfill the buffer;
+/// only excess that persists past this is clock drift or a stale target.
+const SHRINK_AFTER_TICKS: u32 = 10;
+
+/// Self-monitor (loopback) PCM: 200 ms cap. It is local audio with no
+/// jitter or loss, so it never goes through a packet buffer.
+const LOOPBACK_CAP: usize = OPUS_SAMPLE_RATE as usize / 5;
+
+/// Concealment / loss counters accumulated between [`AdaptiveJitterBuffer::drain_stats`] calls.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JitterStats {
+    /// Slots recovered from in-band FEC that was actually present.
+    pub fec: u64,
+    /// Slots concealed with PLC (missing packet, or dry-buffer extrapolation).
+    pub plc: u64,
+    /// Slots that never played: concealed or skipped.
+    pub lost: u64,
+    /// Packets that arrived behind the playhead.
+    pub late: u64,
+}
+
 /// Per-peer state inside the jitter buffer.
 struct PeerBuffer {
-    /// Audio sample FIFO (decoded f32 at 48 kHz).
-    samples: VecDeque<f32>,
-    /// Timestamp of the last real (non-concealment) frame.
+    /// Encoded packets + decoder for this peer.
+    packets: PacketBuffer,
+    /// Timestamp of the last accepted packet.
     last_ts: Option<u32>,
-    /// Arrival time of the last real (non-concealment) frame.
+    /// Arrival time of the last accepted packet.
     last_arrival: Option<Instant>,
-    /// When audio was last pushed for this peer (any frame kind).
+    /// When a packet was last accepted for this peer.
     last_push: Instant,
     /// Smoothed jitter estimate in seconds (exponential moving average).
     /// Uses asymmetric coefficients: fast attack, slower release.
     jitter_estimate: f32,
-    /// How many consecutive ticks this peer has had excess samples.
-    /// Used to avoid draining burst arrivals prematurely.
+    /// How many consecutive hops this peer has had excess buffered media.
     excess_ticks: u32,
     /// While priming, the peer contributes silence until its buffer holds
     /// the target depth. Set on creation and again after a mid-stream
@@ -146,11 +132,11 @@ struct PeerBuffer {
     /// push (recent → underrun, stale → pause). See UNDERRUN_CONFIRM_WINDOW.
     dry_at: Option<Instant>,
     /// Last sample this peer contributed to the mix — the starting point
-    /// for the synthesized decay tail when the buffer runs dry.
+    /// for the synthesized decay tail when the PLC budget is exhausted.
     last_sample: f32,
     /// Remaining fade-in samples after resuming from priming.
     fade_in_remaining: usize,
-    /// Cumulative samples pushed for this peer (drift numerator).
+    /// Cumulative media samples accepted for this peer (drift numerator).
     pushed_samples: u64,
     /// Cumulative wall-paced samples consumed while playing (drift
     /// denominator). Their long-run ratio deviates from 1.0 by
@@ -159,12 +145,12 @@ struct PeerBuffer {
     /// Open estimation window: (start, pushed at start, consumed at
     /// start).
     drift_window: Option<(Instant, u64, u64)>,
-    /// Windows containing an underrun, priming, concealment, drain,
+    /// Windows containing an underrun, priming, concealment, shrink,
     /// or mute measure playout disruption, not clock rate — poisoned
     /// windows restart instead of updating the estimate.
     drift_window_dirty: bool,
     /// Smoothed sender clock skew (`+` = sender fast, `-` = slow).
-    /// 0.0 = no correction; playout is byte-identical to v0.7.
+    /// 0.0 = no correction.
     drift_estimate: f64,
     /// Fractional sample carry for the micro rate adjustment.
     slip_frac: f64,
@@ -174,9 +160,9 @@ struct PeerBuffer {
 }
 
 impl PeerBuffer {
-    fn new() -> Self {
-        Self {
-            samples: VecDeque::with_capacity(4800), // 100ms at 48kHz
+    fn new() -> opus::Result<Self> {
+        Ok(Self {
+            packets: PacketBuffer::new()?,
             last_ts: None,
             last_arrival: None,
             last_push: Instant::now(),
@@ -194,7 +180,17 @@ impl PeerBuffer {
             drift_estimate: 0.0,
             slip_frac: 0.0,
             limiter: Limiter::new(),
-        }
+        })
+    }
+
+    /// Bookkeeping for "ran dry while playing": record the moment so the
+    /// next push can classify it, and rebuild the cushion before playing
+    /// again.
+    fn mark_dry(&mut self, now: Instant) {
+        self.dry_at = Some(now);
+        self.priming = true;
+        self.playing = false;
+        self.drift_window_dirty = true;
     }
 }
 
@@ -206,6 +202,11 @@ pub struct AdaptiveJitterBuffer {
 
     buffers: HashMap<u64, PeerBuffer>,
     peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
+    /// Peers removed via the public API; swept in `adapt()`.
+    removed_peers: Arc<Mutex<HashSet<u64>>>,
+
+    /// Self-monitor PCM (mic loopback), mixed after the peers.
+    loopback: VecDeque<f32>,
 
     /// Scratch buffer for per-peer volume/limiting, allocated once.
     scratch: Vec<f32>,
@@ -219,8 +220,8 @@ pub struct AdaptiveJitterBuffer {
     /// Counts adapt() calls since the last concealment/underrun event.
     /// When this is high, conditions are stable and we can drain.
     stable_ticks: u32,
-    /// Concealment frames observed since last adapt() call. Each one is
-    /// the decoder telling us a packet was lost or arrived too late.
+    /// Concealment slots (FEC + PLC at a due slot) since last adapt():
+    /// each one is a packet that was lost or arrived too late.
     concealment_count: u32,
     /// Mid-stream underruns observed since last adapt() call.
     underrun_count: u32,
@@ -233,6 +234,8 @@ pub struct AdaptiveJitterBuffer {
     /// each puncture an audible gap. Decays ~40% per 10 s, so old trouble
     /// stops mattering on the same timescale users forget it.
     underrun_floor_ms: f32,
+    /// Counters for `AudioStats`, drained by the output worker.
+    stats: JitterStats,
 }
 
 impl AdaptiveJitterBuffer {
@@ -240,7 +243,10 @@ impl AdaptiveJitterBuffer {
         sample_rate: usize,
         initial_target_ms: usize,
         peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
+        removed_peers: Arc<Mutex<HashSet<u64>>>,
     ) -> Self {
+        #[allow(clippy::cast_precision_loss)]
+        let initial_ms = initial_target_ms as f32;
         Self {
             sample_rate,
             target_samples: (initial_target_ms * sample_rate) / 1000,
@@ -248,159 +254,171 @@ impl AdaptiveJitterBuffer {
             max_samples: (200 * sample_rate) / 1000, // 200ms ceiling
             buffers: HashMap::new(),
             peer_settings,
+            removed_peers,
+            loopback: VecDeque::with_capacity(LOOPBACK_CAP),
             scratch: Vec::new(),
             scratch_in: Vec::new(),
             mix_scale: 1.0,
             stable_ticks: 0,
             concealment_count: 0,
             underrun_count: 0,
-            last_logged_target_ms: initial_target_ms as f32,
+            last_logged_target_ms: initial_ms,
             underrun_floor_ms: 0.0,
+            stats: JitterStats::default(),
         }
     }
 
-    /// Ingest a decoded frame with network-stamped arrival time.
+    /// Ingest one encoded packet, stamped with its network arrival time.
     ///
     /// This is the primary entry point from the output worker. It:
-    /// 1. Updates jitter estimation from arrival/timestamp deltas
-    ///    (real packets only)
-    /// 2. Counts concealment frames as health feedback for adaptation
-    /// 3. Pushes audio samples into the per-peer FIFO
+    /// 1. Classifies a pending dry spell (underrun vs DTX pause)
+    /// 2. Updates jitter estimation from arrival/timestamp deltas
+    /// 3. Hands the packet to the peer's [`PacketBuffer`]
     ///
-    /// Frames arrive in playout order: the decoder owns sequence tracking,
-    /// reordering, and loss concealment, and emits exactly one frame per
-    /// 10 ms slot of each peer's active speech.
-    pub fn push_frame(&mut self, frame: DecodedFrame) {
-        let pushed = frame.samples.len() as u64;
+    /// Packets may arrive in any order; the packet buffer sorts them. Late
+    /// packets (behind the playhead) are counted and dropped.
+    pub fn push_packet(&mut self, pkt: AudioPacket, arrival: Instant) {
+        let peer_id = pkt.header.ssrc;
+        let ts = pkt.header.timestamp;
+
         // Check mute
         {
             let Ok(settings) = self.peer_settings.lock() else {
                 return;
             };
-            if let Some(s) = settings.get(&frame.peer_id) {
-                if s.is_muted {
-                    // Clear any buffered audio for this peer
-                    if let Some(peer) = self.buffers.get_mut(&frame.peer_id) {
-                        peer.samples.clear();
-                        peer.drift_window_dirty = true;
-                    }
+            if settings.get(&peer_id).is_some_and(|s| s.is_muted) {
+                if let Some(peer) = self.buffers.get_mut(&peer_id) {
+                    peer.packets.clear();
+                    peer.drift_window_dirty = true;
+                }
+                return;
+            }
+        }
+
+        let peer = match self.buffers.entry(peer_id) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => match PeerBuffer::new() {
+                Ok(p) => {
+                    log::info!("Adding decoder for peer {peer_id}");
+                    v.insert(p)
+                }
+                // Opus init failure is near-impossible; skip this packet
+                // and retry on the next one rather than panicking on an
+                // audio-adjacent thread.
+                Err(e) => {
+                    log::error!("Failed to create Opus decoder for peer {peer_id}: {e}");
                     return;
                 }
+            },
+        };
+
+        // Media duration of this packet, for the drift numerator.
+        let pushed = opus::packet::get_nb_samples(&pkt.opus_data, OPUS_SAMPLE_RATE)
+            .unwrap_or(FRAME_SIZE) as u64;
+
+        match peer.packets.push(pkt) {
+            Push::Accepted => {}
+            Push::Late => {
+                self.stats.late += 1;
+                return;
+            }
+            Push::Duplicate => return,
+        }
+
+        // ── Deferred underrun classification ────────────────────
+        // Runs before last_ts is updated so we can compare against
+        // the previous frame's media clock. Two stories end a dry
+        // spell, and the timestamp tells them apart:
+        //
+        //   Delivery stall: the sender never paused — timestamps are
+        //   contiguous with what we already played, the packets were
+        //   just late. THAT is an underrun; the target must grow.
+        //
+        //   Sender pause (DTX): media time jumped by ≈ the wall gap
+        //   because the clock ran while nothing was sent. Normal.
+        //
+        // Wall-time alone can't tell these apart: the gate transmits
+        // through the first 200 ms of every pause, so a natural
+        // 250–320 ms inter-phrase pause yields a 50–120 ms packet gap
+        // — which a wall-clock-only classifier scores as starvation
+        // on every other sentence (field log: underrun=1 every few
+        // seconds of clean-LAN speech, ratcheting the target +10 ms
+        // each time).
+        if let Some(dry_time) = peer.dry_at.take() {
+            #[allow(clippy::cast_precision_loss)]
+            let media_gap = peer
+                .last_ts
+                .map(|lt| ts.wrapping_sub(lt) as f32 / self.sample_rate as f32);
+            let delivery_resumed_fast = dry_time.elapsed() < UNDERRUN_CONFIRM_WINDOW;
+            if delivery_resumed_fast && media_gap.is_some_and(|g| g <= UNDERRUN_MEDIA_CONTIGUITY_S)
+            {
+                self.underrun_count += 1;
             }
         }
 
-        let peer = self
-            .buffers
-            .entry(frame.peer_id)
-            .or_insert_with(PeerBuffer::new);
+        // ── Jitter estimation ────────────────────────────────────
+        // Compare how much later the packet arrived vs. how much
+        // later its media clock says it should be. DTX pauses move
+        // both clocks together, so they contribute ~zero jitter.
+        if let (Some(last_arrival), Some(last_ts)) = (peer.last_arrival, peer.last_ts) {
+            let arrival_delta = arrival.duration_since(last_arrival).as_secs_f32();
+            #[allow(clippy::cast_precision_loss)]
+            let expected_delta = ts.wrapping_sub(last_ts) as f32 / self.sample_rate as f32;
+            // Only near-continuous packets inform the estimator.
+            // Inter-arrival jitter is defined on a flowing stream;
+            // with DTX the stream pauses (utterance gaps, ~400 ms
+            // silence refreshes), and an interval that spans a pause
+            // measures the pause, not the network. Those samples are
+            // pure noise, and via the EMA + the "jump target up
+            // immediately" rule, a few of them could park the target
+            // — and therefore the priming delay every utterance pays
+            // — far above what the network needs. Media-time
+            // continuity (expected_delta) is the right gate: delayed
+            // bursts of continuous speech still qualify, pauses of
+            // any kind never do. Reordered packets fail it too
+            // (negative media delta wraps huge), which is correct.
+            if expected_delta > 0.0 && expected_delta <= 0.1 && arrival_delta < 0.5 {
+                let jitter_sample = (arrival_delta - expected_delta).abs();
 
-        if frame.is_concealment {
-            self.concealment_count += 1;
-            // Concealment covers loss/late delivery — inflow during it
-            // does not reflect the sender's clock rate.
-            peer.drift_window_dirty = true;
-            // Concealment around a dry spell is packet loss, and the
-            // concealment counter already charges the target for it —
-            // don't let the next real frame double-charge it as an
-            // underrun.
-            peer.dry_at = None;
-        } else {
-            // ── Deferred underrun classification ────────────────────
-            // Runs before last_ts is updated so we can compare against
-            // the previous frame's media clock. Two stories end a dry
-            // spell, and the timestamp tells them apart:
-            //
-            //   Delivery stall: the sender never paused — timestamps are
-            //   contiguous with what we already played, the packets were
-            //   just late. THAT is an underrun; the target must grow.
-            //
-            //   Sender pause (DTX): media time jumped by ≈ the wall gap
-            //   because the clock ran while nothing was sent. Normal.
-            //
-            // Wall-time alone can't tell these apart: the gate transmits
-            // through the first 200 ms of every pause, so a natural
-            // 250–320 ms inter-phrase pause yields a 50–120 ms packet gap
-            // — which a wall-clock-only classifier scores as starvation
-            // on every other sentence (field log: underrun=1 every few
-            // seconds of clean-LAN speech, ratcheting the target +10 ms
-            // each time).
-            if let Some(dry_time) = peer.dry_at.take() {
-                #[allow(clippy::cast_precision_loss)]
-                let media_gap = peer
-                    .last_ts
-                    .map(|lt| frame.timestamp.wrapping_sub(lt) as f32 / self.sample_rate as f32);
-                let delivery_resumed_fast = dry_time.elapsed() < UNDERRUN_CONFIRM_WINDOW;
-                if delivery_resumed_fast
-                    && media_gap.is_some_and(|g| g <= UNDERRUN_MEDIA_CONTIGUITY_S)
-                {
-                    self.underrun_count += 1;
-                }
+                // Winsorize: one genuine outlier (a sender stall
+                // delivering 300 ms of frames in a burst is media-
+                // continuous and correctly passes the gate above) must
+                // raise the estimate, not replace it. Field log showed
+                // a single burst + 0.3 attack slamming the estimate
+                // ~20× in one sample, parking the target at its 200 ms
+                // ceiling with zero concealments or underruns.
+                let capped = jitter_sample.min(peer.jitter_estimate * 3.0 + 0.005);
+
+                // Asymmetric EMA, RFC 3550-strength gain on the way up
+                // (1/16 per sample: a real shift still dominates within
+                // ~20 packets), gentler on the way down so the estimate
+                // outlives short calm stretches.
+                let coeff = if capped > peer.jitter_estimate {
+                    0.0625
+                } else {
+                    0.02
+                };
+                peer.jitter_estimate = peer.jitter_estimate * (1.0 - coeff) + capped * coeff;
             }
-
-            // ── Jitter estimation (real packets only) ────────────────
-            // Compare how much later the packet arrived vs. how much
-            // later its media clock says it should be. DTX pauses move
-            // both clocks together, so they contribute ~zero jitter.
-            if let (Some(last_arrival), Some(last_ts)) = (peer.last_arrival, peer.last_ts) {
-                let arrival_delta = frame
-                    .arrival_time
-                    .duration_since(last_arrival)
-                    .as_secs_f32();
-                #[allow(clippy::cast_precision_loss)]
-                let expected_delta =
-                    frame.timestamp.wrapping_sub(last_ts) as f32 / self.sample_rate as f32;
-                // Only near-continuous packets inform the estimator.
-                // Inter-arrival jitter is defined on a flowing stream;
-                // with DTX the stream pauses (utterance gaps, ~400 ms
-                // silence refreshes), and an interval that spans a pause
-                // measures the pause, not the network. Those samples are
-                // pure noise, and via the EMA + the "jump target up
-                // immediately" rule, a few of them could park the target
-                // — and therefore the priming delay every utterance pays
-                // — far above what the network needs. Media-time
-                // continuity (expected_delta) is the right gate: delayed
-                // bursts of continuous speech still qualify, pauses of
-                // any kind never do.
-                if expected_delta > 0.0 && expected_delta <= 0.1 && arrival_delta < 0.5 {
-                    let jitter_sample = (arrival_delta - expected_delta).abs();
-
-                    // Winsorize: one genuine outlier (a sender stall
-                    // delivering 300 ms of frames in a burst is media-
-                    // continuous and correctly passes the gate above) must
-                    // raise the estimate, not replace it. Field log showed
-                    // a single burst + 0.3 attack slamming the estimate
-                    // ~20× in one sample, parking the target at its 200 ms
-                    // ceiling with zero concealments or underruns.
-                    let capped = jitter_sample.min(peer.jitter_estimate * 3.0 + 0.005);
-
-                    // Asymmetric EMA, RFC 3550-strength gain on the way up
-                    // (1/16 per sample: a real shift still dominates within
-                    // ~20 packets = 200 ms of speech), gentler on the way
-                    // down so the estimate outlives short calm stretches.
-                    let coeff = if capped > peer.jitter_estimate {
-                        0.0625
-                    } else {
-                        0.02
-                    };
-                    peer.jitter_estimate = peer.jitter_estimate * (1.0 - coeff) + capped * coeff;
-                }
-            }
-            peer.last_arrival = Some(frame.arrival_time);
-            peer.last_ts = Some(frame.timestamp);
         }
-
-        // ── Push audio ───────────────────────────────────────────────
-        peer.samples.extend(frame.samples);
+        peer.last_arrival = Some(arrival);
+        peer.last_ts = Some(ts);
         peer.pushed_samples += pushed;
         peer.last_push = Instant::now();
 
         // Hard cap: prevent runaway growth (e.g., frozen output, paused app).
-        // This is a safety valve, not the normal drain path.
-        let hard_cap = self.max_samples * 3;
-        if peer.samples.len() > hard_cap {
-            let excess = peer.samples.len() - hard_cap;
-            peer.samples.drain(..excess);
+        // This is a safety valve, not the normal shrink path.
+        peer.packets.truncate_to(self.max_samples * 3);
+    }
+
+    /// Queue self-monitor audio (mic loopback). Local, lossless, unjittered:
+    /// it bypasses the packet buffers and is summed straight into the mix.
+    pub fn push_loopback(&mut self, frame: &[f32]) {
+        let overflow = (self.loopback.len() + frame.len()).saturating_sub(LOOPBACK_CAP);
+        if overflow > 0 {
+            self.loopback.drain(..overflow);
         }
+        self.loopback.extend(frame.iter().copied());
     }
 
     /// Pull exactly `n` mixed samples, filling with silence if needed.
@@ -420,44 +438,26 @@ impl AdaptiveJitterBuffer {
             return;
         };
         let mut contributing_peers = 0u32;
+        let mut fec = 0u64;
+        let mut plc = 0u64;
+        let mut dry_plc = 0u64;
+        let mut lost = 0u64;
 
         if self.scratch.len() < n {
             self.scratch.resize(n, 0.0);
         }
         let now = Instant::now();
+        // Sustained-excess threshold: target + 4 hops.
+        let headroom = self.target_samples + n * 4;
+        let prime_cap = (60 * self.sample_rate) / 1000;
+        let prime_target = self.target_samples.min(prime_cap);
 
         for (peer_id, peer) in self.buffers.iter_mut() {
             let peer_settings = settings.get(peer_id).cloned().unwrap_or_default();
             if peer_settings.is_muted {
-                peer.samples.clear();
+                peer.packets.clear();
                 peer.playing = false;
                 peer.drift_window_dirty = true;
-                continue;
-            }
-
-            if peer.samples.is_empty() {
-                // Ran dry. Whether this was a genuine underrun (packets
-                // late mid-stream) or a normal DTX pause can only be told
-                // by what happens next, so record the moment and let the
-                // next push classify it. Either way, rebuild the cushion
-                // before playing again.
-                if peer.playing {
-                    // Soften the cut: an instant step from the last sample
-                    // to silence is a broadband click — the "pop" reported
-                    // in the field on every underrun. Synthesize a ~2 ms
-                    // exponential decay tail from where the audio stopped.
-                    let mut tail = peer.last_sample;
-                    for slot in out.iter_mut().take(96) {
-                        tail *= 0.95;
-                        *slot += tail;
-                    }
-                    peer.last_sample = 0.0;
-
-                    peer.dry_at = Some(now);
-                    peer.priming = true;
-                    peer.playing = false;
-                    peer.drift_window_dirty = true;
-                }
                 continue;
             }
 
@@ -472,9 +472,7 @@ impl AdaptiveJitterBuffer {
             // utterance on every network paying the worst case up front.
             if peer.priming {
                 peer.drift_window_dirty = true;
-                let prime_cap = (60 * self.sample_rate) / 1000;
-                let prime_target = self.target_samples.min(prime_cap);
-                if peer.samples.len() >= prime_target {
+                if peer.packets.buffered_media() >= prime_target {
                     peer.priming = false;
                     // Soften the resume edge to match the softened cut.
                     peer.fade_in_remaining = RESUME_FADE_SAMPLES;
@@ -483,14 +481,32 @@ impl AdaptiveJitterBuffer {
                 }
             }
 
+            // ── Sustained excess → shrink during quiet ──────────────
+            // After a jitter spike, packets arrive in bursts and legitimately
+            // fill the buffer past target; those play out naturally. Only
+            // excess that persists for SHRINK_AFTER_TICKS hops is clock
+            // drift or a stale target, and then the packet buffer drops at
+            // most one quiet decoded frame per hop.
+            let depth = peer.packets.buffered_media();
+            let shrink = if depth > headroom {
+                peer.excess_ticks = peer.excess_ticks.saturating_add(1);
+                peer.excess_ticks > SHRINK_AFTER_TICKS
+            } else {
+                peer.excess_ticks = 0;
+                false
+            };
+            if shrink {
+                peer.drift_window_dirty = true;
+            }
+
             // ── Micro rate adjustment (sender clock drift) ──────────
             // drift_estimate < 0: the sender's capture clock is slow —
             // consume fractionally fewer buffered samples per wall
             // hop and time-stretch them onto the full hop, so the
             // buffer stops draining toward an audible underrun.
             // > 0: the opposite, so the buffer stops growing into the
-            // splice-drain below. 0.0 (default, and every healthy
-            // sender): identical to the pre-v0.8 path.
+            // shrink path. 0.0 (default, and every healthy sender):
+            // plain copy.
             peer.consumed_samples += n as u64;
             let mut desired = n;
             if peer.drift_estimate != 0.0 {
@@ -511,59 +527,100 @@ impl AdaptiveJitterBuffer {
                 }
             }
 
+            // ── Decode / conceal into scratch ───────────────────────
             let available;
-            if desired != n && peer.samples.len() >= desired {
-                // Drain `desired` source samples, emit exactly `n`.
-                // The ratio is within ±0.2%, where linear
-                // interpolation is audibly transparent.
-                self.scratch_in.clear();
-                self.scratch_in.extend(peer.samples.drain(..desired));
-                resample_linear(&self.scratch_in, &mut self.scratch[..n]);
-                for slot in &mut self.scratch[..n] {
+            if desired != n {
+                if self.scratch_in.len() < desired {
+                    self.scratch_in.resize(desired, 0.0);
+                }
+                let rep = peer.packets.fill(&mut self.scratch_in[..desired], true, shrink);
+                fec += u64::from(rep.fec);
+                plc += u64::from(rep.plc);
+                dry_plc += u64::from(rep.dry_plc);
+                lost += u64::from(rep.fec + rep.plc + rep.skipped);
+                if rep.filled == desired {
+                    // Drain `desired` source samples, emit exactly `n`.
+                    // The ratio is within ±0.2%, where linear
+                    // interpolation is audibly transparent.
+                    resample_linear(&self.scratch_in[..desired], &mut self.scratch[..n]);
+                    available = n;
+                } else {
+                    // Ran dry mid-hop: no stretch, play what we have.
+                    self.scratch[..rep.filled].copy_from_slice(&self.scratch_in[..rep.filled]);
+                    available = rep.filled;
+                }
+            } else {
+                let rep = peer.packets.fill(&mut self.scratch[..n], true, shrink);
+                fec += u64::from(rep.fec);
+                plc += u64::from(rep.plc);
+                dry_plc += u64::from(rep.dry_plc);
+                lost += u64::from(rep.fec + rep.plc + rep.skipped);
+                available = rep.filled;
+            }
+
+            if available > 0 {
+                for slot in &mut self.scratch[..available] {
                     *slot *= peer_settings.volume;
                 }
-                available = n;
-            } else {
-                // Unadjusted path — byte-identical to pre-v0.8.
-                available = peer.samples.len().min(n);
-                for (slot, s) in self.scratch[..available]
-                    .iter_mut()
-                    .zip(peer.samples.drain(..available))
-                {
-                    *slot = s * peer_settings.volume;
+
+                // Apply per-peer limiter (hearing protection)
+                peer.limiter.process_samples(&mut self.scratch[..available]);
+
+                // Linear fade-in over the first ~3 ms after resuming playout.
+                if peer.fade_in_remaining > 0 {
+                    let n_fade = peer.fade_in_remaining.min(available);
+                    let done = RESUME_FADE_SAMPLES - peer.fade_in_remaining;
+                    #[allow(clippy::cast_precision_loss)]
+                    for (i, s) in self.scratch[..n_fade].iter_mut().enumerate() {
+                        *s *= (done + i + 1) as f32 / RESUME_FADE_SAMPLES as f32;
+                    }
+                    peer.fade_in_remaining -= n_fade;
                 }
-            }
+                peer.last_sample = self.scratch[available - 1];
 
-            // Apply per-peer limiter (hearing protection)
-            peer.limiter.process_samples(&mut self.scratch[..available]);
+                // Sum into output mix and track energy
+                let mut peer_energy = 0.0f32;
+                for i in 0..available {
+                    out[i] += self.scratch[i];
+                    peer_energy += self.scratch[i] * self.scratch[i];
+                }
+                peer.playing = true;
 
-            // Linear fade-in over the first ~3 ms after resuming playout.
-            if peer.fade_in_remaining > 0 {
-                let n_fade = peer.fade_in_remaining.min(available);
-                let done = RESUME_FADE_SAMPLES - peer.fade_in_remaining;
+                // Only count peers with meaningful audio (not silence/DTX residue).
+                // Threshold: ~-60 dBFS per sample average.
                 #[allow(clippy::cast_precision_loss)]
-                for (i, s) in self.scratch[..n_fade].iter_mut().enumerate() {
-                    *s *= (done + i + 1) as f32 / RESUME_FADE_SAMPLES as f32;
+                if (peer_energy / available as f32) > 1e-6 {
+                    contributing_peers += 1;
                 }
-                peer.fade_in_remaining -= n_fade;
-            }
-            peer.last_sample = self.scratch[available - 1];
-
-            // Sum into output mix and track energy
-            let mut peer_energy = 0.0f32;
-            for i in 0..available {
-                out[i] += self.scratch[i];
-                peer_energy += self.scratch[i] * self.scratch[i];
             }
 
-            peer.playing = true;
-
-            // Only count peers with meaningful audio (not silence/DTX residue).
-            // Threshold: ~-60 dBFS per sample average.
-            #[allow(clippy::cast_precision_loss)]
-            if available > 0 && (peer_energy / available as f32) > 1e-6 {
-                contributing_peers += 1;
+            if available < n && peer.playing {
+                // Ran dry (the PLC budget inside the packet buffer is spent).
+                // Whether this was a genuine underrun (packets late
+                // mid-stream) or a normal DTX pause can only be told by what
+                // happens next, so record the moment and let the next push
+                // classify it. Either way, rebuild the cushion before
+                // playing again.
+                //
+                // Soften the cut: an instant step from the last sample to
+                // silence is a broadband click. Synthesize a ~2 ms
+                // exponential decay tail from where the audio stopped.
+                let mut tail = peer.last_sample;
+                for slot in out[available..].iter_mut().take(96) {
+                    tail *= 0.95;
+                    *slot += tail;
+                }
+                peer.last_sample = 0.0;
+                peer.mark_dry(now);
             }
+        }
+
+        // ── Self-monitor ────────────────────────────────────────────
+        for slot in out.iter_mut() {
+            let Some(s) = self.loopback.pop_front() else {
+                break;
+            };
+            *slot += s;
         }
 
         // Soft-knee normalization: no scaling for 1-2 speakers, gentle
@@ -589,33 +646,22 @@ impl AdaptiveJitterBuffer {
         }
         self.mix_scale = scale_end;
 
-        drop(settings); // release lock before drain
+        drop(settings);
 
-        // ── Burst-safe drain ────────────────────────────────────────
-        // After a jitter spike, packets arrive in bursts and legitimately
-        // fill the buffer well past target. Only drain if excess has been
-        // sustained for 10+ consecutive ticks (100ms): burst arrivals play
-        // out naturally while clock-drift growth is still bounded.
-        let headroom = self.target_samples + (n * 4); // target + 4 frames
-
-        for peer in self.buffers.values_mut() {
-            if peer.samples.len() > headroom {
-                peer.excess_ticks = peer.excess_ticks.saturating_add(1);
-
-                if peer.excess_ticks > 10 {
-                    // Sustained excess — this is clock drift, not a burst.
-                    // Drain gently: remove half the excess per cycle to avoid
-                    // a sudden jump in playout position.
-                    let excess = peer.samples.len() - headroom;
-                    let drain_amount = (excess / 2).max(1);
-                    peer.samples.drain(..drain_amount);
-                    peer.drift_window_dirty = true;
-                    // Don't reset excess_ticks — keep draining until stable
-                }
-            } else {
-                peer.excess_ticks = 0;
-            }
+        // Concealment at a *due slot* is the adaptation signal (a packet was
+        // lost or late). Dry-buffer extrapolation is deliberately excluded:
+        // the deferred underrun classification owns that verdict, and
+        // counting it here would charge the target for every DTX pause
+        // (the v0.7.1 bug in a new coat).
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.concealment_count = self
+                .concealment_count
+                .saturating_add((fec + plc).min(u64::from(u32::MAX)) as u32);
         }
+        self.stats.fec += fec;
+        self.stats.plc += plc + dry_plc;
+        self.stats.lost += lost;
     }
 
     /// Adapt target depth based on jitter estimates and buffer health.
@@ -624,16 +670,26 @@ impl AdaptiveJitterBuffer {
     ///
     /// 1. **Jitter estimates** (from arrival vs. media-clock deltas) — what
     ///    the network looks like right now.
-    /// 2. **Health feedback** (concealment frames, mid-stream underruns) —
+    /// 2. **Health feedback** (concealment slots, mid-stream underruns) —
     ///    whether the current target is actually too low.
     ///
     /// The target moves **up fast** on problems (scaled by severity) and
     /// **down slowly** during stable periods (over 200 ticks / 2s).
     pub fn adapt(&mut self) {
+        // Drop decoder state for peers removed via the API, even if no
+        // further packet from them ever arrives.
+        if let Ok(mut removed) = self.removed_peers.lock() {
+            for id in removed.drain() {
+                if self.buffers.remove(&id).is_some() {
+                    log::info!("Dropped decoder for removed peer {id}");
+                }
+            }
+        }
+
         // Prune peers that have been silent long enough that keeping their
         // state (and letting it skew the jitter percentile) serves nothing.
         self.buffers
-            .retain(|_, p| !p.samples.is_empty() || p.last_push.elapsed() < PEER_IDLE_TIMEOUT);
+            .retain(|_, p| !p.packets.is_empty() || p.last_push.elapsed() < PEER_IDLE_TIMEOUT);
 
         // Decay idle jitter estimates. During DTX silence no samples
         // arrive, so without this a spiked estimate freezes at its peak
@@ -651,7 +707,7 @@ impl AdaptiveJitterBuffer {
         // ── Per-peer clock-drift estimation ─────────────────────────
         // Inflow vs wall-paced consumption over a clean window is the
         // sender's capture-clock skew. Poisoned windows (underrun,
-        // priming, concealment, drain, mute) restart without updating.
+        // priming, concealment, shrink, mute) restart without updating.
         let now = Instant::now();
         let min_window_consumed = (self.sample_rate as u64) * 8;
         for p in self.buffers.values_mut() {
@@ -784,6 +840,11 @@ impl AdaptiveJitterBuffer {
         self.underrun_count = 0;
     }
 
+    /// Take the accumulated loss/concealment counters (for `AudioStats`).
+    pub fn drain_stats(&mut self) -> JitterStats {
+        std::mem::take(&mut self.stats)
+    }
+
     pub fn occupancy_ms(&self) -> f32 {
         if self.buffers.is_empty() {
             return 0.0;
@@ -792,7 +853,7 @@ impl AdaptiveJitterBuffer {
         let avg: f32 = self
             .buffers
             .values()
-            .map(|p| p.samples.len() as f32)
+            .map(|p| p.packets.buffered_media() as f32)
             .sum::<f32>()
             / self.buffers.len() as f32;
         #[allow(clippy::cast_precision_loss)]
@@ -901,6 +962,73 @@ mod tests {
                 .map(|(i, &y)| (y - (i as f32 * step * omega).sin()).abs())
                 .fold(0.0f32, f32::max);
             assert!(worst < 0.01, "worst deviation {worst}");
+        }
+    }
+
+    mod end_to_end {
+        use super::super::*;
+
+        fn buffer() -> AdaptiveJitterBuffer {
+            AdaptiveJitterBuffer::new(
+                48_000,
+                10,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashSet::new())),
+            )
+        }
+
+        fn encoder() -> opus::Encoder {
+            opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
+                .expect("encoder")
+        }
+
+        fn packet(enc: &mut opus::Encoder, seq: u32, ssrc: u64) -> AudioPacket {
+            let pcm: Vec<f32> = (0..FRAME_SIZE)
+                .map(|i| {
+                    ((seq as usize * FRAME_SIZE + i) as f32 * 300.0 * std::f32::consts::TAU
+                        / 48_000.0)
+                        .sin()
+                        * 0.4
+                })
+                .collect();
+            let mut buf = vec![0u8; 1024];
+            let n = enc.encode_float(&pcm, &mut buf).expect("encode");
+            AudioPacket::new(seq, seq * FRAME_SIZE as u32, ssrc, buf[..n].to_vec())
+        }
+
+        #[test]
+        fn in_order_stream_plays_after_priming_without_concealment() {
+            let mut jb = buffer();
+            let mut enc = encoder();
+            let t0 = Instant::now();
+            for seq in 0..5 {
+                jb.push_packet(packet(&mut enc, seq, 7), t0);
+            }
+            let mut out = vec![0.0f32; 480];
+            let mut energy = 0.0f32;
+            for _ in 0..10 {
+                jb.pull_mixed(480, &mut out);
+                energy += out.iter().map(|s| s * s).sum::<f32>();
+            }
+            let stats = jb.drain_stats();
+            assert!(energy > 0.0, "no audio reached the mix");
+            assert_eq!((stats.fec, stats.plc, stats.lost, stats.late), (0, 0, 0, 0));
+        }
+
+        #[test]
+        fn late_packet_is_counted_not_played() {
+            let mut jb = buffer();
+            let mut enc = encoder();
+            let t0 = Instant::now();
+            for seq in 0..3 {
+                jb.push_packet(packet(&mut enc, seq, 7), t0);
+            }
+            let mut out = vec![0.0f32; 480];
+            for _ in 0..6 {
+                jb.pull_mixed(480, &mut out);
+            }
+            jb.push_packet(packet(&mut enc, 0, 7), t0);
+            assert_eq!(jb.drain_stats().late, 1);
         }
     }
 }

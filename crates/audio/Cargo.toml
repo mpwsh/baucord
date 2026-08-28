@@ -1,6 +1,6 @@
 [package]
 name = "audio"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 description = "audio components for baucord"
 
@@ -24,8 +24,11 @@ rtrb = "0.4"
 # Bounded channels
 crossbeam-channel.workspace = true
 
-# Opus codec
-#opus = { git = "https://github.com/mpwsh/opus-rs" }
+# Opus codec. `opusic-sys` is the same -sys crate `opus` 0.4 links (no
+# second libopus); it is listed only for `opus_packet_has_lbrr`, which
+# opus-rs does not wrap yet (transport::packet_buffer).
+opus = "0.4"
+opusic-sys = "0.7"
 
 # Resampling
 rubato = "5.0"
@@ -35,18 +38,21 @@ rubato = "5.0"
 # adapter types at the rubato boundary.
 audioadapter-buffers = "5.2"
 
-# Noise suppression (Mozilla RNNoise, pure Rust)
+# Noise suppression (Mozilla RNNoise, pure Rust). Its VAD probability also
+# drives the speaking indicator, so no separate VAD dependency is needed.
 nnnoiseless = "0.5"
 
-# Fork retired: upstream 1.x ships quantized weights in its default
-# predictor, which was the fork's whole reason to exist.
-earshot = "1.2"
-opus = "0.4"
 serde = { workspace = true, optional = true }
-
 
 # Logging
 log.workspace = true
+
+# ── macOS / Linux: real-time scheduling for the audio worker threads ────
+# Windows uses MMCSS directly (platform.rs). `default-features = false`
+# skips the D-Bus/RTKit path on Linux: SCHED_FIFO is requested directly
+# and failure (no rtprio limit) is logged and ignored.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+audio_thread_priority = { version = "0.37", default-features = false }
 
 # ── Windows: process-exclusive system audio loopback ────────────────────
 # `wasapi` wraps ActivateAudioInterfaceAsync process loopback
@@ -61,7 +67,6 @@ wasapi = "0.24"
 [dev-dependencies]
 # examples only — the library itself never initializes a logger
 env_logger = "0.11"
-ui = { path = "../ui" }
 
 [[example]]
 name = "latency_profile"

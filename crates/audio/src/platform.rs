@@ -13,8 +13,15 @@
 //! - MMCSS ("Pro Audio") gives the worker threads audio-class scheduling
 //!   so small buffers survive load without glitching.
 //!
-//! No extra crates: the two Windows APIs involved (winmm, avrt) are
-//! declared directly and linked from the Windows SDK.
+//! macOS and Linux get the equivalent through `audio_thread_priority`
+//! (Mach time-constraint policy / SCHED_FIFO): the output worker now
+//! decodes every peer, and a normal-priority thread loses to a compiler
+//! or a browser tab exactly when the buffers are smallest. Failure is
+//! logged and ignored — on Linux without an rtprio limit the worker just
+//! runs at normal priority, as before.
+//!
+//! The two Windows APIs involved (winmm, avrt) are declared directly and
+//! linked from the Windows SDK.
 
 use cpal::{BufferSize, SupportedBufferSize};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
@@ -62,16 +69,18 @@ impl Drop for TimerResolutionGuard {
     }
 }
 
-// ── MMCSS thread promotion ──────────────────────────────────────────────
+// ── Real-time thread promotion ──────────────────────────────────────────
 
-/// De-registers the calling thread from MMCSS when dropped.
-pub struct MmcssGuard {
+/// Reverts the calling thread's scheduling class when dropped.
+pub struct RtGuard {
     #[cfg(windows)]
     handle: *mut core::ffi::c_void,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    handle: Option<audio_thread_priority::RtPriorityHandle>,
 }
 
 #[cfg(windows)]
-impl Drop for MmcssGuard {
+impl Drop for RtGuard {
     fn drop(&mut self) {
         unsafe {
             AvRevertMmThreadCharacteristics(self.handle);
@@ -79,11 +88,22 @@ impl Drop for MmcssGuard {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for RtGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            if let Err(e) = audio_thread_priority::demote_current_thread_from_real_time(handle) {
+                log::debug!("real-time demotion failed: {e}");
+            }
+        }
+    }
+}
+
 /// Register the current thread with the Windows MMCSS "Pro Audio" task
 /// class. Returns a guard to keep in scope for the thread's lifetime;
-/// `None` on failure (logged, harmless) or on non-Windows platforms.
+/// `None` on failure (logged, harmless).
 #[cfg(windows)]
-pub fn promote_current_thread() -> Option<MmcssGuard> {
+pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<RtGuard> {
     // UTF-16, NUL-terminated.
     let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
     let mut index: u32 = 0;
@@ -92,13 +112,30 @@ pub fn promote_current_thread() -> Option<MmcssGuard> {
         log::warn!("MMCSS registration failed — audio worker runs at normal priority");
         None
     } else {
-        Some(MmcssGuard { handle })
+        Some(RtGuard { handle })
     }
 }
 
-/// No-op off Windows.
-#[cfg(not(windows))]
-pub fn promote_current_thread() -> Option<MmcssGuard> {
+/// Ask for real-time scheduling sized to `buffer_frames` at `sample_rate`
+/// (the period the thread must meet). `None` on failure (logged once at
+/// debug level — on Linux this simply means no rtprio limit is set).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn promote_current_thread(buffer_frames: u32, sample_rate: u32) -> Option<RtGuard> {
+    match audio_thread_priority::promote_current_thread_to_real_time(buffer_frames, sample_rate) {
+        Ok(handle) => Some(RtGuard {
+            handle: Some(handle),
+        }),
+        Err(e) => {
+            log::debug!("real-time promotion unavailable ({e}); worker runs at normal priority");
+            None
+        }
+    }
+}
+
+/// No-op on platforms without a real-time path (iOS/Android workers rely
+/// on the platform audio session).
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<RtGuard> {
     None
 }
 

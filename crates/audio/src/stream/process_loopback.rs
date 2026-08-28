@@ -213,7 +213,7 @@ fn pump_thread(
             let _ = setup_tx.send(Ok(()));
             // Audio-class scheduling (MMCSS "Pro Audio"), same as the
             // encode worker.
-            let _mmcss = crate::platform::promote_current_thread();
+            let _rt = crate::platform::promote_current_thread(960, crate::OPUS_SAMPLE_RATE);
             run_pump(&capture, &event, ring_producer, wake_tx, stats, should_stop);
             if let Err(e) = client.stop_stream() {
                 debug!("System audio process loopback: stop_stream failed: {e}");

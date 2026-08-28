@@ -5,29 +5,31 @@
 //! ## Input pipeline (processor chain)
 //!
 //! ```text
-//! capture → resample → denoise → meter → gate → compressor → AGC → gain → clamp → meter → VAD → encode
+//! capture → resample → denoise → meter → gate → AGC → compressor → gain → clamp → meter → speaking → encode
 //! ```
 //!
 //! ## Output pipeline
 //!
 //! ```text
-//! network → decode (+ FEC/PLC) → jitter buffer → gain → resample → playback
+//! network → per-peer packet buffer → decode at playout (+ FEC/PLC) → mix → gain → limit → resample → playback
 //! ```
+//!
+//! Packets are held *encoded* until their playout slot is due, so the
+//! adaptive jitter target is the only late-tolerance knob and Opus in-band
+//! FEC is applied exactly when a slot goes missing (see
+//! [`transport::packet_buffer`]). One output worker owns every peer's
+//! decoder; a 20 ms mono Opus decode costs tens of microseconds, so even 30
+//! simultaneous speakers fit comfortably inside one 10 ms hop.
 //!
 //! ## Device compatibility
 //!
-//! The engine accepts whatever sample rate and channel count the OS gives us
-//! via `default_input_config()` / `default_output_config()`. Bluetooth headphones,
-//! USB mics, audio interfaces — they all just work. We resample to 48 kHz internally.
-//!
-//! ## Scaling
-//!
-//! Decoding is parallelised across a worker pool (dispatched by peer SSRC),
-//! allowing 30+ simultaneous speakers without garbling or starvation.
+//! The engine asks each device for 48 kHz first (Opus' native rate) and
+//! only falls back to the OS default rate — with a resampler — when the
+//! device cannot do 48 kHz (see [`device`]). Bluetooth HFP mics at 8/16 kHz,
+//! 44.1 kHz interfaces and anything else still just work.
 
-pub mod clock;
 mod config;
-mod decoder;
+mod device;
 mod encoder;
 mod input;
 mod input_config;
@@ -43,13 +45,14 @@ pub mod transport;
 pub use config::{PeerAudioSettings, VoiceChatConfig};
 pub use sounds::SoundType;
 pub use stats::AudioStats;
-pub use transport::{jitter_buffer::DecodedFrame, packet::AudioPacket};
+pub use transport::packet::AudioPacket;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use log::{debug, error, info};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 
@@ -69,14 +72,51 @@ use crate::input_config::InputConfig;
 /// Internal pipeline sample rate (Opus native).
 pub const OPUS_SAMPLE_RATE: u32 = 48_000;
 
-/// Samples per 10 ms frame at 48 kHz.
-pub const FRAME_SIZE: usize = 480;
+/// Samples per voice frame at 48 kHz: 20 ms.
+///
+/// 20 ms halves the packet rate and per-packet header overhead of the old
+/// 10 ms frames, and — the reason it matters under loss — lets Opus
+/// in-band FEC (which carries only the *previous* frame) cover the single
+/// packet a typical 20 ms burst loss removes, instead of one of two.
+/// The 10 ms of extra algorithmic delay is smaller than the reorder hold
+/// this release removed from the receive path.
+pub const FRAME_SIZE: usize = 960;
+
+/// One frame of pipeline PCM. Sent by value over channels: no per-frame
+/// heap allocation, no cross-thread free.
+pub(crate) type PcmFrame = [f32; FRAME_SIZE];
+
+/// Incoming packet with the instant it entered the crate — the timing
+/// point the jitter estimator relies on.
+type Incoming = (AudioPacket, Instant);
 
 /// Default Opus bitrate (bits/s)
 const OPUS_BITRATE: i32 = 48_000;
 
 /// Maximum expected peers. Used for channel sizing.
 const DEFAULT_MAX_PEERS: usize = 32;
+
+/// Clonable, thread-safe handle for feeding received packets into the
+/// engine from another thread. Stamps arrival on send.
+#[derive(Clone)]
+pub struct IncomingSender {
+    tx: Sender<Incoming>,
+    stats: Arc<AudioStats>,
+}
+
+impl IncomingSender {
+    /// Non-blocking; returns `false` if the engine's inbound queue is full
+    /// or the engine is gone (dropping is correct real-time behaviour).
+    pub fn send(&self, packet: AudioPacket) -> bool {
+        // Counted at intake: "packets received from the network", which is
+        // also correct while deafened or before an output device exists.
+        self.stats.record_packet_received(packet.opus_data.len());
+        match self.tx.try_send((packet, Instant::now())) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
 
 /// The main voice chat engine.
 ///
@@ -87,18 +127,18 @@ pub struct VoiceChat {
     output: Option<AudioOutput>,
     input_config: Arc<InputConfig>,
     // ── Channels (each side stored separately, owned by who uses it) ─
-    audio_to_encoder_tx: Sender<Vec<f32>>,
+    audio_to_encoder_tx: Sender<PcmFrame>,
     encoder_to_network_rx: Receiver<AudioPacket>,
-    network_to_decoder_tx: Sender<AudioPacket>,
-    decoder_to_audio_tx: Sender<DecodedFrame>,
-    decoder_to_audio_rx: Receiver<DecodedFrame>,
+    network_to_output_tx: Sender<Incoming>,
+    network_to_output_rx: Receiver<Incoming>,
+    /// Mic self-monitor frames, input worker → output worker.
+    loopback_tx: Sender<PcmFrame>,
+    loopback_rx: Receiver<PcmFrame>,
     sound_tx: Sender<sounds::SoundType>,
     sound_rx: Option<Receiver<sounds::SoundType>>,
 
     // ── Thread handles ───────────────────────────────────────────────
     encoder_thread: Option<std::thread::JoinHandle<()>>,
-    decoder_thread: Option<std::thread::JoinHandle<()>>,
-    should_stop: Arc<AtomicBool>,
 
     // ── Shared state ─────────────────────────────────────────────────
     user_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
@@ -118,16 +158,18 @@ impl VoiceChat {
         let max_peers = DEFAULT_MAX_PEERS;
 
         // ── Build channels ──────────────────────────────────────────
-        let (audio_to_encoder_tx, audio_to_encoder_rx) = bounded(4);
+        let (audio_to_encoder_tx, audio_to_encoder_rx) = bounded::<PcmFrame>(4);
         let (encoder_to_network_tx, encoder_to_network_rx) = bounded(8);
-        let (network_to_decoder_tx, network_to_decoder_rx) = bounded(max_peers * 4);
-        let (decoder_to_audio_tx, decoder_to_audio_rx) = bounded(max_peers * 2);
+        // Inbound packets wait here only until the output worker's next
+        // hop (≤ 10 ms): 32 peers × 50 pkt/s × 10 ms ≈ 16 in flight, with
+        // room for scheduler slop.
+        let (network_to_output_tx, network_to_output_rx) = bounded::<Incoming>(max_peers * 8);
+        let (loopback_tx, loopback_rx) = bounded::<PcmFrame>(8);
         let (sound_tx, sound_rx) = bounded::<sounds::SoundType>(4);
 
         // ── Shared atomics (created once, passed to children) ───────
         let output_gain = Arc::new(AtomicU32::new(config.output_gain.to_bits()));
         let deafened = Arc::new(AtomicBool::new(false));
-        let should_stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(AudioStats::new());
         let removed_peers = Arc::new(Mutex::new(HashSet::new()));
 
@@ -135,14 +177,6 @@ impl VoiceChat {
         let encoder_thread =
             encoder::spawn(audio_to_encoder_rx, encoder_to_network_tx, stats.clone());
 
-        // ── Spawn decoder thread ────────────────────────────────────
-        let decoder_thread = decoder::spawn(
-            network_to_decoder_rx,
-            decoder_to_audio_tx.clone(),
-            stats.clone(),
-            should_stop.clone(),
-            removed_peers.clone(),
-        );
         let input_config = Arc::new(InputConfig::new(
             config.noise_suppression,
             config.input_gain,
@@ -157,15 +191,14 @@ impl VoiceChat {
             output: None,
             audio_to_encoder_tx,
             encoder_to_network_rx,
-            network_to_decoder_tx,
-            decoder_to_audio_tx,
-            decoder_to_audio_rx,
+            network_to_output_tx,
+            network_to_output_rx,
+            loopback_tx,
+            loopback_rx,
             sound_tx,
             input_config,
             sound_rx: Some(sound_rx),
             encoder_thread: Some(encoder_thread),
-            decoder_thread: Some(decoder_thread),
-            should_stop,
             user_settings: Arc::new(Mutex::new(HashMap::new())),
             removed_peers,
             stats,
@@ -179,7 +212,7 @@ impl VoiceChat {
 
     /// Start the audio pipeline (capture + playback).
     ///
-    /// Encoder and decoder threads are already running from `new()`.
+    /// The encoder thread is already running from `new()`.
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Output first, and don't let a missing microphone abort playback:
         // a user with no capture device should still hear the room. (Field
@@ -212,11 +245,10 @@ impl VoiceChat {
     }
 
     fn start_input(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let loopback_tx = self.decoder_to_audio_tx.clone();
         let mut input = AudioInput::new(
             self.config.input_device.as_deref(),
             self.audio_to_encoder_tx.clone(),
-            Some(loopback_tx),
+            self.loopback_tx.clone(),
             self.stats.clone(),
             self.input_config.clone(),
         )?;
@@ -235,9 +267,11 @@ impl VoiceChat {
 
         let mut output = AudioOutput::new(
             self.config.output_device.as_deref(),
-            self.decoder_to_audio_rx.clone(),
+            self.network_to_output_rx.clone(),
+            self.loopback_rx.clone(),
             sound_rx,
             self.user_settings.clone(),
+            self.removed_peers.clone(),
             self.stats.clone(),
             self.config.output_gain,
         )?;
@@ -254,8 +288,14 @@ impl VoiceChat {
         let _ = self.sound_tx.try_send(sound);
     }
 
+    /// Feed a packet received from the network. Arrival is stamped here —
+    /// call it as close to the socket read as possible; the jitter
+    /// estimator measures from this instant.
     pub fn receive_packet(&self, packet: AudioPacket) {
-        let _ = self.network_to_decoder_tx.try_send(packet);
+        self.stats.record_packet_received(packet.opus_data.len());
+        let _ = self
+            .network_to_output_tx
+            .try_send((packet, Instant::now()));
     }
 
     pub fn take_outgoing_packets(&self) -> Vec<AudioPacket> {
@@ -270,8 +310,13 @@ impl VoiceChat {
         self.encoder_to_network_rx.clone()
     }
 
-    pub fn incoming_sender(&self) -> Sender<AudioPacket> {
-        self.network_to_decoder_tx.clone()
+    /// Handle for feeding packets from another thread (see
+    /// [`IncomingSender::send`]).
+    pub fn incoming_sender(&self) -> IncomingSender {
+        IncomingSender {
+            tx: self.network_to_output_tx.clone(),
+            stats: self.stats.clone(),
+        }
     }
 
     pub fn set_peer_settings(&self, peer_id: u64, settings: PeerAudioSettings) {
@@ -541,27 +586,17 @@ impl VoiceChat {
 
 impl Drop for VoiceChat {
     fn drop(&mut self) {
-        self.should_stop.store(true, Ordering::Release);
-
-        // Drop audio devices first — stops platform callbacks.
+        // Drop audio devices first — stops platform callbacks and joins the
+        // input/output workers (the output worker owns every decoder).
         self.input.take();
         self.output.take();
 
-        // Drop channel senders to unblock threads blocked on recv().
-        let (dead_tx, _) = crossbeam_channel::bounded::<Vec<f32>>(0);
+        // Drop the encoder's input sender to unblock its recv(); the input
+        // worker's clone is already gone with `input`.
+        let (dead_tx, _) = crossbeam_channel::bounded::<PcmFrame>(0);
         self.audio_to_encoder_tx = dead_tx;
 
-        let (dead_tx, _) = crossbeam_channel::bounded::<AudioPacket>(0);
-        self.network_to_decoder_tx = dead_tx;
-
         if let Some(thread) = self.encoder_thread.take() {
-            let _ = thread.join();
-        }
-
-        // Decoder thread checks `should_stop` every ≤10 ms and only ever
-        // try_sends, so this join cannot hang even if the application still
-        // holds `incoming_sender()` clones.
-        if let Some(thread) = self.decoder_thread.take() {
             let _ = thread.join();
         }
     }
@@ -572,8 +607,8 @@ mod headless_tests {
     use super::*;
     use std::time::Duration as StdDuration;
 
-    /// Prove the receive path works with no audio devices: packets fed via
-    /// the public API must reach the decoder and register in stats.
+    /// Prove the intake path works with no audio devices: packets fed via
+    /// the public API must register in stats without blocking.
     /// Mirrors exactly what client/voice.rs does with incoming packets.
     #[test]
     fn receive_path_processes_packets_headless() {
@@ -601,12 +636,24 @@ mod headless_tests {
             .load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             received >= 15,
-            "decoder only processed {received}/20 packets"
+            "intake only counted {received}/20 packets"
         );
 
         // outgoing_receiver must be a live owned clone usable in select!
         let rx = vc.outgoing_receiver();
         assert!(rx.try_recv().is_err()); // empty, but connected
+    }
+
+    /// The headless path counts packets in the output worker, which only
+    /// exists once `start()` succeeds — so without an output device the
+    /// inbound queue must still accept packets without blocking or panicking.
+    #[test]
+    fn incoming_sender_never_blocks_without_output() {
+        let vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
+        let tx = vc.incoming_sender();
+        for seq in 0..1000u32 {
+            let _ = tx.send(AudioPacket::new(seq, seq * FRAME_SIZE as u32, 1, vec![0xFC]));
+        }
     }
 }
 

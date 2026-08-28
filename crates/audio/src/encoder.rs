@@ -1,7 +1,14 @@
 //! Opus encoder thread.
 //!
-//! Receives raw 480-sample f32 frames from the input pipeline,
+//! Receives 20 ms (960-sample) f32 frames from the input pipeline,
 //! encodes them to Opus, and sends `AudioPacket`s toward the network.
+//!
+//! ## Frame size
+//!
+//! 20 ms, not 10: half the packet rate and header overhead, and — the
+//! part that matters under loss — the LBRR copy Opus puts in packet N+1
+//! then covers *all* of packet N, so a typical single-packet burst loss
+//! is fully recoverable by in-band FEC. At 10 ms it covered half.
 //!
 //! ## Silence handling (DTX)
 //!
@@ -19,20 +26,21 @@
 //! loss the transport reports via `AudioStats::uplink_loss_pct`.
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
-use log::{error, info};
+use log::{error, info, warn};
 use opus::{Application, Bitrate, Channels, Encoder};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{
-    stats::AudioStats, transport::packet::AudioPacket, FRAME_SIZE, OPUS_BITRATE, OPUS_SAMPLE_RATE,
+    stats::AudioStats, transport::packet::AudioPacket, PcmFrame, FRAME_SIZE, OPUS_BITRATE,
+    OPUS_SAMPLE_RATE,
 };
 
 /// Encoder thread state. Created once, runs until the input channel closes.
 struct EncoderWorker {
     encoder: Encoder,
-    rx: Receiver<Vec<f32>>,
+    rx: Receiver<PcmFrame>,
     tx: Sender<AudioPacket>,
     stats: Arc<AudioStats>,
 
@@ -53,22 +61,38 @@ struct EncoderWorker {
 
 impl EncoderWorker {
     fn new(
-        rx: Receiver<Vec<f32>>,
+        rx: Receiver<PcmFrame>,
         tx: Sender<AudioPacket>,
         stats: Arc<AudioStats>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut encoder = Encoder::new(OPUS_SAMPLE_RATE, Channels::Mono, Application::Voip)?;
 
         // ── Voice chat tuning ───────────────────────────────────────
-        let _ = encoder.set_bitrate(Bitrate::Bits(OPUS_BITRATE));
-        let _ = encoder.set_vbr(true);
-        // Complexity 10: encoder runs on one thread (local user only),
-        // so we can afford the CPU for better sibilant quality.
-        let _ = encoder.set_complexity(10);
-        let _ = encoder.set_bandwidth(opus::Bandwidth::Superwideband);
-        let _ = encoder.set_inband_fec(true);
-        let _ = encoder.set_packet_loss_perc(FEC_LOSS_FLOOR_PCT);
-        let _ = encoder.set_dtx(true);
+        // Every ctl is checked: a silently ignored setting (FEC off,
+        // wrong bandwidth) is exactly the kind of thing that costs a
+        // week in the field.
+        let ctl = |name: &str, r: opus::Result<()>| {
+            if let Err(e) = r {
+                warn!("Opus encoder: {name} failed: {e}");
+            }
+        };
+        ctl("set_bitrate", encoder.set_bitrate(Bitrate::Bits(OPUS_BITRATE)));
+        ctl("set_vbr", encoder.set_vbr(true));
+        // Complexity 6: for speech at 48 kbps the levels above this mostly
+        // buy CELT/music analysis, for roughly a third of the encode CPU —
+        // which matters on the low-end hardware this targets.
+        // `last_encode_us` is the A/B knob if anyone wants to argue.
+        ctl("set_complexity", encoder.set_complexity(6));
+        ctl(
+            "set_bandwidth",
+            encoder.set_bandwidth(opus::Bandwidth::Superwideband),
+        );
+        ctl("set_inband_fec", encoder.set_inband_fec(true));
+        ctl(
+            "set_packet_loss_perc",
+            encoder.set_packet_loss_perc(FEC_LOSS_FLOOR_PCT),
+        );
+        ctl("set_dtx", encoder.set_dtx(true));
         stats
             .fec_loss_hint_pct
             .store(FEC_LOSS_FLOOR_PCT.unsigned_abs(), Ordering::Relaxed);
@@ -80,7 +104,9 @@ impl EncoderWorker {
             stats,
             seq: 0,
             ts_48k: 0,
-            scratch: vec![0u8; 256],
+            // 48 kbps × 20 ms ≈ 120 bytes; LBRR + VBR peaks stay well
+            // under 512.
+            scratch: vec![0u8; 512],
             packets_since_fec_update: 0,
             prev_received: 0,
             prev_lost: 0,
@@ -92,14 +118,6 @@ impl EncoderWorker {
         info!("Encoder thread started");
 
         while let Ok(samples) = self.rx.recv() {
-            if samples.len() != FRAME_SIZE {
-                error!(
-                    "Encoder: expected {FRAME_SIZE} samples, got {}",
-                    samples.len()
-                );
-                continue;
-            }
-
             self.encode_frame(&samples);
             self.maybe_update_fec();
         }
@@ -116,7 +134,10 @@ impl EncoderWorker {
                     .last_encode_us
                     .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-                // DTX: Opus produces ≤2-byte packets during silence.
+                // DTX: Opus produces ≤2-byte "do not transmit" packets
+                // during silence. libopus still encodes a full comfort-
+                // noise refresh frame every 400 ms (MAX_CONSECUTIVE_DTX),
+                // which is > 2 bytes and goes out normally.
                 let dtx = size <= 2;
                 self.stats.dtx_active.store(dtx, Ordering::Relaxed);
 
@@ -154,7 +175,7 @@ impl EncoderWorker {
         }
     }
 
-    /// Adjust the Opus FEC packet-loss hint every ~200 frames (~2 seconds).
+    /// Adjust the Opus FEC packet-loss hint every ~100 frames (~2 seconds).
     ///
     /// Two signals feed it, and the *larger* wins:
     ///
@@ -225,9 +246,9 @@ impl EncoderWorker {
     }
 }
 
-/// Frames between FEC hint re-evaluations (~2 s at 10 ms frames; DTX
+/// Frames between FEC hint re-evaluations (~2 s at 20 ms frames; DTX
 /// frames count too, so this is wall-clock, not speech time).
-const FEC_UPDATE_INTERVAL_FRAMES: u32 = 200;
+const FEC_UPDATE_INTERVAL_FRAMES: u32 = 100;
 
 /// Below this many packets in a window the downlink loss ratio is noise.
 const FEC_MIN_WINDOW_PACKETS: u64 = 50;
@@ -249,7 +270,7 @@ const FEC_LOSS_CEIL_PCT: i32 = 20;
 ///
 /// The thread runs until the `rx` channel is closed (all senders dropped).
 pub fn spawn(
-    rx: Receiver<Vec<f32>>,
+    rx: Receiver<PcmFrame>,
     tx: Sender<AudioPacket>,
     stats: Arc<AudioStats>,
 ) -> std::thread::JoinHandle<()> {

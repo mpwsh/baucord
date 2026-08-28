@@ -7,7 +7,7 @@
 //! ## Pipeline position
 //!
 //! ```text
-//! capture → resample → denoise → gate → **compressor** → AGC → gain → clamp → VAD → encode
+//! capture → resample → denoise → gate → AGC → **compressor** → gain → clamp → speaking → encode
 //! ```
 //!
 //! ## Context interaction
@@ -20,9 +20,14 @@
 //!
 //! Based on the Giannoulis/Massberg/Reiss paper on digital dynamic range
 //! compressor design (JAES 2012). Peak envelope detector with asymmetric
-//! attack/release, soft knee, gate-aware hold, per-sample gain interpolation.
+//! attack/release, soft knee, gate-aware hold, per-frame gain ramp.
 //!
-//! See [`Compressor::with_params`] for tuning documentation.
+//! The envelope is tracked per sample (two multiplies), but the gain
+//! computer runs once per frame on the frame's peak envelope: gain
+//! reduction is monotonic in envelope level, so the minimum gain over the
+//! frame is exactly the gain at the maximum envelope. The old version ran
+//! `log10` + `powf` on every sample (~96k transcendental calls per second)
+//! only to take that same minimum.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -80,10 +85,8 @@ impl Compressor {
             return 1.0;
         }
 
-        // Gate closed → hold current gain, don't adapt to silence — but
-        // still APPLY the held gain. The gate's Closing fade is not "open",
-        // and skipping the multiply here made the fade tail jump up by the
-        // full compression amount (an audible level step on every release).
+        // Gate closed / holding: freeze the gain (don't adapt to the noise
+        // floor) but keep applying it so there is no level step.
         if !gate_open {
             let g = self.current_gain;
             if (g - 1.0).abs() > f32::EPSILON {
@@ -100,47 +103,41 @@ impl Compressor {
         let makeup_db = f32::from_bits(self.knobs.makeup_db.load(Ordering::Relaxed));
         let makeup_linear = db_to_linear(makeup_db);
 
-        // Compute per-sample gain using envelope follower, find minimum
-        // gain across the frame. Apply uniformly with interpolation to
-        // avoid modulating waveform shape (which causes LF distortion).
-        let mut min_gain = 1.0_f32;
-
+        // ── Envelope detector (per sample), peak over the frame ─────
+        let mut peak_env = 0.0f32;
         for &s in samples.iter() {
             let abs = s.abs();
-
             let coeff = if abs > self.envelope {
                 self.attack_coeff
             } else {
                 self.release_coeff
             };
             self.envelope = coeff * self.envelope + (1.0 - coeff) * abs;
-
-            if self.envelope < 1e-6 {
-                continue;
-            }
-
-            let env_db = linear_to_db(self.envelope);
-            let gain_reduction_db = compute_gain_reduction(env_db, threshold_db, ratio, knee_db);
-
-            if gain_reduction_db < -0.01 {
-                let desired_gain = db_to_linear(gain_reduction_db);
-                min_gain = min_gain.min(desired_gain);
-            }
+            peak_env = peak_env.max(self.envelope);
         }
 
-        let frame_target_gain = min_gain * makeup_linear;
+        // ── Gain computer (once per frame) ──────────────────────────
+        let min_gain = if peak_env < 1e-6 {
+            1.0
+        } else {
+            let gain_reduction_db =
+                compute_gain_reduction(linear_to_db(peak_env), threshold_db, ratio, knee_db);
+            if gain_reduction_db < -0.01 {
+                db_to_linear(gain_reduction_db)
+            } else {
+                1.0
+            }
+        };
 
-        // Per-sample linear interpolation to avoid zipper noise.
+        // ── Apply: linear ramp from last frame's gain to this one ───
+        let frame_target_gain = min_gain * makeup_linear;
         let gain_start = self.current_gain;
         let gain_delta = frame_target_gain - gain_start;
         let inv_len = 1.0 / samples.len() as f32;
-
         for (i, s) in samples.iter_mut().enumerate() {
             let t = i as f32 * inv_len;
-            let gain = gain_start + gain_delta * t;
-            *s *= gain;
+            *s *= gain_start + gain_delta * t;
         }
-
         self.current_gain = frame_target_gain;
         frame_target_gain
     }

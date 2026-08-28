@@ -4,24 +4,33 @@
 //! Tracks everything a TeamSpeak-style client needs for its debug overlay:
 //! packet rates, codec stats, bandwidth, latency budgets, and buffer health.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Shared, lock-free audio statistics.
 pub struct AudioStats {
     // ── Packet stats ────────────────────────────────────────────────────
     pub packets_sent: AtomicU64,
+    /// Packets handed to the engine by the application (counted at intake).
     pub packets_received: AtomicU64,
+    /// Playout slots that never got their packet: concealed (FEC/PLC) or
+    /// skipped by a playhead jump after a long outage.
     pub packets_lost: AtomicU64,
     /// Packets that arrived after their slot was already played/concealed.
     pub packets_late: AtomicU64,
-    /// Outgoing packets dropped because the app wasn't draining them.
+    /// Frames dropped on the way out: capture → encoder, or encoder →
+    /// network, because the consumer wasn't draining.
     pub outgoing_dropped: AtomicU64,
 
     // ── Codec stats ─────────────────────────────────────────────────────
     pub encode_errors: AtomicU64,
+    /// Kept for the debug overlay; a corrupt packet is now concealed
+    /// rather than reported, so this stays at 0.
     pub decode_errors: AtomicU64,
+    /// Slots recovered from in-band FEC that was actually present in the
+    /// following packet. (Earlier releases counted every *attempt*.)
     pub fec_recoveries: AtomicU64,
+    /// Slots filled by Opus PLC, including dry-buffer extrapolation.
     pub plc_frames: AtomicU64,
 
     // ── Uplink loss feedback (written by the app, read by the encoder) ──
@@ -38,11 +47,6 @@ pub struct AudioStats {
     // ── Buffer health ───────────────────────────────────────────────────
     pub input_overruns: AtomicU64,
     pub output_underruns: AtomicU64,
-    /// Measured capture-device clock skew vs nominal, signed ppm.
-    /// 0 until the estimator's warmup (~30 s of capture) completes.
-    /// A sustained large value here is the "why does everyone hear me
-    /// breaking up" diagnostic — see [`crate::clock`].
-    pub capture_clock_skew_ppm: AtomicI64,
 
     // ── Jitter buffer ───────────────────────────────────────────────────
     pub jitter_buffer_occupancy_ms: AtomicUsize,
@@ -62,22 +66,27 @@ pub struct AudioStats {
     // ── Codec timing (microseconds) ─────────────────────────────────────
     /// Last encode duration in microseconds.
     pub last_encode_us: AtomicU64,
-    /// Last decode duration in microseconds.
+    /// Wall time of the output worker's last refill pass — decoding every
+    /// peer's due slot, mixing and limiting — in microseconds. This is the
+    /// number to watch when many people talk at once.
     pub last_decode_us: AtomicU64,
 
     // ── Levels ──────────────────────────────────────────────────────────
     /// Output (playback) RMS level, stored as f32 bits (0.0–1.0).
     pub output_level: AtomicU32,
     /// Post-denoise input level, stored as f32 bits (0.0–1.0).
-    /// This is the signal level after noise suppression but before AGC/gain —
-    /// use this for the VAD threshold visualization, not the raw capture level.
+    /// This is the signal level after noise suppression but before the
+    /// gate — use this for the gate threshold visualization, not the raw
+    /// capture level.
     pub denoised_level: AtomicU32,
     /// Post-pipeline input level, stored as f32 bits (0.0–1.0).
-    /// This is what the VAD and encoder actually see — after denoise, AGC,
-    /// gain, and clamp. Useful for debugging "why isn't VAD triggering" issues.
+    /// This is what the encoder actually sees — after denoise, gate, AGC,
+    /// compressor, gain, and clamp.
     pub pipeline_level: AtomicU32,
 
     // ── Pipeline state ──────────────────────────────────────────────────
+    /// Speaking indicator: RNNoise speech probability + open gate, with
+    /// hold (see `processor::speaking`).
     pub vad_active: AtomicBool,
     pub denoise_active: AtomicBool,
     pub dtx_active: AtomicBool,
@@ -108,7 +117,6 @@ impl AudioStats {
             fec_loss_hint_pct: AtomicU32::new(0),
             input_overruns: AtomicU64::new(0),
             output_underruns: AtomicU64::new(0),
-            capture_clock_skew_ppm: AtomicI64::new(0),
             jitter_buffer_occupancy_ms: AtomicUsize::new(0),
             jitter_buffer_target_ms: AtomicUsize::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -153,19 +161,21 @@ impl AudioStats {
             .fetch_add(opus_bytes as u64, Ordering::Relaxed);
     }
 
-    /// Estimated send bandwidth in kbps.
-    ///
-    /// Based on average packet size + 12 bytes UDP/RTP-like header overhead,
-    /// at 100 packets/sec (10ms frames).
+    /// Estimated send bandwidth in kbps, from what was actually sent:
+    /// Opus bytes plus per-packet overhead (16-byte `PacketHeader` +
+    /// 28 bytes IPv4/UDP) over the session. DTX pauses therefore lower it,
+    /// as they do on the wire — the old estimate assumed 100 packets/s of
+    /// average size regardless.
     pub fn estimated_send_kbps(&self) -> f32 {
-        let avg = f32::from_bits(self.avg_packet_size.load(Ordering::Relaxed));
-        if avg < 0.01 {
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        if elapsed < 0.5 {
             return 0.0;
         }
-        // (payload + header_overhead) * packets_per_sec * 8 bits / 1000
-        let packets_per_sec = 100.0; // 10ms frames
-        let header_overhead = 12.0; // minimal RTP-like header
-        (avg + header_overhead) * packets_per_sec * 8.0 / 1000.0
+        const OVERHEAD_BYTES: f32 = 16.0 + 28.0;
+        #[allow(clippy::cast_precision_loss)]
+        let bytes = self.bytes_sent.load(Ordering::Relaxed) as f32
+            + self.packets_sent.load(Ordering::Relaxed) as f32 * OVERHEAD_BYTES;
+        bytes * 8.0 / elapsed / 1000.0
     }
 
     /// Estimated receive bandwidth in kbps (based on actual received data rate).

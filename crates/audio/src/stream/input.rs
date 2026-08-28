@@ -57,7 +57,7 @@
 //!
 //! System audio uses a separate Opus encoder from voice chat, with
 //! different settings optimized for music/game audio:
-//! - 128 kbps stereo (vs 24 kbps mono for voice)
+//! - 128 kbps stereo (vs 48 kbps mono for voice)
 //! - `Application::Audio` (vs `Application::Voip`)
 //! - No DTX — the worker-level silence gate replaces it, stopping
 //!   packets entirely during silence (seq only advances on sent
@@ -647,7 +647,6 @@ impl SystemAudioCapture {
         let should_stop = self.should_stop.clone();
         let is_muted = self.is_muted.clone();
         let volume = self.volume.clone();
-        let stats = self.stats.clone();
 
         self.should_stop.store(false, Ordering::Relaxed);
 
@@ -657,7 +656,6 @@ impl SystemAudioCapture {
             should_stop,
             is_muted,
             volume,
-            stats,
             device_sample_rate,
             wake_rx,
         );
@@ -840,7 +838,6 @@ impl SystemAudioCapture {
         should_stop: Arc<AtomicBool>,
         is_muted: Arc<AtomicBool>,
         volume: Arc<AtomicU32>,
-        stats: Arc<AudioStats>,
         device_sample_rate: u32,
         wake_rx: Receiver<()>,
     ) -> thread::JoinHandle<()> {
@@ -849,14 +846,13 @@ impl SystemAudioCapture {
             // The capture side lives in platform backends; the worker's
             // timed waits benefit from the process-wide 1 ms timer held
             // by VoiceChat's TimerResolutionGuard.
-            let _mmcss = crate::platform::promote_current_thread();
+            let _rt = crate::platform::promote_current_thread(960, crate::OPUS_SAMPLE_RATE);
             Self::worker_loop(
                 ring_consumer,
                 packet_tx,
                 should_stop,
                 is_muted,
                 volume,
-                stats,
                 device_sample_rate,
                 wake_rx,
             );
@@ -870,7 +866,6 @@ impl SystemAudioCapture {
         should_stop: Arc<AtomicBool>,
         is_muted: Arc<AtomicBool>,
         volume: Arc<AtomicU32>,
-        _stats: Arc<AudioStats>,
         device_sample_rate: u32,
         wake_rx: Receiver<()>,
     ) {
@@ -892,7 +887,7 @@ impl SystemAudioCapture {
         }
 
         // Disable DTX — system audio should transmit continuously while
-        // screen sharing is active (unlike voice which uses VAD).
+        // screen sharing is active (unlike voice, which is gated and DTX-encoded).
         if let Err(e) = encoder.set_dtx(false) {
             warn!("Failed to disable DTX for system audio: {e}");
         }
@@ -950,6 +945,8 @@ impl SystemAudioCapture {
         let mut accumulator: Vec<f32> =
             Vec::with_capacity(SYSTEM_AUDIO_FRAME_SIZE * SYSTEM_AUDIO_CHANNELS * 4);
         let mut encode_buf = vec![0u8; 4096]; // Opus output buffer
+        // One interleaved stereo frame, reused for every encode.
+        let mut frame = vec![0.0f32; SYSTEM_AUDIO_FRAME_SIZE * SYSTEM_AUDIO_CHANNELS];
         let mut seq: u32 = 0;
         // Silence-gate state: frames since the last audible one. Starts
         // at 0 so a share always primes the receiver with a few frames
@@ -967,7 +964,10 @@ impl SystemAudioCapture {
         while !should_stop.load(Ordering::Relaxed) {
             // ── Mute: drain ring buffer but don't encode ────────────────
             if is_muted.load(Ordering::Relaxed) {
-                while ring_consumer.pop().is_ok() {}
+                let stale = ring_consumer.slots();
+                if let Ok(chunk) = ring_consumer.read_chunk(stale) {
+                    chunk.commit_all();
+                }
                 // Block until more data lands (or the cap elapses for a
                 // stop check) — replaces a 10 ms polling sleep.
                 crate::platform::wait_for_wake(&wake_rx, WORKER_WAIT_CAP);
@@ -991,17 +991,10 @@ impl SystemAudioCapture {
             // permanently swapped L/R for everything that followed.
             let available_even = ring_consumer.slots() & !1_usize;
             let to_read = target_interleaved.min(read_buf.len()).min(available_even) & !1_usize;
-
-            let mut n_read = 0;
-            for i in 0..to_read {
-                match ring_consumer.pop() {
-                    Ok(s) => {
-                        read_buf[i] = s;
-                        n_read += 1;
-                    }
-                    Err(_) => break, // unreachable: readable count only grows
-                }
-            }
+            // One chunked read (to_read ≤ readable, so nothing is left
+            // unfilled) instead of a pop per sample.
+            let (popped, _) = ring_consumer.pop_partial_slice(&mut read_buf[..to_read]);
+            let n_read = popped.len() & !1_usize;
 
             if n_read == 0 {
                 // Empty ring: block until the capture backend pings the
@@ -1013,7 +1006,10 @@ impl SystemAudioCapture {
             }
 
             // ── Resample to 48 kHz stereo if needed ─────────────────────
-            let at_48k_interleaved: Vec<f32> = if let Some(ref mut r) = resampler {
+            // Output lands straight in `accumulator` (interleaved, 48 kHz);
+            // no intermediate Vec per pass.
+            let before = accumulator.len();
+            if let Some(ref mut r) = resampler {
                 // Deinterleave into per-channel accumulators
                 for pair in read_buf[..n_read].chunks_exact(2) {
                     resampler_accum_l.push(pair[0]);
@@ -1054,35 +1050,29 @@ impl SystemAudioCapture {
                     };
 
                 match r.process_into_buffer(&in_adapter, &mut out_adapter, None) {
-                    Ok((_in_len, out_len)) if out_len > 0 => {
+                    Ok((_in_len, out_len)) => {
                         // Re-interleave: L0 R0 L1 R1 ...
-                        let mut interleaved = Vec::with_capacity(out_len * 2);
                         for i in 0..out_len {
-                            interleaved.push(resampler_output[0][i]);
-                            interleaved.push(resampler_output[1][i]);
+                            accumulator.push(resampler_output[0][i]);
+                            accumulator.push(resampler_output[1][i]);
                         }
-                        interleaved
                     }
-                    Ok(_) => Vec::new(),
                     Err(e) => {
                         error!("System audio resampler error: {e}");
-                        Vec::new()
                     }
                 }
             } else {
-                read_buf[..n_read].to_vec()
-            };
+                accumulator.extend_from_slice(&read_buf[..n_read]);
+            }
 
-            if at_48k_interleaved.is_empty() {
+            if accumulator.len() == before {
                 continue;
             }
 
-            // ── Accumulate into frame-sized chunks ──────────────────────
-            // interleaved_frame_size = 960 * 2 = 1920 interleaved samples
-            accumulator.extend_from_slice(&at_48k_interleaved);
-
+            // ── Frame-sized chunks (interleaved_frame_size = 960 × 2) ──
             while accumulator.len() >= interleaved_frame_size {
-                let mut frame: Vec<f32> = accumulator.drain(..interleaved_frame_size).collect();
+                frame.copy_from_slice(&accumulator[..interleaved_frame_size]);
+                accumulator.drain(..interleaved_frame_size);
 
                 // ── Apply volume & measure peak ─────────────────────────
                 let vol = f32::from_bits(volume.load(Ordering::Relaxed));

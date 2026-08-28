@@ -19,14 +19,14 @@
 //! - **Writes**: nothing
 //!
 //! The limiter is self-contained: it tracks its own envelope and gain.
-//! It's used per-peer in the jitter buffer, not in the main chain.
-
-use super::{AudioProcessor, FrameContext};
+//! It is used per-peer in the jitter buffer and once more on the master
+//! bus after output gain — both on the output worker, neither in a
+//! `ProcessorChain`, so it does not implement `AudioProcessor`.
 
 /// Per-peer output limiter.
 ///
-/// Instantiate one per peer. Call [`process`](AudioProcessor::process)
-/// on each peer's samples before mixing.
+/// Instantiate one per peer. Call [`Limiter::process_samples`] on each
+/// peer's samples before mixing.
 pub struct Limiter {
     threshold: f32,
     gain: f32,
@@ -46,7 +46,7 @@ impl Default for Limiter {
 impl Limiter {
     /// Create a new limiter with default voice-chat tuning.
     ///
-    /// Suitable for 48 kHz, 480-sample (10 ms) frames.
+    /// Per-sample coefficients for 48 kHz; any block length works.
     /// Threshold 0.4 (~-8 dBFS) — normal speech sits around 0.05–0.15.
     pub fn new() -> Self {
         // Coefficients for 48 kHz:
@@ -65,30 +65,9 @@ impl Limiter {
         }
     }
 
-    /// Create a limiter with a custom threshold.
-    ///
-    /// - `threshold`: RMS level (0.05–0.9) above which limiting starts.
-    pub fn with_threshold(threshold: f32) -> Self {
-        let mut limiter = Self::new();
-        limiter.threshold = threshold.clamp(0.05, 0.9);
-        limiter
-    }
-
-    /// Process samples in-place (standalone, without `FrameContext`).
-    ///
-    /// Convenience method for per-peer usage in the jitter buffer
-    /// where a full `FrameContext` isn't available.
+    /// Limit samples in place. Output is bounded to ±0.99, so nothing
+    /// downstream needs to clamp again.
     pub fn process_samples(&mut self, samples: &mut [f32]) {
-        self.apply(samples);
-    }
-
-    /// Current gain being applied (for diagnostics). 1.0 = no reduction.
-    pub fn current_gain(&self) -> f32 {
-        self.gain
-    }
-
-    /// Core limiting algorithm, shared by trait impl and direct callers.
-    fn apply(&mut self, samples: &mut [f32]) {
         for s in samples.iter_mut() {
             // Asymmetric envelope: fast rise, slower fall
             let abs = s.abs();
@@ -117,20 +96,5 @@ impl Limiter {
 
             *s = (*s * self.gain).clamp(-0.99, 0.99);
         }
-    }
-}
-
-impl AudioProcessor for Limiter {
-    fn name(&self) -> &str {
-        "limiter"
-    }
-
-    fn process(&mut self, samples: &mut [f32], _ctx: &mut FrameContext) {
-        self.apply(samples);
-    }
-
-    fn reset(&mut self) {
-        self.gain = 1.0;
-        self.envelope = 0.0;
     }
 }

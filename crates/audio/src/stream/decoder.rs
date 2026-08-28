@@ -103,7 +103,7 @@ impl StreamDecoderWorker {
                     {
                         Ok(n) => {
                             let total = n * STREAM_CHANNELS;
-                            let _ = self.tx.send(StreamAudioFrame {
+                            let _ = self.tx.try_send(StreamAudioFrame {
                                 samples: self.frame_buffer[..total].to_vec(),
                                 seq: 0,
                             });
@@ -130,7 +130,7 @@ impl StreamDecoderWorker {
             Ok(samples_per_channel) => {
                 let total = samples_per_channel * STREAM_CHANNELS;
 
-                let _ = self.tx.send(StreamAudioFrame {
+                let _ = self.tx.try_send(StreamAudioFrame {
                     samples: self.frame_buffer[..total].to_vec(),
                     seq: curr,
                 });
@@ -145,7 +145,7 @@ impl StreamDecoderWorker {
                     .decode_float(&[], &mut self.frame_buffer, false)
                 {
                     let total = n * STREAM_CHANNELS;
-                    let _ = self.tx.send(StreamAudioFrame {
+                    let _ = self.tx.try_send(StreamAudioFrame {
                         samples: self.frame_buffer[..total].to_vec(),
                         seq: curr,
                     });

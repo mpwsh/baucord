@@ -3,7 +3,7 @@
 //! ## Pipeline position
 //!
 //! ```text
-//! capture → resample → denoise → gate → compressor → AGC → gain → **clamp** → VAD → encode
+//! capture → resample → denoise → gate → AGC → compressor → gain → **clamp** → speaking → encode
 //! ```
 //!
 //! ## Context interaction

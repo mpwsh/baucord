@@ -19,9 +19,7 @@
 //! sharer's capture excludes the app's own playback (process loopback
 //! on Windows — see `stream::process_loopback`). Playback here applies
 //! only the user's volume; it never rides the stream level up and down
-//! with speech. `processor::voice_cancel` still exists as an unwired
-//! candidate for mic-path echo suppression, but it has no business in
-//! this pipeline.
+//! with speech.
 //!
 //! ## Pipeline
 //!
@@ -110,9 +108,10 @@ impl StreamAudioOutput {
                 .ok_or("No default output device available")?
         };
 
-        let device_config = device
-            .default_output_config()
-            .map_err(|e| format!("Failed to get default output config: {e}"))?;
+        // 48 kHz when the device can do it, so the stereo sinc resampler
+        // below is the exception path (see crate::device).
+        let device_config = crate::device::preferred_output_config(&device)
+            .map_err(|e| format!("Failed to get output config: {e}"))?;
 
         let sample_rate = device_config.sample_rate();
         let channels = device_config.channels();
@@ -326,7 +325,7 @@ impl StreamAudioOutput {
     ) -> thread::JoinHandle<()> {
         crate::platform::spawn_named("stream-audio-out", move || {
             // Audio-class scheduling (MMCSS "Pro Audio" on Windows).
-            let _mmcss = crate::platform::promote_current_thread();
+            let _rt = crate::platform::promote_current_thread(960, crate::OPUS_SAMPLE_RATE);
 
             // ── Resampler (stereo, 48kHz → device rate) ─────────────────
             let needs_resample = device_sample_rate != OPUS_SAMPLE_RATE;

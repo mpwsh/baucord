@@ -8,10 +8,11 @@
 //! ## Design principles
 //!
 //! - **Zero-alloc hot path**: processors work on borrowed `&mut [f32]`
-//!   slices — no boxing or allocation per frame.
+//!   slices and fixed-size scratch — no allocation per frame.
 //! - **Frame metadata via context**: processors communicate state
-//!   (e.g., "gate is open", "VAD says speech") through [`FrameContext`],
-//!   not return values, so information flows downstream naturally.
+//!   (e.g., "gate is open", "RNNoise thinks this is speech") through
+//!   [`FrameContext`], not return values, so information flows downstream
+//!   naturally.
 //! - **Bypass via context**: processors that can be toggled at runtime
 //!   check a field in [`FrameContext`] and early-return when disabled.
 //!   The chain always has the same shape — good for debugging.
@@ -19,25 +20,10 @@
 //!   coefficients, buffers) and must be `Send` for the worker thread.
 //!   They don't need `Sync` — only the worker calls `process`.
 //!
-//! ## Usage
+//! ## Frame length
 //!
-//! ```rust,ignore
-//! use audio::processor::{AudioProcessor, ProcessorChain, FrameContext};
-//! use audio::processor::gate::NoiseGate;
-//! use audio::processor::agc::AutoGainControl;
-//!
-//! let mut chain = ProcessorChain::new("voice_input");
-//! chain.add(Box::new(NoiseGate::new(0.02, 50)));
-//! chain.add(Box::new(AutoGainControl::new(0.10, 30.0)));
-//!
-//! // In the audio worker loop:
-//! let mut ctx = FrameContext::default();
-//! chain.process(&mut frame, &mut ctx);
-//!
-//! if ctx.gate_open {
-//!     // send to encoder
-//! }
-//! ```
+//! One frame is [`crate::FRAME_SIZE`] samples (20 ms at 48 kHz). Stages
+//! with per-frame smoothing coefficients are tuned for that cadence.
 
 pub mod agc;
 pub mod clamp;
@@ -47,8 +33,7 @@ pub mod gain;
 pub mod gate;
 pub mod level_meter;
 pub mod limiter;
-pub mod vad;
-pub mod voice_cancel;
+pub mod speaking;
 
 // ── Shared utilities ────────────────────────────────────────────────────
 
@@ -80,12 +65,6 @@ pub fn compute_rms(samples: &[f32]) -> f32 {
 #[derive(Debug, Clone)]
 pub struct FrameContext {
     // ── Pipeline config (set by worker before chain runs) ───────────
-    /// Sample rate of the audio (always 48 000 in our pipeline).
-    pub sample_rate: u32,
-
-    /// Number of channels (1 for voice, 2 for screen share).
-    pub channels: u16,
-
     /// Whether noise suppression is enabled this frame.
     pub denoise_enabled: bool,
 
@@ -100,31 +79,23 @@ pub struct FrameContext {
 
     // ── Inter-processor state (written/read during chain) ───────────
     /// Whether the noise gate is currently open (signal passing).
-    /// Written by: `NoiseGate`. Read by: `Compressor`, `AGC`.
+    /// Written by: `NoiseGate`. Read by: `AGC`, `Compressor`, `SpeakingIndicator`.
     pub gate_open: bool,
 
     /// Whether the gate is in its post-speech hold window (open, but
     /// the envelope has fallen below the close threshold). During the
     /// hold only the residual noise floor is passing, so gain stages
     /// must not adapt to it — adapting boosts the noise tail.
-    /// Written by: `NoiseGate`. Read by: `Compressor`, `AGC`.
+    /// Written by: `NoiseGate`. Read by: `AGC`, `Compressor`.
     pub gate_holding: bool,
 
-    /// RNNoise VAD probability (0.0–1.0).
-    /// Written by: `Denoiser`. Read by: `VADStage` pre-filter.
+    /// RNNoise VAD probability (0.0–1.0; 1.0 when denoise is bypassed).
+    /// Written by: `Denoiser`. Read by: `SpeakingIndicator`.
     pub rnnoise_vad_prob: f32,
 
-    /// Whether the frame contains speech (final determination).
-    /// Written by: `VADStage`. Read by: pipeline output logic.
+    /// Whether the frame counts as speech (with hold).
+    /// Written by: `SpeakingIndicator`. Read by: the worker (stats).
     pub is_speech: bool,
-
-    /// Whether a fade-out is active (send one extra frame ramped to zero).
-    /// Written by: `VADStage`. Read by: pipeline output logic.
-    pub fade_out_active: bool,
-
-    /// Current AGC gain in linear scale (for stats/debug).
-    /// Written by: `AGC`.
-    pub agc_gain: f32,
 
     // ── Metering (written by LevelMeter instances) ──────────────────
     /// Post-denoise RMS level (0.0–1.0, scaled for UI).
@@ -134,17 +105,11 @@ pub struct FrameContext {
     /// Post-pipeline RMS level (0.0–1.0, scaled for UI).
     /// What the encoder actually sees.
     pub pipeline_level: f32,
-    /// Voice output RMS energy (0.0–1.0).
-    /// Set by: stream output worker (from voice output stats atomic).
-    /// Read by: `VoiceCanceller` (currently unwired — see its docs).
-    pub voice_energy: f32,
 }
 
 impl Default for FrameContext {
     fn default() -> Self {
         Self {
-            sample_rate: 48_000,
-            channels: 1,
             denoise_enabled: true,
             compressor_enabled: true,
             agc_enabled: true,
@@ -153,11 +118,8 @@ impl Default for FrameContext {
             gate_holding: false,
             rnnoise_vad_prob: 1.0,
             is_speech: false,
-            fade_out_active: false,
-            agc_gain: 1.0,
             denoised_level: 0.0,
             pipeline_level: 0.0,
-            voice_energy: 0.0,
         }
     }
 }
@@ -196,10 +158,7 @@ pub trait AudioProcessor: Send {
 
 // ── Processor chain ─────────────────────────────────────────────────────
 
-/// An ordered chain of audio processors.
-///
-/// Processors are applied in insertion order. The chain itself implements
-/// `AudioProcessor`, so chains can be nested (rarely needed but free).
+/// An ordered chain of audio processors, applied in insertion order.
 pub struct ProcessorChain {
     name: String,
     processors: Vec<Box<dyn AudioProcessor>>,
@@ -221,16 +180,6 @@ impl ProcessorChain {
         self
     }
 
-    /// Number of processors in the chain.
-    pub fn len(&self) -> usize {
-        self.processors.len()
-    }
-
-    /// Whether the chain has no processors.
-    pub fn is_empty(&self) -> bool {
-        self.processors.is_empty()
-    }
-
     /// Process a frame through all processors in order.
     pub fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         for processor in &mut self.processors {
@@ -243,19 +192,5 @@ impl ProcessorChain {
         for processor in &mut self.processors {
             processor.reset();
         }
-    }
-}
-
-impl AudioProcessor for ProcessorChain {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
-        ProcessorChain::process(self, samples, ctx);
-    }
-
-    fn reset(&mut self) {
-        ProcessorChain::reset(self);
     }
 }
