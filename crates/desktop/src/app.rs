@@ -178,7 +178,7 @@ fn spawn_workers(
     Arc<crate::present::PresentShared>,
     crossbeam_channel::Receiver<ScreenEvent>,
 ) {
-    let wake_fn: client::voice::WakeFn = Arc::new(wake);
+    let wake_fn: client::WakeFn = Arc::new(wake);
     let (network_tx, network_control_rx) = crossbeam_channel::bounded::<NetworkControl>(256);
     let (network_msg_tx, network_msg_rx) = crossbeam_channel::bounded::<NetworkMessage>(256);
 

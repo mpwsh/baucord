@@ -9,7 +9,6 @@ pub type ClientId = u64;
 
 /// Per-peer audio settings mirror (`audio::PeerAudioSettings` shape).
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(clippy::struct_excessive_bools)] // mirror of the wire shape
 pub struct PeerAudio {
     pub volume: f32,
     pub is_muted: bool,

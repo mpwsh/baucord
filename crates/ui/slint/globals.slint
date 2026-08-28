@@ -43,14 +43,14 @@ export struct UserRow {
     is-our-channel: bool,   // the channel we are in (highlight, no-op click)
 }
 
-/// One chat row. `kind`: 0 = message, 1 = system, 2 = image, 3 = link
-/// (links render as their own tappable rows under the message that
-/// carried them — Slint has no inline rich text).
+/// One chat row. `kind`: 0 = message, 1 = system, 2 = image, 3 = code
+/// (a ```-fenced block; links stay inline in kind-0 rows via
+/// StyledText).
 export struct ChatRow {
     kind: int,
     ts: string,
     user: string,
-    body: string,        // message text / system text / code (kind 3); links render inline
+    body: string,        // message text / system text / code (kind 3)
     styled: bool,        // kind 0 — body carries *bold*/_italic_/`code` markup
     body-styled: styled-text, // kind 0 when styled — pre-parsed by the shell
     image: image,        // kind 2 — current frame (Rust swaps for GIFs)
@@ -177,7 +177,6 @@ export global Logic {
     callback composer-line-edge(cursor: int, to-end: bool);
     callback attach-image();
     // Wipe the local chat history/images (each user clears their own).
-    // Wipe the local chat history/images (each user clears their own).
     callback clear-chat();
     callback emoji-picked(string);
     callback paste-rich();                // Ctrl/Cmd+V — host runs the paste chain
@@ -188,7 +187,7 @@ export global Logic {
     /// Image viewer overlay: step -1/+1, save current, close.
     callback viewer-step(int);
     callback viewer-save();
-    callback viewer-close();         // opens the gallery viewer
+    callback viewer-close();
     callback gif-hover(int, bool);        // row-id, entering
 
     // Image preview overlay

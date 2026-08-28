@@ -7,7 +7,7 @@
 //!
 //! Frontends talk to the worker threads exclusively through their
 //! control / event channels and inject a wake callback, so this crate
-//! depends on no UI toolkit. The FLTK app lives in the sibling
+//! depends on no UI toolkit. The Slint desktop app lives in the sibling
 //! `desktop` crate; a future mobile shell sits on the same seam.
 
 use std::sync::Arc;
@@ -19,10 +19,10 @@ pub mod voice;
 
 /// A callback the worker threads invoke to wake the UI event loop.
 /// Injected at construction so this crate never imports a UI toolkit
-/// (e.g. `fltk::app::awake` for the desktop, a no-op for headless).
+/// (the desktop shell hands in a `slint::invoke_from_event_loop`
+/// nudge; a headless test can pass a no-op).
 ///
-/// Lives at the crate root because all three worker modules use it;
-/// `voice` re-exports it for backwards compatibility.
+/// Lives at the crate root because all three worker modules use it.
 pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
 
 /// Wire budget for a chat image/GIF payload, re-exported so the UI

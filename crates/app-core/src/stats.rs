@@ -63,7 +63,6 @@ pub struct FrameRing {
     idx: usize,
 }
 
-
 impl FrameRing {
     pub fn push(&mut self, bytes: u64) {
         self.ring[self.idx] = bytes;

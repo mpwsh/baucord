@@ -10,6 +10,7 @@
 // `State.password-prompt` and an inline box appears: type the server
 // password, Save stores it on the selected server, Connect retries.
 
+import { IconSet } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic } from "globals.slint";
@@ -69,7 +70,7 @@ export component ConnectView inherits Rectangle {
                 }
                 IconBtn {
                     size: 36px;
-                    icon: @image-url("icons/pencil.svg");
+                    icon: IconSet.Pencil;
                     tooltip: Tr.server-manage;
                     clicked => { Logic.edit-servers(); }
                 }

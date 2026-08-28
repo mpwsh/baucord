@@ -2,9 +2,10 @@
 //!
 //! `.slint` sources live in `slint/`; `build.rs` compiles them and this
 //! crate re-exports the generated components (`MainWindow`,
-//! `SettingsWindow`, `StreamViewerWindow`, `GalleryWindow`) plus the
+//! `SettingsWindow`, `StreamViewerWindow`, `BaucordTray`) plus the
 //! `State` / `Logic` / `Tr` / `SettingsState` / `SettingsLogic`
-//! globals. The [`convert`] module maps `app-core` view-model types
+//! globals. Icons come from the `@lucide` library that `build.rs`
+//! mounts (the `lucide-slint` build dependency). The [`convert`] module maps `app-core` view-model types
 //! onto the generated row structs.
 //!
 //! This crate compiles identically for desktop and the future

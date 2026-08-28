@@ -14,10 +14,11 @@
 // from the shell, so scroll position survives (same contract as before).
 
 import { ListView } from "std-widgets.slint";
+import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, UserRow } from "globals.slint";
-import { IconBtn, Btn, Sep } from "widgets.slint";
+import { IconBtn, Btn } from "widgets.slint";
 
 component UserRowView inherits Rectangle {
     in property <UserRow> user;
@@ -71,10 +72,13 @@ component UserRowView inherits Rectangle {
             overflow: elide;
             horizontal-stretch: 1;
         }
-        if user.locked : Image {
+        if user.locked : Rectangle {
             width: 12px;
-            source: @image-url("icons/lock.svg");
-            colorize: Theme.text-muted;
+            IconDisplay {
+                icon: IconSet.Lock;
+                size: 12px;
+                stroke: Theme.text-muted;
+            }
         }
         Text {
             text: user.member-label;
@@ -137,12 +141,13 @@ component UserRowView inherits Rectangle {
         }
 
         // Remote (or own) self-mute / deafen status icon.
-        if user.self-deafened || user.self-muted : Image {
+        if user.self-deafened || user.self-muted : Rectangle {
             width: 15px;
-            source: user.self-deafened
-                ? @image-url("icons/headphones-off.svg")
-                : @image-url("icons/mic-off.svg");
-            colorize: Theme.text-muted;
+            IconDisplay {
+                icon: user.self-deafened ? IconSet.HeadphoneOff : IconSet.MicOff;
+                size: 15px;
+                stroke: Theme.text-muted;
+            }
         }
 
         // LIVE chip / hover "…" menu.
@@ -164,10 +169,13 @@ component UserRowView inherits Rectangle {
             }
         }
         // Pure affordance — clicks land on the row's own TouchArea.
-        if !user.sharing && !user.is-us && touch.has-hover : Image {
+        if !user.sharing && !user.is-us && touch.has-hover : Rectangle {
             width: 14px;
-            source: @image-url("icons/dots.svg");
-            colorize: Theme.text-muted;
+            IconDisplay {
+                icon: IconSet.Ellipsis;
+                size: 14px;
+                stroke: Theme.text-muted;
+            }
         }
     }
 }
@@ -248,28 +256,28 @@ export component Sidebar inherits Rectangle {
                 spacing: Theme.gap-xs;
                 alignment: space-around;
                 IconBtn {
-                    icon: State.muted ? @image-url("icons/mic-off.svg") : @image-url("icons/mic.svg");
+                    icon: State.muted ? IconSet.MicOff : IconSet.Mic;
                     active: State.muted;
                     active-danger: true;
                     tooltip: State.muted ? Tr.unmute : Tr.mute;
                     clicked => { Logic.toggle-mute(); }
                 }
                 IconBtn {
-                    icon: State.deafened ? @image-url("icons/headphones-off.svg") : @image-url("icons/headphones.svg");
+                    icon: State.deafened ? IconSet.HeadphoneOff : IconSet.Headphones;
                     active: State.deafened;
                     active-danger: true;
                     tooltip: State.deafened ? Tr.undeafen : Tr.deafen;
                     clicked => { Logic.toggle-deafen(); }
                 }
                 IconBtn {
-                    icon: State.sharing ? @image-url("icons/monitor-off.svg") : @image-url("icons/monitor.svg");
+                    icon: State.sharing ? IconSet.MonitorOff : IconSet.Monitor;
                     active: State.sharing;
                     active-danger: true;
                     tooltip: State.sharing ? Tr.stop-sharing : Tr.share-screen;
                     clicked => { Logic.toggle-share(); }
                 }
                 IconBtn {
-                    icon: @image-url("icons/gear.svg");
+                    icon: IconSet.Settings;
                     tooltip: Tr.settings;
                     clicked => { Logic.open-settings(); }
                 }

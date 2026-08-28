@@ -1,11 +1,10 @@
 //! The chat history model and link detection.
 //!
 //! [`ChatHistory`] is the source of truth the UI model mirrors: rows of
-//! [`ChatItem`], capped at [`MAX_ROWS`] (oldest dropped). Link detection
-//! is ported verbatim from the FLTK `chat_view.rs` (with its tests);
-//! links render inline inside message text (linkified for StyledText)
-//! the message that carried them — Slint renders them as dedicated
-//! tappable rows.
+//! [`ChatItem`], capped at [`MAX_ROWS`] (oldest dropped). ```-fenced
+//! code becomes its own [`ChatItem::Code`] row; links stay inline in
+//! the message text (the markdown translator linkifies them for
+//! StyledText).
 
 /// History cap — oldest rows are dropped past this.
 pub const MAX_ROWS: usize = 500;

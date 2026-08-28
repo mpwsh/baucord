@@ -41,10 +41,6 @@ nnnoiseless = "0.5"
 # Fork retired: upstream 1.x ships quantized weights in its default
 # predictor, which was the fork's whole reason to exist.
 earshot = "1.2"
-# crates.io 0.4.0 (2026-08-23) is the opusic-sys-backed release and is
-# source-identical to the previously pinned git rev 5598766 (verified by
-# diffing src/). Registry release replaces the git pin; keep on 0.4+ —
-# 0.3.x predates the opusic-sys switch.
 opus = "0.4"
 serde = { workspace = true, optional = true }
 

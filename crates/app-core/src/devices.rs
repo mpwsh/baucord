@@ -7,9 +7,6 @@
 //! the side effects (voice-thread messages, WASAPI loopback restart,
 //! settings writes, localized strings).
 
-/// `(name, is_default)` — the shape `audio::VoiceChat::list_*_devices` returns.
-pub type DeviceList = Vec<(String, bool)>;
-
 /// A notice for chat, pre-localization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceNotice {
@@ -150,7 +147,8 @@ pub fn missing_saved<'a>(
 mod tests {
     use super::*;
 
-    fn devs(names: &[(&str, bool)]) -> DeviceList {
+    /// `(name, is_default)` — the shape `audio::VoiceChat::list_*_devices` returns.
+    fn devs(names: &[(&str, bool)]) -> Vec<(String, bool)> {
         names.iter().map(|(n, d)| ((*n).into(), *d)).collect()
     }
 

@@ -6,7 +6,7 @@
 //
 // This module has NO dependency on any UI toolkit.  The caller injects
 // a `WakeFn` callback that is called whenever the UI event loop should
-// check for new events (e.g. `fltk::app::awake` or a no-op for headless).
+// check for new events (a no-op works for headless use).
 
 use crossbeam_channel::{Receiver, Sender, bounded, select};
 
@@ -17,13 +17,10 @@ use std::time::{Duration, Instant};
 
 use log::info;
 
+use crate::WakeFn;
 use crate::config::Settings;
 use crate::network::NetworkControl;
 use audio::{AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig};
-
-/// Re-exported for backwards compatibility — the definition moved to
-/// the crate root since network and screen use it too.
-pub use crate::WakeFn;
 
 // ── Channel messages ────────────────────────────────────────────────────
 

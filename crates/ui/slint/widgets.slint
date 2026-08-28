@@ -5,6 +5,7 @@
 // plain Rectangles with width bindings — the custom-draw code the FLTK
 // build needed is gone.
 
+import { Icon, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 
 // ── Buttons ─────────────────────────────────────────────────────────────
@@ -49,10 +50,11 @@ export component Btn inherits Rectangle {
     }
 }
 
-/// Square icon button. `active` latches it (engaged toggle) and
-/// `active-danger` colors the latched state raspberry instead of cobalt.
+/// Square icon button around a Lucide glyph (`icon: IconSet.Mic`).
+/// `active` latches it (engaged toggle) and `active-danger` colors
+/// the latched state raspberry instead of cobalt.
 export component IconBtn inherits Rectangle {
-    in property <image> icon;
+    in property <Icon> icon;
     in property <string> tooltip;
     in property <bool> active: false;
     in property <bool> active-danger: false;
@@ -69,13 +71,12 @@ export component IconBtn inherits Rectangle {
         : touch.has-hover ? Theme.hover : transparent;
     animate background { duration: 150ms; }
 
-    Image {
-        source: root.icon;
-        width: root.icon-size;
-        height: root.icon-size;
-        colorize: root.active ? Theme.on-accent
+    IconDisplay {
+        icon: root.icon;
+        size: root.icon-size;
+        stroke: root.active ? Theme.on-accent
             : touch.has-hover ? Theme.text-primary : root.idle-color;
-        animate colorize { duration: 150ms; }
+        animate stroke { duration: 150ms; }
     }
 
     touch := TouchArea {

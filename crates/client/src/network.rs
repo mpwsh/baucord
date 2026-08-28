@@ -304,11 +304,6 @@ pub(crate) struct NetworkClient {
 
     // Speaking status dedupe (only send on change)
     last_speaking_sent: bool,
-    /// Total bytes of an in-flight chat image upload, if any. Progress
-    /// is inferred from the media channel's buffered (unacked) bytes
-    /// draining back toward zero — renet exposes no per-message acks,
-    /// but with one upload at a time the channel's memory usage IS the
-    /// unacked remainder.
     /// In-flight paced image upload (chunks not yet handed to renet).
     upload: Option<OutgoingImage>,
     /// Wrapping id so the server can tell uploads apart.

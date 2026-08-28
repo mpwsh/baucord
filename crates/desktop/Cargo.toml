@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2024"
 
 [lints]
@@ -35,7 +35,6 @@ slint.workspace = true
 # this only pulls the accessor trait; cargo unifies the version with
 # slint's own internal dependency.
 i-slint-backend-winit = "1.17"
-renet.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
 env_logger = "0.11"
@@ -43,20 +42,6 @@ chrono = "0.4.45"
 ureq = "3.4"
 open = "5.4"
 global-hotkey = "0.8"
-# png/gif are the wire formats; the rest let attach/paste/drop decode
-# the common disk formats (re-encoded to PNG before sending). 0.25.9
-# floor guarantees the root ImageReader/Limits API used for bounded
-# decoding.
-image = { version = "0.25", default-features = false, features = [
-  "png",
-  "jpeg",
-  "gif",
-  "webp",
-  "bmp",
-  "tiff",
-  "ico",  # decodes assets/icons/icon.ico for the tray (feature `tray`)
-] }
-
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 zip = "8.6"
 self-replace = "1.5"

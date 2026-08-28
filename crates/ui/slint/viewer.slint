@@ -1,16 +1,15 @@
-// viewer.slint — the two media windows.
+// viewer.slint — the stream viewer window.
 //
 // StreamViewerWindow: one per watched peer. The shell pushes each
 // decoded frame as an `image` property (SharedPixelBuffer → Image on
 // the Rust side) — property damage repaints exactly the canvas, no
 // global-redraw concerns. Toolbar: volume, mute, stop watching, stats.
-//
-// GalleryWindow: the chat image viewer — ◀ / ▶ walk neighbouring image
-// rows, Save… on the right. Single instance, managed by the shell.
+// (The chat image viewer is an in-window overlay in main.slint.)
 
+import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { IconBtn, Btn, HSlider } from "widgets.slint";
+import { Btn, HSlider } from "widgets.slint";
 
 export component StreamViewerWindow inherits Window {
     in property <string> peer-name;
@@ -51,10 +50,13 @@ export component StreamViewerWindow inherits Window {
                 padding-left: Theme.gap-md;
                 padding-right: Theme.gap-md;
                 spacing: Theme.gap-md;
-                Image {
+                Rectangle {
                     width: 16px;
-                    source: @image-url("icons/volume.svg");
-                    colorize: Theme.text-muted;
+                    IconDisplay {
+                        icon: IconSet.Volume2;
+                        size: 16px;
+                        stroke: Theme.text-muted;
+                    }
                 }
                 HSlider {
                     width: 130px;

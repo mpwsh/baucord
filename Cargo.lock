@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "app-core",
  "arboard",
@@ -1764,12 +1764,10 @@ dependencies = [
  "global-hotkey",
  "i-slint-backend-winit",
  "i18n",
- "image",
  "log",
  "objc2-app-kit 0.3.2",
  "open",
  "pollster 1.0.1",
- "renet",
  "rfd",
  "self-replace",
  "slint",
@@ -3909,6 +3907,12 @@ checksum = "0fae87c125b03c1d2c0150c90365d7d6bcc53fb73a9acaef207d2d065860f062"
 dependencies = [
  "imgref",
 ]
+
+[[package]]
+name = "lucide-slint"
+version = "1.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc6ad91e297aaf32da4f760224dc5fa875d35ee9afce0d87599bc5ae14b5ebf7"
 
 [[package]]
 name = "lyon_algorithms"
@@ -7037,6 +7041,7 @@ version = "0.4.0"
 dependencies = [
  "app-core",
  "log",
+ "lucide-slint",
  "slint",
  "slint-build",
 ]

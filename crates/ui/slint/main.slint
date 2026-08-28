@@ -6,6 +6,7 @@
 // an overlay here — which retires the orphaned-popup / focus-churn
 // machinery wholesale (there is nothing to strand on the desktop).
 
+import { IconSet } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow } from "globals.slint";
@@ -201,12 +202,12 @@ export component MainWindow inherits Window {
                         horizontal-stretch: 1;
                     }
                     IconBtn {
-                        icon: @image-url("icons/download.svg");
+                        icon: IconSet.Download;
                         tooltip: Tr.menu-save-image;
                         clicked => { Logic.viewer-save(); }
                     }
                     IconBtn {
-                        icon: @image-url("icons/x.svg");
+                        icon: IconSet.X;
                         clicked => { viewer-keys.close(); }
                     }
                 }
@@ -223,7 +224,7 @@ export component MainWindow inherits Window {
                         width: nav-l.width;
                         nav-l := IconBtn {
                             y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/chevron-left.svg");
+                            icon: IconSet.ChevronLeft;
                             opacity: State.viewer-has-prev ? 1.0 : 0.25;
                             clicked => { if (State.viewer-has-prev) { Logic.viewer-step(-1); } }
                         }
@@ -258,7 +259,7 @@ export component MainWindow inherits Window {
                         width: nav-r.width;
                         nav-r := IconBtn {
                             y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/chevron-right.svg");
+                            icon: IconSet.ChevronRight;
                             opacity: State.viewer-has-next ? 1.0 : 0.25;
                             clicked => { if (State.viewer-has-next) { Logic.viewer-step(1); } }
                         }

@@ -560,8 +560,7 @@ impl Settings {
 
 // ── Storage location ────────────────────────────────────────────────────
 
-/// Directory holding baucord's config files (settings.json,
-/// windows.json).
+/// Directory holding baucord's settings.json.
 ///
 /// Release builds prefer the executable's directory so users can find
 /// their config next to the app (baucord installs are portable-style;
@@ -610,54 +609,6 @@ fn writable_exe_dir() -> Option<PathBuf> {
 #[must_use]
 pub fn settings_file_path() -> PathBuf {
     Settings::get_settings_path()
-}
-
-// ── Window-position store ───────────────────────────────────────────────
-//
-// Deliberately a separate tiny file, NOT part of `Settings`: dialogs
-// persist their position with a load-modify-save on close, and going
-// through Settings would race the app's own in-memory copy (whichever
-// saved last would clobber the other's changes).
-
-fn window_positions_path() -> PathBuf {
-    config_base_dir().join("windows.json")
-}
-
-fn read_window_positions() -> HashMap<String, (i32, i32)> {
-    let read = |p: PathBuf| -> Option<HashMap<String, (i32, i32)>> {
-        serde_json::from_str(&fs::read_to_string(p).ok()?).ok()
-    };
-    read(window_positions_path())
-        // Positions written before the storage move (or by a debug
-        // build) live in the platform config dir — read them as a
-        // fallback rather than forgetting every window position once.
-        .or_else(|| {
-            platform_config_dir()
-                .map(|d| d.join("windows.json"))
-                .and_then(read)
-        })
-        .unwrap_or_default()
-}
-
-/// Last saved position of the named window, if any. Callers should
-/// clamp to the current screen before applying — monitors change.
-#[must_use]
-pub fn window_pos(key: &str) -> Option<(i32, i32)> {
-    read_window_positions().get(key).copied()
-}
-
-/// Persist the named window's position. Failures are silent — losing a
-/// window position is not worth an error dialog.
-pub fn set_window_pos(key: &str, pos: (i32, i32)) {
-    let path = window_positions_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut map = read_window_positions();
-    map.insert(key.to_string(), pos);
-    if let Ok(contents) = serde_json::to_string_pretty(&map) {
-        let _ = fs::write(&path, contents);
-    }
 }
 
 #[cfg(test)]
