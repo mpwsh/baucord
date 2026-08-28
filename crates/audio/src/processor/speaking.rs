@@ -66,13 +66,16 @@ impl SpeakingIndicator {
     }
 
     fn classify(&mut self, gate_open: bool, vad_prob: f32) -> bool {
-        let speech_now = gate_open && vad_prob >= VAD_THRESHOLD;
-        if speech_now {
+        if gate_open && vad_prob >= VAD_THRESHOLD {
             self.hold_remaining = HOLD_FRAMES;
-        } else if self.hold_remaining > 0 {
-            self.hold_remaining -= 1;
+            return true;
         }
-        speech_now || self.hold_remaining > 0
+        // Inside the hold: this frame still counts, then spend one.
+        if self.hold_remaining > 0 {
+            self.hold_remaining -= 1;
+            return true;
+        }
+        false
     }
 
     /// Publish the speaking indicator with a slow-fall cooldown for UI.

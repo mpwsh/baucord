@@ -76,13 +76,16 @@ impl EncoderWorker {
                 warn!("Opus encoder: {name} failed: {e}");
             }
         };
-        ctl("set_bitrate", encoder.set_bitrate(Bitrate::Bits(OPUS_BITRATE)));
+        ctl(
+            "set_bitrate",
+            encoder.set_bitrate(Bitrate::Bits(OPUS_BITRATE)),
+        );
         ctl("set_vbr", encoder.set_vbr(true));
         // Complexity 6: for speech at 48 kbps the levels above this mostly
         // buy CELT/music analysis, for roughly a third of the encode CPU —
         // which matters on the low-end hardware this targets.
         // `last_encode_us` is the A/B knob if anyone wants to argue.
-        ctl("set_complexity", encoder.set_complexity(6));
+        ctl("set_complexity", encoder.set_complexity(7));
         ctl(
             "set_bandwidth",
             encoder.set_bandwidth(opus::Bandwidth::Superwideband),

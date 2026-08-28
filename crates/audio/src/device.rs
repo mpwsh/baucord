@@ -22,7 +22,9 @@ use cpal::{Device, SupportedStreamConfig, SupportedStreamConfigRange};
 use crate::OPUS_SAMPLE_RATE;
 
 /// Input config for `device`, at 48 kHz when the device supports it.
-pub fn preferred_input_config(device: &Device) -> Result<SupportedStreamConfig, cpal::Error> {
+pub fn preferred_input_config(
+    device: &Device,
+) -> Result<SupportedStreamConfig, cpal::Error> {
     let default = device.default_input_config()?;
     if default.sample_rate() == OPUS_SAMPLE_RATE {
         return Ok(default);
@@ -34,7 +36,9 @@ pub fn preferred_input_config(device: &Device) -> Result<SupportedStreamConfig, 
 }
 
 /// Output config for `device`, at 48 kHz when the device supports it.
-pub fn preferred_output_config(device: &Device) -> Result<SupportedStreamConfig, cpal::Error> {
+pub fn preferred_output_config(
+    device: &Device,
+) -> Result<SupportedStreamConfig, cpal::Error> {
     let default = device.default_output_config()?;
     if default.sample_rate() == OPUS_SAMPLE_RATE {
         return Ok(default);

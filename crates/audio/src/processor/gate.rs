@@ -69,6 +69,7 @@ const HOLD_EXPANDER_RATIO: f32 = 2.0;
 /// Maximum attenuation the hold-window expander applies. The point is
 /// to move the noise tail below audibility, not to hard-mute the hold
 /// (hard muting would defeat the hold's purpose).
+#[cfg(test)]
 const HOLD_EXPANDER_FLOOR_DB: f32 = -15.0;
 
 /// `HOLD_EXPANDER_FLOOR_DB` as linear gain (10^(-15/20)), precomputed
@@ -406,6 +407,14 @@ mod tests {
             assert!(!ctx.gate_holding);
             drive_into_hold(&mut gate, &mut ctx, 0.003);
             assert!(ctx.gate_holding && ctx.gate_open);
+        }
+        #[test]
+        fn linear_floor_matches_its_db_definition() {
+            let from_db = 10.0_f32.powf(HOLD_EXPANDER_FLOOR_DB / 20.0);
+            assert!(
+        (from_db - HOLD_EXPANDER_FLOOR).abs() < 1e-6,
+        "HOLD_EXPANDER_FLOOR ({HOLD_EXPANDER_FLOOR}) drifted from {HOLD_EXPANDER_FLOOR_DB} dB ({from_db})"
+    );
         }
     }
 }

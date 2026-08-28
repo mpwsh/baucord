@@ -386,9 +386,12 @@ impl PacketBuffer {
             // silence by then), jump the rest. Decoder state is kept — Opus
             // is designed to resume after loss; it is not designed to be
             // recreated mid-stream.
+            // Land exactly MAX_PLC_SLOTS before head, measured from head
+            // (not from where we were), so an irregular timestamp in the
+            // gap cannot leave the remaining slots looking non-contiguous.
             let jump = gap - MAX_PLC_SLOTS;
-            self.next_seq = self.next_seq.wrapping_add(jump);
-            self.next_ts = self.next_ts.wrapping_add(jump * head_dur as u32);
+            self.next_seq = head_seq.wrapping_sub(MAX_PLC_SLOTS);
+            self.next_ts = head_ts.wrapping_sub(MAX_PLC_SLOTS * head_dur as u32);
             return Refill::Skipped(jump);
         }
 
@@ -482,8 +485,8 @@ mod tests {
         let mut e = enc();
         let mut b = PacketBuffer::new().unwrap();
         let p0 = pkt(&mut e, 0, 0);
-        let p1 = pkt(&mut e, 1, 480);
-        let p2 = pkt(&mut e, 2, 960);
+        let p1 = pkt(&mut e, 1, FRAME_SIZE as u32);
+        let p2 = pkt(&mut e, 2, 2 * FRAME_SIZE as u32);
         assert_eq!(b.push(p0), Push::Accepted);
         assert_eq!(b.push(p2), Push::Accepted);
         assert_eq!(b.push(p1), Push::Accepted);
@@ -499,12 +502,12 @@ mod tests {
         let mut b = PacketBuffer::new().unwrap();
         // Warm the encoder so LBRR is actually coded.
         for s in 0..10 {
-            b.push(pkt(&mut e, s, s * 480));
+            b.push(pkt(&mut e, s, s * FRAME_SIZE as u32));
         }
         let mut out = [0.0f32; FRAME_SIZE * 10];
         b.fill(&mut out, true, false);
-        let _lost = pkt(&mut e, 10, 4800); // never pushed
-        b.push(pkt(&mut e, 11, 5280));
+        let _lost = pkt(&mut e, 10, 10 * FRAME_SIZE as u32); // never pushed
+        b.push(pkt(&mut e, 11, 11 * FRAME_SIZE as u32));
         let mut out = [0.0f32; FRAME_SIZE * 2];
         let r = b.fill(&mut out, true, false);
         assert_eq!(r.filled, FRAME_SIZE * 2);
@@ -515,10 +518,10 @@ mod tests {
     fn packet_behind_playhead_is_late() {
         let mut e = enc();
         let mut b = PacketBuffer::new().unwrap();
-        b.push(pkt(&mut e, 5, 2400));
+        b.push(pkt(&mut e, 5, 5 * FRAME_SIZE as u32));
         let mut out = [0.0f32; FRAME_SIZE];
         b.fill(&mut out, true, false);
-        assert_eq!(b.push(pkt(&mut e, 4, 1920)), Push::Late);
+        assert_eq!(b.push(pkt(&mut e, 4, 4 * FRAME_SIZE as u32)), Push::Late);
     }
 
     #[test]
@@ -542,7 +545,7 @@ mod tests {
         b.push(pkt(&mut e, 0, 0));
         let mut out = [0.0f32; FRAME_SIZE];
         b.fill(&mut out, true, false);
-        b.push(pkt(&mut e, 30, 30 * 480)); // 29 missing, media-contiguous
+        b.push(pkt(&mut e, 30, 30 * FRAME_SIZE as u32)); // 29 missing, media-contiguous
         let mut out = vec![0.0f32; FRAME_SIZE * 8];
         let r = b.fill(&mut out, false, false); // no dry-PLC: count exact frames
         assert_eq!(r.skipped, 29 - MAX_PLC_SLOTS);
