@@ -11,8 +11,12 @@ workspace = true
 serde = ["dep:serde"]
 
 [dependencies]
-# Audio I/O
-cpal = "0.18"
+# Audio I/O. 0.18.2 minimum: 0.18.0/0.18.1 advertise 48 kHz output on
+# WASAPI and then refuse to open it ("Stream configuration is not
+# supported in shared mode"); 0.18.2 opens any rate via AUTOCONVERTPCM.
+# `cargo update -p cpal` after bumping — the lock file keeps the old one
+# otherwise.
+cpal = "0.18.2"
 dasp_sample = "0.11"
 
 # Wav reading

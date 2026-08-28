@@ -35,6 +35,17 @@
 //! **IDR** on every backend so a joining viewer always gets a clean
 //! recovery point with parameter sets.
 //!
+//! # Bitrate scaling
+//!
+//! The sender can run rate control below the preset
+//! ([`VideoEncoder::set_bitrate_scale_pct`]) when its uplink is losing
+//! packets. A scale change is handled exactly like a source-resolution
+//! change: the session is reopened with target, maxrate and VBV buffer
+//! all derived from the scaled bitrate ([`RateControl`]). Reopening is
+//! deliberate over a live reconfigure — it is the one path every backend
+//! supports, and the fresh session's first frame is an IDR with parameter
+//! sets, which is exactly the recovery point viewers need after loss.
+//!
 //! # System requirements
 //!
 //! - **Windows (static):** `vcpkg install ffmpeg[x264,gpl]:x64-windows-static-md`
@@ -52,7 +63,9 @@ use ffmpeg::software::scaling::{Context as SwsContext, Flags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg::{Dictionary, Rational};
 
-use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, PixelFormat, Quality, VideoDecoder, VideoEncoder};
+use crate::{
+    CodecError, DecodedFrame, EncodedFrame, Frame, PixelFormat, Quality, VideoDecoder, VideoEncoder,
+};
 
 /// Time between IDR keyframes, in milliseconds of *capture time*.
 pub const KEYFRAME_INTERVAL_MS: u64 = 2_000;
@@ -79,6 +92,36 @@ const ENCODER_PRIORITY: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libx2
 /// ⇒ ~200 KB nominal, leaving overshoot room.
 const VBV_MAX_BITS: u32 = 1_600_000;
 
+/// The three rate-control numbers a session is opened with, all derived
+/// from one target so they scale together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateControl {
+    /// Average bitrate the encoder aims for, bits/s.
+    pub target: u32,
+    /// Peak bitrate: 1.5× target gives keyframes room to breathe without
+    /// allowing unconstrained spikes.
+    pub maxrate: u32,
+    /// VBV buffer, bits. Caps the worst-case size of a single frame (a
+    /// full buffer drain), which matters twice over: it bounds keyframe
+    /// bursts on the wire, and the app's video chunking hard-limits one
+    /// frame to 255 × 1080 B ≈ 275 KB (`protocol::MAX_VIDEO_FRAME_BYTES`)
+    /// — beyond that the frame can't be sent at all. Never above
+    /// [`VBV_MAX_BITS`] (≈ 200 KB/frame), and at low targets it shrinks
+    /// with them so a keyframe stays a fraction of a second of budget
+    /// rather than a multi-second burst.
+    pub bufsize: u32,
+}
+
+impl RateControl {
+    pub const fn for_target(target: u32) -> Self {
+        Self {
+            target,
+            maxrate: target * 3 / 2,
+            bufsize: if target < VBV_MAX_BITS { target } else { VBV_MAX_BITS },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encoder
 // ---------------------------------------------------------------------------
@@ -93,6 +136,10 @@ pub struct FfmpegEncoder {
     codec: ffmpeg::Codec,
     enc_name: &'static str,
     quality: Quality,
+    /// Requested rate-control scale, percent of the preset bitrate
+    /// (see [`VideoEncoder::set_bitrate_scale_pct`]). Applied by
+    /// [`Self::ensure_session`] on the next encode.
+    bitrate_scale_pct: u32,
     force_next_keyframe: bool,
     /// Capture timestamp of the most recent keyframe AU this encoder
     /// actually emitted — ground truth, independent of what the codec
@@ -108,7 +155,8 @@ pub struct FfmpegEncoder {
     session: Option<EncSession>,
 }
 
-/// Everything tied to one (source resolution → output resolution) pairing.
+/// Everything tied to one (source resolution → output resolution,
+/// bitrate scale) configuration.
 struct EncSession {
     encoder: encoder::Video,
     sws: SwsContext,
@@ -117,6 +165,8 @@ struct EncSession {
     src_format: PixelFormat,
     out_w: u32,
     out_h: u32,
+    /// Scale this session's rate control was opened with, percent.
+    bitrate_scale_pct: u32,
     /// Reusable FFmpeg frame for RGBA input (source resolution).
     rgba_frame: VideoFrame,
     /// Reusable FFmpeg frame for YUV420P — fed to the encoder.
@@ -160,6 +210,7 @@ impl FfmpegEncoder {
                 codec,
                 name,
                 quality,
+                100,
                 quality.width(),
                 quality.height(),
                 PixelFormat::Rgba,
@@ -170,6 +221,7 @@ impl FfmpegEncoder {
                         codec,
                         enc_name: name,
                         quality,
+                        bitrate_scale_pct: 100,
                         force_next_keyframe: false,
                         last_idr_out_ms: None,
                         last_idr_reopen_ms: None,
@@ -188,40 +240,77 @@ impl FfmpegEncoder {
         Err(CodecError::NoEncoder(errors.join("; ")))
     }
 
-    /// Ensure the session matches the input frame dimensions, creating or
-    /// recreating it as needed.
+    /// Ensure the session matches the input frame's geometry and the
+    /// requested bitrate scale, creating or recreating it as needed.
+    ///
+    /// When an existing session is replaced, whatever output it already
+    /// has ready is salvaged into `out` (frames still inside a hardware
+    /// encoder's pipeline are lost — they consumed no sequence numbers,
+    /// so viewers see no loss signal).
     fn ensure_session(
         &mut self,
-        src_w: u32,
-        src_h: u32,
-        src_format: PixelFormat,
+        frame: &Frame,
+        out: &mut Vec<EncodedFrame>,
     ) -> Result<(), CodecError> {
-        if let Some(s) = &self.session {
-            if s.src_w == src_w && s.src_h == src_h && s.src_format == src_format {
+        let scale = self.bitrate_scale_pct;
+        if let Some(s) = self.session.as_mut() {
+            let same_source =
+                s.src_w == frame.width && s.src_h == frame.height && s.src_format == frame.format;
+            if same_source && s.bitrate_scale_pct == scale {
                 return Ok(());
             }
+            let reason = if same_source {
+                format!(
+                    "bitrate scale {}% → {}% ({} → {} kbit/s)",
+                    s.bitrate_scale_pct,
+                    scale,
+                    self.quality.scaled_bitrate(s.bitrate_scale_pct) / 1000,
+                    self.quality.scaled_bitrate(scale) / 1000,
+                )
+            } else {
+                format!(
+                    "source resolution {}x{} → {}x{}",
+                    s.src_w, s.src_h, frame.width, frame.height
+                )
+            };
+            // Salvage first, so the count below is what is really lost.
+            let _ = drain_packets(s, out);
             log::info!(
-                "encoder: source resolution changed {}x{} → {}x{}, reopening session \
-                 ({} in-flight frame(s) dropped)",
-                s.src_w,
-                s.src_h,
-                src_w,
-                src_h,
+                "encoder: {reason}, reopening session ({} in-flight frame(s) dropped)",
                 s.pending_ts.len(),
             );
+            // The replacement starts with an IDR. Count it now: on
+            // encoders that can't force IDRs, the overdue check in
+            // encode() would otherwise re-fire before the async pipeline
+            // surfaces that first frame and reopen again in a loop.
+            self.last_idr_out_ms = Some(frame.timestamp_ms);
         }
 
-        let session = open_session(self.codec, self.enc_name, self.quality, src_w, src_h, src_format)?;
+        let session = open_session(
+            self.codec,
+            self.enc_name,
+            self.quality,
+            scale,
+            frame.width,
+            frame.height,
+            frame.format,
+        )?;
         log::info!(
-            "encoder session: {}x{} → {}x{} ({})",
-            src_w,
-            src_h,
+            "encoder session: {}x{} → {}x{} ({}), {} kbit/s{}",
+            frame.width,
+            frame.height,
             session.out_w,
             session.out_h,
-            if src_w == session.out_w && src_h == session.out_h {
+            if frame.width == session.out_w && frame.height == session.out_h {
                 "colorspace only"
             } else {
                 "bicubic downscale + colorspace"
+            },
+            self.quality.scaled_bitrate(scale) / 1000,
+            if scale == 100 {
+                String::new()
+            } else {
+                format!(" ({scale}% of preset)")
             },
         );
 
@@ -287,7 +376,7 @@ impl FfmpegEncoder {
                 self.session = None;
             }
         }
-        self.ensure_session(frame.width, frame.height, frame.format)?;
+        self.ensure_session(frame, &mut out)?;
 
         // Strictly increasing PTS in the 1/1000 time base. Capture
         // timestamps are ms-resolution, so a burst can repeat a value.
@@ -398,6 +487,17 @@ impl FfmpegEncoder {
         self.quality
     }
 
+    /// See [`VideoEncoder::set_bitrate_scale_pct`]. Only records the
+    /// request; [`Self::ensure_session`] reopens on the next encode if
+    /// the running session was opened at a different scale.
+    pub fn set_bitrate_scale_pct(&mut self, pct: u32) {
+        self.bitrate_scale_pct = crate::clamp_bitrate_scale_pct(pct);
+    }
+
+    pub fn bitrate_scale_pct(&self) -> u32 {
+        self.bitrate_scale_pct
+    }
+
     /// Returns the name of the active encoder (e.g. "h264_nvenc", "libx264").
     pub fn encoder_name(&self) -> &'static str {
         self.enc_name
@@ -428,6 +528,14 @@ impl VideoEncoder for FfmpegEncoder {
 
     fn supports_forced_keyframes(&self) -> bool {
         self.supports_forced_keyframes()
+    }
+
+    fn set_bitrate_scale_pct(&mut self, pct: u32) {
+        self.set_bitrate_scale_pct(pct);
+    }
+
+    fn bitrate_scale_pct(&self) -> u32 {
+        self.bitrate_scale_pct()
     }
 }
 
@@ -670,9 +778,6 @@ fn fit_dimensions(src_w: u32, src_h: u32, quality: Quality) -> (u32, u32) {
     (((out_w as u32) & !1).max(2), ((out_h as u32) & !1).max(2))
 }
 
-/// Input pixel format for a given encoder. Most accept planar YUV420P;
-/// Intel QSV only takes the semi-planar NV12 layout (same 4:2:0 subsampling,
-/// interleaved chroma). swscale converts RGBA to either directly.
 /// Whether this encoder's output should be collected *before*
 /// submitting the new frame rather than after. AMF's asynchronous
 /// pipeline finishes an AU ~15-20 ms after submission — right at one
@@ -689,6 +794,9 @@ fn drain_before_submit(name: &str) -> bool {
     name == "h264_amf"
 }
 
+/// Input pixel format for a given encoder. Most accept planar YUV420P;
+/// Intel QSV only takes the semi-planar NV12 layout (same 4:2:0 subsampling,
+/// interleaved chroma). swscale converts RGBA to either directly.
 fn encoder_pix_fmt(name: &str) -> Pixel {
     match name {
         "h264_qsv" => Pixel::NV12,
@@ -696,15 +804,20 @@ fn encoder_pix_fmt(name: &str) -> Pixel {
     }
 }
 
+/// Open one encoding session. `quality` sets the resolution bound and
+/// frame rate; the bitrate is the preset's scaled to `bitrate_scale_pct`
+/// (see [`RateControl`] for everything derived from it).
 fn open_session(
     codec: ffmpeg::Codec,
     name: &str,
     quality: Quality,
+    bitrate_scale_pct: u32,
     src_w: u32,
     src_h: u32,
     src_format: PixelFormat,
 ) -> Result<EncSession, CodecError> {
     let (out_w, out_h) = fit_dimensions(src_w, src_h, quality);
+    let rc = RateControl::for_target(quality.scaled_bitrate(bitrate_scale_pct));
     let pix_fmt = encoder_pix_fmt(name);
     // swscale takes either 4-byte layout natively — BGRA straight from
     // DXGI costs the same as RGBA and saves the capture side a
@@ -724,11 +837,6 @@ fn open_session(
         .video()
         .map_err(|e| CodecError::EncoderInit(e.to_string()))?;
 
-    let target_bitrate = quality.bitrate() as usize;
-    // Peak bitrate: 1.5× target gives keyframes room to breathe
-    // without allowing unconstrained spikes.
-    let max_bitrate = target_bitrate * 3 / 2;
-
     ctx.set_width(out_w);
     ctx.set_height(out_h);
     ctx.set_format(pix_fmt);
@@ -736,8 +844,8 @@ fn open_session(
     // rate control honest under variable capture rates.
     ctx.set_time_base(Rational(1, 1000));
     ctx.set_frame_rate(Some(Rational(quality.fps() as i32, 1)));
-    ctx.set_bit_rate(target_bitrate);
-    ctx.set_max_bit_rate(max_bitrate);
+    ctx.set_bit_rate(rc.target as usize);
+    ctx.set_max_bit_rate(rc.maxrate as usize);
     // Backstop GOP only — the real cadence is the time-based IDR forcing
     // in encode(). Keeping this much longer than KEYFRAME_INTERVAL_MS
     // means exactly one mechanism decides where keyframes go.
@@ -766,7 +874,7 @@ fn open_session(
         (*p).color_range = ffmpeg::ffi::AVColorRange::AVCOL_RANGE_MPEG;
     }
 
-    let opts = codec_options(name, quality);
+    let opts = codec_options(name, rc);
     let encoder = ctx
         .open_with(opts)
         .map_err(|e| CodecError::EncoderInit(format!("{name}: {e}")))?;
@@ -807,6 +915,7 @@ fn open_session(
         src_format,
         out_w,
         out_h,
+        bitrate_scale_pct,
         rgba_frame,
         yuv_frame,
         pkt: Packet::empty(),
@@ -862,28 +971,24 @@ fn drain_packets(session: &mut EncSession, out: &mut Vec<EncodedFrame>) -> Resul
 ///
 /// - **`zerolatency` tune**: Disables lookahead and frame reordering.
 ///
-/// - **ABR + VBV, no CRF**: the `Quality` preset bitrates are the actual
-///   rate-control target. (Setting `crf` alongside a bitrate makes x264
-///   ignore the bitrate entirely — capped CRF — which made the preset
+/// - **ABR + VBV, no CRF**: the session's [`RateControl`] target (the
+///   `Quality` preset bitrate, scaled by the sender's ladder) is the
+///   actual rate-control target. (Setting `crf` alongside a bitrate makes
+///   x264 ignore the bitrate entirely — capped CRF — which made the preset
 ///   numbers decorative. One rate-control story now.)
 ///
 /// - **`forced-idr`** on every backend: frames we force via
 ///   `picture::Type::I` become true IDRs with parameter sets, not open-GOP
 ///   I frames. Without this, hardware encoders can emit a forced "keyframe"
 ///   that a newly-joined viewer cannot actually start decoding from.
-fn codec_options(name: &str, quality: Quality) -> Dictionary<'static> {
+fn codec_options(name: &str, rc: RateControl) -> Dictionary<'static> {
     let mut opts = Dictionary::new();
 
-    let target = quality.bitrate();
-    // VBV buffer caps the worst-case size of a single frame (a full
-    // buffer drain), which matters twice over: it bounds keyframe bursts
-    // on the wire, and the app's video chunking hard-limits one frame to
-    // 255 × 1080 B ≈ 275 KB (`protocol::MAX_VIDEO_FRAME_BYTES`) — beyond
-    // that the frame can't be sent at all. 2 Mbit ⇒ ≤250 KB per frame,
-    // comfortably inside that, and still 0.25–0.6 s of rate-control
-    // window depending on the preset.
-    let vbv_bufsize = target.min(VBV_MAX_BITS);
-    let maxrate = target * 3 / 2;
+    let RateControl {
+        maxrate,
+        bufsize: vbv_bufsize,
+        ..
+    } = rc;
 
     match name {
         "libx264" => {
@@ -1038,6 +1143,53 @@ fn fill_rgba_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod rate_control {
+        use super::*;
+        use crate::MIN_BITRATE_SCALE_PCT;
+
+        #[test]
+        fn maxrate_is_one_and_a_half_times_target() {
+            assert_eq!(RateControl::for_target(8_000_000).maxrate, 12_000_000);
+        }
+
+        #[test]
+        fn bufsize_equals_target_below_the_ceiling() {
+            assert_eq!(RateControl::for_target(1_200_000).bufsize, 1_200_000);
+        }
+
+        #[test]
+        fn bufsize_is_capped_at_the_ceiling() {
+            assert_eq!(RateControl::for_target(10_000_000).bufsize, VBV_MAX_BITS);
+        }
+
+        /// The per-frame transport cap (`protocol::MAX_VIDEO_FRAME_BYTES`,
+        /// 275,400 B) must hold at every rung of every preset: bufsize
+        /// bounds a keyframe, so it must stay under the ceiling that was
+        /// sized against that cap.
+        #[test]
+        fn bufsize_never_exceeds_ceiling_for_any_preset_at_any_scale() {
+            for &q in Quality::ALL {
+                for pct in MIN_BITRATE_SCALE_PCT..=100 {
+                    let rc = RateControl::for_target(q.scaled_bitrate(pct));
+                    assert!(
+                        rc.bufsize <= VBV_MAX_BITS,
+                        "{q} at {pct}%: bufsize {} > {VBV_MAX_BITS}",
+                        rc.bufsize
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn scaling_shrinks_all_three_numbers_together() {
+            let full = RateControl::for_target(Quality::FHD60.scaled_bitrate(100));
+            let half = RateControl::for_target(Quality::FHD60.scaled_bitrate(50));
+            assert!(half.target < full.target);
+            assert!(half.maxrate < full.maxrate);
+            assert!(half.bufsize <= full.bufsize);
+        }
+    }
 
     #[test]
     fn fit_preserves_aspect_and_never_upscales() {

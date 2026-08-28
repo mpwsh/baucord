@@ -43,8 +43,10 @@ use crate::WakeFn;
 use crate::screen::ScreenControl;
 use crate::voice::VoiceControl;
 
-/// How often to sample link statistics for the UI (and the voice
-/// encoder's uplink-loss feedback, which rides the same sample).
+/// How often to sample link statistics for the UI, the voice encoder's
+/// uplink-loss feedback, and the screen thread's bitrate ladder — all
+/// ride the same sample. The ladder's dwell time is sized against this
+/// cadence and renet's loss window (see `RATE_DWELL` in screen.rs).
 const NETWORK_STATS_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Longest the client goes without calling `send_packets()` when it has
@@ -73,9 +75,14 @@ const LINK_LOG_LOSS_PCT: f64 = 5.0;
 /// Uplink loss readings at or above this are not fed to the voice
 /// encoder. renet measures loss over a 6 s window of *sent* packets; on
 /// a quiet link (nobody talking, only keepalives) that window holds a
-/// handful of packets and the ratio is noise — the same artifact
-/// `screen.rs` guards against with `PACE_LOSS_IMPLAUSIBLE`. A link that
-/// really loses half its packets is beyond what FEC can fix anyway.
+/// handful of packets and the ratio is noise. A link that really loses
+/// half its packets is beyond what FEC can fix anyway.
+///
+/// The screen thread's bitrate ladder deliberately does NOT use this
+/// gate: while a share is running the link is anything but quiet, and
+/// the 2026-08-28 incident logged 60–67% real loss for minutes at a
+/// time. It guards against the idle artifact by checking `kbps_up`
+/// against the rung it's on instead.
 const UPLINK_LOSS_IMPLAUSIBLE_PCT: f64 = 50.0;
 
 /// Timeout for the connect-token HTTP fetch.
@@ -214,7 +221,7 @@ pub enum NetworkMessage {
         viewer_id: ClientId,
     },
     /// Aggregated viewer health for the stream we are sharing
-    /// (routed to screen thread, not app — drives fps adaptation).
+    /// (routed to screen thread, not app — shown in the sharer's stats).
     StreamHealth {
         worst_loss: f32,
         worst_rtt_ms: f32,
@@ -1543,7 +1550,10 @@ fn run_network_loop(
 
                     // Link stats → voice thread (drives the encoder's FEC
                     // hint: renet's loss is *our uplink*, the leg the
-                    // decoder-side counters can't see) and → app (UI).
+                    // decoder-side counters can't see), → screen thread
+                    // (drives the bitrate ladder while sharing; the raw
+                    // reading, see UPLINK_LOSS_IMPLAUSIBLE_PCT), and →
+                    // app (UI).
                     NetworkMessage::NetworkStats {
                         rtt_ms,
                         loss_pct,
@@ -1553,6 +1563,12 @@ fn run_network_loop(
                         if let Some(pct) = plausible_uplink_loss_pct(loss_pct) {
                             let _ = voice_tx.try_send(VoiceControl::SetUplinkLoss(pct));
                         }
+                        #[allow(clippy::cast_possible_truncation)] // f32 is plenty for percent/ms/kbit
+                        let _ = screen_tx.try_send(ScreenControl::UplinkStats {
+                            loss_pct: loss_pct as f32,
+                            rtt_ms: rtt_ms as f32,
+                            kbps_up: kbps_up as f32,
+                        });
                         let _ = msg_tx.send(NetworkMessage::NetworkStats {
                             rtt_ms,
                             loss_pct,
@@ -1563,7 +1579,7 @@ fn run_network_loop(
                     }
 
                     // Viewer health for our stream → screen thread
-                    // (drives fps adaptation while sharing)
+                    // (sharer's stats block)
                     NetworkMessage::StreamHealth {
                         worst_loss,
                         worst_rtt_ms,

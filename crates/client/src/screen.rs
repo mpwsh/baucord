@@ -13,7 +13,11 @@
 // and the decoder pulls at its own pace.
 //
 // System audio: incoming Opus stereo packets are delegated to
-// `core::stream::decoder` — screen.rs never touches Opus directly.
+// `audio::stream::decoder` — screen.rs never touches Opus directly.
+//
+// Sender-side adaptation: uplink link samples (from network.rs) drive a
+// bitrate ladder on the encoder; viewer keyframe-request distress drives
+// a small fps pacer. See the "Sender-side adaptation" section below.
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 
@@ -90,12 +94,27 @@ pub enum ScreenControl {
     /// A viewer (relayed via the server) asked for a fresh keyframe —
     /// their decoder hit an unrecoverable gap, or they joined mid-GOP.
     ForceKeyframe,
-    /// Aggregated viewer health for our stream, relayed by the network
-    /// thread ~1/s while sharing. Drives sender-side fps adaptation.
+    /// Aggregated viewer health for our stream (the server→viewer leg),
+    /// relayed by the network thread ~1/s while sharing. Shown in the
+    /// sharer's stats block; it does not drive adaptation — see
+    /// `UplinkStats` for the leg the sharer can actually do something
+    /// about.
     StreamHealth {
+        /// Worst viewer loss, 0.0–1.0 (fraction, not percent).
         worst_loss: f32,
         worst_rtt_ms: f32,
         viewers: u16,
+    },
+    /// Our own uplink as renet measures it, sampled by the network
+    /// thread every ~2 s (`NETWORK_STATS_INTERVAL`). Drives the encoder
+    /// bitrate ladder while sharing; ignored otherwise.
+    UplinkStats {
+        /// Sent packets the server never acked, in percent (0–100).
+        loss_pct: f32,
+        rtt_ms: f32,
+        /// renet payload throughput, kbit/s. Video dominates while
+        /// sharing, so this is effectively the encoder's output rate.
+        kbps_up: f32,
     },
     /// Clean shutdown.
     Shutdown,
@@ -158,8 +177,13 @@ pub struct SharedScreenState {
     /// Number of viewers currently subscribed to our stream.
     pub stream_viewers: Arc<AtomicU32>,
     /// Current capture pace as a percentage of the preset fps
-    /// (100 / 75 / 50) — sender-side adaptation under viewer loss.
+    /// (100 / 75 / 50) — stepped down under viewer keyframe-request
+    /// distress, see `PACE_SCALES`.
     pub fps_scale_pct: Arc<AtomicU32>,
+    /// Current encoder bitrate as a percentage of the preset (100 at
+    /// full rate) — stepped down under uplink loss, see
+    /// `RATE_LADDER_PCT`.
+    pub bitrate_scale_pct: Arc<AtomicU32>,
 }
 
 impl SharedScreenState {
@@ -175,6 +199,7 @@ impl SharedScreenState {
             stream_rtt_ms: Arc::new(AtomicU32::new(0)),
             stream_viewers: Arc::new(AtomicU32::new(0)),
             fps_scale_pct: Arc::new(AtomicU32::new(100)),
+            bitrate_scale_pct: Arc::new(AtomicU32::new(100)),
         }
     }
 }
@@ -292,59 +317,287 @@ struct CaptureState {
     /// System audio capture — started alongside video, sends Opus stereo
     /// packets to the network. `None` if platform doesn't support it.
     system_audio: Option<SystemAudioCapture>,
-    /// Index into `PACE_SCALES` — current fps adaptation step.
+    /// Encoder bitrate ladder (see "Sender-side adaptation").
+    ladder: BitrateLadder,
+    /// Most recent uplink loss sample, percent. Gates the fps pacer:
+    /// keyframe requests during our own loss are not viewer distress.
+    uplink_loss_pct: f32,
+    /// Index into `PACE_SCALES` — current fps pace step.
     pace_idx: usize,
-    /// When the pace last changed (hysteresis cooldown).
+    /// When the pace last changed (cooldown).
     pace_changed: Instant,
-    /// Since when viewer loss has been continuously low (recovery hold).
-    pace_good_since: Option<Instant>,
-    /// Consecutive over-threshold StreamHealth samples (spike filter).
-    pace_bad_samples: u32,
     /// Recent viewer keyframe-request arrivals (distress detector).
     kf_request_times: Vec<Instant>,
     /// Last time viewer distress stepped the pace down.
     last_distress: Option<Instant>,
 }
 
-// ── Sender-side fps adaptation ──────────────────────────────────────────
+// ── Sender-side adaptation ──────────────────────────────────────────────
 //
-// When viewers report sustained packet loss (via the server's
-// StreamHealth aggregation), reduce capture fps instead of per-frame
-// quality: bitrate falls roughly proportionally while every frame keeps
-// its full clarity — the right trade for screen share, where viewers
-// are *reading* the stream, not judging motion smoothness. The
-// encoder's bitrate/quality settings are untouched; in fact each frame
-// gets a slightly larger share of the rate budget.
+// Two loops, two jobs:
+//
+// * The **bitrate ladder** protects our uplink. network.rs samples
+//   renet's uplink loss, RTT and send rate every ~2 s; sustained loss
+//   steps the encoder's bitrate scale down a rung, a long clean stretch
+//   steps it back up. Resolution and frame rate never change: every
+//   frame still goes out, each with fewer bits — a softer picture that
+//   stays smooth, rather than a sharp one that freezes.
+//
+// * The **fps pacer** handles the one case bitrate can't: a viewer that
+//   keeps asking for keyframes while our uplink is clean is failing on
+//   *its* side (a decoder that can't keep up, downlink loss we can't
+//   see). Fewer frames per second is the remedy there.
+//
+// Why the ladder watches the uplink and not viewer reports: in the
+// 2026-08-28 incident a 1080p60 share cycled 60→30→60 fps for eight
+// minutes. The pacer only learned of the problem from viewer keyframe
+// requests, 24 s after the link monitor first logged loss, and stepped
+// back up on a timer keyed to the server→viewer leg — which was clean
+// throughout, because packets the uplink dropped never reached the
+// server to be lost again. So it re-saturated the uplink every ~40 s.
+// This loop reacts to the leg that failed, in ~4 s, and only climbs
+// once the uplink has carried the current rung cleanly for a while.
+
+/// Rungs, percent of the preset bitrate. Descending; index 0 is full
+/// rate.
+const RATE_LADDER_PCT: [u32; 5] = [100, 70, 50, 35, 25];
+/// No rung runs below this many bits/s whatever the preset. A rung the
+/// floor lifts onto the one above it is unreachable (HD30's 25% would be
+/// 875 kbit/s; its ladder ends at 35% ≈ 1.2 Mbit).
+const RATE_FLOOR_BPS: u32 = 1_200_000;
+/// Uplink loss (percent) at or above which a sample counts against the
+/// current rung.
+const RATE_LOSS_STEP_DOWN: f32 = 10.0;
+/// Loss at or above this steps two rungs at once. Every incident episode
+/// crossed 50% within 4 s of onset, and the rung one down demonstrably
+/// didn't fit either — dwelling there is 10 s of frozen stream.
+const RATE_LOSS_SEVERE: f32 = 30.0;
+/// Loss below which a sample counts toward climbing.
+const RATE_LOSS_RECOVERED: f32 = 2.0;
+/// Consecutive lossy samples before stepping down (~4 s). One sample is
+/// a blip; two is a trend.
+const RATE_STEP_DOWN_SAMPLES: u32 = 2;
+/// Consecutive clean samples before stepping up (~30 s), multiplied by
+/// the probe backoff.
+const RATE_STEP_UP_SAMPLES: u32 = 15;
+/// Minimum time at a rung before stepping again. Must exceed renet's
+/// loss window (6 s, excluding the newest 0.9 s): a step's effect isn't
+/// in the loss figure until the window has rolled over, and stepping
+/// again before that acts on stale data. Not applied to a step down
+/// that follows a climb — the link was clean for the whole hold before
+/// the climb, so loss right after it is fresh evidence, and the probe
+/// is undone as soon as it's detected.
+const RATE_DWELL: Duration = Duration::from_secs(10);
+/// A step down this soon after a step up is a failed probe: the next
+/// climb waits twice as long, up to `RATE_PROBE_BACKOFF_MAX` times the
+/// base hold. This is what stops a link that fits at 50% but not 70%
+/// from being re-probed every 30 s.
+const RATE_PROBE_FAIL_WINDOW: Duration = Duration::from_secs(20);
+const RATE_PROBE_BACKOFF_MAX: u32 = 4;
+/// The link only proves or disproves a rung while it is carrying it.
+/// Samples with `up` below this fraction of the rung's bitrate (static
+/// screen, nothing to send) count neither way: loss then isn't ours to
+/// shed, and a clean reading says nothing about whether the rung fits.
+const RATE_EXERCISED_STEP_DOWN: f32 = 0.25;
+const RATE_EXERCISED_STEP_UP: f32 = 0.5;
+
+/// Percent of the preset a rung actually runs at: the ladder value,
+/// lifted to `RATE_FLOOR_BPS` when the preset would put it lower.
+fn rung_pct(quality: Quality, idx: usize) -> u32 {
+    let floor_pct = RATE_FLOOR_BPS.div_ceil(quality.bitrate() / 100);
+    RATE_LADDER_PCT[idx].max(floor_pct).min(100)
+}
+
+/// Lowest rung index reachable for this preset — the last one that is
+/// still strictly below the rung above it after the floor is applied.
+fn lowest_rung(quality: Quality) -> usize {
+    (1..RATE_LADDER_PCT.len())
+        .take_while(|&i| rung_pct(quality, i) < rung_pct(quality, i - 1))
+        .last()
+        .unwrap_or(0)
+}
+
+/// The ladder's state machine, kept free of I/O so it can be unit
+/// tested: [`BitrateLadder::sample`] takes one link sample and returns
+/// the rung change to apply, if any. `adapt_bitrate` owns the side
+/// effects (encoder, shared state, log).
+struct BitrateLadder {
+    quality: Quality,
+    /// Index into `RATE_LADDER_PCT`.
+    idx: usize,
+    /// When the rung last changed; `None` until the first change so a
+    /// share that starts on a saturated uplink doesn't sit out a dwell.
+    changed: Option<Instant>,
+    /// Consecutive lossy, link-exercised samples (spike filter).
+    bad_samples: u32,
+    /// Consecutive clean, link-exercised samples (climb hold).
+    good_samples: u32,
+    /// Multiplier on the climb hold: 1, 2, 4 — doubled by each failed
+    /// probe, reset by a step down that wasn't one.
+    probe_backoff: u32,
+    /// When the ladder last stepped up; a step down soon after is a
+    /// failed probe.
+    last_step_up: Option<Instant>,
+}
+
+/// A rung transition decided by [`BitrateLadder::sample`].
+struct RungChange {
+    /// New bitrate scale, percent of the preset.
+    pct: u32,
+    /// Human-readable trigger, for the log line.
+    why: String,
+}
+
+impl BitrateLadder {
+    fn new(quality: Quality) -> Self {
+        Self {
+            quality,
+            idx: 0,
+            changed: None,
+            bad_samples: 0,
+            good_samples: 0,
+            probe_backoff: 1,
+            last_step_up: None,
+        }
+    }
+
+    /// Current bitrate scale, percent of the preset.
+    fn pct(&self) -> u32 {
+        rung_pct(self.quality, self.idx)
+    }
+
+    /// Whether the ladder is below full rate.
+    fn engaged(&self) -> bool {
+        self.idx > 0
+    }
+
+    /// Apply one uplink sample (loss in percent, RTT in ms, send rate in
+    /// kbit/s) and decide whether the rung changes.
+    #[allow(clippy::cast_precision_loss)] // kbit/s comparisons, exactness irrelevant
+    fn sample(
+        &mut self,
+        now: Instant,
+        loss_pct: f32,
+        rtt_ms: f32,
+        kbps_up: f32,
+    ) -> Option<RungChange> {
+        let rung_kbps = self.quality.scaled_bitrate(self.pct()) as f32 / 1000.0;
+        let exercised = |fraction: f32| kbps_up >= rung_kbps * fraction;
+        let dwelled = self
+            .changed
+            .is_none_or(|t| now.duration_since(t) >= RATE_DWELL);
+        let last_change_was_climb = self.changed.is_some() && self.changed == self.last_step_up;
+
+        if loss_pct >= RATE_LOSS_STEP_DOWN {
+            self.good_samples = 0;
+            if !exercised(RATE_EXERCISED_STEP_DOWN) {
+                // Lossy but idle: not our traffic, nothing to shed.
+                self.bad_samples = 0;
+                return None;
+            }
+            self.bad_samples += 1;
+            let lowest = lowest_rung(self.quality);
+            if self.bad_samples < RATE_STEP_DOWN_SAMPLES
+                || !(dwelled || last_change_was_climb)
+                || self.idx >= lowest
+            {
+                return None;
+            }
+            let failed_probe = self
+                .last_step_up
+                .take()
+                .is_some_and(|t| now.duration_since(t) < RATE_PROBE_FAIL_WINDOW);
+            // A failed probe goes back exactly where it came from — that
+            // rung was known good; overshooting it would waste quality.
+            let rungs = if !failed_probe && loss_pct >= RATE_LOSS_SEVERE { 2 } else { 1 };
+            let next = (self.idx + rungs).min(lowest);
+            self.probe_backoff = if failed_probe {
+                (self.probe_backoff * 2).min(RATE_PROBE_BACKOFF_MAX)
+            } else {
+                1
+            };
+            let note = if failed_probe {
+                format!(
+                    "; probe failed, next climb needs {} clean samples",
+                    RATE_STEP_UP_SAMPLES * self.probe_backoff
+                )
+            } else {
+                String::new()
+            };
+            let why =
+                format!("uplink loss {loss_pct:.0}%, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s{note}");
+            Some(self.move_to(next, now, why))
+        } else if loss_pct < RATE_LOSS_RECOVERED {
+            self.bad_samples = 0;
+            if !self.engaged() || !exercised(RATE_EXERCISED_STEP_UP) {
+                return None;
+            }
+            self.good_samples += 1;
+            let needed = RATE_STEP_UP_SAMPLES * self.probe_backoff;
+            if self.good_samples < needed || !dwelled {
+                return None;
+            }
+            self.last_step_up = Some(now);
+            let why =
+                format!("uplink clean for {needed} samples, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s");
+            Some(self.move_to(self.idx - 1, now, why))
+        } else {
+            // Middle band: hold the rung, restart both clocks.
+            self.bad_samples = 0;
+            self.good_samples = 0;
+            None
+        }
+    }
+
+    fn move_to(&mut self, idx: usize, now: Instant, why: String) -> RungChange {
+        self.idx = idx;
+        self.changed = Some(now);
+        self.bad_samples = 0;
+        self.good_samples = 0;
+        RungChange {
+            pct: self.pct(),
+            why,
+        }
+    }
+}
+
+/// Feed one uplink sample to the ladder and apply its decision.
+fn adapt_bitrate(
+    state: &mut CaptureState,
+    now: Instant,
+    loss_pct: f32,
+    rtt_ms: f32,
+    kbps_up: f32,
+    shared: &SharedScreenState,
+) {
+    state.uplink_loss_pct = loss_pct;
+    let from = state.ladder.pct();
+    if let Some(change) = state.ladder.sample(now, loss_pct, rtt_ms, kbps_up) {
+        state.encoder.set_bitrate_scale_pct(change.pct);
+        shared.bitrate_scale_pct.store(change.pct, Ordering::Relaxed);
+        info!(
+            "bitrate ladder: {from}% → {}% ({} kbit/s; {})",
+            change.pct,
+            state.quality.scaled_bitrate(change.pct) / 1000,
+            change.why
+        );
+    }
+}
+
+// ── Viewer-distress fps pacer ───────────────────────────────────────────
 
 const PACE_SCALES: [f32; 3] = [1.0, 0.75, 0.5];
-/// Step the fps down when worst viewer loss exceeds this.
-const PACE_LOSS_STEP_DOWN: f32 = 0.08;
-/// Consider the link recovered below this loss.
-const PACE_LOSS_RECOVERED: f32 = 0.02;
 /// Minimum time between pace changes.
 const PACE_STEP_COOLDOWN: Duration = Duration::from_secs(2);
-/// How long loss must stay low before stepping back up.
-const PACE_RECOVER_HOLD: Duration = Duration::from_secs(5);
-/// Ignore StreamHealth samples with implausible loss. renet computes
-/// loss over a 6 s window that excludes the newest 900 ms; on a quiet
-/// or freshly-subscribed connection that window holds a handful of
-/// packets (idle exchanges even end with a terminal ack packet that is
-/// never acked), so a perfect link can read 50–100% "loss". A link
-/// that genuinely loses half its packets can't watch a stream at all —
-/// adaptation has nothing useful to do with such a sample either way.
-const PACE_LOSS_IMPLAUSIBLE: f32 = 0.5;
-/// Consecutive over-threshold samples (1/s each) required to step down —
-/// a single spike is measurement noise, three seconds of it is weather.
-const PACE_STEP_DOWN_SAMPLES: u32 = 3;
 /// Repeated viewer keyframe requests mean a viewer keeps failing to
-/// keep a picture — from loss we can't see, or a decoder that can't
-/// keep up with the frame rate. Either way, fewer frames per second is
-/// the remedy. This many requests within PACE_DISTRESS_WINDOW steps
-/// the pace down.
+/// keep a picture. This many requests within PACE_DISTRESS_WINDOW steps
+/// the pace down — unless the bitrate ladder is engaged or the uplink is
+/// lossy, in which case the requests are a symptom of our own loss and
+/// the ladder is already on it.
 const PACE_DISTRESS_REQUESTS: usize = 4;
 const PACE_DISTRESS_WINDOW: Duration = Duration::from_secs(5);
 /// Don't step back up for this long after viewer distress — stepping up
-/// the moment the viewer recovers just re-chokes them in a slow cycle.
+/// the moment the viewer goes quiet just re-chokes them in a slow cycle.
 const PACE_DISTRESS_HOLD: Duration = Duration::from_secs(30);
 
 /// While the screen is static (streaming backend reports Unchanged),
@@ -372,54 +625,62 @@ fn effective_frame_interval(state: &CaptureState) -> Duration {
         .mul_f32(1.0 / PACE_SCALES[state.pace_idx])
 }
 
-/// Apply one StreamHealth sample to the pace state machine.
+/// Record a viewer keyframe request and step the pace down if requests
+/// have become a pattern — but only when they can't be explained by our
+/// own uplink (see `PACE_DISTRESS_REQUESTS`).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn adapt_pace(state: &mut CaptureState, worst_loss: f32, shared: &SharedScreenState) {
-    let now = Instant::now();
-    if worst_loss >= PACE_LOSS_IMPLAUSIBLE {
-        // Measurement artifact (or a dead link, where fps changes help
-        // nobody): display it, adapt on nothing, hold all timers.
-        state.pace_bad_samples = 0;
-    } else if worst_loss >= PACE_LOSS_STEP_DOWN {
-        state.pace_good_since = None;
-        state.pace_bad_samples += 1;
-        if state.pace_bad_samples >= PACE_STEP_DOWN_SAMPLES
-            && state.pace_idx + 1 < PACE_SCALES.len()
-            && now.duration_since(state.pace_changed) >= PACE_STEP_COOLDOWN
-        {
-            state.pace_idx += 1;
-            state.pace_changed = now;
-            state.pace_bad_samples = 0;
-            info!(
-                "Viewer loss {:.1}% sustained — reducing capture to {:.0}% fps (clarity preserved)",
-                worst_loss * 100.0,
-                PACE_SCALES[state.pace_idx] * 100.0
-            );
-        }
-    } else if worst_loss <= PACE_LOSS_RECOVERED {
-        state.pace_bad_samples = 0;
-        if state.pace_idx > 0 {
-            let since = *state.pace_good_since.get_or_insert(now);
-            if now.duration_since(since) >= PACE_RECOVER_HOLD
-                && now.duration_since(state.pace_changed) >= PACE_STEP_COOLDOWN
-                && state
-                    .last_distress
-                    .is_none_or(|t| now.duration_since(t) >= PACE_DISTRESS_HOLD)
-            {
-                state.pace_idx -= 1;
-                state.pace_changed = now;
-                state.pace_good_since = Some(now);
-                info!(
-                    "Viewer link recovered — restoring capture to {:.0}% fps",
-                    PACE_SCALES[state.pace_idx] * 100.0
-                );
-            }
-        }
-    } else {
-        // Middle band: hold the current pace, restart both clocks.
-        state.pace_bad_samples = 0;
-        state.pace_good_since = None;
+fn note_keyframe_request(state: &mut CaptureState, now: Instant, shared: &SharedScreenState) {
+    state.kf_request_times.push(now);
+    state
+        .kf_request_times
+        .retain(|&t| now.duration_since(t) < PACE_DISTRESS_WINDOW);
+    let uplink_explains_it = state.ladder.engaged() || state.uplink_loss_pct >= RATE_LOSS_STEP_DOWN;
+    if uplink_explains_it
+        || state.kf_request_times.len() < PACE_DISTRESS_REQUESTS
+        || state.pace_idx + 1 >= PACE_SCALES.len()
+        || now.duration_since(state.pace_changed) < PACE_STEP_COOLDOWN
+    {
+        return;
     }
+    state.pace_idx += 1;
+    state.pace_changed = now;
+    state.last_distress = Some(now);
+    state.kf_request_times.clear();
+    info!(
+        "Viewer repeatedly requesting keyframes — reducing capture to {:.0}% fps",
+        PACE_SCALES[state.pace_idx] * 100.0
+    );
+    shared.fps_scale_pct.store(
+        (PACE_SCALES[state.pace_idx] * 100.0) as u32,
+        Ordering::Relaxed,
+    );
+}
+
+/// Step the pace back up once viewers have been quiet for the distress
+/// hold. Runs on the uplink sample tick (~2 s).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn recover_pace(state: &mut CaptureState, now: Instant, shared: &SharedScreenState) {
+    if state.pace_idx == 0 {
+        return;
+    }
+    state
+        .kf_request_times
+        .retain(|&t| now.duration_since(t) < PACE_DISTRESS_WINDOW);
+    let held = state
+        .last_distress
+        .is_none_or(|t| now.duration_since(t) >= PACE_DISTRESS_HOLD);
+    if !state.kf_request_times.is_empty()
+        || !held
+        || now.duration_since(state.pace_changed) < PACE_STEP_COOLDOWN
+    {
+        return;
+    }
+    state.pace_idx -= 1;
+    state.pace_changed = now;
+    info!(
+        "Viewers quiet — restoring capture to {:.0}% fps",
+        PACE_SCALES[state.pace_idx] * 100.0
+    );
     shared.fps_scale_pct.store(
         (PACE_SCALES[state.pace_idx] * 100.0) as u32,
         Ordering::Relaxed,
@@ -744,7 +1005,6 @@ fn handle_control(
                 }
             };
 
-            // Create encoder — use ffmpeg if available, fall back to openh264
             let encoder: Box<dyn VideoEncoder + Send> = match create_encoder(quality) {
                 Ok(e) => e,
                 Err(e) => {
@@ -789,10 +1049,10 @@ fn handle_control(
                 telemetry: (Instant::now(), 0, 0, 0, 0, 0),
                 keyframes_logged: 0,
                 system_audio,
+                ladder: BitrateLadder::new(quality),
+                uplink_loss_pct: 0.0,
                 pace_idx: 0,
                 pace_changed: Instant::now(),
-                pace_good_since: None,
-                pace_bad_samples: 0,
                 kf_request_times: Vec::new(),
                 last_distress: None,
             });
@@ -800,6 +1060,7 @@ fn handle_control(
             shared.is_sharing.store(true, Ordering::Relaxed);
             shared.frames_encoded.store(0, Ordering::Relaxed);
             shared.fps_scale_pct.store(100, Ordering::Relaxed);
+            shared.bitrate_scale_pct.store(100, Ordering::Relaxed);
             shared.stream_loss_pct.store(0, Ordering::Relaxed);
             shared.stream_rtt_ms.store(0, Ordering::Relaxed);
             shared.stream_viewers.store(0, Ordering::Relaxed);
@@ -822,6 +1083,7 @@ fn handle_control(
             if st.capture.take().is_some() {
                 shared.is_sharing.store(false, Ordering::Relaxed);
                 shared.fps_scale_pct.store(100, Ordering::Relaxed);
+                shared.bitrate_scale_pct.store(100, Ordering::Relaxed);
                 shared.stream_loss_pct.store(0, Ordering::Relaxed);
                 shared.stream_rtt_ms.store(0, Ordering::Relaxed);
                 shared.stream_viewers.store(0, Ordering::Relaxed);
@@ -989,27 +1251,7 @@ fn handle_control(
                     // period — keep frames flowing so it actually elapses.
                     state.keyframe_burst_until = Some(now + KEYFRAME_BURST_MAX);
                 }
-                state.kf_request_times.push(now);
-                state
-                    .kf_request_times
-                    .retain(|&t| now.duration_since(t) < PACE_DISTRESS_WINDOW);
-                if state.kf_request_times.len() >= PACE_DISTRESS_REQUESTS
-                    && state.pace_idx + 1 < PACE_SCALES.len()
-                    && now.duration_since(state.pace_changed) >= PACE_STEP_COOLDOWN
-                {
-                    state.pace_idx += 1;
-                    state.pace_changed = now;
-                    state.last_distress = Some(now);
-                    state.kf_request_times.clear();
-                    info!(
-                        "Viewer repeatedly requesting keyframes — reducing capture to {:.0}% fps",
-                        PACE_SCALES[state.pace_idx] * 100.0
-                    );
-                    shared.fps_scale_pct.store(
-                        (PACE_SCALES[state.pace_idx] * 100.0) as u32,
-                        Ordering::Relaxed,
-                    );
-                }
+                note_keyframe_request(state, now, shared);
             }
         }
 
@@ -1027,8 +1269,17 @@ fn handle_control(
             shared
                 .stream_viewers
                 .store(u32::from(viewers), Ordering::Relaxed);
+        }
+
+        ScreenControl::UplinkStats {
+            loss_pct,
+            rtt_ms,
+            kbps_up,
+        } => {
             if let Some(state) = &mut st.capture {
-                adapt_pace(state, worst_loss, shared);
+                let now = Instant::now();
+                adapt_bitrate(state, now, loss_pct, rtt_ms, kbps_up, shared);
+                recover_pace(state, now, shared);
             }
         }
 
@@ -1187,7 +1438,7 @@ fn capture_and_encode(
 /// Decode an incoming system audio (Opus stereo) packet from a remote peer.
 ///
 /// Lazy-initializes the stream decoder on the first packet. The Opus
-/// decoder, PLC, and playback pipeline all live in `core::stream::decoder`
+/// decoder, PLC, and playback pipeline all live in `audio::stream::decoder`
 /// — this function just creates the handle and feeds it raw bytes.
 fn decode_incoming_system_audio(
     client_id: u64,
@@ -1216,7 +1467,7 @@ fn decode_incoming_system_audio(
         }
     }
 
-    // Feed the raw Opus packet — core library handles decode + PLC + playback.
+    // Feed the raw Opus packet — the audio crate handles decode + PLC + playback.
     if let Some(ref audio) = stream.stream_audio {
         audio.send(StreamAudioPacket { data, seq });
     }
@@ -1245,6 +1496,227 @@ fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
         Err(e) => {
             warn!("FFmpeg decoder unavailable: {e}");
             Err(CodecError::DecoderInit(e.to_string()))
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod bitrate_ladder {
+        use super::*;
+
+        /// Link samples at `loss` percent while the link is carrying the
+        /// current rung's full rate (so the exercised gates pass).
+        fn carrying(ladder: &mut BitrateLadder, now: Instant, loss: f32) -> Option<u32> {
+            #[allow(clippy::cast_precision_loss)]
+            let kbps = ladder.quality.scaled_bitrate(ladder.pct()) as f32 / 1000.0;
+            ladder.sample(now, loss, 220.0, kbps).map(|c| c.pct)
+        }
+
+        fn at(t0: Instant, secs: u64) -> Instant {
+            t0 + Duration::from_secs(secs)
+        }
+
+        #[test]
+        fn starts_at_full_rate() {
+            assert_eq!(BitrateLadder::new(Quality::FHD60).pct(), 100);
+        }
+
+        #[test]
+        fn holds_on_a_single_lossy_sample() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            assert_eq!(carrying(&mut l, at(t0, 0), 30.0), None);
+        }
+
+        #[test]
+        fn drops_two_rungs_on_severe_loss() {
+            // 2026-08-28 18:31:20–22: 29.7% then 53.4% at 8.3 Mbit.
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 29.7);
+            assert_eq!(carrying(&mut l, at(t0, 2), 53.4), Some(50));
+        }
+
+        #[test]
+        fn drops_one_rung_on_moderate_loss() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 15.0);
+            assert_eq!(carrying(&mut l, at(t0, 2), 15.0), Some(70));
+        }
+
+        #[test]
+        fn ignores_loss_while_the_link_is_idle() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            let steps: Vec<_> = (0..6)
+                .filter_map(|i| l.sample(at(t0, 2 * i), 60.0, 220.0, 500.0))
+                .collect();
+            assert!(steps.is_empty());
+        }
+
+        #[test]
+        fn waits_out_the_dwell_before_stepping_again() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 60.0);
+            carrying(&mut l, at(t0, 2), 60.0); // → 50% at t=2
+            let inside_dwell: Vec<_> = [4, 6, 8, 10]
+                .into_iter()
+                .filter_map(|s| carrying(&mut l, at(t0, s), 60.0))
+                .collect();
+            assert!(inside_dwell.is_empty());
+        }
+
+        #[test]
+        fn steps_again_once_the_dwell_has_passed() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 60.0);
+            carrying(&mut l, at(t0, 2), 60.0); // → 50% at t=2
+            for s in [4, 6, 8, 10] {
+                carrying(&mut l, at(t0, s), 60.0);
+            }
+            assert_eq!(carrying(&mut l, at(t0, 12), 60.0), Some(25));
+        }
+
+        #[test]
+        fn climbs_one_rung_after_the_clean_hold() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 60.0);
+            carrying(&mut l, at(t0, 2), 60.0); // → 50%
+            let mut result = None;
+            for i in 1..=u64::from(RATE_STEP_UP_SAMPLES) {
+                result = carrying(&mut l, at(t0, 12 + 2 * i), 0.5);
+            }
+            assert_eq!(result, Some(70));
+        }
+
+        #[test]
+        fn does_not_climb_one_sample_early() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 60.0);
+            carrying(&mut l, at(t0, 2), 60.0); // → 50%
+            let mut result = None;
+            for i in 1..u64::from(RATE_STEP_UP_SAMPLES) {
+                result = carrying(&mut l, at(t0, 12 + 2 * i), 0.5);
+            }
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn does_not_climb_while_the_link_is_idle() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 60.0);
+            carrying(&mut l, at(t0, 2), 60.0); // → 50%
+            let steps: Vec<_> = (1..=40)
+                .filter_map(|i| l.sample(at(t0, 12 + 2 * i), 0.0, 60.0, 500.0))
+                .collect();
+            assert!(steps.is_empty());
+        }
+
+        /// Drive a fresh FHD60 ladder to 50%, then through a full clean
+        /// hold to a climb to 70%. Returns the ladder and the time (s)
+        /// of the climb.
+        fn after_a_climb() -> (BitrateLadder, Instant, u64) {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 60.0);
+            carrying(&mut l, at(t0, 2), 60.0); // → 50%
+            for i in 1..=u64::from(RATE_STEP_UP_SAMPLES) {
+                carrying(&mut l, at(t0, 12 + 2 * i), 0.5); // → 70% on the last
+            }
+            let t_up = 12 + 2 * u64::from(RATE_STEP_UP_SAMPLES);
+            assert_eq!(l.pct(), 70, "setup: climb did not happen");
+            (l, t0, t_up)
+        }
+
+        #[test]
+        fn failed_probe_is_undone_without_waiting_for_the_dwell() {
+            let (mut l, t0, t_up) = after_a_climb();
+            carrying(&mut l, at(t0, t_up + 2), 60.0);
+            assert_eq!(carrying(&mut l, at(t0, t_up + 4), 60.0), Some(50));
+        }
+
+        #[test]
+        fn failed_probe_returns_to_the_previous_rung_even_under_severe_loss() {
+            let (mut l, t0, t_up) = after_a_climb();
+            carrying(&mut l, at(t0, t_up + 2), 65.0);
+            carrying(&mut l, at(t0, t_up + 4), 65.0);
+            assert_eq!(l.pct(), 50);
+        }
+
+        #[test]
+        fn failed_probe_doubles_the_next_hold() {
+            let (mut l, t0, t_up) = after_a_climb();
+            carrying(&mut l, at(t0, t_up + 2), 60.0);
+            carrying(&mut l, at(t0, t_up + 4), 60.0);
+            assert_eq!(l.probe_backoff, 2);
+        }
+
+        #[test]
+        fn backoff_is_capped() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            l.probe_backoff = RATE_PROBE_BACKOFF_MAX;
+            l.idx = 1;
+            l.changed = Some(at(t0, 100));
+            l.last_step_up = Some(at(t0, 100));
+            carrying(&mut l, at(t0, 102), 60.0);
+            carrying(&mut l, at(t0, 104), 60.0);
+            assert_eq!(l.probe_backoff, RATE_PROBE_BACKOFF_MAX);
+        }
+
+        #[test]
+        fn fresh_congestion_resets_the_backoff() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            l.probe_backoff = 4;
+            carrying(&mut l, at(t0, 0), 60.0);
+            carrying(&mut l, at(t0, 2), 60.0);
+            assert_eq!(l.probe_backoff, 1);
+        }
+
+        #[test]
+        fn middle_band_resets_the_lossy_count() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            carrying(&mut l, at(t0, 0), 15.0);
+            carrying(&mut l, at(t0, 2), 5.0);
+            assert_eq!(carrying(&mut l, at(t0, 4), 15.0), None);
+        }
+
+        #[test]
+        fn floor_shortens_the_hd30_ladder() {
+            assert_eq!(lowest_rung(Quality::HD30), 3);
+        }
+
+        #[test]
+        fn floor_lifts_hd30_bottom_rung_to_35_percent() {
+            assert_eq!(rung_pct(Quality::HD30, 3), 35);
+        }
+
+        #[test]
+        fn fhd60_reaches_every_rung() {
+            assert_eq!(lowest_rung(Quality::FHD60), RATE_LADDER_PCT.len() - 1);
+        }
+
+        #[test]
+        fn never_steps_below_the_lowest_rung() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::HD30);
+            let mut last = None;
+            for i in 0..40 {
+                if let Some(p) = carrying(&mut l, at(t0, 2 * i), 60.0) {
+                    last = Some(p);
+                }
+            }
+            assert_eq!(last, Some(35));
         }
     }
 }

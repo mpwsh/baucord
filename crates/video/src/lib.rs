@@ -96,14 +96,16 @@ impl Quality {
         }
     }
 
-    /// Target bitrate in bits/sec.
+    /// Target bitrate in bits/sec at 100% scale.
     ///
     /// Tuned for **screen content** (sharp text, hard edges, flat colors).
     /// Screen content needs ~1.5–2× more bitrate than camera video at the
     /// same resolution because DCT-based codecs spend more bits preserving
     /// high-frequency detail (glyphs, 1px borders, UI elements).
     ///
-    /// This is the *actual* encoder target (ABR + VBV), not a hint.
+    /// This is the *actual* encoder target (ABR + VBV), not a hint. The
+    /// sender may run below it under uplink pressure — see
+    /// [`Quality::scaled_bitrate`] and [`VideoEncoder::set_bitrate_scale_pct`].
     pub const fn bitrate(self) -> u32 {
         match self {
             Self::HD30 => 3_500_000,
@@ -112,6 +114,19 @@ impl Quality {
             Self::FHD60 => 8_000_000,
             Self::QHD30 => 10_000_000,
         }
+    }
+
+    /// [`Quality::bitrate`] scaled to `pct` percent, with `pct` clamped to
+    /// [`MIN_BITRATE_SCALE_PCT`]`..=100`. Resolution and frame rate are
+    /// unaffected — a scaled session encodes the same frames with fewer
+    /// bits each.
+    // `From` isn't const, so the widening is an `as`; the result is ≤
+    // bitrate() and can't truncate.
+    #[allow(clippy::cast_lossless, clippy::cast_possible_truncation)]
+    pub const fn scaled_bitrate(self, pct: u32) -> u32 {
+        let pct = clamp_bitrate_scale_pct(pct);
+        // u64 intermediate: 10 Mbit × 100 overflows u32.
+        (self.bitrate() as u64 * pct as u64 / 100) as u32
     }
 
     /// Duration of one frame.
@@ -134,7 +149,7 @@ impl Quality {
         self.pixel_count() * 3 / 2
     }
 
-    pub const ALL: &[Quality] = &[
+    pub const ALL: &'static [Quality] = &[
         Self::HD30,
         Self::HD60,
         Self::FHD30,
@@ -160,6 +175,24 @@ impl Quality {
     /// (e.g. a settings file written by a newer version).
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|q| q.key() == key)
+    }
+}
+
+/// Lowest bitrate scale an encoder accepts, in percent of the preset. A
+/// mechanism bound, not policy: the sender's ladder decides how far down
+/// it actually goes (and applies its own absolute floor); this only keeps
+/// a stray value from opening a session at a bitrate rate control can't
+/// work with.
+pub const MIN_BITRATE_SCALE_PCT: u32 = 10;
+
+/// Clamp a bitrate scale into the range the encoder honors.
+pub const fn clamp_bitrate_scale_pct(pct: u32) -> u32 {
+    if pct < MIN_BITRATE_SCALE_PCT {
+        MIN_BITRATE_SCALE_PCT
+    } else if pct > 100 {
+        100
+    } else {
+        pct
     }
 }
 
@@ -252,7 +285,6 @@ pub enum CodecError {
 // Codec traits — allows swapping backends generically
 // ---------------------------------------------------------------------------
 
-/// Encoder that converts RGBA frames into an H.264 bitstream.
 /// Human-readable list of H.264 NAL unit types in an Annex-B access
 /// unit, e.g. `"SPS,PPS,IDR"` — a diagnostic aid for verifying what an
 /// encoder actually emitted. Hardware encoder wrappers have quirks
@@ -296,6 +328,7 @@ pub fn describe_annexb_nals(data: &[u8]) -> String {
     }
 }
 
+/// Encoder that converts RGBA frames into an H.264 bitstream.
 pub trait VideoEncoder {
     /// Encode one RGBA frame.
     ///
@@ -312,6 +345,27 @@ pub trait VideoEncoder {
     fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError>;
 
     fn quality(&self) -> Quality;
+
+    /// Run rate control at `pct` percent of the preset bitrate (clamped
+    /// to [`MIN_BITRATE_SCALE_PCT`]`..=100`). Resolution and frame rate
+    /// stay as the preset says; only bits per frame change.
+    ///
+    /// Takes effect on the next [`VideoEncoder::encode`] call. The
+    /// FFmpeg backend reopens its session for this, so the first frame
+    /// at the new rate is an IDR with parameter sets — a recovery point
+    /// for viewers who lost packets on the way down. Frames in flight
+    /// inside a hardware encoder's pipeline are discarded without
+    /// consuming sequence numbers.
+    ///
+    /// Backends that cannot change rate treat this as a no-op and keep
+    /// reporting 100 from [`VideoEncoder::bitrate_scale_pct`].
+    fn set_bitrate_scale_pct(&mut self, _pct: u32) {}
+
+    /// The scale currently requested via
+    /// [`VideoEncoder::set_bitrate_scale_pct`], in percent.
+    fn bitrate_scale_pct(&self) -> u32 {
+        100
+    }
 
     /// Force the next encoded frame to be a keyframe (IDR).
     ///
@@ -360,4 +414,60 @@ pub trait VideoDecoder {
     /// reference state can't leak into the new GOP. (Resolution changes
     /// are handled automatically; flushing for those is not required.)
     fn flush(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod scaled_bitrate {
+        use super::*;
+
+        #[test]
+        fn returns_preset_bitrate_at_100() {
+            assert_eq!(Quality::FHD60.scaled_bitrate(100), 8_000_000);
+        }
+
+        #[test]
+        fn scales_linearly() {
+            assert_eq!(Quality::FHD60.scaled_bitrate(50), 4_000_000);
+        }
+
+        #[test]
+        fn rounds_down_on_inexact_percent() {
+            assert_eq!(Quality::HD30.scaled_bitrate(35), 1_225_000);
+        }
+
+        #[test]
+        fn clamps_below_minimum_to_minimum() {
+            assert_eq!(
+                Quality::QHD30.scaled_bitrate(0),
+                Quality::QHD30.scaled_bitrate(MIN_BITRATE_SCALE_PCT)
+            );
+        }
+
+        #[test]
+        fn clamps_above_100_to_preset() {
+            assert_eq!(Quality::QHD30.scaled_bitrate(250), Quality::QHD30.bitrate());
+        }
+    }
+
+    mod clamp_bitrate_scale_pct {
+        use super::*;
+
+        #[test]
+        fn passes_values_inside_range() {
+            assert_eq!(clamp_bitrate_scale_pct(70), 70);
+        }
+
+        #[test]
+        fn raises_zero_to_minimum() {
+            assert_eq!(clamp_bitrate_scale_pct(0), MIN_BITRATE_SCALE_PCT);
+        }
+
+        #[test]
+        fn lowers_overshoot_to_100() {
+            assert_eq!(clamp_bitrate_scale_pct(u32::MAX), 100);
+        }
+    }
 }
