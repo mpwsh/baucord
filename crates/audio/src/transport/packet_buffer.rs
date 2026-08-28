@@ -45,10 +45,12 @@ pub const MAX_FRAME: usize = 960;
 const MAX_PLC_SLOTS: u32 = 6;
 
 /// Frames of PLC synthesised when the buffer is *empty* while the peer was
-/// playing, before the caller's priming/underrun logic takes over. Costs
-/// nothing on a real DTX pause (PLC of a pause fades to silence, which is
-/// what a pause sounds like) and replaces the 2 ms decay tail on real
-/// loss with actual extrapolated speech.
+/// playing, before the caller's priming/underrun logic takes over. Only
+/// used when the last real frame was loud: extrapolating a comfort-noise
+/// refresh or the quiet tail before a DTX pause buys nothing (field log:
+/// two silent peers' 400 ms refreshes produced ~7 "PLC" frames/s), while
+/// a mid-word underrun gets 40 ms of real extrapolated speech instead of
+/// a 2 ms decay tail.
 const DRY_PLC_SLOTS: u32 = 2;
 
 /// A packet this far *behind* the playhead is not late, it is a sender
@@ -153,6 +155,9 @@ pub struct PacketBuffer {
     next_ts: u32,
     /// PLC frames spent since the last real frame while the buffer was empty.
     dry_plc_used: u32,
+    /// Whether the last decoded real frame was at/below `QUIET_RMS`.
+    /// Gates dry-PLC: there is nothing worth extrapolating after silence.
+    last_real_quiet: bool,
     /// Decoded PCM for the current slot, consumed by `fill`.
     staging: [f32; MAX_FRAME],
     staged: usize,
@@ -168,6 +173,7 @@ impl PacketBuffer {
             next_seq: 0,
             next_ts: 0,
             dry_plc_used: 0,
+            last_real_quiet: true,
             staging: [0.0; MAX_FRAME],
             staged: 0,
             pos: 0,
@@ -276,6 +282,7 @@ impl PacketBuffer {
         self.slots.clear();
         self.started = false;
         self.dry_plc_used = 0;
+        self.last_real_quiet = true;
         self.staged = 0;
         self.pos = 0;
     }
@@ -332,7 +339,11 @@ impl PacketBuffer {
         self.staged = 0;
 
         let Some(head) = self.slots.front() else {
-            if plc_on_dry && self.started && self.dry_plc_used < DRY_PLC_SLOTS {
+            if plc_on_dry
+                && self.started
+                && !self.last_real_quiet
+                && self.dry_plc_used < DRY_PLC_SLOTS
+            {
                 // Buffer empty mid-playout. Extrapolate rather than cut.
                 // The playhead does NOT advance: if the packet turns up
                 // late it is played (playout delay grew by the PLC we
@@ -423,6 +434,7 @@ impl PacketBuffer {
             Ok(n) if n > 0 => {
                 self.staged = n;
                 self.dry_plc_used = 0;
+                self.last_real_quiet = is_quiet(&self.staging[..n]);
                 self.next_seq = slot.seq.wrapping_add(1);
                 self.next_ts = slot.ts.wrapping_add(n as u32);
                 Refill::Real
@@ -512,6 +524,28 @@ mod tests {
         let r = b.fill(&mut out, true, false);
         assert_eq!(r.filled, FRAME_SIZE * 2);
         assert_eq!(r.fec + r.plc, 1, "exactly one concealed slot");
+    }
+
+    #[test]
+    fn dry_plc_only_follows_a_loud_frame() {
+        let mut e = enc();
+        let mut b = PacketBuffer::new().unwrap();
+        // Digital silence (a DTX refresh / closed-gate frame): no tail.
+        let silent = AudioPacket::new(0, 0, 1, {
+            let mut buf = vec![0u8; 512];
+            let n = e.encode_float(&[0.0f32; FRAME_SIZE], &mut buf).unwrap();
+            buf[..n].to_vec()
+        });
+        b.push(silent);
+        let mut out = vec![0.0f32; FRAME_SIZE * 3];
+        let r = b.fill(&mut out, true, false);
+        assert_eq!(r.dry_plc, 0, "quiet frame must not be extrapolated");
+        assert_eq!(r.filled, FRAME_SIZE);
+        // A loud frame mid-stream: extrapolate up to DRY_PLC_SLOTS.
+        b.push(pkt(&mut e, 1, FRAME_SIZE as u32));
+        let r = b.fill(&mut out, true, false);
+        assert_eq!(r.dry_plc, DRY_PLC_SLOTS);
+        assert_eq!(r.filled, FRAME_SIZE * 3);
     }
 
     #[test]

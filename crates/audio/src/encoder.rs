@@ -76,15 +76,16 @@ impl EncoderWorker {
                 warn!("Opus encoder: {name} failed: {e}");
             }
         };
-        ctl(
-            "set_bitrate",
-            encoder.set_bitrate(Bitrate::Bits(OPUS_BITRATE)),
-        );
+        ctl("set_bitrate", encoder.set_bitrate(Bitrate::Bits(OPUS_BITRATE)));
         ctl("set_vbr", encoder.set_vbr(true));
-        // Complexity 6: for speech at 48 kbps the levels above this mostly
-        // buy CELT/music analysis, for roughly a third of the encode CPU —
-        // which matters on the low-end hardware this targets.
-        // `last_encode_us` is the A/B knob if anyone wants to argue.
+        // Complexity 7 — and not lower. libopus only runs its tonality /
+        // activity analysis at complexity >= 7 (opus_encoder.c, float
+        // build); below that the DTX decision falls back to SILK's own VAD,
+        // which flags a low-level mic floor as "active". Measured 2026-08-28
+        // on a quiet, unmuted mic: complexity 6 sent ~35 pkt/s of 30-byte
+        // near-silence frames, complexity 7 sent the 2.5/s DTX refreshes
+        // and nothing else. 10 buys nothing audible over 7 for speech at
+        // this bitrate; `last_encode_us` is the knob if that ever changes.
         ctl("set_complexity", encoder.set_complexity(7));
         ctl(
             "set_bandwidth",
@@ -118,6 +119,12 @@ impl EncoderWorker {
     }
 
     fn run(&mut self) {
+        // Audio-class scheduling, same as the capture/playback workers. A
+        // CPU-heavy game can otherwise starve this thread; the 4-frame
+        // channel feeding it fills within 80 ms and the sender's own voice
+        // breaks up for everyone else (counted in `outgoing_dropped`).
+        #[allow(clippy::cast_possible_truncation)]
+        let _rt = crate::platform::promote_current_thread(FRAME_SIZE as u32, OPUS_SAMPLE_RATE);
         info!("Encoder thread started");
 
         while let Ok(samples) = self.rx.recv() {

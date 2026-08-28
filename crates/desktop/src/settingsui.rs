@@ -320,7 +320,9 @@ fn wire(win: &SettingsWindow) {
             if app.settings.servers.len() <= 1 {
                 return;
             }
-            let Some(index) = selected_server(app) else { return };
+            let Some(index) = selected_server(app) else {
+                return;
+            };
             let removed = app.settings.servers.remove(index);
             if app.settings.server == removed.name {
                 app.settings.server = app.settings.servers[0].name.clone();
@@ -340,7 +342,9 @@ fn wire(win: &SettingsWindow) {
 
     logic.on_server_name_edited(|text| {
         app::with_current(move |app| {
-            let Some(index) = selected_server(app) else { return };
+            let Some(index) = selected_server(app) else {
+                return;
+            };
             let was_default = app
                 .settings
                 .servers
@@ -369,17 +373,20 @@ fn wire(win: &SettingsWindow) {
 
     logic.on_server_token_url_edited(|text| {
         app::with_current(move |app| {
-            let Some(index) = selected_server(app) else { return };
+            let Some(index) = selected_server(app) else {
+                return;
+            };
             let trimmed = text.trim().to_string();
             app.settings.servers[index].token_url = (!trimmed.is_empty()).then_some(trimmed);
         });
     });
     logic.on_server_token_password_edited(|text| {
         app::with_current(move |app| {
-            let Some(index) = selected_server(app) else { return };
+            let Some(index) = selected_server(app) else {
+                return;
+            };
             let trimmed = text.trim().to_string();
-            app.settings.servers[index].token_password =
-                (!trimmed.is_empty()).then_some(trimmed);
+            app.settings.servers[index].token_password = (!trimmed.is_empty()).then_some(trimmed);
         });
     });
 
@@ -503,7 +510,9 @@ fn wire(win: &SettingsWindow) {
 /// Recompute the selected entry's `address` from the editor's IP and
 /// port fields (both are read fresh — either one may have changed).
 fn update_selected_address(app: &mut AppState) {
-    let Some(index) = selected_server(app) else { return };
+    let Some(index) = selected_server(app) else {
+        return;
+    };
     let Some(win) = &app.settings_win else { return };
     let s = win.global::<SettingsState>();
     let address = join_address(&s.get_server_ip(), &s.get_server_port());
@@ -514,10 +523,7 @@ fn update_selected_address(app: &mut AppState) {
 /// `index` 0 = system default; otherwise the (index-1)-th device.
 /// Error-generic: only the Ok shape matters here, so the real crate's
 /// error type (Box<dyn Error>) and any future change both fit.
-fn device_at<E>(
-    devices: &Result<Vec<(String, bool)>, E>,
-    index: i32,
-) -> Option<String> {
+fn device_at<E>(devices: &Result<Vec<(String, bool)>, E>, index: i32) -> Option<String> {
     if index <= 0 {
         return None;
     }
@@ -529,7 +535,9 @@ fn device_at<E>(
 }
 
 fn set_row_recording(s: &SettingsState, index: i32, recording: bool) {
-    let Ok(index) = usize::try_from(index) else { return };
+    let Ok(index) = usize::try_from(index) else {
+        return;
+    };
     let rows = s.get_keybinds();
     if let Some(mut row) = rows.row_data(index) {
         row.recording = recording;
@@ -560,9 +568,18 @@ fn key_code_for(text: &str) -> Option<String> {
 
     // Function keys.
     let fkeys = [
-        (Key::F1, "F1"), (Key::F2, "F2"), (Key::F3, "F3"), (Key::F4, "F4"),
-        (Key::F5, "F5"), (Key::F6, "F6"), (Key::F7, "F7"), (Key::F8, "F8"),
-        (Key::F9, "F9"), (Key::F10, "F10"), (Key::F11, "F11"), (Key::F12, "F12"),
+        (Key::F1, "F1"),
+        (Key::F2, "F2"),
+        (Key::F3, "F3"),
+        (Key::F4, "F4"),
+        (Key::F5, "F5"),
+        (Key::F6, "F6"),
+        (Key::F7, "F7"),
+        (Key::F8, "F8"),
+        (Key::F9, "F9"),
+        (Key::F10, "F10"),
+        (Key::F11, "F11"),
+        (Key::F12, "F12"),
     ];
     for (key, name) in fkeys {
         if c == char::from(key) {
@@ -612,7 +629,9 @@ fn key_code_for(text: &str) -> Option<String> {
 }
 
 fn finish_capture(app: &mut AppState, text: &str, ctrl: bool, alt: bool, shift: bool) {
-    let Some(i) = app.keybind_recording else { return };
+    let Some(i) = app.keybind_recording else {
+        return;
+    };
     let Some(code) = key_code_for(text) else {
         // A bare modifier — keep recording.
         return;
@@ -634,10 +653,11 @@ fn cancel_capture(app: &mut AppState) {
         let rows = s.get_keybinds();
         for i in 0..rows.row_count() {
             if let Some(mut row) = rows.row_data(i)
-                && row.recording {
-                    row.recording = false;
-                    rows.set_row_data(i, row);
-                }
+                && row.recording
+            {
+                row.recording = false;
+                rows.set_row_data(i, row);
+            }
         }
     }
 }
@@ -705,8 +725,19 @@ fn close(app: &mut AppState) {
 fn set_credits(s: &ui::SettingsState) {
     const SUPER_TESTERS: &[&str] = &["empe"];
     const TESTERS: &[&str] = &[
-        "Bartrix", "BDK", "ChichoV3", "Cholo", "EltotoPA", "willybal", "Nachovsky",
-        "naqel", "Nicky21", "oveer", "Patitutitu", "piksel", "Pin0",
+        "Bartrix",
+        "BDK",
+        "ChichoV3",
+        "Cholo",
+        "EltotoPA",
+        "willybal",
+        "Nachovsky",
+        "naqel",
+        "Nicky21",
+        "oveer",
+        "Patitutitu",
+        "piksel",
+        "Pin0",
         "Scryer",
     ];
     let to_model = |names: &[&str]| {
@@ -727,10 +758,11 @@ fn set_credits(s: &ui::SettingsState) {
 /// roster as separate blocks — the "open config location" button sits
 /// between them, right under the config-file line.
 fn set_about(s: &ui::SettingsState) {
-    let exe_path = std::env::current_exe().map_or_else(|_| t!("unknown"), |p| p.display().to_string());
+    let exe_path =
+        std::env::current_exe().map_or_else(|_| t!("unknown"), |p| p.display().to_string());
     let config_path = client::config::settings_file_path().display().to_string();
     let head = format!(
-        "baucord {}\nhttps://baucord.mpw.sh\n\n{} {}\n{} {}",
+        "baucord {}\nhttps://baucord.com\n\n{} {}\n{} {}",
         app::CURRENT_VERSION,
         t!("about-running-from"),
         exe_path,

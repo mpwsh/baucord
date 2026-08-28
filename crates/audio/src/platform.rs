@@ -102,6 +102,13 @@ impl Drop for RtGuard {
 /// Register the current thread with the Windows MMCSS "Pro Audio" task
 /// class. Returns a guard to keep in scope for the thread's lifetime;
 /// `None` on failure (logged, harmless).
+///
+/// Re-exported from the crate root so the application can promote the
+/// threads that sit between this crate and the socket — the one draining
+/// [`crate::VoiceChat::outgoing_receiver`] above all. A foreground game
+/// plus Windows Game Mode throttles normal-priority threads of background
+/// processes; everything inside this crate is already promoted, so a
+/// normal-priority send loop becomes the one place the voice still stalls.
 #[cfg(windows)]
 pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<RtGuard> {
     // UTF-16, NUL-terminated.

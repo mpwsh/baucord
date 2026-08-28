@@ -5,10 +5,10 @@
 //! ask and how versions compare is shared knowledge.
 
 /// Remote endpoint that returns just the latest version string.
-pub const VERSION_URL: &str = "https://baucord.mpw.sh/version";
+pub const VERSION_URL: &str = "https://baucord.com/version";
 
 /// Base URL for downloads — append the platform-specific filename.
-pub const DOWNLOAD_BASE: &str = "https://baucord.mpw.sh";
+pub const DOWNLOAD_BASE: &str = "https://baucord";
 
 /// Platform-specific zip filename suffix.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

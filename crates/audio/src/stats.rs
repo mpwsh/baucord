@@ -202,7 +202,7 @@ impl AudioStats {
 
         format!(
             "Audio ({}s) | Sent {} Recv {} Lost {} ({:.1}%) | \
-             FEC {} PLC {} (hint {}%, uplink {}%) | Overruns {} Underruns {} | Jitter {}ms (target {}ms) | \
+             FEC {} PLC {} (hint {}%, uplink {}%) | Overruns {} Underruns {} Drop {} | Jitter {}ms (target {}ms) | \
              BW ↑{:.1}kbps ↓{:.1}kbps | Pkt {}B (avg {:.0}B) | \
              Enc {}µs Dec {}µs | Errors: enc {} dec {}",
             elapsed,
@@ -216,6 +216,7 @@ impl AudioStats {
             self.uplink_loss_pct.load(Ordering::Relaxed),
             self.input_overruns.load(Ordering::Relaxed),
             self.output_underruns.load(Ordering::Relaxed),
+            self.outgoing_dropped.load(Ordering::Relaxed),
             self.jitter_buffer_occupancy_ms.load(Ordering::Relaxed),
             self.jitter_buffer_target_ms.load(Ordering::Relaxed),
             self.estimated_send_kbps(),

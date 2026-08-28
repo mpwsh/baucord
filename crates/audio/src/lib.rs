@@ -43,6 +43,7 @@ pub mod stream;
 pub mod transport;
 
 pub use config::{PeerAudioSettings, VoiceChatConfig};
+pub use platform::{promote_current_thread, RtGuard};
 pub use sounds::SoundType;
 pub use stats::AudioStats;
 pub use transport::packet::AudioPacket;

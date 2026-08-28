@@ -17,7 +17,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, SupportedStreamConfig};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
-use log::{debug, error};
+use log::{debug, error, info};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Async, Resampler};
 use std::collections::{HashMap, HashSet};
@@ -96,7 +96,7 @@ impl AudioOutput {
 
         let sample_rate = device_config.sample_rate();
 
-        debug!(
+        info!(
             "Output device: {} @ {}Hz, {}ch, {:?}",
             crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
             sample_rate,

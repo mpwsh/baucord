@@ -28,7 +28,7 @@
 //! - **Hold-window expansion**: during the hold the gate is not fully
 //!   transparent — a gentle downward expander attenuates the signal
 //!   by how far it sits below the close threshold (up to
-//!   [`HOLD_EXPANDER_FLOOR_DB`]). Trailing syllables live at or above
+//!   [`HOLD_EXPANDER_FLOOR`], −15 dB). Trailing syllables live at or above
 //!   the threshold and pass untouched, but the residual noise floor
 //!   (post-denoise hiss, boosted upstream of nothing but the encoder)
 //!   is pushed down immediately instead of playing out as an audible
@@ -68,7 +68,8 @@ const HOLD_EXPANDER_RATIO: f32 = 2.0;
 
 /// Maximum attenuation the hold-window expander applies. The point is
 /// to move the noise tail below audibility, not to hard-mute the hold
-/// (hard muting would defeat the hold's purpose).
+/// (hard muting would defeat the hold's purpose). Runtime code uses
+/// the precomputed linear `HOLD_EXPANDER_FLOOR`; this is what it means.
 #[cfg(test)]
 const HOLD_EXPANDER_FLOOR_DB: f32 = -15.0;
 
@@ -334,6 +335,15 @@ mod tests {
         use super::*;
 
         #[test]
+        fn linear_floor_matches_its_db_definition() {
+            let from_db = 10.0_f32.powf(HOLD_EXPANDER_FLOOR_DB / 20.0);
+            assert!(
+                (from_db - HOLD_EXPANDER_FLOOR).abs() < 1e-6,
+                "HOLD_EXPANDER_FLOOR ({HOLD_EXPANDER_FLOOR}) drifted from {HOLD_EXPANDER_FLOOR_DB} dB ({from_db})"
+            );
+        }
+
+        #[test]
         fn attenuates_the_noise_floor_during_the_hold_window() {
             let (mut gate, mut ctx) = opened_gate();
             // Noise floor: below close threshold (0.0072), above zero.
@@ -364,7 +374,7 @@ mod tests {
                     break;
                 }
             }
-            let floor = 10.0_f32.powf(HOLD_EXPANDER_FLOOR_DB / 20.0);
+            let floor = HOLD_EXPANDER_FLOOR;
             let gain = rms(&out) / 0.0005;
             assert!(
                 gain >= floor * 0.8,
@@ -407,14 +417,6 @@ mod tests {
             assert!(!ctx.gate_holding);
             drive_into_hold(&mut gate, &mut ctx, 0.003);
             assert!(ctx.gate_holding && ctx.gate_open);
-        }
-        #[test]
-        fn linear_floor_matches_its_db_definition() {
-            let from_db = 10.0_f32.powf(HOLD_EXPANDER_FLOOR_DB / 20.0);
-            assert!(
-        (from_db - HOLD_EXPANDER_FLOOR).abs() < 1e-6,
-        "HOLD_EXPANDER_FLOOR ({HOLD_EXPANDER_FLOOR}) drifted from {HOLD_EXPANDER_FLOOR_DB} dB ({from_db})"
-    );
         }
     }
 }
