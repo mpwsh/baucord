@@ -538,6 +538,10 @@ impl AdaptiveJitterBuffer {
                 plc += u64::from(rep.plc);
                 dry_plc += u64::from(rep.dry_plc);
                 lost += u64::from(rep.fec + rep.plc + rep.skipped);
+                if rep.fec + rep.plc + rep.skipped + rep.dropped_quiet > 0 {
+                    // Missing or skipped media is not clock skew.
+                    peer.drift_window_dirty = true;
+                }
                 if rep.filled == desired {
                     // Drain `desired` source samples, emit exactly `n`.
                     // The ratio is within ±0.2%, where linear
@@ -555,6 +559,12 @@ impl AdaptiveJitterBuffer {
                 plc += u64::from(rep.plc);
                 dry_plc += u64::from(rep.dry_plc);
                 lost += u64::from(rep.fec + rep.plc + rep.skipped);
+                if rep.fec + rep.plc + rep.skipped + rep.dropped_quiet > 0 {
+                    // Missing or skipped media is not clock skew: a lossy
+                    // stretch must restart the window, not teach the
+                    // estimator that the sender's clock is slow.
+                    peer.drift_window_dirty = true;
+                }
                 available = rep.filled;
             }
 

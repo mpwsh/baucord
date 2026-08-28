@@ -148,6 +148,13 @@ impl AudioOutput {
         let channels = self.device_config.channels();
         let format = self.device_config.sample_format();
 
+        // Prime the ring with one target fill of silence so the first
+        // callback isn't a guaranteed underrun ("Underruns 1" forever).
+        if let Some(producer) = self.ring_producer.as_mut() {
+            let silence = vec![0.0f32; (sample_rate as usize * 20) / 1000];
+            let _ = producer.push_partial_slice(&silence);
+        }
+
         // Start producer worker BEFORE the stream so it's ready when callbacks arrive
         if let (Some(ring_producer), Some(packet_rx), Some(loopback_rx), Some(sound_rx), Some(wake_rx)) = (
             self.ring_producer.take(),
@@ -236,10 +243,22 @@ impl AudioOutput {
                     }
                     for (frame_idx, &sample) in mono[..want].iter().enumerate() {
                         rms_acc += sample * sample;
-                        // Duplicate mono to all output channels
                         let base = (frames_done + frame_idx) * ch;
-                        for c in 0..ch {
-                            data[base + c] = T::from_sample(sample);
+                        let s = T::from_sample(sample);
+                        // Mono → the front pair only. On 5.1/7.1 endpoints
+                        // (gaming headsets with virtual surround report 8
+                        // channels) the remaining channels are centre, LFE,
+                        // rear and side; feeding them a copy of the voice
+                        // makes the driver's binaural fold-down bass-heavy
+                        // and smeared. Standard channel order puts FL, FR
+                        // first on WASAPI, CoreAudio and ALSA; cpal doesn't
+                        // expose the mask, so that order is assumed.
+                        data[base] = s;
+                        if ch > 1 {
+                            data[base + 1] = s;
+                        }
+                        for slot in &mut data[base + 2.min(ch)..base + ch] {
+                            *slot = T::EQUILIBRIUM;
                         }
                     }
                     frames_done += want;
