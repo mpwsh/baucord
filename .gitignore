@@ -5,9 +5,7 @@ onnxruntime.dll
 diagnostics*.txt
 .DS_Store
 prompt.md
-baucord-*.log
-baucord.log
-server.log
+*.log
 netcode.key
 fltk-ui
 ./crates/*.tar.gz
