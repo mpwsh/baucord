@@ -146,6 +146,41 @@ pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<
     None
 }
 
+/// Promote the **cpal callback thread** — the thread cpal owns and runs our
+/// data callback on — and never revert.
+///
+/// Field log, Windows + Counter-Strike 2: ~1,000 capture discontinuities
+/// per minute (`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`), zero with no
+/// game. cpal's WASAPI capture thread is `THREAD_PRIORITY_TIME_CRITICAL`
+/// inside a normal-priority-class process — priority 15 — while the game
+/// runs 13–15 on every core with its own audio on MMCSS above that. Our
+/// worker threads were already promoted; the thread *reading the device*
+/// was not, and it was the one being starved. `AvSetMmThreadCharacteristics`
+/// applies to the calling thread, so the first callback invocation is the
+/// one place we can reach it.
+///
+/// Call once per stream from inside the callback (guard with a `bool`).
+/// The handle is intentionally leaked: the thread lives exactly as long as
+/// the stream, reverting from any other thread is undefined, and the OS
+/// releases it at thread exit. Skipped on macOS, where the callback runs
+/// on CoreAudio's HAL thread, which is already time-constraint scheduled.
+pub(crate) fn promote_callback_thread(buffer_frames: u32, sample_rate: u32) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (buffer_frames, sample_rate);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        match promote_current_thread(buffer_frames, sample_rate) {
+            Some(guard) => {
+                log::debug!("audio callback thread promoted to real-time priority");
+                std::mem::forget(guard);
+            }
+            None => log::debug!("audio callback thread stays at cpal's default priority"),
+        }
+    }
+}
+
 // ── Stream buffer sizing ────────────────────────────────────────────────
 
 /// Pick a cpal buffer size: request ~10 ms when the device advertises a

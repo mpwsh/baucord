@@ -171,12 +171,9 @@ impl AudioInput {
         let stream_config = StreamConfig {
             channels,
             sample_rate,
-            // ~10 ms when the device advertises a supported range;
-            // untouched (Default) when it doesn't. See platform.rs.
-            buffer_size: crate::platform::request_low_latency_buffer(
-                self.device_config.buffer_size(),
-                sample_rate,
-            ),
+            // Capture wants *tolerance*, not a small buffer: see
+            // device::capture_buffer_size.
+            buffer_size: crate::device::capture_buffer_size(&self.device, &self.device_config),
         };
 
         let mut ring_producer = self
@@ -189,10 +186,21 @@ impl AudioInput {
         let stats_err = self.stats.clone();
         let input_level = self.input_level.clone();
         let ch = channels as usize;
+        // cpal's capture thread runs our callback; promote it on first
+        // entry (see platform::promote_callback_thread).
+        let mut promoted = false;
+        // The engine reports every capture gap through the error callback;
+        // under a starving game that is tens per second. Count all of them
+        // (stats), log at most one per second.
+        let mut last_err_log: Option<std::time::Instant> = None;
 
         let stream = self.device.build_input_stream(
             stream_config,
             move |data: &[T], _: &_| {
+                if !promoted {
+                    promoted = true;
+                    crate::platform::promote_callback_thread(FRAME_SIZE as u32, sample_rate);
+                }
                 if config.muted.load(Ordering::Relaxed) {
                     input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
                     return;
@@ -245,8 +253,15 @@ impl AudioInput {
                 let _ = wake_tx.try_send(());
             },
             move |err| {
-                error!("Input stream error: {err}");
                 stats_err.input_overruns.fetch_add(1, Ordering::Relaxed);
+                let now = std::time::Instant::now();
+                if last_err_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+                    last_err_log = Some(now);
+                    error!(
+                        "Input stream error: {err} (total {})",
+                        stats_err.input_overruns.load(Ordering::Relaxed)
+                    );
+                }
             },
             None,
         )?;

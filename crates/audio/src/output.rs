@@ -222,10 +222,18 @@ impl AudioOutput {
         let ch = channels as usize;
         // Allocated once, outside the callback.
         let mut mono = vec![0.0f32; CALLBACK_SCRATCH];
+        // cpal's render thread runs our callback; promote it on first entry.
+        let mut promoted = false;
+        let mut last_err_log: Option<Instant> = None;
 
         let stream = self.device.build_output_stream(
             config,
             move |data: &mut [T], _: &_| {
+                if !promoted {
+                    promoted = true;
+                    #[allow(clippy::cast_possible_truncation)]
+                    crate::platform::promote_callback_thread(HOP as u32, sample_rate);
+                }
                 let mut rms_acc = 0.0f32;
                 let mut frames_done = 0usize;
                 let frames_total = data.len() / ch;
@@ -278,8 +286,15 @@ impl AudioOutput {
                 let _ = wake_tx.try_send(());
             },
             move |err| {
-                error!("Output stream error: {err}");
                 stats_err.output_underruns.fetch_add(1, Ordering::Relaxed);
+                let now = Instant::now();
+                if last_err_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+                    last_err_log = Some(now);
+                    error!(
+                        "Output stream error: {err} (total {})",
+                        stats_err.output_underruns.load(Ordering::Relaxed)
+                    );
+                }
             },
             None,
         )?;

@@ -27,10 +27,24 @@
 //! this crate's resampler stays idle either way.
 
 use cpal::traits::DeviceTrait;
-use cpal::{Device, SampleFormat, SupportedStreamConfig, SupportedStreamConfigRange};
+use cpal::{
+    BufferSize, Device, SampleFormat, StreamConfig, SupportedStreamConfig,
+    SupportedStreamConfigRange,
+};
 use log::{debug, info};
 
 use crate::OPUS_SAMPLE_RATE;
+
+/// Capture buffer we ask the OS for, in milliseconds.
+///
+/// Capture buffer *capacity* is not latency: the engine's packets are read
+/// the moment they land regardless of how much room is behind them. It is
+/// tolerance — how late the reader may be before the engine overwrites
+/// unread audio and flags a discontinuity (a gap in the sender's voice).
+/// WASAPI's shared-mode default is roughly two engine periods (~20 ms),
+/// which a foreground game blows through routinely. 50 ms covers the
+/// scheduling stalls seen in the field with no cost in the good case.
+const CAPTURE_BUFFER_MS: u32 = 50;
 
 /// Input config for `device`, at 48 kHz when the device supports it.
 pub fn preferred_input_config(device: &Device) -> Result<SupportedStreamConfig, cpal::Error> {
@@ -98,6 +112,27 @@ fn pick_48k(
     best.and_then(|(_, range)| range.try_with_sample_rate(OPUS_SAMPLE_RATE))
 }
 
+/// Buffer size to request for a capture stream on `device` with `cfg`.
+///
+/// Windows: `CAPTURE_BUFFER_MS`, but only if a throwaway stream opens
+/// with it — cpal feeds the duration straight into `Initialize` with no
+/// retry, and a refused duration used to mean total silence in the field.
+/// Elsewhere: the existing ~10 ms low-latency request (CoreAudio and ALSA
+/// report honest ranges and their capture paths are not the ones starving).
+pub fn capture_buffer_size(device: &Device, cfg: &SupportedStreamConfig) -> BufferSize {
+    if cfg!(windows) {
+        let frames = cfg.sample_rate() * CAPTURE_BUFFER_MS / 1000;
+        let wanted = BufferSize::Fixed(frames);
+        if probe_input_with(device, cfg, wanted) {
+            info!("Capture buffer: {CAPTURE_BUFFER_MS} ms requested and accepted");
+            return wanted;
+        }
+        debug!("Capture buffer: {CAPTURE_BUFFER_MS} ms refused; using the backend default");
+        return BufferSize::Default;
+    }
+    crate::platform::request_low_latency_buffer(cfg.buffer_size(), cfg.sample_rate())
+}
+
 // ── Probes: open, never play, drop ──────────────────────────────────────
 
 fn probe_output(device: &Device, cfg: &SupportedStreamConfig) -> bool {
@@ -120,10 +155,16 @@ fn probe_output(device: &Device, cfg: &SupportedStreamConfig) -> bool {
 }
 
 fn probe_input(device: &Device, cfg: &SupportedStreamConfig) -> bool {
+    probe_input_with(device, cfg, BufferSize::Default)
+}
+
+fn probe_input_with(device: &Device, cfg: &SupportedStreamConfig, buffer: BufferSize) -> bool {
+    let mut stream_cfg = cfg.config();
+    stream_cfg.buffer_size = buffer;
     let result = match cfg.sample_format() {
-        SampleFormat::F32 => probe_input_as::<f32>(device, cfg),
-        SampleFormat::I16 => probe_input_as::<i16>(device, cfg),
-        SampleFormat::U16 => probe_input_as::<u16>(device, cfg),
+        SampleFormat::F32 => probe_input_as::<f32>(device, &stream_cfg),
+        SampleFormat::I16 => probe_input_as::<i16>(device, &stream_cfg),
+        SampleFormat::U16 => probe_input_as::<u16>(device, &stream_cfg),
         other => Err(cpal::Error::with_message(
             cpal::ErrorKind::UnsupportedConfig,
             format!("probe: unsupported sample format {other:?}"),
@@ -132,7 +173,7 @@ fn probe_input(device: &Device, cfg: &SupportedStreamConfig) -> bool {
     match result {
         Ok(()) => true,
         Err(e) => {
-            debug!("48 kHz input config advertised but refused ({e}); keeping the OS default");
+            debug!("input config probe refused ({e})");
             false
         }
     }
@@ -149,9 +190,9 @@ fn probe_output_as<T: cpal::SizedSample>(
 
 fn probe_input_as<T: cpal::SizedSample>(
     device: &Device,
-    cfg: &SupportedStreamConfig,
+    cfg: &StreamConfig,
 ) -> Result<(), cpal::Error> {
-    let stream = device.build_input_stream(cfg.config(), |_: &[T], _| {}, |_| {}, None)?;
+    let stream = device.build_input_stream(cfg.clone(), |_: &[T], _| {}, |_| {}, None)?;
     drop(stream);
     Ok(())
 }
