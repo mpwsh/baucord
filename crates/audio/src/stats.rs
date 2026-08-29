@@ -45,8 +45,23 @@ pub struct AudioStats {
     pub fec_loss_hint_pct: AtomicU32,
 
     // ── Buffer health ───────────────────────────────────────────────────
+    /// Capture glitches: engine-reported discontinuities (audio the OS
+    /// dropped before we saw it) plus ring overflows on our side.
     pub input_overruns: AtomicU64,
     pub output_underruns: AtomicU64,
+
+    // ── Device health (see `VoiceChat::service`) ────────────────────────
+    /// The capture stream hit an unrecoverable error (device removed,
+    /// invalidated, repeated engine failures). Cleared by a restart.
+    pub input_stream_failed: AtomicBool,
+    /// Same for playback.
+    pub output_stream_failed: AtomicBool,
+    /// The OS default capture device changed since we opened ours.
+    pub default_input_changed: AtomicBool,
+    /// The OS default playback device changed since we opened ours.
+    pub default_output_changed: AtomicBool,
+    /// Automatic stream restarts performed so far (both sides).
+    pub stream_restarts: AtomicU64,
 
     // ── Jitter buffer ───────────────────────────────────────────────────
     pub jitter_buffer_occupancy_ms: AtomicUsize,
@@ -117,6 +132,11 @@ impl AudioStats {
             fec_loss_hint_pct: AtomicU32::new(0),
             input_overruns: AtomicU64::new(0),
             output_underruns: AtomicU64::new(0),
+            input_stream_failed: AtomicBool::new(false),
+            output_stream_failed: AtomicBool::new(false),
+            default_input_changed: AtomicBool::new(false),
+            default_output_changed: AtomicBool::new(false),
+            stream_restarts: AtomicU64::new(0),
             jitter_buffer_occupancy_ms: AtomicUsize::new(0),
             jitter_buffer_target_ms: AtomicUsize::new(0),
             bytes_sent: AtomicU64::new(0),

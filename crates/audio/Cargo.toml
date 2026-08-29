@@ -1,6 +1,6 @@
 [package]
 name = "audio"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "audio components for baucord"
 
@@ -58,11 +58,12 @@ log.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 audio_thread_priority = { version = "0.37", default-features = false }
 
-# ── Windows: process-exclusive system audio loopback ────────────────────
-# `wasapi` wraps ActivateAudioInterfaceAsync process loopback
-# (EXCLUDE_TARGET_PROCESS_TREE), which cpal cannot express. Used only by
-# `stream::process_loopback`; the cpal endpoint loopback stays as the
-# runtime fallback for Windows builds that predate the API (< 10 2004).
+# ── Windows: native voice capture/render + process loopback ─────────────
+# `wasapi` runs the voice capture and render pumps on threads this crate
+# owns (`native::wasapi`: MMCSS-registered, event-driven shared mode,
+# engine-side conversion to 48 kHz, IMMNotificationClient device events)
+# and the process-exclusive system-audio loopback (`stream::process_
+# loopback`). cpal remains the fallback for both if a native open fails.
 # Cost note: pulls `windows` 0.62 — compile-time only on Windows targets,
 # zero footprint elsewhere (target-gated).
 [target.'cfg(target_os = "windows")'.dependencies]

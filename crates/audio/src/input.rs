@@ -55,7 +55,13 @@ use std::time::Duration;
 pub struct AudioInput {
     device: Device,
     device_config: SupportedStreamConfig,
+    /// The user's device selection (`None` = follow the OS default).
+    device_name: Option<String>,
+    /// cpal stream, when the cpal backend is in use.
     stream: Option<Stream>,
+    /// Native backend stream, when it opened successfully (Windows).
+    #[cfg(windows)]
+    native: Option<crate::native::wasapi::NativeCapture>,
     encoder_tx: Sender<PcmFrame>,
     loopback_tx: Sender<PcmFrame>,
 
@@ -123,7 +129,10 @@ impl AudioInput {
         Ok(Self {
             device,
             device_config,
+            device_name: device_name.map(String::from),
             stream: None,
+            #[cfg(windows)]
+            native: None,
             encoder_tx,
             loopback_tx,
             ring_producer: Some(ring_producer),
@@ -140,6 +149,50 @@ impl AudioInput {
     }
 
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.stats
+            .input_stream_failed
+            .store(false, Ordering::Relaxed);
+
+        #[cfg(windows)]
+        {
+            match self.start_native() {
+                Ok(()) => return Ok(()),
+                Err(e) => log::warn!("Native WASAPI capture unavailable ({e}); using cpal"),
+            }
+        }
+        self.start_cpal()
+    }
+
+    /// Windows: open the device on our own MMCSS thread (see
+    /// `native::wasapi`). On failure the ring and latch are handed back
+    /// untouched so the cpal path can use them.
+    #[cfg(windows)]
+    fn start_native(&mut self) -> Result<(), String> {
+        let producer = self.ring_producer.take().ok_or("ring producer already taken")?;
+        let wake_tx = self.wake_tx.take().ok_or("wake sender already taken")?;
+        match crate::native::wasapi::NativeCapture::start(
+            self.device_name.as_deref(),
+            producer,
+            wake_tx,
+            self.stats.clone(),
+            self.config.clone(),
+            self.input_level.clone(),
+        ) {
+            Ok(native) => {
+                let rate = native.sample_rate;
+                self.native = Some(native);
+                self.start_worker_thread(rate)
+                    .map_err(|e| format!("worker thread: {e}"))
+            }
+            Err(err) => {
+                self.ring_producer = Some(err.producer);
+                self.wake_tx = Some(err.wake_tx);
+                Err(err.reason)
+            }
+        }
+    }
+
+    fn start_cpal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let sample_rate = self.device_config.sample_rate();
         let channels = self.device_config.channels();
         let format = self.device_config.sample_format();
@@ -253,6 +306,9 @@ impl AudioInput {
                 let _ = wake_tx.try_send(());
             },
             move |err| {
+                if matches!(err.kind(), cpal::ErrorKind::DeviceNotAvailable) {
+                    stats_err.input_stream_failed.store(true, Ordering::Relaxed);
+                }
                 stats_err.input_overruns.fetch_add(1, Ordering::Relaxed);
                 let now = std::time::Instant::now();
                 if last_err_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
@@ -321,6 +377,16 @@ impl AudioInput {
             );
         }));
         Ok(())
+    }
+
+    /// Friendly name of the device actually opened (native backend's
+    /// report when in use, otherwise cpal's), for follow-the-default.
+    pub fn opened_device_name(&self) -> Option<String> {
+        #[cfg(windows)]
+        if let Some(n) = self.native.as_ref() {
+            return Some(n.device_name.clone());
+        }
+        crate::device_name(&self.device)
     }
 
     pub fn input_level_handle(&self) -> Arc<AtomicU32> {
@@ -510,6 +576,8 @@ impl Drop for AudioInput {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Relaxed);
         self.stream.take();
+        #[cfg(windows)]
+        self.native.take();
         if let Some(thread) = self.worker_thread.take() {
             let _ = thread.join();
         }
