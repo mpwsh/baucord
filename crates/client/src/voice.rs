@@ -45,6 +45,9 @@ pub enum VoiceControl {
     /// Loss on our outbound path in percent (0–49), from the network
     /// thread's periodic renet sample. Feeds the encoder's FEC hint.
     SetUplinkLoss(u32),
+    /// Round-trip time in ms from the same renet sample. Feeds the
+    /// encoder's rate controller (congestion vs random loss).
+    SetLinkRtt(u32),
     IncomingVoicePacket(AudioPacket),
     PlaySound(SoundType),
     Shutdown,
@@ -320,6 +323,11 @@ impl VoiceLoopState {
                     v.set_uplink_loss_pct(pct);
                 }
             }
+            VoiceControl::SetLinkRtt(rtt_ms) => {
+                if let Some(v) = &self.vc {
+                    v.set_link_rtt_ms(rtt_ms);
+                }
+            }
             VoiceControl::IncomingVoicePacket(packet) => {
                 if let Some(v) = &self.vc {
                     v.receive_packet(packet);
@@ -399,6 +407,13 @@ fn run_voice_loop(
                 Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
                 Err(_) => break,
             }
+        }
+
+        // Device supervision (audio 0.7): restart a side whose device
+        // went away, follow the OS default when none is pinned. Cheap
+        // when nothing changed; the engine logs what it did.
+        if let Some(voice) = state.vc.as_mut() {
+            let _ = voice.service();
         }
 
         // Poll outgoing packets and update shared state

@@ -39,7 +39,9 @@ const CALLBACK_SCRATCH: usize = 8192;
 pub struct AudioOutput {
     device: Device,
     device_config: SupportedStreamConfig,
-    /// The user's device selection (`None` = follow the OS default).
+    /// The user's device selection (`None` = follow the OS default), for
+    /// the native backend's own device lookup.
+    #[cfg(windows)]
     device_name: Option<String>,
     /// cpal stream, when the cpal backend is in use.
     stream: Option<Stream>,
@@ -122,6 +124,7 @@ impl AudioOutput {
         Ok(Self {
             device,
             device_config,
+            #[cfg(windows)]
             device_name: device_name.map(String::from),
             stream: None,
             #[cfg(windows)]
@@ -623,6 +626,9 @@ fn worker_loop(parts: WorkerParts) {
             }
             if js.late > 0 {
                 stats.packets_late.fetch_add(js.late, Ordering::Relaxed);
+            }
+            if js.red > 0 {
+                stats.red_recoveries.fetch_add(js.red, Ordering::Relaxed);
             }
             jitter_buffer.adapt();
 

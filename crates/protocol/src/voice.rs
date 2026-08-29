@@ -15,24 +15,51 @@
 //! ```text
 //! offset  size  field
 //! 0       1     version   (= 2)
-//! 1       1     flags     (reserved, must be 0)
+//! 1       1     flags     (bit 0 = VOICE_FLAG_RED; other bits reserved, 0)
 //! 2       4     sequence number
 //! 6       4     timestamp (48 kHz sample clock)
-//! 10      —     Opus frame (1..=VOICE_MAX_FRAME_SIZE bytes)
+//! 10      —     payload   (1..=VOICE_MAX_FRAME_SIZE bytes)
 //! ```
 //!
 //! There is no sender id (see [`crate::relayed`]) and no length field —
-//! the frame is delimited by the datagram itself.
+//! the payload is delimited by the datagram itself.
+//!
+//! ## Payload types (2.1)
+//!
+//! With `flags == 0` the payload is one Opus packet, as in every v2
+//! packet ever sent. With [`VOICE_FLAG_RED`] set it is a *redundant audio
+//! bundle* (`audio::transport::red`): the sender's current Opus packet
+//! plus full copies of its preceding one or two packets, which a receiver
+//! uses to repair losses exactly. Senders only produce bundles when their
+//! rate controller sees loss, so a receiver that predates this flag keeps
+//! working on a clean link and conceals the bundles it cannot parse on a
+//! lossy one — the same outcome it had before. That is why this is a flag
+//! inside v2 rather than v3: a version bump would make old and new
+//! clients mutually silent, a flag only degrades the old client under
+//! the conditions it was already degrading in.
+//!
+//! The relay only checks version and size (`parse_voice`), so bundles
+//! pass through unchanged.
 
 /// Current voice wire format version.
 pub const VOICE_PROTOCOL_VERSION: u8 = 2;
 
+/// `flags` bit: the payload is a redundant audio bundle, not a bare Opus
+/// packet.
+pub const VOICE_FLAG_RED: u8 = 0x01;
+
+/// All flag bits this version understands. Unknown bits are ignored by
+/// receivers so future flags can be added without a version bump, as this
+/// one was.
+pub const VOICE_FLAGS_KNOWN: u8 = VOICE_FLAG_RED;
+
 /// Serialized header size in bytes.
 pub const VOICE_HEADER_SIZE: usize = 10;
 
-/// Maximum size of a single Opus frame we will send or relay. A 10 ms
-/// frame at 128 kbit/s is ~160 bytes; 512 leaves ample headroom for any
-/// sane encoder setting while bounding hostile input.
+/// Maximum payload we will send or relay. A 20 ms voice frame at 48 kbit/s
+/// is ~120 bytes; the largest RED bundle the audio crate produces (32 kbit/s,
+/// two copies, headers) is ~250 bytes. 512 leaves headroom while bounding
+/// hostile input.
 pub const VOICE_MAX_FRAME_SIZE: usize = 512;
 
 /// Maximum total voice packet size accepted by the relay
@@ -50,22 +77,42 @@ pub struct VoiceHeader {
     pub timestamp: u32,
 }
 
-/// Pack one Opus frame into a voice packet.
+impl VoiceHeader {
+    /// The payload is a redundant audio bundle (see [`VOICE_FLAG_RED`]).
+    #[must_use]
+    pub fn is_red(&self) -> bool {
+        self.flags & VOICE_FLAG_RED != 0
+    }
+}
+
+/// Pack one Opus frame into a voice packet (flags = 0).
 ///
 /// Returns `None` if the frame is empty or exceeds
 /// [`VOICE_MAX_FRAME_SIZE`] — callers should drop such frames (and log),
 /// never truncate audio.
 #[must_use]
 pub fn pack_voice(seq: u32, timestamp: u32, opus_frame: &[u8]) -> Option<Vec<u8>> {
-    if opus_frame.is_empty() || opus_frame.len() > VOICE_MAX_FRAME_SIZE {
+    pack_voice_with_flags(seq, timestamp, 0, opus_frame)
+}
+
+/// Pack a payload with explicit flags — [`VOICE_FLAG_RED`] for a
+/// redundant audio bundle. Same size rules as [`pack_voice`].
+#[must_use]
+pub fn pack_voice_with_flags(
+    seq: u32,
+    timestamp: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    if payload.is_empty() || payload.len() > VOICE_MAX_FRAME_SIZE {
         return None;
     }
-    let mut out = Vec::with_capacity(VOICE_HEADER_SIZE + opus_frame.len());
+    let mut out = Vec::with_capacity(VOICE_HEADER_SIZE + payload.len());
     out.push(VOICE_PROTOCOL_VERSION);
-    out.push(0); // flags
+    out.push(flags & VOICE_FLAGS_KNOWN);
     out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(&timestamp.to_le_bytes());
-    out.extend_from_slice(opus_frame);
+    out.extend_from_slice(payload);
     Some(out)
 }
 
@@ -105,6 +152,23 @@ mod tests {
         assert_eq!(header.seq, 42);
         assert_eq!(header.timestamp, 48_000);
         assert_eq!(parsed_frame, &frame[..]);
+    }
+
+    #[test]
+    fn red_flag_roundtrips_and_plain_packets_are_not_red() {
+        let plain = pack_voice(1, 2, &[0xAB; 8]).unwrap();
+        assert!(!parse_voice(&plain).unwrap().0.is_red());
+
+        let red = pack_voice_with_flags(1, 2, VOICE_FLAG_RED, &[0xCD; 8]).unwrap();
+        let (header, payload) = parse_voice(&red).unwrap();
+        assert!(header.is_red());
+        assert_eq!(payload, &[0xCD; 8]);
+    }
+
+    #[test]
+    fn unknown_flag_bits_are_not_sent() {
+        let packet = pack_voice_with_flags(1, 2, 0xFF, &[1]).unwrap();
+        assert_eq!(packet[1], VOICE_FLAGS_KNOWN);
     }
 
     #[test]

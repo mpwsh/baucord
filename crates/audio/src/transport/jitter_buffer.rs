@@ -28,8 +28,9 @@
 
 use crate::config::PeerAudioSettings;
 use crate::processor::limiter::Limiter;
-use crate::transport::packet::AudioPacket;
+use crate::transport::packet::{AudioPacket, PayloadType};
 use crate::transport::packet_buffer::{PacketBuffer, Push};
+use crate::transport::red;
 use crate::{FRAME_SIZE, OPUS_SAMPLE_RATE};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -93,6 +94,25 @@ const SHRINK_AFTER_TICKS: u32 = 10;
 /// jitter or loss, so it never goes through a packet buffer.
 const LOOPBACK_CAP: usize = OPUS_SAMPLE_RATE as usize / 5;
 
+/// How long after the last observed loss the protection floor stays up.
+///
+/// FEC (LBRR in packet N+1) and RED (a copy in N+1 or N+2) can only repair
+/// a lost slot if playout waits for that later packet: on a clean link the
+/// target sits at its 2–10 ms floor and every repair arrives after its
+/// slot has played — field logs showed `FEC 4 PLC 125` for exactly this
+/// reason. While loss is being observed the target is held at one frame
+/// (or the RED span) plus a margin; when the link has been clean for this
+/// long the floor drops and latency returns to the minimum.
+const LOSS_MEMORY: Duration = Duration::from_secs(5);
+/// Margin on top of the repair distance, so the repair packet's own
+/// jitter doesn't make it late.
+const PROTECT_MARGIN_MS: f32 = 10.0;
+
+/// Comfort noise continues for a paused peer only while its DTX refreshes
+/// keep arriving (every 400 ms); a peer silent for longer than this has
+/// left, muted, or lost its link, and gets silence.
+const CNG_MAX_GAP: Duration = Duration::from_secs(1);
+
 /// Concealment / loss counters accumulated between [`AdaptiveJitterBuffer::drain_stats`] calls.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JitterStats {
@@ -104,6 +124,8 @@ pub struct JitterStats {
     pub lost: u64,
     /// Packets that arrived behind the playhead.
     pub late: u64,
+    /// Packets recovered from a RED copy carried by a later packet.
+    pub red: u64,
 }
 
 /// Per-peer state inside the jitter buffer.
@@ -236,6 +258,15 @@ pub struct AdaptiveJitterBuffer {
     underrun_floor_ms: f32,
     /// Counters for `AudioStats`, drained by the output worker.
     stats: JitterStats,
+
+    // ── Loss protection floor ───────────────────────────────────────
+    /// Last time a due slot had to be concealed or skipped.
+    last_loss_at: Option<Instant>,
+    /// Duration of the most recent accepted packet, for the floor.
+    frame_samples_hint: usize,
+    /// Largest RED redundancy span seen recently, in samples.
+    red_span_samples: usize,
+    last_red_at: Option<Instant>,
 }
 
 impl AdaptiveJitterBuffer {
@@ -265,6 +296,29 @@ impl AdaptiveJitterBuffer {
             last_logged_target_ms: initial_ms,
             underrun_floor_ms: 0.0,
             stats: JitterStats::default(),
+            last_loss_at: None,
+            frame_samples_hint: FRAME_SIZE,
+            red_span_samples: 0,
+            last_red_at: None,
+        }
+    }
+
+    /// Minimum target while repairs are worth waiting for (ms); 0 when the
+    /// link has been clean for `LOSS_MEMORY`.
+    fn protection_floor_ms(&self) -> f32 {
+        let recent_loss = self.last_loss_at.is_some_and(|t| t.elapsed() < LOSS_MEMORY);
+        if !recent_loss {
+            return 0.0;
+        }
+        let recent_red = self.last_red_at.is_some_and(|t| t.elapsed() < LOSS_MEMORY);
+        let span = if recent_red {
+            self.red_span_samples.max(self.frame_samples_hint)
+        } else {
+            self.frame_samples_hint
+        };
+        #[allow(clippy::cast_precision_loss)]
+        {
+            span as f32 * 1000.0 / self.sample_rate as f32 + PROTECT_MARGIN_MS
         }
     }
 
@@ -278,6 +332,58 @@ impl AdaptiveJitterBuffer {
     /// Packets may arrive in any order; the packet buffer sorts them. Late
     /// packets (behind the playhead) are counted and dropped.
     pub fn push_packet(&mut self, pkt: AudioPacket, arrival: Instant) {
+        if pkt.header.payload_type == PayloadType::Red {
+            self.push_red_bundle(pkt, arrival);
+            return;
+        }
+        self.push_primary(pkt, arrival);
+    }
+
+    /// Split a RED bundle: redundant copies go straight into the peer's
+    /// packet buffer (a duplicate of something that already arrived is
+    /// ignored; a copy of something that never arrived is a recovery),
+    /// then the primary takes the normal path.
+    fn push_red_bundle(&mut self, pkt: AudioPacket, arrival: Instant) {
+        let Some(bundle) = red::decode(&pkt.opus_data) else {
+            log::debug!("malformed RED bundle from peer {}", pkt.header.ssrc);
+            return;
+        };
+        let h = &pkt.header;
+        let mut span = 0usize;
+        for block in &bundle.redundant {
+            span = span.max(block.ts_offset as usize);
+            let copy = AudioPacket::new(
+                h.seq.wrapping_sub(block.seq_distance),
+                h.timestamp.wrapping_sub(block.ts_offset),
+                h.ssrc,
+                block.data.to_vec(),
+            );
+            self.push_redundant(copy);
+        }
+        if !bundle.redundant.is_empty() {
+            self.red_span_samples = span;
+            self.last_red_at = Some(arrival);
+        }
+        let primary = AudioPacket::new(h.seq, h.timestamp, h.ssrc, bundle.primary.to_vec());
+        self.push_primary(primary, arrival);
+    }
+
+    /// A redundant copy: no jitter estimation, no underrun classification —
+    /// it isn't a fresh arrival, it's a repair.
+    fn push_redundant(&mut self, pkt: AudioPacket) {
+        let peer_id = pkt.header.ssrc;
+        let Some(peer) = self.buffers.get_mut(&peer_id) else {
+            return;
+        };
+        let pushed = opus::packet::get_nb_samples(&pkt.opus_data, OPUS_SAMPLE_RATE)
+            .unwrap_or(FRAME_SIZE) as u64;
+        if peer.packets.push(pkt) == Push::Accepted {
+            peer.pushed_samples += pushed;
+            self.stats.red += 1;
+        }
+    }
+
+    fn push_primary(&mut self, pkt: AudioPacket, arrival: Instant) {
         let peer_id = pkt.header.ssrc;
         let ts = pkt.header.timestamp;
 
@@ -405,6 +511,10 @@ impl AdaptiveJitterBuffer {
         peer.last_ts = Some(ts);
         peer.pushed_samples += pushed;
         peer.last_push = Instant::now();
+        #[allow(clippy::cast_possible_truncation)] // ≤ MAX_FRAME
+        {
+            self.frame_samples_hint = pushed as usize;
+        }
 
         // Hard cap: prevent runaway growth (e.g., frozen output, paused app).
         // This is a safety valve, not the normal shrink path.
@@ -477,6 +587,22 @@ impl AdaptiveJitterBuffer {
                     // Soften the resume edge to match the softened cut.
                     peer.fade_in_remaining = RESUME_FADE_SAMPLES;
                 } else {
+                    // DTX pause: keep the last refresh's noise floor going
+                    // (decaying) while refreshes keep arriving, instead of
+                    // a blip every 400 ms. Not "playing": priming still
+                    // decides when speech resumes.
+                    if !peer.playing
+                        && peer.last_push.elapsed() < CNG_MAX_GAP
+                        && peer.packets.comfort_noise(&mut self.scratch[..n])
+                    {
+                        for slot in &mut self.scratch[..n] {
+                            *slot *= peer_settings.volume;
+                        }
+                        peer.limiter.process_samples(&mut self.scratch[..n]);
+                        for (o, s) in out.iter_mut().zip(&self.scratch[..n]) {
+                            *o += s;
+                        }
+                    }
                     continue;
                 }
             }
@@ -658,6 +784,10 @@ impl AdaptiveJitterBuffer {
 
         drop(settings);
 
+        if fec + plc + lost > 0 {
+            self.last_loss_at = Some(now);
+        }
+
         // Concealment at a *due slot* is the adaptation signal (a packet was
         // lost or late). Dry-buffer extrapolation is deliberately excluded:
         // the deferred underrun classification owns that verdict, and
@@ -823,6 +953,14 @@ impl AdaptiveJitterBuffer {
         let jitter_samples = self.ms_to_samples(jitter_target_ms);
         if jitter_samples > self.target_samples {
             self.target_samples = jitter_samples;
+        }
+
+        // ── Loss-protection floor ───────────────────────────────────
+        // Repairs (LBRR, RED) live in the *next* packet(s); hold playout
+        // long enough for them to arrive while loss is being observed.
+        let protect = self.ms_to_samples(self.protection_floor_ms());
+        if protect > self.target_samples {
+            self.target_samples = protect;
         }
 
         // ── Clamp to [min, max] ─────────────────────────────────────
@@ -1022,7 +1160,49 @@ mod tests {
             }
             let stats = jb.drain_stats();
             assert!(energy > 0.0, "no audio reached the mix");
-            assert_eq!((stats.fec, stats.plc, stats.lost, stats.late), (0, 0, 0, 0));
+            assert_eq!(
+                (stats.fec, stats.plc, stats.lost, stats.late, stats.red),
+                (0, 0, 0, 0, 0)
+            );
+        }
+
+        /// Packet 2 is never delivered; packet 3 carries a RED copy of it.
+        /// The copy must land in the buffer as a recovery and slot 2 must
+        /// play from it — no concealment, no loss.
+        #[test]
+        fn red_copy_repairs_a_missing_packet_exactly() {
+            let mut jb = buffer();
+            let mut enc = encoder();
+            let t0 = Instant::now();
+            let p0 = packet(&mut enc, 0, 7);
+            let p1 = packet(&mut enc, 1, 7);
+            let p2 = packet(&mut enc, 2, 7); // lost on the wire
+            let p3 = packet(&mut enc, 3, 7);
+
+            jb.push_packet(p0, t0);
+            jb.push_packet(p1, t0);
+            let mut bundle = Vec::new();
+            red::encode(
+                &p3.opus_data,
+                &[(FRAME_SIZE as u32, &p2.opus_data)],
+                &mut bundle,
+            );
+            let p3_red = AudioPacket::new_typed(
+                3,
+                3 * FRAME_SIZE as u32,
+                7,
+                PayloadType::Red,
+                bundle,
+            );
+            jb.push_packet(p3_red, t0);
+
+            let mut out = vec![0.0f32; 480];
+            for _ in 0..8 {
+                jb.pull_mixed(480, &mut out);
+            }
+            let stats = jb.drain_stats();
+            assert_eq!(stats.red, 1, "the copy of packet 2 is a recovery");
+            assert_eq!((stats.fec, stats.plc, stats.lost), (0, 0, 0));
         }
 
         #[test]

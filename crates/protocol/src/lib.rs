@@ -49,5 +49,6 @@ pub use video::{
     VideoReassembler, pack_video_frame, parse_video_header,
 };
 pub use voice::{
-    VOICE_HEADER_SIZE, VOICE_MAX_FRAME_SIZE, VOICE_MTU_BUDGET, VoiceHeader, pack_voice, parse_voice,
+    VOICE_FLAG_RED, VOICE_FLAGS_KNOWN, VOICE_HEADER_SIZE, VOICE_MAX_FRAME_SIZE, VOICE_MTU_BUDGET,
+    VoiceHeader, pack_voice, pack_voice_with_flags, parse_voice,
 };

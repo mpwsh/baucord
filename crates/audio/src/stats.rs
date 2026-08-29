@@ -63,6 +63,22 @@ pub struct AudioStats {
     /// Automatic stream restarts performed so far (both sides).
     pub stream_restarts: AtomicU64,
 
+    // ── Link feedback in / adaptation state out ─────────────────────
+    /// Round-trip time the transport reports (0 = unknown). See
+    /// [`crate::VoiceChat::set_link_rtt_ms`].
+    pub link_rtt_ms: AtomicU32,
+    /// Opus target bitrate currently in force (bits/s).
+    pub send_bitrate_bps: AtomicU32,
+    /// Opus frame length per packet currently in force (20 or 40).
+    pub frame_ms: AtomicU32,
+    /// Rung of the adaptation ladder (0 = best quality).
+    pub adapt_level: AtomicU32,
+    /// Redundant audio (RED) is being sent.
+    pub red_active: AtomicBool,
+    /// Packets recovered at the receiver from a RED copy in a later
+    /// packet (the original never arrived or arrived late).
+    pub red_recoveries: AtomicU64,
+
     // ── Jitter buffer ───────────────────────────────────────────────────
     pub jitter_buffer_occupancy_ms: AtomicUsize,
     /// Current adaptive target depth in milliseconds.
@@ -137,6 +153,12 @@ impl AudioStats {
             default_input_changed: AtomicBool::new(false),
             default_output_changed: AtomicBool::new(false),
             stream_restarts: AtomicU64::new(0),
+            link_rtt_ms: AtomicU32::new(0),
+            send_bitrate_bps: AtomicU32::new(0),
+            frame_ms: AtomicU32::new(20),
+            adapt_level: AtomicU32::new(0),
+            red_active: AtomicBool::new(false),
+            red_recoveries: AtomicU64::new(0),
             jitter_buffer_occupancy_ms: AtomicUsize::new(0),
             jitter_buffer_target_ms: AtomicUsize::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -222,7 +244,7 @@ impl AudioStats {
 
         format!(
             "Audio ({}s) | Sent {} Recv {} Lost {} ({:.1}%) | \
-             FEC {} PLC {} (hint {}%, uplink {}%) | Overruns {} Underruns {} Drop {} | Jitter {}ms (target {}ms) | \
+             FEC {} RED {} PLC {} (hint {}%, uplink {}%) | Rate {}k/{}ms{} | Overruns {} Underruns {} Drop {} | Jitter {}ms (target {}ms) | \
              BW ↑{:.1}kbps ↓{:.1}kbps | Pkt {}B (avg {:.0}B) | \
              Enc {}µs Dec {}µs | Errors: enc {} dec {}",
             elapsed,
@@ -231,9 +253,13 @@ impl AudioStats {
             lost,
             loss_rate,
             self.fec_recoveries.load(Ordering::Relaxed),
+            self.red_recoveries.load(Ordering::Relaxed),
             self.plc_frames.load(Ordering::Relaxed),
             self.fec_loss_hint_pct.load(Ordering::Relaxed),
             self.uplink_loss_pct.load(Ordering::Relaxed),
+            self.send_bitrate_bps.load(Ordering::Relaxed) / 1000,
+            self.frame_ms.load(Ordering::Relaxed),
+            if self.red_active.load(Ordering::Relaxed) { "+RED" } else { "" },
             self.input_overruns.load(Ordering::Relaxed),
             self.output_underruns.load(Ordering::Relaxed),
             self.outgoing_dropped.load(Ordering::Relaxed),

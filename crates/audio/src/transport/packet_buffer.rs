@@ -33,10 +33,11 @@ use opus::{Channels, Decoder};
 use crate::transport::packet::AudioPacket;
 use crate::{FRAME_SIZE, OPUS_SAMPLE_RATE};
 
-/// Largest single packet this buffer decodes: 20 ms at 48 kHz. Bump to
-/// 2880 only if the encoder is ever allowed 60 ms frames; every increase
-/// costs `MAX_FRAME * 4` bytes of staging per peer.
-pub const MAX_FRAME: usize = 960;
+/// Largest single packet this buffer decodes: 40 ms at 48 kHz (the rate
+/// controller's low-bitrate rungs use 40 ms frames). Bump to 2880 only if
+/// 60 ms is ever allowed; every increase costs `MAX_FRAME * 4` bytes of
+/// staging per peer.
+pub const MAX_FRAME: usize = 1920;
 
 /// Missing slots before a present packet beyond this are skipped (playhead
 /// jumps forward) rather than concealed one by one. libopus PLC has faded
@@ -156,8 +157,12 @@ pub struct PacketBuffer {
     /// PLC frames spent since the last real frame while the buffer was empty.
     dry_plc_used: u32,
     /// Whether the last decoded real frame was at/below `QUIET_RMS`.
-    /// Gates dry-PLC: there is nothing worth extrapolating after silence.
+    /// Gates dry-PLC (nothing worth extrapolating after silence) and
+    /// enables comfort-noise continuation instead.
     last_real_quiet: bool,
+    /// Duration of the last decoded real frame, for the caller's
+    /// loss-protection floor.
+    last_real_samples: usize,
     /// Decoded PCM for the current slot, consumed by `fill`.
     staging: [f32; MAX_FRAME],
     staged: usize,
@@ -174,6 +179,7 @@ impl PacketBuffer {
             next_ts: 0,
             dry_plc_used: 0,
             last_real_quiet: true,
+            last_real_samples: FRAME_SIZE,
             staging: [0.0; MAX_FRAME],
             staged: 0,
             pos: 0,
@@ -285,6 +291,40 @@ impl PacketBuffer {
         self.last_real_quiet = true;
         self.staged = 0;
         self.pos = 0;
+    }
+
+    /// Duration of the most recently decoded real frame (samples).
+    pub fn last_frame_samples(&self) -> usize {
+        self.last_real_samples
+    }
+
+    /// Comfort-noise continuation for a peer in a DTX pause.
+    ///
+    /// Opus DTX sends one refresh frame every 400 ms; between them the
+    /// decoder is meant to keep being called with no packet, which
+    /// extrapolates that frame's noise floor and lets it decay (RFC 7587
+    /// §3.1.3 / libopus PLC) instead of playing a 20 ms blip every 400 ms
+    /// with digital silence between. Applies only when the last real
+    /// frame was quiet (a refresh, or a closed-gate frame) and the buffer
+    /// is empty. Does **not** advance the playhead — the next real packet
+    /// resyncs exactly as it would after silence. Returns `false` when not
+    /// applicable (the caller then contributes nothing).
+    pub fn comfort_noise(&mut self, out: &mut [f32]) -> bool {
+        if !self.started || !self.last_real_quiet || !self.slots.is_empty() {
+            return false;
+        }
+        let mut filled = 0;
+        while filled < out.len() {
+            if self.pos >= self.staged {
+                self.pos = 0;
+                self.plc_into_staging(FRAME_SIZE);
+            }
+            let take = (self.staged - self.pos).min(out.len() - filled);
+            out[filled..filled + take].copy_from_slice(&self.staging[self.pos..self.pos + take]);
+            self.pos += take;
+            filled += take;
+        }
+        true
     }
 
     // ── Playout ─────────────────────────────────────────────────────
@@ -435,6 +475,7 @@ impl PacketBuffer {
                 self.staged = n;
                 self.dry_plc_used = 0;
                 self.last_real_quiet = is_quiet(&self.staging[..n]);
+                self.last_real_samples = n;
                 self.next_seq = slot.seq.wrapping_add(1);
                 self.next_ts = slot.ts.wrapping_add(n as u32);
                 Refill::Real

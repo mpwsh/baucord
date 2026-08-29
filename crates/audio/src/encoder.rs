@@ -5,10 +5,11 @@
 //!
 //! ## Frame size
 //!
-//! 20 ms, not 10: half the packet rate and header overhead, and — the
-//! part that matters under loss — the LBRR copy Opus puts in packet N+1
-//! then covers *all* of packet N, so a typical single-packet burst loss
-//! is fully recoverable by in-band FEC. At 10 ms it covered half.
+//! 20 ms by default: half the packet rate and header overhead of 10 ms,
+//! and the LBRR copy Opus puts in packet N+1 then covers *all* of packet
+//! N. Under adaptation the encoder can move to 40 ms frames (two pipeline
+//! frames per packet), halving overhead again exactly when the codec rate
+//! is low enough for 44 bytes of header per packet to matter.
 //!
 //! ## Silence handling (DTX)
 //!
@@ -20,22 +21,43 @@
 //! contiguous sequence numbers across talk pauses (no spurious PLC) while
 //! the timestamps let the jitter buffer tell a pause from network jitter.
 //!
+//! ## Loss protection
+//!
+//! Two mechanisms, both driven by the same 2-second link window:
+//!
+//! - **In-band FEC (LBRR)**: always on; the loss hint is the worse of
+//!   measured downlink loss and transport-reported uplink loss, floored
+//!   so libopus never stops coding LBRR entirely.
+//! - **RED** (`transport::red`): under random loss the
+//!   [`crate::adapt::RateController`] turns on full copies of the
+//!   preceding packet(s) in every packet — exact repair of single losses
+//!   and, at distance 2, of pairs. The controller pays for it by stepping
+//!   the codec down a rung, and never enables it when the loss looks like
+//!   congestion.
+//!
 //! Owns the Opus encoder exclusively — no shared mutex needed.
-//! Adaptive FEC adjusts the packet-loss hint every ~2 seconds from the
-//! worse of (a) downlink loss measured over that window and (b) uplink
-//! loss the transport reports via `AudioStats::uplink_loss_pct`.
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use log::{error, info, warn};
 use opus::{Application, Bitrate, Channels, Encoder};
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::{
-    stats::AudioStats, transport::packet::AudioPacket, PcmFrame, FRAME_SIZE, OPUS_BITRATE,
-    OPUS_SAMPLE_RATE,
-};
+use crate::adapt::{Band, Decision, LinkSample, Profile, RateController, LADDER};
+use crate::transport::packet::{AudioPacket, PayloadType};
+use crate::transport::red;
+use crate::{stats::AudioStats, PcmFrame, FRAME_SIZE, OPUS_SAMPLE_RATE};
+
+/// Largest packet the encoder will ever produce: 40 ms at the top rate,
+/// with LBRR, plus two RED copies of the same. Generous.
+const SCRATCH_BYTES: usize = 1500;
+
+/// Redundant copies per packet when RED is on. 1 repairs any single loss;
+/// 2 also repairs back-to-back pairs at the cost of one more frame of
+/// receiver delay. Field logs so far show mostly isolated losses.
+const RED_DISTANCE: usize = 1;
 
 /// Encoder thread state. Created once, runs until the input channel closes.
 struct EncoderWorker {
@@ -47,16 +69,47 @@ struct EncoderWorker {
     seq: u32,
     ts_48k: u32,
     scratch: Vec<u8>,
+    /// RED bundle assembly buffer.
+    bundle: Vec<u8>,
 
-    /// Packets encoded since last FEC adaptation check.
-    packets_since_fec_update: u32,
-    /// Loss-counter snapshots from the previous FEC update, so the hint
+    // ── Frame accumulation (20 ms in, 20/40 ms out) ─────────────────
+    profile: Profile,
+    /// Applied at the next packet boundary.
+    pending: Option<Decision>,
+    accum: Vec<f32>,
+    /// Timestamp of the first pipeline frame in `accum`.
+    accum_ts: u32,
+
+    // ── RED ─────────────────────────────────────────────────────────
+    red: bool,
+    /// Last transmitted packets, oldest first: (timestamp, bytes).
+    history: VecDeque<(u32, Vec<u8>)>,
+
+    // ── Adaptation ──────────────────────────────────────────────────
+    controller: RateController,
+    /// Packets encoded since last adaptation check.
+    frames_since_update: u32,
+    /// Loss-counter snapshots from the previous update, so the hint
     /// tracks the *recent* loss rate instead of the lifetime average.
     prev_received: u64,
     prev_lost: u64,
     /// Hint currently applied to the encoder; avoids a libopus ctl call
     /// every window when nothing changed.
     current_fec_hint: i32,
+}
+
+fn opus_band(b: Band) -> opus::Bandwidth {
+    match b {
+        Band::Narrow => opus::Bandwidth::Narrowband,
+        Band::Wide => opus::Bandwidth::Wideband,
+        Band::SuperWide => opus::Bandwidth::Superwideband,
+    }
+}
+
+fn ctl(name: &str, r: opus::Result<()>) {
+    if let Err(e) = r {
+        warn!("Opus encoder: {name} failed: {e}");
+    }
 }
 
 impl EncoderWorker {
@@ -66,17 +119,13 @@ impl EncoderWorker {
         stats: Arc<AudioStats>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut encoder = Encoder::new(OPUS_SAMPLE_RATE, Channels::Mono, Application::Voip)?;
+        let profile = LADDER[0];
 
         // ── Voice chat tuning ───────────────────────────────────────
         // Every ctl is checked: a silently ignored setting (FEC off,
         // wrong bandwidth) is exactly the kind of thing that costs a
         // week in the field.
-        let ctl = |name: &str, r: opus::Result<()>| {
-            if let Err(e) = r {
-                warn!("Opus encoder: {name} failed: {e}");
-            }
-        };
-        ctl("set_bitrate", encoder.set_bitrate(Bitrate::Bits(OPUS_BITRATE)));
+        ctl("set_bitrate", encoder.set_bitrate(Bitrate::Bits(profile.bitrate)));
         ctl("set_vbr", encoder.set_vbr(true));
         // Complexity 7 — and not lower. libopus only runs its tonality /
         // activity analysis at complexity >= 7 (opus_encoder.c, float
@@ -87,10 +136,7 @@ impl EncoderWorker {
         // and nothing else. 10 buys nothing audible over 7 for speech at
         // this bitrate; `last_encode_us` is the knob if that ever changes.
         ctl("set_complexity", encoder.set_complexity(7));
-        ctl(
-            "set_bandwidth",
-            encoder.set_bandwidth(opus::Bandwidth::Superwideband),
-        );
+        ctl("set_bandwidth", encoder.set_bandwidth(opus_band(profile.band)));
         ctl("set_inband_fec", encoder.set_inband_fec(true));
         ctl(
             "set_packet_loss_perc",
@@ -100,6 +146,7 @@ impl EncoderWorker {
         stats
             .fec_loss_hint_pct
             .store(FEC_LOSS_FLOOR_PCT.unsigned_abs(), Ordering::Relaxed);
+        Self::publish_profile(&stats, profile, 0, false);
 
         Ok(Self {
             encoder,
@@ -108,14 +155,31 @@ impl EncoderWorker {
             stats,
             seq: 0,
             ts_48k: 0,
-            // 48 kbps × 20 ms ≈ 120 bytes; LBRR + VBR peaks stay well
-            // under 512.
-            scratch: vec![0u8; 512],
-            packets_since_fec_update: 0,
+            scratch: vec![0u8; SCRATCH_BYTES],
+            bundle: Vec::with_capacity(SCRATCH_BYTES),
+            profile,
+            pending: None,
+            accum: Vec::with_capacity(FRAME_SIZE * 2),
+            accum_ts: 0,
+            red: false,
+            history: VecDeque::with_capacity(red::MAX_BLOCKS + 1),
+            controller: RateController::new(),
+            frames_since_update: 0,
             prev_received: 0,
             prev_lost: 0,
             current_fec_hint: FEC_LOSS_FLOOR_PCT,
         })
+    }
+
+    fn publish_profile(stats: &AudioStats, profile: Profile, level: usize, red: bool) {
+        #[allow(clippy::cast_sign_loss)] // bitrates are positive
+        stats
+            .send_bitrate_bps
+            .store(profile.bitrate as u32, Ordering::Relaxed);
+        stats.frame_ms.store(profile.frame_ms, Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation)] // ladder has 5 rungs
+        stats.adapt_level.store(level as u32, Ordering::Relaxed);
+        stats.red_active.store(red, Ordering::Relaxed);
     }
 
     fn run(&mut self) {
@@ -128,66 +192,134 @@ impl EncoderWorker {
         info!("Encoder thread started");
 
         while let Ok(samples) = self.rx.recv() {
-            self.encode_frame(&samples);
-            self.maybe_update_fec();
+            self.push_frame(&samples);
+            self.maybe_adapt();
         }
 
         info!("Encoder thread stopped");
     }
 
-    fn encode_frame(&mut self, samples: &[f32]) {
-        let t0 = Instant::now();
+    /// Samples per packet at the current profile.
+    fn packet_samples(&self) -> usize {
+        FRAME_SIZE * (self.profile.frame_ms / 20) as usize
+    }
 
-        match self.encoder.encode_float(samples, &mut self.scratch) {
-            Ok(size) => {
-                self.stats
-                    .last_encode_us
-                    .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-                // DTX: Opus produces ≤2-byte "do not transmit" packets
-                // during silence. libopus still encodes a full comfort-
-                // noise refresh frame every 400 ms (MAX_CONSECUTIVE_DTX),
-                // which is > 2 bytes and goes out normally.
-                let dtx = size <= 2;
-                self.stats.dtx_active.store(dtx, Ordering::Relaxed);
-
-                if dtx {
-                    // Withhold the packet. The media clock still advances;
-                    // the sequence number only counts transmitted packets,
-                    // so the receiver sees no gap when speech resumes.
-                    self.ts_48k = self.ts_48k.wrapping_add(FRAME_SIZE as u32);
-                    return;
-                }
-
-                let packet =
-                    AudioPacket::new(self.seq, self.ts_48k, 0, self.scratch[..size].to_vec());
-
-                self.seq = self.seq.wrapping_add(1);
-                self.ts_48k = self.ts_48k.wrapping_add(FRAME_SIZE as u32);
-                self.stats.record_packet_sent(size);
-
-                // try_send: if the application isn't draining outgoing
-                // packets, dropping is correct for real-time audio and
-                // guarantees this thread can never wedge in a blocking
-                // send (which used to make shutdown hang).
-                match self.tx.try_send(packet) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        self.stats.outgoing_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(TrySendError::Disconnected(_)) => {}
-                }
+    fn push_frame(&mut self, samples: &[f32]) {
+        if self.accum.is_empty() {
+            // Packet boundary: the only place a frame-length change is
+            // safe to apply.
+            if let Some(d) = self.pending.take() {
+                self.apply(d);
             }
-            Err(e) => {
-                error!("Encode error: {e}");
-                self.stats.encode_errors.fetch_add(1, Ordering::Relaxed);
-            }
+            self.accum_ts = self.ts_48k;
+        }
+        self.accum.extend_from_slice(samples);
+        // The media clock counts pipeline frames regardless of packet size
+        // or DTX, so timestamps stay continuous across both.
+        self.ts_48k = self.ts_48k.wrapping_add(FRAME_SIZE as u32);
+
+        if self.accum.len() >= self.packet_samples() {
+            self.encode_packet();
+            self.accum.clear();
         }
     }
 
-    /// Adjust the Opus FEC packet-loss hint every ~100 frames (~2 seconds).
+    fn encode_packet(&mut self) {
+        let t0 = Instant::now();
+        let packet_ts = self.accum_ts;
+
+        let size = match self.encoder.encode_float(&self.accum, &mut self.scratch) {
+            Ok(size) => size,
+            Err(e) => {
+                error!("Encode error: {e}");
+                self.stats.encode_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        self.stats
+            .last_encode_us
+            .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        // DTX: Opus produces ≤2-byte "do not transmit" packets during
+        // silence. libopus still encodes a full comfort-noise refresh frame
+        // every 400 ms (MAX_CONSECUTIVE_DTX), which is > 2 bytes and goes
+        // out normally.
+        let dtx = size <= 2;
+        self.stats.dtx_active.store(dtx, Ordering::Relaxed);
+        if dtx {
+            // Withhold the packet. The sequence number only counts
+            // transmitted packets, so the receiver sees no gap when speech
+            // resumes. A pause also ends any RED run: the next packet has
+            // nothing contiguous to carry a copy of (Perkins ch. 9 on the
+            // first packet of a talk spurt).
+            self.history.clear();
+            return;
+        }
+
+        let primary = &self.scratch[..size];
+        let (payload_type, wire_bytes): (PayloadType, usize) = if self.red && !self.history.is_empty()
+        {
+            // Copies of the preceding transmitted packets, oldest first,
+            // with their media offset from this packet. Contiguity is
+            // guaranteed: `history` is cleared on every DTX gap.
+            let blocks: Vec<(u32, &[u8])> = self
+                .history
+                .iter()
+                .map(|(ts, data)| (packet_ts.wrapping_sub(*ts), data.as_slice()))
+                .collect();
+            red::encode(primary, &blocks, &mut self.bundle);
+            (PayloadType::Red, self.bundle.len())
+        } else {
+            (PayloadType::Opus, size)
+        };
+
+        let payload = match payload_type {
+            PayloadType::Red => self.bundle.clone(),
+            PayloadType::Opus => primary.to_vec(),
+        };
+        let packet = AudioPacket::new_typed(self.seq, packet_ts, 0, payload_type, payload);
+
+        self.seq = self.seq.wrapping_add(1);
+        self.stats.record_packet_sent(wire_bytes);
+
+        if self.red {
+            self.history.push_back((packet_ts, primary.to_vec()));
+            while self.history.len() > RED_DISTANCE {
+                self.history.pop_front();
+            }
+        }
+        // try_send: if the application isn't draining outgoing packets,
+        // dropping is correct for real-time audio and guarantees this
+        // thread can never wedge in a blocking send (which used to make
+        // shutdown hang).
+        match self.tx.try_send(packet) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.stats.outgoing_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// Apply a controller decision at a packet boundary.
+    fn apply(&mut self, d: Decision) {
+        if d.profile != self.profile {
+            ctl("set_bitrate", self.encoder.set_bitrate(Bitrate::Bits(d.profile.bitrate)));
+            ctl("set_bandwidth", self.encoder.set_bandwidth(opus_band(d.profile.band)));
+            self.profile = d.profile;
+        }
+        if d.red != self.red {
+            self.red = d.red;
+            if !self.red {
+                self.history.clear();
+            }
+        }
+        Self::publish_profile(&self.stats, self.profile, d.level, self.red);
+    }
+
+    /// Every ~2 s: refresh the FEC hint and run the rate controller.
     ///
-    /// Two signals feed it, and the *larger* wins:
+    /// Two signals feed the hint, and the *larger* wins:
     ///
     /// - **Downlink** loss measured by our decoder over the last window.
     ///   Only a proxy for our own stream (it assumes a symmetric path).
@@ -201,12 +333,12 @@ impl EncoderWorker {
     /// The result never goes below [`FEC_LOSS_FLOOR_PCT`]: at 0 libopus
     /// disables in-band FEC outright, and the first seconds of every loss
     /// episode would then go unprotected until the next window closes.
-    fn maybe_update_fec(&mut self) {
-        self.packets_since_fec_update += 1;
-        if self.packets_since_fec_update < FEC_UPDATE_INTERVAL_FRAMES {
+    fn maybe_adapt(&mut self) {
+        self.frames_since_update += 1;
+        if self.frames_since_update < FEC_UPDATE_INTERVAL_FRAMES {
             return;
         }
-        self.packets_since_fec_update = 0;
+        self.frames_since_update = 0;
 
         let downlink = self.downlink_loss_pct_since_last_update();
         // Stored value is already clamped to 0..=100 by the setter;
@@ -234,6 +366,27 @@ impl EncoderWorker {
                 Err(e) => error!("set_packet_loss_perc({fec_hint}) failed: {e}"),
             }
         }
+
+        // ── Rate control ────────────────────────────────────────────
+        let rtt = self.stats.link_rtt_ms.load(Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss)] // small percentages / ms
+        let sample = LinkSample {
+            uplink_loss_pct: uplink.max(0) as f32,
+            rtt_ms: (rtt > 0).then_some(rtt as f32),
+        };
+        let decision = self.controller.evaluate(sample);
+        if decision.changed {
+            info!(
+                "Rate control: {} kbps {:?} {} ms frames, RED {} (uplink {uplink}%, rtt {rtt} ms)",
+                decision.profile.bitrate / 1000,
+                decision.profile.band,
+                decision.profile.frame_ms,
+                if decision.red { "on" } else { "off" }
+            );
+            // Frame-length changes wait for a packet boundary; everything
+            // else could apply now but is simpler to apply together.
+            self.pending = Some(decision);
+        }
     }
 
     /// Downlink loss over the frames since the previous call, as a whole
@@ -256,7 +409,7 @@ impl EncoderWorker {
     }
 }
 
-/// Frames between FEC hint re-evaluations (~2 s at 20 ms frames; DTX
+/// Pipeline frames between adaptation checks (~2 s at 20 ms frames; DTX
 /// frames count too, so this is wall-clock, not speech time).
 const FEC_UPDATE_INTERVAL_FRAMES: u32 = 100;
 

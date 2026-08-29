@@ -30,13 +30,14 @@ use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use audio::AudioPacket;
+use audio::{AudioPacket, PayloadType};
 
 use protocol::{
     CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ChannelDenyReason, ChannelInfo, ClientMessage,
     DenyReason, MEDIA_CHANNEL, PROTOCOL_ID, SIGNAL_CHANNEL, SYSTEM_AUDIO_CHANNEL, ServerMessage,
     ShareScope, VIDEO_CHANNEL, VOICE_CHANNEL, VideoReassembler, pack_system_audio,
-    pack_video_frame, pack_voice, parse_system_audio, parse_voice, split_sender,
+    VOICE_FLAG_RED, pack_video_frame, pack_voice_with_flags, parse_system_audio, parse_voice,
+    split_sender,
 };
 
 use crate::WakeFn;
@@ -155,6 +156,9 @@ pub enum NetworkMessage {
         seq: u32,
         timestamp: u32,
         data: Vec<u8>,
+        /// `data` is a redundant audio bundle (`VOICE_FLAG_RED`), not a
+        /// bare Opus packet.
+        red: bool,
     },
     UserSpeaking {
         client_id: ClientId,
@@ -763,6 +767,7 @@ impl NetworkClient {
                 seq: header.seq,
                 timestamp: header.timestamp,
                 data: frame.to_vec(),
+                red: header.is_red(),
             });
         }
     }
@@ -992,14 +997,17 @@ impl NetworkClient {
         self.send_control(&ClientMessage::AudioState { muted, deafened });
     }
 
-    /// Send one Opus voice frame. One frame per packet — no bundling,
-    /// no added latency (see `protocol::voice`).
-    pub fn send_voice_frame(&mut self, seq: u32, ts_48k: u32, opus_frame: &[u8]) {
-        match pack_voice(seq, ts_48k, opus_frame) {
+    /// Send one voice packet: a bare Opus frame (`flags == 0`) or a
+    /// redundant audio bundle (`VOICE_FLAG_RED`). One packet per audio
+    /// packet — no bundling of *frames* here, no added latency (see
+    /// `protocol::voice`); RED bundles carry copies of packets already
+    /// sent, which costs bytes, not delay.
+    pub fn send_voice_frame(&mut self, seq: u32, ts_48k: u32, flags: u8, payload: &[u8]) {
+        match pack_voice_with_flags(seq, ts_48k, flags, payload) {
             Some(packet) => self.queue_message(VOICE_CHANNEL, packet),
             None => log::debug!(
-                "Dropping voice frame seq={seq}: invalid size {} bytes",
-                opus_frame.len()
+                "Dropping voice packet seq={seq}: invalid size {} bytes",
+                payload.len()
             ),
         }
     }
@@ -1311,9 +1319,14 @@ fn handle_control(
             if let Some(c) = client {
                 // The packet's ssrc is not sent — the server stamps the
                 // authenticated sender id on relay.
+                let flags = match packet.header.payload_type {
+                    PayloadType::Red => VOICE_FLAG_RED,
+                    PayloadType::Opus => 0,
+                };
                 c.send_voice_frame(
                     packet.header.seq,
                     packet.header.timestamp,
+                    flags,
                     &packet.opus_data,
                 );
             }
@@ -1474,8 +1487,15 @@ fn run_network_loop(
                         seq,
                         timestamp,
                         data,
+                        red,
                     } => {
-                        let packet = AudioPacket::new(seq, timestamp, client_id, data);
+                        let payload_type = if red {
+                            PayloadType::Red
+                        } else {
+                            PayloadType::Opus
+                        };
+                        let packet =
+                            AudioPacket::new_typed(seq, timestamp, client_id, payload_type, data);
                         let _ = voice_tx.try_send(VoiceControl::IncomingVoicePacket(packet));
                     }
 
@@ -1563,6 +1583,13 @@ fn run_network_loop(
                         if let Some(pct) = plausible_uplink_loss_pct(loss_pct) {
                             let _ = voice_tx.try_send(VoiceControl::SetUplinkLoss(pct));
                         }
+                        // RTT lets the encoder's rate controller tell
+                        // congestion (loss + RTT inflation: send fewer
+                        // bytes) from random loss (add redundancy).
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let _ = voice_tx.try_send(VoiceControl::SetLinkRtt(
+                            rtt_ms.max(0.0).round() as u32,
+                        ));
                         #[allow(clippy::cast_possible_truncation)] // f32 is plenty for percent/ms/kbit
                         let _ = screen_tx.try_send(ScreenControl::UplinkStats {
                             loss_pct: loss_pct as f32,

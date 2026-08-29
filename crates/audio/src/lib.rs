@@ -32,6 +32,24 @@
 //! engine asks for 48 kHz first (see [`device`]) and only resamples when a
 //! device cannot provide it.
 //!
+//! ## Loss protection and rate adaptation
+//!
+//! Every packet carries Opus in-band FEC for the previous frame. On top of
+//! that the sender runs a small rate controller ([`adapt`]) fed by the
+//! transport's uplink loss ([`VoiceChat::set_uplink_loss_pct`]) and RTT
+//! ([`VoiceChat::set_link_rtt_ms`]): random loss turns on redundant audio
+//! (RED, [`transport::red`] — full copies of the preceding packet) and
+//! steps the codec down one rung to pay for it; congestion (loss with RTT
+//! inflation) steps down without ever adding bytes; recovery is slow and
+//! one rung at a time. The receiver holds playout one repair-distance
+//! longer only while loss is actually being observed, so FEC and RED can
+//! land before their slot plays, and drops back to the minimum latency on
+//! a clean link.
+//!
+//! **Wire format (protocol bump):** `PacketHeader::payload_type` is one
+//! byte the application must serialise and parse ([`PayloadType`]);
+//! receivers construct packets with [`AudioPacket::new_typed`].
+//!
 //! ## Device supervision
 //!
 //! Call [`VoiceChat::service`] from a periodic tick. It restarts a side
@@ -39,6 +57,7 @@
 //! explicitly chosen — driven by `IMMNotificationClient` on Windows and a
 //! two-second poll elsewhere.
 
+mod adapt;
 mod config;
 mod device;
 mod native;
@@ -58,7 +77,7 @@ pub use config::{PeerAudioSettings, VoiceChatConfig};
 pub use platform::{promote_current_thread, RtGuard};
 pub use sounds::SoundType;
 pub use stats::AudioStats;
-pub use transport::packet::AudioPacket;
+pub use transport::packet::{AudioPacket, PayloadType};
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use log::{debug, error, info};
@@ -102,9 +121,6 @@ pub(crate) type PcmFrame = [f32; FRAME_SIZE];
 /// Incoming packet with the instant it entered the crate — the timing
 /// point the jitter estimator relies on.
 type Incoming = (AudioPacket, Instant);
-
-/// Default Opus bitrate (bits/s)
-const OPUS_BITRATE: i32 = 48_000;
 
 /// Minimum spacing between automatic stream restart attempts, so a device
 /// that is genuinely gone is retried calmly rather than hammered.
@@ -407,6 +423,15 @@ impl VoiceChat {
     /// here whenever it refreshes (every couple of seconds is plenty);
     /// values the transport can't measure reliably (idle link, huge
     /// implausible readings) should be withheld rather than passed.
+    /// Round-trip time to the server/peer as the transport measures it,
+    /// in milliseconds. Feeds the rate controller's congestion detector
+    /// (loss *with* RTT inflation = queues filling = send fewer bytes,
+    /// never more redundancy). Call it whenever the transport updates its
+    /// estimate; 0 means unknown.
+    pub fn set_link_rtt_ms(&self, rtt_ms: u32) {
+        self.stats.link_rtt_ms.store(rtt_ms, Ordering::Relaxed);
+    }
+
     pub fn set_uplink_loss_pct(&self, loss_pct: u32) {
         self.stats
             .uplink_loss_pct

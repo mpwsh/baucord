@@ -55,7 +55,9 @@ use std::time::Duration;
 pub struct AudioInput {
     device: Device,
     device_config: SupportedStreamConfig,
-    /// The user's device selection (`None` = follow the OS default).
+    /// The user's device selection (`None` = follow the OS default), for
+    /// the native backend's own device lookup.
+    #[cfg(windows)]
     device_name: Option<String>,
     /// cpal stream, when the cpal backend is in use.
     stream: Option<Stream>,
@@ -129,6 +131,7 @@ impl AudioInput {
         Ok(Self {
             device,
             device_config,
+            #[cfg(windows)]
             device_name: device_name.map(String::from),
             stream: None,
             #[cfg(windows)]
