@@ -72,6 +72,14 @@ const IDLE_SEND_INTERVAL: Duration = Duration::from_millis(10);
 /// [`NETWORK_STATS_INTERVAL`], so a sustained bad link costs one line
 /// per 2 s.
 const LINK_LOG_LOSS_PCT: f64 = 5.0;
+/// While the link carries video-scale traffic, log from this much lower
+/// loss. A 1080p60 frame is ~16 chunks and one lost chunk loses the
+/// frame, so 1–5% packet loss is a broken stream — and the 2026-08-29
+/// incident sat exactly there, invisible under the 5% threshold. The
+/// throughput gate keeps a quiet voice link's idle-loss artifacts from
+/// filling the log.
+const LINK_LOG_LOSS_PCT_STREAMING: f64 = 1.0;
+const LINK_LOG_STREAMING_KBPS: f64 = 500.0;
 
 /// Uplink loss readings at or above this are not fed to the voice
 /// encoder. renet measures loss over a 6 s window of *sent* packets; on
@@ -211,6 +219,8 @@ pub enum NetworkMessage {
         is_keyframe: bool,
         width: u32,
         height: u32,
+        /// Sender capture time, ms on the sender's clock (wraps).
+        timestamp_ms: u32,
         data: Vec<u8>,
     },
     /// An inbound system audio packet (routed to screen thread, not app).
@@ -256,7 +266,9 @@ fn fetch_connect_token(
     username: &str,
     password: Option<&str>,
 ) -> Result<ConnectToken, ConnectError> {
-    let mut request = ureq::post(url).timeout(TOKEN_FETCH_TIMEOUT);
+    let mut request = ureq::post(url)
+        .timeout(TOKEN_FETCH_TIMEOUT)
+        .set(protocol::PROTOCOL_HEADER, &PROTOCOL_ID.to_string());
     if let Some(pass) = password {
         request = request.set("x-baucord-pass", pass);
     }
@@ -264,6 +276,17 @@ fn fetch_connect_token(
     let response = match request.send_string(username) {
         Ok(response) => response,
         Err(ureq::Error::Status(403, _)) => return Err(ConnectError::AccessDenied),
+        // Protocol mismatch: the issuer's body is the user-facing text
+        // (see `protocol::OUTDATED_MESSAGE`), show it as-is.
+        Err(ureq::Error::Status(code, response)) if code == protocol::OUTDATED_STATUS => {
+            let body = response.into_string().unwrap_or_default();
+            let body = body.trim();
+            return Err(ConnectError::Failed(if body.is_empty() {
+                protocol::OUTDATED_MESSAGE.to_string()
+            } else {
+                body.to_string()
+            }));
+        }
         Err(ureq::Error::Status(code, response)) => {
             let body = response.into_string().unwrap_or_default();
             return Err(ConnectError::Failed(format!(
@@ -281,8 +304,21 @@ fn fetch_connect_token(
         .read_to_end(&mut bytes)
         .map_err(|e| ConnectError::Failed(format!("failed to read token response: {e}")))?;
 
-    ConnectToken::read(&mut bytes.as_slice())
-        .map_err(|e| ConnectError::Failed(format!("invalid connect token: {e}")))
+    let token = ConnectToken::read(&mut bytes.as_slice())
+        .map_err(|e| ConnectError::Failed(format!("invalid connect token: {e}")))?;
+
+    // The issuer minted this with *its* protocol id and netcode would
+    // happily use it — an older server would accept us and then
+    // misparse our packets. Refuse up front with a message that says
+    // which side needs the update.
+    if token.protocol_id != PROTOCOL_ID {
+        return Err(ConnectError::Failed(format!(
+            "Server is running an older version (protocol {}, this client speaks {PROTOCOL_ID}) \
+             — ask the admin to update it",
+            token.protocol_id
+        )));
+    }
+    Ok(token)
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -333,6 +369,9 @@ pub(crate) struct NetworkClient {
     /// Warn about OS send-buffer pressure once per connection, not per
     /// tick — bursts can repeat every frame during a stream.
     send_pressure_warned: bool,
+    /// Set while video frames are being dropped for lack of channel
+    /// room; cleared when a frame fits again, so each episode logs once.
+    video_channel_full: bool,
     /// A message was queued on some channel since the last
     /// `send_packets()`; flush on this tick rather than waiting for
     /// [`IDLE_SEND_INTERVAL`].
@@ -421,6 +460,7 @@ impl NetworkClient {
             last_stats_check: Instant::now(),
             announced_connected: false,
             send_pressure_warned: false,
+            video_channel_full: false,
             outbound_pending: true,
             last_send: Instant::now(),
         })
@@ -550,7 +590,8 @@ impl NetworkClient {
         let loss_pct = info.packet_loss * 100.0;
         let kbps_up = info.bytes_sent_per_second * 8.0 / 1000.0;
         let kbps_down = info.bytes_received_per_second * 8.0 / 1000.0;
-        if loss_pct >= LINK_LOG_LOSS_PCT {
+        let streaming = kbps_up >= LINK_LOG_STREAMING_KBPS;
+        if loss_pct >= LINK_LOG_LOSS_PCT || (streaming && loss_pct >= LINK_LOG_LOSS_PCT_STREAMING) {
             log::info!(
                 "link: uplink loss {loss_pct:.1}%, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s, down {kbps_down:.0} kbit/s"
             );
@@ -786,6 +827,7 @@ impl NetworkClient {
                     is_keyframe: frame.is_keyframe,
                     width: u32::from(frame.width),
                     height: u32::from(frame.height),
+                    timestamp_ms: frame.timestamp_ms,
                     data: frame.data,
                 });
             }
@@ -1019,14 +1061,38 @@ impl NetworkClient {
         is_keyframe: bool,
         width: u16,
         height: u16,
+        timestamp_ms: u32,
         data: &[u8],
     ) {
+        // The video channel is reliable: renet keeps every chunk until
+        // the server acks it and *disconnects us* if the channel's
+        // budget overflows, rather than dropping. A stalled uplink
+        // could fill 10 MB in ~10 s at full rate. Drop the frame here
+        // instead; the viewer sees a seq gap and recovers via keyframe
+        // request, and the ladder is already stepping down.
+        let wire_bytes = data.len() + data.len().div_ceil(protocol::VIDEO_CHUNK_PAYLOAD)
+            * protocol::VIDEO_HEADER_SIZE;
+        if !self.client.can_send_message(VIDEO_CHANNEL, wire_bytes) {
+            if !self.video_channel_full {
+                warn!(
+                    "Video channel has no room for frame seq={seq} ({wire_bytes} bytes) — \
+                     dropping frames until the uplink drains"
+                );
+                self.video_channel_full = true;
+            }
+            return;
+        }
+        if self.video_channel_full {
+            log::info!("Video channel has room again (frame seq={seq})");
+            self.video_channel_full = false;
+        }
+
         // `pack_video_frame` refuses empty or oversize frames (past the
         // chunk format's 255 × 1080 B limit). The encoder's VBV keeps
         // frames well under it, but a misbehaving codec must not kill
         // the stream — drop the frame; the viewer sees a seq gap and
         // recovers via keyframe request.
-        match pack_video_frame(seq, is_keyframe, width, height, data) {
+        match pack_video_frame(seq, is_keyframe, width, height, timestamp_ms, data) {
             Some(chunks) => {
                 for chunk in chunks {
                     self.queue_message(VIDEO_CHANNEL, chunk);
@@ -1173,6 +1239,8 @@ pub enum NetworkControl {
         is_keyframe: bool,
         width: u16,
         height: u16,
+        /// Capture time, ms (wraps at u32; viewers unwrap it).
+        timestamp_ms: u32,
         data: Vec<u8>,
     },
     /// Send an Opus stereo system audio packet on the system audio channel.
@@ -1371,10 +1439,11 @@ fn handle_control(
             is_keyframe,
             width,
             height,
+            timestamp_ms,
             data,
         } => {
             if let Some(c) = client {
-                c.send_video_frame(seq, is_keyframe, width, height, &data);
+                c.send_video_frame(seq, is_keyframe, width, height, timestamp_ms, &data);
             }
         }
         NetworkControl::SendSystemAudio {
@@ -1506,6 +1575,7 @@ fn run_network_loop(
                         is_keyframe,
                         width,
                         height,
+                        timestamp_ms,
                         data,
                     } => {
                         if let Err(e) = screen_tx.try_send(ScreenControl::IncomingVideoFrame {
@@ -1514,6 +1584,7 @@ fn run_network_loop(
                             is_keyframe,
                             width,
                             height,
+                            timestamp_ms,
                             data,
                         }) {
                             log::warn!(

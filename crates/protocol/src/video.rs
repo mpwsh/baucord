@@ -1,4 +1,4 @@
-//! Video wire format (version 2): frame chunking and reassembly.
+//! Video wire format (version 3): frame chunking and reassembly.
 //!
 //! Encoded H.264 frames exceed a single safe datagram, so frames are
 //! split into chunks of at most [`VIDEO_CHUNK_PAYLOAD`] bytes. Chunk
@@ -6,15 +6,22 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       1     version      (= 2)
+//! 0       1     version      (= 3)
 //! 1       1     flags        (bit 0: keyframe)
 //! 2       1     chunk index
 //! 3       1     chunk count
 //! 4       4     frame sequence number
 //! 8       2     frame width
 //! 10      2     frame height
-//! 12      —     payload (≤ VIDEO_CHUNK_PAYLOAD bytes)
+//! 12      4     capture timestamp, ms on the sender's clock (wraps)
+//! 16      —     payload (≤ VIDEO_CHUNK_PAYLOAD bytes)
 //! ```
+//!
+//! The timestamp is the sender's capture time, so a viewer can play
+//! frames out at the sender's cadence rather than at whatever cadence
+//! the network delivered them (see `video::buffer`'s playout clock). It
+//! is repeated in every chunk so the reassembler needs no chunk-0
+//! special case. v2 → v3 added it (+4 bytes/chunk).
 //!
 //! Framing invariant: every chunk except the last carries **exactly**
 //! [`VIDEO_CHUNK_PAYLOAD`] bytes; the last carries the remainder
@@ -35,13 +42,13 @@ use std::time::{Duration, Instant};
 use renet::Bytes;
 
 /// Current video wire format version.
-pub const VIDEO_PROTOCOL_VERSION: u8 = 2;
+pub const VIDEO_PROTOCOL_VERSION: u8 = 3;
 
 /// Serialized chunk header size in bytes.
-pub const VIDEO_HEADER_SIZE: usize = 12;
+pub const VIDEO_HEADER_SIZE: usize = 16;
 
 /// Maximum payload bytes per chunk. Header + payload + relay envelope
-/// (8) totals 1100 bytes — comfortably inside a 1200-byte conservative
+/// (8) totals 1104 bytes — comfortably inside a 1200-byte conservative
 /// MTU with renet/netcode overhead on top.
 pub const VIDEO_CHUNK_PAYLOAD: usize = 1080;
 
@@ -78,6 +85,9 @@ pub struct VideoHeader {
     pub seq: u32,
     pub width: u16,
     pub height: u16,
+    /// Sender capture time, milliseconds on the sender's clock. Wraps
+    /// every ~49 days; consumers compare with wrapping arithmetic.
+    pub timestamp_ms: u32,
 }
 
 impl VideoHeader {
@@ -96,6 +106,8 @@ pub struct ReassembledFrame {
     pub is_keyframe: bool,
     pub width: u16,
     pub height: u16,
+    /// See [`VideoHeader::timestamp_ms`].
+    pub timestamp_ms: u32,
     pub data: Vec<u8>,
 }
 
@@ -113,6 +125,7 @@ pub fn pack_video_frame(
     is_keyframe: bool,
     width: u16,
     height: u16,
+    timestamp_ms: u32,
     data: &[u8],
 ) -> Option<Vec<Bytes>> {
     if data.is_empty() || data.len() > MAX_VIDEO_FRAME_BYTES {
@@ -135,6 +148,7 @@ pub fn pack_video_frame(
         buf.extend_from_slice(&seq.to_le_bytes());
         buf.extend_from_slice(&width.to_le_bytes());
         buf.extend_from_slice(&height.to_le_bytes());
+        buf.extend_from_slice(&timestamp_ms.to_le_bytes());
         buf.extend_from_slice(payload);
         boundaries.push((start, buf.len()));
     }
@@ -167,6 +181,7 @@ pub fn parse_video_header(data: &[u8]) -> Option<(VideoHeader, &[u8])> {
         seq: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
         width: u16::from_le_bytes([data[8], data[9]]),
         height: u16::from_le_bytes([data[10], data[11]]),
+        timestamp_ms: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
     };
     if header.chunk_count == 0 || header.chunk_idx >= header.chunk_count {
         return None;
@@ -201,6 +216,7 @@ struct PendingFrame {
     is_keyframe: bool,
     width: u16,
     height: u16,
+    timestamp_ms: u32,
     /// Single pre-sized buffer; chunk `i` lands at `i * VIDEO_CHUNK_PAYLOAD`.
     data: Vec<u8>,
     /// Payload length of the final chunk, recorded when it arrives.
@@ -276,6 +292,7 @@ impl VideoReassembler {
                     is_keyframe: header.is_keyframe(),
                     width: header.width,
                     height: header.height,
+                    timestamp_ms: header.timestamp_ms,
                     data: vec![0; header.chunk_count as usize * VIDEO_CHUNK_PAYLOAD],
                     last_len: 0,
                     first_seen: Instant::now(),
@@ -327,6 +344,7 @@ impl VideoReassembler {
             is_keyframe: frame.is_keyframe,
             width: frame.width,
             height: frame.height,
+            timestamp_ms: frame.timestamp_ms,
             data,
         })
     }
@@ -391,7 +409,7 @@ mod tests {
     #[test]
     fn single_chunk_roundtrip() {
         let data = make_frame(500, 0xAA);
-        let chunks = pack_video_frame(1, true, 1920, 1080, &data).unwrap();
+        let chunks = pack_video_frame(1, true, 1920, 1080, 0, &data).unwrap();
         assert_eq!(chunks.len(), 1);
 
         let mut reassembler = VideoReassembler::new();
@@ -404,9 +422,29 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_roundtrips_through_every_chunk() {
+        let data = make_frame(VIDEO_CHUNK_PAYLOAD * 2 + 5, 0x42);
+        let chunks = pack_video_frame(11, false, 1280, 720, 0xDEAD_BEEF, &data).unwrap();
+        let stamps: Vec<u32> = chunks
+            .iter()
+            .map(|c| parse_video_header(c).unwrap().0.timestamp_ms)
+            .collect();
+        assert_eq!(stamps, vec![0xDEAD_BEEF; 3]);
+    }
+
+    #[test]
+    fn reassembled_frame_carries_the_timestamp() {
+        let data = make_frame(10, 0x01);
+        let chunks = pack_video_frame(2, true, 640, 480, 123_456, &data).unwrap();
+        let mut reassembler = VideoReassembler::new();
+        let frame = reassembler.push_chunk(SENDER, &chunks[0]).unwrap();
+        assert_eq!(frame.timestamp_ms, 123_456);
+    }
+
+    #[test]
     fn multi_chunk_roundtrip() {
         let data = make_frame(VIDEO_CHUNK_PAYLOAD * 3 + 123, 0xBB);
-        let chunks = pack_video_frame(7, false, 1280, 720, &data).unwrap();
+        let chunks = pack_video_frame(7, false, 1280, 720, 0, &data).unwrap();
         assert_eq!(chunks.len(), 4);
 
         let mut reassembler = VideoReassembler::new();
@@ -427,7 +465,7 @@ mod tests {
     #[test]
     fn out_of_order_chunks() {
         let data = make_frame(VIDEO_CHUNK_PAYLOAD * 2 + 50, 0xCC);
-        let chunks = pack_video_frame(9, true, 640, 480, &data).unwrap();
+        let chunks = pack_video_frame(9, true, 640, 480, 0, &data).unwrap();
         assert_eq!(chunks.len(), 3);
 
         let mut reassembler = VideoReassembler::new();
@@ -440,7 +478,7 @@ mod tests {
     #[test]
     fn duplicate_chunks_ignored() {
         let data = make_frame(VIDEO_CHUNK_PAYLOAD + 10, 0xDD);
-        let chunks = pack_video_frame(3, false, 800, 600, &data).unwrap();
+        let chunks = pack_video_frame(3, false, 800, 600, 0, &data).unwrap();
 
         let mut reassembler = VideoReassembler::new();
         assert!(reassembler.push_chunk(SENDER, &chunks[0]).is_none());
@@ -454,8 +492,8 @@ mod tests {
         // Same seq from two senders must reassemble independently.
         let data_a = make_frame(VIDEO_CHUNK_PAYLOAD + 5, 0x01);
         let data_b = make_frame(VIDEO_CHUNK_PAYLOAD + 5, 0x02);
-        let chunks_a = pack_video_frame(1, false, 800, 600, &data_a).unwrap();
-        let chunks_b = pack_video_frame(1, false, 800, 600, &data_b).unwrap();
+        let chunks_a = pack_video_frame(1, false, 800, 600, 0, &data_a).unwrap();
+        let chunks_b = pack_video_frame(1, false, 800, 600, 0, &data_b).unwrap();
 
         let mut reassembler = VideoReassembler::new();
         assert!(reassembler.push_chunk(1, &chunks_a[0]).is_none());
@@ -468,19 +506,19 @@ mod tests {
 
     #[test]
     fn empty_frame_refused() {
-        assert!(pack_video_frame(1, false, 800, 600, &[]).is_none());
+        assert!(pack_video_frame(1, false, 800, 600, 0, &[]).is_none());
     }
 
     #[test]
     fn oversize_frame_refused() {
         let data = make_frame(MAX_VIDEO_FRAME_BYTES + 1, 0);
-        assert!(pack_video_frame(1, false, 800, 600, &data).is_none());
+        assert!(pack_video_frame(1, false, 800, 600, 0, &data).is_none());
     }
 
     #[test]
     fn max_size_frame_roundtrips() {
         let data = make_frame(MAX_VIDEO_FRAME_BYTES, 0xEE);
-        let chunks = pack_video_frame(1, true, 3840, 2160, &data).unwrap();
+        let chunks = pack_video_frame(1, true, 3840, 2160, 0, &data).unwrap();
         assert_eq!(chunks.len(), 255);
 
         let mut reassembler = VideoReassembler::new();
@@ -497,7 +535,7 @@ mod tests {
         // Too short.
         assert!(reassembler.push_chunk(SENDER, &[2, 0, 0, 1]).is_none());
         // Wrong version.
-        let chunks = pack_video_frame(1, false, 800, 600, &[1, 2, 3]).unwrap();
+        let chunks = pack_video_frame(1, false, 800, 600, 0, &[1, 2, 3]).unwrap();
         let mut bad = chunks[0].to_vec();
         bad[0] = 1;
         assert!(reassembler.push_chunk(SENDER, &bad).is_none());
@@ -526,6 +564,7 @@ mod tests {
         bad.extend_from_slice(&1u32.to_le_bytes());
         bad.extend_from_slice(&800u16.to_le_bytes());
         bad.extend_from_slice(&600u16.to_le_bytes());
+        bad.extend_from_slice(&0u32.to_le_bytes()); // timestamp
         bad.extend_from_slice(&[0u8; 100]);
         assert!(parse_video_header(&bad).is_none());
     }
@@ -533,7 +572,7 @@ mod tests {
     #[test]
     fn contradictory_chunk_rejected_without_poisoning_frame() {
         let data = make_frame(VIDEO_CHUNK_PAYLOAD + 10, 0x11);
-        let chunks = pack_video_frame(5, false, 800, 600, &data).unwrap();
+        let chunks = pack_video_frame(5, false, 800, 600, 0, &data).unwrap();
 
         let mut reassembler = VideoReassembler::new();
         assert!(reassembler.push_chunk(SENDER, &chunks[0]).is_none());
@@ -552,7 +591,7 @@ mod tests {
         let data = make_frame(VIDEO_CHUNK_PAYLOAD + 1, 0);
         // 17 incomplete frames; the first should be evicted.
         for seq in 0..17u32 {
-            let chunks = pack_video_frame(seq, false, 800, 600, &data).unwrap();
+            let chunks = pack_video_frame(seq, false, 800, 600, 0, &data).unwrap();
             assert!(reassembler.push_chunk(SENDER, &chunks[0]).is_none());
         }
         assert_eq!(reassembler.pending_count(), 16);
@@ -562,7 +601,7 @@ mod tests {
     #[test]
     fn forget_sender_clears_only_that_sender() {
         let data = make_frame(VIDEO_CHUNK_PAYLOAD + 1, 0);
-        let chunks = pack_video_frame(1, false, 800, 600, &data).unwrap();
+        let chunks = pack_video_frame(1, false, 800, 600, 0, &data).unwrap();
         let mut reassembler = VideoReassembler::new();
         assert!(reassembler.push_chunk(1, &chunks[0]).is_none());
         assert!(reassembler.push_chunk(2, &chunks[0]).is_none());

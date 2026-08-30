@@ -71,10 +71,16 @@ use crate::{
 pub const KEYFRAME_INTERVAL_MS: u64 = 2_000;
 
 /// Minimum spacing between IDR-via-session-reopen events (see the
-/// reopen logic in [`FfmpegEncoder::encode`]): each reopen costs a
-/// rate-control reset and ~10-30 ms, so even under a keyframe-request
-/// storm we cap it at roughly one per interval.
-const MIN_IDR_REOPEN_INTERVAL_MS: u64 = 700;
+/// reopen logic in [`FfmpegEncoder::encode`]). Each reopen costs a
+/// rate-control reset, in-flight frames, and a stall while the session
+/// comes back — so the floor is the natural IDR cadence itself: a
+/// viewer in recovery waits at most one [`KEYFRAME_INTERVAL_MS`] for
+/// the scheduled IDR either way, and everyone else stops paying for
+/// every request. The 2026-08-29 logs show why a shorter floor is
+/// harmful: with 2–4 viewers each requesting on their own cooldown, a
+/// 700 ms floor produced one reopen per second for minutes, and the
+/// encode rate fell to 18–28 fps from the stalls alone.
+const MIN_IDR_REOPEN_INTERVAL_MS: u64 = KEYFRAME_INTERVAL_MS;
 
 /// Codec-level GOP backstop, in seconds. The primary keyframe cadence is
 /// the time-based forcing above; this only guarantees an eventual refresh

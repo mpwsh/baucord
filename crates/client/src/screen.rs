@@ -67,6 +67,9 @@ pub enum ScreenControl {
         is_keyframe: bool,
         width: u32,
         height: u32,
+        /// Sender capture time, ms on the sender's clock (wraps); the
+        /// jitter buffer paces playout with it.
+        timestamp_ms: u32,
         data: Vec<u8>,
     },
     /// A remote peer started sharing — prepare a decoder.
@@ -322,6 +325,11 @@ struct CaptureState {
     /// Most recent uplink loss sample, percent. Gates the fps pacer:
     /// keyframe requests during our own loss are not viewer distress.
     uplink_loss_pct: f32,
+    /// Worst viewer loss from the last `StreamHealth`, percent. Same
+    /// gate, other leg.
+    viewer_loss_pct: f32,
+    /// Last time viewer health was logged (rate limit).
+    health_logged: Option<Instant>,
     /// Index into `PACE_SCALES` — current fps pace step.
     pace_idx: usize,
     /// When the pace last changed (cooldown).
@@ -591,14 +599,24 @@ const PACE_SCALES: [f32; 3] = [1.0, 0.75, 0.5];
 const PACE_STEP_COOLDOWN: Duration = Duration::from_secs(2);
 /// Repeated viewer keyframe requests mean a viewer keeps failing to
 /// keep a picture. This many requests within PACE_DISTRESS_WINDOW steps
-/// the pace down — unless the bitrate ladder is engaged or the uplink is
-/// lossy, in which case the requests are a symptom of our own loss and
-/// the ladder is already on it.
+/// the pace down — unless loss on either leg explains them (see
+/// `PACE_LOSS_GATE_PCT`), in which case fewer frames per second fixes
+/// nothing and the transport's resends / the bitrate ladder are the
+/// remedy.
 const PACE_DISTRESS_REQUESTS: usize = 4;
+/// Loss (percent) on our uplink or at the worst viewer at or above
+/// which keyframe requests are attributed to loss, not to a viewer that
+/// can't keep up. Low on purpose: ~16 chunks per frame means even 2%
+/// packet loss is a stream in constant recovery — the 2026-08-29 logs
+/// show the pacer firing 25 times in one share on exactly that, cutting
+/// the sharer to 30 fps for nothing.
+const PACE_LOSS_GATE_PCT: f32 = 2.0;
 const PACE_DISTRESS_WINDOW: Duration = Duration::from_secs(5);
 /// Don't step back up for this long after viewer distress — stepping up
 /// the moment the viewer goes quiet just re-chokes them in a slow cycle.
 const PACE_DISTRESS_HOLD: Duration = Duration::from_secs(30);
+/// Rate limit on the `viewers:` health log line.
+const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// While the screen is static (streaming backend reports Unchanged),
 /// re-encode the held frame this often. Identical-content P-frames are
@@ -626,16 +644,18 @@ fn effective_frame_interval(state: &CaptureState) -> Duration {
 }
 
 /// Record a viewer keyframe request and step the pace down if requests
-/// have become a pattern — but only when they can't be explained by our
-/// own uplink (see `PACE_DISTRESS_REQUESTS`).
+/// have become a pattern — but only when loss on neither leg explains
+/// them (see `PACE_DISTRESS_REQUESTS`).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn note_keyframe_request(state: &mut CaptureState, now: Instant, shared: &SharedScreenState) {
     state.kf_request_times.push(now);
     state
         .kf_request_times
         .retain(|&t| now.duration_since(t) < PACE_DISTRESS_WINDOW);
-    let uplink_explains_it = state.ladder.engaged() || state.uplink_loss_pct >= RATE_LOSS_STEP_DOWN;
-    if uplink_explains_it
+    let loss_explains_it = state.ladder.engaged()
+        || state.uplink_loss_pct >= PACE_LOSS_GATE_PCT
+        || state.viewer_loss_pct >= PACE_LOSS_GATE_PCT;
+    if loss_explains_it
         || state.kf_request_times.len() < PACE_DISTRESS_REQUESTS
         || state.pace_idx + 1 >= PACE_SCALES.len()
         || now.duration_since(state.pace_changed) < PACE_STEP_COOLDOWN
@@ -919,9 +939,12 @@ fn drain_and_decode(
                     let rx_elapsed = stream.rx_telemetry.0.elapsed();
                     if rx_elapsed.as_secs() >= 10 {
                         info!(
-                            "viewer telemetry peer {client_id}: {:.1} fps decoded over {:.0}s",
+                            "viewer telemetry peer {client_id}: {:.1} fps decoded over {:.0}s \
+                             (playout delay {:.0} ms, reorder window {:.0} ms)",
                             stream.rx_telemetry.1 as f32 / rx_elapsed.as_secs_f32(),
-                            rx_elapsed.as_secs_f32()
+                            rx_elapsed.as_secs_f32(),
+                            stream.jitter_buffer.playout_delay_ms(),
+                            stream.jitter_buffer.adaptive_target_ms(),
                         );
                         stream.rx_telemetry = (decoded_at, 0);
                     }
@@ -1051,6 +1074,8 @@ fn handle_control(
                 system_audio,
                 ladder: BitrateLadder::new(quality),
                 uplink_loss_pct: 0.0,
+                viewer_loss_pct: 0.0,
+                health_logged: None,
                 pace_idx: 0,
                 pace_changed: Instant::now(),
                 kf_request_times: Vec::new(),
@@ -1105,6 +1130,7 @@ fn handle_control(
             is_keyframe,
             width,
             height,
+            timestamp_ms,
             data,
         } => {
             // Decoder init already failed for this peer — drop their
@@ -1157,6 +1183,7 @@ fn handle_control(
                     height,
                     data,
                     arrival_time: Instant::now(),
+                    timestamp_ms,
                 });
             }
         }
@@ -1260,15 +1287,33 @@ fn handle_control(
             worst_rtt_ms,
             viewers,
         } => {
+            let worst_loss_pct = worst_loss * 100.0;
             shared
                 .stream_loss_pct
-                .store((worst_loss * 100.0).to_bits(), Ordering::Relaxed);
+                .store(worst_loss_pct.to_bits(), Ordering::Relaxed);
             shared
                 .stream_rtt_ms
                 .store(worst_rtt_ms.to_bits(), Ordering::Relaxed);
             shared
                 .stream_viewers
                 .store(u32::from(viewers), Ordering::Relaxed);
+            if let Some(state) = &mut st.capture {
+                state.viewer_loss_pct = worst_loss_pct;
+                // The server→viewer leg is otherwise invisible in the
+                // sharer's log; one line per HEALTH_LOG_INTERVAL while
+                // any viewer is losing packets.
+                let now = Instant::now();
+                let due = state
+                    .health_logged
+                    .is_none_or(|t| now.duration_since(t) >= HEALTH_LOG_INTERVAL);
+                if worst_loss_pct >= PACE_LOSS_GATE_PCT && due {
+                    state.health_logged = Some(now);
+                    info!(
+                        "viewers: worst loss {worst_loss_pct:.1}%, worst rtt {worst_rtt_ms:.0} ms, \
+                         {viewers} watching"
+                    );
+                }
+            }
         }
 
         ScreenControl::UplinkStats {
@@ -1430,6 +1475,8 @@ fn capture_and_encode(
             is_keyframe: encoded.is_keyframe,
             width: encoded.width as u16,
             height: encoded.height as u16,
+            // Wraps at ~49 days of share; viewers unwrap it.
+            timestamp_ms: encoded.timestamp_ms as u32,
             data: encoded.data,
         });
     }

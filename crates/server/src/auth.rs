@@ -130,6 +130,30 @@ fn issuer_loop(
                 let _ = request.respond(Response::from_string("ok"));
             }
             (Method::Post, "/token") => {
+                // Protocol gate. In token mode netcode can't reject an
+                // old client (it uses whatever protocol id we put in the
+                // token), so this is the door: no header or a different
+                // id ⇒ 426 with a user-facing body. Old clients show a
+                // non-403 body in their connect error, so they get the
+                // "download the latest version" text without an update.
+                let presented = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv(protocol::PROTOCOL_HEADER))
+                    .and_then(|h| h.value.as_str().trim().parse::<u64>().ok());
+                if presented != Some(protocol::PROTOCOL_ID) {
+                    warn!(
+                        "Token request refused: client protocol {} (server {})",
+                        presented.map_or_else(|| "missing".to_string(), |p| p.to_string()),
+                        protocol::PROTOCOL_ID
+                    );
+                    let _ = request.respond(
+                        Response::from_string(protocol::OUTDATED_MESSAGE)
+                            .with_status_code(protocol::OUTDATED_STATUS),
+                    );
+                    continue;
+                }
+
                 // Shared-password gate, if configured.
                 if let Some(expected) = password {
                     let presented = request
