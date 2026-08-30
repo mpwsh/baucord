@@ -140,6 +140,9 @@ pub enum ScreenEvent {
         frame_bytes: usize,
         seq: u32,
         is_keyframe: bool,
+        /// When the jitter buffer released the frame for decoding (after
+        /// its playout hold), so `decoded_at - enqueued_at` is decode
+        /// latency alone.
         enqueued_at: Instant,
         decoded_at: Instant,
         buffer_depth_ms: f32,
@@ -901,7 +904,12 @@ fn drain_and_decode(
         while let Some(packet) = stream.jitter_buffer.pull_next() {
             let seq = packet.seq;
             let is_keyframe = packet.is_keyframe;
-            let enqueued_at = packet.arrival_time;
+            // Stamp the moment the buffer *released* the frame, not its
+            // network arrival: the buffer now holds frames on purpose
+            // (playout pacing, up to ~200 ms), and the app's per-frame
+            // latency diagnostic should measure the decode/present path
+            // after that hold, not the hold itself.
+            let enqueued_at = Instant::now();
             let frame_bytes = packet.data.len();
 
             if is_keyframe {

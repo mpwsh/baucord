@@ -70,11 +70,20 @@ const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_millis(700);
 
 /// Bounds for the reorder window (how long to hold out for a missing
 /// packet before recovering). Derived at runtime from measured jitter
-/// and observed repair times. The maximum must cover a transport
-/// resend: `VIDEO_RESEND` (150 ms) plus a hop's one-way transit plus
-/// jitter, so ~350 ms — declaring a chunk lost just before its resend
-/// lands would turn every repair into a keyframe request.
-const REORDER_WAIT_MIN: Duration = Duration::from_millis(20);
+/// and observed repair times, within these bounds.
+///
+/// The minimum is the transport's repair latency: a lost chunk is
+/// resent `VIDEO_RESEND` (150 ms) after it was first sent, plus one-way
+/// transit, so it lands ~150–200 ms after the frames that overtook it.
+/// A shorter window can never see a repair — the 2026-08-30 viewer log
+/// shows exactly that: a 20 ms window turned every single lost chunk
+/// into a keyframe request (7 in 30 s, felt as a stutter every ~5 s),
+/// and the repair-time estimator never got a sample to learn from. The
+/// price is paid only during loss: a frame the sender itself dropped
+/// (no repair coming) costs 200 ms instead of 20 before recovery.
+///
+/// The maximum covers a slow hop's resend plus jitter.
+const REORDER_WAIT_MIN: Duration = Duration::from_millis(200);
 const REORDER_WAIT_MAX: Duration = Duration::from_millis(350);
 /// Headroom added to the longest observed repair when sizing the window.
 const REPAIR_MARGIN_MS: f64 = 20.0;
@@ -298,15 +307,29 @@ impl VideoJitterBuffer {
         }
 
         // A gap: later packets exist but `next` is missing. Hold for the
-        // reorder window before declaring it lost.
+        // reorder window before declaring it lost — and never recover
+        // before the earliest later frame's own playout slot, since
+        // nothing could be shown sooner anyway.
         let since = *self.gap_since.get_or_insert(now);
-        if now.duration_since(since) < self.reorder_wait() {
+        let earliest_later_due = self
+            .pending
+            .iter()
+            .filter(|(&s, _)| is_seq_after(s, next))
+            .min_by_key(|(&s, _)| s.wrapping_sub(next))
+            .map(|(_, p)| self.playout_due(p));
+        let window = self.reorder_wait();
+        if now.duration_since(since) < window || earliest_later_due.is_some_and(|due| now < due) {
             return None;
         }
 
         // Window expired: the packet is lost. Recover.
         self.gap_since = None;
         self.stats.gaps_detected += 1;
+        log::info!(
+            "jitter buffer: seq {next} still missing after {} ms (window {} ms) — recovering",
+            now.duration_since(since).as_millis(),
+            window.as_millis()
+        );
 
         if let Some(kf) = self.first_keyframe_after(next) {
             // Clean restart from a buffered keyframe: everything before it
@@ -467,6 +490,10 @@ impl VideoJitterBuffer {
     /// older — it's stale by definition), or clear entirely and request
     /// an IDR if no keyframe is buffered.
     fn recover_from_overflow(&mut self) {
+        log::info!(
+            "jitter buffer: overflow at {} pending (consumer slower than stream) — recovering",
+            self.pending.len()
+        );
         let latest_kf = self.next_seq.and_then(|next| {
             self.pending
                 .iter()
@@ -1118,6 +1145,31 @@ mod tests {
             let before = clock.unwrap_ts(u32::MAX - 5);
             let after = clock.unwrap_ts(10);
             assert_eq!(after - before, 16.0);
+        }
+
+        #[test]
+        fn gap_recovery_waits_for_the_later_frames_playout_slot() {
+            // Even with a zero reorder window, seq 2 is not given up on
+            // before seq 3's own slot: recovering earlier shows nothing.
+            let t0 = Instant::now();
+            let mut buf = VideoJitterBuffer::new(60);
+            buf.set_reorder_wait(Duration::ZERO);
+            buf.push(pkt_at(1, true, t0, 0));
+            buf.pull_next_at(t0 + ms(30));
+            buf.push(pkt_at(3, true, t0 + ms(32), 32));
+            assert!(buf.pull_next_at(t0 + ms(33)).is_none());
+        }
+
+        #[test]
+        fn gap_recovery_proceeds_once_the_later_frames_slot_has_passed() {
+            let t0 = Instant::now();
+            let mut buf = VideoJitterBuffer::new(60);
+            buf.set_reorder_wait(Duration::ZERO);
+            buf.push(pkt_at(1, true, t0, 0));
+            buf.pull_next_at(t0 + ms(30));
+            buf.push(pkt_at(3, true, t0 + ms(32), 32));
+            let after_slot = t0 + ms(32) + PLAYOUT_DELAY_MIN + ms(1);
+            assert_eq!(buf.pull_next_at(after_slot).map(|p| p.seq), Some(3));
         }
 
         #[test]

@@ -80,7 +80,7 @@ pub const OUTDATED_STATUS: u16 = 426;
 
 /// Body of the [`OUTDATED_STATUS`] response — user-facing.
 pub const OUTDATED_MESSAGE: &str =
-    "Client outdated — download the latest version from https://baucord.com";
+    "Client outdated — download the latest version from https://baucord.com/index.html#download";
 
 // ── Channel IDs ─────────────────────────────────────────────────────────
 

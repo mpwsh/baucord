@@ -90,6 +90,12 @@ const GOP_BACKSTOP_SECS: u32 = 8;
 /// Encoder names to try, in priority order.
 const ENCODER_PRIORITY: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"];
 
+/// Hard per-access-unit cap for AMF, in bits: 250 KB, under the
+/// transport's 275,400 B chunking limit with room for the AUD/SPS/PPS
+/// that ride along. Only AMF needs it (see the option block); x264 and
+/// NVENC respect the VBV closely enough that `VBV_MAX_BITS` suffices.
+const AMF_MAX_AU_BITS: u32 = 2_000_000;
+
 /// VBV buffer ceiling in bits. Bounds the worst-case single-frame size
 /// (≈ bufsize bits). NOTE: under `tune zerolatency` (no lookahead) x264
 /// treats VBV as a soft bound and overshoots forced IDRs by 10–25% on
@@ -1064,6 +1070,16 @@ fn codec_options(name: &str, rc: RateControl) -> Dictionary<'static> {
             opts.set("frame_skipping", "0");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
+            // enforce_hrd is not enough on its own: the *first* IDR of a
+            // fresh session comes out of cold rate control and ignores
+            // the buffer (2026-08-30 log: 30 of 31 oversize drops were
+            // the first frame after a reopen, 280–578 KB). Since every
+            // viewer keyframe request is a reopen on AMF, that turned
+            // each request into a dropped keyframe, a forced retry, and
+            // a multi-second freeze for everyone. AMF's own per-AU cap
+            // (`AMF_VIDEO_ENCODER_MAX_AU_SIZE`, bits) is binding from
+            // frame 0; set it just under the transport limit.
+            opts.set("max_au_size", &format!("{AMF_MAX_AU_BITS}"));
             // No-op on FFmpeg <= 7.1 (the option doesn't exist there;
             // unknown dict keys are silently ignored) but honored by
             // FFmpeg 8's rewritten amfenc — kept so an ffmpeg upgrade
