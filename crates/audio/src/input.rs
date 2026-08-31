@@ -23,34 +23,43 @@
 //! capture → encoder and capture → self-monitor hand-offs allocate nothing
 //! per frame, and the ring buffer is read in chunks, not sample by sample.
 
-use crate::input_config::InputConfig;
-use crate::processor::{
-    agc::AutoGainControl,
-    clamp::ClampStage,
-    compressor::Compressor,
-    denoise::Denoiser,
-    gain::GainStage,
-    gate::NoiseGate,
-    level_meter::{LevelMeter, MeterTarget},
-    speaking::SpeakingIndicator,
-    FrameContext, ProcessorChain,
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
-use crate::resampler::build_input_resampler;
-use crate::stats::AudioStats;
-use crate::{PcmFrame, FRAME_SIZE, OPUS_SAMPLE_RATE};
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig,
+};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
 use log::{error, info};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Async, Resampler};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+
+use crate::{
+    input_config::InputConfig,
+    processor::{
+        agc::AutoGainControl,
+        clamp::ClampStage,
+        compressor::Compressor,
+        denoise::Denoiser,
+        gain::GainStage,
+        gate::NoiseGate,
+        level_meter::{LevelMeter, MeterTarget},
+        speaking::SpeakingIndicator,
+        FrameContext, ProcessorChain,
+    },
+    resampler::build_input_resampler,
+    stats::AudioStats,
+    PcmFrame, FRAME_SIZE, OPUS_SAMPLE_RATE,
+};
 
 pub struct AudioInput {
     device: Device,
@@ -171,7 +180,10 @@ impl AudioInput {
     /// untouched so the cpal path can use them.
     #[cfg(windows)]
     fn start_native(&mut self) -> Result<(), String> {
-        let producer = self.ring_producer.take().ok_or("ring producer already taken")?;
+        let producer = self
+            .ring_producer
+            .take()
+            .ok_or("ring producer already taken")?;
         let wake_tx = self.wake_tx.take().ok_or("wake sender already taken")?;
         match crate::native::wasapi::NativeCapture::start(
             self.device_name.as_deref(),

@@ -32,22 +32,25 @@
 //! Built against the `wasapi` crate 0.24 API, the same one
 //! `stream::process_loopback` already compiles with.
 
-use crate::input_config::InputConfig;
-use crate::stats::AudioStats;
-use crate::OPUS_SAMPLE_RATE;
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info, warn};
 use rtrb::{Consumer, Producer};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 use wasapi::{
     AudioCaptureClient, AudioClient, AudioRenderClient, DeviceEnumerator, DeviceEventCallbacks,
     DeviceEventRegistration, Direction, Handle, Role, SampleType, StreamMode, WasapiError,
     WaveFormat,
 };
+
+use crate::{input_config::InputConfig, stats::AudioStats, OPUS_SAMPLE_RATE};
 
 /// Capture engine buffer: tolerance, not latency (see module docs).
 const CAPTURE_BUFFER_HNS: i64 = 50 * 10_000;
@@ -93,7 +96,9 @@ enum SampleLayout {
     F32,
     I16,
     /// 24 or 32 valid bits stored in 32-bit containers, left-justified.
-    I32 { valid_bits: u16 },
+    I32 {
+        valid_bits: u16,
+    },
 }
 
 impl SampleLayout {
@@ -413,23 +418,24 @@ fn capture_thread(
     // the backend exists.
     let _rt = crate::platform::promote_current_thread(480, OPUS_SAMPLE_RATE);
 
-    let opened = (|| -> Result<(AudioClient, AudioCaptureClient, Handle, Negotiated, String), String> {
-        let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
-        let device = find_device(&enumerator, Direction::Capture, device_name)?;
-        let friendly = device.get_friendlyname().unwrap_or_else(|_| "?".into());
-        let (client, negotiated) =
-            open_with_fallback(&device, Direction::Capture, CAPTURE_BUFFER_HNS, "capture")?;
-        let event = client
-            .set_get_eventhandle()
-            .map_err(|e| format!("capture event handle: {e}"))?;
-        let capture = client
-            .get_audiocaptureclient()
-            .map_err(|e| format!("capture client: {e}"))?;
-        client
-            .start_stream()
-            .map_err(|e| format!("capture start: {e}"))?;
-        Ok((client, capture, event, negotiated, friendly))
-    })();
+    let opened =
+        (|| -> Result<(AudioClient, AudioCaptureClient, Handle, Negotiated, String), String> {
+            let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
+            let device = find_device(&enumerator, Direction::Capture, device_name)?;
+            let friendly = device.get_friendlyname().unwrap_or_else(|_| "?".into());
+            let (client, negotiated) =
+                open_with_fallback(&device, Direction::Capture, CAPTURE_BUFFER_HNS, "capture")?;
+            let event = client
+                .set_get_eventhandle()
+                .map_err(|e| format!("capture event handle: {e}"))?;
+            let capture = client
+                .get_audiocaptureclient()
+                .map_err(|e| format!("capture client: {e}"))?;
+            client
+                .start_stream()
+                .map_err(|e| format!("capture start: {e}"))?;
+            Ok((client, capture, event, negotiated, friendly))
+        })();
 
     let (client, capture, event, negotiated, friendly) = match opened {
         Ok(v) => v,
@@ -689,29 +695,30 @@ fn render_thread(
     }
     let _rt = crate::platform::promote_current_thread(480, OPUS_SAMPLE_RATE);
 
-    let opened = (|| -> Result<(AudioClient, AudioRenderClient, Handle, Negotiated, String), String> {
-        let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
-        let device = find_device(&enumerator, Direction::Render, device_name)?;
-        let friendly = device.get_friendlyname().unwrap_or_else(|_| "?".into());
-        let (client, negotiated) =
-            open_with_fallback(&device, Direction::Render, RENDER_BUFFER_HNS, "render")?;
-        let event = client
-            .set_get_eventhandle()
-            .map_err(|e| format!("render event handle: {e}"))?;
-        let render = client
-            .get_audiorenderclient()
-            .map_err(|e| format!("render client: {e}"))?;
-        // Pre-fill the engine buffer with silence so the first period
-        // isn't a glitch, then start.
-        if let Ok(space) = client.get_available_space_in_frames() {
-            let zeros = vec![0u8; space as usize * negotiated.bytes_per_frame];
-            let _ = render.write_to_device(space as usize, &zeros, None);
-        }
-        client
-            .start_stream()
-            .map_err(|e| format!("render start: {e}"))?;
-        Ok((client, render, event, negotiated, friendly))
-    })();
+    let opened =
+        (|| -> Result<(AudioClient, AudioRenderClient, Handle, Negotiated, String), String> {
+            let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
+            let device = find_device(&enumerator, Direction::Render, device_name)?;
+            let friendly = device.get_friendlyname().unwrap_or_else(|_| "?".into());
+            let (client, negotiated) =
+                open_with_fallback(&device, Direction::Render, RENDER_BUFFER_HNS, "render")?;
+            let event = client
+                .set_get_eventhandle()
+                .map_err(|e| format!("render event handle: {e}"))?;
+            let render = client
+                .get_audiorenderclient()
+                .map_err(|e| format!("render client: {e}"))?;
+            // Pre-fill the engine buffer with silence so the first period
+            // isn't a glitch, then start.
+            if let Ok(space) = client.get_available_space_in_frames() {
+                let zeros = vec![0u8; space as usize * negotiated.bytes_per_frame];
+                let _ = render.write_to_device(space as usize, &zeros, None);
+            }
+            client
+                .start_stream()
+                .map_err(|e| format!("render start: {e}"))?;
+            Ok((client, render, event, negotiated, friendly))
+        })();
 
     let (client, render, event, negotiated, friendly) = match opened {
         Ok(v) => v,
@@ -909,7 +916,9 @@ impl Drop for DeviceWatcher {
 
 /// Register the notification client; the registration must outlive the
 /// enumerator it came from, so both are returned together.
-fn register(stats: &Arc<AudioStats>) -> Result<(DeviceEnumerator, DeviceEventRegistration), String> {
+fn register(
+    stats: &Arc<AudioStats>,
+) -> Result<(DeviceEnumerator, DeviceEventRegistration), String> {
     let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
     let mut callbacks = DeviceEventCallbacks::new();
     {

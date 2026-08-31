@@ -5,24 +5,28 @@
 //! (auth), who may share and watch (limits), and when to tell sharers
 //! about their viewers' network health.
 
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    net::{SocketAddr, ToSocketAddrs, UdpSocket},
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime},
+};
+
 use log::{debug, info, warn};
+use protocol::{
+    ChannelDenyReason, ChannelInfo, ChatMessage, ClientMessage, DenyReason, ServerMessage,
+    ShareScope,
+};
 use renet::{Bytes, ClientId, RenetServer, ServerEvent};
 use renet_netcode::{
-    NETCODE_USER_DATA_BYTES, NetcodeServerTransport, ServerAuthentication, ServerConfig,
-};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
-
-use protocol::{
-    ChannelDenyReason, ChannelInfo, ChatMessage, ClientMessage, DenyReason,
-    ServerMessage, ShareScope,
+    NetcodeServerTransport, ServerAuthentication, ServerConfig, NETCODE_USER_DATA_BYTES,
 };
 
-use crate::auth;
-use crate::config::{ChannelSettings, Config, validate_channel_list};
-use crate::relay::{ShareInfo, VideoRelay, VoiceRelay};
+use crate::{
+    auth,
+    config::{validate_channel_list, ChannelSettings, Config},
+    relay::{ShareInfo, VideoRelay, VoiceRelay},
+};
 
 // The protocol crate defines the user-data layout against its own
 // constant so it doesn't depend on the transport crate; make sure the
@@ -278,7 +282,8 @@ impl ChatServer {
         self.process_control_messages();
 
         let media_before = self.media_packet_count();
-        self.voice.process(&mut self.server, &self.deafened, &self.channel_of);
+        self.voice
+            .process(&mut self.server, &self.deafened, &self.channel_of);
         self.video.process(&mut self.server);
         self.video.process_system_audio(&mut self.server);
         if self.media_packet_count() != media_before {
@@ -386,14 +391,17 @@ impl ChatServer {
         if stale {
             self.uploads.remove(&client_id);
         }
-        let upload = self.uploads.entry(client_id).or_insert_with(|| IncomingUpload {
-            upload_id,
-            count,
-            received: 0,
-            bytes: 0,
-            chunks: vec![None; count as usize],
-            started: Instant::now(),
-        });
+        let upload = self
+            .uploads
+            .entry(client_id)
+            .or_insert_with(|| IncomingUpload {
+                upload_id,
+                count,
+                received: 0,
+                bytes: 0,
+                chunks: vec![None; count as usize],
+                started: Instant::now(),
+            });
         if upload.count != count || upload.chunks[index as usize].is_some() {
             return; // inconsistent or duplicate — drop silently
         }
@@ -847,7 +855,13 @@ impl ChatServer {
         }
     }
 
-    fn handle_share_start(&mut self, client_id: ClientId, width: u16, height: u16, scope: ShareScope) {
+    fn handle_share_start(
+        &mut self,
+        client_id: ClientId,
+        width: u16,
+        height: u16,
+        scope: ShareScope,
+    ) {
         let dims_ok = (MIN_SHARE_DIMENSION..=MAX_SHARE_DIMENSION).contains(&width)
             && (MIN_SHARE_DIMENSION..=MAX_SHARE_DIMENSION).contains(&height);
         if !dims_ok {
@@ -965,7 +979,10 @@ impl ChatServer {
         let fresh = match Config::from_file(&path) {
             Ok(fresh) => fresh,
             Err(e) => {
-                warn!("Config reload: {} is not valid YAML — keeping current config: {e}", path.display());
+                warn!(
+                    "Config reload: {} is not valid YAML — keeping current config: {e}",
+                    path.display()
+                );
                 return;
             }
         };
@@ -978,7 +995,10 @@ impl ChatServer {
             return;
         }
         match self.apply_channel_config(fresh.channels) {
-            Ok(()) => info!("Config reload: channel list applied from {}", path.display()),
+            Ok(()) => info!(
+                "Config reload: channel list applied from {}",
+                path.display()
+            ),
             Err(e) => warn!("Config reload: invalid [channels] — keeping current list: {e}"),
         }
     }
@@ -1100,7 +1120,12 @@ impl ChatServer {
     /// Validate and execute a channel move. Password and capacity
     /// checks run here; on success the move is broadcast (including to
     /// the mover) and channel-scoped share visibility is re-validated.
-    fn handle_join_channel(&mut self, client_id: ClientId, channel_id: u16, password: Option<&str>) {
+    fn handle_join_channel(
+        &mut self,
+        client_id: ClientId,
+        channel_id: u16,
+        password: Option<&str>,
+    ) {
         let Some(target) = self.config.channels.get(usize::from(channel_id)) else {
             self.deny_join(client_id, channel_id, ChannelDenyReason::NoSuchChannel);
             return;
@@ -1149,7 +1174,10 @@ impl ChatServer {
 
     /// Members currently in `channel_id`.
     fn members_in(&self, channel_id: u16) -> usize {
-        self.channel_of.values().filter(|c| **c == channel_id).count()
+        self.channel_of
+            .values()
+            .filter(|c| **c == channel_id)
+            .count()
     }
 
     /// Connected clients in `channel` (None never matches anyone).
@@ -1248,7 +1276,10 @@ impl ChatServer {
                 if self.video.is_subscribed(mover, sharer) {
                     self.video.unsubscribe(mover, sharer);
                 }
-                self.send_msg(mover, &ServerMessage::ScreenShareStopped { client_id: sharer });
+                self.send_msg(
+                    mover,
+                    &ServerMessage::ScreenShareStopped { client_id: sharer },
+                );
             }
         }
     }
@@ -1363,8 +1394,16 @@ impl ChatServer {
         // Both reliable channels disconnect on ceiling; media carries
         // the big payloads now, so it's the one that usually matters.
         let watched = [
-            ("control", protocol::CONTROL_CHANNEL, protocol::channels::CONTROL_BUFFER_BYTES),
-            ("media", protocol::MEDIA_CHANNEL, protocol::channels::MEDIA_BUFFER_BYTES),
+            (
+                "control",
+                protocol::CONTROL_CHANNEL,
+                protocol::channels::CONTROL_BUFFER_BYTES,
+            ),
+            (
+                "media",
+                protocol::MEDIA_CHANNEL,
+                protocol::channels::MEDIA_BUFFER_BYTES,
+            ),
         ];
         for client_id in self.server.clients_id() {
             for (name, channel, max_bytes) in watched {

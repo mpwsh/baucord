@@ -11,8 +11,10 @@
 //! same as an Ableton macro rack mapping knobs from individual devices
 //! onto a single control panel.
 
-use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32},
+    Arc,
+};
 
 use crate::processor::{agc, compressor, gate};
 

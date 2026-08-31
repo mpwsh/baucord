@@ -57,8 +57,7 @@ pub const IMAGE_CHUNK_BYTES: usize = 16 * 1024;
 /// Most chunks a single image may span (ceil of the size cap, plus one
 /// for the remainder). Reassemblers refuse anything claiming more.
 #[allow(clippy::cast_possible_truncation)] // 641 with current constants
-pub const MAX_IMAGE_CHUNKS: u32 =
-    (MAX_CHAT_IMAGE_BYTES / IMAGE_CHUNK_BYTES + 1) as u32;
+pub const MAX_IMAGE_CHUNKS: u32 = (MAX_CHAT_IMAGE_BYTES / IMAGE_CHUNK_BYTES + 1) as u32;
 
 /// Client upload pacing for image chunks, bytes per second. Chosen to
 /// sit under typical home uplinks so the router queue stays shallow
@@ -622,7 +621,12 @@ mod tests {
         };
         let bytes = encode_server_message(&msg).unwrap();
         let back = decode_server_message(&bytes).unwrap();
-        let ServerMessage::Init { channels, memberships, .. } = back else {
+        let ServerMessage::Init {
+            channels,
+            memberships,
+            ..
+        } = back
+        else {
             panic!("wrong variant");
         };
         assert_eq!(channels.len(), 2);
@@ -640,7 +644,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             decode_server_message(&bytes).unwrap(),
-            ServerMessage::UserMovedChannel { client_id: 9, channel_id: 2 }
+            ServerMessage::UserMovedChannel {
+                client_id: 9,
+                channel_id: 2
+            }
         ));
 
         let bytes = encode_server_message(&ServerMessage::JoinChannelDenied {
@@ -650,7 +657,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             decode_server_message(&bytes).unwrap(),
-            ServerMessage::JoinChannelDenied { reason: ChannelDenyReason::WrongPassword, .. }
+            ServerMessage::JoinChannelDenied {
+                reason: ChannelDenyReason::WrongPassword,
+                ..
+            }
         ));
     }
 
@@ -667,8 +677,10 @@ mod tests {
         };
         assert_eq!(msg.channel(), CONTROL_CHANNEL);
         let bytes = encode_server_message(&msg).unwrap();
-        let ServerMessage::ChannelListUpdated { channels, memberships } =
-            decode_server_message(&bytes).unwrap()
+        let ServerMessage::ChannelListUpdated {
+            channels,
+            memberships,
+        } = decode_server_message(&bytes).unwrap()
         else {
             panic!("wrong variant");
         };
@@ -686,7 +698,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             decode_client_message(&bytes).unwrap(),
-            ClientMessage::ScreenShareStart { scope: ShareScope::Channel, .. }
+            ClientMessage::ScreenShareStart {
+                scope: ShareScope::Channel,
+                ..
+            }
         ));
     }
 

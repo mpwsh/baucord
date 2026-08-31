@@ -15,15 +15,17 @@
 //! tail-drops arbitrary chunks once the channel budget fills, corrupting
 //! every subsequent frame while still burning bandwidth on them.
 
-use log::{debug, info, warn};
-use renet::{Bytes, ClientId, RenetServer};
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
-
-use protocol::{
-    SYSTEM_AUDIO_CHANNEL, ShareScope, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_CHANNEL,
-    parse_system_audio, parse_video_header, parse_voice, wrap_sender,
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
 };
+
+use log::{debug, info, warn};
+use protocol::{
+    parse_system_audio, parse_video_header, parse_voice, wrap_sender, ShareScope,
+    SYSTEM_AUDIO_CHANNEL, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_CHANNEL,
+};
+use renet::{Bytes, ClientId, RenetServer};
 
 // ════════════════════════════════════════════════════════════════════════
 //  Voice relay — broadcast to all other (non-deafened) clients

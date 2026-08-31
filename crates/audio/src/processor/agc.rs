@@ -23,8 +23,10 @@
 //! prevents pumping). Gate-aware: holds gain during silence so the next
 //! speech onset isn't blasted at max gain.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 
 use super::{compute_rms, AudioProcessor, FrameContext};
 

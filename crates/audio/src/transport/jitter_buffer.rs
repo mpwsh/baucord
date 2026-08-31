@@ -26,16 +26,22 @@
 //! deferred underrun classification, per-peer clock-drift compensation)
 //! is unchanged and lives on in the comments below.
 
-use crate::config::PeerAudioSettings;
-use crate::processor::limiter::Limiter;
-use crate::transport::packet::{AudioPacket, PayloadType};
-use crate::transport::packet_buffer::{PacketBuffer, Push};
-use crate::transport::red;
-use crate::{FRAME_SIZE, OPUS_SAMPLE_RATE};
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use crate::{
+    config::PeerAudioSettings,
+    processor::limiter::Limiter,
+    transport::{
+        packet::{AudioPacket, PayloadType},
+        packet_buffer::{PacketBuffer, Push},
+        red,
+    },
+    FRAME_SIZE, OPUS_SAMPLE_RATE,
+};
 
 /// Deferred underrun classification: a peer that ran dry and then receives
 /// audio again within this window was genuinely starved mid-stream (the
@@ -659,7 +665,9 @@ impl AdaptiveJitterBuffer {
                 if self.scratch_in.len() < desired {
                     self.scratch_in.resize(desired, 0.0);
                 }
-                let rep = peer.packets.fill(&mut self.scratch_in[..desired], true, shrink);
+                let rep = peer
+                    .packets
+                    .fill(&mut self.scratch_in[..desired], true, shrink);
                 fec += u64::from(rep.fec);
                 plc += u64::from(rep.plc);
                 dry_plc += u64::from(rep.dry_plc);
@@ -1187,13 +1195,8 @@ mod tests {
                 &[(FRAME_SIZE as u32, &p2.opus_data)],
                 &mut bundle,
             );
-            let p3_red = AudioPacket::new_typed(
-                3,
-                3 * FRAME_SIZE as u32,
-                7,
-                PayloadType::Red,
-                bundle,
-            );
+            let p3_red =
+                AudioPacket::new_typed(3, 3 * FRAME_SIZE as u32, 7, PayloadType::Red, bundle);
             jb.push_packet(p3_red, t0);
 
             let mut out = vec![0.0f32; 480];

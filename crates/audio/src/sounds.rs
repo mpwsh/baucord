@@ -8,8 +8,9 @@
 //! 2. Add a variant to [`SoundType`]
 //! 3. Add a line in [`SoundBank::new`]
 
-use log::{debug, warn};
 use std::io::Cursor;
+
+use log::{debug, warn};
 
 use crate::OPUS_SAMPLE_RATE;
 

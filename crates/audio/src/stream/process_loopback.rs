@@ -41,20 +41,24 @@
 //! handshake with it so activation failures surface synchronously to the
 //! caller — that is what makes the runtime fallback possible.
 
-use crate::stats::AudioStats;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+};
 
 use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info};
 use rtrb::Producer;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
 use wasapi::{
     AudioCaptureClient, AudioClient, Direction, Handle, SampleType, StreamMode, WasapiError,
     WaveFormat,
 };
 
 use super::input::SystemAudioBackend;
+use crate::stats::AudioStats;
 
 /// Capture format: 48 kHz stereo f32 — exactly what the Opus encode
 /// worker wants, so `needs_resample` is false and rubato never runs.
@@ -378,11 +382,7 @@ fn run_pump(
 /// The engine already delivers the exact layout the ring contract wants
 /// (L R L R … f32 at 48 kHz), so this is a straight byte→f32 copy.
 /// SILENT-flagged buffers never reach here — the pump drops them.
-fn push_interleaved(
-    ring_producer: &mut Producer<f32>,
-    bytes: &[u8],
-    stats: &AudioStats,
-) -> usize {
+fn push_interleaved(ring_producer: &mut Producer<f32>, bytes: &[u8], stats: &AudioStats) -> usize {
     let total = bytes.len() / BYTES_PER_SAMPLE;
     // Never split a stereo pair across a full-ring drop: an odd push
     // count would permanently swap L/R for everything that follows.

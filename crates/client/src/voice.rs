@@ -8,19 +8,20 @@
 // a `WakeFn` callback that is called whenever the UI event loop should
 // check for new events (a no-op works for headless use).
 
-use crossbeam_channel::{Receiver, Sender, bounded, select};
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
-
+use audio::{AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig};
+use crossbeam_channel::{bounded, select, Receiver, Sender};
 use log::info;
 
-use crate::WakeFn;
-use crate::config::Settings;
-use crate::network::NetworkControl;
-use audio::{AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig};
+use crate::{config::Settings, network::NetworkControl, WakeFn};
 
 // ── Channel messages ────────────────────────────────────────────────────
 

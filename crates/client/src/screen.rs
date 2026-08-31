@@ -19,25 +19,15 @@
 // bitrate ladder on the encoder; viewer keyframe-request distress drives
 // a small fps pacer. See the "Sender-side adaptation" section below.
 
-use crossbeam_channel::{Receiver, Sender, bounded};
-
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-
-use std::thread;
-use std::time::{Duration, Instant};
-
-use log::{info, warn};
-
-use video::{
-    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
-    buffer::{BufferedPacket, VideoJitterBuffer},
-    capture::{CaptureStatus, Capturer},
-    codec::{FfmpegDecoder, FfmpegEncoder},
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
 };
-
-use crate::{WakeFn, network::NetworkControl};
 
 use audio::{
     stats::AudioStats,
@@ -46,6 +36,16 @@ use audio::{
         input::SystemAudioCapture,
     },
 };
+use crossbeam_channel::{bounded, Receiver, Sender};
+use log::{info, warn};
+use video::{
+    buffer::{BufferedPacket, VideoJitterBuffer},
+    capture::{CaptureStatus, Capturer},
+    codec::{FfmpegDecoder, FfmpegEncoder},
+    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
+};
+
+use crate::{network::NetworkControl, WakeFn};
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -232,13 +232,7 @@ impl ScreenThreadHandle {
         let join_handle = thread::Builder::new()
             .name("screen-share".into())
             .spawn(move || {
-                run_screen_loop(
-                    control_rx,
-                    event_tx,
-                    network_tx,
-                    shared_clone,
-                    wake,
-                );
+                run_screen_loop(control_rx, event_tx, network_tx, shared_clone, wake);
             })
             .expect("failed to spawn screen thread");
 
@@ -520,7 +514,11 @@ impl BitrateLadder {
                 .is_some_and(|t| now.duration_since(t) < RATE_PROBE_FAIL_WINDOW);
             // A failed probe goes back exactly where it came from — that
             // rung was known good; overshooting it would waste quality.
-            let rungs = if !failed_probe && loss_pct >= RATE_LOSS_SEVERE { 2 } else { 1 };
+            let rungs = if !failed_probe && loss_pct >= RATE_LOSS_SEVERE {
+                2
+            } else {
+                1
+            };
             let next = (self.idx + rungs).min(lowest);
             self.probe_backoff = if failed_probe {
                 (self.probe_backoff * 2).min(RATE_PROBE_BACKOFF_MAX)
@@ -535,8 +533,9 @@ impl BitrateLadder {
             } else {
                 String::new()
             };
-            let why =
-                format!("uplink loss {loss_pct:.0}%, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s{note}");
+            let why = format!(
+                "uplink loss {loss_pct:.0}%, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s{note}"
+            );
             Some(self.move_to(next, now, why))
         } else if loss_pct < RATE_LOSS_RECOVERED {
             self.bad_samples = 0;
@@ -549,8 +548,9 @@ impl BitrateLadder {
                 return None;
             }
             self.last_step_up = Some(now);
-            let why =
-                format!("uplink clean for {needed} samples, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s");
+            let why = format!(
+                "uplink clean for {needed} samples, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s"
+            );
             Some(self.move_to(self.idx - 1, now, why))
         } else {
             // Middle band: hold the rung, restart both clocks.
@@ -585,7 +585,9 @@ fn adapt_bitrate(
     let from = state.ladder.pct();
     if let Some(change) = state.ladder.sample(now, loss_pct, rtt_ms, kbps_up) {
         state.encoder.set_bitrate_scale_pct(change.pct);
-        shared.bitrate_scale_pct.store(change.pct, Ordering::Relaxed);
+        shared
+            .bitrate_scale_pct
+            .store(change.pct, Ordering::Relaxed);
         info!(
             "bitrate ladder: {from}% → {}% ({} kbit/s; {})",
             change.pct,
@@ -773,14 +775,7 @@ fn run_screen_loop(
             let time_to_capture = next_capture.saturating_duration_since(now);
 
             match control_rx.recv_timeout(time_to_capture) {
-                Ok(ctrl) => handle_control(
-                    ctrl,
-                    &mut st,
-                    &event_tx,
-                    &network_tx,
-                    &shared,
-                    &wake,
-                ),
+                Ok(ctrl) => handle_control(ctrl, &mut st, &event_tx, &network_tx, &shared, &wake),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
@@ -791,14 +786,7 @@ fn run_screen_loop(
             // 4ms gives ~250Hz drain rate — fast enough for 60fps with
             // headroom, while keeping CPU usage negligible.
             match control_rx.recv_timeout(Duration::from_millis(4)) {
-                Ok(ctrl) => handle_control(
-                    ctrl,
-                    &mut st,
-                    &event_tx,
-                    &network_tx,
-                    &shared,
-                    &wake,
-                ),
+                Ok(ctrl) => handle_control(ctrl, &mut st, &event_tx, &network_tx, &shared, &wake),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
@@ -807,14 +795,7 @@ fn run_screen_loop(
             // Nothing to capture and no jitter buffers to drain —
             // block until a command arrives instead of waking 10×/s.
             match control_rx.recv() {
-                Ok(ctrl) => handle_control(
-                    ctrl,
-                    &mut st,
-                    &event_tx,
-                    &network_tx,
-                    &shared,
-                    &wake,
-                ),
+                Ok(ctrl) => handle_control(ctrl, &mut st, &event_tx, &network_tx, &shared, &wake),
                 Err(_) => break,
             }
         }
@@ -824,14 +805,7 @@ fn run_screen_loop(
         // (nanoseconds), so we can drain hundreds of pending packets
         // without blocking.
         while let Ok(ctrl) = control_rx.try_recv() {
-            handle_control(
-                ctrl,
-                &mut st,
-                &event_tx,
-                &network_tx,
-                &shared,
-                &wake,
-            );
+            handle_control(ctrl, &mut st, &event_tx, &network_tx, &shared, &wake);
         }
 
         // ── Drain jitter buffers → decode → emit ────────────────────
@@ -1376,9 +1350,7 @@ fn capture_and_encode(
             // is waiting on a forced IDR or the periodic refresh is due
             // — otherwise skip entirely: no swscale, no encoder work,
             // no bytes on the wire, and no seq consumed.
-            let bursting = state
-                .keyframe_burst_until
-                .is_some_and(|until| now < until);
+            let bursting = state.keyframe_burst_until.is_some_and(|until| now < until);
             if !state.encoder.keyframe_pending() && !bursting && now < state.next_refresh {
                 state.telemetry.2 += 1;
                 shared.last_capture_us.store(capture_us, Ordering::Relaxed);

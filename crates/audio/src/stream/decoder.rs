@@ -9,14 +9,19 @@
 //! network → StreamAudioPacket → [decoder thread] → StreamAudioFrame → StreamAudioOutput → cpal
 //! ```
 
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc,
+};
+
 use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{error, info, warn};
 use opus::{Channels, Decoder};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
 
-use crate::stream::output::{StreamAudioFrame, StreamAudioOutput};
-use crate::OPUS_SAMPLE_RATE;
+use crate::{
+    stream::output::{StreamAudioFrame, StreamAudioOutput},
+    OPUS_SAMPLE_RATE,
+};
 
 /// Samples per channel per frame (20 ms at 48 kHz).
 const STREAM_FRAME_SIZE: usize = 960;
@@ -231,14 +236,12 @@ pub fn spawn(
     let should_stop = Arc::new(AtomicBool::new(false));
 
     let stop = should_stop.clone();
-    let decoder_thread =
-        crate::platform::spawn_named(
-            "stream-decode",
-            move || match StreamDecoderWorker::new(packet_rx, frame_tx, stop) {
-                Ok(mut worker) => worker.run(),
-                Err(e) => error!("Failed to create stream Opus decoder: {e}"),
-            },
-        );
+    let decoder_thread = crate::platform::spawn_named("stream-decode", move || {
+        match StreamDecoderWorker::new(packet_rx, frame_tx, stop) {
+            Ok(mut worker) => worker.run(),
+            Err(e) => error!("Failed to create stream Opus decoder: {e}"),
+        }
+    });
 
     Ok(StreamDecoder {
         packet_tx,

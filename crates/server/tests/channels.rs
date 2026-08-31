@@ -2,17 +2,20 @@
 //! socket, driven tick-by-tick against real renet clients. Everything
 //! crosses the actual wire — no mocks.
 
-use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant, SystemTime};
-
-use renet::RenetClient;
-use renet_netcode::{ClientAuthentication, NetcodeClientTransport};
+use std::{
+    net::{SocketAddr, UdpSocket},
+    time::{Duration, Instant, SystemTime},
+};
 
 use protocol::{
     ChannelDenyReason, ClientMessage, DenyReason, ServerMessage, ShareScope, CONTROL_CHANNEL,
 };
-use server::config::{ChannelSettings, Config};
-use server::server::ChatServer;
+use renet::RenetClient;
+use renet_netcode::{ClientAuthentication, NetcodeClientTransport};
+use server::{
+    config::{ChannelSettings, Config},
+    server::ChatServer,
+};
 
 // ── Harness ─────────────────────────────────────────────────────────────
 
@@ -55,9 +58,7 @@ impl TestClient {
         let transport =
             NetcodeClientTransport::new(now, authentication, socket).expect("client transport");
         TestClient {
-            client: RenetClient::new(protocol::connection_config(
-                protocol::CLIENT_BYTES_PER_TICK,
-            )),
+            client: RenetClient::new(protocol::connection_config(protocol::CLIENT_BYTES_PER_TICK)),
             transport,
             last: Instant::now(),
             inbox: Vec::new(),
@@ -127,7 +128,9 @@ impl TestClient {
                 e.0 += 1;
             }
         }
-        got.values().filter(|(received, count)| received >= count).count()
+        got.values()
+            .filter(|(received, count)| received >= count)
+            .count()
     }
 
     /// Pump server + clients until `pred` finds a match in this
@@ -438,7 +441,10 @@ fn hot_reload_moves_renamed_channel_members_to_default() {
     // "Movies" becomes "Cinema": same slot, new name ⇒ new channel ⇒
     // members go to the default.
     server
-        .apply_channel_config(vec![open_channel("Lobby", true), open_channel("Cinema", false)])
+        .apply_channel_config(vec![
+            open_channel("Lobby", true),
+            open_channel("Cinema", false),
+        ])
         .expect("valid list");
 
     let (channels, memberships) = a.wait_for(&mut server, &mut [], |m| match m {
@@ -491,7 +497,11 @@ fn hot_reload_password_change_keeps_members_but_gates_new_joins() {
         ServerMessage::ChannelListUpdated { memberships, .. } => Some(memberships.clone()),
         _ => None,
     });
-    assert_eq!(memberships.get(&1), Some(&1), "existing member never kicked");
+    assert_eq!(
+        memberships.get(&1),
+        Some(&1),
+        "existing member never kicked"
+    );
 
     b.send(&ClientMessage::JoinChannel {
         channel_id: 1,
@@ -514,7 +524,10 @@ fn hot_reload_password_change_keeps_members_but_gates_new_joins() {
     b.wait_for(&mut server, &mut [&mut a], |m| {
         matches!(
             m,
-            ServerMessage::UserMovedChannel { client_id: 2, channel_id: 1 }
+            ServerMessage::UserMovedChannel {
+                client_id: 2,
+                channel_id: 1
+            }
         )
         .then_some(())
     });
@@ -551,7 +564,10 @@ fn hot_reload_rederives_channel_scoped_share_visibility() {
     viewer.wait_for(&mut server, &mut [&mut sharer, &mut lobbyist], |m| {
         matches!(
             m,
-            ServerMessage::UserMovedChannel { client_id: 2, channel_id: 1 }
+            ServerMessage::UserMovedChannel {
+                client_id: 2,
+                channel_id: 1
+            }
         )
         .then_some(())
     });
@@ -618,12 +634,12 @@ fn hot_reload_rejects_invalid_lists_and_keeps_state() {
     });
 
     // No default / duplicate names: both rejected, nothing broadcast.
-    assert!(server.apply_channel_config(vec![open_channel("A", false)]).is_err());
-    assert!(
-        server
-            .apply_channel_config(vec![open_channel("A", true), open_channel("A", false)])
-            .is_err()
-    );
+    assert!(server
+        .apply_channel_config(vec![open_channel("A", false)])
+        .is_err());
+    assert!(server
+        .apply_channel_config(vec![open_channel("A", true), open_channel("A", false)])
+        .is_err());
 
     // Membership untouched: joining Movies again is a no-op (no deny,
     // no move), proving the live list survived the bad edits.
@@ -704,7 +720,11 @@ fn global_image_byte_budget_brakes_coordinated_bursts() {
     }
 
     settle(&mut server, &mut a, &mut b, Duration::from_secs(2));
-    assert_eq!(a.images_completed(), 2, "room budget must stop the burst at 2");
+    assert_eq!(
+        a.images_completed(),
+        2,
+        "room budget must stop the burst at 2"
+    );
 }
 
 #[test]
@@ -736,7 +756,10 @@ fn relay_paces_large_images_instead_of_bursting() {
         a.tick();
         b.tick();
         std::thread::sleep(Duration::from_millis(2));
-        assert!(std::time::Instant::now() < deadline, "image never completed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "image never completed"
+        );
     }
     let took = started.elapsed();
     assert!(
@@ -764,4 +787,3 @@ fn settle(server: &mut ChatServer, a: &mut TestClient, b: &mut TestClient, d: Du
         std::thread::sleep(Duration::from_millis(2));
     }
 }
-

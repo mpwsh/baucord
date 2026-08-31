@@ -36,8 +36,10 @@
 //! not the chunk header; the reassembler keys pending frames by
 //! `(sender, seq)` so interleaved streams can't collide.
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use renet::Bytes;
 

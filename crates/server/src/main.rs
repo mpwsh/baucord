@@ -1,15 +1,16 @@
-use clap::Parser;
-use log::{error, info};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::Path,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
+use clap::Parser;
 use env_logger::Builder;
-use server::config::Config;
-use server::server::ChatServer;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use log::{error, info};
+use server::{config::Config, server::ChatServer};
 
 const LOG_PATH: &str = "server.log";
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;

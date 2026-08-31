@@ -167,7 +167,9 @@ mod tests {
         let d = diff(&old, &new, &out, &out, Some("USB Mic"), None);
         assert!(d.rebuild_input);
         assert!(d.notices.contains(&DeviceNotice::InputLost));
-        assert!(d.notices.contains(&DeviceNotice::MicDisconnected("USB Mic".into())));
+        assert!(d
+            .notices
+            .contains(&DeviceNotice::MicDisconnected("USB Mic".into())));
     }
 
     #[test]
@@ -177,10 +179,9 @@ mod tests {
         let new_out = devs(&[("A", false), ("B", true)]);
         let d = diff(&inp, &inp, &old_out, &new_out, None, None);
         assert!(d.rebuild_output);
-        assert!(
-            d.notices
-                .contains(&DeviceNotice::OutputDefaultChanged(Some("B".into())))
-        );
+        assert!(d
+            .notices
+            .contains(&DeviceNotice::OutputDefaultChanged(Some("B".into()))));
     }
 
     #[test]

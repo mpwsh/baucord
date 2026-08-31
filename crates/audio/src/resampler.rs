@@ -96,9 +96,10 @@ pub fn frames_for_ms(rate: u32, ms: u32) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use audioadapter_buffers::direct::SequentialSliceOfVecs;
     use rubato::Resampler;
+
+    use super::*;
 
     /// Replicates the input.rs inline loop at a 44.1 kHz device rate —
     /// the path a typical Windows shared-mode device exercises and a

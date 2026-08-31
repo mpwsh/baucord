@@ -1,10 +1,8 @@
-use log::info;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
+use std::{collections::HashMap, fs, path::PathBuf};
 
 use audio::PeerAudioSettings;
+use log::info;
+use serde::{Deserialize, Serialize};
 
 /// Key used to store per-peer audio settings.
 ///

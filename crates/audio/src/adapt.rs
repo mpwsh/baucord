@@ -88,11 +88,31 @@ pub struct Profile {
 /// Best first. Total wire rate at each rung (payload + 44 B/packet
 /// overhead, RED off): ≈ 66, 50, 33, 25, 21 kbps.
 pub const LADDER: [Profile; 5] = [
-    Profile { bitrate: 48_000, band: Band::SuperWide, frame_ms: 20 },
-    Profile { bitrate: 32_000, band: Band::Wide, frame_ms: 20 },
-    Profile { bitrate: 24_000, band: Band::Wide, frame_ms: 40 },
-    Profile { bitrate: 16_000, band: Band::Wide, frame_ms: 40 },
-    Profile { bitrate: 12_000, band: Band::Narrow, frame_ms: 40 },
+    Profile {
+        bitrate: 48_000,
+        band: Band::SuperWide,
+        frame_ms: 20,
+    },
+    Profile {
+        bitrate: 32_000,
+        band: Band::Wide,
+        frame_ms: 20,
+    },
+    Profile {
+        bitrate: 24_000,
+        band: Band::Wide,
+        frame_ms: 40,
+    },
+    Profile {
+        bitrate: 16_000,
+        band: Band::Wide,
+        frame_ms: 40,
+    },
+    Profile {
+        bitrate: 12_000,
+        band: Band::Narrow,
+        frame_ms: 40,
+    },
 ];
 
 /// Lowest rung ordinary loss can reach: 16 kbps Wideband. See the module
@@ -465,7 +485,10 @@ mod tests {
         }
         let d = c.current();
         assert!(d.red, "RED should be on under random loss");
-        assert_eq!(d.level, RED_MIN_LEVEL, "RED costs one rung, never runs at 48 kbps");
+        assert_eq!(
+            d.level, RED_MIN_LEVEL,
+            "RED costs one rung, never runs at 48 kbps"
+        );
     }
 
     /// The 2026-08-29..31 failure mode: one loss event, counted by every
@@ -521,7 +544,10 @@ mod tests {
             LADDER.len() - 1,
             "sustained congestion may use the Narrowband basement"
         );
-        assert!(!c.current().red, "RED must not add bytes on a congested link");
+        assert!(
+            !c.current().red,
+            "RED must not add bytes on a congested link"
+        );
     }
 
     #[test]

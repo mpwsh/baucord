@@ -19,8 +19,7 @@
 //! (from [`loop_secs`]) but never more than 30 s, freeze to the first
 //! frame, replay on hover.
 
-use std::rc::Rc;
-use std::time::Instant;
+use std::{rc::Rc, time::Instant};
 
 use crate::images::{gif_gct_len, skip_gif_subblocks, ImageError};
 
@@ -76,9 +75,7 @@ impl GifAnimation {
 /// # Errors
 /// [`ImageError::Codec`] on undecodable input (no frame decoded).
 pub fn decode_animation(bytes: &[u8]) -> Result<GifAnimation, ImageError> {
-    use image::AnimationDecoder;
-    use image::ImageDecoder;
-    use image::codecs::gif::GifDecoder;
+    use image::{codecs::gif::GifDecoder, AnimationDecoder, ImageDecoder};
 
     let mut decoder = GifDecoder::new(std::io::Cursor::new(bytes))
         .map_err(|e| ImageError::Codec(e.to_string()))?;
@@ -179,9 +176,7 @@ impl GifStream {
     }
 
     fn reopen(bytes: &Rc<Vec<u8>>) -> Result<image::Frames<'static>, ImageError> {
-        use image::AnimationDecoder;
-        use image::ImageDecoder;
-        use image::codecs::gif::GifDecoder;
+        use image::{codecs::gif::GifDecoder, AnimationDecoder, ImageDecoder};
 
         let mut decoder = GifDecoder::new(std::io::Cursor::new(RcBytes(Rc::clone(bytes))))
             .map_err(|e| ImageError::Codec(e.to_string()))?;
@@ -292,9 +287,9 @@ pub fn loop_secs(bytes: &[u8]) -> f64 {
 
 #[cfg(test)]
 mod decode_tests {
+    use image::{codecs::gif::GifEncoder, Delay, Frame, RgbaImage};
+
     use super::*;
-    use image::codecs::gif::GifEncoder;
-    use image::{Delay, Frame, RgbaImage};
 
     /// Encode `n` frames of `size`×`size` — alternating solid colors, so
     /// LZW crushes them and the file stays far under the 1 MB wire
@@ -303,16 +298,16 @@ mod decode_tests {
         let mut bytes = Vec::new();
         {
             let mut enc = GifEncoder::new(&mut bytes);
-            enc.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+            enc.set_repeat(image::codecs::gif::Repeat::Infinite)
+                .unwrap();
             for i in 0..n {
-                let c = if i % 2 == 0 { [40, 40, 60, 255] } else { [200, 120, 40, 255] };
+                let c = if i % 2 == 0 {
+                    [40, 40, 60, 255]
+                } else {
+                    [200, 120, 40, 255]
+                };
                 let img = RgbaImage::from_pixel(size, size, image::Rgba(c));
-                let frame = Frame::from_parts(
-                    img,
-                    0,
-                    0,
-                    Delay::from_numer_denom_ms(40, 1),
-                );
+                let frame = Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(40, 1));
                 enc.encode_frame(frame).unwrap();
             }
         }

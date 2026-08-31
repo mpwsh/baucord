@@ -60,10 +60,10 @@
 mod adapt;
 mod config;
 mod device;
-mod native;
 mod encoder;
 mod input;
 mod input_config;
+mod native;
 mod output;
 mod platform;
 pub mod processor;
@@ -73,20 +73,23 @@ pub mod stats;
 pub mod stream;
 pub mod transport;
 
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
+};
+
 pub use config::{PeerAudioSettings, VoiceChatConfig};
+use cpal::traits::{DeviceTrait, HostTrait};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use log::{debug, error, info};
 pub use platform::{promote_current_thread, RtGuard};
 pub use sounds::SoundType;
 pub use stats::AudioStats;
 pub use transport::packet::{AudioPacket, PayloadType};
-
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use log::{debug, error, info};
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-
-use cpal::traits::{DeviceTrait, HostTrait};
 
 /// Human-readable device name.
 ///
@@ -361,9 +364,7 @@ impl VoiceChat {
     /// estimator measures from this instant.
     pub fn receive_packet(&self, packet: AudioPacket) {
         self.stats.record_packet_received(packet.opus_data.len());
-        let _ = self
-            .network_to_output_tx
-            .try_send((packet, Instant::now()));
+        let _ = self.network_to_output_tx.try_send((packet, Instant::now()));
     }
 
     pub fn take_outgoing_packets(&self) -> Vec<AudioPacket> {
@@ -442,8 +443,7 @@ impl VoiceChat {
             .store(loss_pct.min(100), Ordering::Relaxed);
         // Freshness stamp for the consumer-side staleness check; `max(1)`
         // keeps 0 reserved for "never written".
-        let now_ms =
-            u64::try_from(self.stats.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let now_ms = u64::try_from(self.stats.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.stats
             .uplink_loss_updated_ms
             .store(now_ms.max(1), Ordering::Relaxed);
@@ -787,8 +787,9 @@ impl Drop for VoiceChat {
 
 #[cfg(test)]
 mod headless_tests {
-    use super::*;
     use std::time::Duration as StdDuration;
+
+    use super::*;
 
     /// Prove the intake path works with no audio devices: packets fed via
     /// the public API must register in stats without blocking.
@@ -817,10 +818,7 @@ mod headless_tests {
             .stats()
             .packets_received
             .load(std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            received >= 15,
-            "intake only counted {received}/20 packets"
-        );
+        assert!(received >= 15, "intake only counted {received}/20 packets");
 
         // outgoing_receiver must be a live owned clone usable in select!
         let rx = vc.outgoing_receiver();
@@ -835,16 +833,23 @@ mod headless_tests {
         let vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
         let tx = vc.incoming_sender();
         for seq in 0..1000u32 {
-            let _ = tx.send(AudioPacket::new(seq, seq * FRAME_SIZE as u32, 1, vec![0xFC]));
+            let _ = tx.send(AudioPacket::new(
+                seq,
+                seq * FRAME_SIZE as u32,
+                1,
+                vec![0xFC],
+            ));
         }
     }
 }
 
 #[cfg(test)]
 mod voice_loop_repro {
-    use super::*;
-    use crossbeam_channel::{bounded as cb_bounded, select};
     use std::time::Duration as StdDuration;
+
+    use crossbeam_channel::{bounded as cb_bounded, select};
+
+    use super::*;
 
     enum Ctrl {
         Incoming(AudioPacket),

@@ -55,8 +55,10 @@
 //! flag is rate-limited internally so a broken stream can't cause
 //! request spam.
 
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 /// How long the buffer will wait, unprimed, watching undecodable delta
 /// frames stream past before asking the sender for a keyframe. Covers
@@ -712,11 +714,7 @@ impl MinWindow {
     }
 
     fn min(&self) -> Option<f64> {
-        self.buckets
-            .iter()
-            .flatten()
-            .copied()
-            .reduce(f64::min)
+        self.buckets.iter().flatten().copied().reduce(f64::min)
     }
 }
 
@@ -1084,7 +1082,10 @@ mod tests {
             let (mut buf, bunch_at) = after_a_keyframe_bunch();
             let at = bunch_at + Duration::from_secs_f64(PLAYOUT_MARGIN_MS / 1000.0) + ms(1);
             buf.pull_next_at(at);
-            assert!(buf.pull_next_at(at).is_none(), "seq 6 must wait its 16 ms slot");
+            assert!(
+                buf.pull_next_at(at).is_none(),
+                "seq 6 must wait its 16 ms slot"
+            );
         }
 
         #[test]
@@ -1115,7 +1116,11 @@ mod tests {
             let mut buf = VideoJitterBuffer::new(60);
             buf.push(pkt_at(1, true, t0, 0));
             buf.push(pkt_at(2, false, t0 + ms(16) + ms(150), 16));
-            assert!(buf.playout_delay_ms() >= 150.0, "delay {}", buf.playout_delay_ms());
+            assert!(
+                buf.playout_delay_ms() >= 150.0,
+                "delay {}",
+                buf.playout_delay_ms()
+            );
         }
 
         #[test]
@@ -1183,7 +1188,11 @@ mod tests {
             assert!(buf.pull_next_at(t0 + ms(32)).is_none());
             buf.push(pkt_at(2, false, t0 + ms(32) + ms(180), 16));
             buf.pull_next_at(t0 + ms(32) + ms(180));
-            assert!(buf.adaptive_target_ms() >= 180.0, "window {}", buf.adaptive_target_ms());
+            assert!(
+                buf.adaptive_target_ms() >= 180.0,
+                "window {}",
+                buf.adaptive_target_ms()
+            );
         }
     }
 }

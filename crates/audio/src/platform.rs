@@ -23,9 +23,10 @@
 //! The two Windows APIs involved (winmm, avrt) are declared directly and
 //! linked from the Windows SDK.
 
+use std::time::Duration;
+
 use cpal::{BufferSize, SupportedBufferSize};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use std::time::Duration;
 
 // ── High-resolution timer (process-wide) ────────────────────────────────
 

@@ -9,9 +9,12 @@
 //! cargo run --release --example pipeline_bench -- fhd30 5 1920x1200
 //! ```
 
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
 use video::{
     capture::ScreenCapturer,
     codec::{FfmpegDecoder, FfmpegEncoder},

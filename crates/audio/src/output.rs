@@ -3,28 +3,36 @@
 //! Asks the device for 48 kHz first (see [`crate::device`]); only devices
 //! that cannot do 48 kHz get a resampler on this path.
 
-use crate::config::PeerAudioSettings;
-use crate::processor::limiter::Limiter;
-use crate::resampler::build_output_resampler;
-use crate::sounds::{SoundBank, SoundType};
-use crate::stats::AudioStats;
-use crate::transport::jitter_buffer::AdaptiveJitterBuffer;
-use crate::transport::packet::AudioPacket;
-use crate::{PcmFrame, OPUS_SAMPLE_RATE};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, SupportedStreamConfig};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Device, SampleFormat, Stream, SupportedStreamConfig,
+};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
 use log::{debug, error, info};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Async, Resampler};
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+
+use crate::{
+    config::PeerAudioSettings,
+    processor::limiter::Limiter,
+    resampler::build_output_resampler,
+    sounds::{SoundBank, SoundType},
+    stats::AudioStats,
+    transport::{jitter_buffer::AdaptiveJitterBuffer, packet::AudioPacket},
+    PcmFrame, OPUS_SAMPLE_RATE,
+};
 
 /// Samples pulled from the jitter buffer per hop (10 ms at 48 kHz). The
 /// codec frame is 20 ms; the packet buffers stage decoded PCM so the hop
@@ -186,7 +194,10 @@ impl AudioOutput {
     /// untouched for the cpal path.
     #[cfg(windows)]
     fn start_native(&mut self) -> Result<(), String> {
-        let consumer = self.ring_consumer.take().ok_or("ring consumer already taken")?;
+        let consumer = self
+            .ring_consumer
+            .take()
+            .ok_or("ring consumer already taken")?;
         let wake_tx = self.wake_tx.take().ok_or("wake sender already taken")?;
         match crate::native::wasapi::NativeRender::start(
             self.device_name.as_deref(),
@@ -241,7 +252,13 @@ impl AudioOutput {
 
     /// Spawn the mix/decode worker filling the ring at `device_sample_rate`.
     fn spawn_worker_for(&mut self, device_sample_rate: u32) {
-        if let (Some(ring_producer), Some(packet_rx), Some(loopback_rx), Some(sound_rx), Some(wake_rx)) = (
+        if let (
+            Some(ring_producer),
+            Some(packet_rx),
+            Some(loopback_rx),
+            Some(sound_rx),
+            Some(wake_rx),
+        ) = (
             self.ring_producer.take(),
             self.packet_rx.take(),
             self.loopback_rx.take(),
@@ -361,7 +378,9 @@ impl AudioOutput {
             },
             move |err| {
                 if matches!(err.kind(), cpal::ErrorKind::DeviceNotAvailable) {
-                    stats_err.output_stream_failed.store(true, Ordering::Relaxed);
+                    stats_err
+                        .output_stream_failed
+                        .store(true, Ordering::Relaxed);
                 }
                 stats_err.output_underruns.fetch_add(1, Ordering::Relaxed);
                 let now = Instant::now();
@@ -556,8 +575,7 @@ fn worker_loop(parts: WorkerParts) {
                     let expected = r.output_frames_next();
                     resampler_output[0].resize(expected, 0.0);
 
-                    let in_adapter = match SequentialSliceOfVecs::new(&resampler_input, 1, needed)
-                    {
+                    let in_adapter = match SequentialSliceOfVecs::new(&resampler_input, 1, needed) {
                         Ok(a) => a,
                         Err(e) => {
                             error!("Output resampler adapter error: {e}");
@@ -577,7 +595,8 @@ fn worker_loop(parts: WorkerParts) {
                         Ok((_in_len, out_len)) => {
                             // Chunked push; the ring-full remainder is dropped
                             // (the fill gate above makes that rare).
-                            let _ = ring_producer.push_partial_slice(&resampler_output[0][..out_len]);
+                            let _ =
+                                ring_producer.push_partial_slice(&resampler_output[0][..out_len]);
                         }
                         Err(e) => {
                             error!("Output resampler error: {e}");

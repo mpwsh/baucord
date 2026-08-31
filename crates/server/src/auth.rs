@@ -30,13 +30,10 @@
 //!   bytes, ready for `ConnectToken::read`.
 //! - `GET /healthz` — liveness probe, returns `ok`.
 
-use std::io::Read;
-use std::net::SocketAddr;
-use std::path::Path;
-use std::time::SystemTime;
+use std::{io::Read, net::SocketAddr, path::Path, time::SystemTime};
 
 use log::{info, warn};
-use renet_netcode::{ConnectToken, NETCODE_KEY_BYTES, generate_random_bytes};
+use renet_netcode::{generate_random_bytes, ConnectToken, NETCODE_KEY_BYTES};
 use tiny_http::{Header, Method, Response, Server};
 
 /// Wall-clock lifetime of an issued token. Tokens are single-use in

@@ -6,8 +6,7 @@
 // they work correctly. Starts the audio engine, plays join sound,
 // waits, plays leave sound, then exits.
 
-use std::thread;
-use std::time::Duration;
+use std::{thread, time::Duration};
 
 use audio::{SoundType, VoiceChat, VoiceChatConfig};
 

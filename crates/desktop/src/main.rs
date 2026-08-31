@@ -19,8 +19,9 @@ fn main() {
 
     #[cfg(not(debug_assertions))]
     {
-        use env_logger::Target;
         use std::fs::{self, OpenOptions};
+
+        use env_logger::Target;
 
         // Single append-mode log: every run keeps writing baucord.log.
         // One-time migration: sweep the per-run baucord-<timestamp>.log
@@ -36,21 +37,21 @@ fn main() {
             }
         }
 
-        match OpenOptions::new().create(true).append(true).open("baucord.log") {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("baucord.log")
+        {
             Ok(log_file) => {
-                env_logger::Builder::from_env(
-                    env_logger::Env::default().default_filter_or("info"),
-                )
-                .target(Target::Pipe(Box::new(log_file)))
-                .init();
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                    .target(Target::Pipe(Box::new(log_file)))
+                    .init();
             }
             Err(e) => {
                 // Read-only install dir etc. — run without file logging
                 // rather than dying before the window exists.
-                env_logger::Builder::from_env(
-                    env_logger::Env::default().default_filter_or("info"),
-                )
-                .init();
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                    .init();
                 log::warn!("could not open baucord.log ({e}); logging to stderr");
             }
         }

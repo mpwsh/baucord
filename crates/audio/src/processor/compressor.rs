@@ -29,8 +29,10 @@
 //! `log10` + `powf` on every sample (~96k transcendental calls per second)
 //! only to take that same minimum.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 
 use super::{AudioProcessor, FrameContext};
 

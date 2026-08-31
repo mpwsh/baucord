@@ -33,11 +33,10 @@
 //! while the backend said nothing, the probe itself is delivered so the
 //! stream never freezes, whatever new failure mode the OS invents.
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
-use std::time::Instant;
-
 #[cfg(target_os = "windows")]
 use std::time::Duration;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+use std::time::Instant;
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use log::info;

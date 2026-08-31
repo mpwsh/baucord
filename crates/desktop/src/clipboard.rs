@@ -42,7 +42,9 @@ pub fn clipboard_png() -> Option<Vec<u8>> {
     // SAFETY: extern static from AppKit; reading a framework constant.
     let data = pb.dataForType(unsafe { NSPasteboardTypePNG })?;
     let bytes = data.to_vec();
-    bytes.starts_with(&[0x89, b'P', b'N', b'G']).then_some(bytes)
+    bytes
+        .starts_with(&[0x89, b'P', b'N', b'G'])
+        .then_some(bytes)
 }
 
 // The Windows readers are hand-declared like resources.rs: two
@@ -71,8 +73,7 @@ pub fn clipboard_file() -> Option<std::path::PathBuf> {
     }
 
     unsafe {
-        if IsClipboardFormatAvailable(CF_HDROP) == 0 || OpenClipboard(std::ptr::null_mut()) == 0
-        {
+        if IsClipboardFormatAvailable(CF_HDROP) == 0 || OpenClipboard(std::ptr::null_mut()) == 0 {
             return None;
         }
         // From here on, every exit must CloseClipboard.
@@ -91,7 +92,9 @@ pub fn clipboard_file() -> Option<std::path::PathBuf> {
                 return None;
             }
             buf.truncate(copied as usize);
-            Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf)))
+            Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                &buf,
+            )))
         })();
         CloseClipboard();
         result
@@ -165,7 +168,6 @@ pub fn clipboard_png() -> Option<Vec<u8>> {
     None
 }
 
-
 // ── Plain text (all platforms, via arboard) ─────────────────────────────
 
 /// Read the clipboard as plain text.
@@ -177,7 +179,8 @@ pub fn clipboard_text() -> Option<String> {
 /// menu actions).
 pub fn set_clipboard_text(text: &str) {
     if let Ok(mut cb) = arboard::Clipboard::new()
-        && let Err(e) = cb.set_text(text) {
-            log::warn!("Clipboard write failed: {e}");
-        }
+        && let Err(e) = cb.set_text(text)
+    {
+        log::warn!("Clipboard write failed: {e}");
+    }
 }

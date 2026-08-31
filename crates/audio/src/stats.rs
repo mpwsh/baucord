@@ -4,8 +4,10 @@
 //! Tracks everything a TeamSpeak-style client needs for its debug overlay:
 //! packet rates, codec stats, bandwidth, latency budgets, and buffer health.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::{
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    time::Instant,
+};
 
 /// Shared, lock-free audio statistics.
 pub struct AudioStats {

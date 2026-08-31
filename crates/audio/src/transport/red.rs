@@ -119,8 +119,22 @@ mod tests {
         let b = decode(&out).expect("valid");
         assert_eq!(b.primary, b"PRIMARY");
         assert_eq!(b.redundant.len(), 2);
-        assert_eq!(b.redundant[0], Block { ts_offset: 1920, seq_distance: 2, data: b"older" });
-        assert_eq!(b.redundant[1], Block { ts_offset: 960, seq_distance: 1, data: b"newer" });
+        assert_eq!(
+            b.redundant[0],
+            Block {
+                ts_offset: 1920,
+                seq_distance: 2,
+                data: b"older"
+            }
+        );
+        assert_eq!(
+            b.redundant[1],
+            Block {
+                ts_offset: 960,
+                seq_distance: 1,
+                data: b"newer"
+            }
+        );
     }
 
     #[test]
@@ -142,7 +156,10 @@ mod tests {
         }
         assert!(decode(&[]).is_none());
         assert!(decode(&[3]).is_none(), "count above MAX_BLOCKS");
-        assert!(decode(&[1, 0, 0, 0, 9, b'x']).is_none(), "block length past end");
+        assert!(
+            decode(&[1, 0, 0, 0, 9, b'x']).is_none(),
+            "block length past end"
+        );
     }
 
     #[test]

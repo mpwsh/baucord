@@ -6,8 +6,10 @@
 //! failures are typed ([`ImageError`]) instead of pre-localized strings
 //! — the shell maps them to fluent messages.
 
-use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::{
+    io::Cursor,
+    path::{Path, PathBuf},
+};
 
 /// First-pass bound for a pasted image's longest edge.
 pub const MAX_IMAGE_DIM: u32 = 1280;
@@ -147,10 +149,7 @@ pub fn load_image_bytes(bytes: Vec<u8>, max_bytes: usize) -> Result<Vec<u8>, Ima
 /// # Errors
 /// [`ImageError::TooLargeAfterDownscale`] below 320 px, or
 /// [`ImageError::Codec`] from the encoder.
-pub fn encode_bounded_jpeg(
-    buf: &image::RgbImage,
-    max_bytes: usize,
-) -> Result<Vec<u8>, ImageError> {
+pub fn encode_bounded_jpeg(buf: &image::RgbImage, max_bytes: usize) -> Result<Vec<u8>, ImageError> {
     let mut bound = MAX_IMAGE_DIM;
     loop {
         let scaled = if buf.width().max(buf.height()) > bound {
@@ -197,7 +196,9 @@ pub fn decode_bounded(bytes: &[u8]) -> Result<image::DynamicImage, ImageError> {
         .with_guessed_format()
         .map_err(|e| ImageError::Codec(e.to_string()))?;
     reader.limits(limits);
-    reader.decode().map_err(|e| ImageError::Codec(e.to_string()))
+    reader
+        .decode()
+        .map_err(|e| ImageError::Codec(e.to_string()))
 }
 
 /// Does this GIF contain more than one image descriptor? Scans for the
@@ -302,12 +303,14 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
         out.push(bytes[i]);
         i += 1;
     }
@@ -330,8 +333,7 @@ pub fn first_image_path_in(text: &str) -> Option<PathBuf> {
 #[must_use]
 pub fn image_url_in(text: &str) -> Option<String> {
     let t = text.trim();
-    if !(t.starts_with("https://") || t.starts_with("http://")) || t.contains(char::is_whitespace)
-    {
+    if !(t.starts_with("https://") || t.starts_with("http://")) || t.contains(char::is_whitespace) {
         return None;
     }
     let path = t.split(['?', '#']).next().unwrap_or(t);
@@ -402,7 +404,11 @@ mod tests {
         // downscaled AND still JPEG — the whole point is that photos
         // never balloon through a PNG transcode again.
         let img = image::RgbImage::from_fn(4000, 3000, |x, y| {
-            image::Rgb([(x * 7 % 256) as u8, (y * 3 % 256) as u8, ((x + y) % 256) as u8])
+            image::Rgb([
+                (x * 7 % 256) as u8,
+                (y * 3 % 256) as u8,
+                ((x + y) % 256) as u8,
+            ])
         });
         let mut out = std::io::Cursor::new(Vec::new());
         let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);

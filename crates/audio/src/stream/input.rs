@@ -68,8 +68,14 @@
 //! to the screen share viewer's audio output rather than mixing with
 //! voice chat.
 
-use crate::stats::AudioStats;
-use crate::OPUS_SAMPLE_RATE;
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
@@ -81,10 +87,8 @@ use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+
+use crate::{stats::AudioStats, OPUS_SAMPLE_RATE};
 
 /// Sentinel SSRC for system audio packets.
 /// Distinct from `input::LOOPBACK_SSRC` (which is for mic monitoring).
@@ -182,10 +186,13 @@ type StartedBackend = (Box<dyn SystemAudioBackend>, Consumer<f32>);
 
 #[cfg(target_os = "windows")]
 mod wasapi_loopback {
-    use super::*;
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use cpal::{SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
+    use cpal::{
+        traits::{DeviceTrait, HostTrait, StreamTrait},
+        SampleFormat, Stream, StreamConfig, SupportedStreamConfig,
+    };
     use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
+
+    use super::*;
 
     pub struct WasapiLoopback {
         device: cpal::Device,
@@ -945,7 +952,7 @@ impl SystemAudioCapture {
         let mut accumulator: Vec<f32> =
             Vec::with_capacity(SYSTEM_AUDIO_FRAME_SIZE * SYSTEM_AUDIO_CHANNELS * 4);
         let mut encode_buf = vec![0u8; 4096]; // Opus output buffer
-        // One interleaved stereo frame, reused for every encode.
+                                              // One interleaved stereo frame, reused for every encode.
         let mut frame = vec![0.0f32; SYSTEM_AUDIO_FRAME_SIZE * SYSTEM_AUDIO_CHANNELS];
         let mut seq: u32 = 0;
         // Silence-gate state: frames since the last audible one. Starts

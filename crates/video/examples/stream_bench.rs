@@ -1,4 +1,5 @@
 use std::time::{Duration, Instant};
+
 use video::{capture::ScreenCapturer, codec::FfmpegEncoder, Quality};
 
 fn main() {

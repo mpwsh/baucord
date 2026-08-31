@@ -30,8 +30,7 @@ use std::collections::VecDeque;
 
 use opus::{Channels, Decoder};
 
-use crate::transport::packet::AudioPacket;
-use crate::{FRAME_SIZE, OPUS_SAMPLE_RATE};
+use crate::{transport::packet::AudioPacket, FRAME_SIZE, OPUS_SAMPLE_RATE};
 
 /// Largest single packet this buffer decodes: 40 ms at 48 kHz (the rate
 /// controller's low-bitrate rungs use 40 ms frames). Bump to 2880 only if
@@ -365,7 +364,8 @@ impl PacketBuffer {
                 }
             }
             let take = (self.staged - self.pos).min(out.len() - rep.filled);
-            out[rep.filled..rep.filled + take].copy_from_slice(&self.staging[self.pos..self.pos + take]);
+            out[rep.filled..rep.filled + take]
+                .copy_from_slice(&self.staging[self.pos..self.pos + take]);
             self.pos += take;
             rep.filled += take;
         }
@@ -470,7 +470,10 @@ impl PacketBuffer {
     }
 
     fn decode_real(&mut self, slot: &Slot) -> Refill {
-        match self.decoder.decode_float(&slot.data, &mut self.staging, false) {
+        match self
+            .decoder
+            .decode_float(&slot.data, &mut self.staging, false)
+        {
             Ok(n) if n > 0 => {
                 self.staged = n;
                 self.dry_plc_used = 0;
@@ -496,7 +499,10 @@ impl PacketBuffer {
     /// the timeline never stalls.
     fn plc_into_staging(&mut self, dur: usize) {
         let dur = dur.min(MAX_FRAME);
-        match self.decoder.decode_float(&[], &mut self.staging[..dur], false) {
+        match self
+            .decoder
+            .decode_float(&[], &mut self.staging[..dur], false)
+        {
             Ok(n) if n > 0 => self.staged = n,
             _ => {
                 self.staging[..dur].fill(0.0);
@@ -526,7 +532,9 @@ mod tests {
 
     fn pkt(e: &mut opus::Encoder, seq: u32, ts: u32) -> AudioPacket {
         let pcm: Vec<f32> = (0..FRAME_SIZE)
-            .map(|i| ((ts as usize + i) as f32 * 220.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3)
+            .map(|i| {
+                ((ts as usize + i) as f32 * 220.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3
+            })
             .collect();
         let mut buf = vec![0u8; 512];
         let n = e.encode_float(&pcm, &mut buf).unwrap();

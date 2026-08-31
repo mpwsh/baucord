@@ -1,14 +1,14 @@
 // settingsui.rs — the settings window: populate, wire, and the two
 // live loops (8 Hz level meters, keybind capture).
 
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::{sync::atomic::Ordering, time::Duration};
 
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
-
-use client::config::{BindableAction, ServerEntry, build_bind_string};
-use client::voice::VoiceControl;
+use client::{
+    config::{build_bind_string, BindableAction, ServerEntry},
+    voice::VoiceControl,
+};
 use i18n::t;
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use ui::{KeybindRow, ServerRow, SettingsLogic, SettingsState, SettingsWindow};
 
 use crate::app::{self, AppState};

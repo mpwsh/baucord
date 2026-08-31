@@ -149,7 +149,9 @@ pub fn scrub_control_chars(s: &str) -> String {
     // Newlines are legitimate since the composer went multi-line
     // (Shift+Enter); every other control char still gets dropped —
     // including \r, so CRLF pastes normalize to \n.
-    s.chars().filter(|c| *c == '\n' || !c.is_control()).collect()
+    s.chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect()
 }
 
 #[cfg(test)]
@@ -165,14 +167,20 @@ mod tests {
         assert_eq!(h.rows().len(), MAX_ROWS);
         assert_eq!(
             h.rows()[0],
-            ChatItem::System { body: "row 20".into() }
+            ChatItem::System {
+                body: "row 20".into()
+            }
         );
     }
 
     #[test]
     fn code_fences_become_rows() {
         let mut h = ChatHistory::new();
-        let d = h.push_message("12:00", "a", "look:\n```\nlet x = 1;\n```\nand https://x.test");
+        let d = h.push_message(
+            "12:00",
+            "a",
+            "look:\n```\nlet x = 1;\n```\nand https://x.test",
+        );
         // Links stay inline in the message text (linkified at render
         // time) — no extra rows.
         assert_eq!(d.appended, 3);
@@ -195,7 +203,9 @@ mod tests {
         let d = h.push_message("12:00", "a", "see https://x.test/a and www.y.test");
         // One row: links render inline via the markdown translator.
         assert_eq!(d.appended, 1);
-        assert!(matches!(&h.rows()[0], ChatItem::Message { body, .. } if body.contains("www.y.test")));
+        assert!(
+            matches!(&h.rows()[0], ChatItem::Message { body, .. } if body.contains("www.y.test"))
+        );
     }
 
     #[test]

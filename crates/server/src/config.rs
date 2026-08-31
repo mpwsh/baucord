@@ -6,10 +6,9 @@
 //! a deployment to disagree with every client. What remains configurable
 //! is genuinely deployment-specific: addresses, capacity, limits, auth.
 
+use std::{fs, net::SocketAddr, path::Path};
+
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::net::SocketAddr;
-use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -221,64 +220,64 @@ impl Config {
 /// reload, which must vet a new list *before* swapping it in — a bad
 /// edit to a running server is rejected here and never applied.
 pub fn validate_channel_list(channels: &[ChannelSettings]) -> Result<u16, String> {
-        if channels.is_empty() {
-            return Err(
-                "channels: list is empty — omit the key entirely for a single default Lobby"
-                    .to_string(),
-            );
+    if channels.is_empty() {
+        return Err(
+            "channels: list is empty — omit the key entirely for a single default Lobby"
+                .to_string(),
+        );
+    }
+    if channels.len() > MAX_CHANNELS {
+        return Err(format!(
+            "channels: {} channels configured, maximum is {MAX_CHANNELS}",
+            channels.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut default_index: Option<usize> = None;
+    for (i, ch) in channels.iter().enumerate() {
+        let name = ch.name.trim();
+        if name.is_empty() {
+            return Err(format!("channels[{i}]: name must not be empty"));
         }
-        if channels.len() > MAX_CHANNELS {
+        if !seen.insert(name.to_string()) {
+            return Err(format!("channels[{i}]: duplicate channel name '{name}'"));
+        }
+        if ch.user_limit == Some(0) {
             return Err(format!(
-                "channels: {} channels configured, maximum is {MAX_CHANNELS}",
-                channels.len()
+                "channels[{i}] '{name}': user_limit 0 makes the channel unjoinable — \
+                     omit the key for unlimited"
             ));
         }
-        let mut seen = std::collections::HashSet::new();
-        let mut default_index: Option<usize> = None;
-        for (i, ch) in channels.iter().enumerate() {
-            let name = ch.name.trim();
-            if name.is_empty() {
-                return Err(format!("channels[{i}]: name must not be empty"));
-            }
-            if !seen.insert(name.to_string()) {
-                return Err(format!("channels[{i}]: duplicate channel name '{name}'"));
-            }
-            if ch.user_limit == Some(0) {
+        if ch.default {
+            if let Some(first) = default_index {
                 return Err(format!(
-                    "channels[{i}] '{name}': user_limit 0 makes the channel unjoinable — \
-                     omit the key for unlimited"
+                    "channels[{i}] '{name}': 'default: true' is already set on \
+                         channels[{first}] '{}' — exactly one channel may be the default",
+                    channels[first].name
                 ));
             }
-            if ch.default {
-                if let Some(first) = default_index {
-                    return Err(format!(
-                        "channels[{i}] '{name}': 'default: true' is already set on \
-                         channels[{first}] '{}' — exactly one channel may be the default",
-                        channels[first].name
-                    ));
-                }
-                if ch.password.is_some() {
-                    return Err(format!(
-                        "channels[{i}] '{name}': the default channel cannot have a password — \
+            if ch.password.is_some() {
+                return Err(format!(
+                    "channels[{i}] '{name}': the default channel cannot have a password — \
                          every client lands there on connect"
-                    ));
-                }
-                if ch.user_limit.is_some() {
-                    return Err(format!(
-                        "channels[{i}] '{name}': the default channel cannot have a user_limit — \
-                         a full default channel would block all new connections"
-                    ));
-                }
-                default_index = Some(i);
+                ));
             }
+            if ch.user_limit.is_some() {
+                return Err(format!(
+                    "channels[{i}] '{name}': the default channel cannot have a user_limit — \
+                         a full default channel would block all new connections"
+                ));
+            }
+            default_index = Some(i);
         }
-        let default_index = default_index.ok_or_else(|| {
-            "channels: no channel has 'default: true' — mark exactly one (typically the Lobby)"
-                .to_string()
-        })?;
-        #[allow(clippy::cast_possible_truncation)] // len ≤ MAX_CHANNELS ≤ u16::MAX
-        Ok(default_index as u16)
     }
+    let default_index = default_index.ok_or_else(|| {
+        "channels: no channel has 'default: true' — mark exactly one (typically the Lobby)"
+            .to_string()
+    })?;
+    #[allow(clippy::cast_possible_truncation)] // len ≤ MAX_CHANNELS ≤ u16::MAX
+    Ok(default_index as u16)
+}
 
 impl Default for Config {
     fn default() -> Self {

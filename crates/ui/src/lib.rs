@@ -18,9 +18,12 @@ slint::include_modules!();
 pub mod convert {
     //! app-core → generated-struct conversions.
 
+    use app_core::{
+        chat::ChatItem,
+        roster::{split_id, ChannelRow, RosterItem, RosterRow},
+    };
+
     use super::{ChatRow, UserRow};
-    use app_core::chat::ChatItem;
-    use app_core::roster::{split_id, ChannelRow, RosterItem, RosterRow};
 
     /// Roster row → sidebar model row.
     #[must_use]
@@ -167,8 +170,7 @@ pub mod convert {
             );
             return slint::Image::default();
         }
-        let mut buf =
-            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
         buf.make_mut_bytes().copy_from_slice(rgba);
         slint::Image::from_rgba8(buf)
     }

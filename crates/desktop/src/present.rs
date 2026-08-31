@@ -23,13 +23,16 @@
 //! anyone pays to convert them — the old design paid the copy first and
 //! discarded after.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
+};
 
-use client::WakeFn;
-use client::screen::ScreenEvent;
+use client::{screen::ScreenEvent, WakeFn};
 use crossbeam_channel::{Receiver, Sender};
 use log::{error, warn};
 

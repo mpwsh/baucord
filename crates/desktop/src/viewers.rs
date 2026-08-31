@@ -4,11 +4,9 @@
 
 use std::rc::Rc;
 
-use slint::{ComponentHandle, Model};
-
-use app_core::fps::FpsCounter;
-use app_core::stats::FrameRing;
+use app_core::{fps::FpsCounter, stats::FrameRing};
 use i18n::t;
+use slint::{ComponentHandle, Model};
 use ui::{State, StreamViewerWindow};
 
 use crate::app::{self, AppState};
@@ -189,7 +187,9 @@ pub fn open_gallery(app: &mut AppState, row_id: i32) {
         if let Ok(anim) = app_core::gif::decode_animation(&bytes) {
             if let Some(first) = anim.frames.first() {
                 s.set_viewer_image(ui::convert::rgba_image(
-                    &first.rgba, anim.width, anim.height,
+                    &first.rgba,
+                    anim.width,
+                    anim.height,
                 ));
             }
             app.gallery_gif = Some(GalleryGif {
@@ -211,7 +211,9 @@ pub fn open_gallery(app: &mut AppState, row_id: i32) {
 /// Move to the previous/next image row.
 pub fn step_gallery(app: &mut AppState, dir: i32) {
     let ids = image_row_ids(app);
-    let Some(current) = app.gallery_row else { return };
+    let Some(current) = app.gallery_row else {
+        return;
+    };
     let Some(pos) = ids.iter().position(|&id| id == current) else {
         return;
     };

@@ -57,11 +57,13 @@ extern crate ffmpeg_next as ffmpeg;
 
 use std::collections::VecDeque;
 
-use ffmpeg::codec::{self, encoder, packet::Packet};
-use ffmpeg::format::Pixel;
-use ffmpeg::software::scaling::{Context as SwsContext, Flags};
-use ffmpeg::util::frame::video::Video as VideoFrame;
-use ffmpeg::{Dictionary, Rational};
+use ffmpeg::{
+    codec::{self, encoder, packet::Packet},
+    format::Pixel,
+    software::scaling::{Context as SwsContext, Flags},
+    util::frame::video::Video as VideoFrame,
+    Dictionary, Rational,
+};
 
 use crate::{
     CodecError, DecodedFrame, EncodedFrame, Frame, PixelFormat, Quality, VideoDecoder, VideoEncoder,
@@ -129,7 +131,11 @@ impl RateControl {
         Self {
             target,
             maxrate: target * 3 / 2,
-            bufsize: if target < VBV_MAX_BITS { target } else { VBV_MAX_BITS },
+            bufsize: if target < VBV_MAX_BITS {
+                target
+            } else {
+                VBV_MAX_BITS
+            },
         }
     }
 }

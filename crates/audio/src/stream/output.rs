@@ -27,11 +27,20 @@
 //! Network → Opus decode (stereo) → ring buffer → resample → cpal playback
 //! ```
 
-use crate::OPUS_SAMPLE_RATE;
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, SupportedStreamConfig};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Device, SampleFormat, Stream, SupportedStreamConfig,
+};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
 use log::{error, info};
@@ -40,10 +49,8 @@ use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+
+use crate::OPUS_SAMPLE_RATE;
 
 /// Decoded stereo audio frame from the network.
 ///
@@ -93,10 +100,7 @@ impl StreamAudioOutput {
     ///
     /// - `device_name`: output device (or `None` for default)
     /// - `volume`: initial playback volume (0.0–2.0)
-    pub fn new(
-        device_name: Option<&str>,
-        volume: f32,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(device_name: Option<&str>, volume: f32) -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
 
         let device = if let Some(name) = device_name {

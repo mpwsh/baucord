@@ -5,6 +5,7 @@
 //! ```
 
 use std::time::Instant;
+
 use video::{capture::ScreenCapturer, Quality};
 
 fn main() {

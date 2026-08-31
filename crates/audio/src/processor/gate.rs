@@ -36,8 +36,10 @@
 //!   resuming speech is never dulled; release is smoothed to avoid
 //!   zipper noise.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 
 use super::{compute_rms, AudioProcessor, FrameContext};
 
@@ -289,9 +291,10 @@ fn smoothstep(t: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::processor::{AudioProcessor, FrameContext};
-    use std::sync::Arc;
 
     /// One 10 ms frame of a ±`amp` square wave (RMS = `amp` exactly,
     /// which makes envelope math deterministic).

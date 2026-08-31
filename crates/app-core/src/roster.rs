@@ -195,7 +195,13 @@ mod tests {
 
     #[test]
     fn id_split_roundtrips_at_extremes() {
-        for id in [0u64, 1, u64::from(u32::MAX), u64::MAX, 0x8000_0000_0000_0001] {
+        for id in [
+            0u64,
+            1,
+            u64::from(u32::MAX),
+            u64::MAX,
+            0x8000_0000_0000_0001,
+        ] {
             let (lo, hi) = split_id(id);
             assert_eq!(join_id(lo, hi), id);
         }
@@ -221,16 +227,22 @@ mod tests {
 
         // Lobby header, amy, zoe(us), Gaming header, bob.
         assert_eq!(items.len(), 5);
-        let RosterItem::Channel(lobby) = &items[0] else { panic!("expected header") };
+        let RosterItem::Channel(lobby) = &items[0] else {
+            panic!("expected header")
+        };
         assert_eq!(lobby.name, "Lobby");
         assert_eq!(lobby.members, 2);
         assert!(lobby.is_ours, "we are in the Lobby");
         assert!(matches!(&items[1], RosterItem::User(u) if u.name == "amy"));
-        let RosterItem::User(us) = &items[2] else { panic!("expected user") };
+        let RosterItem::User(us) = &items[2] else {
+            panic!("expected user")
+        };
         assert_eq!(us.name, "zoe");
         assert!(us.is_us);
         assert!(us.self_muted, "self row uses local state");
-        let RosterItem::Channel(gaming) = &items[3] else { panic!("expected header") };
+        let RosterItem::Channel(gaming) = &items[3] else {
+            panic!("expected header")
+        };
         assert_eq!(gaming.name, "Gaming");
         assert!(!gaming.is_ours);
         assert!(matches!(&items[4], RosterItem::User(u) if u.name == "bob"));
@@ -241,9 +253,18 @@ mod tests {
         let channels = [meta(0, "Lobby"), meta(1, "AFK")];
         let mut users = HashMap::new();
         users.insert(1, UserState::new("amy", PeerAudio::default(), 0));
-        let items = grouped_rows(&channels, &users, Some(1), &HashSet::default(), false, false);
+        let items = grouped_rows(
+            &channels,
+            &users,
+            Some(1),
+            &HashSet::default(),
+            false,
+            false,
+        );
         assert_eq!(items.len(), 3);
-        let RosterItem::Channel(afk) = &items[2] else { panic!("expected header") };
+        let RosterItem::Channel(afk) = &items[2] else {
+            panic!("expected header")
+        };
         assert_eq!(afk.members, 0);
     }
 

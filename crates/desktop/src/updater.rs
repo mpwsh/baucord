@@ -4,16 +4,19 @@
 // Ported from the FLTK `ui/splash.rs` + `ui/update.rs`; URL building
 // and version comparison live in app-core, the side effects stay here.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
+use app_core::update::{download_url, is_newer, PLATFORM_SUFFIX, VERSION_URL};
+use i18n::t;
 use log::{error, info, warn};
 use slint::ComponentHandle;
-
-use app_core::update::{PLATFORM_SUFFIX, VERSION_URL, download_url, is_newer};
-use i18n::t;
 use ui::State;
 
 use crate::app::{self, CURRENT_VERSION};
@@ -208,15 +211,14 @@ fn download_zip(
             return Err("Download cancelled".into());
         }
 
-        let n = std::io::Read::read(&mut reader, &mut buf)
-            .map_err(|e| format!("Read error: {e}"))?;
+        let n =
+            std::io::Read::read(&mut reader, &mut buf).map_err(|e| format!("Read error: {e}"))?;
 
         if n == 0 {
             break;
         }
 
-        std::io::Write::write_all(&mut file, &buf[..n])
-            .map_err(|e| format!("Write error: {e}"))?;
+        std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("Write error: {e}"))?;
 
         downloaded += n as u64;
 
@@ -275,8 +277,14 @@ pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
     let new_main_exe = extract_dir.join(&main_exe);
     if !new_main_exe.exists() {
         cleanup_staging(&zip_path, &extract_dir);
-        let listing = if extracted.is_empty() { "none".to_string() } else { extracted.join(", ") };
-        return Err(format!("{main_exe} not found in update zip (root-level entries: {listing})"));
+        let listing = if extracted.is_empty() {
+            "none".to_string()
+        } else {
+            extracted.join(", ")
+        };
+        return Err(format!(
+            "{main_exe} not found in update zip (root-level entries: {listing})"
+        ));
     }
 
     // Zips built on Windows carry no Unix mode bits, so the staged
@@ -323,8 +331,7 @@ fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<Vec<String>, String> 
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("Failed to open {}: {e}", zip_path.display()))?;
 
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip: {e}"))?;
 
     std::fs::create_dir_all(dest_dir).map_err(|e| format!("Failed to create staging dir: {e}"))?;
 

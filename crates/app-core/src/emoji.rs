@@ -5,8 +5,7 @@
 //! still render nicely). The catalog ([`crate::EMOJI`]) also feeds the
 //! picker palette. Ported verbatim from the FLTK `ui/emoji.rs`.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use crate::EMOJI;
 
@@ -15,7 +14,12 @@ const MAX_SHORTCODE_LEN: usize = 40;
 
 fn shortcode_map() -> &'static HashMap<&'static str, &'static str> {
     static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| EMOJI.iter().map(|(name, emoji, _)| (*name, *emoji)).collect())
+    MAP.get_or_init(|| {
+        EMOJI
+            .iter()
+            .map(|(name, emoji, _)| (*name, *emoji))
+            .collect()
+    })
 }
 
 /// Strip VARIATION SELECTOR-16 (U+FE0F) for display. Slint's Skia
@@ -87,10 +91,16 @@ mod tests {
 
     #[test]
     fn vs16_is_stripped_for_display() {
-        assert_eq!(strip_variation_selectors("a\u{2708}\u{fe0f}b"), "a\u{2708}b");
+        assert_eq!(
+            strip_variation_selectors("a\u{2708}\u{fe0f}b"),
+            "a\u{2708}b"
+        );
         assert_eq!(strip_variation_selectors("plain"), "plain");
         // both replace paths normalize
-        assert_eq!(replace_shortcodes("\u{26a0}\u{fe0f} watch out"), "\u{26a0} watch out");
+        assert_eq!(
+            replace_shortcodes("\u{26a0}\u{fe0f} watch out"),
+            "\u{26a0} watch out"
+        );
         assert_eq!(replace_shortcodes(":warning: here"), "\u{26a0} here");
     }
 

@@ -17,32 +17,31 @@
 // by the server from the authenticated transport, so it cannot be
 // spoofed by other clients. See `protocol::relayed`.
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
-use log::warn;
-use renet::{ClientId, RenetClient};
-use renet_netcode::{
-    ClientAuthentication, ConnectToken, NetcodeClientTransport, NetcodeTransportError,
-    generate_random_bytes,
+use std::{
+    collections::HashMap,
+    io::Read,
+    net::{SocketAddr, UdpSocket},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
-use std::collections::HashMap;
-use std::io::Read;
-use std::net::{SocketAddr, UdpSocket};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
 
 use audio::{AudioPacket, PayloadType};
-
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use log::warn;
 use protocol::{
-    CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, ChannelDenyReason, ChannelInfo, ClientMessage,
-    DenyReason, MEDIA_CHANNEL, PROTOCOL_ID, SIGNAL_CHANNEL, SYSTEM_AUDIO_CHANNEL, ServerMessage,
-    ShareScope, VIDEO_CHANNEL, VOICE_CHANNEL, VideoReassembler, pack_system_audio,
-    VOICE_FLAG_RED, pack_video_frame, pack_voice_with_flags, parse_system_audio, parse_voice,
-    split_sender,
+    pack_system_audio, pack_video_frame, pack_voice_with_flags, parse_system_audio, parse_voice,
+    split_sender, ChannelDenyReason, ChannelInfo, ClientMessage, DenyReason, ServerMessage,
+    ShareScope, VideoReassembler, CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, MEDIA_CHANNEL,
+    PROTOCOL_ID, SIGNAL_CHANNEL, SYSTEM_AUDIO_CHANNEL, VIDEO_CHANNEL, VOICE_CHANNEL,
+    VOICE_FLAG_RED,
+};
+use renet::{ClientId, RenetClient};
+use renet_netcode::{
+    generate_random_bytes, ClientAuthentication, ConnectToken, NetcodeClientTransport,
+    NetcodeTransportError,
 };
 
-use crate::WakeFn;
-use crate::screen::ScreenControl;
-use crate::voice::VoiceControl;
+use crate::{screen::ScreenControl, voice::VoiceControl, WakeFn};
 
 /// How often to sample link statistics for the UI, the voice encoder's
 /// uplink-loss feedback, and the screen thread's bitrate ladder — all
@@ -114,7 +113,9 @@ pub enum NetworkMessage {
     /// Outbound image upload progress, 0–100. 100 means the reliable
     /// channel has drained (every byte acked) — the UI hides its
     /// indicator on it.
-    UploadProgress { pct: u8 },
+    UploadProgress {
+        pct: u8,
+    },
     Connected,
     Disconnected(String),
     /// The token issuer answered HTTP 403 during connect — the server
@@ -409,7 +410,11 @@ impl NetworkClient {
         // granted so a clamped buffer (firewall LSPs, policy) is
         // visible in baucord.log when diagnosing ENOBUFS reports.
         if let (Ok(snd), Ok(rcv)) = (sock_ref.send_buffer_size(), sock_ref.recv_buffer_size()) {
-            log::info!("UDP socket buffers: send {} KB, recv {} KB", snd / 1024, rcv / 1024);
+            log::info!(
+                "UDP socket buffers: send {} KB, recv {} KB",
+                snd / 1024,
+                rcv / 1024
+            );
         }
 
         let current_time = SystemTime::now()
@@ -670,10 +675,8 @@ impl NetworkClient {
                     "Server denied joining channel {channel_id}: {}",
                     reason.describe()
                 );
-                self.message_queue.push(NetworkMessage::ChannelJoinDenied {
-                    channel_id,
-                    reason,
-                });
+                self.message_queue
+                    .push(NetworkMessage::ChannelJoinDenied { channel_id, reason });
             }
             ServerMessage::ChannelListUpdated {
                 channels,
@@ -712,7 +715,8 @@ impl NetworkClient {
                 count,
                 data,
             } => {
-                if let Some(image) = self.accept_image_chunk(client_id, upload_id, index, count, data)
+                if let Some(image) =
+                    self.accept_image_chunk(client_id, upload_id, index, count, data)
                 {
                     let username = self
                         .usernames
@@ -1003,11 +1007,11 @@ impl NetworkClient {
             };
             match protocol::encode_client_message(&msg) {
                 Some(encoded) => {
-                        // Field-level borrows: `upload` is still live here, so the
-                        // `queue_message` helper (which takes `&mut self`) can't be used.
-                        self.client.send_message(msg.channel(), encoded);
-                        self.outbound_pending = true;
-                    }
+                    // Field-level borrows: `upload` is still live here, so the
+                    // `queue_message` helper (which takes `&mut self`) can't be used.
+                    self.client.send_message(msg.channel(), encoded);
+                    self.outbound_pending = true;
+                }
                 None => {
                     warn!("Image chunk failed to encode; aborting upload");
                     self.upload = None;
@@ -1077,8 +1081,8 @@ impl NetworkClient {
         // could fill 10 MB in ~10 s at full rate. Drop the frame here
         // instead; the viewer sees a seq gap and recovers via keyframe
         // request, and the ladder is already stepping down.
-        let wire_bytes = data.len() + data.len().div_ceil(protocol::VIDEO_CHUNK_PAYLOAD)
-            * protocol::VIDEO_HEADER_SIZE;
+        let wire_bytes = data.len()
+            + data.len().div_ceil(protocol::VIDEO_CHUNK_PAYLOAD) * protocol::VIDEO_HEADER_SIZE;
         if !self.client.can_send_message(VIDEO_CHANNEL, wire_bytes) {
             if !self.video_channel_full {
                 warn!(
@@ -1666,10 +1670,10 @@ fn run_network_loop(
                         // congestion (loss + RTT inflation: send fewer
                         // bytes) from random loss (add redundancy).
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let _ = voice_tx.try_send(VoiceControl::SetLinkRtt(
-                            rtt_ms.max(0.0).round() as u32,
-                        ));
-                        #[allow(clippy::cast_possible_truncation)] // f32 is plenty for percent/ms/kbit
+                        let _ = voice_tx
+                            .try_send(VoiceControl::SetLinkRtt(rtt_ms.max(0.0).round() as u32));
+                        #[allow(clippy::cast_possible_truncation)]
+                        // f32 is plenty for percent/ms/kbit
                         let _ = screen_tx.try_send(ScreenControl::UplinkStats {
                             loss_pct: loss_pct as f32,
                             rtt_ms: rtt_ms as f32,

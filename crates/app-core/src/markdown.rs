@@ -58,7 +58,10 @@ pub fn split_fences(body: &str) -> Vec<Segment> {
         // the opening line, then the fence's own line breaks.
         if let Some(nl) = code.find('\n') {
             let info = code[..nl].trim();
-            if !info.is_empty() && info.chars().all(|c| c.is_alphanumeric() || "+-_#.".contains(c))
+            if !info.is_empty()
+                && info
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || "+-_#.".contains(c))
             {
                 code = &code[nl + 1..];
             }
@@ -122,7 +125,11 @@ fn match_url(chars: &[char]) -> Option<(String, usize)> {
     if trimmed.len() < 8 && !is_www {
         return None; // "http://" with nothing behind it
     }
-    let dest = if is_www { format!("https://{trimmed}") } else { trimmed.to_string() };
+    let dest = if is_www {
+        format!("https://{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
     Some((dest, trimmed.chars().count()))
 }
 
@@ -294,10 +301,7 @@ mod tests {
 
     #[test]
     fn unterminated_fence_stays_text() {
-        assert_eq!(
-            split_fences("uh ```\noops"),
-            vec![text("uh ```\noops")]
-        );
+        assert_eq!(split_fences("uh ```\noops"), vec![text("uh ```\noops")]);
     }
 
     #[test]
@@ -374,13 +378,19 @@ mod tests {
     fn urls_become_inline_links() {
         let (cm, styled) = to_commonmark_none("see https://x.com/home now");
         assert!(styled);
-        assert_eq!(cm, r"see [https\:\/\/x\.com\/home](<https://x.com/home>) now");
+        assert_eq!(
+            cm,
+            r"see [https\:\/\/x\.com\/home](<https://x.com/home>) now"
+        );
     }
 
     #[test]
     fn url_trailing_punctuation_stays_out() {
         let (cm, _) = to_commonmark_none("go to www.example.com, ok?");
-        assert_eq!(cm, r"go to [www\.example\.com](<https://www.example.com>)\, ok\?");
+        assert_eq!(
+            cm,
+            r"go to [www\.example\.com](<https://www.example.com>)\, ok\?"
+        );
     }
 
     #[test]

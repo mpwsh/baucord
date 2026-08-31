@@ -7,17 +7,19 @@
 // hotkey manager (common on Wayland, some remote sessions, etc.) the
 // app runs without them instead of crashing at startup.
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
-use global_hotkey::{
-    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
-    hotkey::{Code, HotKey, Modifiers},
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Once, OnceLock},
 };
-use log::{info, warn};
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::{Once, OnceLock};
 
 use client::config::{BindableAction, Settings};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use global_hotkey::{
+    hotkey::{Code, HotKey, Modifiers},
+    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+};
+use log::{info, warn};
 
 /// Our own event channel. `GlobalHotKeyEvent::set_event_handler`
 /// *replaces* the crate's internal channel delivery, so the handler

@@ -7,16 +7,19 @@
 // `set_row_data`. Autoplay policy is unchanged: ~3 loops (≤30 s),
 // freeze to frame 0 (dropping the decoded frames), replay on hover.
 
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use app_core::{
+    gif::{self, GifAnimation},
+    images::{self, ImageError},
+};
+use i18n::t;
 use log::{info, warn};
 use slint::{ComponentHandle, Model};
-
-use app_core::gif::{self, GifAnimation};
-use app_core::images::{self, ImageError};
-use i18n::t;
 use ui::State;
 
 use crate::app::AppState;
@@ -297,10 +300,11 @@ pub fn paste_into_chat(app: &mut AppState) {
     // 1. Copied file (platform clipboards expose these differently —
     //    clipboard.rs handles each).
     if let Some(path) = crate::clipboard::clipboard_file()
-        && images::is_image_path(&path) {
-            attach_path(app, &path);
-            return;
-        }
+        && images::is_image_path(&path)
+    {
+        attach_path(app, &path);
+        return;
+    }
 
     // 2. Native image data (PNG from screenshots etc.).
     if let Some(png) = crate::clipboard::clipboard_png() {
@@ -407,8 +411,10 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     // of buffering hundreds of MB.
     // `.take` is std::io::Read's — fully qualified so it can't resolve
     // to Iterator::take on some future BodyReader.
-    let mut reader =
-        std::io::Read::take(resp.body_mut().as_reader(), client::MAX_CHAT_IMAGE_BYTES as u64 + 1);
+    let mut reader = std::io::Read::take(
+        resp.body_mut().as_reader(),
+        client::MAX_CHAT_IMAGE_BYTES as u64 + 1,
+    );
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut buf).map_err(|e| e.to_string())?;
     if buf.len() > client::MAX_CHAT_IMAGE_BYTES {
@@ -431,16 +437,18 @@ fn show_preview(app: &mut AppState, bytes: Vec<u8>) {
             s.set_preview_open(true);
 
             app.preview_gif = None;
-            if bytes.starts_with(b"GIF8") && images::gif_is_animated(&bytes)
+            if bytes.starts_with(b"GIF8")
+                && images::gif_is_animated(&bytes)
                 && let Ok(anim) = gif::decode_animation(&bytes)
-                    && !anim.frames.is_empty() {
-                        app.preview_gif = Some(crate::viewers::GalleryGif {
-                            anim: Rc::new(anim),
-                            idx: 0,
-                            in_frame_ms: 0.0,
-                        });
-                        app.ensure_gif_ticker();
-                    }
+                && !anim.frames.is_empty()
+            {
+                app.preview_gif = Some(crate::viewers::GalleryGif {
+                    anim: Rc::new(anim),
+                    idx: 0,
+                    in_frame_ms: 0.0,
+                });
+                app.ensure_gif_ticker();
+            }
 
             app.set_pending_preview(bytes);
         }

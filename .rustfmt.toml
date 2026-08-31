@@ -1,3 +1,45 @@
-reorder_imports = true
+# baucord workspace formatting.
+#
+# ── Status quo, measured 2026-08-31 ──────────────────────────────────────
+# The previous three-line config was a complete no-op on stable rustfmt:
+# `reorder_imports = true` is the default, and the two import options below
+# are nightly-only — stable prints "unstable features are only available in
+# nightly channel" and ignores them. The committed code confirms nothing was
+# ever applied (std imports sit after external ones in one flat block, e.g.
+# audio/src/encoder.rs). Measured against the pristine sources, the effective
+# formatting is plain default-2021 rustfmt to within ~127 small hand-noise
+# hunks across ~40 files; every width override tested scored worse:
+#
+#   default widths ................ 127 hunks of disagreement  ← best
+#   fn_call_width = 70 ............ 136
+#   style_edition = "2024" ........ 178
+#   use_small_heuristics = "Max" .. 233 (13-file sample)
+#
+# ── The import style this workspace wants ────────────────────────────────
+# Kept from the previous config. These require a nightly rustfmt to take
+# effect (the compiler stays stable — nightly is for `fmt` only):
+#
+#   cargo +nightly fmt --all              # format
+#   cargo +nightly fmt --all -- --check   # CI
+#
+# Pin the nightly in CI (e.g. a dated toolchain) so a rustfmt behavior
+# change can't break the check overnight. Applying these the first time
+# rewrites imports in ~25–30 of 54 files (std-first grouping + merging
+# per-crate use trees) — do that as one standalone normalization commit
+# together with the ~127 body hunks.
+#
+# If you'd rather stay 100 % stable instead: delete the next two lines
+# (killing the per-run warnings) and run plain `cargo fmt` — you lose only
+# the import grouping/merging, which was never in effect anyway.
 imports_granularity = "Crate"
 group_imports = "StdExternalCrate"
+
+# Stable, and the one setting that measurably matters: half the workspace is
+# edition 2024, and rustfmt would apply the 2024 *style rules* to those
+# crates by default — which disagree with this codebase 40 % more than the
+# 2021 rules (178 vs 127 hunks). Pinning keeps formatting identical across
+# the mixed-edition workspace and stable across future edition bumps.
+style_edition = "2021"
+
+# Dropped: `reorder_imports = true` (it is the default).
+

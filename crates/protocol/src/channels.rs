@@ -79,8 +79,7 @@ pub const PROTOCOL_HEADER: &str = "x-baucord-protocol";
 pub const OUTDATED_STATUS: u16 = 426;
 
 /// Body of the [`OUTDATED_STATUS`] response — user-facing.
-pub const OUTDATED_MESSAGE: &str =
-    "Client outdated — download the latest version from baucord.com";
+pub const OUTDATED_MESSAGE: &str = "Client outdated — download the latest version from baucord.com";
 
 // ── Channel IDs ─────────────────────────────────────────────────────────
 

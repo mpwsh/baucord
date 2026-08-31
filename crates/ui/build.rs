@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 fn main() {
     // `@lucide` resolves to lucide-slint's generated `lucide.slint`

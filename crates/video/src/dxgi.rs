@@ -31,27 +31,38 @@
 //! reported with `LastPresentTime == 0` and skipped (matching xcap) —
 //! callers seed the first picture from a screenshot.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex,
+    },
+    thread::JoinHandle,
+};
 
-use windows::Win32::Foundation::{HMODULE, LPARAM, RECT};
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+use windows::{
+    core::{Interface, BOOL},
+    Win32::{
+        Foundation::{HMODULE, LPARAM, RECT},
+        Graphics::{
+            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D11::{
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
+                ID3D11Texture2D, D3D11_BOX, D3D11_CPU_ACCESS_READ,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_SINGLETHREADED,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_STAGING,
+            },
+            Dxgi::{
+                Common::DXGI_FORMAT_B8G8R8A8_UNORM, IDXGIDevice, IDXGIOutput1,
+                IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT,
+                DXGI_OUTDUPL_FRAME_INFO,
+            },
+            Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
+        },
+        System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
+    },
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIDevice, IDXGIOutput1,
-    IDXGIOutputDuplication, IDXGIResource,
-};
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-use windows::core::{BOOL, Interface};
 
 use crate::CaptureError;
 
@@ -271,9 +282,8 @@ fn worker_loop(
                     continue;
                 }
 
-                let grabbed = unsafe {
-                    grab_frame(&_device, &context, &duplication, resource, &mut staging)
-                };
+                let grabbed =
+                    unsafe { grab_frame(&_device, &context, &duplication, resource, &mut staging) };
                 match grabbed {
                     Ok(Some(frame)) => {
                         shared.slot.lock().unwrap().push_back(frame);
@@ -358,7 +368,9 @@ unsafe fn grab_frame(
         let mut tex = None;
         unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut tex)) }?;
         let tex = tex.ok_or_else(|| {
-            GrabError::Windows(windows::core::Error::from_hresult(windows::core::HRESULT(-1)))
+            GrabError::Windows(windows::core::Error::from_hresult(windows::core::HRESULT(
+                -1,
+            )))
         })?;
         *staging = Some((tex, width, height));
     }
@@ -455,9 +467,7 @@ fn hmonitor_at(monitor_index: usize) -> Result<isize, CaptureError> {
 fn open_duplication(
     h_monitor_raw: isize,
 ) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication), CaptureError> {
-    let werr = |what: &str, e: windows::core::Error| {
-        CaptureError::Capture(format!("{what}: {e}"))
-    };
+    let werr = |what: &str, e: windows::core::Error| CaptureError::Capture(format!("{what}: {e}"));
     unsafe {
         let mut device = None;
         D3D11CreateDevice(
@@ -479,7 +489,9 @@ fn open_duplication(
             .GetImmediateContext()
             .map_err(|e| werr("GetImmediateContext", e))?;
         let dxgi_device: IDXGIDevice = device.cast().map_err(|e| werr("cast IDXGIDevice", e))?;
-        let adapter = dxgi_device.GetAdapter().map_err(|e| werr("GetAdapter", e))?;
+        let adapter = dxgi_device
+            .GetAdapter()
+            .map_err(|e| werr("GetAdapter", e))?;
 
         let mut output_index = 0u32;
         loop {

@@ -37,18 +37,25 @@
 //!
 //! Owns the Opus encoder exclusively — no shared mutex needed.
 
+use std::{
+    collections::VecDeque,
+    sync::{atomic::Ordering, Arc},
+    time::{Duration, Instant},
+};
+
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use log::{error, info, warn};
 use opus::{Application, Bitrate, Channels, Encoder};
-use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use crate::adapt::{Band, Decision, LinkSample, Profile, RateController, LADDER};
-use crate::transport::packet::{AudioPacket, PayloadType};
-use crate::transport::red;
-use crate::{stats::AudioStats, PcmFrame, FRAME_SIZE, OPUS_SAMPLE_RATE};
+use crate::{
+    adapt::{Band, Decision, LinkSample, Profile, RateController, LADDER},
+    stats::AudioStats,
+    transport::{
+        packet::{AudioPacket, PayloadType},
+        red,
+    },
+    PcmFrame, FRAME_SIZE, OPUS_SAMPLE_RATE,
+};
 
 /// Largest packet the encoder will ever produce: 40 ms at the top rate,
 /// with LBRR, plus two RED copies of the same. Generous.
@@ -131,7 +138,10 @@ impl EncoderWorker {
         // Every ctl is checked: a silently ignored setting (FEC off,
         // wrong bandwidth) is exactly the kind of thing that costs a
         // week in the field.
-        ctl("set_bitrate", encoder.set_bitrate(Bitrate::Bits(profile.bitrate)));
+        ctl(
+            "set_bitrate",
+            encoder.set_bitrate(Bitrate::Bits(profile.bitrate)),
+        );
         ctl("set_vbr", encoder.set_vbr(true));
         // Complexity 7 — and not lower. libopus only runs its tonality /
         // activity analysis at complexity >= 7 (opus_encoder.c, float
@@ -142,7 +152,10 @@ impl EncoderWorker {
         // and nothing else. 10 buys nothing audible over 7 for speech at
         // this bitrate; `last_encode_us` is the knob if that ever changes.
         ctl("set_complexity", encoder.set_complexity(7));
-        ctl("set_bandwidth", encoder.set_bandwidth(opus_band(profile.band)));
+        ctl(
+            "set_bandwidth",
+            encoder.set_bandwidth(opus_band(profile.band)),
+        );
         ctl("set_inband_fec", encoder.set_inband_fec(true));
         ctl(
             "set_packet_loss_perc",
@@ -272,21 +285,21 @@ impl EncoderWorker {
         }
 
         let primary = &self.scratch[..size];
-        let (payload_type, wire_bytes): (PayloadType, usize) = if self.red && !self.history.is_empty()
-        {
-            // Copies of the preceding transmitted packets, oldest first,
-            // with their media offset from this packet. Contiguity is
-            // guaranteed: `history` is cleared on every DTX gap.
-            let blocks: Vec<(u32, &[u8])> = self
-                .history
-                .iter()
-                .map(|(ts, data)| (packet_ts.wrapping_sub(*ts), data.as_slice()))
-                .collect();
-            red::encode(primary, &blocks, &mut self.bundle);
-            (PayloadType::Red, self.bundle.len())
-        } else {
-            (PayloadType::Opus, size)
-        };
+        let (payload_type, wire_bytes): (PayloadType, usize) =
+            if self.red && !self.history.is_empty() {
+                // Copies of the preceding transmitted packets, oldest first,
+                // with their media offset from this packet. Contiguity is
+                // guaranteed: `history` is cleared on every DTX gap.
+                let blocks: Vec<(u32, &[u8])> = self
+                    .history
+                    .iter()
+                    .map(|(ts, data)| (packet_ts.wrapping_sub(*ts), data.as_slice()))
+                    .collect();
+                red::encode(primary, &blocks, &mut self.bundle);
+                (PayloadType::Red, self.bundle.len())
+            } else {
+                (PayloadType::Opus, size)
+            };
 
         let payload = match payload_type {
             PayloadType::Red => self.bundle.clone(),
@@ -319,8 +332,14 @@ impl EncoderWorker {
     /// Apply a controller decision at a packet boundary.
     fn apply(&mut self, d: Decision) {
         if d.profile != self.profile {
-            ctl("set_bitrate", self.encoder.set_bitrate(Bitrate::Bits(d.profile.bitrate)));
-            ctl("set_bandwidth", self.encoder.set_bandwidth(opus_band(d.profile.band)));
+            ctl(
+                "set_bitrate",
+                self.encoder.set_bitrate(Bitrate::Bits(d.profile.bitrate)),
+            );
+            ctl(
+                "set_bandwidth",
+                self.encoder.set_bandwidth(opus_band(d.profile.band)),
+            );
             self.profile = d.profile;
         }
         if d.red != self.red {
@@ -362,8 +381,8 @@ impl EncoderWorker {
         // for two minutes after the transport stopped reporting.
         let uplink: Option<i32> = {
             let updated_ms = self.stats.uplink_loss_updated_ms.load(Ordering::Relaxed);
-            let now_ms = u64::try_from(self.stats.start_time.elapsed().as_millis())
-                .unwrap_or(u64::MAX);
+            let now_ms =
+                u64::try_from(self.stats.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
             let fresh = updated_ms != 0 && now_ms.saturating_sub(updated_ms) <= UPLINK_STALE_MS;
             // Stored value is already clamped to 0..=100 by the setter;
             // try_from keeps the cast lint-free without an unwrap.
@@ -429,8 +448,6 @@ impl EncoderWorker {
             }
         }
     }
-
-
 
     /// Downlink loss over the frames since the previous call, as a whole
     /// percentage. `None` when the window held too few packets to mean

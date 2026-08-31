@@ -23,33 +23,39 @@
 //
 // Speaking state is driven by voice events, not inferred from packet flow.
 
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::rc::{Rc, Weak};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    rc::{Rc, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
-use log::{info, warn};
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
-
+use app_core::{
+    chat::ChatHistory,
+    roster::{self, ChannelMeta, PeerAudio, UserState},
+};
+use audio::{PeerAudioSettings, SoundType};
 use client::{
-    config::{BindableAction, Settings, peer_key},
+    config::{peer_key, BindableAction, Settings},
     network::{NetworkControl, NetworkMessage, NetworkThreadHandle},
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
 };
-
-use app_core::chat::ChatHistory;
-use app_core::roster::{self, ChannelMeta, PeerAudio, UserState};
-use audio::{PeerAudioSettings, SoundType};
 use i18n::t;
+use log::{info, warn};
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use ui::{ChatRow, Logic, MainWindow, Phase, State, Tr, UserRow};
 
-use crate::hotkeys::HotkeyManager;
-use crate::media::{self, GifPlayer};
-use crate::viewers::Viewer;
+use crate::{
+    hotkeys::HotkeyManager,
+    media::{self, GifPlayer},
+    viewers::Viewer,
+};
 
 /// Compiled-in version of this binary.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -366,7 +372,11 @@ pub fn run() {
     start_timers(&state);
     crate::updater::spawn_version_check();
 
-    state.borrow().main.show().expect("failed to show the main window");
+    state
+        .borrow()
+        .main
+        .show()
+        .expect("failed to show the main window");
     {
         let weak = state.borrow().main.as_weak();
         let armed = state.borrow().main_repaint_arm.clone();
@@ -500,10 +510,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, |app| {
             if let Some(id) = app.user_id_at(index) {
                 let username = app.username_of(id);
-                let muted = app
-                    .users
-                    .get(&id)
-                    .is_some_and(|u| u.audio.is_muted);
+                let muted = app.users.get(&id).is_some_and(|u| u.audio.is_muted);
                 app.handle_mute_user(id, &username, !muted);
                 app.main.global::<State>().set_user_popup_open(false);
             }
@@ -734,9 +741,10 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_update_install(move || {
         with_app(&w, |app| {
             if let Some(path) = app.update_zip_path.clone()
-                && let Err(e) = crate::updater::extract_and_install(&path) {
-                    app.show_error(&e);
-                }
+                && let Err(e) = crate::updater::extract_and_install(&path)
+            {
+                app.show_error(&e);
+            }
         });
     });
 
@@ -786,16 +794,14 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 ///   flipping at the `show()` call itself fires before the OS maps
 ///   and clears the real surface. The first paint of the fresh
 ///   surface is the exact right moment.
-pub fn repaint_on_reveal(
-    win: &slint::Window,
-    armed: Rc<Cell<bool>>,
-    flip: impl Fn() + 'static,
-) {
+pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl Fn() + 'static) {
     use i_slint_backend_winit::WinitWindowAccessor;
     win.on_winit_window_event(move |_w, ev| {
         use i_slint_backend_winit::winit::event::WindowEvent;
-        let reveal = matches!(ev, WindowEvent::Focused(true) | WindowEvent::Occluded(false))
-            || (matches!(ev, WindowEvent::RedrawRequested) && armed.take());
+        let reveal = matches!(
+            ev,
+            WindowEvent::Focused(true) | WindowEvent::Occluded(false)
+        ) || (matches!(ev, WindowEvent::RedrawRequested) && armed.take());
         if reveal {
             flip();
         }
@@ -938,8 +944,7 @@ impl AppState {
     fn present_frame(&mut self, f: crate::present::PreparedFrame) {
         let present_at = Instant::now();
         let net_to_decode_ms = f.decoded_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
-        let decode_to_present_ms =
-            present_at.duration_since(f.decoded_at).as_secs_f32() * 1000.0;
+        let decode_to_present_ms = present_at.duration_since(f.decoded_at).as_secs_f32() * 1000.0;
         let total_ms = present_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
         if total_ms > 25.0 {
             warn!(
@@ -992,9 +997,7 @@ impl AppState {
                                         // Timer removes itself by
                                         // dropping out of the vec on
                                         // the next share start.
-                                        app.main
-                                            .global::<State>()
-                                            .set_stream_stats("".into());
+                                        app.main.global::<State>().set_stream_stats("".into());
                                     });
                                 }
                             },
@@ -1034,7 +1037,9 @@ impl AppState {
             ScreenEvent::PeerStoppedSharing { client_id } => {
                 let username = self.username_of(client_id);
                 info!("{username} stopped sharing");
-                self.push_chat_system(&t!("chat-peer-stopped-sharing", "name" => username.as_str()));
+                self.push_chat_system(
+                    &t!("chat-peer-stopped-sharing", "name" => username.as_str()),
+                );
                 if let Some(viewer) = self.viewers.remove(&client_id) {
                     viewer.close();
                 }
@@ -1119,9 +1124,7 @@ impl AppState {
                 if pct >= 100 {
                     s.set_upload_line("".into());
                 } else {
-                    s.set_upload_line(
-                        t!("chat-upload-progress", "pct" => u32::from(pct)).into(),
-                    );
+                    s.set_upload_line(t!("chat-upload-progress", "pct" => u32::from(pct)).into());
                 }
             }
             NetworkMessage::ImageMessage { username, data } => {
@@ -1181,10 +1184,7 @@ impl AppState {
                     viewer.close();
                 }
                 let username = self.username_of(target_id);
-                self.push_chat_system(&format!(
-                    "Can't watch {username}: {}",
-                    reason.describe()
-                ));
+                self.push_chat_system(&format!("Can't watch {username}: {}", reason.describe()));
             }
             NetworkMessage::ScreenShareStarted {
                 client_id,
@@ -1583,7 +1583,11 @@ impl AppState {
             self.main.global::<State>().set_channel_prompt_open(false);
             return;
         };
-        let password = self.main.global::<State>().get_channel_password().to_string();
+        let password = self
+            .main
+            .global::<State>()
+            .get_channel_password()
+            .to_string();
         if password.is_empty() {
             return;
         }
@@ -1683,9 +1687,7 @@ impl AppState {
 
     fn handle_disconnect(&mut self) {
         self.network.tx.send(NetworkControl::Disconnect).ok();
-        self.push_chat_system(
-            &t!("chat-disconnected", "reason" => t!("disconnect-reason-user")),
-        );
+        self.push_chat_system(&t!("chat-disconnected", "reason" => t!("disconnect-reason-user")));
         self.teardown_connection();
         self.show_connect_phase();
     }
@@ -1745,8 +1747,7 @@ impl AppState {
         // when Baucord itself is focused (which covers the in-app
         // share button — clicking it focuses us) or when focus can't
         // be determined (never start a stream on a guess).
-        let baucord_focused = video::capture::focused_pid()
-            .map(|pid| pid == std::process::id());
+        let baucord_focused = video::capture::focused_pid().map(|pid| pid == std::process::id());
         match baucord_focused {
             Some(false) => self.start_share_with_saved(),
             _ => self.open_share_dialog(),
@@ -1763,8 +1764,8 @@ impl AppState {
             return;
         }
         let monitor_index = self.saved_or_primary_monitor(&monitors);
-        let quality = video::Quality::from_key(&self.settings.share.quality)
-            .unwrap_or(video::Quality::FHD30);
+        let quality =
+            video::Quality::from_key(&self.settings.share.quality).unwrap_or(video::Quality::FHD30);
         let everyone = self.settings.share.everyone;
         log::info!(
             "share hotkey pressed outside Baucord — starting immediately with saved \
@@ -1807,8 +1808,8 @@ impl AppState {
             .map(|q| q.to_string().into())
             .collect();
         let default_monitor = self.saved_or_primary_monitor(&monitors);
-        let saved_quality = video::Quality::from_key(&self.settings.share.quality)
-            .unwrap_or(video::Quality::FHD30);
+        let saved_quality =
+            video::Quality::from_key(&self.settings.share.quality).unwrap_or(video::Quality::FHD30);
         let default_q = video::Quality::ALL
             .iter()
             .position(|q| *q == saved_quality)
@@ -1868,9 +1869,8 @@ impl AppState {
     fn send_current_message(&mut self) {
         let s = self.main.global::<State>();
         let raw = s.get_draft().to_string();
-        let rendered = app_core::emoji::replace_shortcodes(
-            &app_core::chat::scrub_control_chars(raw.trim()),
-        );
+        let rendered =
+            app_core::emoji::replace_shortcodes(&app_core::chat::scrub_control_chars(raw.trim()));
         let text: String = rendered
             .chars()
             .take(app_core::chat::MAX_MESSAGE_CHARS)
@@ -1878,10 +1878,7 @@ impl AppState {
         if text.is_empty() {
             return;
         }
-        self.network
-            .tx
-            .send(NetworkControl::SendMessage(text))
-            .ok();
+        self.network.tx.send(NetworkControl::SendMessage(text)).ok();
         s.set_draft("".into());
         self.main.invoke_focus_composer();
     }
@@ -1900,8 +1897,10 @@ impl AppState {
     }
 
     pub fn username_of(&self, client_id: u64) -> String {
-        self.users
-            .get(&client_id).map_or_else(|| t!("fallback-username", "id" => client_id.to_string()), |u| u.username.clone())
+        self.users.get(&client_id).map_or_else(
+            || t!("fallback-username", "id" => client_id.to_string()),
+            |u| u.username.clone(),
+        )
     }
 
     fn open_user_popup(&mut self, index: i32) {
@@ -2007,9 +2006,7 @@ impl AppState {
                                 target_id: client_id,
                             })
                             .ok();
-                        app.push_chat_system(
-                            &t!("chat-watching", "name" => username.as_str()),
-                        );
+                        app.push_chat_system(&t!("chat-watching", "name" => username.as_str()));
                         info!("Viewer open + subscribed to {client_id}");
                     }
                     Err(e) => {
@@ -2113,10 +2110,7 @@ impl AppState {
             // so when that device changes the capture stream dies too.
             // Restart it if a screen share is currently active.
             if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                self.screen
-                    .tx
-                    .send(ScreenControl::RestartSystemAudio)
-                    .ok();
+                self.screen.tx.send(ScreenControl::RestartSystemAudio).ok();
             }
         }
 
@@ -2156,7 +2150,10 @@ impl AppState {
 
     pub fn set_input_device(&mut self, device: Option<String>) {
         self.settings.audio.input.device.clone_from(&device);
-        self.voice.tx.send(VoiceControl::SetInputDevice(device)).ok();
+        self.voice
+            .tx
+            .send(VoiceControl::SetInputDevice(device))
+            .ok();
         self.refresh_device_warning();
     }
 
@@ -2173,7 +2170,12 @@ impl AppState {
         &self.voice.tx
     }
 
-    pub fn voice_levels(&self) -> (Arc<std::sync::atomic::AtomicU32>, Arc<std::sync::atomic::AtomicU32>) {
+    pub fn voice_levels(
+        &self,
+    ) -> (
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
         (
             self.voice.shared.output_level.clone(),
             self.voice.shared.denoised_level.clone(),
@@ -2347,11 +2349,12 @@ impl AppState {
         for (row_id, image) in restores {
             for i in 0..self.chat_model.row_count() {
                 if let Some(mut row) = self.chat_model.row_data(i)
-                    && row.row_id == row_id {
-                        row.image = image.clone();
-                        self.chat_model.set_row_data(i, row);
-                        break;
-                    }
+                    && row.row_id == row_id
+                {
+                    row.image = image.clone();
+                    self.chat_model.set_row_data(i, row);
+                    break;
+                }
             }
         }
         self.preview_gif = None;
@@ -2434,14 +2437,14 @@ impl AppState {
         for (row_id, image) in blits {
             for i in 0..self.chat_model.row_count() {
                 if let Some(mut row) = self.chat_model.row_data(i)
-                    && row.row_id == row_id {
-                        row.image = image.clone();
-                        self.chat_model.set_row_data(i, row);
-                        break;
-                    }
+                    && row.row_id == row_id
+                {
+                    row.image = image.clone();
+                    self.chat_model.set_row_data(i, row);
+                    break;
+                }
             }
         }
-
 
         if let Some(g) = &mut self.gallery_gif {
             any_playing = true;
@@ -2502,7 +2505,7 @@ impl AppState {
         kbps_up: f64,
         kbps_down: f64,
     ) {
-        use app_core::stats::{LatencyGrade, latency_grade, net_str};
+        use app_core::stats::{latency_grade, net_str, LatencyGrade};
         let s = self.main.global::<State>();
         s.set_status_text(format!("●  {}", t!("status-connected")).into());
         s.set_status_color(match latency_grade(rtt_ms) {
@@ -2596,8 +2599,8 @@ impl AppState {
         if let Some(proc) = self.sys.process(pid) {
             // cpu_usage() is % of one core; normalize to % of the whole
             // machine (task-manager style).
-            let cores = std::thread::available_parallelism()
-                .map_or(1, std::num::NonZero::get) as f32;
+            let cores =
+                std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as f32;
             let cpu_pct = proc.cpu_usage() / cores;
             // Memory: the platform-native figure (what the user's own
             // task monitor shows), with sysinfo's RSS as the fallback.
@@ -2631,9 +2634,7 @@ impl AppState {
     }
 
     pub fn show_error(&mut self, error: &str) {
-        self.main
-            .global::<State>()
-            .set_error_text(error.into());
+        self.main.global::<State>().set_error_text(error.into());
         let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
         if let Some(weak) = weak {
             self.error_timer.start(
@@ -2907,10 +2908,10 @@ pub mod tray {
     //! — no cross-thread event hop like the old `tray-icon` crate,
     //! and a visible tray icon by itself keeps
     //! `run_event_loop_until_quit` alive.
+    use i18n::t;
     use log::warn;
 
     use super::{with_current, AppState};
-    use i18n::t;
 
     thread_local! {
         /// Keeps the OS tray item alive for the app's lifetime —
