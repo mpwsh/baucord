@@ -40,6 +40,13 @@ pub struct AudioStats {
     /// packets while the downlink is clean needs this to get any FEC at
     /// all. See [`crate::VoiceChat::set_uplink_loss_pct`].
     pub uplink_loss_pct: AtomicU32,
+    /// When [`Self::uplink_loss_pct`] was last written, in milliseconds
+    /// since [`Self::start_time`] (0 = never). Consumers must treat a
+    /// value older than their staleness bound as unknown rather than
+    /// current — the transport stops refreshing it when it has nothing
+    /// trustworthy to say, and a latched reading once pinned the rate
+    /// controller for minutes (2026-08-30 00:17 incident).
+    pub uplink_loss_updated_ms: AtomicU64,
     /// The packet-loss hint most recently applied to the Opus encoder
     /// (0–100). Diagnostic: lets the overlay show whether FEC is armed.
     pub fec_loss_hint_pct: AtomicU32,
@@ -145,6 +152,7 @@ impl AudioStats {
             fec_recoveries: AtomicU64::new(0),
             plc_frames: AtomicU64::new(0),
             uplink_loss_pct: AtomicU32::new(0),
+            uplink_loss_updated_ms: AtomicU64::new(0),
             fec_loss_hint_pct: AtomicU32::new(0),
             input_overruns: AtomicU64::new(0),
             output_underruns: AtomicU64::new(0),

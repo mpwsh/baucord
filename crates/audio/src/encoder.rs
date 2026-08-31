@@ -37,13 +37,13 @@
 //!
 //! Owns the Opus encoder exclusively — no shared mutex needed.
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use log::{error, info, warn};
 use opus::{Application, Bitrate, Channels, Encoder};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::adapt::{Band, Decision, LinkSample, Profile, RateController, LADDER};
 use crate::transport::packet::{AudioPacket, PayloadType};
@@ -87,8 +87,14 @@ struct EncoderWorker {
 
     // ── Adaptation ──────────────────────────────────────────────────
     controller: RateController,
-    /// Packets encoded since last adaptation check.
-    frames_since_update: u32,
+    /// Wall-clock time of the last adaptation evaluation. Wall clock and
+    /// not frame count on purpose: mute stops the frame flow entirely
+    /// (input.rs discards while muted), and a frame-counted tick froze
+    /// the controller — and everything downstream of it — at whatever
+    /// state the last frame left it in. Field case, 2026-08-30 00:16:
+    /// twelve minutes muted through a 60 % loss storm at 48 kbps, then
+    /// three ticks after unmuting, 12 kbps mid-sentence.
+    last_adapt: Instant,
     /// Loss-counter snapshots from the previous update, so the hint
     /// tracks the *recent* loss rate instead of the lifetime average.
     prev_received: u64,
@@ -164,7 +170,7 @@ impl EncoderWorker {
             red: false,
             history: VecDeque::with_capacity(red::MAX_BLOCKS + 1),
             controller: RateController::new(),
-            frames_since_update: 0,
+            last_adapt: Instant::now(),
             prev_received: 0,
             prev_lost: 0,
             current_fec_hint: FEC_LOSS_FLOOR_PCT,
@@ -191,8 +197,17 @@ impl EncoderWorker {
         let _rt = crate::platform::promote_current_thread(FRAME_SIZE as u32, OPUS_SAMPLE_RATE);
         info!("Encoder thread started");
 
-        while let Ok(samples) = self.rx.recv() {
-            self.push_frame(&samples);
+        loop {
+            // Bounded wait instead of a blocking recv: while muted the
+            // input pipeline sends nothing, and the adaptation tick must
+            // keep running so the rate controller can keep evaluating —
+            // and recovering — with no frames flowing. Four wakeups a
+            // second on an idle channel is noise, CPU-wise.
+            match self.rx.recv_timeout(RECV_TICK) {
+                Ok(samples) => self.push_frame(&samples),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
             self.maybe_adapt();
         }
 
@@ -334,29 +349,44 @@ impl EncoderWorker {
     /// disables in-band FEC outright, and the first seconds of every loss
     /// episode would then go unprotected until the next window closes.
     fn maybe_adapt(&mut self) {
-        self.frames_since_update += 1;
-        if self.frames_since_update < FEC_UPDATE_INTERVAL_FRAMES {
+        if self.last_adapt.elapsed() < ADAPT_INTERVAL {
             return;
         }
-        self.frames_since_update = 0;
+        self.last_adapt = Instant::now();
 
         let downlink = self.downlink_loss_pct_since_last_update();
-        // Stored value is already clamped to 0..=100 by the setter;
-        // try_from keeps the cast lint-free without an unwrap.
-        let uplink = i32::try_from(self.stats.uplink_loss_pct.load(Ordering::Relaxed))
-            .unwrap_or(FEC_LOSS_CEIL_PCT);
+        // The transport-fed uplink loss carries a freshness timestamp
+        // (see `AudioStats::uplink_loss_updated_ms`): a value nobody has
+        // refreshed within UPLINK_STALE_MS is *unknown*, not still true.
+        // Field case, 2026-08-30 00:17: a 38 % reading latched verbatim
+        // for two minutes after the transport stopped reporting.
+        let uplink: Option<i32> = {
+            let updated_ms = self.stats.uplink_loss_updated_ms.load(Ordering::Relaxed);
+            let now_ms = u64::try_from(self.stats.start_time.elapsed().as_millis())
+                .unwrap_or(u64::MAX);
+            let fresh = updated_ms != 0 && now_ms.saturating_sub(updated_ms) <= UPLINK_STALE_MS;
+            // Stored value is already clamped to 0..=100 by the setter;
+            // try_from keeps the cast lint-free without an unwrap.
+            fresh.then(|| {
+                i32::try_from(self.stats.uplink_loss_pct.load(Ordering::Relaxed))
+                    .unwrap_or(FEC_LOSS_CEIL_PCT)
+            })
+        };
 
         let fec_hint = downlink
             .unwrap_or(0)
-            .max(uplink)
+            .max(uplink.unwrap_or(0))
             .clamp(FEC_LOSS_FLOOR_PCT, FEC_LOSS_CEIL_PCT);
 
         if fec_hint != self.current_fec_hint {
             match self.encoder.set_packet_loss_perc(fec_hint) {
                 Ok(()) => {
                     info!(
-                        "Opus FEC hint {}% → {}% (downlink {:?}%, uplink {uplink}%)",
-                        self.current_fec_hint, fec_hint, downlink
+                        "Opus FEC hint {}% → {}% (downlink {:?}%, uplink {})",
+                        self.current_fec_hint,
+                        fec_hint,
+                        downlink,
+                        fmt_uplink(uplink),
                     );
                     self.current_fec_hint = fec_hint;
                     self.stats
@@ -371,23 +401,36 @@ impl EncoderWorker {
         let rtt = self.stats.link_rtt_ms.load(Ordering::Relaxed);
         #[allow(clippy::cast_precision_loss)] // small percentages / ms
         let sample = LinkSample {
-            uplink_loss_pct: uplink.max(0) as f32,
+            uplink_loss_pct: uplink.map(|u| u.max(0) as f32),
             rtt_ms: (rtt > 0).then_some(rtt as f32),
         };
         let decision = self.controller.evaluate(sample);
         if decision.changed {
             info!(
-                "Rate control: {} kbps {:?} {} ms frames, RED {} (uplink {uplink}%, rtt {rtt} ms)",
+                "Rate control: {} kbps {:?} {} ms frames, RED {} (uplink {}, smoothed {:.0}%, rtt {rtt} ms)",
                 decision.profile.bitrate / 1000,
                 decision.profile.band,
                 decision.profile.frame_ms,
-                if decision.red { "on" } else { "off" }
+                if decision.red { "on" } else { "off" },
+                fmt_uplink(uplink),
+                self.controller.smoothed_loss_pct(),
             );
             // Frame-length changes wait for a packet boundary; everything
             // else could apply now but is simpler to apply together.
             self.pending = Some(decision);
         }
+        // A packet boundary is also "no packet in progress": while muted
+        // or silent the accumulator is empty, and applying here keeps the
+        // encoder ctls and published stats truthful during the gap
+        // instead of deferring to the first frame after unmute.
+        if self.accum.is_empty() {
+            if let Some(d) = self.pending.take() {
+                self.apply(d);
+            }
+        }
     }
+
+
 
     /// Downlink loss over the frames since the previous call, as a whole
     /// percentage. `None` when the window held too few packets to mean
@@ -409,9 +452,31 @@ impl EncoderWorker {
     }
 }
 
-/// Pipeline frames between adaptation checks (~2 s at 20 ms frames; DTX
-/// frames count too, so this is wall-clock, not speech time).
-const FEC_UPDATE_INTERVAL_FRAMES: u32 = 100;
+/// Wall-clock interval between adaptation evaluations. The rate
+/// controller's dwell and climb holds (adapt.rs) are counted in
+/// evaluations and sized against this cadence and renet's 6 s loss
+/// window — change one, revisit the others.
+const ADAPT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Bounded wait on the frame channel, so the adaptation tick runs even
+/// when the input pipeline is silent (muted). Frames normally arrive
+/// every 20 ms; this only bounds the idle case.
+const RECV_TICK: Duration = Duration::from_millis(250);
+
+/// An uplink-loss reading older than this is treated as unknown rather
+/// than current (`LinkSample.uplink_loss_pct = None`): the smoothed
+/// estimate then decays instead of acting on a latched value. Sized to
+/// a few transport sampling periods (~2 s each).
+const UPLINK_STALE_MS: u64 = 10_000;
+
+/// Display helper: the uplink reading, or "stale" when there is no
+/// fresh one, so incident logs distinguish "0 % loss" from "no data".
+fn fmt_uplink(uplink: Option<i32>) -> String {
+    match uplink {
+        Some(v) => format!("{v}%"),
+        None => "stale".to_owned(),
+    }
+}
 
 /// Below this many packets in a window the downlink loss ratio is noise.
 const FEC_MIN_WINDOW_PACKETS: u64 = 50;

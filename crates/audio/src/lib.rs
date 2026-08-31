@@ -420,9 +420,13 @@ impl VoiceChat {
     /// from loss we *observe* on received streams, which says nothing
     /// about what listeners hear when our own uplink is the lossy leg.
     /// Callers should feed the transport's ack-derived loss estimate
-    /// here whenever it refreshes (every couple of seconds is plenty);
-    /// values the transport can't measure reliably (idle link, huge
-    /// implausible readings) should be withheld rather than passed.
+    /// here whenever it refreshes (every couple of seconds is plenty).
+    /// Prefer *clamping* an extreme reading over withholding it: each
+    /// write also refreshes a staleness timestamp, and a value nobody
+    /// refreshes for ~10 s is treated as unknown by the encoder's rate
+    /// controller (the estimate decays instead of latching). Withholding
+    /// during a bad stretch therefore reads as "no data", not "no loss"
+    /// — safe, but blind.
     /// Round-trip time to the server/peer as the transport measures it,
     /// in milliseconds. Feeds the rate controller's congestion detector
     /// (loss *with* RTT inflation = queues filling = send fewer bytes,
@@ -436,6 +440,13 @@ impl VoiceChat {
         self.stats
             .uplink_loss_pct
             .store(loss_pct.min(100), Ordering::Relaxed);
+        // Freshness stamp for the consumer-side staleness check; `max(1)`
+        // keeps 0 reserved for "never written".
+        let now_ms =
+            u64::try_from(self.stats.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.stats
+            .uplink_loss_updated_ms
+            .store(now_ms.max(1), Ordering::Relaxed);
     }
 
     pub fn set_noise_suppression(&self, enabled: bool) {

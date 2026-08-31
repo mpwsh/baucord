@@ -4,7 +4,7 @@
 // Ported from the FLTK `ui/splash.rs` + `ui/update.rs`; URL building
 // and version comparison live in app-core, the side effects stay here.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -18,11 +18,17 @@ use ui::State;
 
 use crate::app::{self, CURRENT_VERSION};
 
-/// The main executable filename inside the update zip.
-const MAIN_EXE: &str = "baucord.exe";
+/// Executable file stems inside the update zip. The release archives
+/// use the target's native naming, so the real filename is the stem
+/// plus [`std::env::consts::EXE_SUFFIX`] — `baucord.exe` on Windows,
+/// `baucord` on Linux and macOS (see [`exe_name`]).
+const MAIN_EXE_STEM: &str = "baucord";
+const COMPANION_EXE_STEM: &str = "dedicated-server";
 
-/// The companion executable filename inside the update zip.
-const COMPANION_EXE: &str = "dedicated-server.exe";
+/// Platform-native executable filename for a stem.
+fn exe_name(stem: &str) -> String {
+    format!("{stem}{}", std::env::consts::EXE_SUFFIX)
+}
 
 // ── Version check (startup) ─────────────────────────────────────────────
 
@@ -235,17 +241,25 @@ fn download_zip(
 /// and ends in `process::exit`.
 ///
 /// Steps:
-/// 1. Extract zip contents to a staging dir next to the exe.
-/// 2. `self_replace` the running binary.
-/// 3. `fs::copy` the companion binary.
-/// 4. Clean up the zip and staging dir.
-/// 5. Spawn the new executable and exit.
+/// 1. Extract root-level zip entries to a staging dir next to the exe.
+/// 2. Make sure both staged binaries carry the exec bit (Unix).
+/// 3. `self_replace` the running binary.
+/// 4. `fs::copy` the companion binary.
+/// 5. Clean up the zip and staging dir.
+/// 6. Spawn the new executable and exit.
 pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
     let zip_path = PathBuf::from(zip_path);
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Resolve our own path ONCE, before the swap. On Linux
+    // `current_exe()` reads `/proc/self/exe`, which turns into
+    // `…/baucord (deleted)` the moment self_replace renames the new
+    // file over the running inode — relaunching from a second lookup
+    // would spawn a path that no longer exists.
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Failed to locate current exe: {e}"))?;
+    let exe_dir = current_exe
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
 
     let extract_dir = exe_dir.join(".baucord-update-staging");
 
@@ -254,35 +268,41 @@ pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
         let _ = std::fs::remove_dir_all(&extract_dir);
     }
 
-    extract_zip(&zip_path, &extract_dir)?;
+    let extracted = extract_zip(&zip_path, &extract_dir)?;
 
     // Locate the extracted main binary
-    let new_main_exe = extract_dir.join(MAIN_EXE);
+    let main_exe = exe_name(MAIN_EXE_STEM);
+    let new_main_exe = extract_dir.join(&main_exe);
     if !new_main_exe.exists() {
         cleanup_staging(&zip_path, &extract_dir);
-        return Err(format!("{MAIN_EXE} not found in update zip"));
+        let listing = if extracted.is_empty() { "none".to_string() } else { extracted.join(", ") };
+        return Err(format!("{main_exe} not found in update zip (root-level entries: {listing})"));
     }
+
+    // Zips built on Windows carry no Unix mode bits, so the staged
+    // files may be 0644. self_replace re-applies the running binary's
+    // permissions itself, but the companion is a plain fs::copy — and
+    // fs::copy carries the *source* mode — so fix both up front.
+    ensure_executable(&new_main_exe)?;
 
     // Replace the running executable via self_replace
     self_replace::self_replace(&new_main_exe)
-        .map_err(|e| format!("Failed to replace {MAIN_EXE}: {e}"))?;
+        .map_err(|e| format!("Failed to replace {main_exe}: {e}"))?;
 
-    info!("Replaced {MAIN_EXE} via self_replace");
+    info!("Replaced {main_exe} via self_replace");
 
     // Copy the companion executable (not locked — plain overwrite)
-    let new_companion = extract_dir.join(COMPANION_EXE);
+    let companion_exe = exe_name(COMPANION_EXE_STEM);
+    let new_companion = extract_dir.join(&companion_exe);
     if new_companion.exists() {
-        let dest_companion = exe_dir.join(COMPANION_EXE);
+        ensure_executable(&new_companion)?;
+        let dest_companion = exe_dir.join(&companion_exe);
         std::fs::copy(&new_companion, &dest_companion)
-            .map_err(|e| format!("Failed to copy {COMPANION_EXE}: {e}"))?;
-        info!("Copied {COMPANION_EXE}");
+            .map_err(|e| format!("Failed to copy {companion_exe}: {e}"))?;
+        info!("Copied {companion_exe}");
     }
 
     cleanup_staging(&zip_path, &extract_dir);
-
-    // Spawn the new binary and exit
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Failed to locate current exe: {e}"))?;
 
     info!("Relaunching {}", current_exe.display());
 
@@ -296,8 +316,10 @@ pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
     std::process::exit(0);
 }
 
-/// Extract a zip file into the given directory.
-fn extract_zip(zip_path: &PathBuf, dest_dir: &PathBuf) -> Result<(), String> {
+/// Extract a zip file's root-level files into the given directory,
+/// preserving Unix mode bits where the archive recorded them. Returns
+/// the extracted filenames (for the "not found" diagnostic).
+fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("Failed to open {}: {e}", zip_path.display()))?;
 
@@ -305,6 +327,8 @@ fn extract_zip(zip_path: &PathBuf, dest_dir: &PathBuf) -> Result<(), String> {
         zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip: {e}"))?;
 
     std::fs::create_dir_all(dest_dir).map_err(|e| format!("Failed to create staging dir: {e}"))?;
+
+    let mut extracted = Vec::new();
 
     for i in 0..archive.len() {
         let mut entry = archive
@@ -333,14 +357,52 @@ fn extract_zip(zip_path: &PathBuf, dest_dir: &PathBuf) -> Result<(), String> {
         std::io::copy(&mut entry, &mut out_file)
             .map_err(|e| format!("Failed to extract {}: {e}", out_path.display()))?;
 
+        apply_unix_mode(&out_path, entry.unix_mode())?;
+
         info!("Extracted: {}", out_path.display());
+        extracted.push(name.to_string_lossy().into_owned());
     }
 
+    Ok(extracted)
+}
+
+/// Apply the mode bits a zip entry recorded, if any (archives built on
+/// Windows have none).
+#[cfg(unix)]
+fn apply_unix_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mode) = mode else {
+        return Ok(());
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+        .map_err(|e| format!("Failed to set mode on {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn apply_unix_mode(_path: &Path, _mode: Option<u32>) -> Result<(), String> {
+    Ok(())
+}
+
+/// Make a staged binary runnable regardless of what the archive said:
+/// owner rwx, group/other rx, on top of whatever is already set.
+#[cfg(unix)]
+fn ensure_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to stat {}: {e}", path.display()))?
+        .permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms)
+        .map_err(|e| format!("Failed to make {} executable: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
 /// Best-effort cleanup of the zip and staging directory.
-fn cleanup_staging(zip_path: &PathBuf, extract_dir: &PathBuf) {
+fn cleanup_staging(zip_path: &Path, extract_dir: &Path) {
     if let Err(e) = std::fs::remove_dir_all(extract_dir) {
         error!("Failed to clean staging dir: {e}");
     }

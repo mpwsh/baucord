@@ -81,18 +81,25 @@ const LINK_LOG_LOSS_PCT: f64 = 5.0;
 const LINK_LOG_LOSS_PCT_STREAMING: f64 = 1.0;
 const LINK_LOG_STREAMING_KBPS: f64 = 500.0;
 
-/// Uplink loss readings at or above this are not fed to the voice
-/// encoder. renet measures loss over a 6 s window of *sent* packets; on
-/// a quiet link (nobody talking, only keepalives) that window holds a
-/// handful of packets and the ratio is noise. A link that really loses
-/// half its packets is beyond what FEC can fix anyway.
+/// Ceiling applied to uplink loss readings before they are fed to the
+/// voice encoder. renet measures loss over a 6 s window of *sent*
+/// packets; on a quiet link (nobody talking, only keepalives) that
+/// window holds a handful of packets and the ratio is noise — a reading
+/// of 80 % may mean four lost keepalives. Extreme readings are therefore
+/// *clamped* to this value, not dropped: the encoder's rate controller
+/// only needs to know "the link is bad", and the exact figure above 50
+/// adds nothing. Dropping them (the previous behavior) left the encoder
+/// blind during the worst storms and let its last-seen value latch —
+/// the 2026-08-29 03:51 logs show the encoder acting on 24 % while the
+/// transport measured 78 %. The idle-artifact concern is now handled by
+/// staleness on the audio side: a value nobody refreshes for ~10 s is
+/// treated as unknown and decays (see `AudioStats::uplink_loss_updated_ms`).
 ///
-/// The screen thread's bitrate ladder deliberately does NOT use this
-/// gate: while a share is running the link is anything but quiet, and
-/// the 2026-08-28 incident logged 60–67% real loss for minutes at a
-/// time. It guards against the idle artifact by checking `kbps_up`
-/// against the rung it's on instead.
-const UPLINK_LOSS_IMPLAUSIBLE_PCT: f64 = 50.0;
+/// The screen thread's bitrate ladder uses the raw reading: while a
+/// share is running the link is anything but quiet, and it guards
+/// against the idle artifact by checking `kbps_up` against the rung
+/// it's on instead.
+const UPLINK_LOSS_CLAMP_PCT: f64 = 50.0;
 
 /// Timeout for the connect-token HTTP fetch.
 const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1482,14 +1489,15 @@ fn handle_control(
     true
 }
 
-/// Convert renet's percent loss into a whole-number hint for the voice
-/// encoder, or `None` if the reading is not worth acting on.
+/// Convert renet's percent loss into a whole-number reading for the
+/// voice encoder: clamped to [`UPLINK_LOSS_CLAMP_PCT`], or `None` only
+/// when the value is not a number at all.
 fn plausible_uplink_loss_pct(loss_pct: f64) -> Option<u32> {
-    if !loss_pct.is_finite() || loss_pct < 0.0 || loss_pct >= UPLINK_LOSS_IMPLAUSIBLE_PCT {
+    if !loss_pct.is_finite() || loss_pct < 0.0 {
         return None;
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // bounded to 0..50 above
-    Some(loss_pct.round() as u32)
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // bounded to 0..=50 above
+    Some(loss_pct.round().min(UPLINK_LOSS_CLAMP_PCT) as u32)
 }
 
 fn run_network_loop(
@@ -1732,12 +1740,19 @@ mod tests {
     }
 
     #[test]
-    fn plausible_uplink_loss_should_reject_idle_link_artifacts() {
-        assert_eq!(plausible_uplink_loss_pct(50.0), None);
+    fn plausible_uplink_loss_should_clamp_extreme_readings() {
+        // Not dropped: the encoder must learn the link is bad during a
+        // storm (2026-08-29 03:51: encoder saw 24 % while renet said
+        // 78 %). The staleness check on the audio side handles the
+        // idle-link artifact this used to guard against.
+        assert_eq!(plausible_uplink_loss_pct(50.0), Some(50));
+        assert_eq!(plausible_uplink_loss_pct(78.3), Some(50));
+        assert_eq!(plausible_uplink_loss_pct(100.0), Some(50));
     }
 
     #[test]
     fn plausible_uplink_loss_should_reject_nan() {
         assert_eq!(plausible_uplink_loss_pct(f64::NAN), None);
+        assert_eq!(plausible_uplink_loss_pct(-1.0), None);
     }
 }
