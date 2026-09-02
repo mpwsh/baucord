@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.3.4"
+version = "1.0.0"
 edition = "2024"
 
 [lints]
@@ -8,15 +8,18 @@ workspace = true
 
 [dependencies]
 protocol = { path = "../protocol" }
-socket2 = "0.6.2"
-renet = "2.0"
-renet_netcode = "2.0"
+transport = { path = "../transport" }
+bytes.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 chrono = "0.4"
 log = "0.4"
 env_logger = "0.11"
-clap = { version = "4.5.45", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 serde_yaml = "0.9.34"
-# Token issuer HTTP endpoint (plain HTTP; TLS is terminated by the
-# reverse proxy in front — see auth.rs).
-tiny_http = "0.12"
+# Constant-time comparison for the shared password.
+subtle = "2.6"
+# SHA-256 for chat-image content hashes and client-key user ids.
+sha2 = "0.11"
+
+[dev-dependencies]
+transport = { path = "../transport", features = ["sim"] }

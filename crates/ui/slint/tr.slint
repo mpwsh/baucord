@@ -88,8 +88,8 @@ export global Tr {
     in property <string> server-manage: "Manage servers";
     in property <string> save: "Save";
     in property <string> connect-access-denied: "Access denied: password";
-    in property <string> server-token-url: "Token URL (secure servers)";
-    in property <string> server-config-note: "These are deployment constants — set once and shared by everyone on your server. They apply on the next connect.";
+    in property <string> server-fingerprint: "Server identity (SHA256:…, from the invite)";
+    in property <string> server-config-note: "The password is the room secret everyone on your server shares. The identity is learned on first connect and pinned; paste it from an invite to verify the server up front. Both apply on the next connect.";
     in property <string> audio-devices-header: "Devices";
     in property <string> audio-input-device: "Input device";
     in property <string> audio-output-device: "Output device";

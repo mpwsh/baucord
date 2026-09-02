@@ -28,8 +28,8 @@ export global SettingsState {
     in-out property <string> server-name;
     in-out property <string> server-ip;
     in-out property <string> server-port;
-    in-out property <string> server-token-url;
-    in-out property <string> server-token-password;
+    in-out property <string> server-fingerprint;
+    in-out property <string> server-password;
 
     // Audio
     in property <[string]> input-devices;     // index 0 = "System default"
@@ -70,8 +70,8 @@ export global SettingsLogic {
     callback server-name-edited(string);
     callback server-ip-edited(string);
     callback server-port-edited(string);
-    callback server-token-url-edited(string);
-    callback server-token-password-edited(string);
+    callback server-fingerprint-edited(string);
+    callback server-password-edited(string);
 
     callback input-device-selected(int);
     callback output-device-selected(int);
@@ -251,16 +251,16 @@ component ServersPanel inherits VerticalLayout {
             }
         }
     }
-    FieldLabel { text: Tr.server-token-url; }
-    Field {
-        text <=> SettingsState.server-token-url;
-        edited => { SettingsLogic.server-token-url-edited(self.text); }
-    }
     FieldLabel { text: Tr.server-password; }
     Field {
-        text <=> SettingsState.server-token-password;
+        text <=> SettingsState.server-password;
         secret: true;
-        edited => { SettingsLogic.server-token-password-edited(self.text); }
+        edited => { SettingsLogic.server-password-edited(self.text); }
+    }
+    FieldLabel { text: Tr.server-fingerprint; }
+    Field {
+        text <=> SettingsState.server-fingerprint;
+        edited => { SettingsLogic.server-fingerprint-edited(self.text); }
     }
     Hint { text: Tr.server-config-note; }
     Rectangle { }

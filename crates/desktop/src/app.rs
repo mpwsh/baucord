@@ -1,7 +1,7 @@
 // app.rs — Main application coordinator (Slint edition).
 //
 // Owns the Slint event loop and delegates to:
-//   - NetworkThreadHandle (client::network) for renet client + protocol
+//   - NetworkThreadHandle (client::network) for the QUIC session + protocol
 //   - VoiceThreadHandle   (client::voice)   for audio capture/playback
 //   - ScreenThreadHandle  (client::screen)  for screen capture/encode/decode
 //
@@ -106,6 +106,10 @@ pub struct AppState {
     pending_channel_join: Option<u16>,
     connected: bool,
     pub settings: Settings,
+    /// Our Ed25519 identity key (next to settings.json), sent in Hello
+    /// so the server can derive a stable user id. `None` if it could
+    /// not be loaded; the session works without it.
+    client_key: Option<Arc<transport::ClientKey>>,
     is_muted: bool,
     is_deafened: bool,
     pub is_testing_mic: bool,
@@ -311,6 +315,7 @@ pub fn run() {
         channels: Vec::new(),
         pending_channel_join: None,
         connected: false,
+        client_key: client::config::load_client_key(),
         settings,
         is_muted: false,
         is_deafened: false,
@@ -1056,12 +1061,49 @@ impl AppState {
                 s.set_error_text("".into());
                 s.set_password_prompt(false);
             }
+            NetworkMessage::ServerIdentity {
+                fingerprint,
+                first_use,
+            } => {
+                // Trust on first use (or a signed key rotation): pin it
+                // on the server entry so a different key is refused
+                // from now on.
+                let changed = self.settings.default_server().is_none_or(|s| {
+                    s.fingerprint.as_deref() != Some(fingerprint.as_str())
+                });
+                if changed {
+                    if let Some(server) = self.settings.default_server_mut() {
+                        server.fingerprint = Some(fingerprint.clone());
+                    }
+                    self.settings.save();
+                    crate::settingsui::refresh_servers(self);
+                    if first_use {
+                        info!("Pinned server identity {fingerprint}");
+                        self.push_chat_system(
+                            &t!("chat-identity-pinned", "fingerprint" => fingerprint.as_str()),
+                        );
+                    }
+                }
+            }
+            NetworkMessage::IdentityChanged { expected, observed } => {
+                // Nothing was sent to that server. No silent accept: the
+                // user decides, by editing (or clearing) the pin.
+                let text = t!(
+                    "error-identity-changed",
+                    "expected" => expected.as_str(),
+                    "observed" => observed.as_str()
+                );
+                self.push_chat_system(&text);
+                self.teardown_connection();
+                self.show_connect_phase();
+                self.show_error(&text);
+            }
             NetworkMessage::AccessDenied => {
-                // Token issuer said 403: surface the inline password
-                // prompt on the connect card (persistent, unlike the
-                // 5s error toast) so the user can save the password
-                // and hit Connect again.
-                info!("Connect denied by the token issuer (403)");
+                // The server refused our Hello for the room password:
+                // surface the inline password prompt on the connect card
+                // (persistent, unlike the 5s error toast) so the user
+                // can save the password and hit Connect again.
+                info!("Connect refused: wrong or missing server password");
                 let s = self.main.global::<State>();
                 s.set_password_prompt(true);
                 s.set_password("".into());
@@ -1208,6 +1250,8 @@ impl AppState {
             | NetworkMessage::VoiceData { .. }
             | NetworkMessage::VideoFrame { .. }
             | NetworkMessage::StreamHealth { .. }
+            | NetworkMessage::VoiceReceiverReport { .. }
+            | NetworkMessage::UplinkVideo { .. }
             | NetworkMessage::KeyframeRequested { .. } => {}
         }
     }
@@ -1244,8 +1288,10 @@ impl AppState {
             .send(NetworkControl::Connect {
                 addr,
                 nickname: nickname.to_string(),
-                token_url: server.token_url,
-                token_password: server.token_password,
+                password: server.password,
+                fingerprint: server.fingerprint,
+                client_key: self.client_key.clone(),
+                portable: client::config::is_portable_install(),
             })
             .ok();
     }
@@ -1255,7 +1301,7 @@ impl AppState {
     fn save_prompt_password(&mut self, password: &str) {
         let password = password.trim();
         if let Some(server) = self.settings.default_server_mut() {
-            server.token_password = (!password.is_empty()).then(|| password.to_string());
+            server.password = (!password.is_empty()).then(|| password.to_string());
         }
         self.settings.save();
         let s = self.main.global::<State>();
@@ -2869,7 +2915,7 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_server_manage(t!("server-manage").into());
     tr.set_save(t!("save").into());
     tr.set_connect_access_denied(t!("connect-access-denied").into());
-    tr.set_server_token_url(t!("server-token-url").into());
+    tr.set_server_fingerprint(t!("server-fingerprint").into());
     tr.set_server_config_note(t!("server-config-note").into());
     tr.set_audio_devices_header(t!("audio-devices-header").into());
     tr.set_audio_input_device(t!("audio-input-device").into());

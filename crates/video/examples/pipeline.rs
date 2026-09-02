@@ -41,7 +41,7 @@ struct FrameTimings {
 
 /// Simulate a network hop: fixed latency + bandwidth throttle.
 ///
-/// At 300KB budget per tick (typical renet config), a 10KB frame
+/// At a 300 KB/tick uplink budget (the 0.5 line's transport config), a 10KB frame
 /// "costs" ~1ms of serialization overhead. A 50KB keyframe costs ~5ms.
 fn simulate_network(
     encoded: &EncodedFrame,

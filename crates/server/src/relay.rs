@@ -7,25 +7,28 @@
 //! [`protocol::wrap_sender`] before fan-out. A client cannot impersonate
 //! another client's voice or video, full stop.
 //!
-//! The video relay additionally implements per-viewer backpressure: a
-//! viewer whose outbound video queue grows past a watermark stops
-//! receiving delta frames (which would be useless without their
-//! predecessors anyway) and is resumed at the next keyframe boundary
-//! once the queue drains — the classic SFU pattern. Without this, renet
-//! tail-drops arbitrary chunks once the channel budget fills, corrupting
-//! every subsequent frame while still burning bandwidth on them.
+//! Video rides *groups* (spec §6.2): the sharer opens one stream per
+//! keyframe, and the relay mirrors each group onto every viewer's
+//! connection as a group of its own, keyed by the sharer's id (the
+//! *track*). A viewer that falls behind loses whole groups — the
+//! transport resets the group when its bytes wait longer than the
+//! deadline — and forwarding resumes at the next keyframe. Nothing
+//! older than one GOP ever queues, and the relay needs no watermarks or
+//! keyframe pokes of its own; the transport's counters say how often
+//! each viewer fell behind, and that is what `StreamHealth` reports.
 
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
-use log::{debug, info, warn};
+use log::{debug, info};
 use protocol::{
-    parse_system_audio, parse_video_header, parse_voice, wrap_sender, ShareScope,
-    SYSTEM_AUDIO_CHANNEL, VIDEO_BUFFER_BYTES, VIDEO_CHANNEL, VOICE_CHANNEL,
+    ClientId, Lane, ShareScope, parse_system_audio, parse_video_header, parse_voice, wrap_sender,
 };
-use renet::{Bytes, ClientId, RenetServer};
+use transport::{Driver, LinkStats, VideoItem};
+
+use crate::link_stats::VoiceSeqTracker;
 
 // ════════════════════════════════════════════════════════════════════════
 //  Voice relay — broadcast to all other (non-deafened) clients
@@ -47,13 +50,23 @@ pub struct VoiceStats {
 #[derive(Default)]
 pub struct VoiceRelay {
     pub stats: VoiceStats,
+    /// Per-sender sequence tracking for the link report — see
+    /// [`crate::link_stats`].
+    pub seq: VoiceSeqTracker,
 }
 
 impl VoiceRelay {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             stats: VoiceStats::default(),
+            seq: VoiceSeqTracker::default(),
         }
+    }
+
+    /// Forget a client's sequence position once it is gone.
+    pub fn handle_disconnect(&mut self, client_id: ClientId) {
+        self.seq.remove(client_id);
     }
 
     /// Read voice packets from all clients and forward to the *speaker's
@@ -64,33 +77,37 @@ impl VoiceRelay {
     ///
     /// `channel_of` is the membership map owned by the server. Rooms
     /// are routing policy, not transport: everything still rides the
-    /// one renet `VOICE_CHANNEL`; this filter is what makes a room a
-    /// room. A client somehow missing from the map (should be
-    /// impossible — connect events run before the relay each tick)
-    /// hears and reaches nobody rather than everybody: fail closed.
+    /// one Voice lane; this filter is what makes a room a room. A
+    /// client somehow missing from the map (should be impossible —
+    /// admission runs before the relay each tick) hears and reaches
+    /// nobody rather than everybody: fail closed.
+    ///
+    /// `clients` are the *admitted* peers; a connection still in its
+    /// `Hello` is not among them and its voice, if any, is ignored.
     pub fn process(
         &mut self,
-        server: &mut RenetServer,
+        driver: &mut Driver,
+        now: Instant,
+        clients: &[ClientId],
         deafened: &HashSet<ClientId>,
         channel_of: &HashMap<ClientId, u16>,
     ) {
-        let clients: Vec<ClientId> = server.clients_id();
-
-        for sender in &clients {
+        for sender in clients {
             let sender_channel = channel_of.get(sender);
-            while let Some(message) = server.receive_message(*sender, VOICE_CHANNEL) {
+            while let Some(message) = driver.recv(*sender, Lane::Voice) {
                 self.stats.packets_received += 1;
 
                 // Single source of validation: the shared parser.
-                if parse_voice(&message).is_none() {
+                let Some((hdr, _)) = parse_voice(&message) else {
                     self.stats.packets_dropped_malformed += 1;
                     continue;
-                }
+                };
+                self.seq.note(*sender, hdr.seq);
 
-                // Stamp the authenticated sender once; fan out refcounted.
-                let envelope = Bytes::from(wrap_sender(*sender, &message));
+                // Stamp the authenticated sender once; fan out.
+                let envelope = wrap_sender(*sender, &message);
                 let mut sent = 0u64;
-                for recipient in &clients {
+                for recipient in clients {
                     if recipient == sender {
                         continue;
                     }
@@ -102,8 +119,9 @@ impl VoiceRelay {
                         self.stats.sends_skipped_deafened += 1;
                         continue;
                     }
-                    server.send_message(*recipient, VOICE_CHANNEL, envelope.clone());
-                    sent += 1;
+                    if driver.send(now, *recipient, Lane::Voice, &envelope).is_ok() {
+                        sent += 1;
+                    }
                 }
 
                 if sent > 0 {
@@ -147,17 +165,17 @@ impl VoiceRelay {
 pub struct VideoStats {
     pub chunks_received: u64,
     pub chunks_forwarded: u64,
-    /// Per-viewer chunk sends suppressed by backpressure.
-    pub chunks_suppressed_backpressure: u64,
     pub chunks_dropped_malformed: u64,
     pub chunks_dropped_not_sharing: u64,
     pub chunks_dropped_no_subscribers: u64,
-    /// Keyframe frame-starts forwarded to at least one viewer.
-    pub keyframes_relayed: u64,
+    /// Groups (keyframe-led streams) received from sharers.
+    pub groups_received: u64,
+    /// Groups the sharer abandoned mid-way (its own uplink fell behind).
+    pub groups_reset_by_sharer: u64,
+    /// Groups opened toward viewers (one per viewer per sharer group).
+    pub groups_relayed: u64,
     pub keyframe_requests_forwarded: u64,
     pub keyframe_requests_suppressed: u64,
-    /// Times a viewer entered the backpressure (waiting-for-keyframe) state.
-    pub backpressure_marks: u64,
     pub bytes_relayed: u64,
     // System audio
     pub sys_audio_received: u64,
@@ -172,9 +190,12 @@ pub struct VideoStats {
 /// to the sharer as `ServerMessage::StreamHealth`.
 pub struct StreamHealthReport {
     pub sharer: ClientId,
-    /// Worst packet loss among connected viewers, 0.0–1.0.
+    /// Worst "behind" ratio among connected viewers, 0.0–1.0: video
+    /// groups the relay had to abandon for that viewer over groups it
+    /// started, since the last report. Measured on the video itself,
+    /// never on transport ack accounting (spec §6.2).
     pub worst_loss: f32,
-    /// Worst RTT among connected viewers, in milliseconds.
+    /// Worst path RTT among connected viewers, in milliseconds.
     pub worst_rtt_ms: f32,
     pub viewers: u16,
 }
@@ -184,16 +205,6 @@ pub struct StreamHealthReport {
 /// requests, new-subscriber kicks, and backpressure pokes all funnel
 /// through it, and an IDR produced for one passes serves every viewer.
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(300);
-
-/// Suspend delta forwarding to a viewer once their queued (unsent)
-/// video exceeds this. 1 MB ≈ 2–3 s of a 3 Mbit/s stream or ~6 queued
-/// keyframes — the stream is already stalled for that viewer; feeding
-/// the queue further only adds latency to their eventual recovery.
-const VIDEO_QUEUE_SUSPEND_BYTES: usize = 1_000_000;
-
-/// Resume a suspended viewer only at a keyframe boundary once their
-/// queue has drained below this.
-const VIDEO_QUEUE_RESUME_BYTES: usize = 256 * 1024;
 
 /// Everything the relay knows about one active share.
 #[derive(Debug, Clone, Copy)]
@@ -208,16 +219,15 @@ pub struct ShareInfo {
 pub struct VideoRelay {
     /// Currently sharing clients and their announced share parameters.
     sharers: HashMap<ClientId, ShareInfo>,
-    /// streamer_id → set of viewer client_ids.
+    /// `streamer_id` → set of viewer `client_id`s.
     subscribers: HashMap<ClientId, HashSet<ClientId>>,
     /// Last time a keyframe request was forwarded to each sharer.
     keyframe_request_gate: HashMap<ClientId, Instant>,
-    /// Viewers in backpressure: `(sharer, viewer)` pairs receiving no
-    /// deltas until a keyframe boundary + drained queue.
-    waiting_keyframe: HashSet<(ClientId, ClientId)>,
-    /// Keyframe pokes to send to sharers, drained by the server each
-    /// tick (subject to the gate): `(sharer, viewer)`.
-    pending_pokes: Vec<(ClientId, ClientId)>,
+    /// Sharers whose current group is open on their viewers' tracks.
+    group_open: HashSet<ClientId>,
+    /// Per-viewer transport counters at the last health report, so the
+    /// report covers one interval.
+    health_baseline: HashMap<ClientId, LinkStats>,
     pub stats: VideoStats,
 }
 
@@ -228,13 +238,14 @@ impl Default for VideoRelay {
 }
 
 impl VideoRelay {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sharers: HashMap::new(),
             subscribers: HashMap::new(),
             keyframe_request_gate: HashMap::new(),
-            waiting_keyframe: HashSet::new(),
-            pending_pokes: Vec::new(),
+            group_open: HashSet::new(),
+            health_baseline: HashMap::new(),
             stats: VideoStats::default(),
         }
     }
@@ -244,7 +255,7 @@ impl VideoRelay {
     /// A client started (or re-announced) sharing their screen.
     pub fn start_sharing(&mut self, client_id: ClientId, info: ShareInfo) {
         info!(
-            "Screen share started: {client_id} ({}x{}, {:?} scope)",
+            "Screen share started: {client_id:#x} ({}x{}, {:?} scope)",
             info.width, info.height, info.scope
         );
         self.sharers.insert(client_id, info);
@@ -252,11 +263,13 @@ impl VideoRelay {
     }
 
     /// Share parameters for `client_id`, if they are sharing.
+    #[must_use]
     pub fn share_info(&self, client_id: ClientId) -> Option<ShareInfo> {
         self.sharers.get(&client_id).copied()
     }
 
     /// Snapshot of the viewers subscribed to `streamer`.
+    #[must_use]
     pub fn subscribers_of(&self, streamer: ClientId) -> Vec<ClientId> {
         self.subscribers
             .get(&streamer)
@@ -264,57 +277,71 @@ impl VideoRelay {
             .unwrap_or_default()
     }
 
-    /// A client stopped sharing their screen.
-    pub fn stop_sharing(&mut self, client_id: ClientId) {
-        info!("Screen share stopped: {client_id}");
+    /// A client stopped sharing their screen. Any group still open on
+    /// its viewers is finished.
+    pub fn stop_sharing(&mut self, driver: &mut Driver, now: Instant, client_id: ClientId) {
+        info!("Screen share stopped: {client_id:#x}");
         self.sharers.remove(&client_id);
-        self.subscribers.remove(&client_id);
+        if let Some(viewers) = self.subscribers.remove(&client_id) {
+            for viewer in viewers {
+                driver.video_finish_group(now, viewer, client_id);
+            }
+        }
+        self.group_open.remove(&client_id);
         self.keyframe_request_gate.remove(&client_id);
-        self.waiting_keyframe
-            .retain(|(sharer, _)| *sharer != client_id);
-        self.pending_pokes
-            .retain(|(sharer, _)| *sharer != client_id);
     }
 
     /// A viewer wants to watch a streamer. Caller enforces caps first.
     pub fn subscribe(&mut self, viewer: ClientId, streamer: ClientId) {
         if self.sharers.contains_key(&streamer) {
             self.subscribers.entry(streamer).or_default().insert(viewer);
-            info!("{viewer} subscribed to {streamer}'s screen");
+            info!("{viewer:#x} subscribed to {streamer:#x}'s screen");
         } else {
-            debug!("{viewer} tried to subscribe to {streamer} who is not sharing");
+            debug!("{viewer:#x} tried to subscribe to {streamer:#x} who is not sharing");
         }
     }
 
-    /// A viewer stops watching a streamer.
-    pub fn unsubscribe(&mut self, viewer: ClientId, streamer: ClientId) {
-        if let Some(subs) = self.subscribers.get_mut(&streamer) {
-            subs.remove(&viewer);
+    /// A viewer stops watching a streamer; their open group on that
+    /// track is abandoned.
+    pub fn unsubscribe(
+        &mut self,
+        driver: &mut Driver,
+        now: Instant,
+        viewer: ClientId,
+        streamer: ClientId,
+    ) {
+        if let Some(subs) = self.subscribers.get_mut(&streamer)
+            && subs.remove(&viewer)
+        {
+            driver.video_reset_group(now, viewer, streamer);
         }
-        self.waiting_keyframe.remove(&(streamer, viewer));
-        self.pending_pokes
-            .retain(|(s, v)| !(*s == streamer && *v == viewer));
     }
 
-    /// Clean up when a client disconnects.
-    pub fn handle_disconnect(&mut self, client_id: ClientId) {
+    /// Clean up when a client disconnects: as a sharer, its viewers'
+    /// groups are abandoned; as a viewer, it is dropped from every
+    /// subscriber set.
+    pub fn handle_disconnect(&mut self, driver: &mut Driver, now: Instant, client_id: ClientId) {
         if self.sharers.remove(&client_id).is_some() {
-            self.subscribers.remove(&client_id);
+            if let Some(viewers) = self.subscribers.remove(&client_id) {
+                for viewer in viewers {
+                    driver.video_reset_group(now, viewer, client_id);
+                }
+            }
+            self.group_open.remove(&client_id);
             self.keyframe_request_gate.remove(&client_id);
         }
         for subs in self.subscribers.values_mut() {
             subs.remove(&client_id);
         }
-        self.waiting_keyframe
-            .retain(|(sharer, viewer)| *sharer != client_id && *viewer != client_id);
-        self.pending_pokes
-            .retain(|(sharer, viewer)| *sharer != client_id && *viewer != client_id);
+        self.health_baseline.remove(&client_id);
     }
 
+    #[must_use]
     pub fn is_sharing(&self, client_id: ClientId) -> bool {
         self.sharers.contains_key(&client_id)
     }
 
+    #[must_use]
     pub fn is_subscribed(&self, viewer: ClientId, streamer: ClientId) -> bool {
         self.subscribers
             .get(&streamer)
@@ -322,19 +349,20 @@ impl VideoRelay {
     }
 
     /// Number of active screen shares.
+    #[must_use]
     pub fn sharer_count(&self) -> usize {
         self.sharers.len()
     }
 
     /// Number of viewers subscribed to `streamer`.
+    #[must_use]
     pub fn viewer_count(&self, streamer: ClientId) -> usize {
         self.subscribers.get(&streamer).map_or(0, HashSet::len)
     }
 
     /// Rate-gate keyframe requests toward `streamer`. Returns true (and
     /// arms the gate) if the request should be forwarded.
-    pub fn allow_keyframe_request(&mut self, streamer: ClientId) -> bool {
-        let now = Instant::now();
+    pub fn allow_keyframe_request(&mut self, now: Instant, streamer: ClientId) -> bool {
         let allowed = self
             .keyframe_request_gate
             .get(&streamer)
@@ -349,17 +377,14 @@ impl VideoRelay {
     }
 
     /// Active sharers (for the join snapshot sent to new clients).
+    #[must_use]
     pub fn sharers(&self) -> &HashMap<ClientId, ShareInfo> {
         &self.sharers
     }
 
-    /// Drain pending backpressure keyframe pokes: `(sharer, viewer)`.
-    pub fn take_pokes(&mut self) -> Vec<(ClientId, ClientId)> {
-        std::mem::take(&mut self.pending_pokes)
-    }
-
-    /// Per-stream viewer health for the periodic `StreamHealth` report.
-    pub fn stream_health(&self, server: &RenetServer) -> Vec<StreamHealthReport> {
+    /// Per-stream viewer health for the periodic `StreamHealth` report,
+    /// over the interval since the previous call.
+    pub fn stream_health(&mut self, driver: &Driver) -> Vec<StreamHealthReport> {
         let mut reports = Vec::new();
         for (sharer, subs) in &self.subscribers {
             if !self.sharers.contains_key(sharer) || subs.is_empty() {
@@ -369,14 +394,28 @@ impl VideoRelay {
             let mut worst_rtt_ms = 0f32;
             let mut viewers = 0u16;
             for viewer in subs {
-                if let Ok(info) = server.network_info(*viewer) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        worst_loss = worst_loss.max(info.packet_loss as f32);
-                        worst_rtt_ms = worst_rtt_ms.max((info.rtt * 1000.0) as f32);
-                    }
-                    viewers = viewers.saturating_add(1);
+                let Some(stats) = driver.stats(*viewer) else {
+                    continue;
+                };
+                let base = self
+                    .health_baseline
+                    .get(viewer)
+                    .copied()
+                    .unwrap_or_default();
+                let started = stats.groups_started.saturating_sub(base.groups_started);
+                let reset = stats.groups_reset.saturating_sub(base.groups_reset);
+                #[allow(clippy::cast_precision_loss)]
+                let behind = if started == 0 {
+                    0.0
+                } else {
+                    (reset as f32 / started as f32).min(1.0)
+                };
+                worst_loss = worst_loss.max(behind);
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    worst_rtt_ms = worst_rtt_ms.max(stats.rtt.as_secs_f32() * 1000.0);
                 }
+                viewers = viewers.saturating_add(1);
             }
             if viewers > 0 {
                 reports.push(StreamHealthReport {
@@ -387,95 +426,97 @@ impl VideoRelay {
                 });
             }
         }
+        // Next interval starts now, for every viewer of anyone.
+        for subs in self.subscribers.values() {
+            for viewer in subs {
+                if let Some(stats) = driver.stats(*viewer) {
+                    self.health_baseline.insert(*viewer, stats);
+                }
+            }
+        }
         reports
     }
 
-    // ── Packet relay (called every tick) ────────────────────────────
+    // ── Group relay (called every tick) ─────────────────────────────
 
-    pub fn process(&mut self, server: &mut RenetServer) {
-        let clients: Vec<ClientId> = server.clients_id();
-        for client_id in &clients {
-            while let Some(message) = server.receive_message(*client_id, VIDEO_CHANNEL) {
-                self.relay_video_chunk(server, *client_id, &message);
+    /// Read every sharer's incoming groups and mirror them onto their
+    /// viewers' tracks.
+    pub fn process(&mut self, driver: &mut Driver, now: Instant, clients: &[ClientId]) {
+        for sender in clients {
+            while let Some((_, item)) = driver.recv_video(*sender) {
+                self.relay_video_item(driver, now, *sender, item);
             }
         }
     }
 
-    /// Validate and fan out one video chunk with per-viewer backpressure.
-    fn relay_video_chunk(&mut self, server: &mut RenetServer, sender: ClientId, message: &Bytes) {
-        self.stats.chunks_received += 1;
-
-        // Single source of validation (header, framing invariant, dims).
-        let Some((hdr, _payload)) = parse_video_header(message) else {
-            self.stats.chunks_dropped_malformed += 1;
-            return;
-        };
-
+    fn relay_video_item(
+        &mut self,
+        driver: &mut Driver,
+        now: Instant,
+        sender: ClientId,
+        item: VideoItem,
+    ) {
         if !self.sharers.contains_key(&sender) {
-            self.stats.chunks_dropped_not_sharing += 1;
+            if matches!(item, VideoItem::Chunk(_)) {
+                self.stats.chunks_dropped_not_sharing += 1;
+            }
             return;
         }
+        let viewers: Vec<ClientId> = self
+            .subscribers
+            .get(&sender)
+            .map(|subs| subs.iter().copied().collect())
+            .unwrap_or_default();
 
-        // Snapshot viewers so we can mutate backpressure state below.
-        let viewers: Vec<ClientId> = match self.subscribers.get(&sender) {
-            Some(subs) if !subs.is_empty() => subs.iter().copied().collect(),
-            _ => {
-                self.stats.chunks_dropped_no_subscribers += 1;
-                return;
-            }
-        };
-
-        let keyframe_start = hdr.is_keyframe() && hdr.chunk_idx == 0;
-        let envelope = Bytes::from(wrap_sender(sender, message));
-        let mut sent = 0u64;
-
-        for viewer in viewers {
-            if !server.is_connected(viewer) {
-                continue;
-            }
-
-            let available = server.channel_available_memory(viewer, VIDEO_CHANNEL);
-            let queued = VIDEO_BUFFER_BYTES.saturating_sub(available);
-            let key = (sender, viewer);
-
-            if self.waiting_keyframe.contains(&key) {
-                if keyframe_start && queued < VIDEO_QUEUE_RESUME_BYTES {
-                    // Clean resume: the viewer's decoder restarts from
-                    // this keyframe with no torn frames in between.
-                    self.waiting_keyframe.remove(&key);
-                    debug!("Backpressure cleared for viewer {viewer} of {sender}");
-                    server.send_message(viewer, VIDEO_CHANNEL, envelope.clone());
-                    sent += 1;
-                } else {
-                    // Still suspended. If we just skipped the start of a
-                    // keyframe (queue not drained yet), poke the sharer
-                    // so the next one arrives promptly; the per-sharer
-                    // gate absorbs duplicates.
-                    if keyframe_start {
-                        self.pending_pokes.push(key);
-                    }
-                    self.stats.chunks_suppressed_backpressure += 1;
+        match item {
+            VideoItem::GroupStart => {
+                self.stats.groups_received += 1;
+                self.group_open.insert(sender);
+                for viewer in &viewers {
+                    driver.video_new_group(now, *viewer, sender);
+                    self.stats.groups_relayed += 1;
                 }
-            } else if queued > VIDEO_QUEUE_SUSPEND_BYTES {
-                self.waiting_keyframe.insert(key);
-                self.stats.backpressure_marks += 1;
-                self.stats.chunks_suppressed_backpressure += 1;
-                self.pending_pokes.push(key);
-                warn!(
-                    "Viewer {viewer} can't keep up with {sender}'s stream \
-                     ({queued} bytes queued) — suspending deltas until next keyframe"
-                );
-            } else {
-                server.send_message(viewer, VIDEO_CHANNEL, envelope.clone());
-                sent += 1;
             }
-        }
-
-        if sent > 0 {
-            self.stats.chunks_forwarded += 1;
-            self.stats.bytes_relayed += envelope.len() as u64 * sent;
-            if keyframe_start {
-                self.stats.keyframes_relayed += 1;
+            VideoItem::Chunk(message) => {
+                self.stats.chunks_received += 1;
+                // Single source of validation (header, framing
+                // invariant, dims).
+                if parse_video_header(&message).is_none() {
+                    self.stats.chunks_dropped_malformed += 1;
+                    return;
+                }
+                if viewers.is_empty() {
+                    self.stats.chunks_dropped_no_subscribers += 1;
+                    return;
+                }
+                let envelope = wrap_sender(sender, &message);
+                let mut sent = 0u64;
+                for viewer in &viewers {
+                    // A viewer whose group was reset simply misses the
+                    // rest of it; the next GroupStart reopens.
+                    if driver.video_group_open(*viewer, sender)
+                        && driver.send_video(now, *viewer, sender, &envelope).is_ok()
+                    {
+                        sent += 1;
+                    }
+                }
+                if sent > 0 {
+                    self.stats.chunks_forwarded += 1;
+                    self.stats.bytes_relayed += envelope.len() as u64 * sent;
+                }
+            }
+            VideoItem::GroupEnd => {
+                self.group_open.remove(&sender);
+                for viewer in &viewers {
+                    driver.video_finish_group(now, *viewer, sender);
+                }
+            }
+            VideoItem::GroupReset => {
+                self.stats.groups_reset_by_sharer += 1;
+                self.group_open.remove(&sender);
+                for viewer in &viewers {
+                    driver.video_reset_group(now, *viewer, sender);
+                }
             }
         }
     }
@@ -485,16 +526,26 @@ impl VideoRelay {
     /// Forward system audio to the stream's subscribers. Deliberately
     /// not gated by voice-chat deafen state: deafening the room's
     /// voices shouldn't mute the movie.
-    pub fn process_system_audio(&mut self, server: &mut RenetServer) {
-        let clients: Vec<ClientId> = server.clients_id();
-        for client_id in &clients {
-            while let Some(message) = server.receive_message(*client_id, SYSTEM_AUDIO_CHANNEL) {
-                self.relay_system_audio(server, *client_id, &message);
+    pub fn process_system_audio(
+        &mut self,
+        driver: &mut Driver,
+        now: Instant,
+        clients: &[ClientId],
+    ) {
+        for client_id in clients {
+            while let Some(message) = driver.recv(*client_id, Lane::SystemAudio) {
+                self.relay_system_audio(driver, now, *client_id, &message);
             }
         }
     }
 
-    fn relay_system_audio(&mut self, server: &mut RenetServer, sender: ClientId, message: &Bytes) {
+    fn relay_system_audio(
+        &mut self,
+        driver: &mut Driver,
+        now: Instant,
+        sender: ClientId,
+        message: &[u8],
+    ) {
         self.stats.sys_audio_received += 1;
 
         if parse_system_audio(message).is_none() {
@@ -515,11 +566,13 @@ impl VideoRelay {
             }
         };
 
-        let envelope = Bytes::from(wrap_sender(sender, message));
+        let envelope = wrap_sender(sender, message);
         let mut sent = 0u64;
         for viewer in viewers {
-            if server.is_connected(viewer) {
-                server.send_message(viewer, SYSTEM_AUDIO_CHANNEL, envelope.clone());
+            if driver
+                .send(now, viewer, Lane::SystemAudio, &envelope)
+                .is_ok()
+            {
                 sent += 1;
             }
         }
@@ -540,10 +593,12 @@ impl VideoRelay {
         }
 
         info!(
-            "Video — chunks RX: {}, FWD: {}, keyframes: {}, relayed: {:.2} MB",
+            "Video — chunks RX: {}, FWD: {}, groups RX: {} (sharer resets {}), groups relayed: {}, relayed: {:.2} MB",
             self.stats.chunks_received,
             self.stats.chunks_forwarded,
-            self.stats.keyframes_relayed,
+            self.stats.groups_received,
+            self.stats.groups_reset_by_sharer,
+            self.stats.groups_relayed,
             self.stats.bytes_relayed as f64 / 1_048_576.0,
         );
         info!(
@@ -552,12 +607,6 @@ impl VideoRelay {
             self.stats.chunks_dropped_not_sharing,
             self.stats.chunks_dropped_malformed,
         );
-        if self.stats.backpressure_marks > 0 {
-            info!(
-                "Video backpressure — viewers suspended: {}, chunks suppressed: {}",
-                self.stats.backpressure_marks, self.stats.chunks_suppressed_backpressure,
-            );
-        }
         info!(
             "Streams active: {}, total subscribers: {}",
             self.sharers.len(),

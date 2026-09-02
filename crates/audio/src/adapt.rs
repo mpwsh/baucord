@@ -17,10 +17,11 @@
 //!
 //! ## Dwell (why the ladder no longer free-falls)
 //!
-//! The transport's loss figure is a ~6 s sliding window (renet:
-//! `connection_stats.rs`, 300 ms buckets, newest ~0.9 s excluded), and we
-//! evaluate every ~2 s. Without a hold, one loss event is counted by
-//! three or four consecutive evaluations and every episode rides the
+//! The loss figure arrives as a receiver report every 2 s (1.0: the
+//! relay counts our voice packets against their sequence numbers; the
+//! 0.5 line used a ~6 s transport window), and we evaluate every ~2 s.
+//! Without a hold, one loss event is counted by consecutive
+//! evaluations and every episode rides the
 //! ladder to the bottom — the 2026-08-29..31 chicho logs show exactly
 //! this: 48 → 12 kbps in 6–8 s on every burst regardless of severity.
 //! So after any rung change the controller now dwells [`DWELL_EVALS`]
@@ -144,7 +145,7 @@ const RTT_INFLATION: f32 = 1.5;
 const RTT_MARGIN_MS: f32 = 30.0;
 
 /// Evaluations to hold after any rung change before stepping again
-/// (~8 s at the 2 s cadence — longer than renet's 6 s loss window, so
+/// (~8 s at the 2 s cadence — several receiver-report windows, so
 /// the next step acts on post-change evidence). A step *down* that
 /// immediately undoes a climb is exempt: the climb was the fresh event,
 /// and a failed probe should be reverted at once.

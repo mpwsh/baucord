@@ -44,10 +44,9 @@ server-manage = Administrar servidores
 server-new-name = Servidor nuevo
 save = Guardar
 connect-access-denied = Acceso denegado: contraseña — escribila abajo, Guardá y volvé a Conectar
-server-token-url = URL de token (solo servidores seguros)
+server-fingerprint = Identidad del servidor (SHA256:…, de la invitación; se aprende en la primera conexión)
 server-config-note =
-    Dejá la URL de token vacía para servidores abiertos o de LAN.
-    Los cambios se aplican en la próxima conexión.
+    La contraseña es el secreto de la sala que comparten todos en tu servidor. La identidad se aprende en la primera conexión y queda fijada; pegala desde una invitación para verificar el servidor de antemano. Ambas aplican en la próxima conexión.
 
 # ── Barra lateral ───────────────────────────────────────────────────────
 users-count = Usuarios: { $count }
@@ -160,7 +159,7 @@ about-open-folder = Abrir carpeta de instalación
 about-built-with = HECHO CON
 tech-rust = Rust - Lenguaje de programación
 tech-fltk = FLTK - Interfaz de usuario
-tech-renet = Renet - Redes
+tech-quinn = quinn-proto - Transporte QUIC
 tech-ffmpeg = FFmpeg - Codificación/decodificación de video
 tech-xcap = Xcap - Captura de pantalla
 tech-cpal = CPAL - Entrada/salida de audio
@@ -240,3 +239,7 @@ share-visibility = Visible para
 share-channel-only = Mi canal
 share-everyone = Todos
 chat-channels-updated = se actualizaron los canales de voz
+
+# Fijación de identidad del servidor (1.0)
+error-identity-changed = La identidad del servidor cambió: se esperaba { $expected }, se recibió { $observed }. No se envió nada. Si el administrador rotó la clave a propósito, editá la identidad del servidor en Ajustes (o borrala) y conectá de nuevo.
+chat-identity-pinned = Identidad del servidor fijada: { $fingerprint }

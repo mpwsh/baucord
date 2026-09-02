@@ -1,16 +1,17 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use env_logger::Builder;
-use log::{error, info};
+use log::{info, warn};
 use server::{config::Config, server::ChatServer};
+use transport::{DriverHost, ServerIdentity, UdpIo};
 
 const LOG_PATH: &str = "server.log";
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
@@ -28,6 +29,17 @@ struct Args {
     /// Override port from config
     #[arg(long)]
     port: Option<u16>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Generate a new identity key, signed by the current one so
+    /// pinned clients accept it. The old key is kept under `retired/`
+    /// (for two years) and continues to vouch for the new one. Run
+    /// while the server is stopped, then restart it.
+    RotateKey,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,6 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.server.port = port;
     }
 
+    if let Some(Command::RotateKey) = args.command {
+        return rotate_key(&config);
+    }
+
     let log_file = Arc::new(Mutex::new(open_log_file()?));
 
     Builder::new()
@@ -90,17 +106,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .init();
 
-    info!("Starting {}", config.server.name);
+    info!(
+        "Starting {} (baucord {})",
+        config.server.name,
+        env!("CARGO_PKG_VERSION")
+    );
 
-    let mut server = ChatServer::new(config)?;
+    // ── Identity ────────────────────────────────────────────────────
+    let identity_dir = PathBuf::from(&config.identity.dir);
+    let (identity, created) = ServerIdentity::load_or_create(&identity_dir)?;
+    if created {
+        warn!(
+            "Generated a new server identity in {} — back this directory up; every client will pin it",
+            identity_dir.display()
+        );
+    }
+    info!("Server identity: {}", identity.fingerprint());
+    for old in identity.retired_fingerprints() {
+        info!("  vouching for retired key {old}");
+    }
+    info!(
+        "Invite: {}#{}",
+        config.public_endpoint(),
+        identity.fingerprint()
+    );
+
+    // ── Socket + server ─────────────────────────────────────────────
+    let addr = config.socket_addr()?;
+    let mut server = ChatServer::new(config, &identity)?;
+    let mut udp = UdpIo::bind(addr, server.budget().socket_buffer_bytes)?;
+    server.driver().set_max_gso_segments(udp.max_gso_segments());
     // Hot reload: edits to the [channels] section of the config file
     // apply live; everything else still needs a restart.
-    server.watch_config_file(std::path::PathBuf::from(&args.config));
+    server.watch_config_file(PathBuf::from(&args.config));
 
-    info!("Server listening on:");
-    for addr in server.addresses() {
-        info!("  {addr}");
-    }
+    info!("Server listening on {}", udp.local_addr()?);
     info!("Press Ctrl+C to stop");
 
     // ── Adaptive poll loop ──────────────────────────────────────────
@@ -108,13 +148,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Voice packets need sub-millisecond relay turnaround, so the loop
     // runs at 1 ms while media is flowing. But a voice server is idle
     // most of its life; the server tells us how fast the next tick
-    // needs to come (1 ms hot, 5 ms quiet, 20 ms empty), which cuts
-    // idle CPU roughly 5–20× at a worst-case cost of +5 ms on the first
-    // packet of a talk burst — inaudible under the jitter buffer.
+    // needs to come (1 ms hot, 5 ms quiet, 20 ms empty), and the
+    // transport's next timer caps the sleep so acks, keep-alives and
+    // idle timeouts fire on time.
     let mut last_rotate_check = Instant::now();
     loop {
-        if let Err(e) = server.update() {
-            error!("Server error: {e}");
+        let now = Instant::now();
+        if let Err(e) = udp.recv_batch(|d| server.driver().handle_datagram(now, d)) {
+            warn!("UDP receive error: {e}");
+        }
+        server.update(now);
+        while let Some(t) = server.driver().poll_transmit() {
+            udp.send(&t);
         }
 
         if last_rotate_check.elapsed() >= LOG_ROTATE_CHECK_INTERVAL {
@@ -122,8 +167,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_rotate_check = Instant::now();
         }
 
-        thread::sleep(server.suggested_sleep());
+        let mut sleep = server.suggested_sleep();
+        if let Some(deadline) = server.driver().next_timeout() {
+            sleep = sleep.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        if !sleep.is_zero() {
+            thread::sleep(sleep);
+        }
     }
+}
+
+fn rotate_key(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = PathBuf::from(&config.identity.dir);
+    let (current, created) = ServerIdentity::load_or_create(&dir)?;
+    if created {
+        println!(
+            "No identity existed in {}; generated one ({}). Nothing to rotate.",
+            dir.display(),
+            current.fingerprint()
+        );
+        return Ok(());
+    }
+    let old = current.fingerprint();
+    drop(current);
+    let rotated = ServerIdentity::rotate(&dir)?;
+    println!("Rotated server identity in {}", dir.display());
+    println!("  old: {old} (retired, still vouching for the new key)");
+    println!("  new: {}", rotated.fingerprint());
+    println!(
+        "Restart the server to serve the new certificate; pinned clients migrate automatically."
+    );
+    Ok(())
 }
 
 fn open_log_file() -> std::io::Result<File> {

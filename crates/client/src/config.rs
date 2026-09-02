@@ -120,45 +120,83 @@ pub struct ServerEntry {
     pub name: String,
     /// `ip:port` (or `[v6]:port`) — parsed as a `SocketAddr` on connect.
     pub address: String,
-    /// Token issuer URL for secure servers, e.g.
-    /// `https://vc.example.com/token` (the deployment's reverse proxy
-    /// routes this to the server's in-process issuer).
-    ///
-    /// `Some` → fetch a connect token and authenticate securely.
-    /// `None` → open (unsecure) connect, for LAN/dev servers running
-    /// with `authentication.secure: false`.
-    #[serde(default)]
-    pub token_url: Option<String>,
-    /// Shared password sent to the issuer in the `x-baucord-pass`
-    /// header, if the server configures one.
+    /// Shared room password sent in `Hello`, if the server requires one
+    /// (`authentication.secure: true`).
     ///
     /// Stored in settings.json as plain text on purpose: this is a
     /// shared room secret for a friends server, not a personal
     /// credential — treat it accordingly (and don't reuse a personal
     /// password for it). An OS-keychain integration would add a
     /// per-platform dependency for a secret every member knows.
+    ///
+    /// (0.5 files called this `token_password`; it migrates on load.)
+    #[serde(default, alias = "token_password")]
+    pub password: Option<String>,
+    /// The server's pinned identity, `SHA256:<base64>` (spec §3.2).
+    /// Filled from an invite string, or on first successful connection
+    /// (trust on first use). A server presenting a different key is
+    /// refused until the user accepts the change.
     #[serde(default)]
-    pub token_password: Option<String>,
+    pub fingerprint: Option<String>,
     /// Saved voice-channel passwords for this server, keyed by channel
     /// *name* (channel ids are per-server-run indexes; names are the
     /// stable handle an operator gives a room). Filled when a join with
     /// a typed password succeeds path-wise (we save on OK — a wrong
     /// password just re-opens the prompt). Same plain-text rationale as
-    /// `token_password` above.
+    /// `password` above.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub channel_passwords: HashMap<String, String>,
 }
 
 impl ServerEntry {
-    /// The official baucord server — the out-of-the-box entry.
+    /// The official baucord server — the out-of-the-box entry. Its
+    /// fingerprint is learned on first use.
     #[must_use]
     pub fn official() -> Self {
         Self {
             name: "baucord".to_string(),
             address: "216.238.121.18:5000".to_string(),
-            token_url: Some("https://auth.baucord.com/token".to_string()),
-            token_password: Some("conos".to_string()),
+            password: Some("conos".to_string()),
+            fingerprint: None,
             channel_passwords: HashMap::new(),
+        }
+    }
+
+    /// Parse an invite string: `host:port` or `host:port#SHA256:…`
+    /// (spec §3.2). The name defaults to the address.
+    #[must_use]
+    pub fn from_invite(invite: &str) -> Option<Self> {
+        let invite = invite.trim();
+        let (address, fingerprint) = match invite.split_once('#') {
+            Some((addr, fp)) => (addr.trim(), Some(fp.trim())),
+            None => (invite, None),
+        };
+        if address.is_empty() || !address.contains(':') {
+            return None;
+        }
+        let fingerprint = match fingerprint {
+            Some(fp) if !fp.is_empty() => {
+                // Only a well-formed fingerprint is worth pinning.
+                fp.parse::<transport::Fingerprint>().ok()?;
+                Some(fp.to_string())
+            }
+            _ => None,
+        };
+        Some(Self {
+            name: address.to_string(),
+            address: address.to_string(),
+            password: None,
+            fingerprint,
+            channel_passwords: HashMap::new(),
+        })
+    }
+
+    /// The invite string for this entry (with the pin, once known).
+    #[must_use]
+    pub fn invite(&self) -> String {
+        match &self.fingerprint {
+            Some(fp) => format!("{}#{fp}", self.address),
+            None => self.address.clone(),
         }
     }
 }
@@ -172,8 +210,6 @@ fn default_servers() -> Vec<ServerEntry> {
 #[derive(Debug, Deserialize)]
 struct LegacyServer {
     address: String,
-    #[serde(default)]
-    token_url: Option<String>,
     #[serde(default)]
     token_password: Option<String>,
 }
@@ -375,8 +411,8 @@ impl From<SettingsDe> for Settings {
                     ServerEntry {
                         name: legacy.address.clone(),
                         address: legacy.address,
-                        token_url: legacy.token_url,
-                        token_password: legacy.token_password,
+                        password: legacy.token_password,
+                        fingerprint: None,
                         channel_passwords: HashMap::new(),
                     }
                 };
@@ -429,7 +465,7 @@ impl Settings {
     fn exe_adjacent_settings_path() -> PathBuf {
         let mut path = std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from("."));
         path.push("settings.json");
         path
@@ -507,11 +543,16 @@ impl Settings {
         }
         for entry in &mut self.servers {
             let blank = |v: &Option<String>| v.as_deref().is_some_and(|s| s.trim().is_empty());
-            if blank(&entry.token_url) {
-                entry.token_url = None;
+            if blank(&entry.password) {
+                entry.password = None;
             }
-            if blank(&entry.token_password) {
-                entry.token_password = None;
+            if blank(&entry.fingerprint)
+                || entry
+                    .fingerprint
+                    .as_deref()
+                    .is_some_and(|fp| fp.parse::<transport::Fingerprint>().is_err())
+            {
+                entry.fingerprint = None;
             }
         }
         if !self.servers.iter().any(|s| s.name == self.server) {
@@ -609,6 +650,37 @@ pub fn settings_file_path() -> PathBuf {
     Settings::get_settings_path()
 }
 
+/// Where the client's Ed25519 identity key lives: next to settings.json.
+#[must_use]
+pub fn client_key_path() -> PathBuf {
+    config_base_dir().join("identity.key")
+}
+
+/// Whether settings live next to the executable (a portable install),
+/// for the telemetry client info.
+#[must_use]
+pub fn is_portable_install() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .is_some_and(|dir| dir == config_base_dir())
+}
+
+/// Load (or create) the client's identity key. Failure is logged and
+/// treated as "no key": the session still works, without a stable user
+/// id.
+#[must_use]
+pub fn load_client_key() -> Option<std::sync::Arc<transport::ClientKey>> {
+    let path = client_key_path();
+    match transport::ClientKey::load_or_create(&path) {
+        Ok(key) => Some(std::sync::Arc::new(key)),
+        Err(e) => {
+            log::warn!("client key unavailable ({e}); connecting without one");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,8 +706,10 @@ mod tests {
         assert_eq!(s.servers.len(), 1);
         let e = &s.servers[0];
         assert_eq!(e.address, "10.0.0.7:6000");
-        assert_eq!(e.token_url.as_deref(), Some("https://vc.example.com/token"));
-        assert_eq!(e.token_password.as_deref(), Some("sekrit"));
+        // The 0.5 token password becomes the room password; the issuer
+        // URL is gone with the issuer.
+        assert_eq!(e.password.as_deref(), Some("sekrit"));
+        assert_eq!(e.fingerprint, None);
         // Pre-existing settings survive the migration.
         assert_eq!(s.user.nickname, "empe");
         assert_eq!(s.keybinds[0].bind, "F2");
@@ -665,7 +739,7 @@ mod tests {
         }"#,
         );
         assert_eq!(s.server, "baucord");
-        assert_eq!(s.servers[0].token_password, None);
+        assert_eq!(s.servers[0].password, None);
 
         let json = serde_json::to_string_pretty(&s).expect("serialize");
         let back: Settings = serde_json::from_str(&json).expect("re-parse");
@@ -702,9 +776,44 @@ mod tests {
             Some("2.2.2.2:2")
         );
         if let Some(server) = s.default_server_mut() {
-            server.token_password = Some("pw".to_string());
+            server.password = Some("pw".to_string());
         }
-        assert_eq!(s.servers[1].token_password.as_deref(), Some("pw"));
+        assert_eq!(s.servers[1].password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn one_point_oh_fields_round_trip_and_invites_parse() {
+        let s = parse(
+            r#"{ "server": "x", "servers": [ { "name": "x", "address": "1.2.3.4:5000",
+                "password": "pw", "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" } ] }"#,
+        );
+        assert_eq!(s.servers[0].password.as_deref(), Some("pw"));
+        assert!(s.servers[0].fingerprint.is_some());
+        assert_eq!(
+            s.servers[0].invite(),
+            "1.2.3.4:5000#SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        // A malformed pin is dropped rather than trusted.
+        let s = parse(
+            r#"{ "server": "x", "servers": [ { "name": "x", "address": "1.2.3.4:5000",
+                "fingerprint": "garbage" } ] }"#,
+        );
+        assert_eq!(s.servers[0].fingerprint, None);
+
+        let e = ServerEntry::from_invite(
+            " 10.0.0.1:5000#SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ",
+        )
+        .expect("invite");
+        assert_eq!(e.address, "10.0.0.1:5000");
+        assert!(e.fingerprint.is_some());
+        assert_eq!(
+            ServerEntry::from_invite("10.0.0.1:5000")
+                .expect("bare")
+                .fingerprint,
+            None
+        );
+        assert!(ServerEntry::from_invite("nope").is_none());
+        assert!(ServerEntry::from_invite("10.0.0.1:5000#bad").is_none());
     }
 
     #[test]

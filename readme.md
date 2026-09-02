@@ -2,8 +2,9 @@
 
 A lightweight voice, text, and screen sharing application built with Rust.
 
-Uses [Slint](https://slint.dev) for the UI, `renet` + `renet_netcode` for
-network transport, and FFmpeg for video encoding/decoding. Audio runs on
+Uses [Slint](https://slint.dev) for the UI, QUIC (`quinn-proto`, driven
+without a runtime) for network transport, and FFmpeg for video
+encoding/decoding. Audio runs on
 dedicated threads with crossbeam channels. Screen sharing follows the same
 architecture: capture → encode → network → decode → viewer window. The
 server is a simple relay — no mixing, no transcoding.
@@ -44,9 +45,10 @@ server is a simple relay — no mixing, no transcoding.
   channel, with message history, inline links, images, gifs, and an
   emoji picker
 - **Multiple servers** — save several servers in settings, pick a
-  default, switch from the connect screen. Secure servers hand out
-  netcode connect tokens via a small HTTP issuer (optional shared
-  password)
+  default, switch from the connect screen. Every connection is
+  encrypted and the server's identity is pinned (from an invite
+  string, or on first use); secure servers additionally require a
+  shared room password
 - **Global hotkeys** — toggle mute, deafen, and screen share from any
   window; rebind with live key capture
 - **Three languages** — English, Español (Argentina), Português (Brasil)
@@ -113,11 +115,19 @@ Omit the `channels` key entirely for a single open Lobby. The
 bad edit is logged and ignored, never applied. Everything else in the
 file needs a restart.
 
-Open mode (`authentication.secure: false`) accepts anyone and is meant
-for LAN/dev — the server logs loudly about it. Secure mode requires
-clients to present a netcode connect token from the built-in HTTP token
-issuer (see `authentication.issuer`, optional shared password; the
-signing key is generated on first secure start).
+Every connection is QUIC over UDP, encrypted, and authenticated by the
+server's Ed25519 identity key (generated on first start in
+`identity.dir`, default `data/baucord`; clients pin its fingerprint).
+Open mode (`authentication.secure: false`) then accepts anyone and is
+meant for LAN/dev — the server logs loudly about it. Secure mode
+requires clients to send `authentication.password` in their hello
+(checked in constant time, failures rate-limited per address).
+
+The startup log prints the identity and an invite string,
+`host:port#SHA256:…`; hand that to people so their client verifies the
+server before saying hello. To rotate the key, stop the server and run
+`baucord-server rotate-key` — the new key is signed by the old one, so
+pinned clients migrate automatically.
 
 ### Client
 
@@ -140,44 +150,38 @@ the handshake instead of misbehaving mid-call.
 The production layout is Docker Compose on a Linux host:
 
 ```
-client ──udp/5000──────────────────────────────▶ baucord   (media relay, published directly)
-client ──https/443──▶ apisix ──http──▶ baucord:5001       (token issuer, auth.baucord.com)
-                        └─ etcd (apisix config)   certer (Let's Encrypt + route provisioning)
+client ──udp/5000 (QUIC)──▶ baucord   (relay, published directly)
 ```
 
-Media UDP is published straight from the `baucord` container. It does
-**not** go through the APISIX stream proxy: that added two userspace
-copies per packet and hid real client addresses from the relay. APISIX
-only fronts HTTP.
+One service: everything — media, control, admission — rides the single
+QUIC port, so there is no HTTP issuer, no reverse proxy and no
+certificate to provision. Media UDP is published straight from the
+`baucord` container (not through a userspace proxy: that added copies
+per packet and hid real client addresses from the relay).
 
-The `baucord` image runs as uid `10000`; the netcode signing key is kept
-in `./data/baucord` on the host so `docker compose up` recreates don't
-invalidate tokens clients already hold.
+The `baucord` image runs as uid `10000`; the identity key is kept in
+`./data/baucord` on the host so `docker compose up` recreates keep the
+identity every client has pinned. Back that directory up.
 
 ### Layout
 
 ```
 docker-compose.yml
 config/
-  apisix.yml        # APISIX config (HTTP only, proxy_mode: http)
-  routes.yml        # routes pushed by certer via the Admin API
   baucord.yaml      # mounted as /app/server.yaml
-  debug.yml
-  certer.Dockerfile
 scripts/
   setup.sh          # bootstrap / re-apply host + stack
   monitor-net.sh    # UDP / NIC drop logger
-data/baucord/       # created by setup.sh; holds netcode.key (keep out of git)
-certs/              # Let's Encrypt state (keep out of git)
+data/baucord/       # created by setup.sh; holds identity.key (keep out of git, back it up)
 ```
 
 ### Bootstrapping a host
 
-1. Point DNS for the issuer hostname (`auth.baucord.com` in
-   `docker-compose.yml` / `config/routes.yml`) at the host, and open
-   `udp/5000`, `tcp/80`, `tcp/443` in the cloud firewall.
+1. Open `udp/5000` in the cloud firewall. (No DNS or TLS certificate
+   is needed: the server's own key is its identity.)
 2. Set `server.public_address` in `config/baucord.yaml` to the host's
-   public IP and port.
+   public IP and port (it is printed in the invite string), and
+   `authentication.password` to the room secret.
 3. Clone this directory onto the host and run:
 
    ```bash
@@ -188,14 +192,14 @@ certs/              # Let's Encrypt state (keep out of git)
 
    - checks for Docker and the compose plugin and installs them from the
      distro repos only if missing
-   - creates `./data/baucord` owned by uid 10000 (and migrates an
-     existing `netcode.key` out of a running container if there is one)
+   - creates `./data/baucord` owned by uid 10000 (the identity key is
+     generated there on first start)
    - tunes the host for UDP fan-out: socket buffer caps and kernel
      ingress backlog (`/etc/sysctl.d/99-baucord-udp.conf`), conntrack
      sizing for Docker's port publishing, a boot-time service for NIC
      ring buffers / RPS, and disables cloud-init network hotplug
    - runs `docker compose up -d`
-   - deletes the legacy APISIX stream routes (certer only upserts)
+   - prints the invite string (`host:port#SHA256:…`) from the log
 
    The settings block at the top of the script (`MEDIA_PORT`,
    `MEDIA_VIA_DOCKER_NAT`, `BAUCORD_UID`, interface auto-detection) is
@@ -212,8 +216,8 @@ certs/              # Let's Encrypt state (keep out of git)
 ### Monitoring while it runs
 
 A relay is a UDP fan-out — a ~177 KB keyframe goes to every viewer at
-once — and the kernel drops those bursts silently; you see netcode
-timeouts, not errors. Run the monitor during load (a 200-person test,
+once — and the kernel drops those bursts silently; you see idle
+timeouts and abandoned video groups, not errors. Run the monitor during load (a 200-person test,
 or just always):
 
 ```bash
@@ -222,7 +226,7 @@ tail -f /var/log/baucord-net.log
 ```
 
 UDP counters are per network namespace, so the script samples the host
-*and* the `baucord` container (`CONTAINERS="baucord apisix"` to add
+*and* the `baucord` container (`CONTAINERS="baucord other"` to add
 more, `CONTAINERS=""` for host only) and writes one CSV row per
 namespace per interval. Every `*_err` / `*_drop` column is the delta for
 that interval, and `note` names the layer that dropped:
@@ -253,17 +257,15 @@ If you leave it running long-term, add a logrotate rule:
 
 For the last bit of headroom, run `baucord` with `network_mode: host`
 instead of `ports:`. That removes Docker's DNAT and conntrack from the
-media path. It also changes how APISIX reaches the issuer (`baucord:5001`
-becomes the host gateway), so update `config/routes.yml` accordingly,
-then set `MEDIA_VIA_DOCKER_NAT="false"` in `scripts/setup.sh` and re-run
-it — that enables a `notrack` rule for the media port, which is only
-safe without DNAT.
+media path. Then set `MEDIA_VIA_DOCKER_NAT="false"` in
+`scripts/setup.sh` and re-run it — that enables a `notrack` rule for the
+media port, which is only safe without DNAT.
 
 ## Known Limitations
 
-- No end-to-end encryption: secure mode protects the transport with
-  netcode connect tokens, but the relay sees all traffic in the clear;
-  open mode is for LAN/dev and shouldn't cross the internet
+- No end-to-end encryption: every hop is TLS-encrypted QUIC and the
+  server is pinned, but the relay sees all media in the clear; open
+  mode (no password) is for LAN/dev
 - Push-to-talk is reserved in the settings format but not implemented
   yet — voice activation only for now
 - Chat history is not replayed to new joiners; you see the room from

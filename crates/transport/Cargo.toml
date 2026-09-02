@@ -1,0 +1,48 @@
+[package]
+name = "transport"
+version = "1.0.0"
+edition = "2024"
+description = "Sans-IO QUIC transport for baucord: quinn-proto driven from the existing threads, lane mapping, identity pinning, and an in-process simulation harness."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The in-memory network + fake clock harness (spec §4.7). Pulled in by
+# the transport's own tests and by the server's integration tests.
+sim = []
+
+[dependencies]
+protocol = { path = "../protocol" }
+bytes.workspace = true
+log.workspace = true
+thiserror.workspace = true
+# QUIC state machine, no I/O. `log` bridges its tracing spans to the
+# workspace logger; `rustls-ring` is the TLS provider (ring over aws-lc-rs
+# for footprint). No default features: that would pull `bloom` (fastbloom)
+# which we don't need.
+quinn-proto = { version = "0.11.17", default-features = false, features = [
+  "rustls-ring",
+  "log",
+] }
+# Synchronous UDP with GSO/GRO/ECN; no runtime. Default features would
+# pull `tracing`.
+quinn-udp = { version = "0.6.1", default-features = false, features = ["log"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.15"
+# Self-signed Ed25519 identity certificates and the successor extension.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+# Ed25519 verification of successor proofs and client-key proofs; already
+# in the tree via rustls.
+ring = "0.17"
+sha2 = "0.11"
+base64 = "0.23"
+# quinn-proto's own rand; reused for peer ids.
+rand = "0.10"
+# Deterministic PRNG for the simulation harness (already in the tree
+# via quinn-proto).
+rand_pcg = "0.10"
+
+[dev-dependencies]
+env_logger = "0.11"

@@ -23,6 +23,8 @@ default = []
 tray = ["slint/system-tray"]
 [dependencies]
 client = { path = "../client" }
+# Fingerprint parsing for the settings editor and the identity key type.
+transport = { path = "../transport" }
 i18n = { path = "../i18n" }
 audio = { path = "../audio", features = ["serde"] }
 video = { path = "../video" }

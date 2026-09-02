@@ -82,7 +82,7 @@ export global State {
     in-out property <string> password;
     in property <[string]> server-names;   // saved servers, by name
     in-out property <int> server-index: 0; // dropdown pick = default server
-    in property <bool> password-prompt: false; // 403 → show the save box
+    in property <bool> password-prompt: false; // refused (password) → show the save box
     in property <string> error-text;       // 5s toast, cleared by host
     in property <string> device-warning;   // "saved mic missing" notice
 

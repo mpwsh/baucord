@@ -6,10 +6,10 @@
 #
 # Idempotent — re-run after pulling config changes. It:
 #   1. checks Docker + the compose plugin are present (installs from Ubuntu repos if not)
-#   2. creates ./data/baucord for the netcode key (container runs as uid 10000)
+#   2. creates ./data/baucord for the server identity key (container runs as uid 10000)
 #   3. tunes the host for UDP fan-out (sysctls, conntrack, NIC ring buffers, RPS)
-#   4. starts / updates the compose stack
-#   5. removes the legacy APISIX stream routes (media no longer goes through APISIX)
+#   4. starts / updates the compose stack (one service: baucord)
+#   5. prints the invite string (address + identity fingerprint) from the server log
 #   6. installs + enables the network monitor as a systemd service
 #      (baucord-monitor — CSV at /var/log/baucord-net.log, logrotate managed)
 #
@@ -23,7 +23,7 @@ MEDIA_PORT="5000"           # UDP port baucord listens on (server.port in config
 MEDIA_VIA_DOCKER_NAT="true" # true  = baucord uses `ports:` (iptables DNAT -> conntrack required)
 # false = baucord runs network_mode: host (media port can skip conntrack)
 BAUCORD_UID="10000"       # uid:gid the mpwsh/baucord image runs as (user "runner")
-DATA_DIR="./data/baucord" # mounted at /app/data; holds netcode.key
+DATA_DIR="./data/baucord" # mounted at /app/data; holds identity.key (the server's identity — back it up)
 IFACE="${IFACE:-$(ip -o route show default | awk '{print $5; exit}')}"
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -67,13 +67,11 @@ docker compose version
 
 # ── 2. Data dir for the non-root container ────────────────────────────────────
 log "Preparing $DATA_DIR (owner uid $BAUCORD_UID)"
-mkdir -p "$DATA_DIR" certs
-# Migrating from a container that kept netcode.key in /app: carry the key over so
-# tokens already issued stay valid.
-if [[ ! -f "$DATA_DIR/netcode.key" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx baucord; then
-  if docker cp baucord:/app/netcode.key "$DATA_DIR/netcode.key" 2>/dev/null; then
-    echo "  migrated existing netcode.key from the running container"
-  fi
+mkdir -p "$DATA_DIR"
+# 0.5 kept a netcode.key here; 1.0 generates identity.key on first start
+# and clients pin it, so the directory must persist across recreates.
+if [[ -f "$DATA_DIR/netcode.key" ]]; then
+  echo "  netcode.key from the 0.5 line is no longer used; leaving it in place"
 fi
 chown -R "$BAUCORD_UID:$BAUCORD_UID" "$DATA_DIR"
 chmod 700 "$DATA_DIR"
@@ -211,26 +209,20 @@ sysctl net.core.rmem_max net.core.wmem_max net.core.netdev_max_backlog \
 log "Starting / updating the compose stack"
 docker compose up -d --remove-orphans
 
-# ── 5. Remove legacy stream routes (certer only upserts; never deletes) ───────
-log "Cleaning up legacy APISIX stream routes"
-admin_key="$(grep -m1 -oP 'key: "\K[^"]+' config/apisix.yml || true)"
-if [[ -z "$admin_key" ]]; then
-  echo "  could not read admin key from config/apisix.yml; delete stream_routes 1 and 2 manually"
+# ── 5. Invite string ──────────────────────────────────────────────────────────
+# The server logs its identity fingerprint at startup; the invite is
+# `<public address>#<fingerprint>`. Clients that paste it verify the
+# server before saying hello; clients without it pin on first use.
+log "Invite string"
+for _ in $(seq 1 30); do
+  invite="$(docker compose logs --no-color baucord 2>/dev/null | grep -m1 -oP 'Invite: \K\S+' || true)"
+  [[ -n "$invite" ]] && break
+  sleep 1
+done
+if [[ -n "$invite" ]]; then
+  echo "  $invite"
 else
-  for _ in $(seq 1 30); do
-    docker compose exec -T certer curl -sf -o /dev/null -H "X-API-KEY: $admin_key" \
-      http://127.0.0.1:9180/apisix/admin/routes 2>/dev/null && break
-    sleep 2
-  done
-  for id in 1 2; do
-    code="$(docker compose exec -T certer curl -s -o /dev/null -w '%{http_code}' \
-      -H "X-API-KEY: $admin_key" -X DELETE "http://127.0.0.1:9180/apisix/admin/stream_routes/$id" 2>/dev/null || echo err)"
-    case "$code" in
-    200) echo "  deleted stream_route $id" ;;
-    404) echo "  stream_route $id not present" ;;
-    *) echo "  stream_route $id: admin API returned '$code' — delete manually if it still exists" ;;
-    esac
-  done
+  echo "  not in the log yet; run: docker compose logs baucord | grep Invite"
 fi
 
 # ── 6. Network monitor service ────────────────────────────────────────────────

@@ -1,25 +1,39 @@
 //! Control-plane message types and their serialization.
 //!
 //! Messages are serialized with `postcard` (compact varint encoding) and
-//! travel on [`CONTROL_CHANNEL`] or [`SIGNAL_CHANNEL`] — each variant
-//! knows its own channel via [`ClientMessage::channel`] /
-//! [`ServerMessage::channel`], so call sites can't misroute.
+//! travel on the Control, Signal or Media lane — each variant knows its
+//! own lane via [`ClientMessage::lane`] / [`ServerMessage::lane`], so
+//! call sites can't misroute.
 //!
-//! **Compatibility policy:** there is none within a wire version — this
-//! is a v1 protocol with no deployed peers, and [`crate::PROTOCOL_ID`]
-//! hard-gates mismatched versions at the handshake. Change these enums
-//! freely, but bump `PROTOCOL_ID` when you do.
+//! **Compatibility policy** (see [`crate::features`]): a breaking change
+//! bumps [`crate::ALPN`] and old peers are refused in the handshake. An
+//! additive change is a *new message variant*, appended at the end of
+//! its enum, sent only when the peer announced the matching feature bit.
+//! Never add a field to an existing struct — postcard is positional.
 
 use std::collections::HashMap;
 
-use renet::ClientId;
 use serde::{Deserialize, Serialize};
 
-use crate::channels::{CONTROL_CHANNEL, MEDIA_CHANNEL, SIGNAL_CHANNEL};
+use crate::lanes::Lane;
+
+/// Transport-assigned identity of a connection, valid for its lifetime.
+/// The server assigns a random non-zero id at admission and every peer
+/// learns it from [`ServerMessage::Welcome`] / [`ServerMessage::Init`].
+pub type ClientId = u64;
+
+/// Stable identity behind a display name: `SHA-256(client public key)`.
+/// Not honored by a 1.0 server (Part C of the spec); always `None` in
+/// [`ServerMessage::Welcome`] until the `IDENTITY` feature ships.
+pub type UserId = [u8; 32];
+
+/// Display string for the wire version, sent in `Hello` for the
+/// server's logs (the ALPN already gates compatibility).
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Upper bound for a serialized control message. Anything larger is
 /// dropped before deserialization — a cheap guard against hostile length
-/// games, independent of renet's channel memory cap.
+/// games, independent of any transport-level buffer bound.
 ///
 /// Chat images are the one deliberate exception: their wire size is
 /// governed by [`MAX_IMAGE_MESSAGE_BYTES`] instead, and the codec
@@ -59,6 +73,13 @@ pub const IMAGE_CHUNK_BYTES: usize = 16 * 1024;
 #[allow(clippy::cast_possible_truncation)] // 641 with current constants
 pub const MAX_IMAGE_CHUNKS: u32 = (MAX_CHAT_IMAGE_BYTES / IMAGE_CHUNK_BYTES + 1) as u32;
 
+/// Size cap for a "send my log" upload (§9.1) **[default]**.
+pub const MAX_LOG_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// Most chunks a log upload may span.
+#[allow(clippy::cast_possible_truncation)] // 129 with current constants
+pub const MAX_LOG_UPLOAD_CHUNKS: u32 = (MAX_LOG_UPLOAD_BYTES / IMAGE_CHUNK_BYTES + 1) as u32;
+
 /// Client upload pacing for image chunks, bytes per second. Chosen to
 /// sit under typical home uplinks so the router queue stays shallow
 /// and voice never waits behind bulk: a 1 MiB image takes ~2 s, the
@@ -70,12 +91,15 @@ pub const MEDIA_UPLOAD_PACE: usize = 512 * 1024;
 /// A text message attributed to a specific client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Server-assigned, unique for the server's lifetime (history,
+    /// replies and reactions get a stable handle from day one).
+    pub id: u64,
+    /// Server wall clock, milliseconds since the Unix epoch.
+    pub ts: u64,
     pub client_id: ClientId,
     pub text: String,
 }
 
-/// An image chat message attributed to a specific client.
-///
 /// Why the server refused a screen-share request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DenyReason {
@@ -108,7 +132,7 @@ impl DenyReason {
 
 // ── Voice channels (rooms) ──────────────────────────────────────────────
 //
-// Not to be confused with renet transport channels (`crate::channels`):
+// Not to be confused with transport lanes (`crate::lanes`):
 // a voice channel is a server-defined *room* that scopes voice routing
 // and (optionally) screen-share visibility. Rooms are static per server
 // run, defined in server.yaml, and identified on the wire by their
@@ -163,11 +187,205 @@ impl ChannelDenyReason {
     }
 }
 
+// ── Admission ───────────────────────────────────────────────────────────
+
+/// How the client asks to be let in. Only the shared server password
+/// exists in 1.0; `Account` is reserved so that adding it later is an
+/// appended variant, not a wire break.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Auth {
+    /// The room secret from `server.yaml` (`authentication.password`);
+    /// `None` on servers that don't require one.
+    Shared { password: Option<String> },
+}
+
+/// Proof that the client holds a stable Ed25519 identity key: the public
+/// key and its signature over this TLS session's exporter value
+/// (`export_keying_material("baucord-client-auth")`), so a replayed
+/// `Hello` proves nothing on another session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientKeyProof {
+    pub public_key: [u8; 32],
+    /// 64-byte Ed25519 signature.
+    pub signature: Vec<u8>,
+}
+
+/// Why admission was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefusedReason {
+    /// The shared password is missing or wrong.
+    WrongPassword,
+    /// `network.max_clients` reached.
+    ServerFull,
+    /// Too many failed admissions from this address recently.
+    RateLimited,
+    /// The `Hello` was malformed or arrived too late.
+    BadHello,
+}
+
+impl RefusedReason {
+    /// Human-readable form for UI display.
+    #[must_use]
+    pub fn describe(&self) -> &'static str {
+        match self {
+            RefusedReason::WrongPassword => "wrong server password",
+            RefusedReason::ServerFull => "the server is full",
+            RefusedReason::RateLimited => "too many attempts — try again in a minute",
+            RefusedReason::BadHello => "the server did not understand the handshake",
+        }
+    }
+}
+
+// ── Telemetry (§9.1) ────────────────────────────────────────────────────
+//
+// The client's own view of its session, sent as data so the operator
+// can line it up with the server's `link:` line for the same
+// connection without asking anyone for a log file.
+
+/// Client build and platform.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub version: String,
+    pub os: String,
+    pub arch: String,
+    /// Settings live next to the executable (portable install).
+    pub portable: bool,
+}
+
+/// Transport path statistics. `loss_pct` is *transport-level* (packets
+/// the QUIC stack declared lost) and informational: it never steers a
+/// media decision (spec §6.1).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PathSample {
+    pub rtt_ms: u32,
+    pub loss_pct: f32,
+    pub cwnd: u64,
+    pub bytes_in_flight: u64,
+    pub kbps_up: f32,
+    pub kbps_down: f32,
+    /// Datagrams dropped at send time (buffer full or too large).
+    pub datagram_send_drops: u64,
+    /// Times the transport reported `DatagramsBlocked`.
+    pub datagrams_blocked: u64,
+}
+
+/// Audio encode / decode counters, all already computed for the local
+/// `audio stats:` line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AudioSample {
+    // ── encode ──
+    pub bitrate_bps: u32,
+    /// Opus band as the ladder names it (`"wide"`, `"narrow"`, …).
+    pub band: String,
+    pub frame_ms: u32,
+    pub red: bool,
+    pub fec_hint_pct: u32,
+    pub smoothed_loss_pct: f32,
+    /// The encoder transmitted enough packets in the last window for
+    /// its receiver report to count (spec §6.1).
+    pub exercised: bool,
+    pub packets_sent: u64,
+    pub encode_us: u64,
+    pub input_overruns: u64,
+    pub output_underruns: u64,
+    pub input_device: String,
+    pub output_device: String,
+    // ── decode ──
+    pub packets_received: u64,
+    pub packets_lost: u64,
+    pub fec_recoveries: u64,
+    pub red_recoveries: u64,
+    pub plc_frames: u64,
+    pub jitter_ms: u32,
+    pub jitter_target_ms: u32,
+    pub decode_us: u64,
+}
+
+/// Screen-share sender counters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SharingSample {
+    pub preset: String,
+    pub rung_pct: u32,
+    pub fps_encoded: f32,
+    pub fps_scale_pct: u32,
+    pub forced_keyframes: u64,
+    pub keyframe_requests: u64,
+    pub encoder: String,
+    /// Groups the sharer reset because they fell behind the deadline.
+    pub groups_reset: u64,
+}
+
+/// Screen-share viewer counters, one per watched stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ViewingSample {
+    pub sharer: ClientId,
+    pub frames_decoded: u64,
+    pub frames_dropped: u64,
+    pub keyframe_requests_sent: u64,
+    pub decode_us: u64,
+}
+
+/// One periodic telemetry sample (every 10 s while connected).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TelemetrySample {
+    pub client: ClientInfo,
+    pub path: PathSample,
+    pub audio: Option<AudioSample>,
+    pub sharing: Option<SharingSample>,
+    pub viewing: Vec<ViewingSample>,
+}
+
+/// A notable moment, sent immediately (a handful per session).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TelemetryEvent {
+    // (Variants carry a `String` or two; the size spread is small.)
+    /// The audio rate ladder moved.
+    RateRungChanged {
+        level: u32,
+        bitrate_bps: u32,
+        red: bool,
+    },
+    /// The server-identity prompt was shown to the user.
+    IdentityPromptShown,
+    /// An audio device changed or was restarted.
+    DeviceChanged {
+        description: String,
+    },
+    /// A burst of capture discontinuities.
+    InputDiscontinuityBurst {
+        count: u64,
+    },
+    /// The transport reported send-buffer pressure.
+    SendBufferPressure,
+    ShareStarted {
+        preset: String,
+        encoder: String,
+    },
+    ShareStopped,
+    /// The connection ended, as the client understood it.
+    Disconnected {
+        reason: String,
+    },
+}
+
 // ── Client → Server ─────────────────────────────────────────────────────
 
 /// Messages sent from a client to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
+    /// First message on the Control stream. The server answers with
+    /// [`ServerMessage::Welcome`] followed by [`ServerMessage::Init`],
+    /// or [`ServerMessage::Refused`] and closes.
+    Hello {
+        username: String,
+        auth: Auth,
+        /// Stable identity proof (Part C); a 1.0 server only logs it.
+        client_key: Option<ClientKeyProof>,
+        /// Capability bits ([`crate::features`]).
+        features: u64,
+        client_version: String,
+    },
+
     /// Send a text chat message to the room.
     Chat(String),
 
@@ -228,19 +446,50 @@ pub enum ClientMessage {
         channel_id: u16,
         password: Option<String>,
     },
+
+    // ── Telemetry (feature bit `TELEMETRY`) ─────────────────────────
+    /// Periodic sample of the client's own view (§9.1). Boxed: the
+    /// sample is a few hundred bytes of counters and would otherwise
+    /// size every `ClientMessage` on the hot path.
+    Telemetry(Box<TelemetrySample>),
+    /// A notable moment (§9.1).
+    TelemetryEvent(TelemetryEvent),
+    /// One slice of a "send my log to this server" upload; same
+    /// chunking as images, size-capped by [`MAX_LOG_UPLOAD_BYTES`].
+    LogUploadChunk {
+        upload_id: u32,
+        index: u32,
+        count: u32,
+        data: Vec<u8>,
+    },
 }
 
 impl ClientMessage {
-    /// The channel this message must be sent on.
+    /// The lane this message must be sent on.
     #[must_use]
-    pub fn channel(&self) -> u8 {
+    pub fn lane(&self) -> Lane {
         match self {
-            ClientMessage::RequestKeyframe { .. } => SIGNAL_CHANNEL,
-            // Bulk media rides its own reliable-unordered channel so it
-            // can never head-of-line block ordered chat text.
-            ClientMessage::ChatImageChunk { .. } => MEDIA_CHANNEL,
-            _ => CONTROL_CHANNEL,
+            // Timely, tiny, must never queue behind chat.
+            ClientMessage::RequestKeyframe { .. }
+            | ClientMessage::SubscribeScreen { .. }
+            | ClientMessage::UnsubscribeScreen { .. }
+            | ClientMessage::JoinChannel { .. } => Lane::Signal,
+            // Bulk rides its own stream per upload.
+            ClientMessage::ChatImageChunk { .. } | ClientMessage::LogUploadChunk { .. } => {
+                Lane::Media
+            }
+            _ => Lane::Control,
         }
+    }
+
+    /// Whether this message is a media-upload chunk (rides a Media
+    /// stream that the upload opens and finishes).
+    #[must_use]
+    pub fn is_upload_chunk(&self) -> bool {
+        matches!(
+            self,
+            ClientMessage::ChatImageChunk { .. } | ClientMessage::LogUploadChunk { .. }
+        )
     }
 }
 
@@ -249,6 +498,19 @@ impl ClientMessage {
 /// Messages sent from the server to clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
+    /// Admission granted. Always followed by [`ServerMessage::Init`].
+    Welcome {
+        client_id: ClientId,
+        /// Always `None` on a 1.0 server (Part C).
+        user_id: Option<UserId>,
+        /// The server's capability bits; the client uses the
+        /// intersection with its own.
+        features: u64,
+    },
+
+    /// Admission refused; the server closes the connection after this.
+    Refused { reason: RefusedReason },
+
     /// Initialization payload for a newly connected client: the current
     /// user list, our authoritative client id, server name and greeting,
     /// plus the voice-channel roster: every channel this server defines
@@ -343,6 +605,13 @@ pub enum ServerMessage {
         upload_id: u32,
         index: u32,
         count: u32,
+        /// Server-assigned message id / timestamp, same as
+        /// [`ChatMessage`] (repeated per chunk; postcard has no header).
+        id: u64,
+        ts: u64,
+        /// SHA-256 of the complete image, so receivers can cache by
+        /// content and a later blob store can dedup against them.
+        hash: [u8; 32],
         data: Vec<u8>,
     },
 
@@ -369,19 +638,40 @@ pub enum ServerMessage {
         channels: Vec<ChannelInfo>,
         memberships: HashMap<ClientId, u16>,
     },
+
+    // ── Receiver report (spec §6.1) ─────────────────────────────────
+    /// The relay's view of *this client's* voice over the last
+    /// reporting interval: what its listeners actually miss, counted
+    /// from the voice sequence numbers where the packets arrive. The
+    /// only loss figure that may drive the audio rate ladder.
+    VoiceReceiverReport {
+        received: u32,
+        expected: u32,
+        lost: u32,
+        late: u32,
+        /// The server's path RTT to this client, ms.
+        rtt_ms: u32,
+    },
 }
 
 impl ServerMessage {
-    /// The channel this message must be sent on.
+    /// The lane this message must be sent on.
     #[must_use]
-    pub fn channel(&self) -> u8 {
+    pub fn lane(&self) -> Lane {
         match self {
             ServerMessage::KeyframeRequested { .. } | ServerMessage::StreamHealth { .. } => {
-                SIGNAL_CHANNEL
+                Lane::Signal
             }
-            ServerMessage::ChatImageChunk { .. } => MEDIA_CHANNEL,
-            _ => CONTROL_CHANNEL,
+            ServerMessage::ChatImageChunk { .. } => Lane::Media,
+            _ => Lane::Control,
         }
+    }
+
+    /// Whether this message is a media-upload chunk (rides a Media
+    /// stream that the relay opens and finishes per image).
+    #[must_use]
+    pub fn is_upload_chunk(&self) -> bool {
+        matches!(self, ServerMessage::ChatImageChunk { .. })
     }
 }
 
@@ -403,6 +693,9 @@ fn client_message_len_ok(msg: &ClientMessage, wire_len: usize) -> bool {
     match msg {
         ClientMessage::ChatImageChunk { data, count, .. } => {
             data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_IMAGE_CHUNKS
+        }
+        ClientMessage::LogUploadChunk { data, count, .. } => {
+            data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_LOG_UPLOAD_CHUNKS
         }
         _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
     }
@@ -516,6 +809,9 @@ mod tests {
             upload_id: 3,
             index: 7,
             count: 40,
+            id: 1,
+            ts: 2,
+            hash: [3; 32],
             data: data.clone(),
         };
         let bytes = encode_server_message(&msg).unwrap();
@@ -563,31 +859,34 @@ mod tests {
     }
 
     #[test]
-    fn image_chunks_use_media_channel() {
+    fn image_chunks_use_media_lane() {
         let c = ClientMessage::ChatImageChunk {
             upload_id: 0,
             index: 0,
             count: 1,
             data: Vec::new(),
         };
-        assert_eq!(c.channel(), MEDIA_CHANNEL);
+        assert_eq!(c.lane(), Lane::Media);
         let s = ServerMessage::ChatImageChunk {
             client_id: 0,
             upload_id: 0,
             index: 0,
             count: 1,
+            id: 0,
+            ts: 0,
+            hash: [0; 32],
             data: Vec::new(),
         };
-        assert_eq!(s.channel(), MEDIA_CHANNEL);
+        assert_eq!(s.lane(), Lane::Media);
     }
 
     #[test]
-    fn join_channel_roundtrips_on_control() {
+    fn join_channel_roundtrips_on_signal() {
         let msg = ClientMessage::JoinChannel {
             channel_id: 3,
             password: Some("hunter2".to_string()),
         };
-        assert_eq!(msg.channel(), CONTROL_CHANNEL);
+        assert_eq!(msg.lane(), Lane::Signal);
         let bytes = encode_client_message(&msg).unwrap();
         let back = decode_client_message(&bytes).unwrap();
         assert!(matches!(
@@ -675,7 +974,7 @@ mod tests {
             }],
             memberships: HashMap::from([(7, 0)]),
         };
-        assert_eq!(msg.channel(), CONTROL_CHANNEL);
+        assert_eq!(msg.lane(), Lane::Control);
         let bytes = encode_server_message(&msg).unwrap();
         let ServerMessage::ChannelListUpdated {
             channels,
@@ -706,18 +1005,158 @@ mod tests {
     }
 
     #[test]
-    fn keyframe_messages_use_signal_channel() {
+    fn keyframe_messages_use_signal_lane() {
         assert_eq!(
-            ClientMessage::RequestKeyframe { target_id: 1 }.channel(),
-            SIGNAL_CHANNEL
+            ClientMessage::RequestKeyframe { target_id: 1 }.lane(),
+            Lane::Signal
         );
         assert_eq!(
-            ServerMessage::KeyframeRequested { viewer_id: 1 }.channel(),
-            SIGNAL_CHANNEL
+            ServerMessage::KeyframeRequested { viewer_id: 1 }.lane(),
+            Lane::Signal
         );
-        assert_eq!(
-            ClientMessage::Chat(String::new()).channel(),
-            CONTROL_CHANNEL
-        );
+        assert_eq!(ClientMessage::Chat(String::new()).lane(), Lane::Control);
+    }
+
+    #[test]
+    fn hello_and_welcome_roundtrip() {
+        let hello = ClientMessage::Hello {
+            username: "chicho".to_string(),
+            auth: Auth::Shared {
+                password: Some("conos".to_string()),
+            },
+            client_key: Some(ClientKeyProof {
+                public_key: [7; 32],
+                signature: vec![9; 64],
+            }),
+            features: crate::features::CLIENT_1_0,
+            client_version: "1.0.0".to_string(),
+        };
+        assert_eq!(hello.lane(), Lane::Control);
+        let bytes = encode_client_message(&hello).unwrap();
+        let ClientMessage::Hello {
+            username,
+            auth: Auth::Shared { password },
+            client_key,
+            features,
+            ..
+        } = decode_client_message(&bytes).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(username, "chicho");
+        assert_eq!(password.as_deref(), Some("conos"));
+        assert_eq!(client_key.map(|k| k.public_key), Some([7; 32]));
+        assert_eq!(features, crate::features::CLIENT_1_0);
+
+        let welcome = ServerMessage::Welcome {
+            client_id: 42,
+            user_id: None,
+            features: crate::features::SERVER_1_0,
+        };
+        let bytes = encode_server_message(&welcome).unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes).unwrap(),
+            ServerMessage::Welcome {
+                client_id: 42,
+                user_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn refused_and_receiver_report_roundtrip() {
+        let bytes = encode_server_message(&ServerMessage::Refused {
+            reason: RefusedReason::WrongPassword,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes).unwrap(),
+            ServerMessage::Refused {
+                reason: RefusedReason::WrongPassword
+            }
+        ));
+
+        let report = ServerMessage::VoiceReceiverReport {
+            received: 90,
+            expected: 100,
+            lost: 10,
+            late: 2,
+            rtt_ms: 43,
+        };
+        assert_eq!(report.lane(), Lane::Control);
+        let bytes = encode_server_message(&report).unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes).unwrap(),
+            ServerMessage::VoiceReceiverReport {
+                expected: 100,
+                lost: 10,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn chat_message_carries_server_id_and_timestamp() {
+        let msg = ServerMessage::Chat(ChatMessage {
+            id: 5,
+            ts: 1_700_000_000_000,
+            client_id: 1,
+            text: "hi".to_string(),
+        });
+        let bytes = encode_server_message(&msg).unwrap();
+        let ServerMessage::Chat(back) = decode_server_message(&bytes).unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!((back.id, back.ts), (5, 1_700_000_000_000));
+    }
+
+    #[test]
+    fn telemetry_sample_roundtrips_on_control() {
+        let msg = ClientMessage::Telemetry(Box::new(TelemetrySample {
+            client: ClientInfo {
+                version: "1.0.0".to_string(),
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                portable: true,
+            },
+            path: PathSample {
+                rtt_ms: 40,
+                ..PathSample::default()
+            },
+            audio: Some(AudioSample::default()),
+            sharing: None,
+            viewing: vec![ViewingSample {
+                sharer: 9,
+                ..ViewingSample::default()
+            }],
+        }));
+        assert_eq!(msg.lane(), Lane::Control);
+        let bytes = encode_client_message(&msg).unwrap();
+        assert!(bytes.len() < 600, "sample is {} bytes", bytes.len());
+        let ClientMessage::Telemetry(back) = decode_client_message(&bytes).unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(back.path.rtt_ms, 40);
+        assert_eq!(back.viewing[0].sharer, 9);
+    }
+
+    #[test]
+    fn log_upload_chunk_is_bounded_like_images() {
+        let ok = ClientMessage::LogUploadChunk {
+            upload_id: 1,
+            index: 0,
+            count: 2,
+            data: vec![0; IMAGE_CHUNK_BYTES],
+        };
+        assert_eq!(ok.lane(), Lane::Media);
+        assert!(encode_client_message(&ok).is_some());
+        let overcount = ClientMessage::LogUploadChunk {
+            upload_id: 1,
+            index: 0,
+            count: MAX_LOG_UPLOAD_CHUNKS + 1,
+            data: Vec::new(),
+        };
+        assert!(encode_client_message(&overcount).is_none());
     }
 }

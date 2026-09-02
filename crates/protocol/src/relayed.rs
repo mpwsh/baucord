@@ -2,7 +2,7 @@
 //!
 //! Media packets (voice / video / system audio) carry **no sender id**
 //! from client to server — the server already knows who each datagram
-//! came from via the authenticated netcode transport. When relaying, the
+//! came from via the authenticated QUIC connection. When relaying, the
 //! server prepends the sender's transport id:
 //!
 //! ```text

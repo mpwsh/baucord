@@ -1,6 +1,6 @@
 //! Roster state — the user list a shell renders.
 //!
-//! `ClientId` is a plain `u64` here (renet's `ClientId` is one); the
+//! `ClientId` is a plain `u64` here (the transport's peer id is one); the
 //! crate stays free of networking deps.
 
 use std::collections::{HashMap, HashSet};

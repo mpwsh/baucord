@@ -1,16 +1,20 @@
-// network.rs — Renet client + network thread.
+// network.rs — QUIC client + network thread.
 //
-// NetworkClient handles protocol and serialization; NetworkThreadHandle
-// owns the thread that polls the client and routes voice packets to the
-// voice thread and video packets to the screen thread.
+// NetworkClient handles the session (transport driver, admission,
+// protocol, serialization); NetworkThreadHandle owns the thread that
+// pumps it and routes voice packets to the voice thread and video
+// groups to the screen thread.
 //
-// All wire protocol types come from the shared `protocol` crate.
+// All wire protocol types come from the shared `protocol` crate; the
+// transport (quinn-proto driven from this thread, no runtime) from
+// `transport`.
 //
-// Authentication: when `token_url` is configured, the client fetches a
-// netcode ConnectToken over HTTPS (the server's in-process issuer,
-// behind the deployment's TLS proxy) and connects in secure mode — the
-// server assigns our client id and username via the token. Without a
-// token URL it falls back to open (unsecure) mode for LAN/dev servers.
+// Authentication (spec §3): the server's identity is an Ed25519 key we
+// pin by fingerprint — from the invite string, or on first use — and
+// the room password rides inside `Hello` over the encrypted connection.
+// Our own key signs the TLS exporter so the server can derive a stable
+// user id. A server whose key changed is refused before any application
+// data flows; the UI decides whether to accept the new one.
 //
 // Media attribution: relayed media arrives wrapped in the server's
 // sender envelope ([sender_id: u64][packet]) — the sender id is stamped
@@ -19,57 +23,43 @@
 
 use std::{
     collections::HashMap,
-    io::Read,
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
+    sync::Arc,
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use audio::{AudioPacket, PayloadType};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
-use log::warn;
+use log::{info, warn};
 use protocol::{
-    pack_system_audio, pack_video_frame, pack_voice_with_flags, parse_system_audio, parse_voice,
-    split_sender, ChannelDenyReason, ChannelInfo, ClientMessage, DenyReason, ServerMessage,
-    ShareScope, VideoReassembler, CLIENT_BYTES_PER_TICK, CONTROL_CHANNEL, MEDIA_CHANNEL,
-    PROTOCOL_ID, SIGNAL_CHANNEL, SYSTEM_AUDIO_CHANNEL, VIDEO_CHANNEL, VOICE_CHANNEL,
-    VOICE_FLAG_RED,
+    AudioSample, Auth, ChannelDenyReason, ChannelInfo, ClientId, ClientInfo, ClientKeyProof,
+    ClientMessage, DenyReason, Lane, PathSample, RefusedReason, ServerMessage, ShareScope,
+    SharingSample, TelemetryEvent, TelemetrySample, VOICE_FLAG_RED, VideoReassembler,
+    ViewingSample, features, pack_system_audio, pack_video_frame, pack_voice_with_flags,
+    parse_system_audio, parse_voice, split_sender,
 };
-use renet::{ClientId, RenetClient};
-use renet_netcode::{
-    generate_random_bytes, ClientAuthentication, ConnectToken, NetcodeClientTransport,
-    NetcodeTransportError,
+use sha2::{Digest, Sha256};
+use transport::{
+    Budget, ClientKey, DisconnectReason, Driver, Event, Fingerprint, LinkStats, OWN_TRACK,
+    Observation, PeerId, Trust, UdpIo, UploadId, VideoItem,
+    identity::{CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL},
 };
 
-use crate::{screen::ScreenControl, voice::VoiceControl, WakeFn};
+use crate::{WakeFn, screen::ScreenControl, voice::VoiceControl};
 
-/// How often to sample link statistics for the UI, the voice encoder's
-/// uplink-loss feedback, and the screen thread's bitrate ladder — all
-/// ride the same sample. The ladder's dwell time is sized against this
-/// cadence and renet's loss window (see `RATE_DWELL` in screen.rs).
+/// How often to sample link statistics for the UI and the screen
+/// thread's bitrate ladder. The ladder's dwell time is sized against
+/// this cadence (see `RATE_DWELL` in screen.rs).
 const NETWORK_STATS_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Longest the client goes without calling `send_packets()` when it has
-/// nothing queued. Outbound messages (voice, video, control) still flush
-/// on the very next 1 ms loop iteration, so media latency is untouched;
-/// this only bounds the cadence of ack-only packets.
-///
-/// Why it matters: renet emits a standalone `Ack` packet on every
-/// `send_packets()` call while `pending_acks` is non-empty, and that set
-/// only empties once the *server acknowledges our ack* — a round trip
-/// later. Calling `send_packets()` every 1 ms therefore produced ~1000
-/// ack packets/s on the uplink whenever anyone in the room was sharing
-/// (the server ticks at 1 ms then and its acks keep ours pending). The
-/// server's hourly stats show the mirror image: 81 kbit/s of 10-byte
-/// renet acks to *idle* clients, ~0.5 Mbit/s on the wire. Ten times the
-/// voice packet rate, and packets-per-second is what Wi-Fi uplinks,
-/// DOCSIS upstream schedulers and cheap NAT flow caches choke on.
-const IDLE_SEND_INTERVAL: Duration = Duration::from_millis(10);
+/// How often a telemetry sample goes to the server (spec §9.1).
+const TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Log link samples at or above this loss so a bad stretch is visible in
-/// the log file, not just the overlay. Sampled every
-/// [`NETWORK_STATS_INTERVAL`], so a sustained bad link costs one line
-/// per 2 s.
+/// Log link samples at or above this transport-level loss so a bad
+/// stretch is visible in the log file, not just the overlay. Sampled
+/// every [`NETWORK_STATS_INTERVAL`], so a sustained bad link costs one
+/// line per 2 s.
 const LINK_LOG_LOSS_PCT: f64 = 5.0;
 /// While the link carries video-scale traffic, log from this much lower
 /// loss. A 1080p60 frame is ~16 chunks and one lost chunk loses the
@@ -80,47 +70,56 @@ const LINK_LOG_LOSS_PCT: f64 = 5.0;
 const LINK_LOG_LOSS_PCT_STREAMING: f64 = 1.0;
 const LINK_LOG_STREAMING_KBPS: f64 = 500.0;
 
-/// Ceiling applied to uplink loss readings before they are fed to the
-/// voice encoder. renet measures loss over a 6 s window of *sent*
-/// packets; on a quiet link (nobody talking, only keepalives) that
-/// window holds a handful of packets and the ratio is noise — a reading
-/// of 80 % may mean four lost keepalives. Extreme readings are therefore
-/// *clamped* to this value, not dropped: the encoder's rate controller
-/// only needs to know "the link is bad", and the exact figure above 50
-/// adds nothing. Dropping them (the previous behavior) left the encoder
-/// blind during the worst storms and let its last-seen value latch —
-/// the 2026-08-29 03:51 logs show the encoder acting on 24 % while the
-/// transport measured 78 %. The idle-artifact concern is now handled by
-/// staleness on the audio side: a value nobody refreshes for ~10 s is
-/// treated as unknown and decays (see `AudioStats::uplink_loss_updated_ms`).
-///
-/// The screen thread's bitrate ladder uses the raw reading: while a
-/// share is running the link is anything but quiet, and it guards
-/// against the idle artifact by checking `kbps_up` against the rung
-/// it's on instead.
+/// A voice receiver report covers a window in which the sender was
+/// actually talking only if the relay expected at least this many
+/// packets (spec §6.1: "exercised"). Below that the loss figure is a
+/// handful of DTX refreshes and says nothing.
+const VOICE_REPORT_MIN_PACKETS: u32 = 15;
+
+/// Ceiling applied to voice loss readings before they are fed to the
+/// encoder. Its rate controller only needs to know "the link is bad";
+/// the exact figure above 50 adds nothing.
 const UPLINK_LOSS_CLAMP_PCT: f64 = 50.0;
 
-/// Timeout for the connect-token HTTP fetch.
-const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest a relayed image may sit half-assembled before it is
+/// forgotten (its sender vanished or gave up mid-pace).
+const IMAGE_PARTIAL_TTL: Duration = Duration::from_secs(120);
 
-/// Largest token response we will read (a netcode token is 2048 bytes).
-const MAX_TOKEN_RESPONSE_BYTES: u64 = 8192;
+/// One "send my log" upload per this interval, mirroring the server's
+/// acceptance window.
+const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_secs(600);
 
 // ── Messages sent to the UI / App layer ─────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
-    /// Outbound image upload progress, 0–100. 100 means the reliable
-    /// channel has drained (every byte acked) — the UI hides its
-    /// indicator on it.
+    /// Outbound image upload progress, 0–100. 100 means the transport
+    /// has taken every byte — the UI hides its indicator on it.
     UploadProgress {
         pct: u8,
     },
+    /// Admitted by the server (`Welcome` received).
     Connected,
+    /// The server presented `fingerprint`. `first_use` when we had no
+    /// pin for this server (trust on first use): the app stores it on
+    /// the server entry. Also sent after a signed key rotation, with
+    /// the new fingerprint, so the pin follows.
+    ServerIdentity {
+        fingerprint: String,
+        first_use: bool,
+    },
+    /// The server's key differs from the one we pinned, and no signed
+    /// successor proof vouched for it. Nothing was sent to it. The app
+    /// asks the user; connecting again with `fingerprint = observed`
+    /// accepts the new key.
+    IdentityChanged {
+        expected: String,
+        observed: String,
+    },
     Disconnected(String),
-    /// The token issuer answered HTTP 403 during connect — the server
-    /// password is missing or wrong. The UI prompts for it and offers
-    /// to save it on the server entry.
+    /// The server refused our `Hello` for a wrong or missing room
+    /// password. The UI prompts for it and offers to save it on the
+    /// server entry.
     AccessDenied,
     InitClient {
         users: HashMap<ClientId, String>,
@@ -161,8 +160,8 @@ pub enum NetworkMessage {
         username: String,
         text: String,
     },
-    /// A chat image from a user (encoded PNG bytes, ≤
-    /// `protocol::MAX_CHAT_IMAGE_BYTES`).
+    /// A chat image from a user (encoded PNG/JPEG/GIF bytes, ≤
+    /// `protocol::MAX_CHAT_IMAGE_BYTES`, content hash verified).
     ImageMessage {
         username: String,
         data: Vec<u8>,
@@ -186,17 +185,36 @@ pub enum NetworkMessage {
         muted: bool,
         deafened: bool,
     },
-    /// Periodic link statistics (replaces the old `LatencyUpdate`,
-    /// which carried only RTT while renet was already measuring loss
-    /// and throughput).
+    /// Periodic link statistics for the UI. `loss_pct` is the
+    /// transport's own accounting and informational only — the media
+    /// paths get their loss from receiver reports and group resets.
     NetworkStats {
         rtt_ms: f64,
-        /// Packet loss, 0.0–100.0 (percent).
+        /// Transport-level packet loss, 0.0–100.0 (percent).
         loss_pct: f64,
         /// Outbound throughput in kbit/s.
         kbps_up: f64,
         /// Inbound throughput in kbit/s.
         kbps_down: f64,
+    },
+    /// The relay's account of our voice over the last two seconds
+    /// (routed to the voice thread, not app): the only loss figure the
+    /// audio ladder acts on (spec §6.1).
+    VoiceReceiverReport {
+        /// Percent of expected packets that never arrived, clamped.
+        loss_pct: u32,
+        rtt_ms: u32,
+        /// The window held enough packets to mean something.
+        exercised: bool,
+    },
+    /// Our own video uplink as the transport measures it (routed to the
+    /// screen thread, not app): the share of groups we had to abandon,
+    /// which is what the bitrate ladder steps on.
+    UplinkVideo {
+        /// Groups reset over groups started in the window, percent.
+        behind_pct: f32,
+        rtt_ms: f32,
+        kbps_up: f32,
     },
 
     // ── Screen share events ─────────────────────────────────────────
@@ -251,361 +269,325 @@ pub enum NetworkMessage {
     },
 }
 
-// ── Token fetch ─────────────────────────────────────────────────────────
-
-/// Why a connect attempt never produced a session.
-#[derive(Debug)]
-pub(crate) enum ConnectError {
-    /// The token issuer refused us with HTTP 403 — wrong or missing
-    /// server password. Other statuses stay [`ConnectError::Failed`]:
-    /// the issuer's contract reserves 403 for the password check.
-    AccessDenied,
-    /// Anything else (socket, HTTP, token decode…), preformatted for
-    /// the error toast.
-    Failed(String),
-}
-
-/// Fetch a netcode ConnectToken from the issuer.
-///
-/// Blocking (runs on the network thread during connect). The URL should
-/// be HTTPS in any real deployment — the token contains the session keys.
-fn fetch_connect_token(
-    url: &str,
-    username: &str,
-    password: Option<&str>,
-) -> Result<ConnectToken, ConnectError> {
-    let mut request = ureq::post(url)
-        .timeout(TOKEN_FETCH_TIMEOUT)
-        .set(protocol::PROTOCOL_HEADER, &PROTOCOL_ID.to_string());
-    if let Some(pass) = password {
-        request = request.set("x-baucord-pass", pass);
-    }
-
-    let response = match request.send_string(username) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(403, _)) => return Err(ConnectError::AccessDenied),
-        // Protocol mismatch: the issuer's body is the user-facing text
-        // (see `protocol::OUTDATED_MESSAGE`), show it as-is.
-        Err(ureq::Error::Status(code, response)) if code == protocol::OUTDATED_STATUS => {
-            let body = response.into_string().unwrap_or_default();
-            let body = body.trim();
-            return Err(ConnectError::Failed(if body.is_empty() {
-                protocol::OUTDATED_MESSAGE.to_string()
-            } else {
-                body.to_string()
-            }));
-        }
-        Err(ureq::Error::Status(code, response)) => {
-            let body = response.into_string().unwrap_or_default();
-            return Err(ConnectError::Failed(format!(
-                "token server returned {code}: {}",
-                body.trim()
-            )));
-        }
-        Err(e) => return Err(ConnectError::Failed(format!("token request failed: {e}"))),
-    };
-
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take(MAX_TOKEN_RESPONSE_BYTES)
-        .read_to_end(&mut bytes)
-        .map_err(|e| ConnectError::Failed(format!("failed to read token response: {e}")))?;
-
-    let token = ConnectToken::read(&mut bytes.as_slice())
-        .map_err(|e| ConnectError::Failed(format!("invalid connect token: {e}")))?;
-
-    // The issuer minted this with *its* protocol id and netcode would
-    // happily use it — an older server would accept us and then
-    // misparse our packets. Refuse up front with a message that says
-    // which side needs the update.
-    if token.protocol_id != PROTOCOL_ID {
-        return Err(ConnectError::Failed(format!(
-            "Server is running an older version (protocol {}, this client speaks {PROTOCOL_ID}) \
-             — ask the admin to update it",
-            token.protocol_id
-        )));
-    }
-    Ok(token)
-}
-
 // ════════════════════════════════════════════════════════════════════════
-//  NetworkClient — protocol + state
+//  NetworkClient — session state
 // ════════════════════════════════════════════════════════════════════════
-
-/// A chat image being paced onto the wire, chunk by chunk.
-struct OutgoingImage {
-    upload_id: u32,
-    chunks: Vec<Vec<u8>>,
-    next: usize,
-}
 
 /// A relayed chat image being reassembled from paced chunks.
 struct IncomingImage {
     count: u32,
     received: u32,
     bytes: usize,
+    hash: [u8; 32],
     chunks: Vec<Option<Vec<u8>>>,
     started: Instant,
 }
 
+/// What we say once the transport is up.
+struct PendingHello {
+    username: String,
+    password: Option<String>,
+    client_key: Option<Arc<ClientKey>>,
+}
+
+/// Where the session is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Phase {
+    /// QUIC handshake in progress.
+    Connecting,
+    /// Transport up, `Hello` sent, waiting for the verdict.
+    AwaitingWelcome,
+    /// Admitted; the application protocol is live.
+    Admitted,
+    /// Over — the reason has been reported to the app.
+    Closed,
+}
+
+/// Latest numbers the other threads handed us for the telemetry
+/// sample; `None`/empty until they do.
+#[derive(Default)]
+struct TelemetryInputs {
+    audio: Option<AudioSample>,
+    sharing: Option<SharingSample>,
+    viewing: Vec<ViewingSample>,
+}
+
 pub(crate) struct NetworkClient {
-    client: RenetClient,
-    transport: NetcodeClientTransport,
+    driver: Driver,
+    udp: UdpIo,
+    /// The server, as the driver names it.
+    server: PeerId,
+    phase: Phase,
+    hello: Option<PendingHello>,
+    /// The identity the server presented (once the handshake verified
+    /// it).
+    identity: Option<Observation>,
+    client_info: ClientInfo,
     usernames: HashMap<ClientId, String>,
     message_queue: Vec<NetworkMessage>,
-    last_updated: Instant,
     reassembler: VideoReassembler,
-
     // Speaking status dedupe (only send on change)
     last_speaking_sent: bool,
-    /// In-flight paced image upload (chunks not yet handed to renet).
-    upload: Option<OutgoingImage>,
-    /// Wrapping id so the server can tell uploads apart.
-    upload_next_id: u32,
-    /// Token bucket for upload pacing, in bytes.
-    upload_tokens: f64,
-    upload_last_tick: Instant,
-    /// Reassembly of relayed images, keyed by (sender, upload id).
-    incoming_images: HashMap<(u64, u32), IncomingImage>,
+    /// In-flight image upload, as the transport tracks it.
+    upload: Option<UploadId>,
     /// Last percentage reported to the UI (255 = force first emit).
     upload_last_pct: u8,
+    /// Reassembly of relayed images, keyed by (sender, upload id).
+    incoming_images: HashMap<(u64, u32), IncomingImage>,
     last_stats_check: Instant,
-    /// Whether we've announced `NetworkMessage::Connected` to the app.
-    /// Set once the netcode handshake actually completes.
-    announced_connected: bool,
-    /// Warn about OS send-buffer pressure once per connection, not per
-    /// tick — bursts can repeat every frame during a stream.
-    send_pressure_warned: bool,
-    /// Set while video frames are being dropped for lack of channel
-    /// room; cleared when a frame fits again, so each episode logs once.
-    video_channel_full: bool,
-    /// A message was queued on some channel since the last
-    /// `send_packets()`; flush on this tick rather than waiting for
-    /// [`IDLE_SEND_INTERVAL`].
-    outbound_pending: bool,
-    /// When `send_packets()` last ran (idle-flush cadence).
-    last_send: Instant,
+    /// Transport counters at the last stats sample.
+    stats_baseline: Option<LinkStats>,
+    /// Telemetry negotiated with the server.
+    telemetry_enabled: bool,
+    last_telemetry: Instant,
+    telemetry: TelemetryInputs,
+    last_log_upload: Option<Instant>,
+    /// Frames dropped because no video group was open (delta frames
+    /// before the first keyframe, or after a reset). Logged once per
+    /// episode.
+    video_no_group: bool,
+    /// Keyframe requests we sent per sharer (viewing telemetry).
+    keyframe_requests_sent: HashMap<ClientId, u64>,
+    /// `DatagramsBlocked` reports (telemetry).
+    datagrams_blocked: u64,
 }
 
 impl NetworkClient {
+    /// Bind a socket and start the QUIC handshake. Nothing blocks; the
+    /// outcome arrives through [`Self::poll_messages`].
+    ///
+    /// # Errors
+    /// Socket or TLS setup failure, preformatted for the error toast.
     pub fn connect(
         server_addr: SocketAddr,
         username: &str,
-        token_url: Option<&str>,
-        token_password: Option<&str>,
-    ) -> Result<Self, ConnectError> {
-        let client = RenetClient::new(protocol::connection_config(CLIENT_BYTES_PER_TICK));
-
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .map_err(|e| ConnectError::Failed(format!("Failed to bind socket: {e}")))?;
-        let sock_ref = socket2::SockRef::from(&socket);
-        sock_ref
-            .set_send_buffer_size(protocol::UDP_SOCKET_BUFFER_BYTES)
-            .ok();
-        sock_ref
-            .set_recv_buffer_size(protocol::UDP_SOCKET_BUFFER_BYTES)
-            .ok();
-        // The sets above are best-effort; log what the OS actually
-        // granted so a clamped buffer (firewall LSPs, policy) is
-        // visible in baucord.log when diagnosing ENOBUFS reports.
-        if let (Ok(snd), Ok(rcv)) = (sock_ref.send_buffer_size(), sock_ref.recv_buffer_size()) {
-            log::info!(
-                "UDP socket buffers: send {} KB, recv {} KB",
-                snd / 1024,
-                rcv / 1024
-            );
-        }
-
-        let current_time = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| ConnectError::Failed(format!("System time error: {e}")))?;
-
-        let authentication = match token_url {
-            Some(url) => {
-                // Secure mode: the issuer assigns our client id and
-                // embeds our username inside the token; the connection
-                // is keyed by material derived from the server's
-                // private key.
-                log::info!("Fetching connect token from {url}");
-                let connect_token = fetch_connect_token(url, username, token_password)?;
-                ClientAuthentication::Secure { connect_token }
-            }
-            None => {
-                // Open mode (LAN/dev). The previous implementation used
-                // the wall-clock millisecond timestamp as the client id,
-                // which collides when two people connect in the same
-                // millisecond and is trivially predictable. Random is
-                // free.
-                let mut client_id = u64::from_le_bytes(generate_random_bytes());
-                if client_id == 0 {
-                    client_id = 1;
-                }
-                ClientAuthentication::Unsecure {
-                    server_addr,
-                    client_id,
-                    user_data: Some(protocol::encode_username(&protocol::sanitize_username(
-                        username,
-                    ))),
-                    protocol_id: PROTOCOL_ID,
-                }
-            }
+        password: Option<&str>,
+        fingerprint: Option<Fingerprint>,
+        client_key: Option<Arc<ClientKey>>,
+        portable: bool,
+    ) -> Result<Self, String> {
+        let budget = Budget::client();
+        let bind: SocketAddr = if server_addr.is_ipv4() {
+            "0.0.0.0:0".parse().expect("literal")
+        } else {
+            "[::]:0".parse().expect("literal")
         };
-
-        let transport = NetcodeClientTransport::new(current_time, authentication, socket)
-            .map_err(|e| ConnectError::Failed(format!("Failed to create transport: {e}")))?;
+        let udp = UdpIo::bind(bind, budget.socket_buffer_bytes)
+            .map_err(|e| format!("Failed to bind socket: {e}"))?;
+        let mut driver = Driver::new_client(fingerprint, budget)
+            .map_err(|e| format!("Failed to set up the transport: {e}"))?;
+        driver.set_max_gso_segments(udp.max_gso_segments());
+        let now = Instant::now();
+        let server = driver
+            .connect(now, server_addr)
+            .map_err(|e| format!("Failed to connect: {e}"))?;
+        info!(
+            "Connecting to {server_addr} ({})",
+            fingerprint.map_or_else(
+                || "no pin — trust on first use".to_string(),
+                |fp| format!("pinned {fp}")
+            )
+        );
 
         Ok(NetworkClient {
-            client,
-            transport,
+            driver,
+            udp,
+            server,
+            phase: Phase::Connecting,
+            hello: Some(PendingHello {
+                username: username.to_string(),
+                password: password.map(str::to_string),
+                client_key,
+            }),
+            identity: None,
+            client_info: ClientInfo {
+                version: protocol::CLIENT_VERSION.to_string(),
+                os: std::env::consts::OS.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
+                portable,
+            },
             usernames: HashMap::new(),
             message_queue: Vec::new(),
-            last_updated: Instant::now(),
             reassembler: VideoReassembler::new(),
             last_speaking_sent: false,
             upload: None,
-            upload_next_id: 0,
-            upload_tokens: 0.0,
-            upload_last_tick: Instant::now(),
-            incoming_images: HashMap::new(),
             upload_last_pct: 255,
-            last_stats_check: Instant::now(),
-            announced_connected: false,
-            send_pressure_warned: false,
-            video_channel_full: false,
-            outbound_pending: true,
-            last_send: Instant::now(),
+            incoming_images: HashMap::new(),
+            last_stats_check: now,
+            stats_baseline: None,
+            telemetry_enabled: false,
+            last_telemetry: now,
+            telemetry: TelemetryInputs::default(),
+            last_log_upload: None,
+            video_no_group: false,
+            keyframe_requests_sent: HashMap::new(),
+            datagrams_blocked: 0,
         })
     }
 
     // ── Tick ────────────────────────────────────────────────────────
 
+    /// Receive, process, send. Cheap when nothing happened.
     pub fn update(&mut self) {
+        if self.phase == Phase::Closed {
+            return;
+        }
         let now = Instant::now();
-        let duration = now - self.last_updated;
-        self.last_updated = now;
-
-        self.client.update(duration);
-
-        if let Err(e) = self.transport.update(duration, &mut self.client) {
-            log::error!("Transport error: {e:?}");
-            self.message_queue
-                .push(NetworkMessage::Disconnected(e.to_string()));
-            return;
+        if let Err(e) = self.udp.recv_batch(|d| self.driver.handle_datagram(now, d)) {
+            warn!("UDP receive error: {e}");
         }
+        self.driver.handle_timeouts(now);
 
-        if let Some(reason) = self.client.disconnect_reason() {
-            log::error!("Renet disconnect reason: {reason:?}");
-            self.message_queue
-                .push(NetworkMessage::Disconnected(reason.to_string()));
-            return;
-        }
-
-        self.pump_upload();
-
-        // Announce Connected exactly once, when the handshake completes.
-        if !self.announced_connected && self.client.is_connected() {
-            self.announced_connected = true;
-            self.message_queue.push(NetworkMessage::Connected);
-        }
-
-        self.process_control_messages();
-        self.process_voice_messages();
-        self.process_video_messages();
-        self.process_system_audio_messages();
-
-        // Flush immediately when anything was queued this tick (media
-        // latency is unchanged); otherwise at most every
-        // IDLE_SEND_INTERVAL so ack-only traffic stays near 100 pps.
-        // The netcode handshake and keepalives are sent from
-        // `transport.update()` above and are unaffected.
-        let idle_flush_due = now.duration_since(self.last_send) >= IDLE_SEND_INTERVAL;
-        if !(self.outbound_pending || idle_flush_due) {
+        self.process_events(now);
+        if self.phase != Phase::Closed {
+            self.process_control_messages(now);
+            self.process_voice_messages();
+            self.process_video_messages(now);
+            self.process_system_audio_messages();
+            self.report_upload_progress();
             self.sample_link_stats(now);
-            return;
-        }
-        self.outbound_pending = false;
-        self.last_send = now;
-
-        if let Err(e) = self.transport.send_packets(&mut self.client) {
-            // Transient send-buffer pressure. Two flavors, same
-            // meaning for UDP as congestion loss — drop the datagrams
-            // and let renet's reliability layer re-send; never a
-            // reason to tear the connection down:
-            //   * WouldBlock — the socket's own queue is full
-            //     (WSAEWOULDBLOCK = 10035 on Windows).
-            //   * ENOBUFS "no buffer space available" — the OS or
-            //     interface queue is full (WSAENOBUFS = 10055 on
-            //     Windows, errno 105 on Linux, 55 on macOS). Windows
-            //     raises this routinely during video keyframe bursts,
-            //     especially on Wi-Fi, even with a large SO_SNDBUF.
-            // If pressure persists long enough to matter, keepalives
-            // stop landing and netcode's own timeout produces a real
-            // disconnect. The typed check is primary; the string probe
-            // is a fallback for errors surfacing through wrapped
-            // variants — computed once, only on the (rare) error path.
-            #[cfg(windows)]
-            const ENOBUFS: i32 = 10055;
-            #[cfg(target_os = "macos")]
-            const ENOBUFS: i32 = 55;
-            #[cfg(not(any(windows, target_os = "macos")))]
-            const ENOBUFS: i32 = 105;
-            let is_transient = matches!(
-                &e,
-                NetcodeTransportError::IO(io_err)
-                    if io_err.kind() == std::io::ErrorKind::WouldBlock
-                        || io_err.raw_os_error() == Some(ENOBUFS)
-            ) || {
-                let msg = e.to_string();
-                msg.contains("10035")
-                    || msg.contains("10055")
-                    || msg.contains("WouldBlock")
-                    || msg.contains("buffer space")
-            };
-            if is_transient {
-                if !self.send_pressure_warned {
-                    self.send_pressure_warned = true;
-                    log::warn!(
-                        "send_packets: OS send buffer pressure ({e}); dropping this batch and continuing (logged once per connection)"
-                    );
-                }
-                log::debug!("send_packets: transient buffer pressure, will retry next tick");
-            } else {
-                self.message_queue
-                    .push(NetworkMessage::Disconnected(format!(
-                        "Failed to send packets: {e}"
-                    )));
-            }
+            self.maybe_send_telemetry(now);
         }
 
-        self.sample_link_stats(now);
+        self.flush();
     }
 
-    /// Sample link statistics for the UI every ~2 seconds. renet
-    /// already measures loss and throughput alongside RTT — the old
-    /// code exposed only RTT and left the rest unread.
+    /// Push everything the driver produced onto the wire.
+    fn flush(&mut self) {
+        while let Some(t) = self.driver.poll_transmit() {
+            self.udp.send(&t);
+        }
+    }
+
+    /// The next moment the transport needs a tick, for the loop's sleep.
+    pub fn next_timeout(&mut self) -> Option<Instant> {
+        self.driver.next_timeout()
+    }
+
+    fn process_events(&mut self, now: Instant) {
+        let events: Vec<Event> = self.driver.drain_events().collect();
+        for event in events {
+            match event {
+                Event::Connected { identity, .. } => {
+                    self.identity = identity;
+                    if let Some(Observation::Accepted { fingerprint, trust }) = &self.identity {
+                        info!("Transport up; server identity {fingerprint} ({trust:?})");
+                    }
+                    self.send_hello(now);
+                }
+                Event::Disconnected { reason, .. } => {
+                    self.on_disconnected(&reason);
+                }
+                Event::DatagramsBlocked { .. } => {
+                    self.datagrams_blocked += 1;
+                    if self.datagrams_blocked == 1 {
+                        warn!("Voice datagram send buffer full; oldest packets are being dropped");
+                        self.send_event(now, TelemetryEvent::SendBufferPressure);
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_disconnected(&mut self, reason: &DisconnectReason) {
+        if self.phase == Phase::Closed {
+            return;
+        }
+        let was_connecting = matches!(self.phase, Phase::Connecting | Phase::AwaitingWelcome);
+        self.phase = Phase::Closed;
+        match reason {
+            DisconnectReason::IdentityChanged { expected, observed } => {
+                warn!("Server identity changed: pinned {expected}, presented {observed}");
+                self.message_queue.push(NetworkMessage::IdentityChanged {
+                    expected: expected.to_string(),
+                    observed: observed.to_string(),
+                });
+            }
+            DisconnectReason::ApplicationClosed { .. } if was_connecting => {
+                // The server closed under a `Refused`; that verdict was
+                // already reported (or never arrived, in which case say
+                // so).
+                if !self.message_queue.iter().any(|m| {
+                    matches!(
+                        m,
+                        NetworkMessage::AccessDenied | NetworkMessage::Disconnected(_)
+                    )
+                }) {
+                    self.message_queue
+                        .push(NetworkMessage::Disconnected(reason.to_string()));
+                }
+            }
+            other => {
+                log::error!("Disconnected: {other}");
+                self.message_queue
+                    .push(NetworkMessage::Disconnected(other.to_string()));
+            }
+        }
+    }
+
+    /// Say who we are, once the transport is up.
+    fn send_hello(&mut self, now: Instant) {
+        let Some(hello) = self.hello.take() else {
+            return;
+        };
+        let client_key = hello.client_key.as_ref().and_then(|key| {
+            let mut exported = [0u8; CLIENT_AUTH_EXPORTER_BYTES];
+            self.driver
+                .export_keying_material(self.server, CLIENT_AUTH_EXPORTER_LABEL, b"", &mut exported)
+                .map(|()| ClientKeyProof {
+                    public_key: key.public_key(),
+                    signature: key.sign(&exported),
+                })
+        });
+        let msg = ClientMessage::Hello {
+            username: hello.username,
+            auth: Auth::Shared {
+                password: hello.password,
+            },
+            client_key,
+            features: features::CLIENT_1_0,
+            client_version: protocol::CLIENT_VERSION.to_string(),
+        };
+        self.send_control(now, &msg);
+        self.phase = Phase::AwaitingWelcome;
+    }
+
+    // ── Link statistics & telemetry ─────────────────────────────────
+
+    /// Sample transport statistics every ~2 seconds: the UI overlay
+    /// (path RTT/loss/throughput) and the screen thread's bitrate ladder
+    /// (the share of video groups the transport abandoned).
     ///
     /// Samples at or above [`LINK_LOG_LOSS_PCT`] are also written to the
-    /// log. Loss here is *uplink* (our sent packets the server never
-    /// acked); the throughput figures count renet payload only, so add
-    /// ~53 bytes/packet of netcode+UDP+IP to get wire rates.
+    /// log. Loss here is the transport's own accounting (packets it
+    /// declared lost); the media paths never act on it.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn sample_link_stats(&mut self, now: Instant) {
         if now.duration_since(self.last_stats_check) < NETWORK_STATS_INTERVAL {
             return;
         }
+        let interval = now.duration_since(self.last_stats_check).as_secs_f64();
         self.last_stats_check = now;
-        if !self.client.is_connected() {
+        if self.phase != Phase::Admitted {
             return;
         }
-        let info = self.client.network_info();
-        let rtt_ms = info.rtt * 1000.0;
-        let loss_pct = info.packet_loss * 100.0;
-        let kbps_up = info.bytes_sent_per_second * 8.0 / 1000.0;
-        let kbps_down = info.bytes_received_per_second * 8.0 / 1000.0;
+        let Some(stats) = self.driver.stats(self.server) else {
+            return;
+        };
+        let base = self.stats_baseline.unwrap_or_default();
+        self.stats_baseline = Some(stats);
+        let rtt_ms = stats.rtt.as_secs_f64() * 1000.0;
+        let loss_pct = stats.path_loss_pct_since(&base);
+        let kbps_up =
+            (stats.bytes_tx.saturating_sub(base.bytes_tx)) as f64 * 8.0 / 1000.0 / interval;
+        let kbps_down =
+            (stats.bytes_rx.saturating_sub(base.bytes_rx)) as f64 * 8.0 / 1000.0 / interval;
         let streaming = kbps_up >= LINK_LOG_STREAMING_KBPS;
         if loss_pct >= LINK_LOG_LOSS_PCT || (streaming && loss_pct >= LINK_LOG_LOSS_PCT_STREAMING) {
-            log::info!(
-                "link: uplink loss {loss_pct:.1}%, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s, down {kbps_down:.0} kbit/s"
+            info!(
+                "link: path loss {loss_pct:.1}%, rtt {rtt_ms:.0} ms, cwnd {} KB, up {kbps_up:.0} kbit/s, down {kbps_down:.0} kbit/s, dgram drops {}",
+                stats.cwnd / 1024,
+                stats.datagram_send_drops - base.datagram_send_drops,
             );
         }
         self.message_queue.push(NetworkMessage::NetworkStats {
@@ -614,23 +596,158 @@ impl NetworkClient {
             kbps_up,
             kbps_down,
         });
+
+        // The sharer's leg, measured on the video itself.
+        let started = stats.groups_started.saturating_sub(base.groups_started);
+        let reset = stats.groups_reset.saturating_sub(base.groups_reset);
+        if started > 0 || reset > 0 {
+            let behind_pct = if started == 0 {
+                100.0
+            } else {
+                (reset as f32 * 100.0 / started as f32).min(100.0)
+            };
+            self.message_queue.push(NetworkMessage::UplinkVideo {
+                behind_pct,
+                rtt_ms: rtt_ms as f32,
+                kbps_up: kbps_up as f32,
+            });
+        }
     }
 
-    // ── Control channels (control + signal) ─────────────────────────
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn maybe_send_telemetry(&mut self, now: Instant) {
+        if !self.telemetry_enabled
+            || self.phase != Phase::Admitted
+            || now.duration_since(self.last_telemetry) < TELEMETRY_INTERVAL
+        {
+            return;
+        }
+        let interval = now.duration_since(self.last_telemetry).as_secs_f64();
+        self.last_telemetry = now;
+        let Some(stats) = self.driver.stats(self.server) else {
+            return;
+        };
+        let base = self.stats_baseline.unwrap_or_default();
+        let path = PathSample {
+            rtt_ms: stats.rtt.as_millis().min(u128::from(u32::MAX)) as u32,
+            loss_pct: stats.path_loss_pct_since(&base) as f32,
+            cwnd: stats.cwnd,
+            bytes_in_flight: 0,
+            kbps_up: (stats.bytes_tx.saturating_sub(base.bytes_tx)) as f32 * 8.0
+                / 1000.0
+                / interval as f32,
+            kbps_down: (stats.bytes_rx.saturating_sub(base.bytes_rx)) as f32 * 8.0
+                / 1000.0
+                / interval as f32,
+            datagram_send_drops: stats.datagram_send_drops,
+            datagrams_blocked: self.datagrams_blocked,
+        };
+        let mut sharing = self.telemetry.sharing.clone();
+        if let Some(s) = sharing.as_mut() {
+            s.groups_reset = stats.groups_reset;
+        }
+        let sample = TelemetrySample {
+            client: self.client_info.clone(),
+            path,
+            audio: self.telemetry.audio.clone(),
+            sharing,
+            viewing: self.telemetry.viewing.clone(),
+        };
+        self.send_control(now, &ClientMessage::Telemetry(Box::new(sample)));
+    }
 
-    fn process_control_messages(&mut self) {
-        for channel in [CONTROL_CHANNEL, SIGNAL_CHANNEL, MEDIA_CHANNEL] {
-            while let Some(message) = self.client.receive_message(channel) {
+    /// Send a telemetry event now (a handful per session).
+    pub fn send_event(&mut self, now: Instant, event: TelemetryEvent) {
+        if self.telemetry_enabled && self.phase == Phase::Admitted {
+            self.send_control(now, &ClientMessage::TelemetryEvent(event));
+        }
+    }
+
+    /// Latest audio counters for the next telemetry sample.
+    pub fn set_audio_sample(&mut self, sample: AudioSample) {
+        self.telemetry.audio = Some(sample);
+    }
+
+    /// Latest sharing counters (`None` once the share stops).
+    pub fn set_sharing_sample(&mut self, sample: Option<SharingSample>) {
+        self.telemetry.sharing = sample;
+    }
+
+    /// Latest per-stream viewing counters.
+    pub fn set_viewing_samples(&mut self, mut samples: Vec<ViewingSample>) {
+        for s in &mut samples {
+            s.keyframe_requests_sent = self
+                .keyframe_requests_sent
+                .get(&s.sharer)
+                .copied()
+                .unwrap_or(0);
+        }
+        self.telemetry.viewing = samples;
+    }
+
+    // ── Control lanes (control + signal + media) ────────────────────
+
+    fn process_control_messages(&mut self, now: Instant) {
+        for lane in [Lane::Control, Lane::Signal, Lane::Media] {
+            while let Some(message) = self.driver.recv(self.server, lane) {
                 let Some(msg) = protocol::decode_server_message(&message) else {
                     continue;
                 };
-                self.handle_server_message(msg);
+                self.handle_server_message(now, msg);
+                if self.phase == Phase::Closed {
+                    return;
+                }
             }
         }
     }
 
-    fn handle_server_message(&mut self, msg: ServerMessage) {
+    #[allow(clippy::too_many_lines)]
+    fn handle_server_message(&mut self, now: Instant, msg: ServerMessage) {
         match msg {
+            ServerMessage::Welcome {
+                client_id,
+                user_id: _,
+                features: server_features,
+            } => {
+                if self.phase != Phase::AwaitingWelcome {
+                    return;
+                }
+                self.phase = Phase::Admitted;
+                self.telemetry_enabled = features::has(
+                    features::negotiate(features::CLIENT_1_0, server_features),
+                    features::TELEMETRY,
+                );
+                self.last_telemetry = now;
+                self.stats_baseline = self.driver.stats(self.server);
+                info!(
+                    "Admitted as {client_id:#x} (server features {server_features:#x}, telemetry {})",
+                    if self.telemetry_enabled { "on" } else { "off" }
+                );
+                if let Some(Observation::Accepted { fingerprint, trust }) = &self.identity {
+                    let first_use = matches!(trust, Trust::FirstUse | Trust::Successor { .. });
+                    if let Trust::Successor { from } = trust {
+                        info!("Server rotated its key: {from} → {fingerprint}; updating the pin");
+                    }
+                    self.message_queue.push(NetworkMessage::ServerIdentity {
+                        fingerprint: fingerprint.to_string(),
+                        first_use,
+                    });
+                }
+                self.message_queue.push(NetworkMessage::Connected);
+            }
+            ServerMessage::Refused { reason } => {
+                warn!("Server refused us: {}", reason.describe());
+                self.phase = Phase::Closed;
+                match reason {
+                    RefusedReason::WrongPassword => {
+                        self.message_queue.push(NetworkMessage::AccessDenied);
+                    }
+                    other => self
+                        .message_queue
+                        .push(NetworkMessage::Disconnected(other.describe().to_string())),
+                }
+                self.driver.close(now, self.server, "refused");
+            }
             ServerMessage::Init {
                 usernames,
                 client_id,
@@ -639,7 +756,7 @@ impl NetworkClient {
                 channels,
                 memberships,
             } => {
-                self.usernames = usernames.clone();
+                self.usernames.clone_from(&usernames);
                 self.message_queue.push(NetworkMessage::InitClient {
                     client_id,
                     users: usernames,
@@ -691,18 +808,14 @@ impl NetworkClient {
                 let username = self
                     .usernames
                     .remove(&client_id)
-                    .unwrap_or_else(|| format!("User{client_id}"));
+                    .unwrap_or_else(|| format!("User{client_id:x}"));
                 self.message_queue.push(NetworkMessage::UserLeft {
                     client_id,
                     username,
                 });
             }
             ServerMessage::Chat(msg) => {
-                let username = self
-                    .usernames
-                    .get(&msg.client_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("User{}", msg.client_id));
+                let username = self.username_of(msg.client_id);
                 self.message_queue.push(NetworkMessage::TextMessage {
                     username,
                     text: msg.text,
@@ -713,16 +826,14 @@ impl NetworkClient {
                 upload_id,
                 index,
                 count,
+                hash,
                 data,
+                ..
             } => {
                 if let Some(image) =
-                    self.accept_image_chunk(client_id, upload_id, index, count, data)
+                    self.accept_image_chunk(now, client_id, upload_id, index, count, hash, data)
                 {
-                    let username = self
-                        .usernames
-                        .get(&client_id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("User{client_id}"));
+                    let username = self.username_of(client_id);
                     self.message_queue.push(NetworkMessage::ImageMessage {
                         username,
                         data: image,
@@ -765,6 +876,7 @@ impl NetworkClient {
             ServerMessage::ScreenShareStopped { client_id } => {
                 // Forget any partial frames from that stream.
                 self.reassembler.forget_sender(client_id);
+                self.keyframe_requests_sent.remove(&client_id);
                 self.message_queue
                     .push(NetworkMessage::ScreenShareStopped { client_id });
             }
@@ -775,7 +887,7 @@ impl NetworkClient {
             }
             ServerMessage::SubscribeDenied { target_id, reason } => {
                 warn!(
-                    "Server denied subscribe to {target_id}: {}",
+                    "Server denied subscribe to {target_id:#x}: {}",
                     reason.describe()
                 );
                 self.message_queue
@@ -795,6 +907,29 @@ impl NetworkClient {
                     worst_rtt_ms,
                     viewers,
                 });
+            }
+            ServerMessage::VoiceReceiverReport {
+                received: _,
+                expected,
+                lost,
+                late: _,
+                rtt_ms,
+            } => {
+                let exercised = expected >= VOICE_REPORT_MIN_PACKETS;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let loss_pct = if expected == 0 {
+                    0
+                } else {
+                    (f64::from(lost) * 100.0 / f64::from(expected))
+                        .round()
+                        .min(UPLINK_LOSS_CLAMP_PCT) as u32
+                };
+                self.message_queue
+                    .push(NetworkMessage::VoiceReceiverReport {
+                        loss_pct,
+                        rtt_ms,
+                        exercised,
+                    });
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.
@@ -803,10 +938,17 @@ impl NetworkClient {
         }
     }
 
-    // ── Voice channel ───────────────────────────────────────────────
+    fn username_of(&self, client_id: ClientId) -> String {
+        self.usernames
+            .get(&client_id)
+            .cloned()
+            .unwrap_or_else(|| format!("User{client_id:x}"))
+    }
+
+    // ── Voice lane ──────────────────────────────────────────────────
 
     fn process_voice_messages(&mut self) {
-        while let Some(message) = self.client.receive_message(VOICE_CHANNEL) {
+        while let Some(message) = self.driver.recv(self.server, Lane::Voice) {
             // [sender_id][voice packet] — sender stamped by the server.
             let Some((sender_id, packet)) = split_sender(&message) else {
                 continue;
@@ -824,31 +966,47 @@ impl NetworkClient {
         }
     }
 
-    // ── Video channel ───────────────────────────────────────────────
+    // ── Video lane ──────────────────────────────────────────────────
 
-    fn process_video_messages(&mut self) {
-        while let Some(message) = self.client.receive_message(VIDEO_CHANNEL) {
-            let Some((sender_id, chunk)) = split_sender(&message) else {
-                continue;
-            };
-            if let Some(frame) = self.reassembler.push_chunk(sender_id, chunk) {
-                self.message_queue.push(NetworkMessage::VideoFrame {
-                    client_id: frame.sender_id,
-                    seq: frame.seq,
-                    is_keyframe: frame.is_keyframe,
-                    width: u32::from(frame.width),
-                    height: u32::from(frame.height),
-                    timestamp_ms: frame.timestamp_ms,
-                    data: frame.data,
-                });
+    /// Groups arrive per sharer (the track). A reset group means the
+    /// relay abandoned it for us — we were behind — so any partial
+    /// frame of that sharer is dropped; the next group starts with a
+    /// keyframe.
+    fn process_video_messages(&mut self, now: Instant) {
+        while let Some((track, item)) = self.driver.recv_video(self.server) {
+            match item {
+                VideoItem::GroupStart | VideoItem::GroupEnd => {}
+                VideoItem::GroupReset => {
+                    self.reassembler.forget_sender(track);
+                    log::debug!("video group from {track:#x} reset by the relay (we were behind)");
+                    // The relay gave up on that group; a keyframe is
+                    // what gets us back in.
+                    self.send_request_keyframe(now, track);
+                }
+                VideoItem::Chunk(message) => {
+                    let Some((sender_id, chunk)) = split_sender(&message) else {
+                        continue;
+                    };
+                    if let Some(frame) = self.reassembler.push_chunk(sender_id, chunk) {
+                        self.message_queue.push(NetworkMessage::VideoFrame {
+                            client_id: frame.sender_id,
+                            seq: frame.seq,
+                            is_keyframe: frame.is_keyframe,
+                            width: u32::from(frame.width),
+                            height: u32::from(frame.height),
+                            timestamp_ms: frame.timestamp_ms,
+                            data: frame.data,
+                        });
+                    }
+                }
             }
         }
     }
 
-    // ── System audio channel ────────────────────────────────────────
+    // ── System audio lane ───────────────────────────────────────────
 
     fn process_system_audio_messages(&mut self) {
-        while let Some(message) = self.client.receive_message(SYSTEM_AUDIO_CHANNEL) {
+        while let Some(message) = self.driver.recv(self.server, Lane::SystemAudio) {
             let Some((sender_id, packet)) = split_sender(&message) else {
                 continue;
             };
@@ -865,74 +1023,132 @@ impl NetworkClient {
 
     // ── Outbound messages ───────────────────────────────────────────
 
-    /// The one place messages enter renet's send queues. Marks the
-    /// connection dirty so `update()` flushes on this tick instead of
-    /// waiting for the idle cadence.
-    fn queue_message(&mut self, channel: u8, message: impl Into<renet::Bytes>) {
-        self.client.send_message(channel, message);
-        self.outbound_pending = true;
-    }
-
-    fn send_control(&mut self, msg: &ClientMessage) {
+    fn send_control(&mut self, now: Instant, msg: &ClientMessage) {
+        debug_assert!(!msg.is_upload_chunk(), "uploads go through send_media");
         match protocol::encode_client_message(msg) {
-            Some(encoded) => self.queue_message(msg.channel(), encoded),
+            Some(encoded) => {
+                if let Err(e) = self.driver.send(now, self.server, msg.lane(), &encoded) {
+                    log::debug!("send on {} failed: {e}", msg.lane());
+                }
+            }
             None => warn!("Failed to serialize client message"),
         }
     }
 
-    pub fn send_message(&mut self, text: String) {
-        self.send_control(&ClientMessage::Chat(text));
+    pub fn send_message(&mut self, now: Instant, text: String) {
+        self.send_control(now, &ClientMessage::Chat(text));
     }
 
     /// Queue a chat image for a *paced* upload: split into
-    /// [`protocol::IMAGE_CHUNK_BYTES`] chunks, then [`pump_upload`]
-    /// trickles them out at [`protocol::MEDIA_UPLOAD_PACE`] so the
-    /// router queue voice shares never backs up behind bulk. A new
+    /// [`protocol::IMAGE_CHUNK_BYTES`] chunks on one Media stream, which
+    /// the transport trickles out at [`protocol::MEDIA_UPLOAD_PACE`] so
+    /// the router queue voice shares never backs up behind bulk. A new
     /// image replaces any upload still in flight (matching the UI,
     /// which sends one at a time).
-    ///
-    /// [`pump_upload`]: Self::pump_upload
-    pub fn send_image(&mut self, data: Vec<u8>) {
+    pub fn send_image(&mut self, now: Instant, data: &[u8]) {
         if data.len() > protocol::MAX_CHAT_IMAGE_BYTES {
             warn!("Refusing oversized image ({} KB)", data.len() / 1024);
             return;
         }
-        let chunks: Vec<Vec<u8>> = data
-            .chunks(protocol::IMAGE_CHUNK_BYTES)
-            .map(<[u8]>::to_vec)
-            .collect();
-        if chunks.is_empty() {
+        let Some(frames) = chunk_upload(data, 0, |upload_id, index, count, chunk| {
+            ClientMessage::ChatImageChunk {
+                upload_id,
+                index,
+                count,
+                data: chunk,
+            }
+        }) else {
+            return;
+        };
+        match self.driver.send_media(now, self.server, frames) {
+            Ok(id) => {
+                self.upload = Some(id);
+                self.upload_last_pct = 255;
+                self.report_upload_progress();
+            }
+            Err(e) => warn!("Image upload could not start: {e}"),
+        }
+    }
+
+    /// Upload our log file to the server (spec §9.1), at most once per
+    /// ten minutes. The bytes are the tail the UI decided to send, ≤
+    /// [`protocol::MAX_LOG_UPLOAD_BYTES`].
+    pub fn send_log(&mut self, now: Instant, data: &[u8]) {
+        if self
+            .last_log_upload
+            .is_some_and(|t| now.duration_since(t) < LOG_UPLOAD_MIN_INTERVAL)
+        {
+            warn!("Log upload skipped: one per ten minutes");
             return;
         }
-        self.upload_next_id = self.upload_next_id.wrapping_add(1);
-        self.upload = Some(OutgoingImage {
-            upload_id: self.upload_next_id,
-            chunks,
-            next: 0,
-        });
-        self.upload_last_pct = 255;
-        self.upload_tokens = 0.0;
-        self.upload_last_tick = Instant::now();
+        let tail = if data.len() > protocol::MAX_LOG_UPLOAD_BYTES {
+            &data[data.len() - protocol::MAX_LOG_UPLOAD_BYTES..]
+        } else {
+            data
+        };
+        let Some(frames) = chunk_upload(tail, 1, |upload_id, index, count, chunk| {
+            ClientMessage::LogUploadChunk {
+                upload_id,
+                index,
+                count,
+                data: chunk,
+            }
+        }) else {
+            return;
+        };
+        match self.driver.send_media(now, self.server, frames) {
+            Ok(_) => {
+                self.last_log_upload = Some(now);
+                info!("Uploading {} KB of log to the server", tail.len() / 1024);
+            }
+            Err(e) => warn!("Log upload could not start: {e}"),
+        }
+    }
+
+    /// Report image upload progress as the transport takes the bytes.
+    fn report_upload_progress(&mut self) {
+        let Some(id) = self.upload else {
+            return;
+        };
+        let (pct, done) = match self.driver.upload_progress(self.server, id) {
+            #[allow(clippy::cast_possible_truncation)]
+            Some((written, total)) if total > 0 => {
+                ((written * 100 / total) as u8, written >= total)
+            }
+            // Retired by the transport: fully acknowledged.
+            _ => (100, true),
+        };
+        if pct != self.upload_last_pct {
+            self.upload_last_pct = pct;
+            self.message_queue
+                .push(NetworkMessage::UploadProgress { pct });
+        }
+        if done {
+            self.upload = None;
+        }
     }
 
     /// Fold one relayed chunk into its image; `Some(bytes)` when the
-    /// image completes. Bounds mirror the codec's: chunk counts and
-    /// total size are capped, a fresh `upload_id` from the same sender
-    /// abandons the old partial, and partials older than two minutes
-    /// are pruned (their sender vanished or gave up mid-pace).
+    /// image completes and its content hash checks out. Bounds mirror
+    /// the codec's: chunk counts and total size are capped, a fresh
+    /// `upload_id` from the same sender abandons the old partial, and
+    /// partials older than two minutes are pruned.
+    #[allow(clippy::too_many_arguments)]
     fn accept_image_chunk(
         &mut self,
+        now: Instant,
         client_id: u64,
         upload_id: u32,
         index: u32,
         count: u32,
+        hash: [u8; 32],
         data: Vec<u8>,
     ) -> Option<Vec<u8>> {
         if count == 0 || count > protocol::MAX_IMAGE_CHUNKS || index >= count {
             return None;
         }
         self.incoming_images
-            .retain(|_, img| img.started.elapsed() < Duration::from_secs(120));
+            .retain(|_, img| now.duration_since(img.started) < IMAGE_PARTIAL_TTL);
         // A newer upload from the same sender obsoletes any partial.
         self.incoming_images
             .retain(|(sender, id), _| *sender != client_id || *id == upload_id);
@@ -944,10 +1160,11 @@ impl NetworkClient {
                 count,
                 received: 0,
                 bytes: 0,
+                hash,
                 chunks: vec![None; count as usize],
-                started: Instant::now(),
+                started: now,
             });
-        if entry.count != count || entry.chunks[index as usize].is_some() {
+        if entry.count != count || entry.hash != hash || entry.chunks[index as usize].is_some() {
             return None; // inconsistent or duplicate — drop
         }
         entry.bytes += data.len();
@@ -965,99 +1182,48 @@ impl NetworkClient {
         for chunk in entry.chunks {
             image.extend_from_slice(&chunk?);
         }
+        let digest: [u8; 32] = Sha256::digest(&image).into();
+        if digest != entry.hash {
+            warn!("Relayed image from {client_id:#x} failed its content hash; dropped");
+            return None;
+        }
         Some(image)
     }
 
-    /// Emit queued upload chunks as the token bucket allows. Called
-    /// every tick; a no-op without an upload in flight.
-    fn pump_upload(&mut self) {
-        let Some(upload) = &mut self.upload else {
-            return;
-        };
-        let now = Instant::now();
-        let dt = now.duration_since(self.upload_last_tick).as_secs_f64();
-        self.upload_last_tick = now;
-        // Cap the bucket at a two-chunk burst: after an idle stretch we
-        // must not blast the backlog we were pacing to avoid.
-        let burst = 2.0 * protocol::IMAGE_CHUNK_BYTES as f64;
-        #[allow(clippy::cast_precision_loss)]
-        {
-            self.upload_tokens =
-                (self.upload_tokens + dt * protocol::MEDIA_UPLOAD_PACE as f64).min(burst);
-        }
-
-        #[allow(clippy::cast_possible_truncation)]
-        let count = upload.chunks.len() as u32;
-        while upload.next < upload.chunks.len() {
-            let chunk = &upload.chunks[upload.next];
-            #[allow(clippy::cast_precision_loss)]
-            if self.upload_tokens < chunk.len() as f64 {
-                break;
-            }
-            #[allow(clippy::cast_precision_loss)]
-            {
-                self.upload_tokens -= chunk.len() as f64;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let msg = ClientMessage::ChatImageChunk {
-                upload_id: upload.upload_id,
-                index: upload.next as u32,
-                count,
-                data: chunk.clone(),
-            };
-            match protocol::encode_client_message(&msg) {
-                Some(encoded) => {
-                    // Field-level borrows: `upload` is still live here, so the
-                    // `queue_message` helper (which takes `&mut self`) can't be used.
-                    self.client.send_message(msg.channel(), encoded);
-                    self.outbound_pending = true;
-                }
-                None => {
-                    warn!("Image chunk failed to encode; aborting upload");
-                    self.upload = None;
-                    return;
-                }
-            }
-            upload.next += 1;
-        }
-
-        // Real progress: chunks handed to the transport / total.
-        #[allow(clippy::cast_possible_truncation)]
-        let pct = (upload.next * 100 / upload.chunks.len()) as u8;
-        let done = upload.next >= upload.chunks.len();
-        if pct != self.upload_last_pct {
-            self.upload_last_pct = pct;
-            self.message_queue
-                .push(NetworkMessage::UploadProgress { pct });
-        }
-        if done {
-            self.upload = None;
-        }
-    }
-
-    pub fn send_speaking_status(&mut self, is_speaking: bool) {
+    pub fn send_speaking_status(&mut self, now: Instant, is_speaking: bool) {
         // Edge-triggered by the voice thread; dedupe defensively in case
         // the same state is ever delivered twice.
         if is_speaking == self.last_speaking_sent {
             return;
         }
-        self.send_control(&ClientMessage::Speaking(is_speaking));
+        self.send_control(now, &ClientMessage::Speaking(is_speaking));
         self.last_speaking_sent = is_speaking;
     }
 
     /// Broadcast our mute/deafen state to all other users via the server.
-    pub fn send_audio_state(&mut self, muted: bool, deafened: bool) {
-        self.send_control(&ClientMessage::AudioState { muted, deafened });
+    pub fn send_audio_state(&mut self, now: Instant, muted: bool, deafened: bool) {
+        self.send_control(now, &ClientMessage::AudioState { muted, deafened });
     }
 
     /// Send one voice packet: a bare Opus frame (`flags == 0`) or a
-    /// redundant audio bundle (`VOICE_FLAG_RED`). One packet per audio
+    /// redundant audio bundle (`VOICE_FLAG_RED`). One datagram per audio
     /// packet — no bundling of *frames* here, no added latency (see
     /// `protocol::voice`); RED bundles carry copies of packets already
     /// sent, which costs bytes, not delay.
-    pub fn send_voice_frame(&mut self, seq: u32, ts_48k: u32, flags: u8, payload: &[u8]) {
+    pub fn send_voice_frame(
+        &mut self,
+        now: Instant,
+        seq: u32,
+        ts_48k: u32,
+        flags: u8,
+        payload: &[u8],
+    ) {
         match pack_voice_with_flags(seq, ts_48k, flags, payload) {
-            Some(packet) => self.queue_message(VOICE_CHANNEL, packet),
+            Some(packet) => {
+                if let Err(e) = self.driver.send(now, self.server, Lane::Voice, &packet) {
+                    log::debug!("voice packet seq={seq} not sent: {e}");
+                }
+            }
             None => log::debug!(
                 "Dropping voice packet seq={seq}: invalid size {} bytes",
                 payload.len()
@@ -1065,9 +1231,15 @@ impl NetworkClient {
         }
     }
 
-    /// Chunk and send an encoded H.264 frame on the video channel.
+    /// Chunk and send an encoded H.264 frame. A keyframe opens a new
+    /// group (spec §6.2) — the previous one is finished, or reset if
+    /// the uplink still had bytes of it waiting. Delta frames ride the
+    /// open group; with none open (nothing since the last reset) they
+    /// are dropped, since without their keyframe they decode to noise.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_video_frame(
         &mut self,
+        now: Instant,
         seq: u32,
         is_keyframe: bool,
         width: u16,
@@ -1075,27 +1247,22 @@ impl NetworkClient {
         timestamp_ms: u32,
         data: &[u8],
     ) {
-        // The video channel is reliable: renet keeps every chunk until
-        // the server acks it and *disconnects us* if the channel's
-        // budget overflows, rather than dropping. A stalled uplink
-        // could fill 10 MB in ~10 s at full rate. Drop the frame here
-        // instead; the viewer sees a seq gap and recovers via keyframe
-        // request, and the ladder is already stepping down.
-        let wire_bytes = data.len()
-            + data.len().div_ceil(protocol::VIDEO_CHUNK_PAYLOAD) * protocol::VIDEO_HEADER_SIZE;
-        if !self.client.can_send_message(VIDEO_CHANNEL, wire_bytes) {
-            if !self.video_channel_full {
+        if is_keyframe {
+            self.driver.video_new_group(now, self.server, OWN_TRACK);
+        }
+        if !self.driver.video_group_open(self.server, OWN_TRACK) {
+            if !self.video_no_group {
                 warn!(
-                    "Video channel has no room for frame seq={seq} ({wire_bytes} bytes) — \
-                     dropping frames until the uplink drains"
+                    "Video frame seq={seq} dropped: the current group was abandoned (uplink behind) — \
+                     waiting for the next keyframe"
                 );
-                self.video_channel_full = true;
+                self.video_no_group = true;
             }
             return;
         }
-        if self.video_channel_full {
-            log::info!("Video channel has room again (frame seq={seq})");
-            self.video_channel_full = false;
+        if self.video_no_group {
+            info!("Video resumed at keyframe seq={seq}");
+            self.video_no_group = false;
         }
 
         // `pack_video_frame` refuses empty or oversize frames (past the
@@ -1106,7 +1273,7 @@ impl NetworkClient {
         match pack_video_frame(seq, is_keyframe, width, height, timestamp_ms, data) {
             Some(chunks) => {
                 for chunk in chunks {
-                    self.queue_message(VIDEO_CHANNEL, chunk);
+                    let _ = self.driver.send(now, self.server, Lane::Video, &chunk);
                 }
             }
             None => warn!(
@@ -1118,9 +1285,20 @@ impl NetworkClient {
     }
 
     /// Send an encoded system audio (Opus stereo) packet.
-    pub fn send_system_audio(&mut self, seq: u32, channels: u8, duration_ms: u16, opus: &[u8]) {
+    pub fn send_system_audio(
+        &mut self,
+        now: Instant,
+        seq: u32,
+        channels: u8,
+        duration_ms: u16,
+        opus: &[u8],
+    ) {
         match pack_system_audio(seq, channels, duration_ms, opus) {
-            Some(packet) => self.queue_message(SYSTEM_AUDIO_CHANNEL, packet),
+            Some(packet) => {
+                let _ = self
+                    .driver
+                    .send(now, self.server, Lane::SystemAudio, &packet);
+            }
             None => warn!(
                 "System audio packet not packable ({} bytes), dropping",
                 opus.len()
@@ -1130,73 +1308,102 @@ impl NetworkClient {
 
     /// Send screen share signaling. Dimensions are clamped into the
     /// wire format's u16 range (the server validates 16..=4096 anyway).
-    pub fn send_screen_share_start(&mut self, width: u32, height: u32, scope: ShareScope) {
+    pub fn send_screen_share_start(
+        &mut self,
+        now: Instant,
+        width: u32,
+        height: u32,
+        scope: ShareScope,
+    ) {
         let width = u16::try_from(width.min(4096)).unwrap_or(u16::MAX);
         let height = u16::try_from(height.min(4096)).unwrap_or(u16::MAX);
-        self.send_control(&ClientMessage::ScreenShareStart {
-            width,
-            height,
-            scope,
-        });
+        self.send_control(
+            now,
+            &ClientMessage::ScreenShareStart {
+                width,
+                height,
+                scope,
+            },
+        );
     }
 
     /// Ask to move to `channel_id` (with the channel password, if any).
-    pub fn send_join_channel(&mut self, channel_id: u16, password: Option<String>) {
-        self.send_control(&ClientMessage::JoinChannel {
-            channel_id,
-            password,
-        });
+    pub fn send_join_channel(&mut self, now: Instant, channel_id: u16, password: Option<String>) {
+        self.send_control(
+            now,
+            &ClientMessage::JoinChannel {
+                channel_id,
+                password,
+            },
+        );
     }
 
-    pub fn send_screen_share_stop(&mut self) {
-        self.send_control(&ClientMessage::ScreenShareStop);
+    /// Stop sharing: close the open group cleanly, then tell the room.
+    pub fn send_screen_share_stop(&mut self, now: Instant) {
+        self.driver.video_finish_group(now, self.server, OWN_TRACK);
+        self.video_no_group = false;
+        self.send_control(now, &ClientMessage::ScreenShareStop);
     }
 
-    pub fn send_subscribe_screen(&mut self, target_id: u64) {
-        self.send_control(&ClientMessage::SubscribeScreen { target_id });
+    pub fn send_subscribe_screen(&mut self, now: Instant, target_id: u64) {
+        self.send_control(now, &ClientMessage::SubscribeScreen { target_id });
     }
 
-    pub fn send_unsubscribe_screen(&mut self, target_id: u64) {
-        self.send_control(&ClientMessage::UnsubscribeScreen { target_id });
+    pub fn send_unsubscribe_screen(&mut self, now: Instant, target_id: u64) {
+        self.reassembler.forget_sender(target_id);
+        self.send_control(now, &ClientMessage::UnsubscribeScreen { target_id });
     }
 
     /// Ask the server to relay a keyframe request to the user we're
-    /// watching. Travels on the signal channel: reliable, but never
-    /// queued behind chat or presence traffic.
-    pub fn send_request_keyframe(&mut self, target_id: u64) {
-        self.send_control(&ClientMessage::RequestKeyframe { target_id });
+    /// watching. Travels on the signal lane: reliable, but never queued
+    /// behind chat or presence traffic.
+    pub fn send_request_keyframe(&mut self, now: Instant, target_id: u64) {
+        *self.keyframe_requests_sent.entry(target_id).or_insert(0) += 1;
+        self.send_control(now, &ClientMessage::RequestKeyframe { target_id });
     }
 
     pub fn poll_messages(&mut self) -> Vec<NetworkMessage> {
         std::mem::take(&mut self.message_queue)
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.client.is_connected()
+    /// The session is over and its reason has been reported.
+    pub fn is_closed(&self) -> bool {
+        self.phase == Phase::Closed
     }
 
-    pub fn is_connecting(&self) -> bool {
-        self.client.is_connecting()
-    }
-
-    pub fn disconnect_reason(&self) -> Option<renet::DisconnectReason> {
-        self.client.disconnect_reason()
-    }
-
+    /// Close the connection and push the close packet out.
     pub fn disconnect(&mut self) {
-        self.client.disconnect();
-        // Flush the disconnect packet over the wire. Without this,
-        // the server won't know we left until its keepalive times out.
-        //
-        // Both client.update() AND transport.update() are needed:
-        // the disconnect packet is generated by the netcode transport
-        // layer, not the renet client layer.
-        let duration = Instant::now() - self.last_updated;
-        self.last_updated = Instant::now();
-        self.client.update(duration);
-        let _ = self.transport.update(duration, &mut self.client);
-        let _ = self.transport.send_packets(&mut self.client);
+        let now = Instant::now();
+        if self.phase != Phase::Closed {
+            self.driver.video_finish_group(now, self.server, OWN_TRACK);
+            self.driver.close(now, self.server, "bye");
+            self.phase = Phase::Closed;
+        }
+        self.flush();
     }
+}
+
+/// Split `data` into one `Media` frame per [`protocol::IMAGE_CHUNK_BYTES`]
+/// chunk, each an encoded `build` message. `upload_id` is per kind so
+/// the server tells an image from a log.
+fn chunk_upload(
+    data: &[u8],
+    upload_id: u32,
+    build: impl Fn(u32, u32, u32, Vec<u8>) -> ClientMessage,
+) -> Option<Vec<protocol::Bytes>> {
+    let chunks: Vec<&[u8]> = data.chunks(protocol::IMAGE_CHUNK_BYTES).collect();
+    if chunks.is_empty() {
+        return None;
+    }
+    let count = u32::try_from(chunks.len()).ok()?;
+    let mut frames = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let index = u32::try_from(i).ok()?;
+        let msg = build(upload_id, index, count, chunk.to_vec());
+        let encoded = protocol::encode_client_message(&msg)?;
+        frames.push(protocol::Bytes::from(encoded));
+    }
+    Some(frames)
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1208,16 +1415,23 @@ pub enum NetworkControl {
     Connect {
         addr: SocketAddr,
         nickname: String,
-        /// Token issuer URL for secure servers (`None` = open connect).
-        token_url: Option<String>,
-        /// Optional shared password for the issuer.
-        token_password: Option<String>,
+        /// The room password, for servers running `secure: true`.
+        password: Option<String>,
+        /// The pinned server identity (`SHA256:…`); `None` = trust on
+        /// first use. An unparsable value is treated as `None`.
+        fingerprint: Option<String>,
+        /// Our own identity key, if the app could load one.
+        client_key: Option<Arc<ClientKey>>,
+        /// Settings live next to the executable (telemetry).
+        portable: bool,
     },
     Disconnect,
     SendMessage(String),
     /// Send a chat image (encoded PNG; the UI caps it at
     /// `protocol::MAX_CHAT_IMAGE_BYTES` before it gets here).
     SendImage(Vec<u8>),
+    /// Upload our log to the server (the tail, ≤ 2 MiB).
+    SendLog(Vec<u8>),
     SendVoicePacket(AudioPacket),
     SendSpeakingStatus(bool),
     /// Broadcast mute/deafen state to other users.
@@ -1244,7 +1458,7 @@ pub enum NetworkControl {
     },
     /// Signal that we stopped sharing.
     ScreenShareStop,
-    /// Send an encoded H.264 frame on the video channel.
+    /// Send an encoded H.264 frame on the video lane.
     SendVideoFrame {
         seq: u32,
         is_keyframe: bool,
@@ -1254,7 +1468,7 @@ pub enum NetworkControl {
         timestamp_ms: u32,
         data: Vec<u8>,
     },
-    /// Send an Opus stereo system audio packet on the system audio channel.
+    /// Send an Opus stereo system audio packet on the system audio lane.
     SendSystemAudio {
         seq: u32,
         channels: u8,
@@ -1274,6 +1488,16 @@ pub enum NetworkControl {
     UnsubscribeScreen {
         target_id: u64,
     },
+
+    // ── Telemetry (spec §9.1) ───────────────────────────────────────
+    /// A notable moment, forwarded to the server immediately.
+    TelemetryEvent(TelemetryEvent),
+    /// Latest audio counters for the periodic sample.
+    TelemetryAudio(AudioSample),
+    /// Latest sharing counters (`None` when not sharing).
+    TelemetrySharing(Option<SharingSample>),
+    /// Latest per-stream viewing counters.
+    TelemetryViewing(Vec<ViewingSample>),
 
     Shutdown,
 }
@@ -1295,6 +1519,9 @@ impl NetworkThreadHandle {
     /// The caller creates channels externally so that `network_tx` can be
     /// shared with the voice thread before the network thread starts
     /// (resolving the circular dependency).
+    ///
+    /// # Panics
+    /// If the OS refuses to create the thread.
     pub fn spawn(
         tx: Sender<NetworkControl>,
         control_rx: Receiver<NetworkControl>,
@@ -1307,7 +1534,7 @@ impl NetworkThreadHandle {
         let join_handle = thread::Builder::new()
             .name("client-network".into())
             .spawn(move || {
-                run_network_loop(control_rx, msg_tx, voice_tx, screen_tx, wake);
+                run_network_loop(&control_rx, &msg_tx, &voice_tx, &screen_tx, &wake);
             })
             .expect("failed to spawn network thread");
 
@@ -1336,40 +1563,45 @@ impl Drop for NetworkThreadHandle {
 // ── Thread loop ─────────────────────────────────────────────────────────
 
 /// Handle one control message. Returns `false` when the loop should stop.
+#[allow(clippy::too_many_lines)]
 fn handle_control(
     ctrl: NetworkControl,
     client: &mut Option<NetworkClient>,
     msg_tx: &Sender<NetworkMessage>,
     wake: &WakeFn,
 ) -> bool {
+    let now = Instant::now();
     match ctrl {
         NetworkControl::Connect {
             addr,
             nickname,
-            token_url,
-            token_password,
+            password,
+            fingerprint,
+            client_key,
+            portable,
         } => {
             // Replace any existing session cleanly first.
             if let Some(mut old) = client.take() {
                 old.disconnect();
             }
-            // Blocking: includes the token fetch in secure mode. That's
-            // fine — this is the network thread, the UI is elsewhere,
-            // and there is no session to service yet.
+            let pin = fingerprint.as_deref().and_then(|fp| {
+                let parsed = fp.parse::<Fingerprint>().ok();
+                if parsed.is_none() {
+                    warn!("Ignoring unparsable server fingerprint '{fp}'");
+                }
+                parsed
+            });
             match NetworkClient::connect(
                 addr,
                 &nickname,
-                token_url.as_deref(),
-                token_password.as_deref(),
+                password.as_deref(),
+                pin,
+                client_key,
+                portable,
             ) {
-                // Connected is announced by NetworkClient::update()
-                // once the handshake actually completes.
+                // Connected is announced once the server admits us.
                 Ok(c) => *client = Some(c),
-                Err(ConnectError::AccessDenied) => {
-                    msg_tx.send(NetworkMessage::AccessDenied).ok();
-                    wake();
-                }
-                Err(ConnectError::Failed(e)) => {
+                Err(e) => {
                     msg_tx.send(NetworkMessage::Disconnected(e)).ok();
                     wake();
                 }
@@ -1386,12 +1618,17 @@ fn handle_control(
         }
         NetworkControl::SendMessage(text) => {
             if let Some(c) = client {
-                c.send_message(text);
+                c.send_message(now, text);
             }
         }
         NetworkControl::SendImage(data) => {
             if let Some(c) = client {
-                c.send_image(data);
+                c.send_image(now, &data);
+            }
+        }
+        NetworkControl::SendLog(data) => {
+            if let Some(c) = client {
+                c.send_log(now, &data);
             }
         }
         NetworkControl::SendVoicePacket(packet) => {
@@ -1403,6 +1640,7 @@ fn handle_control(
                     PayloadType::Opus => 0,
                 };
                 c.send_voice_frame(
+                    now,
                     packet.header.seq,
                     packet.header.timestamp,
                     flags,
@@ -1412,12 +1650,12 @@ fn handle_control(
         }
         NetworkControl::SendSpeakingStatus(speaking) => {
             if let Some(c) = client {
-                c.send_speaking_status(speaking);
+                c.send_speaking_status(now, speaking);
             }
         }
         NetworkControl::SendAudioState { muted, deafened } => {
             if let Some(c) = client {
-                c.send_audio_state(muted, deafened);
+                c.send_audio_state(now, muted, deafened);
             }
         }
 
@@ -1426,7 +1664,7 @@ fn handle_control(
             password,
         } => {
             if let Some(c) = client {
-                c.send_join_channel(channel_id, password);
+                c.send_join_channel(now, channel_id, password);
             }
         }
 
@@ -1437,12 +1675,12 @@ fn handle_control(
             scope,
         } => {
             if let Some(c) = client {
-                c.send_screen_share_start(width, height, scope);
+                c.send_screen_share_start(now, width, height, scope);
             }
         }
         NetworkControl::ScreenShareStop => {
             if let Some(c) = client {
-                c.send_screen_share_stop();
+                c.send_screen_share_stop(now);
             }
         }
         NetworkControl::SendVideoFrame {
@@ -1454,7 +1692,7 @@ fn handle_control(
             data,
         } => {
             if let Some(c) = client {
-                c.send_video_frame(seq, is_keyframe, width, height, timestamp_ms, &data);
+                c.send_video_frame(now, seq, is_keyframe, width, height, timestamp_ms, &data);
             }
         }
         NetworkControl::SendSystemAudio {
@@ -1464,22 +1702,43 @@ fn handle_control(
             data,
         } => {
             if let Some(c) = client {
-                c.send_system_audio(seq, channels, duration_ms, &data);
+                c.send_system_audio(now, seq, channels, duration_ms, &data);
             }
         }
         NetworkControl::RequestKeyframe { target_id } => {
             if let Some(c) = client {
-                c.send_request_keyframe(target_id);
+                c.send_request_keyframe(now, target_id);
             }
         }
         NetworkControl::SubscribeScreen { target_id } => {
             if let Some(c) = client {
-                c.send_subscribe_screen(target_id);
+                c.send_subscribe_screen(now, target_id);
             }
         }
         NetworkControl::UnsubscribeScreen { target_id } => {
             if let Some(c) = client {
-                c.send_unsubscribe_screen(target_id);
+                c.send_unsubscribe_screen(now, target_id);
+            }
+        }
+
+        NetworkControl::TelemetryEvent(event) => {
+            if let Some(c) = client {
+                c.send_event(now, event);
+            }
+        }
+        NetworkControl::TelemetryAudio(sample) => {
+            if let Some(c) = client {
+                c.set_audio_sample(sample);
+            }
+        }
+        NetworkControl::TelemetrySharing(sample) => {
+            if let Some(c) = client {
+                c.set_sharing_sample(sample);
+            }
+        }
+        NetworkControl::TelemetryViewing(samples) => {
+            if let Some(c) = client {
+                c.set_viewing_samples(samples);
             }
         }
 
@@ -1493,54 +1752,202 @@ fn handle_control(
     true
 }
 
-/// Convert renet's percent loss into a whole-number reading for the
-/// voice encoder: clamped to [`UPLINK_LOSS_CLAMP_PCT`], or `None` only
-/// when the value is not a number at all.
-fn plausible_uplink_loss_pct(loss_pct: f64) -> Option<u32> {
-    if !loss_pct.is_finite() || loss_pct < 0.0 {
-        return None;
+/// Route one message from the session to whoever consumes it: media
+/// and link feedback to the voice/screen threads (hot paths, bypassing
+/// the app), everything else to the app.
+#[allow(clippy::too_many_lines)]
+fn route_message(
+    msg: NetworkMessage,
+    msg_tx: &Sender<NetworkMessage>,
+    voice_tx: &Sender<VoiceControl>,
+    screen_tx: &Sender<ScreenControl>,
+    wake: &WakeFn,
+) {
+    match msg {
+        // Voice → voice thread
+        NetworkMessage::VoiceData {
+            client_id,
+            seq,
+            timestamp,
+            data,
+            red,
+        } => {
+            let payload_type = if red {
+                PayloadType::Red
+            } else {
+                PayloadType::Opus
+            };
+            let packet = AudioPacket::new_typed(seq, timestamp, client_id, payload_type, data);
+            let _ = voice_tx.try_send(VoiceControl::IncomingVoicePacket(packet));
+        }
+
+        // Video → screen thread
+        NetworkMessage::VideoFrame {
+            client_id,
+            seq,
+            is_keyframe,
+            width,
+            height,
+            timestamp_ms,
+            data,
+        } => {
+            if let Err(e) = screen_tx.try_send(ScreenControl::IncomingVideoFrame {
+                client_id,
+                seq,
+                is_keyframe,
+                width,
+                height,
+                timestamp_ms,
+                data,
+            }) {
+                warn!("Screen channel full, dropped frame seq={seq} keyframe={is_keyframe} - {e}");
+            }
+        }
+
+        // System audio → screen thread
+        NetworkMessage::SystemAudioData {
+            client_id,
+            seq,
+            data,
+        } => {
+            let _ = screen_tx.try_send(ScreenControl::IncomingSystemAudio {
+                client_id,
+                seq,
+                data,
+            });
+        }
+
+        // Screen share signaling → screen thread + app
+        NetworkMessage::ScreenShareStarted {
+            client_id,
+            width,
+            height,
+            scope,
+        } => {
+            let _ = screen_tx.try_send(ScreenControl::PeerStartedSharing {
+                client_id,
+                width,
+                height,
+            });
+            let _ = msg_tx.send(NetworkMessage::ScreenShareStarted {
+                client_id,
+                width,
+                height,
+                scope,
+            });
+            wake();
+        }
+        NetworkMessage::ScreenShareStopped { client_id } => {
+            let _ = screen_tx.try_send(ScreenControl::PeerStoppedSharing { client_id });
+            let _ = msg_tx.send(NetworkMessage::ScreenShareStopped { client_id });
+            wake();
+        }
+
+        // Keyframe request from a viewer → screen thread
+        NetworkMessage::KeyframeRequested { viewer_id } => {
+            info!("Keyframe requested by viewer {viewer_id:#x}");
+            let _ = screen_tx.try_send(ScreenControl::ForceKeyframe);
+        }
+
+        // The relay's account of our voice → voice thread: this is the
+        // encoder's only loss input (spec §6.1). RTT lets its rate
+        // controller tell congestion (loss + RTT inflation: send fewer
+        // bytes) from random loss (add redundancy).
+        NetworkMessage::VoiceReceiverReport {
+            loss_pct,
+            rtt_ms,
+            exercised,
+        } => {
+            if exercised {
+                let _ = voice_tx.try_send(VoiceControl::SetUplinkLoss(loss_pct));
+            }
+            let _ = voice_tx.try_send(VoiceControl::SetLinkRtt(rtt_ms));
+        }
+
+        // Our video uplink → screen thread (drives the bitrate ladder
+        // while sharing).
+        NetworkMessage::UplinkVideo {
+            behind_pct,
+            rtt_ms,
+            kbps_up,
+        } => {
+            let _ = screen_tx.try_send(ScreenControl::UplinkStats {
+                loss_pct: behind_pct,
+                rtt_ms,
+                kbps_up,
+            });
+        }
+
+        // Link stats → app (UI only).
+        NetworkMessage::NetworkStats { .. } => {
+            let _ = msg_tx.send(msg);
+            wake();
+        }
+
+        // Viewer health for our stream → screen thread (sharer's stats)
+        NetworkMessage::StreamHealth {
+            worst_loss,
+            worst_rtt_ms,
+            viewers,
+        } => {
+            let _ = screen_tx.try_send(ScreenControl::StreamHealth {
+                worst_loss,
+                worst_rtt_ms,
+                viewers,
+            });
+        }
+
+        // Everything else → app. These carry state (join / leave, init,
+        // chat, mute states, denials, identity) — losing one desyncs
+        // the UI until reconnect, so use a blocking send. The app
+        // drains this channel every event-loop pass.
+        other => {
+            let _ = msg_tx.send(other);
+            wake();
+        }
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // bounded to 0..=50 above
-    Some(loss_pct.round().min(UPLINK_LOSS_CLAMP_PCT) as u32)
 }
 
 fn run_network_loop(
-    control_rx: Receiver<NetworkControl>,
-    msg_tx: Sender<NetworkMessage>,
-    voice_tx: Sender<VoiceControl>,
-    screen_tx: Sender<ScreenControl>,
-    wake: WakeFn,
+    control_rx: &Receiver<NetworkControl>,
+    msg_tx: &Sender<NetworkMessage>,
+    voice_tx: &Sender<VoiceControl>,
+    screen_tx: &Sender<ScreenControl>,
+    wake: &WakeFn,
 ) {
     let mut client: Option<NetworkClient> = None;
     let mut running = true;
 
     while running {
-        // Block on the control channel instead of the old try_recv +
-        // fixed 1 ms sleep. Outbound work (voice frames from the voice
-        // thread, video chunks from the screen thread) wakes this loop
-        // *immediately*. Connected, the 1 ms timeout doubles as the
-        // inbound polling cadence (renet needs regular update() calls
-        // to service the UDP socket). Disconnected there is nothing to
-        // poll, so block outright — zero wakeups until Connect or
-        // Shutdown arrives.
-        let recv_result = if client.is_some() {
-            control_rx.recv_timeout(Duration::from_millis(1))
-        } else {
-            control_rx
+        // Block on the control channel. Outbound work (voice frames
+        // from the voice thread, video chunks from the screen thread)
+        // wakes this loop *immediately*. Connected, the timeout is the
+        // inbound polling cadence — 1 ms, capped by the transport's
+        // next timer so acks and keep-alives are never late.
+        // Disconnected there is nothing to poll, so block outright.
+        let recv_result = match &mut client {
+            Some(c) => {
+                let mut wait = Duration::from_millis(1);
+                if let Some(deadline) = c.next_timeout() {
+                    wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+                }
+                control_rx.recv_timeout(wait)
+            }
+            None => control_rx
                 .recv()
-                .map_err(|_| RecvTimeoutError::Disconnected)
+                .map_err(|_| RecvTimeoutError::Disconnected),
         };
 
         match recv_result {
             Ok(ctrl) => {
-                if !handle_control(ctrl, &mut client, &msg_tx, &wake) {
+                if !handle_control(ctrl, &mut client, msg_tx, wake) {
                     running = false;
                 }
                 // Drain a bounded burst of whatever else queued up.
                 for _ in 0..63 {
                     match control_rx.try_recv() {
                         Ok(ctrl) => {
-                            if !handle_control(ctrl, &mut client, &msg_tx, &wake) {
+                            if !handle_control(ctrl, &mut client, msg_tx, wake) {
                                 running = false;
                             }
                         }
@@ -1559,204 +1966,13 @@ fn run_network_loop(
         // Poll network
         if let Some(c) = &mut client {
             c.update();
-
             for msg in c.poll_messages() {
-                match msg {
-                    // Voice → voice thread (hot path, bypass app)
-                    NetworkMessage::VoiceData {
-                        client_id,
-                        seq,
-                        timestamp,
-                        data,
-                        red,
-                    } => {
-                        let payload_type = if red {
-                            PayloadType::Red
-                        } else {
-                            PayloadType::Opus
-                        };
-                        let packet =
-                            AudioPacket::new_typed(seq, timestamp, client_id, payload_type, data);
-                        let _ = voice_tx.try_send(VoiceControl::IncomingVoicePacket(packet));
-                    }
-
-                    // Video → screen thread (hot path, bypass app)
-                    NetworkMessage::VideoFrame {
-                        client_id,
-                        seq,
-                        is_keyframe,
-                        width,
-                        height,
-                        timestamp_ms,
-                        data,
-                    } => {
-                        if let Err(e) = screen_tx.try_send(ScreenControl::IncomingVideoFrame {
-                            client_id,
-                            seq,
-                            is_keyframe,
-                            width,
-                            height,
-                            timestamp_ms,
-                            data,
-                        }) {
-                            log::warn!(
-                                "Screen channel full, dropped frame seq={seq} keyframe={is_keyframe} - {e}"
-                            );
-                        }
-                    }
-
-                    // System audio → screen thread (hot path, bypass app)
-                    NetworkMessage::SystemAudioData {
-                        client_id,
-                        seq,
-                        data,
-                    } => {
-                        let _ = screen_tx.try_send(ScreenControl::IncomingSystemAudio {
-                            client_id,
-                            seq,
-                            data,
-                        });
-                    }
-
-                    // Screen share signaling → screen thread + app
-                    NetworkMessage::ScreenShareStarted {
-                        client_id,
-                        width,
-                        height,
-                        scope,
-                    } => {
-                        let _ = screen_tx.try_send(ScreenControl::PeerStartedSharing {
-                            client_id,
-                            width,
-                            height,
-                        });
-                        let _ = msg_tx.send(NetworkMessage::ScreenShareStarted {
-                            client_id,
-                            width,
-                            height,
-                            scope,
-                        });
-                        wake();
-                    }
-                    NetworkMessage::ScreenShareStopped { client_id } => {
-                        let _ = screen_tx.try_send(ScreenControl::PeerStoppedSharing { client_id });
-                        let _ = msg_tx.send(NetworkMessage::ScreenShareStopped { client_id });
-                        wake();
-                    }
-
-                    // Keyframe request from a viewer → screen thread
-                    // (hot path, bypass app)
-                    NetworkMessage::KeyframeRequested { viewer_id } => {
-                        log::info!("Keyframe requested by viewer {viewer_id}");
-                        let _ = screen_tx.try_send(ScreenControl::ForceKeyframe);
-                    }
-
-                    // Link stats → voice thread (drives the encoder's FEC
-                    // hint: renet's loss is *our uplink*, the leg the
-                    // decoder-side counters can't see), → screen thread
-                    // (drives the bitrate ladder while sharing; the raw
-                    // reading, see UPLINK_LOSS_IMPLAUSIBLE_PCT), and →
-                    // app (UI).
-                    NetworkMessage::NetworkStats {
-                        rtt_ms,
-                        loss_pct,
-                        kbps_up,
-                        kbps_down,
-                    } => {
-                        if let Some(pct) = plausible_uplink_loss_pct(loss_pct) {
-                            let _ = voice_tx.try_send(VoiceControl::SetUplinkLoss(pct));
-                        }
-                        // RTT lets the encoder's rate controller tell
-                        // congestion (loss + RTT inflation: send fewer
-                        // bytes) from random loss (add redundancy).
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let _ = voice_tx
-                            .try_send(VoiceControl::SetLinkRtt(rtt_ms.max(0.0).round() as u32));
-                        #[allow(clippy::cast_possible_truncation)]
-                        // f32 is plenty for percent/ms/kbit
-                        let _ = screen_tx.try_send(ScreenControl::UplinkStats {
-                            loss_pct: loss_pct as f32,
-                            rtt_ms: rtt_ms as f32,
-                            kbps_up: kbps_up as f32,
-                        });
-                        let _ = msg_tx.send(NetworkMessage::NetworkStats {
-                            rtt_ms,
-                            loss_pct,
-                            kbps_up,
-                            kbps_down,
-                        });
-                        wake();
-                    }
-
-                    // Viewer health for our stream → screen thread
-                    // (sharer's stats block)
-                    NetworkMessage::StreamHealth {
-                        worst_loss,
-                        worst_rtt_ms,
-                        viewers,
-                    } => {
-                        let _ = screen_tx.try_send(ScreenControl::StreamHealth {
-                            worst_loss,
-                            worst_rtt_ms,
-                            viewers,
-                        });
-                    }
-
-                    // Everything else → app. These carry state (join /
-                    // leave, init, chat, mute states, denials) — losing
-                    // one desyncs the UI until reconnect, so use a
-                    // blocking send. The app drains this channel every
-                    // event-loop pass.
-                    other => {
-                        let _ = msg_tx.send(other);
-                        wake();
-                    }
-                }
+                route_message(msg, msg_tx, voice_tx, screen_tx, wake);
             }
-
-            if !c.is_connected() && !c.is_connecting() {
-                log::error!(
-                    "Connection lost — is_connected=false, is_connecting=false, disconnect_reason={:?}",
-                    c.disconnect_reason()
-                );
+            if c.is_closed() {
+                // The reason was already reported by the session.
                 client = None;
-                msg_tx
-                    .send(NetworkMessage::Disconnected("Connection lost".into()))
-                    .ok();
-                wake();
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::plausible_uplink_loss_pct;
-
-    #[test]
-    fn plausible_uplink_loss_should_round_ordinary_readings() {
-        assert_eq!(plausible_uplink_loss_pct(9.4), Some(9));
-    }
-
-    #[test]
-    fn plausible_uplink_loss_should_pass_zero() {
-        assert_eq!(plausible_uplink_loss_pct(0.0), Some(0));
-    }
-
-    #[test]
-    fn plausible_uplink_loss_should_clamp_extreme_readings() {
-        // Not dropped: the encoder must learn the link is bad during a
-        // storm (2026-08-29 03:51: encoder saw 24 % while renet said
-        // 78 %). The staleness check on the audio side handles the
-        // idle-link artifact this used to guard against.
-        assert_eq!(plausible_uplink_loss_pct(50.0), Some(50));
-        assert_eq!(plausible_uplink_loss_pct(78.3), Some(50));
-        assert_eq!(plausible_uplink_loss_pct(100.0), Some(50));
-    }
-
-    #[test]
-    fn plausible_uplink_loss_should_reject_nan() {
-        assert_eq!(plausible_uplink_loss_pct(f64::NAN), None);
-        assert_eq!(plausible_uplink_loss_pct(-1.0), None);
     }
 }

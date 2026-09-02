@@ -6,7 +6,7 @@
 // card. Values live in State so they survive failed attempts and
 // reconnects.
 //
-// When the token issuer answers 403, the host flips
+// When the server refuses the hello for the room password, the host flips
 // `State.password-prompt` and an inline box appears: type the server
 // password, Save stores it on the selected server, Connect retries.
 
@@ -76,8 +76,8 @@ export component ConnectView inherits Rectangle {
                 }
             }
 
-            // Token issuer said 403: ask for the server password and
-            // save it on the selected entry, then Connect retries.
+            // Wrong or missing room password: ask for it and save it on
+            // the selected entry, then Connect retries.
             if State.password-prompt : VerticalLayout {
                 spacing: Theme.gap-sm;
                 Text {

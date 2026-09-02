@@ -41,7 +41,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use renet::Bytes;
+use bytes::Bytes;
 
 /// Current video wire format version.
 pub const VIDEO_PROTOCOL_VERSION: u8 = 3;
@@ -51,7 +51,7 @@ pub const VIDEO_HEADER_SIZE: usize = 16;
 
 /// Maximum payload bytes per chunk. Header + payload + relay envelope
 /// (8) totals 1104 bytes — comfortably inside a 1200-byte conservative
-/// MTU with renet/netcode overhead on top.
+/// MTU with QUIC framing on top.
 pub const VIDEO_CHUNK_PAYLOAD: usize = 1080;
 
 /// Maximum encoded frame size (chunk count is a `u8`).
@@ -116,7 +116,7 @@ pub struct ReassembledFrame {
 /// Split an encoded frame into wire chunks.
 ///
 /// All chunks share one backing allocation; the returned [`Bytes`] are
-/// zero-copy slices of it, ready to hand to renet.
+/// zero-copy slices of it, ready to hand to the transport.
 ///
 /// Returns `None` for an empty frame or one larger than
 /// [`MAX_VIDEO_FRAME_BYTES`] — the caller should drop the frame (and,

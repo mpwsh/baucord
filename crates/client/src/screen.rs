@@ -22,8 +22,8 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -36,16 +36,16 @@ use audio::{
         input::SystemAudioCapture,
     },
 };
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use log::{info, warn};
 use video::{
+    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
     buffer::{BufferedPacket, VideoJitterBuffer},
     capture::{CaptureStatus, Capturer},
     codec::{FfmpegDecoder, FfmpegEncoder},
-    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
 };
 
-use crate::{network::NetworkControl, WakeFn};
+use crate::{WakeFn, network::NetworkControl};
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -103,20 +103,25 @@ pub enum ScreenControl {
     /// `UplinkStats` for the leg the sharer can actually do something
     /// about.
     StreamHealth {
-        /// Worst viewer loss, 0.0–1.0 (fraction, not percent).
+        /// Worst viewer "behind" share, 0.0–1.0 (fraction, not
+        /// percent): video groups the relay abandoned for that viewer
+        /// over groups it started, last second.
         worst_loss: f32,
         worst_rtt_ms: f32,
         viewers: u16,
     },
-    /// Our own uplink as renet measures it, sampled by the network
-    /// thread every ~2 s (`NETWORK_STATS_INTERVAL`). Drives the encoder
-    /// bitrate ladder while sharing; ignored otherwise.
+    /// Our own video uplink as the transport measures it, sampled by
+    /// the network thread every ~2 s (`NETWORK_STATS_INTERVAL`). Drives
+    /// the encoder bitrate ladder while sharing; ignored otherwise.
+    /// Measured on the video itself (spec §6.2), never on transport
+    /// ack accounting.
     UplinkStats {
-        /// Sent packets the server never acked, in percent (0–100).
+        /// Video groups we had to abandon because their bytes waited
+        /// past the deadline, over groups started, in percent (0–100).
         loss_pct: f32,
         rtt_ms: f32,
-        /// renet payload throughput, kbit/s. Video dominates while
-        /// sharing, so this is effectively the encoder's output rate.
+        /// Bytes on the wire, kbit/s. Video dominates while sharing,
+        /// so this is effectively the encoder's output rate.
         kbps_up: f32,
     },
     /// Clean shutdown.
@@ -266,7 +271,7 @@ impl Drop for ScreenThreadHandle {
 /// ~60/s; fresh well below the target while encode tracks it means the
 /// *source* isn't changing that fast (30 fps video content, display
 /// refresh cap) rather than a pipeline problem.
-fn report_share_telemetry(state: &mut CaptureState) {
+fn report_share_telemetry(state: &mut CaptureState, network_tx: &Sender<NetworkControl>) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
     let (start, fresh, skipped, encoded, single, multi) = state.telemetry;
     let elapsed = start.elapsed();
@@ -283,6 +288,25 @@ fn report_share_telemetry(state: &mut CaptureState) {
         single as f32 / secs,
         multi as f32 / secs
     );
+    // The same numbers ride to the server (spec §9.1); the network
+    // thread fills in the transport's group counters.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let _ = network_tx.try_send(NetworkControl::TelemetrySharing(Some(
+        protocol::SharingSample {
+            preset: state.quality.to_string(),
+            rung_pct: state.ladder.pct(),
+            fps_encoded: encoded as f32 / secs,
+            fps_scale_pct: (PACE_SCALES[state.pace_idx] * 100.0).round() as u32,
+            forced_keyframes: state.forced_keyframes,
+            keyframe_requests: state.keyframe_requests,
+            encoder: state.encoder_name.to_string(),
+            groups_reset: 0,
+        },
+    )));
     state.telemetry = (Instant::now(), 0, 0, 0, 0, 0);
 }
 
@@ -319,9 +343,16 @@ struct CaptureState {
     system_audio: Option<SystemAudioCapture>,
     /// Encoder bitrate ladder (see "Sender-side adaptation").
     ladder: BitrateLadder,
-    /// Most recent uplink loss sample, percent. Gates the fps pacer:
-    /// keyframe requests during our own loss are not viewer distress.
+    /// Most recent uplink sample (groups abandoned, percent). Gates the
+    /// fps pacer: keyframe requests while our own uplink is behind are
+    /// not viewer distress.
     uplink_loss_pct: f32,
+    /// Encoder backend name, for telemetry.
+    encoder_name: &'static str,
+    /// IDRs we forced (viewer requests, oversized-frame restarts).
+    forced_keyframes: u64,
+    /// Keyframe requests relayed to us by viewers.
+    keyframe_requests: u64,
     /// Worst viewer loss from the last `StreamHealth`, percent. Same
     /// gate, other leg.
     viewer_loss_pct: f32,
@@ -341,8 +372,9 @@ struct CaptureState {
 //
 // Two loops, two jobs:
 //
-// * The **bitrate ladder** protects our uplink. network.rs samples
-//   renet's uplink loss, RTT and send rate every ~2 s; sustained loss
+// * The **bitrate ladder** protects our uplink. network.rs samples the
+//   share of video groups the transport abandoned (spec §6.2), RTT and
+//   send rate every ~2 s; sustained loss
 //   steps the encoder's bitrate scale down a rung, a long clean stretch
 //   steps it back up. Resolution and frame rate never change: every
 //   frame still goes out, each with fewer bits — a softer picture that
@@ -385,10 +417,10 @@ const RATE_STEP_DOWN_SAMPLES: u32 = 2;
 /// Consecutive clean samples before stepping up (~30 s), multiplied by
 /// the probe backoff.
 const RATE_STEP_UP_SAMPLES: u32 = 15;
-/// Minimum time at a rung before stepping again. Must exceed renet's
-/// loss window (6 s, excluding the newest 0.9 s): a step's effect isn't
-/// in the loss figure until the window has rolled over, and stepping
-/// again before that acts on stale data. Not applied to a step down
+/// Minimum time at a rung before stepping again. Groups are up to 2 s
+/// long and a reset shows up in the *next* sample, so a step's effect
+/// takes a few samples to appear in the figure; stepping again before
+/// that acts on stale data. Not applied to a step down
 /// that follows a climb — the link was clean for the whole hold before
 /// the climb, so loss right after it is fresh evidence, and the probe
 /// is undone as soon as it's detected.
@@ -718,6 +750,11 @@ struct PeerStream {
     decoder: Box<dyn VideoDecoder + Send>,
     width: u32,
     height: u32,
+    /// Frames dropped by the jitter buffer / decoder since the stream
+    /// opened, and cumulative decode time — for the telemetry sample.
+    frames_decoded_total: u64,
+    frames_dropped_total: u64,
+    decode_us_total: u64,
     /// Rolling 10 s viewer telemetry: (window start, decoded frames).
     /// Splits "viewer fps is low" into what actually *arrived and
     /// decoded* vs what the sharer sent (compare against the sharer's
@@ -873,6 +910,7 @@ fn drain_and_decode(
     // overflow jump-to-freshest-keyframe — skipping stale video instead
     // of replaying it, which is what a live viewer wants.
     const DECODE_BUDGET: Duration = Duration::from_millis(24);
+    let mut report_viewing = false;
     for (&client_id, stream) in peer_streams.iter_mut() {
         let pass_start = Instant::now();
         while let Some(packet) = stream.jitter_buffer.pull_next() {
@@ -918,10 +956,13 @@ fn drain_and_decode(
                     let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
                     let decoded_at = Instant::now();
                     stream.rx_telemetry.1 += 1;
+                    stream.frames_decoded_total += 1;
+                    stream.decode_us_total +=
+                        u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
                     let rx_elapsed = stream.rx_telemetry.0.elapsed();
                     if rx_elapsed.as_secs() >= 10 {
                         info!(
-                            "viewer telemetry peer {client_id}: {:.1} fps decoded over {:.0}s \
+                            "viewer telemetry peer {client_id:#x}: {:.1} fps decoded over {:.0}s \
                              (playout delay {:.0} ms, reorder window {:.0} ms)",
                             stream.rx_telemetry.1 as f32 / rx_elapsed.as_secs_f32(),
                             rx_elapsed.as_secs_f32(),
@@ -929,6 +970,7 @@ fn drain_and_decode(
                             stream.jitter_buffer.adaptive_target_ms(),
                         );
                         stream.rx_telemetry = (decoded_at, 0);
+                        report_viewing = true;
                     }
                     // 1080p keyframes cost 12–15 ms in software decode —
                     // that's normal and the jitter buffer absorbs it.
@@ -976,6 +1018,24 @@ fn drain_and_decode(
             });
         }
     }
+    if report_viewing {
+        // Every stream's counters ride to the server (spec §9.1); the
+        // network thread adds the keyframe requests it sent for us.
+        let samples: Vec<protocol::ViewingSample> = peer_streams
+            .iter()
+            .map(|(sharer, ps)| protocol::ViewingSample {
+                sharer: *sharer,
+                frames_decoded: ps.frames_decoded_total,
+                frames_dropped: ps.frames_dropped_total,
+                keyframe_requests_sent: 0,
+                decode_us: ps
+                    .decode_us_total
+                    .checked_div(ps.frames_decoded_total)
+                    .unwrap_or(0),
+            })
+            .collect();
+        let _ = network_tx.try_send(NetworkControl::TelemetryViewing(samples));
+    }
 }
 
 fn handle_control(
@@ -1010,16 +1070,17 @@ fn handle_control(
                 }
             };
 
-            let encoder: Box<dyn VideoEncoder + Send> = match create_encoder(quality) {
-                Ok(e) => e,
-                Err(e) => {
-                    event_tx
-                        .send(ScreenEvent::Error(format!("Encoder init: {e}")))
-                        .ok();
-                    wake();
-                    return;
-                }
-            };
+            let (encoder, encoder_name): (Box<dyn VideoEncoder + Send>, &'static str) =
+                match create_encoder(quality) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        event_tx
+                            .send(ScreenEvent::Error(format!("Encoder init: {e}")))
+                            .ok();
+                        wake();
+                        return;
+                    }
+                };
 
             info!(
                 "Screen share started: {quality}, monitor {monitor_index}, capture backend: {}",
@@ -1056,6 +1117,9 @@ fn handle_control(
                 system_audio,
                 ladder: BitrateLadder::new(quality),
                 uplink_loss_pct: 0.0,
+                encoder_name,
+                forced_keyframes: 0,
+                keyframe_requests: 0,
                 viewer_loss_pct: 0.0,
                 health_logged: None,
                 pace_idx: 0,
@@ -1064,6 +1128,12 @@ fn handle_control(
                 last_distress: None,
             });
 
+            let _ = network_tx.try_send(NetworkControl::TelemetryEvent(
+                protocol::TelemetryEvent::ShareStarted {
+                    preset: quality.to_string(),
+                    encoder: encoder_name.to_string(),
+                },
+            ));
             shared.is_sharing.store(true, Ordering::Relaxed);
             shared.frames_encoded.store(0, Ordering::Relaxed);
             shared.fps_scale_pct.store(100, Ordering::Relaxed);
@@ -1095,6 +1165,10 @@ fn handle_control(
                 shared.stream_rtt_ms.store(0, Ordering::Relaxed);
                 shared.stream_viewers.store(0, Ordering::Relaxed);
                 let _ = network_tx.send(NetworkControl::ScreenShareStop);
+                let _ = network_tx.try_send(NetworkControl::TelemetrySharing(None));
+                let _ = network_tx.try_send(NetworkControl::TelemetryEvent(
+                    protocol::TelemetryEvent::ShareStopped,
+                ));
                 *shared.current_quality.lock().unwrap() = None;
                 event_tx.send(ScreenEvent::SharingStopped).ok();
                 wake();
@@ -1136,6 +1210,9 @@ fn handle_control(
                                 height,
                                 jitter_buffer: VideoJitterBuffer::new(30),
                                 stream_audio: None,
+                                frames_decoded_total: 0,
+                                frames_dropped_total: 0,
+                                decode_us_total: 0,
                                 rx_telemetry: (Instant::now(), 0),
                             },
                         );
@@ -1252,6 +1329,8 @@ fn handle_control(
         ScreenControl::ForceKeyframe => {
             if let Some(state) = &mut st.capture {
                 info!("Viewer requested keyframe — forcing IDR");
+                state.keyframe_requests += 1;
+                state.forced_keyframes += 1;
                 state.encoder.force_keyframe();
 
                 let now = Instant::now();
@@ -1342,7 +1421,7 @@ fn capture_and_encode(
     if status == CaptureStatus::Fresh {
         state.telemetry.1 += 1;
     }
-    report_share_telemetry(state);
+    report_share_telemetry(state, network_tx);
     let repeat = match status {
         CaptureStatus::Fresh => false,
         CaptureStatus::Unchanged => {
@@ -1427,6 +1506,7 @@ fn capture_and_encode(
                 encoded.data.len(),
                 protocol::MAX_VIDEO_FRAME_BYTES,
             );
+            state.forced_keyframes += 1;
             state.encoder.force_keyframe();
             if !state.encoder.supports_forced_keyframes() {
                 state.keyframe_burst_until = Some(Instant::now() + KEYFRAME_BURST_MAX);
@@ -1503,11 +1583,14 @@ fn decode_incoming_system_audio(
 // ── Encoder/decoder factory ─────────────────────────────────────────────
 
 /// Create the video encoder (FFmpeg is currently the only backend).
-fn create_encoder(quality: Quality) -> Result<Box<dyn VideoEncoder + Send>, CodecError> {
+fn create_encoder(
+    quality: Quality,
+) -> Result<(Box<dyn VideoEncoder + Send>, &'static str), CodecError> {
     match FfmpegEncoder::new(quality) {
         Ok(enc) => {
-            info!("Using FFmpeg encoder: {}", enc.encoder_name());
-            Ok(Box::new(enc))
+            let name = enc.encoder_name();
+            info!("Using FFmpeg encoder: {name}");
+            Ok((Box::new(enc), name))
         }
         Err(e) => {
             warn!("FFmpeg encoder unavailable: {e}");

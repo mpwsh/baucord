@@ -36,8 +36,9 @@ pub struct AudioStats {
     pub plc_frames: AtomicU64,
 
     // ── Uplink loss feedback (written by the app, read by the encoder) ──
-    /// Loss on *our outbound* path as a percentage (0–100), supplied by
-    /// the transport (renet's ack-derived estimate). The decoder-side
+    /// Loss on *our outbound* path as a percentage (0–100), from the
+    /// relay's voice receiver report (what it actually received of our
+    /// packets, every 2 s — never a transport ack estimate). The decoder-side
     /// counters above only see the downlink; a user whose uplink drops
     /// packets while the downlink is clean needs this to get any FEC at
     /// all. See [`crate::VoiceChat::set_uplink_loss_pct`].

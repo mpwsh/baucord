@@ -77,15 +77,15 @@ fn fill_server_editor(app: &AppState) {
     s.set_server_name(entry.map_or("", |e| e.name.as_str()).into());
     s.set_server_ip(ip.into());
     s.set_server_port(port.into());
-    s.set_server_token_url(
+    s.set_server_password(
         entry
-            .and_then(|e| e.token_url.as_deref())
+            .and_then(|e| e.password.as_deref())
             .unwrap_or("")
             .into(),
     );
-    s.set_server_token_password(
+    s.set_server_fingerprint(
         entry
-            .and_then(|e| e.token_password.as_deref())
+            .and_then(|e| e.fingerprint.as_deref())
             .unwrap_or("")
             .into(),
     );
@@ -298,8 +298,8 @@ fn wire(win: &SettingsWindow) {
             app.settings.servers.push(ServerEntry {
                 name,
                 address: String::new(),
-                token_url: None,
-                token_password: None,
+                password: None,
+                fingerprint: None,
                 channel_passwords: std::collections::HashMap::new(),
             });
             app.settings.save();
@@ -371,22 +371,29 @@ fn wire(win: &SettingsWindow) {
         app::with_current(update_selected_address);
     });
 
-    logic.on_server_token_url_edited(|text| {
+    logic.on_server_fingerprint_edited(|text| {
         app::with_current(move |app| {
             let Some(index) = selected_server(app) else {
                 return;
             };
-            let trimmed = text.trim().to_string();
-            app.settings.servers[index].token_url = (!trimmed.is_empty()).then_some(trimmed);
+            // Accept a bare fingerprint or a whole invite string
+            // (`host:port#SHA256:…`); only a well-formed pin is kept.
+            let trimmed = text.trim();
+            let pin = trimmed
+                .rsplit_once('#')
+                .map_or(trimmed, |(_, fp)| fp)
+                .trim();
+            let valid = pin.parse::<transport::Fingerprint>().is_ok();
+            app.settings.servers[index].fingerprint = valid.then(|| pin.to_string());
         });
     });
-    logic.on_server_token_password_edited(|text| {
+    logic.on_server_password_edited(|text| {
         app::with_current(move |app| {
             let Some(index) = selected_server(app) else {
                 return;
             };
             let trimmed = text.trim().to_string();
-            app.settings.servers[index].token_password = (!trimmed.is_empty()).then_some(trimmed);
+            app.settings.servers[index].password = (!trimmed.is_empty()).then_some(trimmed);
         });
     });
 
@@ -772,7 +779,7 @@ fn set_about(s: &ui::SettingsState) {
     let tech: Vec<String> = [
         "tech-rust",
         "tech-slint",
-        "tech-renet",
+        "tech-quinn",
         "tech-ffmpeg",
         "tech-xcap",
         "tech-cpal",

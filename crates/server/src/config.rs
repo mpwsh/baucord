@@ -17,6 +17,7 @@ pub struct Config {
     pub network: NetworkSettings,
     pub limits: LimitSettings,
     pub authentication: AuthSettings,
+    pub identity: IdentitySettings,
     pub logging: LoggingSettings,
     /// Voice channels (rooms). Omitting the key gives a single open
     /// "Lobby" default channel, so pre-channels configs keep working.
@@ -67,12 +68,9 @@ pub struct ServerSettings {
     /// Address to bind the UDP socket on.
     pub host: String,
     pub port: u16,
-    /// The address clients reach this server at (`"ip:port"` or
-    /// `"host:port"` resolving to one address).
-    ///
-    /// **Required in secure mode when `host` is a wildcard** (0.0.0.0 /
-    /// ::), because connect tokens embed the concrete address the client
-    /// must dial — a token pointing at 0.0.0.0 is unusable.
+    /// The address clients reach this server at (`"host:port"`). Only
+    /// used to print the invite string (`host:port#SHA256:…`) at
+    /// startup; the transport itself does not need it.
     pub public_address: Option<String>,
     pub greeting_message: String,
 }
@@ -80,12 +78,11 @@ pub struct ServerSettings {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetworkSettings {
+    /// Connections admitted at once; the transport refuses the rest
+    /// during the handshake. (`bytes_per_tick` from the 0.5 line is
+    /// gone: QUIC's congestion controller and the per-lane budgets
+    /// replace it, and an old key is ignored.)
     pub max_clients: usize,
-    /// Per-client outbound budget per server tick (~1 ms). This is burst
-    /// pacing, not rate policing: 20 000 B/tick spreads a keyframe burst
-    /// over ~9 ms while capping any one client at ≈160 Mbit/s — far above
-    /// steady-state traffic. See `protocol::channels` for the full story.
-    pub bytes_per_tick: u64,
 }
 
 /// Admission control. These are the real bandwidth ceiling: worst-case
@@ -131,34 +128,31 @@ pub struct LimitSettings {
     pub media_relay_kb_per_sec: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Admission. Every connection is encrypted and the server's identity
+/// is pinned by clients regardless of these settings; this is only
+/// about who gets past `Hello`.
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
-    /// `true`: netcode secure mode — clients must present a ConnectToken
-    /// obtained from the token issuer. `false`: open mode for LAN/dev;
-    /// anyone who can reach the UDP port can join, and media is not
-    /// encrypted end-to-end by netcode session keys derived from a
-    /// private token. The server logs loudly when running open.
+    /// `true`: clients must send the shared `password` in `Hello`
+    /// (compared in constant time; failures are rate-limited per
+    /// source address). `false`: open mode for LAN/dev — anyone who
+    /// can reach the UDP port can join with any name. The server logs
+    /// loudly when running open.
     pub secure: bool,
-    /// Path to the 32-byte netcode private key, hex-encoded (64 chars).
-    /// Generated automatically on first secure start if missing.
-    pub private_key_file: String,
-    pub issuer: IssuerSettings,
+    /// The room secret. Required when `secure` is true.
+    pub password: Option<String>,
 }
 
+/// Where the server keeps its Ed25519 identity key and certificate.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
-pub struct IssuerSettings {
-    /// Bind address of the plain-HTTP token issuer. Defaults to
-    /// loopback: the expectation is a TLS-terminating reverse proxy
-    /// (APISIX, Caddy, nginx) in front routing e.g. `/token` here.
-    /// Tokens contain session keys — never expose this over plain HTTP
-    /// to the internet.
-    pub bind: String,
-    /// Optional shared password clients must present in the
-    /// `x-baucord-pass` header. `None` disables the check (rely on the
-    /// proxy for access control).
-    pub password: Option<String>,
+pub struct IdentitySettings {
+    /// Directory for `identity.key`, `identity.pem`, `retired/` and
+    /// uploaded client logs (`logs/`). Created on first start. Keep it
+    /// on persistent storage: the key *is* the server's identity, and
+    /// every client pins it.
+    pub dir: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,23 +160,76 @@ pub struct IssuerSettings {
 pub struct LoggingSettings {
     pub level: String,
     pub stats_interval_secs: u64,
+    /// One `link:` line per connected client every this many seconds
+    /// (0 = off): the relay's view of that client's link — QUIC path
+    /// RTT, congestion window, transport-level loss, bytes in/out,
+    /// abandoned video groups, and the voice packets received vs. the
+    /// sender's sequence numbers (what listeners actually miss). Meant
+    /// to be lined up by timestamp against the client's own `link:`
+    /// lines and its `telemetry:` samples. ~9 clients at 2 s is a few
+    /// hundred lines a minute; raise it or set 0 outside diagnosis.
+    pub link_stats_interval_secs: u64,
+    /// Log the periodic `telemetry:` samples clients send (§9.1). Off
+    /// still accepts the messages; they are just not written out.
+    pub telemetry: bool,
 }
 
 impl Config {
+    /// # Errors
+    /// Unreadable file or invalid YAML.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = fs::read_to_string(path)?;
         Ok(serde_yaml::from_str(&contents)?)
     }
 
     /// Write this config to a YAML file.
+    ///
+    /// # Errors
+    /// Serialization or write failure.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         let contents = serde_yaml::to_string(self)?;
         fs::write(path, contents)?;
         Ok(())
     }
 
+    /// # Errors
+    /// `server.host` is not an IP address.
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         format!("{}:{}", self.server.host, self.server.port).parse()
+    }
+
+    /// Check the admission settings for contradictions.
+    ///
+    /// # Errors
+    /// `secure: true` without a password.
+    pub fn validate_authentication(&self) -> Result<(), String> {
+        if self.authentication.secure
+            && self
+                .authentication
+                .password
+                .as_deref()
+                .is_none_or(|p| p.trim().is_empty())
+        {
+            return Err(
+                "authentication.secure is true but authentication.password is empty — \
+                 set a password, or set secure: false for an open LAN server"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The `host:port` clients should dial, for the invite string.
+    #[must_use]
+    pub fn public_endpoint(&self) -> String {
+        self.server.public_address.clone().unwrap_or_else(|| {
+            let host = if self.server.host == "0.0.0.0" || self.server.host == "::" {
+                "<public-ip>".to_string()
+            } else {
+                self.server.host.clone()
+            };
+            format!("{host}:{}", self.server.port)
+        })
     }
 
     /// Validate the channel list and return the default channel's index.
@@ -193,6 +240,9 @@ impl Config {
     /// and more than [`MAX_CHANNELS`] channels are all config mistakes
     /// the operator should fix, not states the server should limp
     /// through.
+    ///
+    /// # Errors
+    /// A human-readable description of the first problem found.
     pub fn validate_channels(&self) -> Result<u16, String> {
         validate_channel_list(&self.channels)
     }
@@ -219,6 +269,9 @@ impl Config {
 /// index. Shared by startup ([`Config::validate_channels`]) and hot
 /// reload, which must vet a new list *before* swapping it in — a bad
 /// edit to a running server is rejected here and never applied.
+///
+/// # Errors
+/// A human-readable description of the first problem found.
 pub fn validate_channel_list(channels: &[ChannelSettings]) -> Result<u16, String> {
     if channels.is_empty() {
         return Err(
@@ -286,6 +339,7 @@ impl Default for Config {
             network: NetworkSettings::default(),
             limits: LimitSettings::default(),
             authentication: AuthSettings::default(),
+            identity: IdentitySettings::default(),
             logging: LoggingSettings::default(),
             channels: default_channels(),
         }
@@ -306,10 +360,7 @@ impl Default for ServerSettings {
 
 impl Default for NetworkSettings {
     fn default() -> Self {
-        Self {
-            max_clients: 64,
-            bytes_per_tick: protocol::SERVER_BYTES_PER_TICK,
-        }
+        Self { max_clients: 64 }
     }
 }
 
@@ -330,21 +381,10 @@ impl Default for LimitSettings {
     }
 }
 
-impl Default for AuthSettings {
+impl Default for IdentitySettings {
     fn default() -> Self {
         Self {
-            secure: false,
-            private_key_file: "netcode.key".to_string(),
-            issuer: IssuerSettings::default(),
-        }
-    }
-}
-
-impl Default for IssuerSettings {
-    fn default() -> Self {
-        Self {
-            bind: "127.0.0.1:5001".to_string(),
-            password: None,
+            dir: "data/baucord".to_string(),
         }
     }
 }
@@ -354,6 +394,8 @@ impl Default for LoggingSettings {
         Self {
             level: "info".to_string(),
             stats_interval_secs: 30,
+            link_stats_interval_secs: 2,
+            telemetry: true,
         }
     }
 }

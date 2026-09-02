@@ -10,18 +10,18 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
 use audio::{AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig};
-use crossbeam_channel::{bounded, select, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded, select};
 use log::info;
 
-use crate::{config::Settings, network::NetworkControl, WakeFn};
+use crate::{WakeFn, config::Settings, network::NetworkControl};
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -43,10 +43,11 @@ pub enum VoiceControl {
     AddPeer(u64),
     RemovePeer(u64),
     SetPeerAudio(u64, PeerAudioSettings),
-    /// Loss on our outbound path in percent (0–49), from the network
-    /// thread's periodic renet sample. Feeds the encoder's FEC hint.
+    /// Loss on our outbound path in percent (0–50), from the relay's
+    /// voice receiver report (only when the window held enough packets
+    /// to mean something). Feeds the encoder's FEC hint.
     SetUplinkLoss(u32),
-    /// Round-trip time in ms from the same renet sample. Feeds the
+    /// Round-trip time in ms from the same report. Feeds the
     /// encoder's rate controller (congestion vs random loss).
     SetLinkRtt(u32),
     IncomingVoicePacket(AudioPacket),

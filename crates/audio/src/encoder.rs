@@ -471,8 +471,8 @@ impl EncoderWorker {
 
 /// Wall-clock interval between adaptation evaluations. The rate
 /// controller's dwell and climb holds (adapt.rs) are counted in
-/// evaluations and sized against this cadence and renet's 6 s loss
-/// window — change one, revisit the others.
+/// evaluations and sized against this cadence and the relay's 2 s
+/// receiver-report window — change one, revisit the others.
 const ADAPT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Bounded wait on the frame channel, so the adaptation tick runs even

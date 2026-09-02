@@ -42,11 +42,10 @@ server-remove = Remove
 server-manage = Manage servers
 server-new-name = New server
 save = Save
-connect-access-denied = Access denied: password — enter it below and Save, then Connect again
-server-token-url = Token URL (secure servers only)
+connect-access-denied = Access denied: wrong or missing server password — enter it below and Save, then Connect again
+server-fingerprint = Server identity (SHA256:…, from the invite; learned on first connect)
 server-config-note =
-    Leave the token URL empty for open/LAN servers.
-    Changes apply on the next connect.
+    The password is the room secret everyone on your server shares. The identity is learned on first connect and pinned; paste it from an invite to verify the server up front. Both apply on the next connect.
 
 # ── Sidebar ─────────────────────────────────────────────────────────────
 users-count = Users: { $count }
@@ -158,7 +157,7 @@ about-open-folder = Open install folder
 about-built-with = BUILT WITH
 tech-rust = Rust - Programming Language
 tech-fltk = FLTK - User Interface
-tech-renet = Renet - Networking
+tech-quinn = quinn-proto - QUIC transport
 tech-ffmpeg = FFmpeg - Video Encoding/Decoding
 tech-xcap = Xcap - Screen capture
 tech-cpal = CPAL - Audio I/O
@@ -238,3 +237,7 @@ share-visibility = Visible to
 share-channel-only = My channel
 share-everyone = Everyone
 chat-channels-updated = voice channels were updated
+
+# Server identity pinning (1.0)
+error-identity-changed = The server's identity changed: expected { $expected }, got { $observed }. Nothing was sent. If the admin rotated the key on purpose, edit the server's identity in Settings (or clear it) and connect again.
+chat-identity-pinned = Pinned this server's identity: { $fingerprint }

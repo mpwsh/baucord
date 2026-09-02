@@ -2,11 +2,11 @@ server:
   name: Baucord Server
   host: 0.0.0.0
   port: 5000
+  # Printed in the invite string at startup: <public_address>#SHA256:<fingerprint>
   public_address: "216.238.121.18:5000"
   greeting_message: Welcome to the server!
 network:
   max_clients: 256
-  bytes_per_tick: 4194304
 limits:
   max_sharers: 5
   max_viewers_per_stream: 8
@@ -17,14 +17,19 @@ limits:
 logging:
   level: info
   stats_interval_secs: 3600
+  link_stats_interval_secs: 2
+  telemetry: true
 authentication:
+  # Every connection is encrypted and pinned regardless; `secure` only
+  # decides whether Hello must carry the room password.
   secure: true
-  # Mounted from ./data/baucord on the host (docker-compose.yml) so the key
-  # survives container recreation. Generated on first secure start.
-  private_key_file: /app/data/netcode.key
-  issuer:
-    bind: "0.0.0.0:5001"
-    password: conos
+  password: conos
+identity:
+  # Mounted from ./data/baucord on the host (docker-compose.yml) so the
+  # Ed25519 identity key survives container recreation. Generated on
+  # first start; clients pin it, so back it up. Client log uploads land
+  # in logs/ underneath.
+  dir: /app/data
 channels:
   - name: Lobby
     default: true

@@ -3,8 +3,6 @@ members = ["crates/*"]
 resolver = "2"
 
 
-[patch.crates-io]
-renet = { git = "https://github.com/mpwsh/renet", rev = "4ae0e12" }
 # ── Shared dependency versions ──────────────────────────────────────────
 # Crates opt in per dependency with `dep.workspace = true`. Only deps
 # used by two or more crates live here; single-user deps stay local.
@@ -20,7 +18,8 @@ slint = { version = "1.17", default-features = false, features = [
   "accessibility",
   "compat-1-2",
 ] }
-renet = "2.0"
+bytes = "1.12"
+thiserror = "2"
 
 # ── Shared lints (crates opt in with `[lints] workspace = true`) ────────
 [workspace.lints.rust]
