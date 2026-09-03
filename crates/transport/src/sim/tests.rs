@@ -170,18 +170,16 @@ fn voice_datagrams_flow_both_ways() {
     assert_eq!(at_server[3].len(), 100);
     assert_eq!(at_client[3].len(), 300);
     // Nothing leaked across lanes.
-    assert!(
-        p.net
-            .driver(server)
-            .recv(client_peer, Lane::SystemAudio)
-            .is_none()
-    );
-    assert!(
-        p.net
-            .driver(client)
-            .recv(server_peer, Lane::Voice)
-            .is_none()
-    );
+    assert!(p
+        .net
+        .driver(server)
+        .recv(client_peer, Lane::SystemAudio)
+        .is_none());
+    assert!(p
+        .net
+        .driver(client)
+        .recv(server_peer, Lane::Voice)
+        .is_none());
 }
 
 #[test]
@@ -276,6 +274,12 @@ fn starting_a_new_group_while_the_old_is_unsent_resets_it() {
     let stats = p.net.driver(client).stats(server_peer).expect("stats");
     assert_eq!(stats.groups_started, 4);
     assert!(stats.groups_reset >= 2, "{stats:?}");
+    assert_eq!(
+        stats.groups_reset,
+        stats.groups_reset_superseded + stats.groups_reset_deadline + stats.groups_reset_unacked,
+        "every behind-reset has exactly one cause: {stats:?}"
+    );
+    assert_eq!(stats.groups_reset_upstream, 0);
     let mut items = Vec::new();
     while let Some((_, it)) = p.net.driver(server).recv_video(client_peer) {
         items.push(it);
@@ -292,11 +296,9 @@ fn starting_a_new_group_while_the_old_is_unsent_resets_it() {
         .expect("a group start");
     let tail = &items[last_start..];
     assert_eq!(tail.len(), 7, "{tail:?}");
-    assert!(
-        tail[1..6]
-            .iter()
-            .all(|i| *i == VideoItem::Chunk(Bytes::from(vec![9; 1000])))
-    );
+    assert!(tail[1..6]
+        .iter()
+        .all(|i| *i == VideoItem::Chunk(Bytes::from(vec![9; 1000]))));
     assert_eq!(tail[6], VideoItem::GroupEnd);
 }
 
@@ -631,13 +633,53 @@ fn a_dead_peer_is_detected_by_the_idle_timeout() {
     assert!(ok, "server {server_saw:?} client {client_saw:?}");
     assert_eq!(server_saw, Some(DisconnectReason::TimedOut));
     assert_eq!(client_saw, Some(DisconnectReason::TimedOut));
+    assert!(server_saw
+        .as_ref()
+        .is_some_and(DisconnectReason::is_transient));
     let took = p.net.now() - cut_at;
-    assert!(took < Duration::from_secs(20), "took {took:?}");
+    assert!(took < Duration::from_secs(35), "took {took:?}");
     // Both tables are eventually empty.
     p.net
         .run_for(Duration::from_secs(5), Duration::from_millis(10));
     assert_eq!(p.net.driver(server).peer_count(), 0);
     assert_eq!(p.net.driver(client).peer_count(), 0);
+}
+
+#[test]
+fn a_blackout_shorter_than_the_idle_timeout_is_survived() {
+    let mut p = pair(21, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, client_peer) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+    // 20 s of total loss, then the link returns.
+    p.net.set_link(
+        server,
+        client,
+        LinkSpec::clean(Duration::from_millis(10)).with_loss(1.0),
+    );
+    p.net
+        .run_for(Duration::from_secs(20), Duration::from_millis(10));
+    p.net
+        .set_link(server, client, LinkSpec::clean(Duration::from_millis(10)));
+    let now = p.net.now();
+    p.net
+        .driver(client)
+        .send(now, server_peer, Lane::Control, b"still here")
+        .expect("send");
+    let mut got = None;
+    let ok = p.net.run_until(Duration::from_secs(5), TICK, |net| {
+        got = net.driver(server).recv(client_peer, Lane::Control);
+        got.is_some()
+    });
+    assert!(ok, "session should survive a 20 s blackout");
+    assert!(p.net.driver(server).is_connected(client_peer));
+    assert!(p.net.driver(client).is_connected(server_peer));
+    let events: Vec<Event> = p.net.driver(client).drain_events().collect();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::Disconnected { .. })),
+        "{events:?}"
+    );
 }
 
 #[test]

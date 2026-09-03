@@ -29,28 +29,29 @@ pub mod voice;
 // Explicit re-exports: everything a consumer needs, nothing more.
 pub use bytes::Bytes;
 pub use lanes::{
-    ALPN, Carrier, DATAGRAM_PAYLOAD_LIMIT, Lane, OUTDATED_MESSAGE, SYSTEM_AUDIO_DATAGRAM_BUDGET,
+    Carrier, Lane, ALPN, DATAGRAM_PAYLOAD_LIMIT, OUTDATED_MESSAGE, SYSTEM_AUDIO_DATAGRAM_BUDGET,
     VIDEO_FRAME_BUDGET, VOICE_DATAGRAM_BUDGET,
 };
 pub use messages::{
-    AudioSample, Auth, CLIENT_VERSION, ChannelDenyReason, ChannelInfo, ChatMessage, ClientId,
-    ClientInfo, ClientKeyProof, ClientMessage, DenyReason, IMAGE_CHUNK_BYTES, MAX_CHAT_IMAGE_BYTES,
-    MAX_CONTROL_MESSAGE_BYTES, MAX_IMAGE_CHUNKS, MAX_IMAGE_MESSAGE_BYTES, MAX_LOG_UPLOAD_BYTES,
-    MAX_LOG_UPLOAD_CHUNKS, MEDIA_UPLOAD_PACE, PathSample, RefusedReason, ServerMessage, ShareScope,
-    SharingSample, TelemetryEvent, TelemetrySample, UserId, ViewingSample, decode_client_message,
-    decode_server_message, encode_client_message, encode_server_message,
+    decode_client_message, decode_server_message, encode_client_message, encode_server_message,
+    AudioSample, Auth, ChannelDenyReason, ChannelInfo, ChatMessage, ClientId, ClientInfo,
+    ClientKeyProof, ClientMessage, DenyReason, PathSample, RefusedReason, ServerMessage,
+    ShareScope, SharingSample, TelemetryEvent, TelemetrySample, UserId, ViewingSample,
+    CLIENT_VERSION, IMAGE_CHUNK_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES,
+    MAX_IMAGE_CHUNKS, MAX_IMAGE_MESSAGE_BYTES, MAX_LOG_UPLOAD_BYTES, MAX_LOG_UPLOAD_CHUNKS,
+    MEDIA_UPLOAD_PACE,
 };
-pub use relayed::{RELAY_SENDER_BYTES, split_sender, wrap_sender};
+pub use relayed::{split_sender, wrap_sender, RELAY_SENDER_BYTES};
 pub use system_audio::{
-    SYSTEM_AUDIO_HEADER_SIZE, SYSTEM_AUDIO_MTU_BUDGET, SystemAudioHeader, pack_system_audio,
-    parse_system_audio,
+    pack_system_audio, parse_system_audio, SystemAudioHeader, SYSTEM_AUDIO_HEADER_SIZE,
+    SYSTEM_AUDIO_MTU_BUDGET,
 };
-pub use username::{MAX_USERNAME_BYTES, sanitize_username, truncate_on_char_boundary};
+pub use username::{sanitize_username, truncate_on_char_boundary, MAX_USERNAME_BYTES};
 pub use video::{
-    MAX_VIDEO_FRAME_BYTES, ReassembledFrame, VIDEO_CHUNK_PAYLOAD, VIDEO_HEADER_SIZE, VideoHeader,
-    VideoReassembler, pack_video_frame, parse_video_header,
+    pack_video_frame, parse_video_header, ReassembledFrame, VideoHeader, VideoReassembler,
+    MAX_VIDEO_FRAME_BYTES, VIDEO_CHUNK_PAYLOAD, VIDEO_HEADER_SIZE,
 };
 pub use voice::{
-    VOICE_FLAG_RED, VOICE_FLAGS_KNOWN, VOICE_HEADER_SIZE, VOICE_MAX_FRAME_SIZE, VOICE_MTU_BUDGET,
-    VoiceHeader, pack_voice, pack_voice_with_flags, parse_voice,
+    pack_voice, pack_voice_with_flags, parse_voice, VoiceHeader, VOICE_FLAGS_KNOWN, VOICE_FLAG_RED,
+    VOICE_HEADER_SIZE, VOICE_MAX_FRAME_SIZE, VOICE_MTU_BUDGET,
 };

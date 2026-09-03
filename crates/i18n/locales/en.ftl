@@ -241,3 +241,4 @@ chat-channels-updated = voice channels were updated
 # Server identity pinning (1.0)
 error-identity-changed = The server's identity changed: expected { $expected }, got { $observed }. Nothing was sent. If the admin rotated the key on purpose, edit the server's identity in Settings (or clear it) and connect again.
 chat-identity-pinned = Pinned this server's identity: { $fingerprint }
+error-connection-lost = Connection lost: { $reason }. Reconnecting in { $secs } s…

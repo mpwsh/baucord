@@ -207,12 +207,13 @@ mod tests {
     /// call, however the platform's `recv` batches — the bug this
     /// guards against left all but the first datagram in the kernel
     /// queue on macOS and Windows.
+    const N: usize = 300;
+
     #[test]
     fn recv_batch_drains_the_whole_socket_queue() {
         let mut rx = UdpIo::bind("127.0.0.1:0".parse().unwrap(), 1 << 20).expect("bind rx");
         let tx = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind tx");
         let to = rx.local_addr().expect("addr");
-        const N: usize = 300;
         for i in 0..N {
             tx.send_to(&[u8::try_from(i % 256).unwrap(); 100], to)
                 .expect("send");

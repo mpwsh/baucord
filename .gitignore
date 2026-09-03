@@ -1,12 +1,4 @@
-/target
-/backups
-todo.md
-onnxruntime.dll
-diagnostics*.txt
-.DS_Store
-prompt.md
+target/
 *.log
-netcode.key
-fltk-ui
-./crates/*.tar.gz
-/data
+# Sandbox placeholders; the real sounds live in the main repo.
+assets/

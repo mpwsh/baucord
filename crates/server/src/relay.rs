@@ -24,7 +24,7 @@ use std::{
 
 use log::{debug, info};
 use protocol::{
-    ClientId, Lane, ShareScope, parse_system_audio, parse_video_header, parse_voice, wrap_sender,
+    parse_system_audio, parse_video_header, parse_voice, wrap_sender, ClientId, Lane, ShareScope,
 };
 use transport::{Driver, LinkStats, VideoItem};
 

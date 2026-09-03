@@ -20,19 +20,19 @@ use std::{
 
 use log::{debug, info, warn};
 use protocol::{
-    Auth, ChannelDenyReason, ChannelInfo, ChatMessage, ClientId, ClientKeyProof, ClientMessage,
-    DenyReason, Lane, RefusedReason, ServerMessage, ShareScope, TelemetryEvent, TelemetrySample,
-    features,
+    features, Auth, ChannelDenyReason, ChannelInfo, ChatMessage, ClientId, ClientKeyProof,
+    ClientMessage, DenyReason, Lane, RefusedReason, ServerMessage, ShareScope, TelemetryEvent,
+    TelemetrySample,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use transport::{
+    identity::{verify_ed25519, CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL},
     Budget, DisconnectReason, Driver, DriverHost, Event, Fingerprint, LinkStats, ServerIdentity,
-    identity::{CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL, verify_ed25519},
 };
 
 use crate::{
-    config::{ChannelSettings, Config, validate_channel_list},
+    config::{validate_channel_list, ChannelSettings, Config},
     relay::{ShareInfo, VideoRelay, VoiceRelay},
 };
 
@@ -1659,15 +1659,34 @@ impl ChatServer {
                 let rx_kbit = (stats.bytes_rx.saturating_sub(base.bytes_rx)) as f64 * 8.0
                     / 1000.0
                     / interval_secs;
+                let sup = stats
+                    .groups_reset_superseded
+                    .saturating_sub(base.groups_reset_superseded);
+                let dl = stats
+                    .groups_reset_deadline
+                    .saturating_sub(base.groups_reset_deadline);
+                let ack = stats
+                    .groups_reset_unacked
+                    .saturating_sub(base.groups_reset_unacked);
+                let upstream = stats
+                    .groups_reset_upstream
+                    .saturating_sub(base.groups_reset_upstream);
+                let behind = stats.groups_reset.saturating_sub(base.groups_reset);
+                let cause = if behind > 0 || upstream > 0 {
+                    format!(
+                        " (superseded {sup}, deadline {dl}, unacked {ack}, upstream {upstream})"
+                    )
+                } else {
+                    String::new()
+                };
                 info!(
                     "link: {username} ({client_id:#x}): rtt {rtt_ms} ms, cwnd {} KB, path loss {:.1}%, \
                      tx {tx_kbit:.0} kbit/s, rx {rx_kbit:.0} kbit/s, mtu {}, dgram drops {}, \
-                     groups reset {}/{} | voice rx {} pkt, expected {}, lost {} ({:.1}%), late {}{}",
+                     groups behind {behind}/{}{cause} | voice rx {} pkt, expected {}, lost {} ({:.1}%), late {}{}",
                     stats.cwnd / 1024,
                     stats.path_loss_pct_since(&base),
                     stats.current_mtu,
                     stats.datagram_send_drops - base.datagram_send_drops,
-                    stats.groups_reset - base.groups_reset,
                     stats.groups_started - base.groups_started,
                     voice.received,
                     voice.expected,
@@ -1728,7 +1747,7 @@ impl ChatServer {
             if let Some(stats) = self.driver.stats(client_id) {
                 let username = self.get_username(client_id);
                 info!(
-                    "  {username} ({client_id:#x}): rtt {} ms, cwnd {} KB, lost {}/{} pkt, tx {:.2} MB, rx {:.2} MB, groups reset {}/{}",
+                    "  {username} ({client_id:#x}): rtt {} ms, cwnd {} KB, lost {}/{} pkt, tx {:.2} MB, rx {:.2} MB, groups behind {}/{} (superseded {}, deadline {}, unacked {}, upstream {})",
                     stats.rtt.as_millis(),
                     stats.cwnd / 1024,
                     stats.lost_packets,
@@ -1737,6 +1756,10 @@ impl ChatServer {
                     stats.bytes_rx as f64 / 1_048_576.0,
                     stats.groups_reset,
                     stats.groups_started,
+                    stats.groups_reset_superseded,
+                    stats.groups_reset_deadline,
+                    stats.groups_reset_unacked,
+                    stats.groups_reset_upstream,
                 );
             }
         }

@@ -167,6 +167,11 @@ pub struct AppState {
     // Timers — held so they keep firing.
     timers: Vec<slint::Timer>,
     error_timer: slint::Timer,
+    /// Backoff before an automatic reconnect after a transient loss.
+    reconnect_timer: slint::Timer,
+    /// Consecutive automatic reconnects since the last successful
+    /// admission; capped so a dead server does not spin forever.
+    reconnect_attempts: u32,
     stream_stats_timer_active: Arc<AtomicBool>,
     pub meter_timer: slint::Timer,
     /// The single animation ticker driving every playing GIF (chat
@@ -349,6 +354,8 @@ pub fn run() {
         keybind_recording: None,
         timers: Vec::new(),
         error_timer: slint::Timer::default(),
+        reconnect_timer: slint::Timer::default(),
+        reconnect_attempts: 0,
         stream_stats_timer_active: Arc::new(AtomicBool::new(false)),
         meter_timer: slint::Timer::default(),
         gif_ticker: slint::Timer::default(),
@@ -1057,9 +1064,46 @@ impl AppState {
         match msg {
             NetworkMessage::Connected => {
                 self.connected = true;
+                self.reconnect_attempts = 0;
                 let s = self.main.global::<State>();
                 s.set_error_text("".into());
                 s.set_password_prompt(false);
+            }
+            NetworkMessage::ConnectionLost { reason } => {
+                // Network, not credentials: come back on our own, with
+                // backoff (2, 4, 8, 16, 30 s), instead of dumping the
+                // user on the connect screen with a transport error.
+                self.push_chat_system(&t!("chat-disconnected", "reason" => reason.as_str()));
+                self.teardown_connection();
+                self.show_connect_phase();
+                const MAX_AUTO_RECONNECTS: u32 = 5;
+                if self.reconnect_attempts >= MAX_AUTO_RECONNECTS {
+                    self.show_error(&reason);
+                } else {
+                    self.reconnect_attempts += 1;
+                    let secs = (2u64 << (self.reconnect_attempts - 1)).min(30);
+                    let secs_text = secs.to_string();
+                    self.show_error(&t!(
+                        "error-connection-lost",
+                        "reason" => reason.as_str(),
+                        "secs" => secs_text.as_str()
+                    ));
+                    let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+                    if let Some(weak) = weak {
+                        self.reconnect_timer.start(
+                            slint::TimerMode::SingleShot,
+                            Duration::from_secs(secs),
+                            move || {
+                                with_app(&weak, |app| {
+                                    if !app.connected {
+                                        let nickname = app.settings.user.nickname.clone();
+                                        app.handle_connect(&nickname);
+                                    }
+                                });
+                            },
+                        );
+                    }
+                }
             }
             NetworkMessage::ServerIdentity {
                 fingerprint,
@@ -1068,9 +1112,10 @@ impl AppState {
                 // Trust on first use (or a signed key rotation): pin it
                 // on the server entry so a different key is refused
                 // from now on.
-                let changed = self.settings.default_server().is_none_or(|s| {
-                    s.fingerprint.as_deref() != Some(fingerprint.as_str())
-                });
+                let changed = self
+                    .settings
+                    .default_server()
+                    .is_none_or(|s| s.fingerprint.as_deref() != Some(fingerprint.as_str()));
                 if changed {
                     if let Some(server) = self.settings.default_server_mut() {
                         server.fingerprint = Some(fingerprint.clone());
@@ -1261,6 +1306,7 @@ impl AppState {
     // ════════════════════════════════════════════════════════════════
 
     fn handle_connect(&mut self, nickname: &str) {
+        self.reconnect_timer.stop();
         self.settings.user.nickname = nickname.to_string();
 
         // A password typed into the 403 prompt but not yet saved still
@@ -1732,6 +1778,8 @@ impl AppState {
     }
 
     fn handle_disconnect(&mut self) {
+        self.reconnect_timer.stop();
+        self.reconnect_attempts = 0;
         self.network.tx.send(NetworkControl::Disconnect).ok();
         self.push_chat_system(&t!("chat-disconnected", "reason" => t!("disconnect-reason-user")));
         self.teardown_connection();

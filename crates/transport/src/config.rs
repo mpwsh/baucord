@@ -57,8 +57,12 @@ impl Budget {
     #[must_use]
     pub fn client() -> Self {
         Self {
-            max_idle_timeout: Duration::from_secs(15),
-            keep_alive_interval: Some(Duration::from_secs(5)),
+            // 30 s (spec: 15 s): a Wi-Fi roam or ISP hiccup of 15–25 s
+            // now survives instead of ending the session; the roster
+            // shows a dead peer for up to 30 s in exchange. Keep-alives
+            // every 2 s so a lossy link still lands some in the window.
+            max_idle_timeout: Duration::from_secs(30),
+            keep_alive_interval: Some(Duration::from_secs(2)),
             max_ack_delay: Duration::from_millis(25),
             datagram_receive_buffer: 64 * 1024,
             datagram_send_buffer: 32 * 1024,
@@ -78,7 +82,8 @@ impl Budget {
     #[must_use]
     pub fn server() -> Self {
         Self {
-            max_idle_timeout: Duration::from_secs(15),
+            // Matches the client; QUIC uses the smaller of the two.
+            max_idle_timeout: Duration::from_secs(30),
             keep_alive_interval: None,
             max_ack_delay: Duration::from_millis(25),
             datagram_receive_buffer: 256 * 1024,

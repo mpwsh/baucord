@@ -241,3 +241,4 @@ chat-channels-updated = os canais de voz foram atualizados
 # Fixação da identidade do servidor (1.0)
 error-identity-changed = A identidade do servidor mudou: esperado { $expected }, recebido { $observed }. Nada foi enviado. Se o administrador trocou a chave de propósito, edite a identidade do servidor nas Configurações (ou limpe-a) e conecte novamente.
 chat-identity-pinned = Identidade do servidor fixada: { $fingerprint }
+error-connection-lost = Conexão perdida: { $reason }. Reconectando em { $secs } s…

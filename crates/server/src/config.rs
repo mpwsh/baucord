@@ -162,8 +162,11 @@ pub struct LoggingSettings {
     pub stats_interval_secs: u64,
     /// One `link:` line per connected client every this many seconds
     /// (0 = off): the relay's view of that client's link — QUIC path
-    /// RTT, congestion window, transport-level loss, bytes in/out,
-    /// abandoned video groups, and the voice packets received vs. the
+    /// RTT, congestion window, transport-level loss, bytes in/out, video
+    /// groups abandoned because that client fell behind (with the cause:
+    /// superseded by the next keyframe, deadline, unacknowledged finish —
+    /// `upstream` resets mirror the sharer's own and are not the
+    /// client's fault), and the voice packets received vs. the
     /// sender's sequence numbers (what listeners actually miss). Meant
     /// to be lined up by timestamp against the client's own `link:`
     /// lines and its `telemetry:` samples. ~9 clients at 2 s is a few

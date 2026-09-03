@@ -5,17 +5,17 @@
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 use protocol::{
-    Auth, ChannelDenyReason, ClientId, ClientMessage, DenyReason, Lane, RefusedReason,
-    ServerMessage, ShareScope, features,
+    features, Auth, ChannelDenyReason, ClientId, ClientMessage, DenyReason, Lane, RefusedReason,
+    ServerMessage, ShareScope,
 };
 use server::{
     config::{ChannelSettings, Config},
     server::ChatServer,
 };
 use transport::{
-    Budget, DisconnectReason, Driver, Event, Fingerprint, OWN_TRACK, PeerId, ServerIdentity,
-    VideoItem,
     sim::{LinkSpec, NodeId, SimNet},
+    Budget, DisconnectReason, Driver, Event, Fingerprint, PeerId, ServerIdentity, VideoItem,
+    OWN_TRACK,
 };
 
 const TICK: Duration = Duration::from_millis(2);
@@ -371,12 +371,10 @@ fn secure_mode_checks_the_password_and_rate_limits_failures() {
 
     // Right password from elsewhere: in.
     let alice = w.connect("alice", Some("hunter2"));
-    assert!(
-        alice
-            .inbox
-            .iter()
-            .any(|m| matches!(m, ServerMessage::Init { .. }))
-    );
+    assert!(alice
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::Init { .. })));
 
     // Five failures from one address within a minute, then even the
     // right password is refused as rate-limited.
@@ -413,16 +411,14 @@ fn refused_connections_are_closed_after_the_verdict() {
         c.disconnected(),
         Some(DisconnectReason::ApplicationClosed { .. })
     ));
-    assert!(
-        c.inbox
-            .iter()
-            .any(|m| matches!(m, ServerMessage::Refused { .. }))
-    );
-    assert!(
-        !c.inbox
-            .iter()
-            .any(|m| matches!(m, ServerMessage::Init { .. }))
-    );
+    assert!(c
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::Refused { .. })));
+    assert!(!c
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::Init { .. })));
 }
 
 #[test]
@@ -896,16 +892,14 @@ fn hot_reload_rejects_invalid_lists_and_keeps_state() {
     });
 
     // No default / duplicate names: both rejected, nothing broadcast.
-    assert!(
-        w.server()
-            .apply_channel_config(vec![open_channel("A", false)])
-            .is_err()
-    );
-    assert!(
-        w.server()
-            .apply_channel_config(vec![open_channel("A", true), open_channel("A", false)])
-            .is_err()
-    );
+    assert!(w
+        .server()
+        .apply_channel_config(vec![open_channel("A", false)])
+        .is_err());
+    assert!(w
+        .server()
+        .apply_channel_config(vec![open_channel("A", true), open_channel("A", false)])
+        .is_err());
 
     // Membership untouched: joining Movies again is a no-op (no deny,
     // no move), proving the live list survived the bad edits.

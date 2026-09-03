@@ -42,6 +42,7 @@ enum Command {
     RotateKey,
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 

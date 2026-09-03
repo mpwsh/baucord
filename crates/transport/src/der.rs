@@ -198,7 +198,7 @@ fn push_base128(out: &mut Vec<u8>, mut value: u64) {
 
 #[cfg(test)]
 mod tests {
-    use rcgen::{CertificateParams, CustomExtension, KeyPair, PKCS_ED25519, PublicKeyData};
+    use rcgen::{CertificateParams, CustomExtension, KeyPair, PublicKeyData, PKCS_ED25519};
 
     use super::*;
 

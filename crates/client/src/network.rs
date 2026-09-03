@@ -33,20 +33,20 @@ use audio::{AudioPacket, PayloadType};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use log::{info, warn};
 use protocol::{
-    AudioSample, Auth, ChannelDenyReason, ChannelInfo, ClientId, ClientInfo, ClientKeyProof,
-    ClientMessage, DenyReason, Lane, PathSample, RefusedReason, ServerMessage, ShareScope,
-    SharingSample, TelemetryEvent, TelemetrySample, VOICE_FLAG_RED, VideoReassembler,
-    ViewingSample, features, pack_system_audio, pack_video_frame, pack_voice_with_flags,
-    parse_system_audio, parse_voice, split_sender,
+    features, pack_system_audio, pack_video_frame, pack_voice_with_flags, parse_system_audio,
+    parse_voice, split_sender, AudioSample, Auth, ChannelDenyReason, ChannelInfo, ClientId,
+    ClientInfo, ClientKeyProof, ClientMessage, DenyReason, Lane, PathSample, RefusedReason,
+    ServerMessage, ShareScope, SharingSample, TelemetryEvent, TelemetrySample, VideoReassembler,
+    ViewingSample, VOICE_FLAG_RED,
 };
 use sha2::{Digest, Sha256};
 use transport::{
-    Budget, ClientKey, DisconnectReason, Driver, Event, Fingerprint, LinkStats, OWN_TRACK,
-    Observation, PeerId, Trust, UdpIo, UploadId, VideoItem,
     identity::{CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL},
+    Budget, ClientKey, DisconnectReason, Driver, Event, Fingerprint, LinkStats, Observation,
+    PeerId, Trust, UdpIo, UploadId, VideoItem, OWN_TRACK,
 };
 
-use crate::{WakeFn, screen::ScreenControl, voice::VoiceControl};
+use crate::{screen::ScreenControl, voice::VoiceControl, WakeFn};
 
 /// How often to sample link statistics for the UI and the screen
 /// thread's bitrate ladder. The ladder's dwell time is sized against
@@ -80,6 +80,13 @@ const VOICE_REPORT_MIN_PACKETS: u32 = 15;
 /// encoder. Its rate controller only needs to know "the link is bad";
 /// the exact figure above 50 adds nothing.
 const UPLINK_LOSS_CLAMP_PCT: f64 = 50.0;
+
+/// The relay sends a receiver report every 2 s unconditionally. None
+/// for this long means the control stream is stalled — the link is
+/// bad, not quiet — and the audio ladder must not read the silence as
+/// "all clear" (the 2026-09-03 05:07 log: ladder stepped *up* to 24 kbps
+/// during a 90 % loss blackout because the reports had gone stale).
+const REPORT_STALL: Duration = Duration::from_secs(6);
 
 /// Longest a relayed image may sit half-assembled before it is
 /// forgotten (its sender vanished or gave up mid-pace).
@@ -117,6 +124,14 @@ pub enum NetworkMessage {
         observed: String,
     },
     Disconnected(String),
+    /// An established session died for network reasons (idle timeout,
+    /// or the server no longer recognizing us after a blackout).
+    /// Nothing about the credentials changed: the app should reconnect
+    /// with the same parameters after a short backoff rather than send
+    /// the user back to the connect screen.
+    ConnectionLost {
+        reason: String,
+    },
     /// The server refused our `Hello` for a wrong or missing room
     /// password. The UI prompts for it and offers to save it on the
     /// server entry.
@@ -338,6 +353,10 @@ pub(crate) struct NetworkClient {
     last_stats_check: Instant,
     /// Transport counters at the last stats sample.
     stats_baseline: Option<LinkStats>,
+    /// Transport counters at the last telemetry sample (its own
+    /// baseline: the 2 s sampler advances `stats_baseline`, so sharing
+    /// it under-reported the 10 s throughput ~5×).
+    telemetry_baseline: Option<LinkStats>,
     /// Telemetry negotiated with the server.
     telemetry_enabled: bool,
     last_telemetry: Instant,
@@ -354,6 +373,11 @@ pub(crate) struct NetworkClient {
     /// The last receive pass stopped with datagrams still queued; the
     /// loop must come straight back rather than sleep.
     backlog: bool,
+    /// When the last voice receiver report arrived (admission counts as
+    /// the first), for the stall detector.
+    last_report: Instant,
+    /// A stall has been reported; cleared when reports resume.
+    reports_stalled: bool,
 }
 
 impl NetworkClient {
@@ -419,6 +443,7 @@ impl NetworkClient {
             incoming_images: HashMap::new(),
             last_stats_check: now,
             stats_baseline: None,
+            telemetry_baseline: None,
             telemetry_enabled: false,
             last_telemetry: now,
             telemetry: TelemetryInputs::default(),
@@ -427,6 +452,8 @@ impl NetworkClient {
             keyframe_requests_sent: HashMap::new(),
             datagrams_blocked: 0,
             backlog: false,
+            last_report: now,
+            reports_stalled: false,
         })
     }
 
@@ -504,8 +531,15 @@ impl NetworkClient {
             return;
         }
         let was_connecting = matches!(self.phase, Phase::Connecting | Phase::AwaitingWelcome);
+        let was_admitted = self.phase == Phase::Admitted;
         self.phase = Phase::Closed;
         match reason {
+            transient if was_admitted && transient.is_transient() => {
+                warn!("Connection lost: {transient}");
+                self.message_queue.push(NetworkMessage::ConnectionLost {
+                    reason: transient.to_string(),
+                });
+            }
             DisconnectReason::IdentityChanged { expected, observed } => {
                 warn!("Server identity changed: pinned {expected}, presented {observed}");
                 self.message_queue.push(NetworkMessage::IdentityChanged {
@@ -607,7 +641,29 @@ impl NetworkClient {
             kbps_down,
         });
 
-        // The sharer's leg, measured on the video itself.
+        // No receiver report for a while: the control stream is stalled
+        // under loss. Feed the ladder a "bad link" reading so it holds
+        // its lowest rung instead of decaying to clean and climbing.
+        let since_report = now.duration_since(self.last_report);
+        if since_report >= REPORT_STALL {
+            if !self.reports_stalled {
+                warn!(
+                    "No receiver report for {:.0} s (path loss {loss_pct:.0}%); holding the audio ladder down",
+                    since_report.as_secs_f64()
+                );
+                self.reports_stalled = true;
+            }
+            #[allow(clippy::cast_sign_loss)] // both non-negative by construction
+            self.message_queue
+                .push(NetworkMessage::VoiceReceiverReport {
+                    loss_pct: UPLINK_LOSS_CLAMP_PCT as u32,
+                    rtt_ms: rtt_ms.max(0.0) as u32,
+                    exercised: true,
+                });
+        }
+
+        // The sharer's leg, measured on the video itself: only groups
+        // *we* abandoned because our uplink was behind.
         let started = stats.groups_started.saturating_sub(base.groups_started);
         let reset = stats.groups_reset.saturating_sub(base.groups_reset);
         if started > 0 || reset > 0 {
@@ -637,7 +693,8 @@ impl NetworkClient {
         let Some(stats) = self.driver.stats(self.server) else {
             return;
         };
-        let base = self.stats_baseline.unwrap_or_default();
+        let base = self.telemetry_baseline.unwrap_or_default();
+        self.telemetry_baseline = Some(stats);
         let path = PathSample {
             rtt_ms: stats.rtt.as_millis().min(u128::from(u32::MAX)) as u32,
             loss_pct: stats.path_loss_pct_since(&base) as f32,
@@ -728,7 +785,9 @@ impl NetworkClient {
                     features::TELEMETRY,
                 );
                 self.last_telemetry = now;
+                self.last_report = now;
                 self.stats_baseline = self.driver.stats(self.server);
+                self.telemetry_baseline = self.stats_baseline;
                 info!(
                     "Admitted as {client_id:#x} (server features {server_features:#x}, telemetry {})",
                     if self.telemetry_enabled { "on" } else { "off" }
@@ -925,6 +984,11 @@ impl NetworkClient {
                 late: _,
                 rtt_ms,
             } => {
+                self.last_report = now;
+                if self.reports_stalled {
+                    info!("Receiver reports resumed");
+                    self.reports_stalled = false;
+                }
                 let exercised = expected >= VOICE_REPORT_MIN_PACKETS;
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let loss_pct = if expected == 0 {

@@ -23,12 +23,12 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, info, warn};
-use protocol::{Lane, frame};
+use protocol::{frame, Lane};
 use quinn_proto::{
+    crypto::rustls::{QuicClientConfig, QuicServerConfig},
     ClientConfig, Connection, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Endpoint,
     EndpointConfig, Event as QuicEvent, FinishError, ReadError, SendDatagramError, ServerConfig,
     StreamEvent, StreamId, VarInt, WriteError,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 
 use crate::{
@@ -98,6 +98,10 @@ pub enum DisconnectReason {
     ApplicationClosed { code: u64, reason: String },
     /// No traffic for `max_idle_timeout`.
     TimedOut,
+    /// The peer sent a stateless reset: it no longer knows this
+    /// connection (it timed us out first, or restarted). Seen after a
+    /// blackout on our side that outlasted the idle timeout.
+    Reset,
     /// The peer's version of the protocol is different (ALPN refused
     /// in the TLS handshake).
     AlpnMismatch,
@@ -111,6 +115,16 @@ pub enum DisconnectReason {
     Transport(String),
 }
 
+impl DisconnectReason {
+    /// The session died for network reasons and a fresh connection
+    /// with the same parameters is the sensible next step. Refusals,
+    /// identity or version mismatches, and deliberate closes are not.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::TimedOut | Self::Reset)
+    }
+}
+
 impl std::fmt::Display for DisconnectReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -119,7 +133,12 @@ impl std::fmt::Display for DisconnectReason {
                 write!(f, "closed by peer (code {code})")
             }
             DisconnectReason::ApplicationClosed { reason, .. } => f.write_str(reason),
-            DisconnectReason::TimedOut => f.write_str("connection timed out"),
+            DisconnectReason::TimedOut => {
+                f.write_str("connection timed out (no packets from the peer)")
+            }
+            DisconnectReason::Reset => f.write_str(
+                "the server no longer knows this connection (it timed us out, or restarted)",
+            ),
             DisconnectReason::AlpnMismatch => f.write_str(protocol::OUTDATED_MESSAGE),
             DisconnectReason::IdentityChanged { .. } => f.write_str("server identity changed"),
             DisconnectReason::Transport(s) => f.write_str(s),
@@ -199,8 +218,21 @@ pub struct LinkStats {
     pub datagrams_blocked: u64,
     /// Video groups this side opened.
     pub groups_started: u64,
-    /// Video groups this side abandoned (byte or time bound).
+    /// Video groups this side abandoned because the *peer was behind*:
+    /// the sum of the three causes below plus groups the peer stopped
+    /// reading. Application-requested resets (a relay mirroring the
+    /// sharer's own reset, an unsubscribe) are counted separately in
+    /// `groups_reset_upstream` and are not this peer's fault.
     pub groups_reset: u64,
+    /// …because a newer keyframe arrived while bytes of the previous
+    /// group were still waiting to be handed to the transport.
+    pub groups_reset_superseded: u64,
+    /// …because queued bytes waited past the deadline or byte bound.
+    pub groups_reset_deadline: u64,
+    /// …because a finished group was not acknowledged in time.
+    pub groups_reset_unacked: u64,
+    /// Groups reset at the application's request (see `groups_reset`).
+    pub groups_reset_upstream: u64,
     /// Video groups the peer abandoned on us.
     pub groups_reset_by_peer: u64,
     /// Media uploads this side abandoned because the peer stopped
@@ -393,6 +425,10 @@ struct Counters {
     blocked_episode: bool,
     groups_started: u64,
     groups_reset: u64,
+    groups_reset_superseded: u64,
+    groups_reset_deadline: u64,
+    groups_reset_unacked: u64,
+    groups_reset_upstream: u64,
     groups_reset_by_peer: u64,
     uploads_dropped: u64,
 }
@@ -480,6 +516,10 @@ impl Peer {
             datagrams_blocked: self.counters.datagrams_blocked,
             groups_started: self.counters.groups_started,
             groups_reset: self.counters.groups_reset,
+            groups_reset_superseded: self.counters.groups_reset_superseded,
+            groups_reset_deadline: self.counters.groups_reset_deadline,
+            groups_reset_unacked: self.counters.groups_reset_unacked,
+            groups_reset_upstream: self.counters.groups_reset_upstream,
             groups_reset_by_peer: self.counters.groups_reset_by_peer,
             uploads_dropped: self.counters.uploads_dropped,
         }
@@ -913,7 +953,7 @@ impl Driver {
             return;
         };
         if let Some(p) = self.peers.get_mut(&handle) {
-            video_close_current(p, track, now, false);
+            video_close_current(p, track, now, None);
             match p.conn.streams().open(Dir::Uni) {
                 Some(stream) => {
                     let mut header = Vec::with_capacity(1 + TRACK_BYTES);
@@ -931,6 +971,7 @@ impl Driver {
                 None => {
                     // Stream credit exhausted: the peer holds too many
                     // groups open — behave as behind and skip this one.
+                    p.counters.groups_reset_deadline += 1;
                     p.counters.groups_reset += 1;
                 }
             }
@@ -945,19 +986,20 @@ impl Driver {
             return;
         };
         if let Some(p) = self.peers.get_mut(&handle) {
-            video_close_current(p, track, now, false);
+            video_close_current(p, track, now, None);
         }
         self.drain_peer(handle, now);
     }
 
-    /// Video: abandon the track's current group (the relay saw the
-    /// sharer reset it, or the sharer went away).
+    /// Video: abandon the track's current group at the application's
+    /// request (the relay saw the sharer reset it, a viewer
+    /// unsubscribed). Not counted against this peer.
     pub fn video_reset_group(&mut self, now: Instant, peer: PeerId, track: Track) {
         let Some(handle) = self.ids.get(&peer).copied() else {
             return;
         };
         if let Some(p) = self.peers.get_mut(&handle) {
-            video_close_current(p, track, now, true);
+            video_close_current(p, track, now, Some(ResetCause::Upstream));
         }
         self.drain_peer(handle, now);
     }
@@ -1305,6 +1347,16 @@ fn send_datagram(
     }
 }
 
+/// Why an outgoing group is being abandoned — accounted separately so
+/// the logs can tell a behind peer from an upstream reset.
+#[derive(Debug, Clone, Copy)]
+enum ResetCause {
+    /// Queued bytes waited past the deadline or byte bound.
+    Deadline,
+    /// The application asked (relay mirroring the sharer, unsubscribe).
+    Upstream,
+}
+
 fn video_send(p: &mut Peer, track: Track, bytes: &[u8], now: Instant) {
     let Some(group) = p.video_out.get_mut(&track) else {
         return; // group was reset; wait for the next keyframe
@@ -1312,22 +1364,39 @@ fn video_send(p: &mut Peer, track: Track, bytes: &[u8], now: Instant) {
     // Byte and time bounds (§6.2): a behind peer loses the group, not
     // its place in the queue.
     if group.out.bytes > VIDEO_GROUP_MAX_PENDING || group.out.age(now) > VIDEO_GROUP_DEADLINE {
-        video_close_current(p, track, now, true);
+        video_close_current(p, track, now, Some(ResetCause::Deadline));
         return;
     }
     group.out.push(frame::encode(bytes), now);
 }
 
-/// Finish (or reset) the track's current outgoing group. A group with
-/// unsent bytes is always reset when a newer one starts — that is the
-/// "newer keyframe exists" rule.
-fn video_close_current(p: &mut Peer, track: Track, now: Instant, force_reset: bool) {
+/// Finish the track's current outgoing group, or reset it for `cause`.
+/// With no cause given, a group that still has unsent bytes is reset
+/// anyway — that is the "newer keyframe exists" rule — and counted as
+/// superseded.
+fn video_close_current(p: &mut Peer, track: Track, now: Instant, cause: Option<ResetCause>) {
     let Some(group) = p.video_out.remove(&track) else {
         return;
     };
-    if force_reset || !group.out.is_empty() {
+    let cause = match cause {
+        Some(c) => Some(c),
+        None if !group.out.is_empty() => {
+            p.counters.groups_reset_superseded += 1;
+            p.counters.groups_reset += 1;
+            let _ = p.conn.send_stream(group.stream).reset(GROUP_RESET_CODE);
+            return;
+        }
+        None => None,
+    };
+    if let Some(cause) = cause {
+        match cause {
+            ResetCause::Deadline => {
+                p.counters.groups_reset_deadline += 1;
+                p.counters.groups_reset += 1;
+            }
+            ResetCause::Upstream => p.counters.groups_reset_upstream += 1,
+        }
         let _ = p.conn.send_stream(group.stream).reset(GROUP_RESET_CODE);
-        p.counters.groups_reset += 1;
         return;
     }
     match p.conn.send_stream(group.stream).finish() {
@@ -1361,7 +1430,7 @@ fn flush_peer(p: &mut Peer, now: Instant, media_pace: usize) {
         }
     }
     for track in reset_tracks {
-        video_close_current(p, track, now, true);
+        video_close_current(p, track, now, Some(ResetCause::Deadline));
     }
     // Finished groups not acknowledged within the deadline (plus a
     // couple of RTTs for the acks themselves) are stale: reset them so
@@ -1372,6 +1441,7 @@ fn flush_peer(p: &mut Peer, now: Instant, media_pace: usize) {
         let g = &p.video_finishing[i];
         if now.saturating_duration_since(g.finished_at) > ack_deadline {
             let _ = p.conn.send_stream(g.stream).reset(GROUP_RESET_CODE);
+            p.counters.groups_reset_unacked += 1;
             p.counters.groups_reset += 1;
             p.video_finishing.remove(i);
             continue;
@@ -1722,6 +1792,7 @@ fn map_connection_error(
     }
     match e {
         ConnectionError::TimedOut => DisconnectReason::TimedOut,
+        ConnectionError::Reset => DisconnectReason::Reset,
         ConnectionError::LocallyClosed => DisconnectReason::LocallyClosed,
         ConnectionError::ApplicationClosed(close) => DisconnectReason::ApplicationClosed {
             code: close.error_code.into_inner(),

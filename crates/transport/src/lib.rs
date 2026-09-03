@@ -22,8 +22,8 @@ pub mod udp;
 
 pub use config::Budget;
 pub use driver::{
-    DisconnectReason, Driver, DriverHost, Event, InboundDatagram, LinkStats, OWN_TRACK, PeerId,
-    SendError, Track, Transmit, UploadId, VideoItem,
+    DisconnectReason, Driver, DriverHost, Event, InboundDatagram, LinkStats, PeerId, SendError,
+    Track, Transmit, UploadId, VideoItem, OWN_TRACK,
 };
 pub use identity::{ClientKey, Fingerprint, Observation, PinnedVerifier, ServerIdentity, Trust};
 pub use protocol::Lane;

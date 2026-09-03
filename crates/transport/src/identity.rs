@@ -28,12 +28,12 @@ use std::{
 
 use base64::Engine;
 use log::{info, warn};
-use rcgen::{CertificateParams, CustomExtension, KeyPair, PKCS_ED25519, PublicKeyData, SigningKey};
+use rcgen::{CertificateParams, CustomExtension, KeyPair, PublicKeyData, SigningKey, PKCS_ED25519};
 use rustls::{
-    DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
+    DigitallySignedStruct, SignatureScheme,
 };
 use sha2::{Digest, Sha256};
 
