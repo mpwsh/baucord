@@ -1,7 +1,8 @@
 services:
   baucord:
     container_name: baucord
-    image: mpwsh/baucord:latest
+    #image: mpwsh/baucord:latest
+    build: .
     restart: always
     ulimits:
       nofile:

@@ -19,6 +19,7 @@ logging:
   stats_interval_secs: 3600
   link_stats_interval_secs: 2
   telemetry: true
+  file: ""
 authentication:
   # Every connection is encrypted and pinned regardless; `secure` only
   # decides whether Hello must carry the room password.

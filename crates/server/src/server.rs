@@ -351,6 +351,21 @@ impl ChatServer {
         }
     }
 
+    /// Close every connection with `reason` (a deploy or operator
+    /// stop). Clients treat "server restarting" as transient and come
+    /// back on their own in a couple of seconds, instead of discovering
+    /// the restart through the idle timeout. Call `update`/flush a few
+    /// more times afterwards so the close packets leave.
+    pub fn shutdown(&mut self, now: Instant, reason: &str) {
+        info!(
+            "Shutting down: closing {} connections ({reason})",
+            self.driver.peer_count()
+        );
+        for peer in self.driver.peers() {
+            self.driver.close(now, peer, reason);
+        }
+    }
+
     /// Admitted clients, in no particular order.
     fn clients(&self) -> Vec<ClientId> {
         self.usernames.keys().copied().collect()

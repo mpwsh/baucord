@@ -1,35 +1,52 @@
 # syntax=docker/dockerfile:1
-FROM lukemathwalker/cargo-chef:latest-rust-1.89 AS chef
+
+# Keep in sync with rust-toolchain.toml. The chef image ships rustup,
+# so copying rust-toolchain.toml below makes a mismatch self-correct
+# (rustup fetches the pinned version) instead of silently building
+# with whatever the tag says.
+ARG RUST_VERSION=1.95
+FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION} AS chef
 WORKDIR /app
 
+# ── Plan: dependency recipe from the manifests only ─────────────────────
+# The whole workspace is copied so Cargo.lock resolves exactly as it
+# does on a developer machine (that is what lets --locked hold below);
+# only the server's dependency graph is ever *compiled*, so ffmpeg,
+# pipewire and slint never enter this image.
 FROM chef AS planner
-COPY Cargo.* ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
-RUN rm -rf crates/audio crates/client crates/desktop crates/ui crates/video
 RUN cargo chef prepare --recipe-path recipe.json
 
+# ── Build ───────────────────────────────────────────────────────────────
 FROM chef AS builder
+COPY rust-toolchain.toml ./
 COPY --from=planner /app/recipe.json recipe.json
-# Cook dependencies — this is the cached Docker layer
-RUN cargo chef cook --release --recipe-path recipe.json
-# Build the binary
-COPY Cargo.* ./
+# Dependencies: the cached layer. `deploy` = release + stripped symbols
+# (see the workspace profiles), the same profile the desktop ships with.
+RUN cargo chef cook --profile deploy --package server --bin server --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-RUN rm -rf crates/audio crates/client crates/desktop crates/ui crates/video
-RUN cargo build --release --bin server && \
-  strip target/release/server
+# --locked: Cargo.lock is authoritative; a manifest/lock drift fails the
+# build here rather than resolving something new inside the container.
+RUN cargo build --profile deploy --locked --package server --bin server
 
-# ── Runtime ──────────────────────────────────────────────────────
-FROM debian:trixie-slim
-
-RUN useradd --uid 10000 --create-home runner
+# ── Runtime ─────────────────────────────────────────────────────────────
+# Distroless: glibc + CA certs, no shell, no package manager. The server
+# is pure Rust (rustls, no OpenSSL) so `cc` is all it needs. The builder
+# is Debian bookworm (glibc 2.36) and so is this base — no glibc drift.
+# uid 10000 matches setup.sh's chown of ./data/baucord.
+FROM gcr.io/distroless/cc-debian12
+# /app is owned by the runtime uid (no shell here, so ownership comes
+# from --chown; WORKDIR would create it root-owned, hence it follows
+# the COPY). With `logging.file: ""` in the container config nothing
+# is written there anyway; this keeps the default config working too.
+COPY --from=builder --chown=10000:10000 /app/target/deploy/server /app/server
 WORKDIR /app
-
-COPY --from=builder /app/target/release/server .
-RUN chown -R runner:runner /app
-
-EXPOSE 5000/udp
-
 USER 10000
-
-ENTRYPOINT ["./server"]
+EXPOSE 5000/udp
+# Docker sends SIGTERM to PID 1; the server closes every session with a
+# reason so clients reconnect in ~2 s instead of waiting out the idle
+# timeout. `stop_grace_period` in compose need not exceed a few seconds.
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/app/server"]

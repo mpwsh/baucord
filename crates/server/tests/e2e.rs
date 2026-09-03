@@ -465,6 +465,30 @@ fn a_non_hello_first_message_is_refused() {
     assert_eq!(reason, RefusedReason::BadHello);
 }
 
+#[test]
+fn shutdown_closes_every_session_with_the_restart_reason() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut a = w.connect("alice", None);
+    let mut b = w.connect("bob", None);
+    let now = w.net.now();
+    w.server().shutdown(now, "server restarting");
+    let deadline = w.net.now() + WAIT;
+    while a.disconnected().is_none() || b.disconnected().is_none() {
+        assert!(w.net.now() < deadline, "clients never saw the close");
+        w.pump(&mut [&mut a, &mut b]);
+    }
+    for c in [&a, &b] {
+        assert!(
+            matches!(
+                c.disconnected(),
+                Some(DisconnectReason::ApplicationClosed { reason, .. }) if reason == "server restarting"
+            ),
+            "{:?}",
+            c.disconnected()
+        );
+    }
+}
+
 // ── Channels ────────────────────────────────────────────────────────────
 
 #[test]

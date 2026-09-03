@@ -254,3 +254,4 @@ error-refused-full = O servidor está cheio no momento.
 error-refused-rate-limited = Muitas tentativas falhas — espere um minuto e tente de novo.
 error-outdated = Esta versão do baucord não combina com o servidor. Atualize o baucord e tente de novo.
 error-local = Não foi possível iniciar a conexão: { $detail }
+error-lost-restart = O servidor está reiniciando.

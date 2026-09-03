@@ -127,7 +127,14 @@ pub enum LossKind {
     /// handshake never completed, or the server closed it because our
     /// Hello never arrived — a link losing most of its packets.
     Unreachable,
+    /// The server closed us on purpose because it is restarting (a
+    /// deploy). It will be back in seconds.
+    ServerRestart,
 }
+
+/// The close reason the server sends when it is shutting down for a
+/// restart. Wire contract with the server binary; do not reword.
+const SERVER_RESTART_REASON: &str = "server restarting";
 
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
@@ -578,7 +585,18 @@ impl NetworkClient {
         // not a refusal — retry like any other transient loss.
         let hello_lost = was_connecting
             && matches!(reason, DisconnectReason::ApplicationClosed { reason, .. } if reason == "no hello");
+        let server_restart = matches!(
+            reason,
+            DisconnectReason::ApplicationClosed { reason, .. } if reason == SERVER_RESTART_REASON
+        );
         match reason {
+            _ if server_restart => {
+                info!("The server is restarting; reconnecting shortly");
+                self.message_queue.push(NetworkMessage::ConnectionLost {
+                    kind: LossKind::ServerRestart,
+                    detail: SERVER_RESTART_REASON.to_string(),
+                });
+            }
             _ if hello_lost => {
                 warn!("Connection attempt failed: the server did not receive our Hello in time");
                 self.message_queue.push(NetworkMessage::ConnectionLost {

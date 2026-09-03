@@ -175,6 +175,11 @@ pub struct LoggingSettings {
     /// Log the periodic `telemetry:` samples clients send (§9.1). Off
     /// still accepts the messages; they are just not written out.
     pub telemetry: bool,
+    /// Log file, rotated at 5 MiB, in addition to stderr. Empty
+    /// disables it — the right setting in a container, where the
+    /// runtime captures stderr and the working directory need not be
+    /// writable. An unwritable path is a warning, never a failure.
+    pub file: String,
 }
 
 impl Config {
@@ -399,6 +404,7 @@ impl Default for LoggingSettings {
             stats_interval_secs: 30,
             link_stats_interval_secs: 2,
             telemetry: true,
+            file: "server.log".to_string(),
         }
     }
 }

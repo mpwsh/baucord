@@ -1080,6 +1080,7 @@ impl AppState {
                     LossKind::Timeout => "error-lost-timeout",
                     LossKind::Reset => "error-lost-reset",
                     LossKind::Unreachable => "error-lost-unreachable",
+                    LossKind::ServerRestart => "error-lost-restart",
                 });
                 self.push_chat_system(&what);
                 self.teardown_connection();

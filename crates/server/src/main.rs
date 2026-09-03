@@ -2,7 +2,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -13,9 +16,14 @@ use log::{info, warn};
 use server::{config::Config, server::ChatServer};
 use transport::{DriverHost, ServerIdentity, UdpIo};
 
-const LOG_PATH: &str = "server.log";
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
-const LOG_ROTATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const LOG_ROTATE_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+/// The close reason clients key their automatic reconnect on. Wire
+/// contract with `client::network`; do not reword.
+const SHUTDOWN_REASON: &str = "server restarting";
+/// How long to keep pumping after closing everything, so the close
+/// frames actually leave.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -78,7 +86,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return rotate_key(&config);
     }
 
-    let log_file = Arc::new(Mutex::new(open_log_file()?));
+    // The file is optional: a container captures stderr and may run
+    // from a read-only directory. Failing to open it is a warning.
+    let log_path = config.logging.file.trim().to_string();
+    let log_file: Option<Arc<Mutex<File>>> = if log_path.is_empty() {
+        None
+    } else {
+        match open_log_file(&log_path) {
+            Ok(f) => Some(Arc::new(Mutex::new(f))),
+            Err(e) => {
+                eprintln!("warning: cannot open log file {log_path} ({e}); logging to stderr only");
+                None
+            }
+        }
+    };
 
     Builder::new()
         .filter_level(
@@ -89,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(log::LevelFilter::Info),
         )
         .format({
-            let log_file = Arc::clone(&log_file);
+            let log_file = log_file.clone();
             move |_, record| {
                 let line = format!(
                     "[{} {} {}] {}\n",
@@ -99,7 +120,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     record.args()
                 );
                 eprint!("{line}");
-                if let Ok(mut f) = log_file.lock() {
+                if let Some(f) = &log_file
+                    && let Ok(mut f) = f.lock()
+                {
                     let _ = f.write_all(line.as_bytes());
                 }
                 Ok(())
@@ -144,6 +167,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Server listening on {}", udp.local_addr()?);
     info!("Press Ctrl+C to stop");
 
+    // SIGTERM (docker stop, systemd) / SIGINT: leave through the loop,
+    // not mid-packet, so every client gets a close with a reason.
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))?;
+    }
+
     // ── Adaptive poll loop ──────────────────────────────────────────
     //
     // Voice packets need sub-millisecond relay turnaround, so the loop
@@ -155,6 +186,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_rotate_check = Instant::now();
     loop {
         let now = Instant::now();
+        if stop.load(Ordering::SeqCst) {
+            server.shutdown(now, SHUTDOWN_REASON);
+            // Let the close frames (and their acks) travel: a few ticks
+            // is plenty, and a peer that is already gone costs nothing.
+            let deadline = Instant::now() + SHUTDOWN_GRACE;
+            while Instant::now() < deadline && server.driver().peer_count() > 0 {
+                let now = Instant::now();
+                let _ = udp.recv_batch(|d| server.driver().handle_datagram(now, d));
+                server.driver().handle_timeouts(now);
+                while let Some(t) = server.driver().poll_transmit() {
+                    udp.send(&t);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            info!("Stopped");
+            return Ok(());
+        }
         let drained = match udp.recv_batch(|d| server.driver().handle_datagram(now, d)) {
             Ok(outcome) => outcome.drained,
             Err(e) => {
@@ -168,7 +216,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if last_rotate_check.elapsed() >= LOG_ROTATE_CHECK_INTERVAL {
-            rotate_log_if_needed(&log_file);
+            if let Some(f) = &log_file {
+                rotate_log_if_needed(&log_path, f);
+            }
             last_rotate_check = Instant::now();
         }
 
@@ -210,8 +260,8 @@ fn rotate_key(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn open_log_file() -> std::io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(LOG_PATH)
+fn open_log_file(path: &str) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// Rotate `server.log` → `server.log.1` once it exceeds the cap, so a
@@ -219,8 +269,8 @@ fn open_log_file() -> std::io::Result<File> {
 /// unbounded or vaporizing all evidence at startup (the previous
 /// behavior — the log was truncated exactly when you restart to debug
 /// a crash, which is when you needed it).
-fn rotate_log_if_needed(log_file: &Arc<Mutex<File>>) {
-    let Ok(meta) = fs::metadata(LOG_PATH) else {
+fn rotate_log_if_needed(path: &str, log_file: &Arc<Mutex<File>>) {
+    let Ok(meta) = fs::metadata(path) else {
         return;
     };
     if meta.len() <= MAX_LOG_BYTES {
@@ -230,11 +280,11 @@ fn rotate_log_if_needed(log_file: &Arc<Mutex<File>>) {
         return;
     };
     let _ = guard.flush();
-    let rotated = format!("{LOG_PATH}.1");
-    if fs::rename(LOG_PATH, &rotated).is_ok() {
+    let rotated = format!("{path}.1");
+    if fs::rename(path, &rotated).is_ok() {
         // Open a fresh file at the canonical path and swap it in; the
         // renamed handle keeps writing to .1 until the swap lands.
-        match open_log_file() {
+        match open_log_file(path) {
             Ok(new_file) => *guard = new_file,
             Err(_) => {
                 let _ = guard.set_len(0);
