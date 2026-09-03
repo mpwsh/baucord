@@ -446,8 +446,11 @@ impl NetworkClient {
         } else {
             "[::]:0".parse().expect("literal")
         };
-        let udp = UdpIo::bind(bind, budget.socket_buffer_bytes)
+        let mut udp = UdpIo::bind(bind, budget.socket_buffer_bytes)
             .map_err(|e| format!("Failed to bind socket: {e}"))?;
+        if budget.mark_voice {
+            udp.mark_voice(server_addr);
+        }
         let mut driver = Driver::new_client(fingerprint, budget)
             .map_err(|e| format!("Failed to set up the transport: {e}"))?;
         driver.set_max_gso_segments(udp.max_gso_segments());

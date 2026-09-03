@@ -61,10 +61,12 @@ use crate::{
 /// with LBRR, plus two RED copies of the same. Generous.
 const SCRATCH_BYTES: usize = 1500;
 
-/// Redundant copies per packet when RED is on. 1 repairs any single loss;
-/// 2 also repairs back-to-back pairs at the cost of one more frame of
-/// receiver delay. Field logs so far show mostly isolated losses.
-const RED_DISTANCE: usize = 1;
+/// Redundant copies per packet when RED is on, decided by the ladder
+/// (`Decision::red_blocks`): 1 repairs any single loss; 2 also repairs
+/// back-to-back pairs, which a link dropping a third of everything
+/// produces constantly (2026-09-03: a client at 40 % upstream loss for
+/// 35 minutes). Capped by the RED wire format.
+const RED_DISTANCE_MAX: usize = red::MAX_BLOCKS;
 
 /// Encoder thread state. Created once, runs until the input channel closes.
 struct EncoderWorker {
@@ -91,6 +93,8 @@ struct EncoderWorker {
     red: bool,
     /// Last transmitted packets, oldest first: (timestamp, bytes).
     history: VecDeque<(u32, Vec<u8>)>,
+    /// Copies to carry per packet while RED is on (1 or 2).
+    red_distance: usize,
 
     // ── Adaptation ──────────────────────────────────────────────────
     controller: RateController,
@@ -182,6 +186,7 @@ impl EncoderWorker {
             accum_ts: 0,
             red: false,
             history: VecDeque::with_capacity(red::MAX_BLOCKS + 1),
+            red_distance: 1,
             controller: RateController::new(),
             last_adapt: Instant::now(),
             prev_received: 0,
@@ -312,7 +317,7 @@ impl EncoderWorker {
 
         if self.red {
             self.history.push_back((packet_ts, primary.to_vec()));
-            while self.history.len() > RED_DISTANCE {
+            while self.history.len() > self.red_distance.min(RED_DISTANCE_MAX) {
                 self.history.pop_front();
             }
         }
@@ -347,6 +352,13 @@ impl EncoderWorker {
             if !self.red {
                 self.history.clear();
             }
+        }
+        if d.red_blocks != self.red_distance {
+            info!(
+                "Rate control: RED depth {} → {} copies per packet",
+                self.red_distance, d.red_blocks
+            );
+            self.red_distance = d.red_blocks.clamp(1, RED_DISTANCE_MAX);
         }
         Self::publish_profile(&self.stats, self.profile, d.level, self.red);
     }
@@ -383,13 +395,19 @@ impl EncoderWorker {
             let updated_ms = self.stats.uplink_loss_updated_ms.load(Ordering::Relaxed);
             let now_ms =
                 u64::try_from(self.stats.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let fresh = updated_ms != 0 && now_ms.saturating_sub(updated_ms) <= UPLINK_STALE_MS;
+            let age_ms = now_ms.saturating_sub(updated_ms);
             // Stored value is already clamped to 0..=100 by the setter;
             // try_from keeps the cast lint-free without an unwrap.
-            fresh.then(|| {
-                i32::try_from(self.stats.uplink_loss_pct.load(Ordering::Relaxed))
-                    .unwrap_or(FEC_LOSS_CEIL_PCT)
-            })
+            let last = i32::try_from(self.stats.uplink_loss_pct.load(Ordering::Relaxed))
+                .unwrap_or(FEC_LOSS_CEIL_PCT);
+            let fresh = updated_ms != 0 && age_ms <= UPLINK_STALE_MS;
+            // The relay reports every 2 s unconditionally, so a gap after a
+            // *bad* reading is the loss delaying the reports, not the link
+            // healing: hold the hint a while longer instead of switching
+            // FEC off in the middle of the trouble (2026-09-03: 68 flaps
+            // 20 % → 5 % → 20 % in 40 minutes at 40 % upstream loss).
+            let held = updated_ms != 0 && last >= UPLINK_HOLD_MIN_PCT && age_ms <= UPLINK_HOLD_MS;
+            (fresh || held).then_some(last)
         };
 
         let fec_hint = downlink
@@ -485,6 +503,12 @@ const RECV_TICK: Duration = Duration::from_millis(250);
 /// estimate then decays instead of acting on a latched value. Sized to
 /// a few transport sampling periods (~2 s each).
 const UPLINK_STALE_MS: u64 = 10_000;
+
+/// A stale reading at or above this loss keeps steering the FEC hint
+/// for up to [`UPLINK_HOLD_MS`] — silence from the relay under heavy
+/// loss is the loss, not recovery.
+const UPLINK_HOLD_MIN_PCT: i32 = 10;
+const UPLINK_HOLD_MS: u64 = 45_000;
 
 /// Display helper: the uplink reading, or "stale" when there is no
 /// fresh one, so incident logs distinguish "0 % loss" from "no data".

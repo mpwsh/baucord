@@ -45,6 +45,11 @@ pub struct Budget {
     pub media_pace_bytes_per_sec: usize,
     /// Kernel UDP socket buffer target, send and receive.
     pub socket_buffer_bytes: usize,
+    /// Mark outgoing packets as voice-class (DSCP EF / qWAVE voice
+    /// flow) so home routers and gaming `QoS` engines prioritize them
+    /// instead of dropping unknown UDP under contention. Client side;
+    /// the relay's packets are marked by whoever runs its network.
+    pub mark_voice: bool,
 }
 
 /// Datagram MTU everything assumes until discovery raises it: voice fits
@@ -74,6 +79,7 @@ impl Budget {
             initial_rtt: Duration::from_millis(100),
             media_pace_bytes_per_sec: protocol::MEDIA_UPLOAD_PACE,
             socket_buffer_bytes: 8 * 1024 * 1024,
+            mark_voice: true,
         }
     }
 
@@ -98,6 +104,7 @@ impl Budget {
             initial_rtt: Duration::from_millis(100),
             media_pace_bytes_per_sec: 1024 * 1024,
             socket_buffer_bytes: 64 * 1024 * 1024,
+            mark_voice: false,
         }
     }
 

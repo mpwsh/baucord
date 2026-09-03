@@ -1,6 +1,6 @@
 [package]
 name = "transport"
-version = "1.0.0"
+version = "1.0.2"
 edition = "2024"
 description = "Sans-IO QUIC transport for baucord: quinn-proto driven from the existing threads, lane mapping, identity pinning, and an in-process simulation harness."
 
@@ -29,10 +29,16 @@ quinn-proto = { version = "0.11.17", default-features = false, features = [
 # Synchronous UDP with GSO/GRO/ECN; no runtime. Default features would
 # pull `tracing`.
 quinn-udp = { version = "0.6.1", default-features = false, features = ["log"] }
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.43", default-features = false, features = [
+  "ring",
+  "std",
+] }
 rustls-pki-types = "1.15"
 # Self-signed Ed25519 identity certificates and the successor extension.
-rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14.10", default-features = false, features = [
+  "ring",
+  "pem",
+] }
 # Ed25519 verification of successor proofs and client-key proofs; already
 # in the tree via rustls.
 ring = "0.17"
@@ -43,6 +49,18 @@ rand = "0.10"
 # Deterministic PRNG for the simulation harness (already in the tree
 # via quinn-proto).
 rand_pcg = "0.10"
+# DSCP marking of the socket (voice class) on Unix.
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 env_logger = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+# qWAVE: the Windows way to mark a UDP flow as voice (DSCP + 802.1p) —
+# IP_TOS is ignored by the Windows stack. Discord's "High Packet
+# Priority" is this API.
+windows-sys = { version = "0.52", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_NetworkManagement_QoS",
+] }

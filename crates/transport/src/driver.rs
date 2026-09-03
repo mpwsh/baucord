@@ -954,26 +954,23 @@ impl Driver {
         };
         if let Some(p) = self.peers.get_mut(&handle) {
             video_close_current(p, track, now, None);
-            match p.conn.streams().open(Dir::Uni) {
-                Some(stream) => {
-                    let mut header = Vec::with_capacity(1 + TRACK_BYTES);
-                    header.push(Lane::Video.tag());
-                    header.extend_from_slice(&track.to_le_bytes());
-                    let mut out = OutQueue::default();
-                    out.push(Bytes::from(header), now);
-                    let _ = p
-                        .conn
-                        .send_stream(stream)
-                        .set_priority(Lane::Video.priority());
-                    p.video_out.insert(track, GroupOut { stream, out });
-                    p.counters.groups_started += 1;
-                }
-                None => {
-                    // Stream credit exhausted: the peer holds too many
-                    // groups open — behave as behind and skip this one.
-                    p.counters.groups_reset_deadline += 1;
-                    p.counters.groups_reset += 1;
-                }
+            if let Some(stream) = p.conn.streams().open(Dir::Uni) {
+                let mut header = Vec::with_capacity(1 + TRACK_BYTES);
+                header.push(Lane::Video.tag());
+                header.extend_from_slice(&track.to_le_bytes());
+                let mut out = OutQueue::default();
+                out.push(Bytes::from(header), now);
+                let _ = p
+                    .conn
+                    .send_stream(stream)
+                    .set_priority(Lane::Video.priority());
+                p.video_out.insert(track, GroupOut { stream, out });
+                p.counters.groups_started += 1;
+            } else {
+                // Stream credit exhausted: the peer holds too many
+                // groups open — behave as behind and skip this one.
+                p.counters.groups_reset_deadline += 1;
+                p.counters.groups_reset += 1;
             }
         }
         self.drain_peer(handle, now);

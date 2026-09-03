@@ -553,6 +553,12 @@ impl VoiceChat {
         self.stats.get_summary()
     }
 
+    /// Names of the devices currently open, `(input, output)`.
+    #[must_use]
+    pub fn opened_devices(&self) -> (Option<String>, Option<String>) {
+        (self.opened_input.clone(), self.opened_output.clone())
+    }
+
     /// Device supervision. Call this from any periodic tick (100 ms – 1 s
     /// is fine; it is cheap when nothing changed). It:
     ///

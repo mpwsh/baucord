@@ -10,7 +10,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed},
         Arc,
     },
     thread,
@@ -191,8 +191,11 @@ impl VoiceLoopState {
     }
 
     /// Write the audio engine's counters to the log every
-    /// [`STATS_LOG_INTERVAL`] while an engine is running.
-    fn maybe_log_stats(&mut self) {
+    /// [`STATS_LOG_INTERVAL`] while an engine is running, and hand the
+    /// same numbers to the network thread for the telemetry sample
+    /// (spec §9.1) — packets sent, ladder state, overruns, devices: what
+    /// tells "his network" from "his machine" in the server log.
+    fn maybe_log_stats(&mut self, network_tx: &Sender<NetworkControl>) {
         let Some(voice) = self.vc.as_ref() else {
             return;
         };
@@ -201,6 +204,39 @@ impl VoiceLoopState {
         }
         self.last_stats_log = Instant::now();
         info!("audio stats: {}", voice.stats_summary());
+        let s = voice.stats();
+        let (input_device, output_device) = voice.opened_devices();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let report_age_ms = now_ms.saturating_sub(s.uplink_loss_updated_ms.load(Relaxed));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        let sample = protocol::AudioSample {
+            bitrate_bps: s.send_bitrate_bps.load(Relaxed),
+            band: format!("L{}", s.adapt_level.load(Relaxed)),
+            frame_ms: s.frame_ms.load(Relaxed),
+            red: s.red_active.load(Relaxed),
+            fec_hint_pct: s.fec_loss_hint_pct.load(Relaxed),
+            smoothed_loss_pct: s.uplink_loss_pct.load(Relaxed) as f32,
+            // A report younger than three intervals means the relay is
+            // still telling us about our voice.
+            exercised: report_age_ms < 6_000,
+            packets_sent: s.packets_sent.load(Relaxed),
+            encode_us: s.last_encode_us.load(Relaxed),
+            input_overruns: s.input_overruns.load(Relaxed),
+            output_underruns: s.output_underruns.load(Relaxed),
+            input_device: input_device.unwrap_or_default(),
+            output_device: output_device.unwrap_or_default(),
+            packets_received: s.packets_received.load(Relaxed),
+            packets_lost: s.packets_lost.load(Relaxed),
+            fec_recoveries: s.fec_recoveries.load(Relaxed),
+            red_recoveries: s.red_recoveries.load(Relaxed),
+            plc_frames: s.plc_frames.load(Relaxed),
+            jitter_ms: s.jitter_buffer_occupancy_ms.load(Relaxed) as u32,
+            jitter_target_ms: s.jitter_buffer_target_ms.load(Relaxed) as u32,
+            decode_us: s.last_decode_us.load(Relaxed),
+        };
+        let _ = network_tx.try_send(NetworkControl::TelemetryAudio(sample));
     }
 
     /// Whether the mic should be muted — true if either user-muted or deafened.
@@ -473,6 +509,6 @@ fn run_voice_loop(
             }
         }
 
-        state.maybe_log_stats();
+        state.maybe_log_stats(&network_tx);
     }
 }

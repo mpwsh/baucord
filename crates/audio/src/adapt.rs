@@ -189,13 +189,26 @@ pub struct Decision {
     pub level: usize,
     pub profile: Profile,
     pub red: bool,
+    /// Redundant copies per packet while `red` is on: one repairs any
+    /// isolated loss; two also repair back-to-back pairs, which is what
+    /// a link dropping a third of everything produces (at 40 % random
+    /// loss one copy leaves ~16 % of frames missing, two leave ~6 %).
+    /// Costs one more frame of receiver delay and one more copy's bytes.
+    pub red_blocks: usize,
     /// Something changed since the previous decision.
     pub changed: bool,
 }
 
+/// Smoothed loss at which RED carries two copies instead of one.
+const DEEP_RED_LOSS: f32 = 20.0;
+/// …and below which it goes back to one (hysteresis).
+const DEEP_RED_OFF_LOSS: f32 = 12.0;
+
 pub struct RateController {
     level: usize,
     red: bool,
+    /// See [`Decision::red_blocks`].
+    red_blocks: usize,
     loss: f32,
     rtt_min: Option<f32>,
     rtt: Option<f32>,
@@ -236,6 +249,7 @@ impl RateController {
         Self {
             level: 0,
             red: false,
+            red_blocks: 1,
             loss: 0.0,
             rtt_min: None,
             rtt: None,
@@ -259,6 +273,7 @@ impl RateController {
             level: self.level,
             profile: LADDER[self.level],
             red: self.red,
+            red_blocks: self.red_blocks,
             changed: false,
         }
     }
@@ -288,7 +303,7 @@ impl RateController {
 
     /// Feed one sample (every ~2 s) and get the profile to use.
     pub fn evaluate(&mut self, sample: LinkSample) -> Decision {
-        let before = (self.level, self.red);
+        let before = (self.level, self.red, self.red_blocks);
 
         // ── Estimate updates ────────────────────────────────────────
         // Smoothing: half-life of one evaluation, so a single lossy
@@ -402,10 +417,24 @@ impl RateController {
             }
         }
 
-        let changed = (self.level, self.red) != before;
+        // Depth of redundancy follows the smoothed loss with hysteresis,
+        // independent of the rung: it is the only lever left once the
+        // ladder sits on its floor.
+        if self.red {
+            if self.loss >= DEEP_RED_LOSS {
+                self.red_blocks = 2;
+            } else if self.loss < DEEP_RED_OFF_LOSS {
+                self.red_blocks = 1;
+            }
+        } else {
+            self.red_blocks = 1;
+        }
+
+        let changed = (self.level, self.red, self.red_blocks) != before;
         Decision {
             level: self.level,
             profile: LADDER[self.level],
+            red_blocks: self.red_blocks,
             red: self.red,
             changed,
         }
@@ -666,5 +695,37 @@ mod tests {
         let d = c.evaluate(sample(60.0, 40.0));
         assert!(d.level > up, "failed probe must be reverted immediately");
         assert_eq!(c.probe_backoff, 2);
+    }
+
+    #[test]
+    fn red_depth_follows_smoothed_loss_with_hysteresis() {
+        let mut c = RateController::new();
+        let mut d = c.current();
+        assert_eq!(d.red_blocks, 1);
+        // Sustained heavy loss: RED comes on and deepens to two copies.
+        for _ in 0..8 {
+            d = c.evaluate(LinkSample {
+                uplink_loss_pct: Some(40.0),
+                rtt_ms: Some(25.0),
+            });
+        }
+        assert!(d.red, "RED must be on at 40 % loss");
+        assert_eq!(d.red_blocks, 2, "40 % loss wants two redundant copies");
+        // Loss easing to 15 %: still deep (above the off threshold).
+        for _ in 0..8 {
+            d = c.evaluate(LinkSample {
+                uplink_loss_pct: Some(15.0),
+                rtt_ms: Some(25.0),
+            });
+        }
+        assert_eq!(d.red_blocks, 2, "hysteresis holds the depth at 15 %");
+        // Clean link: back to one, then RED off.
+        for _ in 0..12 {
+            d = c.evaluate(LinkSample {
+                uplink_loss_pct: Some(0.0),
+                rtt_ms: Some(25.0),
+            });
+        }
+        assert_eq!(d.red_blocks, 1);
     }
 }

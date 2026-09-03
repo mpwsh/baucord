@@ -37,6 +37,10 @@ pub struct RecvOutcome {
     pub drained: bool,
 }
 
+/// DSCP "Expedited Forwarding" (46): the class routers and `QoS` engines
+/// file interactive voice under. As a `TOS` byte it is `46 << 2`.
+const DSCP_EF: u32 = 46;
+
 /// A bound, nonblocking UDP socket with the `quinn-udp` extras.
 pub struct UdpIo {
     socket: UdpSocket,
@@ -45,6 +49,8 @@ pub struct UdpIo {
     metas: Vec<RecvMeta>,
     /// Datagrams dropped because the kernel would not take them.
     send_drops: u64,
+    #[cfg(windows)]
+    qos: Option<windows_qos::VoiceFlow>,
 }
 
 impl UdpIo {
@@ -75,7 +81,47 @@ impl UdpIo {
             bufs: (0..RECV_BATCH).map(|_| vec![0u8; RECV_BUF_BYTES]).collect(),
             metas: vec![RecvMeta::default(); RECV_BATCH],
             send_drops: 0,
+            #[cfg(windows)]
+            qos: None,
         })
+    }
+
+    /// Mark everything this socket sends to `peer` as voice-class
+    /// traffic (DSCP EF), so routers with `QoS` and "gaming" traffic
+    /// engines file it with the interactive flows instead of dropping
+    /// it as unknown UDP when the link is contended. Best effort: a
+    /// stack that refuses it logs and carries on unmarked.
+    ///
+    /// On Unix this is the socket's TOS/traffic-class byte; Windows
+    /// ignores those and needs a qWAVE flow (the API behind Discord's
+    /// "High Packet Priority"), which is per destination — hence the
+    /// `peer` argument, which the Unix path does not need.
+    pub fn mark_voice(&mut self, peer: SocketAddr) {
+        #[cfg(not(windows))]
+        {
+            // `set_tclass_v6` needs socket2's `all` feature (enabled in
+            // Cargo.toml); `set_tos_v4` is always there.
+            let sock = socket2::SockRef::from(&self.socket);
+            let result = if peer.is_ipv6() {
+                sock.set_tclass_v6(DSCP_EF << 2)
+            } else {
+                sock.set_tos_v4(DSCP_EF << 2)
+            };
+            match result {
+                Ok(()) => log::info!("UDP socket marked DSCP EF (voice) toward {peer}"),
+                Err(e) => log::info!("could not mark the UDP socket DSCP EF: {e}"),
+            }
+        }
+        #[cfg(windows)]
+        {
+            match windows_qos::VoiceFlow::add(&self.socket, peer) {
+                Ok(flow) => {
+                    log::info!("UDP socket added to a qWAVE voice flow toward {peer}");
+                    self.qos = Some(flow);
+                }
+                Err(e) => log::info!("qWAVE voice flow unavailable ({e}); sending unmarked"),
+            }
+        }
     }
 
     /// # Errors
@@ -197,6 +243,125 @@ impl UdpIo {
     }
 }
 
+#[cfg(windows)]
+mod windows_qos {
+    //! qWAVE: `QOSCreateHandle` once, `QOSAddSocketToFlow` with
+    //! `QOSTrafficTypeVoice` for the (socket, destination) pair. Without
+    //! administrator rights Windows picks the DSCP itself (voice ⇒ 56,
+    //! CS7); that is still a top-priority class for every QoS engine.
+
+    use std::{
+        net::{SocketAddr, UdpSocket},
+        os::windows::io::AsRawSocket,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        NetworkManagement::QoS::{
+            QOSAddSocketToFlow, QOSCreateHandle, QOSRemoveSocketFromFlow, QOSTrafficTypeVoice,
+            QOS_NON_ADAPTIVE_FLOW, QOS_VERSION,
+        },
+        Networking::WinSock::{
+            AF_INET, AF_INET6, IN6_ADDR, IN_ADDR, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+        },
+    };
+
+    pub struct VoiceFlow {
+        handle: HANDLE,
+        flow_id: u32,
+    }
+
+    impl VoiceFlow {
+        pub fn add(socket: &UdpSocket, peer: SocketAddr) -> Result<Self, String> {
+            let version = QOS_VERSION {
+                MajorVersion: 1,
+                MinorVersion: 0,
+            };
+            let mut handle: HANDLE = std::ptr::null_mut();
+            // SAFETY: plain FFI with valid out-pointers; qwave.dll is part
+            // of Windows Vista and later.
+            let ok = unsafe { QOSCreateHandle(&version, &mut handle) };
+            if ok == 0 {
+                return Err(format!(
+                    "QOSCreateHandle: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut flow_id: u32 = 0;
+            let ok = match peer {
+                SocketAddr::V4(a) => {
+                    let sa = SOCKADDR_IN {
+                        sin_family: AF_INET,
+                        sin_port: a.port().to_be(),
+                        sin_addr: IN_ADDR {
+                            S_un: windows_sys::Win32::Networking::WinSock::IN_ADDR_0 {
+                                S_addr: u32::from_ne_bytes(a.ip().octets()),
+                            },
+                        },
+                        sin_zero: [0; 8],
+                    };
+                    // SAFETY: `sa` outlives the call; the cast is the
+                    // documented sockaddr punning.
+                    unsafe {
+                        QOSAddSocketToFlow(
+                            handle,
+                            socket.as_raw_socket() as usize,
+                            std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
+                            QOSTrafficTypeVoice,
+                            QOS_NON_ADAPTIVE_FLOW,
+                            &mut flow_id,
+                        )
+                    }
+                }
+                SocketAddr::V6(a) => {
+                    let sa = SOCKADDR_IN6 {
+                        sin6_family: AF_INET6,
+                        sin6_port: a.port().to_be(),
+                        sin6_flowinfo: a.flowinfo(),
+                        sin6_addr: IN6_ADDR {
+                            u: windows_sys::Win32::Networking::WinSock::IN6_ADDR_0 {
+                                Byte: a.ip().octets(),
+                            },
+                        },
+                        Anonymous: windows_sys::Win32::Networking::WinSock::SOCKADDR_IN6_0 {
+                            sin6_scope_id: a.scope_id(),
+                        },
+                    };
+                    // SAFETY: as above.
+                    unsafe {
+                        QOSAddSocketToFlow(
+                            handle,
+                            socket.as_raw_socket() as usize,
+                            std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
+                            QOSTrafficTypeVoice,
+                            QOS_NON_ADAPTIVE_FLOW,
+                            &mut flow_id,
+                        )
+                    }
+                }
+            };
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: handle came from QOSCreateHandle.
+                unsafe { CloseHandle(handle) };
+                return Err(format!("QOSAddSocketToFlow: {err}"));
+            }
+            Ok(Self { handle, flow_id })
+        }
+    }
+
+    impl Drop for VoiceFlow {
+        fn drop(&mut self) {
+            // SAFETY: both values came from the qWAVE calls above; a
+            // socket already closed just makes the removal a no-op.
+            unsafe {
+                QOSRemoveSocketFromFlow(self.handle, 0, self.flow_id, 0);
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -232,5 +397,22 @@ mod tests {
         }
         assert_eq!(got.len(), N);
         assert!(got.iter().all(|len| *len == 100));
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod dscp_tests {
+    use super::*;
+
+    /// The voice mark is a real socket option: after `mark_voice` the
+    /// kernel reports DSCP EF on the socket.
+    #[test]
+    fn mark_voice_sets_dscp_ef_on_the_socket() {
+        let mut io = UdpIo::bind("127.0.0.1:0".parse().unwrap(), 1 << 20).expect("bind");
+        io.mark_voice("127.0.0.1:5000".parse().unwrap());
+        let tos = socket2::SockRef::from(&io.socket)
+            .tos_v4()
+            .expect("read tos");
+        assert_eq!(tos, DSCP_EF << 2, "expected EF (46 << 2 = 184), got {tos}");
     }
 }
