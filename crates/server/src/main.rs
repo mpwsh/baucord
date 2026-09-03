@@ -154,9 +154,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_rotate_check = Instant::now();
     loop {
         let now = Instant::now();
-        if let Err(e) = udp.recv_batch(|d| server.driver().handle_datagram(now, d)) {
-            warn!("UDP receive error: {e}");
-        }
+        let drained = match udp.recv_batch(|d| server.driver().handle_datagram(now, d)) {
+            Ok(outcome) => outcome.drained,
+            Err(e) => {
+                warn!("UDP receive error: {e}");
+                true
+            }
+        };
         server.update(now);
         while let Some(t) = server.driver().poll_transmit() {
             udp.send(&t);
@@ -167,6 +171,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_rotate_check = Instant::now();
         }
 
+        // Never sleep on a backlog: whatever is still in the socket
+        // queue is latency for everyone on this relay.
+        if !drained {
+            continue;
+        }
         let mut sleep = server.suggested_sleep();
         if let Some(deadline) = server.driver().next_timeout() {
             sleep = sleep.min(deadline.saturating_duration_since(Instant::now()));

@@ -9,3 +9,4 @@ prompt.md
 netcode.key
 fltk-ui
 ./crates/*.tar.gz
+/data

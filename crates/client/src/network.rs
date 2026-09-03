@@ -312,6 +312,7 @@ struct TelemetryInputs {
     viewing: Vec<ViewingSample>,
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent session flags
 pub(crate) struct NetworkClient {
     driver: Driver,
     udp: UdpIo,
@@ -350,6 +351,9 @@ pub(crate) struct NetworkClient {
     keyframe_requests_sent: HashMap<ClientId, u64>,
     /// `DatagramsBlocked` reports (telemetry).
     datagrams_blocked: u64,
+    /// The last receive pass stopped with datagrams still queued; the
+    /// loop must come straight back rather than sleep.
+    backlog: bool,
 }
 
 impl NetworkClient {
@@ -422,6 +426,7 @@ impl NetworkClient {
             video_no_group: false,
             keyframe_requests_sent: HashMap::new(),
             datagrams_blocked: 0,
+            backlog: false,
         })
     }
 
@@ -462,6 +467,11 @@ impl NetworkClient {
     /// The next moment the transport needs a tick, for the loop's sleep.
     pub fn next_timeout(&mut self) -> Option<Instant> {
         self.driver.next_timeout()
+    }
+
+    /// Datagrams were still queued on the socket after the last tick.
+    pub fn has_backlog(&self) -> bool {
+        self.backlog
     }
 
     fn process_events(&mut self, now: Instant) {
@@ -1926,6 +1936,10 @@ fn run_network_loop(
         // next timer so acks and keep-alives are never late.
         // Disconnected there is nothing to poll, so block outright.
         let recv_result = match &mut client {
+            Some(c) if c.has_backlog() => control_rx.try_recv().map_err(|e| match e {
+                TryRecvError::Empty => RecvTimeoutError::Timeout,
+                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+            }),
             Some(c) => {
                 let mut wait = Duration::from_millis(1);
                 if let Some(deadline) = c.next_timeout() {

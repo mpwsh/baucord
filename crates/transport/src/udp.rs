@@ -17,10 +17,25 @@ use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState};
 
 use crate::driver::{InboundDatagram, Transmit};
 
-/// Datagrams read per `recv` call (each buffer may hold a GRO batch).
+/// Buffers offered per `recv` call. Linux `recvmmsg` fills up to all of
+/// them; macOS and Windows return **one** datagram per call regardless.
 const RECV_BATCH: usize = 16;
 /// One receive buffer: large enough for a full GRO batch.
 const RECV_BUF_BYTES: usize = 64 * 1024;
+/// Datagrams one [`UdpIo::recv_batch`] call will deliver before handing
+/// control back. A flood past this is reported as `drained: false` so
+/// the loop comes straight back instead of sleeping.
+const RECV_CALL_BUDGET: usize = 4096;
+
+/// What one [`UdpIo::recv_batch`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvOutcome {
+    /// Datagrams handed to the callback.
+    pub delivered: usize,
+    /// The socket queue was empty when we stopped. When false, more is
+    /// waiting and the caller should not sleep before the next call.
+    pub drained: bool,
+}
 
 /// A bound, nonblocking UDP socket with the `quinn-udp` extras.
 pub struct UdpIo {
@@ -82,14 +97,27 @@ impl UdpIo {
     }
 
     /// Receive everything that is ready, calling `f` per datagram
-    /// (GRO batches are handed over whole; the driver splits them).
-    /// Returns how many were delivered.
+    /// (GRO batches are split into their segments).
+    ///
+    /// Keeps calling `recv` until the socket reports `WouldBlock` — the
+    /// count a single `recv` returns says nothing about what is still
+    /// queued (macOS and Windows hand back one datagram per call), and
+    /// leaving packets in the kernel queue between ticks is exactly the
+    /// bufferbloat a relay must not add: at 5 Mbit/s of video that is
+    /// ~430 packets/s, and a loop that took one per tick built up a
+    /// second of queue on a LAN.
     ///
     /// # Errors
     /// A socket error other than `WouldBlock` / `Interrupted`.
-    pub fn recv_batch(&mut self, mut f: impl FnMut(InboundDatagram)) -> io::Result<usize> {
+    pub fn recv_batch(&mut self, mut f: impl FnMut(InboundDatagram)) -> io::Result<RecvOutcome> {
         let mut delivered = 0;
         loop {
+            if delivered >= RECV_CALL_BUDGET {
+                return Ok(RecvOutcome {
+                    delivered,
+                    drained: false,
+                });
+            }
             let mut slices: Vec<IoSliceMut<'_>> = self
                 .bufs
                 .iter_mut()
@@ -101,7 +129,12 @@ impl UdpIo {
                     .recv(UdpSockRef::from(&self.socket), &mut slices, &mut self.metas)
                 {
                     Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(delivered),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        return Ok(RecvOutcome {
+                            delivered,
+                            drained: true,
+                        });
+                    }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(e),
                 };
@@ -127,8 +160,12 @@ impl UdpIo {
                     delivered += 1;
                 }
             }
-            if n < RECV_BATCH {
-                return Ok(delivered);
+            if n == 0 {
+                // Defensive: a zero-length read must not spin.
+                return Ok(RecvOutcome {
+                    delivered,
+                    drained: true,
+                });
             }
         }
     }
@@ -157,5 +194,42 @@ impl UdpIo {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// Everything queued on the socket comes out of one `recv_batch`
+    /// call, however the platform's `recv` batches — the bug this
+    /// guards against left all but the first datagram in the kernel
+    /// queue on macOS and Windows.
+    #[test]
+    fn recv_batch_drains_the_whole_socket_queue() {
+        let mut rx = UdpIo::bind("127.0.0.1:0".parse().unwrap(), 1 << 20).expect("bind rx");
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind tx");
+        let to = rx.local_addr().expect("addr");
+        const N: usize = 300;
+        for i in 0..N {
+            tx.send_to(&[u8::try_from(i % 256).unwrap(); 100], to)
+                .expect("send");
+        }
+        // Let the loopback deliver.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = Vec::new();
+        while got.len() < N && Instant::now() < deadline {
+            let outcome = rx.recv_batch(|d| got.push(d.data.len())).expect("recv");
+            if outcome.delivered == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            } else {
+                // A single call must not stop while packets remain.
+                assert!(outcome.drained || outcome.delivered >= RECV_CALL_BUDGET);
+            }
+        }
+        assert_eq!(got.len(), N);
+        assert!(got.iter().all(|len| *len == 100));
     }
 }

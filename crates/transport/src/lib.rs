@@ -27,4 +27,4 @@ pub use driver::{
 };
 pub use identity::{ClientKey, Fingerprint, Observation, PinnedVerifier, ServerIdentity, Trust};
 pub use protocol::Lane;
-pub use udp::UdpIo;
+pub use udp::{RecvOutcome, UdpIo};
