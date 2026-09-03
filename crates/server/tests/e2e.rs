@@ -445,7 +445,7 @@ fn server_full_is_refused_at_hello() {
 fn a_silent_connection_is_closed_without_hello() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
     let mut c = w.open();
-    w.settle(&mut [&mut c], Duration::from_secs(7));
+    w.settle(&mut [&mut c], Duration::from_secs(12));
     assert!(
         c.disconnected().is_some(),
         "a connection that never says Hello must be closed"

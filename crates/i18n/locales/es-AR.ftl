@@ -243,4 +243,16 @@ chat-channels-updated = se actualizaron los canales de voz
 # Fijación de identidad del servidor (1.0)
 error-identity-changed = La identidad del servidor cambió: se esperaba { $expected }, se recibió { $observed }. No se envió nada. Si el administrador rotó la clave a propósito, editá la identidad del servidor en Ajustes (o borrala) y conectá de nuevo.
 chat-identity-pinned = Identidad del servidor fijada: { $fingerprint }
-error-connection-lost = Se perdió la conexión: { $reason }. Reconectando en { $secs } s…
+
+# Resultados de conexión (1.0.1). Cortos, en el idioma del usuario; el
+# motivo técnico queda en baucord.log.
+error-lost-timeout = Se perdió la conexión — el servidor no responde. Revisá tu internet.
+error-lost-reset = Se perdió la conexión — el servidor cerró la sesión después de que tu conexión se quedó muda.
+error-lost-unreachable = No se puede llegar al servidor ahora — tu conexión está perdiendo paquetes.
+error-lost-generic = Se perdió la conexión.
+error-lost-gave-up = La reconexión automática se rindió; tocá Conectar para intentar de nuevo.
+error-reconnecting = Reconectando en { $secs } s…
+error-refused-full = El servidor está lleno en este momento.
+error-refused-rate-limited = Demasiados intentos fallidos — esperá un minuto y probá de nuevo.
+error-outdated = Esta versión de baucord no coincide con el servidor. Actualizá baucord y probá de nuevo.
+error-local = No se pudo iniciar la conexión: { $detail }

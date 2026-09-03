@@ -98,6 +98,37 @@ const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_secs(600);
 
 // ── Messages sent to the UI / App layer ─────────────────────────────────
 
+/// Why a session ended for good. The UI maps each to a sentence a
+/// person can act on; nothing here is meant to be displayed raw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectKind {
+    /// The user clicked Disconnect.
+    UserRequested,
+    /// The server refused admission (wrong password is reported
+    /// separately as `AccessDenied` because it has its own prompt).
+    Refused(RefusedReason),
+    /// This client is too old (or too new) for the server.
+    Outdated,
+    /// Could not even start: socket, TLS setup, bad address.
+    LocalError,
+    /// Anything else the transport reported and we did not classify.
+    Other,
+}
+
+/// Why a session dropped in a way worth retrying automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossKind {
+    /// Nothing from the server for the idle timeout.
+    Timeout,
+    /// The server no longer knew our session (it timed us out first,
+    /// or restarted).
+    Reset,
+    /// The connection attempt itself did not get through: the
+    /// handshake never completed, or the server closed it because our
+    /// Hello never arrived — a link losing most of its packets.
+    Unreachable,
+}
+
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
     /// Outbound image upload progress, 0–100. 100 means the transport
@@ -123,14 +154,22 @@ pub enum NetworkMessage {
         expected: String,
         observed: String,
     },
-    Disconnected(String),
-    /// An established session died for network reasons (idle timeout,
-    /// or the server no longer recognizing us after a blackout).
-    /// Nothing about the credentials changed: the app should reconnect
-    /// with the same parameters after a short backoff rather than send
-    /// the user back to the connect screen.
+    /// The session ended and will not come back on its own. `kind` is
+    /// what the UI shows (a short localized sentence per kind);
+    /// `detail` is the transport's own wording, for the log and the
+    /// system chat line only — never the toast.
+    Disconnected {
+        kind: DisconnectKind,
+        detail: String,
+    },
+    /// An established session (or an attempt) died for network
+    /// reasons. Nothing about the credentials changed: the app should
+    /// reconnect with the same parameters after a short backoff rather
+    /// than send the user back to the connect screen. Same split:
+    /// `kind` for the UI, `detail` for the log.
     ConnectionLost {
-        reason: String,
+        kind: LossKind,
+        detail: String,
     },
     /// The server refused our `Hello` for a wrong or missing room
     /// password. The UI prompts for it and offers to save it on the
@@ -533,11 +572,30 @@ impl NetworkClient {
         let was_connecting = matches!(self.phase, Phase::Connecting | Phase::AwaitingWelcome);
         let was_admitted = self.phase == Phase::Admitted;
         self.phase = Phase::Closed;
+        // The server closes a connection whose Hello never arrived: on a
+        // link losing most packets the handshake can squeak through
+        // while the Hello stream data does not. A network condition,
+        // not a refusal — retry like any other transient loss.
+        let hello_lost = was_connecting
+            && matches!(reason, DisconnectReason::ApplicationClosed { reason, .. } if reason == "no hello");
         match reason {
-            transient if was_admitted && transient.is_transient() => {
-                warn!("Connection lost: {transient}");
+            _ if hello_lost => {
+                warn!("Connection attempt failed: the server did not receive our Hello in time");
                 self.message_queue.push(NetworkMessage::ConnectionLost {
-                    reason: transient.to_string(),
+                    kind: LossKind::Unreachable,
+                    detail: "hello not received".to_string(),
+                });
+            }
+            transient if transient.is_transient() && (was_admitted || was_connecting) => {
+                let kind = match transient {
+                    DisconnectReason::Reset => LossKind::Reset,
+                    _ if was_connecting => LossKind::Unreachable,
+                    _ => LossKind::Timeout,
+                };
+                warn!("Connection lost ({kind:?}): {transient}");
+                self.message_queue.push(NetworkMessage::ConnectionLost {
+                    kind,
+                    detail: transient.to_string(),
                 });
             }
             DisconnectReason::IdentityChanged { expected, observed } => {
@@ -554,17 +612,28 @@ impl NetworkClient {
                 if !self.message_queue.iter().any(|m| {
                     matches!(
                         m,
-                        NetworkMessage::AccessDenied | NetworkMessage::Disconnected(_)
+                        NetworkMessage::AccessDenied | NetworkMessage::Disconnected { .. }
                     )
                 }) {
-                    self.message_queue
-                        .push(NetworkMessage::Disconnected(reason.to_string()));
+                    self.message_queue.push(NetworkMessage::Disconnected {
+                        kind: DisconnectKind::Other,
+                        detail: reason.to_string(),
+                    });
                 }
+            }
+            DisconnectReason::AlpnMismatch => {
+                log::error!("Disconnected: {reason}");
+                self.message_queue.push(NetworkMessage::Disconnected {
+                    kind: DisconnectKind::Outdated,
+                    detail: reason.to_string(),
+                });
             }
             other => {
                 log::error!("Disconnected: {other}");
-                self.message_queue
-                    .push(NetworkMessage::Disconnected(other.to_string()));
+                self.message_queue.push(NetworkMessage::Disconnected {
+                    kind: DisconnectKind::Other,
+                    detail: other.to_string(),
+                });
             }
         }
     }
@@ -666,6 +735,16 @@ impl NetworkClient {
         // *we* abandoned because our uplink was behind.
         let started = stats.groups_started.saturating_sub(base.groups_started);
         let reset = stats.groups_reset.saturating_sub(base.groups_reset);
+        if reset > 0 {
+            // The evidence for tuning the group deadlines: which rule
+            // abandoned our groups, per 2 s window.
+            info!(
+                "video uplink: abandoned {reset}/{started} groups (superseded {}, deadline {}, unacked {}), rtt {rtt_ms:.0} ms, path loss {loss_pct:.1}%, up {kbps_up:.0} kbit/s",
+                stats.groups_reset_superseded - base.groups_reset_superseded,
+                stats.groups_reset_deadline - base.groups_reset_deadline,
+                stats.groups_reset_unacked - base.groups_reset_unacked,
+            );
+        }
         if started > 0 || reset > 0 {
             let behind_pct = if started == 0 {
                 100.0
@@ -811,9 +890,10 @@ impl NetworkClient {
                     RefusedReason::WrongPassword => {
                         self.message_queue.push(NetworkMessage::AccessDenied);
                     }
-                    other => self
-                        .message_queue
-                        .push(NetworkMessage::Disconnected(other.describe().to_string())),
+                    other => self.message_queue.push(NetworkMessage::Disconnected {
+                        kind: DisconnectKind::Refused(other),
+                        detail: other.describe().to_string(),
+                    }),
                 }
                 self.driver.close(now, self.server, "refused");
             }
@@ -1676,7 +1756,12 @@ fn handle_control(
                 // Connected is announced once the server admits us.
                 Ok(c) => *client = Some(c),
                 Err(e) => {
-                    msg_tx.send(NetworkMessage::Disconnected(e)).ok();
+                    msg_tx
+                        .send(NetworkMessage::Disconnected {
+                            kind: DisconnectKind::LocalError,
+                            detail: e,
+                        })
+                        .ok();
                     wake();
                 }
             }
@@ -1686,7 +1771,10 @@ fn handle_control(
                 c.disconnect();
             }
             msg_tx
-                .send(NetworkMessage::Disconnected("User disconnected".into()))
+                .send(NetworkMessage::Disconnected {
+                    kind: DisconnectKind::UserRequested,
+                    detail: "user disconnected".into(),
+                })
                 .ok();
             wake();
         }

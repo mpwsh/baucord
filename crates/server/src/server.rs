@@ -56,8 +56,12 @@ const MEDIA_ACTIVE_WINDOW: Duration = Duration::from_millis(500);
 const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
 /// A connection that has not sent `Hello` this long after the
-/// handshake is closed.
-const HELLO_DEADLINE: Duration = Duration::from_secs(5);
+/// handshake is closed. The handshake itself already proved the peer
+/// is a real client; on a link losing most of its packets the Hello
+/// stream data needs several retransmissions on top (seen: handshake
+/// up after 9 s, Hello still missing at +5 s). A pending slot for ten
+/// seconds costs nothing.
+const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Failed admissions per source address in [`ADMISSION_FAILURE_WINDOW`]
 /// before further attempts are refused outright.

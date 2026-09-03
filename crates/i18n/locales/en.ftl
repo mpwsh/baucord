@@ -241,4 +241,16 @@ chat-channels-updated = voice channels were updated
 # Server identity pinning (1.0)
 error-identity-changed = The server's identity changed: expected { $expected }, got { $observed }. Nothing was sent. If the admin rotated the key on purpose, edit the server's identity in Settings (or clear it) and connect again.
 chat-identity-pinned = Pinned this server's identity: { $fingerprint }
-error-connection-lost = Connection lost: { $reason }. Reconnecting in { $secs } s…
+
+# Connection outcomes (1.0.1). Short, in the user's language; the
+# technical reason is in baucord.log.
+error-lost-timeout = Connection lost — no response from the server. Check your internet.
+error-lost-reset = Connection lost — the server dropped this session after your connection went quiet.
+error-lost-unreachable = Can't reach the server right now — your connection is losing packets.
+error-lost-generic = Connection lost.
+error-lost-gave-up = Automatic reconnect gave up; press Connect to try again.
+error-reconnecting = Reconnecting in { $secs } s…
+error-refused-full = The server is full right now.
+error-refused-rate-limited = Too many failed attempts — wait a minute and try again.
+error-outdated = This version of baucord doesn't match the server. Update baucord and try again.
+error-local = Couldn't start the connection: { $detail }

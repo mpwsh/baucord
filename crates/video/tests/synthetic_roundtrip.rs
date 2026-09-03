@@ -6,7 +6,7 @@
 
 use video::{
     codec::{FfmpegDecoder, FfmpegEncoder, KEYFRAME_INTERVAL_MS},
-    Frame, Quality,
+    Frame, PixelFormat, Quality,
 };
 
 /// Synthetic RGBA frame: gradient background + a moving white square, so
@@ -36,6 +36,7 @@ fn synth_frame(w: u32, h: u32, i: u64, timestamp_ms: u64) -> Frame {
         width: w,
         height: h,
         timestamp_ms,
+        format: PixelFormat::Rgba,
     }
 }
 
@@ -51,6 +52,7 @@ fn solid_frame(w: u32, h: u32, rgb: [u8; 3], timestamp_ms: u64) -> Frame {
         width: w,
         height: h,
         timestamp_ms,
+        format: PixelFormat::Rgba,
     }
 }
 

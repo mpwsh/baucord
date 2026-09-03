@@ -42,7 +42,7 @@ use app_core::{
 use audio::{PeerAudioSettings, SoundType};
 use client::{
     config::{peer_key, BindableAction, Settings},
-    network::{NetworkControl, NetworkMessage, NetworkThreadHandle},
+    network::{DisconnectKind, LossKind, NetworkControl, NetworkMessage, NetworkThreadHandle},
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
 };
@@ -1069,24 +1069,31 @@ impl AppState {
                 s.set_error_text("".into());
                 s.set_password_prompt(false);
             }
-            NetworkMessage::ConnectionLost { reason } => {
+            NetworkMessage::ConnectionLost { kind, detail } => {
                 // Network, not credentials: come back on our own, with
                 // backoff (2, 4, 8, 16, 30 s), instead of dumping the
                 // user on the connect screen with a transport error.
-                self.push_chat_system(&t!("chat-disconnected", "reason" => reason.as_str()));
+                // The user sees one plain sentence per kind; the
+                // transport's wording goes to the log only.
+                log::warn!("connection lost ({kind:?}): {detail}");
+                let what = t!(match kind {
+                    LossKind::Timeout => "error-lost-timeout",
+                    LossKind::Reset => "error-lost-reset",
+                    LossKind::Unreachable => "error-lost-unreachable",
+                });
+                self.push_chat_system(&what);
                 self.teardown_connection();
                 self.show_connect_phase();
                 const MAX_AUTO_RECONNECTS: u32 = 5;
                 if self.reconnect_attempts >= MAX_AUTO_RECONNECTS {
-                    self.show_error(&reason);
+                    self.show_error(&format!("{what} {}", t!("error-lost-gave-up")));
                 } else {
                     self.reconnect_attempts += 1;
                     let secs = (2u64 << (self.reconnect_attempts - 1)).min(30);
                     let secs_text = secs.to_string();
-                    self.show_error(&t!(
-                        "error-connection-lost",
-                        "reason" => reason.as_str(),
-                        "secs" => secs_text.as_str()
+                    self.show_error(&format!(
+                        "{what} {}",
+                        t!("error-reconnecting", "secs" => secs_text.as_str())
                     ));
                     let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
                     if let Some(weak) = weak {
@@ -1153,14 +1160,31 @@ impl AppState {
                 s.set_password_prompt(true);
                 s.set_password("".into());
             }
-            NetworkMessage::Disconnected(reason) => {
+            NetworkMessage::Disconnected { kind, detail } => {
+                log::info!("disconnected ({kind:?}): {detail}");
+                let what = match kind {
+                    DisconnectKind::UserRequested => t!("disconnect-reason-user"),
+                    DisconnectKind::Refused(client::RefusedReason::ServerFull) => {
+                        t!("error-refused-full")
+                    }
+                    DisconnectKind::Refused(client::RefusedReason::RateLimited) => {
+                        t!("error-refused-rate-limited")
+                    }
+                    DisconnectKind::Refused(_) | DisconnectKind::Outdated => {
+                        t!("error-outdated")
+                    }
+                    DisconnectKind::LocalError => {
+                        t!("error-local", "detail" => detail.as_str())
+                    }
+                    DisconnectKind::Other => t!("error-lost-generic"),
+                };
                 if self.connected {
-                    self.push_chat_system(&t!("chat-disconnected", "reason" => reason.as_str()));
+                    self.push_chat_system(&t!("chat-disconnected", "reason" => what.as_str()));
                     self.teardown_connection();
                     self.show_connect_phase();
-                    self.show_error(&reason);
-                } else {
-                    self.show_error(&reason);
+                }
+                if kind != DisconnectKind::UserRequested {
+                    self.show_error(&what);
                 }
             }
             NetworkMessage::InitClient {

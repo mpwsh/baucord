@@ -29,4 +29,4 @@ pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
 /// layer enforces the same cap the codec does — the numbers can't
 /// drift because they are the same constant.
 pub use protocol::MAX_CHAT_IMAGE_BYTES;
-pub use protocol::{ChannelDenyReason, ChannelInfo, ShareScope};
+pub use protocol::{ChannelDenyReason, ChannelInfo, RefusedReason, ShareScope};
