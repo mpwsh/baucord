@@ -100,7 +100,8 @@ const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Why a session ended for good. The UI maps each to a sentence a
 /// person can act on; nothing here is meant to be displayed raw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Not `Copy`: a 1.1 refusal (`Banned`) carries its reason text.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisconnectKind {
     /// The user clicked Disconnect.
     UserRequested,
@@ -911,10 +912,13 @@ impl NetworkClient {
                     RefusedReason::WrongPassword => {
                         self.message_queue.push(NetworkMessage::AccessDenied);
                     }
-                    other => self.message_queue.push(NetworkMessage::Disconnected {
-                        kind: DisconnectKind::Refused(other),
-                        detail: other.describe().to_string(),
-                    }),
+                    other => {
+                        let detail = other.describe().to_string();
+                        self.message_queue.push(NetworkMessage::Disconnected {
+                            kind: DisconnectKind::Refused(other),
+                            detail,
+                        });
+                    }
                 }
                 self.driver.close(now, self.server, "refused");
             }
@@ -1105,6 +1109,25 @@ impl NetworkClient {
                         rtt_ms,
                         exercised,
                     });
+            }
+            // ── 1.1 (the client half lands with the invite door) ────
+            ServerMessage::Session {
+                permissions,
+                persistent,
+                ..
+            } => {
+                info!("Session: permissions {permissions:#x}, persistent {persistent}");
+            }
+            ServerMessage::Removed { kind, reason, by } => {
+                // The server closes the connection right after; the
+                // disconnect path below reports it.
+                warn!("Removed from the server ({kind:?}) by {by}: {reason}");
+            }
+            ServerMessage::InviteCreated { code, .. } => {
+                info!("Invite created: {code}");
+            }
+            ServerMessage::InviteDenied { reason } => {
+                warn!("Invite refused: {reason:?}");
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.

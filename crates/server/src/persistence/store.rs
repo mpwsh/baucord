@@ -1,0 +1,1205 @@
+//! The `SQLite` side of persistence: opening, migrating, the handful of
+//! statements the persistence thread runs, and the offline operations
+//! (`backup`, `check`) the CLI runs against a database file.
+//!
+//! Everything here is called from the persistence thread or from a CLI
+//! subcommand — never from the relay tick (spec §0, rule 1).
+
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use log::{info, warn};
+use protocol::permissions::BUILTIN_ROLES;
+use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
+
+use super::{AuditRow, MessageRow, PersistError, TelemetryEventRow, TelemetryRow};
+use crate::{
+    clock::WallMs,
+    policy::{
+        InviteRecord, KeyRecord, Policy, Restriction, RestrictionKind, RoleRecord, UserRecord,
+    },
+};
+
+/// The general chat is conversation 1 (spec §6).
+pub const GENERAL_CONV: u64 = 1;
+
+/// Forward-only migrations; index + 1 is the schema version they
+/// produce. A database newer than this list refuses to open.
+const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_foundation.sql")];
+
+/// The schema version this build produces.
+#[allow(clippy::cast_possible_truncation)] // a handful of migrations
+pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
+
+/// Tables `check` counts, in the order they are printed.
+const COUNTED_TABLES: &[&str] = &[
+    "users",
+    "user_keys",
+    "roles",
+    "invites",
+    "restrictions",
+    "channels",
+    "messages",
+    "blobs",
+    "audit",
+    "user_progress",
+    "telemetry_samples",
+    "telemetry_events",
+];
+
+/// Wait this long on a locked database (a CLI command mid-backup)
+/// before giving up on a statement.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Retention windows, in days. Zero keeps rows forever.
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    pub history_days: u32,
+    pub telemetry_days: u32,
+}
+
+/// Where data goes. `Memory` is persistence off: writes are discarded,
+/// reads answer "unavailable", and nothing survives the process.
+pub enum Store {
+    Sqlite(Sqlite),
+    Memory,
+}
+
+/// An open database and the connection-local `data_version` used to
+/// notice other processes writing to it.
+pub struct Sqlite {
+    conn: Connection,
+    data_version: i64,
+}
+
+impl Sqlite {
+    /// Open (creating if needed), apply pending migrations, re-sync the
+    /// built-in roles, and return the store with the message-id
+    /// watermark to rebase the in-memory counter on.
+    ///
+    /// # Errors
+    /// I/O or `SQLite` failure, or a database newer than this build.
+    pub fn open(path: &Path) -> Result<(Self, u64), PersistError> {
+        if !is_memory_path(path)
+            && let Some(dir) = path.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            fs::create_dir_all(dir).map_err(|e| PersistError::Io(dir.to_path_buf(), e))?;
+        }
+        let mut conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // WAL so the CLI (and a backup) can read while the server
+        // writes; NORMAL loses at most the last transactions on power
+        // loss, never consistency — the right trade for chat history.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;",
+        )?;
+        migrate(&mut conn)?;
+        sync_builtin_roles(&conn)?;
+        let watermark: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(msg_id), 0) FROM messages",
+            [],
+            |row| row.get(0),
+        )?;
+        let next_message_id = u64::try_from(watermark).unwrap_or(0).saturating_add(1);
+        let data_version = read_data_version(&conn)?;
+        info!(
+            "Database {} open (schema {SCHEMA_VERSION}, next message id {next_message_id})",
+            path.display()
+        );
+        Ok((
+            Self { conn, data_version },
+            next_message_id,
+        ))
+    }
+
+    /// Insert one general-chat (or DM) message. A duplicate id is
+    /// ignored: the tick's counter is the authority.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_message(&self, m: &MessageRow) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO messages (msg_id, conv_id, ts, user_id, body)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                ordered(m.msg_id),
+                ordered(m.conv_id),
+                ordered(m.ts),
+                m.user_id,
+                m.body
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a coalesced batch of telemetry samples in one transaction.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_telemetry(&mut self, rows: &[TelemetryRow]) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO telemetry_samples
+                 (ts, user_id, key_hash, rtt_ms, path_loss, voice_loss, groups_behind,
+                  rung, input_device, output_device, sample)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+            for r in rows {
+                stmt.execute(params![
+                    ordered(r.ts),
+                    r.user_id,
+                    r.key_hash,
+                    r.rtt_ms,
+                    r.path_loss,
+                    r.voice_loss,
+                    r.groups_behind.map(ordered),
+                    r.rung,
+                    r.input_device,
+                    r.output_device,
+                    r.sample,
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Insert one telemetry event.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_telemetry_event(&self, e: &TelemetryEventRow) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO telemetry_events (ts, user_id, key_hash, kind, event)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ordered(e.ts), e.user_id, e.key_hash, e.kind, e.event],
+        )?;
+        Ok(())
+    }
+
+    /// The last `limit` undeleted messages of `conv_id` before
+    /// `before` (exclusive; `None` = the newest), oldest first.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn messages_before(
+        &self,
+        conv_id: u64,
+        before: Option<u64>,
+        limit: u16,
+    ) -> Result<Vec<MessageRow>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT msg_id, conv_id, ts, user_id, body FROM messages
+             WHERE conv_id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR msg_id < ?2)
+             ORDER BY msg_id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![ordered(conv_id), before.map(ordered), i64::from(limit)],
+            |row| {
+                Ok(MessageRow {
+                    msg_id: unordered(row.get(0)?),
+                    conv_id: unordered(row.get(1)?),
+                    ts: unordered(row.get(2)?),
+                    user_id: row.get(3)?,
+                    body: row.get(4)?,
+                })
+            },
+        )?;
+        let mut out: Vec<MessageRow> = rows.collect::<Result<_, _>>()?;
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Fold the WAL back into the main file without blocking writers.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn checkpoint(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+    }
+
+    /// Delete rows past their retention window. Returns rows removed.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn prune(&self, now: WallMs, retention: Retention) -> Result<u64, rusqlite::Error> {
+        let mut removed = 0u64;
+        if let Some(cutoff) = cutoff(now, retention.history_days) {
+            removed += count(self.conn.execute(
+                "DELETE FROM messages WHERE ts < ?1",
+                params![ordered(cutoff)],
+            )?);
+        }
+        if let Some(cutoff) = cutoff(now, retention.telemetry_days) {
+            removed += count(self.conn.execute(
+                "DELETE FROM telemetry_samples WHERE ts < ?1",
+                params![ordered(cutoff)],
+            )?);
+            removed += count(self.conn.execute(
+                "DELETE FROM telemetry_events WHERE ts < ?1",
+                params![ordered(cutoff)],
+            )?);
+        }
+        Ok(removed)
+    }
+
+    /// Whether another connection committed to the database since the
+    /// last call (the CLI, or an operator with `sqlite3`). Our own
+    /// commits never change the value.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn changed_externally(&mut self) -> Result<bool, rusqlite::Error> {
+        let version = read_data_version(&self.conn)?;
+        let changed = version != self.data_version;
+        self.data_version = version;
+        Ok(changed)
+    }
+
+    // ── Policy (spec §0 rule 4: loaded once, consulted in RAM) ──────
+
+    /// Read every policy table into a [`Policy`]. Run at startup and
+    /// again after another process changed the file.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn load_policy(&self) -> Result<Policy, rusqlite::Error> {
+        let mut policy = Policy::new();
+        self.load_roles(&mut policy)?;
+        self.load_users(&mut policy)?;
+        self.load_keys(&mut policy)?;
+        self.load_invites(&mut policy)?;
+        self.load_restrictions(&mut policy)?;
+        Ok(policy)
+    }
+
+    fn load_roles(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT role_id, name, permissions, rank, builtin FROM roles")?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                RoleRecord {
+                    name: r.get(1)?,
+                    permissions: bits_from_sql(r.get(2)?),
+                    rank: r.get(3)?,
+                    builtin: r.get::<_, i64>(4)? != 0,
+                },
+            ))
+        })? {
+            let (id, role) = row?;
+            policy.roles.insert(id, role);
+        }
+        Ok(())
+    }
+
+    fn load_users(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id, name, created_at, last_seen, invited_with FROM users")?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, [u8; 32]>(0)?,
+                UserRecord {
+                    name: r.get(1)?,
+                    created_at: unordered(r.get(2)?),
+                    last_seen: unordered(r.get(3)?),
+                    invited_with: r.get(4)?,
+                    roles: BTreeSet::new(),
+                },
+            ))
+        })? {
+            let (id, user) = row?;
+            policy.users.insert(id, user);
+        }
+        let mut stmt = self.conn.prepare("SELECT user_id, role_id FROM user_roles")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, u32>(1)?)))? {
+            let (user, role) = row?;
+            if let Some(u) = policy.users.get_mut(&user) {
+                u.roles.insert(role);
+            }
+        }
+        Ok(())
+    }
+
+    fn load_keys(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key_hash, user_id, added_at, last_seen, retired_at FROM user_keys")?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, [u8; 32]>(0)?,
+                KeyRecord {
+                    user_id: r.get(1)?,
+                    added_at: unordered(r.get(2)?),
+                    last_seen: unordered(r.get(3)?),
+                    retired_at: r.get::<_, Option<i64>>(4)?.map(unordered),
+                },
+            ))
+        })? {
+            let (hash, key) = row?;
+            policy.keys.insert(hash, key);
+        }
+        Ok(())
+    }
+
+    fn load_invites(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT code, created_by, created_at, expires_at, max_uses, uses, grants_role,
+                    revoked_at
+             FROM invites",
+        )?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                InviteRecord {
+                    created_by: r.get(1)?,
+                    created_at: unordered(r.get(2)?),
+                    expires_at: r.get::<_, Option<i64>>(3)?.map(unordered),
+                    max_uses: r.get(4)?,
+                    uses: r.get(5)?,
+                    grants_role: r.get(6)?,
+                    revoked_at: r.get::<_, Option<i64>>(7)?.map(unordered),
+                },
+            ))
+        })? {
+            let (code, invite) = row?;
+            policy.invites.insert(code, invite);
+        }
+        Ok(())
+    }
+
+    fn load_restrictions(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, user_id, key_hash, ip, kind, until, reason, by, created_at
+             FROM restrictions ORDER BY id",
+        )?;
+        for row in stmt.query_map([], |r| {
+            let kind: i64 = r.get(4)?;
+            let ip: Option<String> = r.get(3)?;
+            Ok((
+                Restriction {
+                    id: unordered(r.get(0)?),
+                    user_id: r.get(1)?,
+                    key_hash: r.get(2)?,
+                    ip: None,
+                    kind: RestrictionKind::Server,
+                    until: r.get::<_, Option<i64>>(5)?.map(unordered),
+                    reason: r.get(6)?,
+                    by: r.get(7)?,
+                    created_at: unordered(r.get(8)?),
+                },
+                kind,
+                ip,
+            ))
+        })? {
+            let (mut restriction, kind, ip) = row?;
+            let id = restriction.id;
+            let Some(kind) = RestrictionKind::from_db(kind) else {
+                warn!("restriction {id} has unknown kind {kind}; ignoring it");
+                continue;
+            };
+            restriction.kind = kind;
+            restriction.ip = ip.and_then(|text| {
+                let parsed = text.parse().ok();
+                if parsed.is_none() {
+                    warn!("restriction {id} has an unparsable address {text:?}; ignoring it");
+                }
+                parsed
+            });
+            policy.restrictions.push(restriction);
+            policy.next_restriction_id = policy.next_restriction_id.max(id + 1);
+        }
+        Ok(())
+    }
+
+    /// Create or refresh a user row (name and last-seen).
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn upsert_user(
+        &self,
+        user_id: &[u8; 32],
+        user: &UserRecord,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO users (user_id, name, created_at, last_seen, invited_with)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 name = excluded.name,
+                 last_seen = excluded.last_seen",
+            params![
+                user_id,
+                user.name,
+                ordered(user.created_at),
+                ordered(user.last_seen),
+                user.invited_with
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Link (or refresh) a key on a user.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn upsert_key(&self, key_hash: &[u8; 32], key: &KeyRecord) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO user_keys (key_hash, user_id, added_at, last_seen, retired_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(key_hash) DO UPDATE SET
+                 user_id = excluded.user_id,
+                 last_seen = excluded.last_seen,
+                 retired_at = excluded.retired_at",
+            params![
+                key_hash,
+                key.user_id,
+                ordered(key.added_at),
+                ordered(key.last_seen),
+                key.retired_at.map(ordered)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn grant_role(
+        &self,
+        user_id: &[u8; 32],
+        role_id: u32,
+        granted_by: Option<&[u8; 32]>,
+        now: WallMs,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO user_roles (user_id, role_id, granted_by, granted_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, role_id, granted_by, ordered(now)],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn revoke_role(&self, user_id: &[u8; 32], role_id: u32) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM user_roles WHERE user_id = ?1 AND role_id = ?2",
+            params![user_id, role_id],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_invite(&self, code: &str, invite: &InviteRecord) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO invites
+             (code, created_by, created_at, expires_at, max_uses, uses, grants_role, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                code,
+                invite.created_by,
+                ordered(invite.created_at),
+                invite.expires_at.map(ordered),
+                invite.max_uses,
+                invite.uses,
+                invite.grants_role,
+                invite.revoked_at.map(ordered)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Count one admission through `code`.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn use_invite(&self, code: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE invites SET uses = uses + 1 WHERE code = ?1",
+            params![code],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn revoke_invite(&self, code: &str, now: WallMs) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE invites SET revoked_at = ?2 WHERE code = ?1 AND revoked_at IS NULL",
+            params![code, ordered(now)],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_restriction(&self, r: &Restriction) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO restrictions
+             (id, user_id, key_hash, ip, kind, until, reason, by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                ordered(r.id),
+                r.user_id,
+                r.key_hash,
+                r.ip.map(|ip| ip.to_string()),
+                r.kind.to_db(),
+                r.until.map(ordered),
+                r.reason,
+                r.by,
+                ordered(r.created_at)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn delete_restriction(&self, id: u64) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM restrictions WHERE id = ?1",
+            params![ordered(id)],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_audit(&self, a: &AuditRow) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO audit (ts, actor_user_id, action, target, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ordered(a.ts), a.actor, a.action, a.target, a.detail],
+        )?;
+        Ok(())
+    }
+
+    /// Final checkpoint on shutdown so the main file is complete on its
+    /// own (a restore from a plain file copy then has nothing to
+    /// recover).
+    pub fn close(self) {
+        if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            log::warn!("Final WAL checkpoint failed: {e}");
+        }
+        if let Err((_, e)) = self.conn.close() {
+            log::warn!("Closing the database: {e}");
+        }
+    }
+}
+
+/// `":memory:"` is `SQLite`'s private in-memory database — used by unit
+/// tests; it has no directory to create.
+fn is_memory_path(path: &Path) -> bool {
+    path.to_str() == Some(":memory:")
+}
+
+fn read_data_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row("PRAGMA data_version", [], |row| row.get(0))
+}
+
+/// Apply every migration past the recorded version, each in its own
+/// transaction. A database from a newer build is an error, not a guess.
+fn migrate(conn: &mut Connection) -> Result<(), PersistError> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")?;
+    let current: u32 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .optional()?
+        .unwrap_or(0);
+    if current > SCHEMA_VERSION {
+        return Err(PersistError::Downgrade {
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    let applied = usize::try_from(current).unwrap_or(usize::MAX);
+    for (index, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
+        let version = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        tx.execute("DELETE FROM schema_version", [])?;
+        tx.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![version],
+        )?;
+        tx.commit()?;
+        info!("Database migrated to schema version {version}");
+    }
+    Ok(())
+}
+
+/// Write the built-in roles' current permission sets and ranks. Run at
+/// every startup so a permission added in code reaches an existing
+/// database without a migration; custom roles are untouched.
+fn sync_builtin_roles(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO roles (role_id, name, permissions, rank, builtin)
+         VALUES (?1, ?2, ?3, ?4, 1)
+         ON CONFLICT(role_id) DO UPDATE SET
+             name = excluded.name,
+             permissions = excluded.permissions,
+             rank = excluded.rank,
+             builtin = 1",
+    )?;
+    for role in BUILTIN_ROLES {
+        stmt.execute(params![
+            role.id,
+            role.name,
+            bits_to_sql(role.permissions),
+            role.rank
+        ])?;
+    }
+    Ok(())
+}
+
+/// `now − days`, or `None` when `days` is zero (keep forever).
+fn cutoff(now: WallMs, days: u32) -> Option<WallMs> {
+    if days == 0 {
+        return None;
+    }
+    let window = u64::from(days).saturating_mul(24 * 60 * 60 * 1000);
+    Some(now.saturating_sub(window))
+}
+
+/// Ids and timestamps: unsigned in Rust, `INTEGER` (i64) in `SQLite`.
+/// They never approach the sign bit; clamp rather than wrap so ordering
+/// is preserved if they ever did.
+fn ordered(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn unordered(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+/// Permission bitsets keep their bit pattern across the i64 column.
+fn bits_to_sql(bits: u64) -> i64 {
+    i64::from_ne_bytes(bits.to_ne_bytes())
+}
+
+fn bits_from_sql(value: i64) -> u64 {
+    u64::from_ne_bytes(value.to_ne_bytes())
+}
+
+/// Rows affected, as a counter.
+fn count(rows: usize) -> u64 {
+    u64::try_from(rows).unwrap_or(u64::MAX)
+}
+
+// ── Offline operations (CLI) ────────────────────────────────────────────
+
+/// `server backup <file.tar>`: a consistent snapshot of the database
+/// through `SQLite`'s online backup API (a plain copy of a WAL database
+/// is not safe) plus the `blobs/` directory, in one archive — either
+/// half alone restores to dangling references.
+///
+/// # Errors
+/// No database at `db_path`, a `SQLite` failure, or an archive I/O error.
+pub fn backup_to_tar(db_path: &Path, out: &Path) -> Result<BackupReport, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let src = Connection::open(db_path)?;
+    src.busy_timeout(BUSY_TIMEOUT)?;
+    let snapshot = out.with_extension(format!("snapshot-{}.db", std::process::id()));
+    src.backup(MAIN_DB, &snapshot, None)?;
+    drop(src);
+
+    let result = write_archive(db_path, &snapshot, out);
+    // Best effort: the snapshot is scratch either way.
+    let _ = fs::remove_file(&snapshot);
+    result
+}
+
+fn write_archive(
+    db_path: &Path,
+    snapshot: &Path,
+    out: &Path,
+) -> Result<BackupReport, PersistError> {
+    let archive_err = |e: std::io::Error| PersistError::Archive(out.to_path_buf(), e);
+    let file = File::create(out).map_err(archive_err)?;
+    let mut tar = tar::Builder::new(file);
+    tar.append_path_with_name(snapshot, "baucord.db")
+        .map_err(archive_err)?;
+    let blobs = blobs_dir(db_path);
+    let blob_files = if blobs.is_dir() {
+        tar.append_dir_all("blobs", &blobs).map_err(archive_err)?;
+        fs::read_dir(&blobs).map_or(0, |entries| entries.filter_map(Result::ok).count())
+    } else {
+        0
+    };
+    let file = tar.into_inner().map_err(archive_err)?;
+    file.sync_all().map_err(archive_err)?;
+    let db_bytes = fs::metadata(snapshot).map_or(0, |m| m.len());
+    Ok(BackupReport {
+        db_bytes,
+        blob_files,
+    })
+}
+
+/// Where blobs live: `blobs/` next to the database file (spec §1).
+#[must_use]
+pub fn blobs_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .map_or_else(|| PathBuf::from("blobs"), |dir| dir.join("blobs"))
+}
+
+/// What `backup_to_tar` archived.
+#[derive(Debug, Clone, Copy)]
+pub struct BackupReport {
+    pub db_bytes: u64,
+    pub blob_files: usize,
+}
+
+/// `server invite create`: mint a code straight into the database.
+/// A running server notices within 2 s (`data_version`).
+///
+/// # Errors
+/// No database at `db_path`, an unknown role, or a `SQLite` failure.
+pub fn cli_create_invite(
+    db_path: &Path,
+    role: u32,
+    ttl_ms: Option<u64>,
+    max_uses: Option<u32>,
+) -> Result<(String, InviteRecord), PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let known_role: Option<i64> = db
+        .conn
+        .query_row(
+            "SELECT role_id FROM roles WHERE role_id = ?1",
+            params![role],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if known_role.is_none() {
+        return Err(PersistError::UnknownRole(role));
+    }
+    let now = super::wall_now();
+    let code = crate::policy::generate_invite_code();
+    let invite = InviteRecord {
+        created_by: None,
+        created_at: now,
+        expires_at: ttl_ms.map(|ttl| now.saturating_add(ttl)),
+        max_uses,
+        uses: 0,
+        grants_role: role,
+        revoked_at: None,
+    };
+    db.insert_invite(&code, &invite)?;
+    db.insert_audit(&AuditRow {
+        ts: now,
+        actor: None,
+        action: "invite.create".to_string(),
+        target: Some(code.clone()),
+        detail: Some(format!("cli: role {role}, max_uses {max_uses:?}, ttl_ms {ttl_ms:?}")),
+    })?;
+    db.close();
+    Ok((code, invite))
+}
+
+/// `server invite list`: every code, newest first.
+///
+/// # Errors
+/// No database at `db_path`, or a `SQLite` failure.
+pub fn cli_list_invites(db_path: &Path) -> Result<Vec<(String, InviteRecord)>, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    db.close();
+    let mut invites: Vec<(String, InviteRecord)> = policy.invites.into_iter().collect();
+    invites.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at).then_with(|| a.0.cmp(&b.0)));
+    Ok(invites)
+}
+
+/// `server invite revoke CODE`. Returns whether the code existed and
+/// was not already revoked.
+///
+/// # Errors
+/// No database at `db_path`, or a `SQLite` failure.
+pub fn cli_revoke_invite(db_path: &Path, code: &str) -> Result<bool, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let now = super::wall_now();
+    let changed = db.conn.execute(
+        "UPDATE invites SET revoked_at = ?2 WHERE code = ?1 AND revoked_at IS NULL",
+        params![code, ordered(now)],
+    )?;
+    if changed > 0 {
+        db.insert_audit(&AuditRow {
+            ts: now,
+            actor: None,
+            action: "invite.revoke".to_string(),
+            target: Some(code.to_string()),
+            detail: Some("cli".to_string()),
+        })?;
+    }
+    db.close();
+    Ok(changed > 0)
+}
+
+/// `server db check`: integrity, schema version and row counts. Opens
+/// the file as-is — no migration is applied.
+///
+/// # Errors
+/// No database at `db_path`, or a `SQLite` failure.
+pub fn check(db_path: &Path) -> Result<CheckReport, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let conn = Connection::open(db_path)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let mut integrity_stmt = conn.prepare("PRAGMA integrity_check")?;
+    let integrity: Vec<String> = integrity_stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    drop(integrity_stmt);
+    let schema_version: Option<u32> = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .optional()
+        .unwrap_or(None);
+    let mut counts = Vec::with_capacity(COUNTED_TABLES.len());
+    for table in COUNTED_TABLES {
+        // Table names come from our own constant list, never from input.
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(-1);
+        counts.push((*table, count));
+    }
+    let file_bytes = fs::metadata(db_path).map_or(0, |m| m.len());
+    Ok(CheckReport {
+        integrity,
+        schema_version,
+        supported_version: SCHEMA_VERSION,
+        counts,
+        file_bytes,
+    })
+}
+
+/// What `check` found.
+#[derive(Debug, Clone)]
+pub struct CheckReport {
+    /// `["ok"]` when `SQLite` found nothing wrong; otherwise one line per
+    /// problem.
+    pub integrity: Vec<String>,
+    /// `None` if the file has no `schema_version` table (not a baucord
+    /// database, or an empty file).
+    pub schema_version: Option<u32>,
+    pub supported_version: u32,
+    /// Rows per table; `-1` where the table does not exist.
+    pub counts: Vec<(&'static str, i64)>,
+    pub file_bytes: u64,
+}
+
+impl CheckReport {
+    /// Integrity passed and the schema is one this build can open.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.integrity.as_slice() == ["ok"]
+            && self
+                .schema_version
+                .is_some_and(|v| v <= self.supported_version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory() -> Sqlite {
+        Sqlite::open(Path::new(":memory:")).expect("open").0
+    }
+
+    fn row(msg_id: u64, body: &str) -> MessageRow {
+        MessageRow {
+            msg_id,
+            conv_id: GENERAL_CONV,
+            ts: 1_000 + msg_id,
+            user_id: [7u8; 32],
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn open_creates_schema_and_starts_ids_at_one() {
+        let (_, next) = Sqlite::open(Path::new(":memory:")).expect("open");
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn open_rebases_the_message_counter_on_the_watermark() {
+        let dir = std::env::temp_dir().join(format!(
+            "baucord-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.join("baucord.db");
+        {
+            let (db, _) = Sqlite::open(&path).expect("open");
+            db.insert_message(&row(41, "a")).expect("insert");
+            db.insert_message(&row(42, "b")).expect("insert");
+            db.close();
+        }
+        let (db, next) = Sqlite::open(&path).expect("reopen");
+        assert_eq!(next, 43);
+        db.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_roles_are_present_after_open() {
+        let db = memory();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM roles WHERE builtin = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn messages_before_pages_backwards_and_returns_oldest_first() {
+        let db = memory();
+        for id in 1..=5 {
+            db.insert_message(&row(id, "x")).expect("insert");
+        }
+        let page = db
+            .messages_before(GENERAL_CONV, None, 2)
+            .expect("read");
+        assert_eq!(
+            page.iter().map(|m| m.msg_id).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        let older = db
+            .messages_before(GENERAL_CONV, Some(4), 10)
+            .expect("read");
+        assert_eq!(
+            older.iter().map(|m| m.msg_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn duplicate_message_ids_are_ignored_not_errors() {
+        let db = memory();
+        db.insert_message(&row(1, "first")).expect("insert");
+        db.insert_message(&row(1, "again")).expect("dup insert");
+        let page = db
+            .messages_before(GENERAL_CONV, None, 10)
+            .expect("read");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].body, "first");
+    }
+
+    #[test]
+    fn prune_removes_only_rows_past_the_window() {
+        let db = memory();
+        let day = 24 * 60 * 60 * 1000;
+        db.insert_message(&MessageRow {
+            ts: 10 * day,
+            ..row(1, "old")
+        })
+        .expect("insert");
+        db.insert_message(&MessageRow {
+            ts: 95 * day,
+            ..row(2, "new")
+        })
+        .expect("insert");
+        let removed = db
+            .prune(
+                100 * day,
+                Retention {
+                    history_days: 30,
+                    telemetry_days: 0,
+                },
+            )
+            .expect("prune");
+        assert_eq!(removed, 1);
+        let left = db
+            .messages_before(GENERAL_CONV, None, 10)
+            .expect("read");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].body, "new");
+    }
+
+    #[test]
+    fn zero_retention_keeps_everything() {
+        let db = memory();
+        db.insert_message(&row(1, "keep")).expect("insert");
+        let removed = db
+            .prune(
+                u64::MAX / 2,
+                Retention {
+                    history_days: 0,
+                    telemetry_days: 0,
+                },
+            )
+            .expect("prune");
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn own_writes_do_not_count_as_external_changes() {
+        let mut db = memory();
+        db.insert_message(&row(1, "x")).expect("insert");
+        assert!(!db.changed_externally().expect("poll"));
+    }
+
+    #[test]
+    fn a_newer_schema_refuses_to_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "baucord-store-newer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.join("baucord.db");
+        {
+            let (db, _) = Sqlite::open(&path).expect("open");
+            db.conn
+                .execute("UPDATE schema_version SET version = 999", [])
+                .expect("bump");
+            db.close();
+        }
+        match Sqlite::open(&path) {
+            Err(PersistError::Downgrade { found: 999, .. }) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a newer schema must refuse to open"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telemetry_batches_land_in_one_transaction() {
+        let mut db = memory();
+        let rows: Vec<TelemetryRow> = (0..3)
+            .map(|i| TelemetryRow {
+                ts: 1_000 + i,
+                user_id: [1u8; 32],
+                key_hash: [1u8; 32],
+                rtt_ms: 40,
+                path_loss: 0.5,
+                voice_loss: Some(1.0),
+                groups_behind: None,
+                rung: None,
+                input_device: Some("mic".to_string()),
+                output_device: None,
+                sample: vec![1, 2, 3],
+            })
+            .collect();
+        db.insert_telemetry(&rows).expect("insert");
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn policy_round_trips_through_the_tables() {
+        let db = memory();
+        let alice = [1u8; 32];
+        let key = [7u8; 32];
+        let mut user = UserRecord {
+            name: "alice".into(),
+            created_at: 10,
+            last_seen: 10,
+            invited_with: Some("K7FQ2MX9ABCD".into()),
+            roles: BTreeSet::new(),
+        };
+        db.upsert_user(&alice, &user).expect("user");
+        db.upsert_key(
+            &key,
+            &KeyRecord {
+                user_id: alice,
+                added_at: 10,
+                last_seen: 10,
+                retired_at: None,
+            },
+        )
+        .expect("key");
+        db.grant_role(&alice, protocol::permissions::ROLE_MEMBER, None, 10)
+            .expect("role");
+        db.grant_role(&alice, protocol::permissions::ROLE_MEMBER, None, 11)
+            .expect("duplicate grant is ignored");
+        db.insert_invite(
+            "K7FQ2MX9ABCD",
+            &InviteRecord {
+                created_by: Some(alice),
+                created_at: 10,
+                expires_at: Some(99),
+                max_uses: Some(3),
+                uses: 0,
+                grants_role: protocol::permissions::ROLE_GUEST,
+                revoked_at: None,
+            },
+        )
+        .expect("invite");
+        db.use_invite("K7FQ2MX9ABCD").expect("use");
+        let ban = Restriction {
+            id: 5,
+            user_id: Some(alice),
+            key_hash: None,
+            ip: Some("10.0.0.9".parse().unwrap()),
+            kind: RestrictionKind::Server,
+            until: None,
+            reason: "spam".into(),
+            by: None,
+            created_at: 12,
+        };
+        db.insert_restriction(&ban).expect("restriction");
+        user.name = "Alice".into();
+        user.last_seen = 20;
+        db.upsert_user(&alice, &user).expect("refresh");
+
+        let policy = db.load_policy().expect("load");
+        let loaded = &policy.users[&alice];
+        assert_eq!(loaded.name, "Alice");
+        assert_eq!(loaded.last_seen, 20);
+        assert_eq!(loaded.created_at, 10, "created_at is never refreshed");
+        assert!(loaded.roles.contains(&protocol::permissions::ROLE_MEMBER));
+        assert_eq!(policy.keys[&key].user_id, alice);
+        assert_eq!(policy.invites["K7FQ2MX9ABCD"].uses, 1);
+        assert_eq!(policy.restrictions, vec![ban]);
+        assert_eq!(policy.next_restriction_id, 6);
+        assert_eq!(policy.roles.len(), 4);
+    }
+
+    #[test]
+    fn check_reports_ok_on_a_fresh_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "baucord-store-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.join("baucord.db");
+        Sqlite::open(&path).expect("open").0.close();
+        let report = check(&path).expect("check");
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(report.schema_version, Some(SCHEMA_VERSION));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

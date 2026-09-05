@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::lanes::Lane;
+use crate::{lanes::Lane, permissions::RoleId};
 
 /// Transport-assigned identity of a connection, valid for its lifetime.
 /// The server assigns a random non-zero id at admission and every peer
@@ -189,14 +189,25 @@ impl ChannelDenyReason {
 
 // ── Admission ───────────────────────────────────────────────────────────
 
-/// How the client asks to be let in. Only the shared server password
-/// exists in 1.0; `Account` is reserved so that adding it later is an
-/// appended variant, not a wire break.
+/// How the client asks to be let in (spec §3.2).
+///
+/// 1.0 had only the shared room password. 1.1 admits by device key: a
+/// known key logs in with `Key`, a first visit presents an invite code
+/// with `Invite`. `Shared` stays so a 1.0 client's `Hello` still
+/// decodes — and is refused with [`RefusedReason::BadHello`], which
+/// that client already renders as "update baucord".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Auth {
-    /// The room secret from `server.yaml` (`authentication.password`);
-    /// `None` on servers that don't require one.
+    /// The 1.0 room secret. Refused by a 1.1 server.
     Shared { password: Option<String> },
+    /// "You know this device": `Hello.client_key` is the login. Every
+    /// visit after the first.
+    Key,
+    /// A first visit: `Hello.client_key` plus an invite code. The
+    /// server creates the user, links the key and grants the code's
+    /// role. A known key sending a code is logged in as `Key` and no
+    /// use is burned.
+    Invite { code: String },
 }
 
 /// Proof that the client holds a stable Ed25519 identity key: the public
@@ -210,17 +221,51 @@ pub struct ClientKeyProof {
     pub signature: Vec<u8>,
 }
 
-/// Why admission was refused.
+/// Why a `Hello` without a valid invite needs one (spec §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NeedInviteReason {
+    /// The server has never seen this key.
+    UnknownKey,
+    /// This key was unlinked from its user by an admin; it cannot
+    /// found a second user. An admin has to re-link it.
+    KeyRetired,
+}
+
+/// Why an invite code was not accepted (spec §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InviteInvalidReason {
+    Expired,
+    Revoked,
+    /// Its use cap is reached.
+    Exhausted,
+    /// No such code.
+    Unknown,
+}
+
+/// Why admission was refused. Not `Copy`: a ban carries its reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefusedReason {
-    /// The shared password is missing or wrong.
+    /// The shared password is missing or wrong (1.0 servers only).
     WrongPassword,
     /// `network.max_clients` reached.
     ServerFull,
     /// Too many failed admissions from this address recently.
     RateLimited,
-    /// The `Hello` was malformed or arrived too late.
+    /// The `Hello` was malformed, arrived too late, or used the 1.0
+    /// password variant against a 1.1 server.
     BadHello,
+    // ── 1.1 (feature bit `INVITES`) ─────────────────────────────────
+    /// Unknown (or retired) key and no invite code: the client shows
+    /// the invite field.
+    NeedInvite { why: NeedInviteReason },
+    /// The code did not admit: the client says which and keeps the
+    /// field.
+    InviteInvalid { why: InviteInvalidReason },
+    /// The chosen name belongs to someone else: ask for another.
+    NameInUse,
+    /// A `server` restriction on the key, user or address. `until` is
+    /// milliseconds since the Unix epoch; `None` is indefinite.
+    Banned { until: Option<u64>, reason: String },
 }
 
 impl RefusedReason {
@@ -232,6 +277,26 @@ impl RefusedReason {
             RefusedReason::ServerFull => "the server is full",
             RefusedReason::RateLimited => "too many attempts — try again in a minute",
             RefusedReason::BadHello => "the server did not understand the handshake",
+            RefusedReason::NeedInvite {
+                why: NeedInviteReason::UnknownKey,
+            } => "this server needs an invite code",
+            RefusedReason::NeedInvite {
+                why: NeedInviteReason::KeyRetired,
+            } => "this device was removed from your user; ask an admin to re-link it",
+            RefusedReason::InviteInvalid {
+                why: InviteInvalidReason::Expired,
+            } => "that invite code has expired",
+            RefusedReason::InviteInvalid {
+                why: InviteInvalidReason::Revoked,
+            } => "that invite code was revoked",
+            RefusedReason::InviteInvalid {
+                why: InviteInvalidReason::Exhausted,
+            } => "that invite code has been used up",
+            RefusedReason::InviteInvalid {
+                why: InviteInvalidReason::Unknown,
+            } => "that invite code is not valid",
+            RefusedReason::NameInUse => "that name is already in use",
+            RefusedReason::Banned { .. } => "you are banned from this server",
         }
     }
 }
@@ -462,6 +527,22 @@ pub enum ClientMessage {
         count: u32,
         data: Vec<u8>,
     },
+
+    // ── 1.1: invites (feature bit `INVITES`) ────────────────────────
+    /// Mint an invite code (spec §3.1). Needs `CREATE_INVITES`. A
+    /// member gets guest codes; `grants_role` other than guest needs
+    /// `MANAGE_INVITES`, and admin codes only come from the CLI.
+    /// Expiry longer than the default (24 h) also needs
+    /// `MANAGE_INVITES`; the server clamps and reports what it minted.
+    /// Answered with `InviteCreated` or `InviteDenied`.
+    CreateInvite {
+        /// `None` = guest.
+        grants_role: Option<RoleId>,
+        /// Seconds from now; `None` = the default.
+        expires_secs: Option<u64>,
+        /// `None` = unlimited.
+        max_uses: Option<u32>,
+    },
 }
 
 impl ClientMessage {
@@ -652,6 +733,63 @@ pub enum ServerMessage {
         /// The server's path RTT to this client, ms.
         rtt_ms: u32,
     },
+
+    // ── 1.1: sessions and invites (feature bit `INVITES`) ───────────
+    /// Who this session is, right after `Welcome` (spec §10). The
+    /// client renders what `permissions` allows; it never decides.
+    Session {
+        user_id: UserId,
+        /// Bitset from [`crate::permissions`]: this user's roles
+        /// unioned, minus active restrictions.
+        permissions: u64,
+        /// `false`: this server forgets roles, bans and invites when it
+        /// restarts (spec §1.1). The client shows a standing notice.
+        persistent: bool,
+    },
+    /// This session is over by the server's decision (spec §4.1). The
+    /// connection closes 300 ms later; the client renders a final
+    /// disconnect with the reason and does not auto-reconnect — except
+    /// after `Replaced`, which is its own newer connection winning.
+    Removed {
+        kind: RemovedKind,
+        reason: String,
+        /// Display name of who did it; `server` for automatic ones.
+        by: String,
+    },
+    /// Answer to `CreateInvite`.
+    InviteCreated {
+        code: String,
+        grants_role: RoleId,
+        /// Milliseconds since the Unix epoch; `None` = never.
+        expires_at: Option<u64>,
+        max_uses: Option<u32>,
+    },
+    /// `CreateInvite` was refused.
+    InviteDenied { reason: InviteDenyReason },
+}
+
+/// Why a session was ended (spec §4.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemovedKind {
+    /// Access unchanged; rejoining is one click.
+    Disconnected,
+    /// Access revoked until an admin lifts it.
+    Kicked,
+    /// Access revoked and the key and address blocked; `until` in
+    /// milliseconds since the Unix epoch, `None` = indefinite.
+    Banned { until: Option<u64> },
+    /// The same user signed in from a newer connection (auto-reconnect
+    /// after a blackout); this older session yields.
+    Replaced,
+}
+
+/// Why `CreateInvite` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InviteDenyReason {
+    /// No `CREATE_INVITES`, or no `MANAGE_INVITES` for that role.
+    NoPermission,
+    /// No such role, or a role that codes may not grant (admin).
+    RoleNotAllowed,
 }
 
 impl ServerMessage {
@@ -746,6 +884,37 @@ pub fn decode_server_message(bytes: &[u8]) -> Option<ServerMessage> {
     }
     let msg: ServerMessage = postcard::from_bytes(bytes).ok()?;
     server_message_len_ok(&msg, bytes.len()).then_some(msg)
+}
+
+// ── Telemetry at rest ───────────────────────────────────────────────
+//
+// The server keeps each sample and event as an opaque blob next to the
+// columns worth querying (spec §9). Same codec as the wire so the
+// `server telemetry` CLI and a future viewer decode them with this
+// crate and nothing else.
+
+/// Serialize a telemetry sample for storage.
+#[must_use]
+pub fn encode_telemetry_sample(sample: &TelemetrySample) -> Option<Vec<u8>> {
+    postcard::to_allocvec(sample).ok()
+}
+
+/// Deserialize a stored telemetry sample.
+#[must_use]
+pub fn decode_telemetry_sample(bytes: &[u8]) -> Option<TelemetrySample> {
+    postcard::from_bytes(bytes).ok()
+}
+
+/// Serialize a telemetry event for storage.
+#[must_use]
+pub fn encode_telemetry_event(event: &TelemetryEvent) -> Option<Vec<u8>> {
+    postcard::to_allocvec(event).ok()
+}
+
+/// Deserialize a stored telemetry event.
+#[must_use]
+pub fn decode_telemetry_event(bytes: &[u8]) -> Option<TelemetryEvent> {
+    postcard::from_bytes(bytes).ok()
 }
 
 #[cfg(test)]
@@ -1093,6 +1262,171 @@ mod tests {
                 lost: 10,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn key_and_invite_auth_roundtrip_in_hello() {
+        for auth in [
+            Auth::Key,
+            Auth::Invite {
+                code: "K7FQ2MX9ABCD".to_string(),
+            },
+        ] {
+            let msg = ClientMessage::Hello {
+                username: "alice".to_string(),
+                auth: auth.clone(),
+                client_key: None,
+                features: features_for_test(),
+                client_version: CLIENT_VERSION.to_string(),
+            };
+            let bytes = encode_client_message(&msg).unwrap();
+            let Some(ClientMessage::Hello { auth: back, .. }) = decode_client_message(&bytes)
+            else {
+                panic!("not a Hello");
+            };
+            match (auth, back) {
+                (Auth::Key, Auth::Key) => {}
+                (Auth::Invite { code: a }, Auth::Invite { code: b }) => assert_eq!(a, b),
+                (a, b) => panic!("auth changed on the wire: {a:?} → {b:?}"),
+            }
+        }
+    }
+
+    fn features_for_test() -> u64 {
+        crate::features::CLIENT_1_0 | crate::features::INVITES
+    }
+
+    #[test]
+    fn banned_refusal_carries_until_and_reason() {
+        let bytes = encode_server_message(&ServerMessage::Refused {
+            reason: RefusedReason::Banned {
+                until: Some(1_800_000_000_000),
+                reason: "spam".to_string(),
+            },
+        })
+        .unwrap();
+        let Some(ServerMessage::Refused { reason }) = decode_server_message(&bytes) else {
+            panic!("not a Refused");
+        };
+        assert_eq!(
+            reason,
+            RefusedReason::Banned {
+                until: Some(1_800_000_000_000),
+                reason: "spam".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn need_invite_reasons_describe_themselves_distinctly() {
+        let unknown = RefusedReason::NeedInvite {
+            why: NeedInviteReason::UnknownKey,
+        };
+        let retired = RefusedReason::NeedInvite {
+            why: NeedInviteReason::KeyRetired,
+        };
+        assert_ne!(unknown.describe(), retired.describe());
+    }
+
+    #[test]
+    fn telemetry_sample_survives_storage_codec() {
+        let sample = TelemetrySample {
+            path: PathSample {
+                rtt_ms: 42,
+                ..PathSample::default()
+            },
+            ..TelemetrySample::default()
+        };
+        let bytes = encode_telemetry_sample(&sample).unwrap();
+        assert_eq!(decode_telemetry_sample(&bytes).unwrap().path.rtt_ms, 42);
+        let event = TelemetryEvent::ShareStopped;
+        let bytes = encode_telemetry_event(&event).unwrap();
+        assert!(matches!(
+            decode_telemetry_event(&bytes).unwrap(),
+            TelemetryEvent::ShareStopped
+        ));
+    }
+
+    #[test]
+    fn session_and_removed_roundtrip_on_control() {
+        let session = ServerMessage::Session {
+            user_id: [9u8; 32],
+            permissions: crate::permissions::MEMBER_PERMISSIONS,
+            persistent: false,
+        };
+        assert_eq!(session.lane(), Lane::Control);
+        let bytes = encode_server_message(&session).unwrap();
+        let Some(ServerMessage::Session {
+            user_id,
+            permissions,
+            persistent,
+        }) = decode_server_message(&bytes)
+        else {
+            panic!("not a Session");
+        };
+        assert_eq!(user_id, [9u8; 32]);
+        assert_eq!(permissions, crate::permissions::MEMBER_PERMISSIONS);
+        assert!(!persistent);
+
+        let removed = ServerMessage::Removed {
+            kind: RemovedKind::Banned { until: Some(42) },
+            reason: "spam".to_string(),
+            by: "mpw".to_string(),
+        };
+        assert_eq!(removed.lane(), Lane::Control);
+        let bytes = encode_server_message(&removed).unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes),
+            Some(ServerMessage::Removed {
+                kind: RemovedKind::Banned { until: Some(42) },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invite_messages_roundtrip() {
+        let create = ClientMessage::CreateInvite {
+            grants_role: Some(crate::permissions::ROLE_MEMBER),
+            expires_secs: Some(3600),
+            max_uses: None,
+        };
+        assert_eq!(create.lane(), Lane::Control);
+        let bytes = encode_client_message(&create).unwrap();
+        assert!(matches!(
+            decode_client_message(&bytes),
+            Some(ClientMessage::CreateInvite {
+                grants_role: Some(2),
+                expires_secs: Some(3600),
+                max_uses: None,
+            })
+        ));
+
+        let created = ServerMessage::InviteCreated {
+            code: "K7FQ2MX9ABCD".to_string(),
+            grants_role: crate::permissions::ROLE_GUEST,
+            expires_at: Some(1_800_000_000_000),
+            max_uses: Some(1),
+        };
+        let bytes = encode_server_message(&created).unwrap();
+        let Some(ServerMessage::InviteCreated { code, max_uses, .. }) =
+            decode_server_message(&bytes)
+        else {
+            panic!("not InviteCreated");
+        };
+        assert_eq!(code, "K7FQ2MX9ABCD");
+        assert_eq!(max_uses, Some(1));
+
+        let bytes = encode_server_message(&ServerMessage::InviteDenied {
+            reason: InviteDenyReason::RoleNotAllowed,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes),
+            Some(ServerMessage::InviteDenied {
+                reason: InviteDenyReason::RoleNotAllowed
+            })
         ));
     }
 

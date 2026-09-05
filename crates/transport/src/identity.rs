@@ -49,7 +49,7 @@ pub const SUCCESSOR_EXTENSION_OID: &[u64] = &[2, 25, 3_276_867_917_789_066_850];
 /// How long a retired key keeps vouching for its successor **[default:
 /// 2 years]**. A client that hasn't connected in longer than this gets
 /// the identity prompt.
-pub const RETIRED_KEY_RETENTION: Duration = Duration::from_secs(2 * 365 * 24 * 3600);
+pub const RETIRED_KEY_RETENTION: Duration = Duration::from_hours(2 * 365 * 24);
 
 /// Certificate validity **[default: 20 years]**. Cosmetic — the client
 /// ignores expiry.
@@ -234,6 +234,20 @@ impl ClientKey {
         write_private(path, doc.as_ref())?;
         info!("Generated client key at {}", path.display());
         Self::from_pkcs8(doc.as_ref()).map_err(|e| IdentityError::ClientKey(path.to_path_buf(), e))
+    }
+
+    /// A fresh key that lives only in memory — for tests and for the
+    /// simulator. The client's own key goes through
+    /// [`Self::load_or_create`] so it survives restarts.
+    ///
+    /// # Panics
+    /// If the system RNG fails, which `ring` treats as unrecoverable.
+    #[must_use]
+    pub fn generate() -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+            .expect("system RNG available");
+        Self::from_pkcs8(doc.as_ref()).expect("freshly generated key parses")
     }
 
     /// # Errors

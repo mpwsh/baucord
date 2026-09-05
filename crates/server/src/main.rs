@@ -13,7 +13,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use env_logger::Builder;
 use log::{info, warn};
-use server::{config::Config, server::ChatServer};
+use server::{config::Config, persistence, server::ChatServer};
 use transport::{DriverHost, ServerIdentity, UdpIo};
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
@@ -48,6 +48,55 @@ enum Command {
     /// (for two years) and continues to vouch for the new one. Run
     /// while the server is stopped, then restart it.
     RotateKey,
+    /// Write a consistent snapshot of the database (via `SQLite`'s
+    /// online backup API — a plain copy of a live database is not
+    /// safe) together with the `blobs/` directory into one tar
+    /// archive. Safe to run while the server is up.
+    Backup {
+        /// Output archive, e.g. `baucord-2026-09-04.tar`.
+        file: PathBuf,
+    },
+    /// Database maintenance.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
+    /// Invite codes (needs persistence on; a running server picks up
+    /// changes within 2 s).
+    Invite {
+        #[command(subcommand)]
+        command: InviteCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InviteCommand {
+    /// Mint a code and print the join link.
+    Create {
+        /// Role the code grants: guest, member, organizer, admin (or a
+        /// role id).
+        #[arg(long, default_value = "guest")]
+        grants: String,
+        /// How long the code stays valid, e.g. `1h`, `24h`, `7d`, or
+        /// `never`.
+        #[arg(long, default_value = "24h")]
+        expires: String,
+        /// How many people may join with it (default: unlimited).
+        #[arg(long)]
+        uses: Option<u32>,
+    },
+    /// List every code with its state.
+    List,
+    /// Stop a code from admitting anyone else. People who already
+    /// joined keep their access.
+    Revoke { code: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum DbCommand {
+    /// Run `SQLite`'s integrity check and print the schema version and
+    /// row counts. Read-only; safe while the server is up.
+    Check,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -82,8 +131,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.server.port = port;
     }
 
-    if let Some(Command::RotateKey) = args.command {
-        return rotate_key(&config);
+    match args.command {
+        Some(Command::RotateKey) => return rotate_key(&config),
+        Some(Command::Backup { file }) => return backup(&config, &file),
+        Some(Command::Db {
+            command: DbCommand::Check,
+        }) => return db_check(&config),
+        Some(Command::Invite { command }) => return invite_command(&config, command),
+        None => {}
     }
 
     // The file is optional: a container captures stderr and may run
@@ -150,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("  vouching for retired key {old}");
     }
     info!(
-        "Invite: {}#{}",
+        "Address: {}#{} (the 1.0 invite form: verify-only, no code)",
         config.public_endpoint(),
         identity.fingerprint()
     );
@@ -258,6 +313,215 @@ fn rotate_key(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "Restart the server to serve the new certificate; pinned clients migrate automatically."
     );
     Ok(())
+}
+
+/// `server backup <file.tar>`.
+fn backup(config: &Config, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    let report = persistence::backup_to_tar(&db, out)?;
+    println!(
+        "Wrote {} — database {:.1} MB, {} blob file(s)",
+        out.display(),
+        megabytes(report.db_bytes),
+        report.blob_files
+    );
+    Ok(())
+}
+
+/// `server db check`.
+fn db_check(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    let report = persistence::check(&db)?;
+    println!("{} — {:.1} MB", db.display(), megabytes(report.file_bytes));
+    match report.schema_version {
+        Some(v) if v <= report.supported_version => {
+            println!("schema version {v} (this build: {})", report.supported_version);
+        }
+        Some(v) => println!(
+            "schema version {v} — NEWER than this build ({}); this server will refuse to open it",
+            report.supported_version
+        ),
+        None => println!("no schema_version table — not a baucord database, or empty"),
+    }
+    if report.integrity.as_slice() == ["ok"] {
+        println!("integrity: ok");
+    } else {
+        println!("integrity: PROBLEMS");
+        for line in &report.integrity {
+            println!("  {line}");
+        }
+    }
+    for (table, count) in &report.counts {
+        if *count >= 0 {
+            println!("  {table:<18} {count}");
+        }
+    }
+    if report.is_ok() {
+        Ok(())
+    } else {
+        Err("database check failed".into())
+    }
+}
+
+/// `server invite …`.
+fn invite_command(
+    config: &Config,
+    command: InviteCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    match command {
+        InviteCommand::Create {
+            grants,
+            expires,
+            uses,
+        } => {
+            let role = parse_role(&grants)?;
+            let ttl_ms = parse_ttl(&expires)?;
+            let (code, invite) = persistence::cli_create_invite(&db, role, ttl_ms, uses)?;
+            let identity_dir = PathBuf::from(&config.identity.dir);
+            let (identity, created) = ServerIdentity::load_or_create(&identity_dir)?;
+            if created {
+                eprintln!(
+                    "warning: no server identity existed in {}; generated one — the server \
+                     has never run from here?",
+                    identity_dir.display()
+                );
+            }
+            println!(
+                "baucord://{}/{code}#{}",
+                config.public_endpoint(),
+                identity.fingerprint()
+            );
+            println!(
+                "  grants {}, {}, {}",
+                role_name(role),
+                describe_expiry(invite.expires_at),
+                match invite.max_uses {
+                    Some(n) => format!("{n} use(s)"),
+                    None => "unlimited uses".to_string(),
+                }
+            );
+            Ok(())
+        }
+        InviteCommand::List => {
+            let invites = persistence::cli_list_invites(&db)?;
+            if invites.is_empty() {
+                println!("no invites");
+                return Ok(());
+            }
+            let now = persistence_wall_now();
+            for (code, invite) in invites {
+                let state = if invite.revoked_at.is_some() {
+                    "revoked"
+                } else if invite.expires_at.is_some_and(|at| at <= now) {
+                    "expired"
+                } else if invite.max_uses.is_some_and(|max| invite.uses >= max) {
+                    "used up"
+                } else {
+                    "valid"
+                };
+                println!(
+                    "{code}  {:<9} {:<10} uses {}{}  {}",
+                    role_name(invite.grants_role),
+                    state,
+                    invite.uses,
+                    invite.max_uses.map(|m| format!("/{m}")).unwrap_or_default(),
+                    describe_expiry(invite.expires_at),
+                );
+            }
+            Ok(())
+        }
+        InviteCommand::Revoke { code } => {
+            let code = server::policy::normalize_invite_code(&code)
+                .ok_or_else(|| format!("'{code}' is not an invite code"))?;
+            if persistence::cli_revoke_invite(&db, &code)? {
+                println!("revoked {code}");
+                Ok(())
+            } else {
+                Err(format!("{code}: no such code, or already revoked").into())
+            }
+        }
+    }
+}
+
+fn parse_role(text: &str) -> Result<u32, String> {
+    let lower = text.trim().to_ascii_lowercase();
+    if let Some(role) = protocol::permissions::BUILTIN_ROLES
+        .iter()
+        .find(|r| r.name == lower)
+    {
+        return Ok(role.id);
+    }
+    lower
+        .parse()
+        .map_err(|_| format!("'{text}' is not a role name or id"))
+}
+
+/// `30m`, `1h`, `24h`, `7d`, `never`.
+fn parse_ttl(text: &str) -> Result<Option<u64>, String> {
+    let text = text.trim().to_ascii_lowercase();
+    if text == "never" || text == "0" {
+        return Ok(None);
+    }
+    let (number, unit) = text.split_at(text.trim_end_matches(char::is_alphabetic).len());
+    let n: u64 = number
+        .parse()
+        .map_err(|_| format!("'{text}': expected a number and a unit, like 24h"))?;
+    let per_unit: u64 = match unit {
+        "s" => 1_000,
+        "m" | "min" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return Err(format!("'{text}': unit must be s, m, h or d")),
+    };
+    Ok(Some(n.saturating_mul(per_unit)))
+}
+
+fn role_name(role: u32) -> String {
+    protocol::permissions::BUILTIN_ROLES
+        .iter()
+        .find(|r| r.id == role)
+        .map_or_else(|| format!("role {role}"), |r| r.name.to_string())
+}
+
+fn describe_expiry(expires_at: Option<u64>) -> String {
+    match expires_at {
+        None => "never expires".to_string(),
+        Some(at) => {
+            let now = persistence_wall_now();
+            if at <= now {
+                "expired".to_string()
+            } else {
+                let left = (at - now) / 1000;
+                if left >= 86_400 {
+                    format!("expires in {} d", left / 86_400)
+                } else if left >= 3_600 {
+                    format!("expires in {} h", left / 3_600)
+                } else {
+                    format!("expires in {} min", (left / 60).max(1))
+                }
+            }
+        }
+    }
+}
+
+fn persistence_wall_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[allow(clippy::cast_precision_loss)] // display only
+fn megabytes(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// The database file, or an error when persistence is off.
+fn database_path(config: &Config) -> Result<PathBuf, persistence::PersistError> {
+    if !config.persistence.enabled {
+        return Err(persistence::PersistError::Disabled);
+    }
+    Ok(PathBuf::from(config.persistence.path.trim()))
 }
 
 fn open_log_file(path: &str) -> std::io::Result<File> {

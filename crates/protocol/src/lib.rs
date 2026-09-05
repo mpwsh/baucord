@@ -20,6 +20,7 @@ pub mod features;
 pub mod frame;
 pub mod lanes;
 pub mod messages;
+pub mod permissions;
 pub mod relayed;
 pub mod system_audio;
 pub mod username;
@@ -33,14 +34,17 @@ pub use lanes::{
     VIDEO_FRAME_BUDGET, VOICE_DATAGRAM_BUDGET,
 };
 pub use messages::{
-    decode_client_message, decode_server_message, encode_client_message, encode_server_message,
-    AudioSample, Auth, ChannelDenyReason, ChannelInfo, ChatMessage, ClientId, ClientInfo,
-    ClientKeyProof, ClientMessage, DenyReason, PathSample, RefusedReason, ServerMessage,
-    ShareScope, SharingSample, TelemetryEvent, TelemetrySample, UserId, ViewingSample,
-    CLIENT_VERSION, IMAGE_CHUNK_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES,
-    MAX_IMAGE_CHUNKS, MAX_IMAGE_MESSAGE_BYTES, MAX_LOG_UPLOAD_BYTES, MAX_LOG_UPLOAD_CHUNKS,
-    MEDIA_UPLOAD_PACE,
+    decode_client_message, decode_server_message, decode_telemetry_event,
+    decode_telemetry_sample, encode_client_message, encode_server_message,
+    encode_telemetry_event, encode_telemetry_sample, AudioSample, Auth, ChannelDenyReason,
+    ChannelInfo, ChatMessage, ClientId, ClientInfo, ClientKeyProof, ClientMessage, DenyReason,
+    InviteDenyReason, InviteInvalidReason, NeedInviteReason, PathSample, RefusedReason,
+    RemovedKind, ServerMessage, ShareScope, SharingSample, TelemetryEvent, TelemetrySample,
+    UserId, ViewingSample, CLIENT_VERSION,
+    IMAGE_CHUNK_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_IMAGE_CHUNKS,
+    MAX_IMAGE_MESSAGE_BYTES, MAX_LOG_UPLOAD_BYTES, MAX_LOG_UPLOAD_CHUNKS, MEDIA_UPLOAD_PACE,
 };
+pub use permissions::{Rank, RoleId};
 pub use relayed::{split_sender, wrap_sender, RELAY_SENDER_BYTES};
 pub use system_audio::{
     pack_system_audio, parse_system_audio, SystemAudioHeader, SYSTEM_AUDIO_HEADER_SIZE,

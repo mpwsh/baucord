@@ -242,7 +242,8 @@ through the full QUIC stack. The 19 transport scenarios in
 ## 5. Server (`crates/server`)
 
 `main.rs` owns the socket, the loop, the log file, signals, and the
-`rotate-key` subcommand. `ChatServer` is pure policy.
+`rotate-key`, `backup` and `db check` subcommands. `ChatServer` is pure
+policy.
 
 ### Tick
 
@@ -253,16 +254,54 @@ watch 3 s, stats). `suggested_sleep()` is 1 ms with media flowing,
 5 ms quiet, 20 ms empty; the loop also wakes for the transport's next
 timer and skips sleeping on a socket backlog.
 
-### Admission
+### Admission (`server.rs`, `policy.rs`)
 
-A connection is `pending` from `Connected` until its first Control
-frame, which must be `Hello` within 10 s. Then, in order: per-IP failure
-rate limit (5 per 60 s → `RateLimited`), constant-time password check
-when `secure` (`WrongPassword`, counted), `ServerFull`, username
-sanitization, client-key verification (logged), feature negotiation,
-`Welcome`, then the `Init` snapshot and `UserJoined` broadcast. A
-refusal sends `Refused { reason }` and closes 300 ms later so the reason
-lands.
+The device key is the identity and invites are the door
+(PERSISTENCE-SPEC.md §3). A connection is `pending` from `Connected`
+until its first Control frame, which must be `Hello` within 10 s. Then,
+in order:
+
+1. per-IP failure rate limit (5 per 60 s → `RateLimited`);
+2. `Auth::Shared` (a 1.0 client) → `BadHello`, not counted;
+3. the `ClientKeyProof` must verify against this connection's TLS
+   exporter → else `BadHello`; the key hash is `SHA-256(pubkey)`;
+4. bans: an active `server` restriction on the user, key or address →
+   `Banned { until, reason }`, not counted;
+5. who the key is: known → that user (`Auth::Key`; a code sent anyway
+   burns no use); retired → `NeedInvite { KeyRetired }`; unknown without
+   a code → `NeedInvite { UnknownKey }` (not counted); unknown with a
+   code → the code is normalized (uppercase, separators dropped) and
+   checked → `InviteInvalid { Unknown | Expired | Exhausted | Revoked }`
+   (counted);
+6. names: unique among users online, case-insensitively, ignoring this
+   user's own sessions; a guest cannot take a stored member's name while
+   that member is offline → `NameInUse`;
+7. `ServerFull`, again not counting this user's own sessions;
+8. this user's own live sessions get `Removed { Replaced }` and yield
+   (auto-reconnect after a blackout makes this routine);
+9. a first visit creates the user (`user_id` = the founding key's hash),
+   links the key, grants the code's role and counts the use; a return
+   refreshes the name of record and last-seen;
+10. feature negotiation (`SERVER_1_1`), `Welcome { user_id: Some }`,
+    `Session { user_id, permissions, persistent }`, then the `Init`
+    snapshot and `UserJoined` broadcast.
+
+A refusal sends `Refused { reason }` and closes 300 ms later so the
+reason lands. `remove_session` (replacement, bans, kicks) sends
+`Removed { kind, reason, by }`, closes 300 ms later and drops the
+session from the rosters at once.
+
+`policy.rs` is the in-memory policy the tick consults (users, keys,
+roles, invites, restrictions) in both modes; every change is applied
+there first and then queued to the persistence thread. With nobody
+holding `ADMIN` at startup the server mints a one-shot admin invite
+(1 h, 1 use) and prints `baucord://host:port/CODE#fingerprint` at warn
+level. `ChatServer::mint_invite / revoke_invite / restrict /
+lift_restriction / unlink_key` are the single implementations behind
+`ClientMessage::CreateInvite`, the bootstrap code, the tests, and the
+admin commands to come. `server invite create|list|revoke` (persistence
+on) writes the database directly; the running server picks the change
+up within 2 s.
 
 ### Relay
 
@@ -299,13 +338,47 @@ The same tick writes the `link:` line when
 from clients are logged as `telemetry:` / `telemetry event:` lines;
 log uploads are stored under `<identity.dir>/logs/`.
 
+### Persistence (`persistence/`)
+
+The tick never touches disk (PERSISTENCE-SPEC.md §0, rule 1). One
+`persistence` thread owns the SQLite connection (`rusqlite`, bundled,
+WAL, `synchronous=NORMAL`, `data/baucord/baucord.db`); the tick holds a
+`Persist` handle:
+
+- **Writes** (`Command`) go on a bounded queue (`persistence.write_queue`,
+  4,096). A full queue *drops and counts* (`dropped_writes` in the stats
+  line); nothing on the tick ever waits. General chat is broadcast first
+  and inserted after — a drop is a hole in history, never a lost
+  delivery. Message ids come from the tick's counter, rebased on the
+  database's watermark at startup.
+- **Reads** (`Query`) carry a reply channel and a deadline; `Persist::poll`
+  runs once per tick and resolves each as answered or `TimedOut`. A reply
+  that lands after its deadline is discarded.
+- **Telemetry** is coalesced per user on the tick (last wins) and handed
+  over as a batch once a second; a full queue hands the batch back.
+- The thread checkpoints the WAL every 60 s, prunes retention windows
+  hourly, and polls `PRAGMA data_version` every 2 s to notice another
+  process (the CLI, `sqlite3`) writing to the file; when it does, it
+  reloads the policy tables and hands the tick a `Notice::Policy` to
+  swap in. Policy writes that are dropped under backpressure are
+  logged, not just counted.
+- `persistence.enabled: false` keeps the thread with a memory-only store:
+  writes are discarded, reads answer `Unavailable`, no file is created.
+
+Migrations are forward-only (`persistence/migrations/`), applied on the
+main thread before the socket binds; a database from a newer build
+refuses to open. Wall time on the tick comes from `Clock`
+(`clock.rs`): `base_wall + (now − base_instant)`, so the simulator's
+fake `Instant` moves wall time too.
+
 ### Shutdown
 
 SIGTERM/SIGINT (the `ctrlc` crate with `termination`) sets a flag; the
 loop calls `shutdown(now, "server restarting")`, which closes every
-session with that reason, pumps for up to 500 ms so the close frames
-leave, and exits 0. The reason string is a wire contract with the client
-(`SERVER_RESTART_REASON`).
+session with that reason, flushes pending telemetry, asks the
+persistence thread to drain its queue (bounded to 5 s) and exit, pumps
+for up to 500 ms so the close frames leave, and exits 0. The reason
+string is a wire contract with the client (`SERVER_RESTART_REASON`).
 
 ## 6. Client (`crates/client`)
 

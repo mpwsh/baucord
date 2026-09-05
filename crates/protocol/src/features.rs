@@ -19,16 +19,31 @@ pub const PROFILES: u64 = 1 << 2;
 pub const HISTORY: u64 = 1 << 3;
 /// Roles and permissions.
 pub const ROLES: u64 = 1 << 4;
-/// Achievements.
-pub const ACHIEVEMENTS: u64 = 1 << 5;
-/// Content-addressed blob fetches.
+/// Progress: xp and levels (`UserDetails.level`, `ProgressUpdate`).
+/// Bit 5 was reserved for achievements, which no server ever
+/// announced; progress replaces them.
+pub const PROGRESS: u64 = 1 << 5;
+/// Content-addressed blob fetches (files, avatars).
 pub const BLOBS: u64 = 1 << 6;
+/// Invite codes as the door: `Auth::Key` / `Auth::Invite`, the
+/// `NeedInvite` / `InviteInvalid` / `Banned` refusals, `Session`.
+pub const INVITES: u64 = 1 << 7;
+/// Direct messages.
+pub const DM: u64 = 1 << 8;
+/// Channels created and managed from the client.
+pub const CHANNELS_UI: u64 = 1 << 9;
+/// Admin commands over the wire and the admin channel.
+pub const ADMIN: u64 = 1 << 10;
 
 /// What a 1.0 client can do.
 pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
 /// What a 1.0 server offers: it logs telemetry; it only *logs* client
 /// keys, so it does not announce [`IDENTITY`].
 pub const SERVER_1_0: u64 = TELEMETRY;
+/// What a 1.1 client can do: it logs in by key and presents invites.
+pub const CLIENT_1_1: u64 = CLIENT_1_0 | INVITES;
+/// What a 1.1 server offers: keys are the login, invites the door.
+pub const SERVER_1_1: u64 = TELEMETRY | IDENTITY | INVITES;
 
 /// Bits both sides announced.
 #[must_use]
@@ -61,8 +76,12 @@ mod tests {
             PROFILES,
             HISTORY,
             ROLES,
-            ACHIEVEMENTS,
+            PROGRESS,
             BLOBS,
+            INVITES,
+            DM,
+            CHANNELS_UI,
+            ADMIN,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);

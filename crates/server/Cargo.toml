@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 
 [lints]
@@ -17,10 +17,18 @@ env_logger = "0.11"
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = { version = "3.5", features = ["termination"] }
 serde_yaml = "0.9.34"
-# Constant-time comparison for the shared password.
-subtle = "2.6"
 # SHA-256 for chat-image content hashes and client-key user ids.
 sha2 = "0.11"
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+# Invite codes (spec §3.1).
+rand.workspace = true
+# The persistence store (spec §1). `bundled` compiles SQLite in (no
+# system library on any platform; `cc` handles MSVC); `backup` is the
+# online backup API behind `server backup`.
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+# `server backup` archives the database snapshot and the blobs directory.
+tar = "0.4.46"
 
 [dev-dependencies]
 transport = { path = "../transport", features = ["sim"] }

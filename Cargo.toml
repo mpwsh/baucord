@@ -1,8 +1,6 @@
 [workspace]
 members = ["crates/*"]
 resolver = "2"
-
-
 # ── Shared dependency versions ──────────────────────────────────────────
 # Crates opt in per dependency with `dep.workspace = true`. Only deps
 # used by two or more crates live here; single-user deps stay local.
@@ -20,32 +18,28 @@ slint = { version = "1.17", default-features = false, features = [
 ] }
 bytes = "1.12"
 thiserror = "2"
-
+rand = "0.10"
 # ── Shared lints (crates opt in with `[lints] workspace = true`) ────────
 [workspace.lints.rust]
 future-incompatible = "warn"
 nonstandard_style = { level = "deny", priority = -1 }
-
 [workspace.lints.clippy]
 # Groups sit at negative priority so the individual lints below can
 # override them — cargo applies lower priorities first.
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 redundant_clone = "deny"
-
 # ── Release: fast binary ────────────────────────────────────────────────
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1 # better optimization, slower compile
 panic = "abort"   # ~10% smaller binary, no unwind overhead
-
 # ── Deploy: ship to users ──────────────────────────────────────────────
 [profile.deploy]
 inherits = "release"
 strip = "symbols"
 lto = "thin"
-
 # ── Debug-opt: release speed with debug symbols ────────────────────────
 [profile.debug-opt]
 inherits = "release"
@@ -54,11 +48,9 @@ debug-assertions = true
 incremental = true
 # override: keep unwind so backtraces work in profiling
 panic = "unwind"
-
 # ── Dev: fast compile, tolerable runtime ───────────────────────────────
 [profile.dev]
 opt-level = 1
-
 # Optimize all dependencies even in dev — they don't change often
 # and unoptimized audio/codec code is unusably slow.
 [profile.dev.package."*"]

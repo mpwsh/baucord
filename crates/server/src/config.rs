@@ -16,12 +16,19 @@ pub struct Config {
     pub server: ServerSettings,
     pub network: NetworkSettings,
     pub limits: LimitSettings,
+    /// Legacy (1.0). Still parsed so old files load; never written.
+    #[serde(skip_serializing)]
     pub authentication: AuthSettings,
     pub identity: IdentitySettings,
+    pub persistence: PersistenceSettings,
     pub logging: LoggingSettings,
     /// Voice channels (rooms). Omitting the key gives a single open
     /// "Lobby" default channel, so pre-channels configs keep working.
+    /// This list is the hot-reloaded *base*; channels people create
+    /// from the client live in the database (spec §5).
     pub channels: Vec<ChannelSettings>,
+    /// Policy for channels created from the client.
+    pub user_channels: UserChannelSettings,
 }
 
 /// One voice channel (room). Designed to grow: every field except
@@ -87,9 +94,10 @@ pub struct NetworkSettings {
 
 /// Admission control. These are the real bandwidth ceiling: worst-case
 /// server egress ≈ `max_sharers × max_viewers_per_stream × stream bitrate`
-/// (plus voice, which is negligible). Defaults: 2 × 8 × ~4 Mbit/s ≈
-/// 64 Mbit/s. Size these to your uplink instead of discovering the limit
-/// live mid-movie-night.
+/// (plus voice, which is negligible). Defaults: 8 × 16 × ~4 Mbit/s ≈
+/// 512 Mbit/s at full tilt — a hosted relay's uplink; size these to
+/// yours instead of discovering the limit live mid-movie-night. Admins
+/// bypass them (`BYPASS_LIMITS`).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitSettings {
@@ -126,21 +134,38 @@ pub struct LimitSettings {
     /// during uploads. Values below 64 are treated as 64. At the
     /// default 1024, a 2.5 MB image takes ~2.5 s per receiver.
     pub media_relay_kb_per_sec: usize,
+    /// Per-user chat rate limit: at most `burst` messages in any
+    /// `per_secs` window. A person typing fast fits; a paste loop
+    /// does not.
+    pub chat: ChatLimit,
 }
 
-/// Admission. Every connection is encrypted and the server's identity
-/// is pinned by clients regardless of these settings; this is only
-/// about who gets past `Hello`.
+/// Sliding-window chat rate limit (spec §1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatLimit {
+    pub burst: u32,
+    pub per_secs: u64,
+}
+
+impl Default for ChatLimit {
+    fn default() -> Self {
+        Self {
+            burst: 5,
+            per_secs: 5,
+        }
+    }
+}
+
+/// The 1.0 password door. Admission is by invite and device key
+/// since 1.1 (spec §3); this section is read for compatibility and
+/// warned about.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
-    /// `true`: clients must send the shared `password` in `Hello`
-    /// (compared in constant time; failures are rate-limited per
-    /// source address). `false`: open mode for LAN/dev — anyone who
-    /// can reach the UDP port can join with any name. The server logs
-    /// loudly when running open.
+    /// 1.0: clients had to send this shared password. Ignored since
+    /// 1.1 (with a warning at startup) — invites are the only door.
     pub secure: bool,
-    /// The room secret. Required when `secure` is true.
     pub password: Option<String>,
 }
 
@@ -153,6 +178,84 @@ pub struct IdentitySettings {
     /// on persistent storage: the key *is* the server's identity, and
     /// every client pins it.
     pub dir: String,
+}
+
+/// The `SQLite` store (spec §1). `enabled: false` keeps everything in
+/// memory for the session: roles, invites, bans and channels still
+/// work until the process exits, and history, DMs, files and the
+/// admin CLI do not exist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistenceSettings {
+    pub enabled: bool,
+    /// The database file. Blobs live in a `blobs/` directory next to
+    /// it. Keep both with the identity key: `server backup` archives
+    /// them together.
+    pub path: String,
+    pub history: HistorySettings,
+    pub files: FileSettings,
+    pub avatars: AvatarSettings,
+    pub telemetry: TelemetryRetention,
+    /// Depth of the write queue between the relay tick and the
+    /// persistence thread. Writes past it are dropped and counted
+    /// rather than ever blocking the tick. Not written to the config
+    /// file: tests lower it to provoke drops; leave the default.
+    #[serde(skip_serializing)]
+    pub write_queue: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistorySettings {
+    /// General-chat messages replayed to a joining client.
+    pub replay: u16,
+    /// Messages older than this are pruned hourly.
+    pub retain_days: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileSettings {
+    /// Per-file size cap.
+    pub max_mb: u32,
+    /// Per-user upload volume per day.
+    pub per_user_daily_mb: u32,
+    /// Total blob storage; oldest unreferenced blobs are evicted
+    /// first, then uploads are refused.
+    pub total_cap_gb: u32,
+    /// Unreferenced blobs older than this are deleted.
+    pub retain_days: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AvatarSettings {
+    pub max_kb: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetryRetention {
+    /// Telemetry rows older than this are pruned hourly.
+    pub retain_days: u32,
+}
+
+/// Policy for channels created from the client (spec §5). The base
+/// list stays in `channels:` and hot-reloads as before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserChannelSettings {
+    /// UI-created channels one organizer may own at a time (admins are
+    /// exempt).
+    pub max_per_user: u16,
+    /// A UI-created channel empty for this long is deleted unless its
+    /// creator marked it permanent.
+    pub temporary_after_min: u32,
+    /// The config channel idle users are moved to. Omit to disable
+    /// auto-AFK; when set, it must name a channel in `channels:`.
+    pub afk_channel: Option<String>,
+    /// Default idle timeout before the move; a channel may set its own.
+    pub afk_after_min: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -206,23 +309,40 @@ impl Config {
         format!("{}:{}", self.server.host, self.server.port).parse()
     }
 
-    /// Check the admission settings for contradictions.
+    /// Check the limits and user-channel policy for values that would
+    /// silently disable a feature or divide by zero.
     ///
     /// # Errors
-    /// `secure: true` without a password.
-    pub fn validate_authentication(&self) -> Result<(), String> {
-        if self.authentication.secure
-            && self
-                .authentication
-                .password
-                .as_deref()
-                .is_none_or(|p| p.trim().is_empty())
-        {
-            return Err(
-                "authentication.secure is true but authentication.password is empty — \
-                 set a password, or set secure: false for an open LAN server"
-                    .to_string(),
-            );
+    /// A human-readable description of the first problem found.
+    pub fn validate_policy(&self) -> Result<(), String> {
+        let chat = self.limits.chat;
+        if chat.burst == 0 || chat.per_secs == 0 {
+            return Err(format!(
+                "limits.chat: burst {} per {} s would refuse every message — \
+                 both must be at least 1",
+                chat.burst, chat.per_secs
+            ));
+        }
+        if self.user_channels.afk_after_min == 0 {
+            return Err("user_channels.afk_after_min must be at least 1".to_string());
+        }
+        if self.user_channels.temporary_after_min == 0 {
+            return Err("user_channels.temporary_after_min must be at least 1".to_string());
+        }
+        if let Some(afk) = self.user_channels.afk_channel.as_deref() {
+            let afk = afk.trim();
+            if !self.channels.iter().any(|ch| ch.name.trim() == afk) {
+                return Err(format!(
+                    "user_channels.afk_channel '{afk}' is not in the channels list — \
+                     add it there, or omit the key to disable auto-AFK"
+                ));
+            }
+        }
+        if self.persistence.enabled && self.persistence.path.trim().is_empty() {
+            return Err("persistence.path is empty".to_string());
+        }
+        if self.persistence.write_queue == 0 {
+            return Err("persistence.write_queue must be at least 1".to_string());
         }
         Ok(())
     }
@@ -348,8 +468,10 @@ impl Default for Config {
             limits: LimitSettings::default(),
             authentication: AuthSettings::default(),
             identity: IdentitySettings::default(),
+            persistence: PersistenceSettings::default(),
             logging: LoggingSettings::default(),
             channels: default_channels(),
+            user_channels: UserChannelSettings::default(),
         }
     }
 }
@@ -375,8 +497,8 @@ impl Default for NetworkSettings {
 impl Default for LimitSettings {
     fn default() -> Self {
         Self {
-            max_sharers: 2,
-            max_viewers_per_stream: 8,
+            max_sharers: 8,
+            max_viewers_per_stream: 16,
             max_chat_bytes: 2000,
             // 4 MiB/min per client (four full-size images or a pile of
             // stickers), 16 MiB/min for the room — bursty enough for a
@@ -385,6 +507,64 @@ impl Default for LimitSettings {
             max_image_kb_per_minute: 4096,
             max_image_kb_per_minute_global: 16_384,
             media_relay_kb_per_sec: 1024,
+            chat: ChatLimit::default(),
+        }
+    }
+}
+
+impl Default for PersistenceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: "data/baucord/baucord.db".to_string(),
+            history: HistorySettings::default(),
+            files: FileSettings::default(),
+            avatars: AvatarSettings::default(),
+            telemetry: TelemetryRetention::default(),
+            write_queue: 4096,
+        }
+    }
+}
+
+impl Default for HistorySettings {
+    fn default() -> Self {
+        Self {
+            replay: 50,
+            retain_days: 90,
+        }
+    }
+}
+
+impl Default for FileSettings {
+    fn default() -> Self {
+        Self {
+            max_mb: 50,
+            per_user_daily_mb: 500,
+            total_cap_gb: 20,
+            retain_days: 30,
+        }
+    }
+}
+
+impl Default for AvatarSettings {
+    fn default() -> Self {
+        Self { max_kb: 256 }
+    }
+}
+
+impl Default for TelemetryRetention {
+    fn default() -> Self {
+        Self { retain_days: 30 }
+    }
+}
+
+impl Default for UserChannelSettings {
+    fn default() -> Self {
+        Self {
+            max_per_user: 2,
+            temporary_after_min: 30,
+            afk_channel: None,
+            afk_after_min: 30,
         }
     }
 }
@@ -406,5 +586,64 @@ impl Default for LoggingSettings {
             telemetry: true,
             file: "server.log".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_pass_policy_validation() {
+        Config::default().validate_policy().expect("defaults are valid");
+    }
+
+    #[test]
+    fn afk_channel_must_exist_in_the_channel_list() {
+        let mut config = Config::default();
+        config.user_channels.afk_channel = Some("AFK".to_string());
+        let err = config.validate_policy().expect_err("missing AFK channel");
+        assert!(err.contains("afk_channel"), "{err}");
+        config.channels.push(ChannelSettings {
+            name: "AFK".to_string(),
+            default: false,
+            password: None,
+            user_limit: None,
+        });
+        config.validate_policy().expect("AFK channel present");
+    }
+
+    #[test]
+    fn a_zero_chat_limit_is_rejected() {
+        let mut config = Config::default();
+        config.limits.chat.burst = 0;
+        assert!(config.validate_policy().is_err());
+    }
+
+    #[test]
+    fn new_sections_round_trip_through_yaml() {
+        let mut config = Config::default();
+        config.persistence.enabled = false;
+        config.persistence.history.replay = 25;
+        config.user_channels.max_per_user = 3;
+        config.limits.chat.burst = 9;
+        let yaml = serde_yaml::to_string(&config).expect("serialize");
+        assert!(!yaml.contains("write_queue"), "tuning knob must stay out of the file");
+        let back: Config = serde_yaml::from_str(&yaml).expect("parse");
+        assert!(!back.persistence.enabled);
+        assert_eq!(back.persistence.history.replay, 25);
+        assert_eq!(back.persistence.write_queue, 4096);
+        assert_eq!(back.user_channels.max_per_user, 3);
+        assert_eq!(back.limits.chat.burst, 9);
+    }
+
+    #[test]
+    fn a_pre_1_1_config_loads_with_the_new_defaults() {
+        let yaml = "server:\n  name: old\nchannels:\n  - name: Lobby\n    default: true\n";
+        let config: Config = serde_yaml::from_str(yaml).expect("parse");
+        assert!(config.persistence.enabled);
+        assert_eq!(config.user_channels.max_per_user, 2);
+        assert_eq!(config.limits.chat.per_secs, 5);
+        assert_eq!(config.limits.max_sharers, 8);
     }
 }

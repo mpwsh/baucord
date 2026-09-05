@@ -71,7 +71,7 @@ const FLAG_KEYFRAME: u8 = 0b0000_0001;
 /// marginal keyframes and locked the stream into a PLI → forced-IDR →
 /// evicted-again loop. 2 s equals the GOP interval: anything still
 /// incomplete then is superseded by the next natural keyframe anyway.
-const FRAME_TIMEOUT: Duration = Duration::from_millis(2000);
+const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum in-flight partial frames across all senders. Bounds hostile
 /// or badly-reordered input; normal operation holds 1–2 per stream.
@@ -145,7 +145,9 @@ pub fn pack_video_frame(
         buf.push(flags);
         // chunk_count ≤ 255 is guaranteed by the MAX_VIDEO_FRAME_BYTES
         // bound above, so these casts cannot truncate.
+        #[allow(clippy::cast_possible_truncation)]
         buf.push(idx as u8);
+        #[allow(clippy::cast_possible_truncation)]
         buf.push(chunk_count as u8);
         buf.extend_from_slice(&seq.to_le_bytes());
         buf.extend_from_slice(&width.to_le_bytes());
