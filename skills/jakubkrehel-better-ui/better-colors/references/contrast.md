@@ -2,13 +2,13 @@
 
 Contrast is measured between a **foreground color**, meaning text, an icon, or a UI element, and the **background color** it actually renders against, usually the nearest ancestor that paints one. Identify that background first. Measuring against the page background when the element sits on a card gives the wrong answer.
 
-**Report, don't repaint.** When a check fails, report the pair, its measured value and the threshold it misses, and leave the colors unchanged. They are a design decision. Apply the fix below only when asked.
+**Report, don't repaint.** When a check fails, report the pair, its measured value and the threshold it misses, and leave the colors unchanged. They are a design decision. Apply a fix only when asked.
 
 `better-accessibility` decides when contrast is required and whether a given pair must pass. This file covers measuring the pair and, on request, changing it.
 
 ## APCA thresholds (recommended)
 
-APCA (Accessible Perceptual Contrast Algorithm) models perceived contrast more accurately than WCAG 2 and is the better default for design decisions. Lc (Lightness Contrast) measures perceived contrast between foreground and background. These levels simplify APCA's full font-size and weight lookup table:
+APCA (Accessible Perceptual Contrast Algorithm) models perceived contrast more accurately than WCAG 2 and pairs naturally with oklch, since both are grounded in perceptual lightness. It's the better default for design decisions. Lc (Lightness Contrast) measures perceived contrast between foreground and background. These levels simplify APCA's full font-size and weight lookup table:
 
 | Content type | Minimum | Preferred |
 | --- | --- | --- |
@@ -37,39 +37,60 @@ When a project must claim WCAG conformance, WCAG is the gate and APCA is the tie
 
 ## Fixing a failing pair (on request)
 
-**Change lightness first.** It is the channel contrast responds to. Hue and saturation move the measured value far less, so fixing contrast by changing hue is wasted effort.
-
-Move the foreground away from the background in perceived lightness, holding hue and saturation, then remeasure. Keeping hue fixed is what stops a contrast fix becoming a palette change.
+**Change lightness first.** It is the channel contrast responds to. Hue and saturation move the measured value far less, so fixing contrast by changing hue is wasted effort. In oklch this is literal — adjust `L` and leave `C` and `H` alone:
 
 ```css
 /* Failing: text too close to its background in lightness (Lc ≈ 50) */
-color: #7d93b0;
-background: #eef2f7;
+color: oklch(0.65 0.2 250);
+background: oklch(0.75 0.05 250);
 
-/* Fixed: darker text, same hue (Lc ≈ 90) */
-color: #2b3a4f;
-background: #eef2f7;
+/* Fixed: darker text, same hue and chroma (Lc ≈ 90) */
+color: oklch(0.35 0.2 250);
+background: oklch(0.75 0.05 250);
 ```
+
+In hex or rgb the same principle applies, it's just less direct: move the foreground away from the background in perceived lightness, holding hue and saturation, then remeasure.
 
 Two constraints on the fix:
 
 - **Mid-lightness backgrounds cap what is achievable.** On a background near 75% perceived lightness, even pure black text reaches only about Lc 60. Body text needs a background near one extreme, so a mid-range background is the thing that has to change.
-- **Pushing lightness can push the color out of gamut.** Reduce saturation as needed to keep it renderable. See [color-formats.md](color-formats.md).
+- **Pushing lightness can push the color out of gamut.** Reduce chroma as needed to keep it renderable ([gamut.md](gamut.md)).
 
 Always remeasure after changing a value. Do not assume a fix landed.
 
 ## Quick approximations
 
-Useful for a first pass and approximations. Verify by measuring before reporting a result.
+Useful for a first pass. Verify by measuring before reporting a result.
 
 For body text targeting |Lc| ≥ 75:
 
-- **Light background (above ~90% perceived lightness):** foreground below ~35%.
-- **Dark background (below ~25% perceived lightness):** foreground above ~90%.
+- **Light background (above ~85–90% perceived lightness):** foreground below ~35–45%.
+- **Dark background (below ~25% perceived lightness):** foreground above ~75–90%.
 
 The gap is asymmetric because APCA is polarity-aware. Mirrored pairs do not score identically, which is why a pair passing in light mode can fail in dark.
 
-**Light or dark background?** The crossover is around 73% perceived lightness. Above it use dark text; at or below it light text scores higher. That is higher than intuition suggests. Between roughly 60% and 73% the background already looks light, yet white text still measures meaningfully better than black.
+**Which text color reads better on a given background?** A background is "light" once its perceived lightness exceeds `L 0.6` — use dark text there, light text otherwise:
+
+```
+if L > 0.6 → use dark text on this background
+if L <= 0.6 → use light text on this background
+```
+
+The crossover for a full body-text pass is higher, around 73% perceived lightness. Above it use dark text; at or below it light text scores higher. That is higher than intuition suggests — between roughly 60% and 73% the background already looks light, yet white text still measures meaningfully better than black.
+
+## Detecting hue drift in an existing palette
+
+Palettes built in HSL often drift in hue across their own steps without anyone noticing, because HSL's hue channel isn't as stable as it looks:
+
+1. Convert each step to oklch.
+2. Compare the `H` values across steps.
+3. A spread greater than 10° across the ramp is visible drift.
+
+```
+hsl(240, 80%, 20%)  →  oklch H ≈ 269
+hsl(240, 80%, 50%)  →  oklch H ≈ 267
+hsl(240, 80%, 90%)  →  oklch H ≈ 285  /* shifted 18° */
+```
 
 ## What to check
 

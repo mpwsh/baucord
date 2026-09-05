@@ -1,6 +1,6 @@
 # Color formats
 
-Which notation to write colors in, how to convert between them and what happens at the edges of a display's gamut. Every other rule in this skill is stated perceptually and holds whatever notation you write.
+Which notation to write colors in, and how to convert between them. Every other rule in this skill is stated perceptually and holds whatever notation you write. Gamut clipping and Display P3 have moved to [gamut.md](gamut.md).
 
 ## Choosing a notation
 
@@ -13,73 +13,51 @@ Which notation to write colors in, how to convert between them and what happens 
 
 **Match whatever the project already uses.** Notation is not a defect: a project on hex is not doing it wrong.
 
-**For a genuinely new color system, `oklch()` is the best default.** Even lightness steps stay even, and a fixed hue stays fixed. See [palette-generation.md](palette-generation.md).
+**For a genuinely new color system, `oklch()` is the best default.** Equal L steps read as equal brightness, and hue holds constant across the whole lightness range — the reason its numbers behave the way [palette-generation.md](palette-generation.md) describes. See [palette-generation.md](palette-generation.md).
 
 ```css
 oklch(L C H)          /* lightness 0–1, chroma 0–~0.4, hue 0–360 */
 oklch(L C H / alpha)  /* alpha uses a slash, never a comma */
 ```
 
-## Converting
+L and C use 3 decimal places, H uses up to 3. Drop trailing zeros. Format `-0` as `0`.
 
-Convert when the user asks, when an agreed migration is in scope, or when the project is standardizing on a notation and this value is the straggler. Never convert an isolated value in a project that deliberately uses something else and never because this skill happened to load.
+## Supported input formats
 
-When conversion is in scope, change the values and nothing else:
+| Format | Examples |
+| --- | --- |
+| Hex (3/6/8-digit) | `#f00`, `#ff0000`, `#ff000080` |
+| `rgb()` / `rgba()` | `rgb(255, 0, 0)`, `rgba(255, 0, 0, 0.5)` |
+| `hsl()` / `hsla()` | `hsl(0, 100%, 50%)`, `hsla(0, 100%, 50%, 0.5)` |
 
-- Leave CSS keywords alone: `currentColor`, `inherit`, `transparent`, `initial`, `unset`.
-- Leave gradient functions alone. Convert the color stops inside them; do not touch the interpolation method.
-- Leave colors in third-party configs that expect a specific format.
-- Preserve comments and formatting.
+## When to convert
+
+Convert when the user asks, when an agreed migration is in scope, or when the project is standardizing on a notation and this value is the straggler. Never convert an isolated value in a project that deliberately uses something else, and never just because this skill happened to load.
+
+Bulk conversion is a migration, not cleanup. It shifts every rendered color by a rounding margin and touches files nobody asked about, so it has to be the task rather than a side effect. When it is in scope:
+
+1. Replace all hex colors with their oklch equivalents.
+2. Replace all `rgb()`, `rgba()`, `hsl()`, `hsla()` function calls.
+3. Leave gradient functions unchanged — only convert the color stops inside them, not the interpolation method.
+4. Leave CSS keywords alone: `currentColor`, `inherit`, `transparent`, `initial`, `unset`.
+5. Leave colors in third-party configs that expect a specific format.
+6. Preserve comments and formatting.
 
 ```css
 /* Before */
 color: #3b82f6;
+background: #1e293b;
+border-color: #e2e8f0;
 border: 1px solid rgba(0, 0, 0, 0.1);
 
 /* After */
 color: oklch(0.623 0.188 259.815);
+background: oklch(0.279 0.037 260.031);
+border-color: oklch(0.929 0.013 255.508);
 border: 1px solid oklch(0 0 0 / 0.1);
 ```
 
-Bulk conversion is a migration, not cleanup. It shifts every rendered color by a rounding margin and touches files nobody asked about, so it has to be the task rather than a side effect.
-
-## Gamut
-
-Every sRGB color exists in Display P3, but not the reverse. P3 covers roughly 50% more colors, which matters only for the most saturated values. A color at 60% of maximum vividness looks the same on both.
-
-A color more vivid than its display can render gets clipped, and clipping is not graceful. It flattens neighbouring steps into one rendered color, so the top of a ramp can lose its distinctions on an sRGB screen. Maximum vividness varies by hue and lightness. Cyans top out far lower than reds and purples, so a clipping ramp clips at some steps and not others.
-
-The fix is to reduce vividness while holding hue and lightness. Generate ramps against sRGB unless the product is display-restricted, and add P3 as an enhancement:
-
-```css
-.accent {
-  background: #3b82f6;
-}
-
-@media (color-gamut: p3) {
-  .accent {
-    background: oklch(0.62 0.24 259);
-  }
-}
-```
-
-Order matters. The sRGB value comes first so every display gets something, and the P3 rule overrides only where it will render. A P3 color with no fallback is a `HIGH` finding; it does not degrade, it fails.
-
-For browser matrices predating `oklch()` support, the same layering works with `@supports`:
-
-```css
-.accent {
-  background: #3b82f6;
-}
-
-@supports (color: oklch(0 0 0)) {
-  .accent {
-    background: oklch(0.62 0.19 259);
-  }
-}
-```
-
-Check the project's actual browser matrix before adding this. On a modern baseline it is dead weight.
+Alpha uses the forward-slash syntax. Omit alpha when it's 1.
 
 ## Modern CSS worth knowing
 
@@ -87,4 +65,4 @@ Check the project's actual browser matrix before adding this. On a modern baseli
 - **Relative color syntax** adjusts one channel of an existing color. `oklch(from var(--color-accent-solid) calc(l - 0.1) c h)` darkens the accent by hand. Powerful and easy to overuse, since a token defined by three chained derivations is unreadable.
 - **`light-dark()`** puts both appearances in one declaration. See [palette-generation.md](palette-generation.md).
 
-All three compute at render time, so their output cannot be contrast-checked statically. Measure the rendered result.
+All three compute at render time, so their output cannot be contrast-checked statically. Measure the rendered result ([contrast.md](contrast.md)).

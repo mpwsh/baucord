@@ -23,6 +23,41 @@ Properties of the finished ramp, checkable against any output in any notation:
 - **No two adjacent steps are indistinguishable.** If `200` and `300` look identical on a calibrated screen, the ramp has more steps than decisions. Drop one.
 - **Both ends stop short of pure black and white.** A ramp that reaches them loses its identity exactly where the page background lives.
 
+## Scale size
+
+Design system palettes use a numeric scale from `50` (lightest) to `950` (darkest). The standard step labels scale with palette size:
+
+| Size | Labels |
+| --- | --- |
+| 5 | 100, 300, 500, 700, 900 |
+| 9 | 50, 100, 200, 300, 500, 700, 800, 900, 950 |
+| 11 (Tailwind) | 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950 |
+
+9 steps is the standard default. See [palette-structure.md](palette-structure.md) for what Radix's 12-step, role-defined convention offers instead.
+
+## The generation algorithm
+
+Given a base color with lightness `L`, a chroma percentage, and hue `H`:
+
+**1. Set lightness bounds**, clamped so neither end reaches pure black or white, which carry zero chroma:
+
+```
+delta = 0.4
+minL = max(0.05, baseL - delta)
+maxL = min(0.95, baseL + delta)
+```
+
+**2. Distribute lightness evenly** from `maxL` (lightest, label `50`) to `minL` (darkest, label `950`).
+
+**3. Clamp chroma per step.** Each lightness level has a different maximum chroma for a given hue and color space ([gamut.md](gamut.md) has the per-hue table):
+
+```
+maxChroma = findMaxChroma(step[i].L, hue, colorSpace)
+step[i].C = (chromaPercentage / 100) * maxChroma
+```
+
+This keeps every step in gamut. High-chroma base colors will show lower chroma at the lightest and darkest ends — that's correct and expected, not a bug to fix.
+
 ## Use a color library
 
 Never compute these by hand or by eye. `culori`, `colorjs.io` and `chroma.js` all convert between notations, measure perceived lightness and interpolate perceptually. Read the brand color in whatever format it arrives, do the math in a perceptual space and emit the project's notation:
@@ -34,8 +69,6 @@ import { formatHex, interpolate, samples } from 'culori'
 const ramp = interpolate(['#eff6ff', '#3b82f6', '#172554'], 'lab')
 const steps = samples(11).map((t) => formatHex(ramp(t)))
 ```
-
-The output format is the project's choice. For a ramp the interpolation space is not, because the steps have to land evenly in perceived lightness and sRGB interpolation produces muddy mid-steps. Decorative gradients are the opposite case, where the space is a deliberate look ([color-usage.md](color-usage.md)).
 
 ```css
 :root {
@@ -53,20 +86,29 @@ The output format is the project's choice. For a ramp the interpolation space is
 }
 ```
 
+The output format is the project's choice. For a ramp the interpolation space is not, because the steps have to land evenly in perceived lightness and sRGB interpolation produces muddy mid-steps. Decorative gradients are the opposite case, where the space is a deliberate look ([color-usage.md](color-usage.md)).
+
 ## Several hues at once
 
 With an accent plus status ramps, the ramps must agree step for step. `danger-500` and `brand-500` should read as equally bright and vivid, or a red button looks heavier than a blue one at the same step.
 
 - **Match perceived lightness exactly.** Same step, same brightness, across every hue.
-- **Match vividness relatively, not absolutely.** Hues do not share a maximum vividness. A saturated yellow and a saturated blue are not equally far from gray, and no format makes them so. Set each ramp to the same *proportion* of what its own hue reaches. Copying a saturation number across hues leaves one washed out.
+- **Match vividness relatively, not absolutely.** Hues do not share a maximum vividness — a saturated yellow and a saturated blue are not equally far from gray, and no format makes them so. Set each ramp to the same *proportion* of what its own hue reaches, not the same raw chroma number:
 
-Yellows and cyans are the usual casualties, peaking much lower than reds and blues. Copy the numbers across and the warning color looks weak beside the danger one.
+```css
+:root {
+  /* Same L, same C% (80% of max) — different absolute C per hue */
+  --blue-500: oklch(0.623 0.141 250);   /* 80% of max 0.176 */
+  --green-500: oklch(0.623 0.157 145);  /* 80% of max 0.196 */
+  --red-500: oklch(0.623 0.202 25);     /* 80% of max 0.253 */
+}
+```
+
+Yellows and cyans are the usual casualties, peaking much lower than reds and blues. Copy a saturation or chroma number straight across hues and the warning color looks weak beside the danger one.
 
 ## Dark mode
 
-A dark palette is not the light one reversed. Reversal is the starting point, not the output.
-
-Swap the semantic roles first, then tune the values:
+A dark palette is not the light one reversed. Reversal is the starting point, not the output. Swap the semantic roles first:
 
 ```css
 :root {
@@ -80,7 +122,7 @@ Swap the semantic roles first, then tune the values:
 }
 ```
 
-Three things almost always need hand-tuning after the swap:
+Then tune three things that almost always need hand-adjustment after the swap:
 
 - **Vividness comes down.** A color that reads as confident on white reads as neon on near-black. Dark appearances need the accent a step or two less vivid.
 - **The dark end needs more separation.** Steps distinguishable as pale backgrounds collapse into each other as dark surfaces.
@@ -102,3 +144,10 @@ Pick one and use it throughout:
 ```
 
 Mixing mechanisms is the common failure. A media query setting some tokens and a class setting others gives a half-themed interface the moment a user overrides their system preference.
+
+## Why not HSL
+
+HSL causes the two failures this whole file works around:
+
+- **Hue drift.** `hsl(240, 80%, 20%)` and `hsl(240, 80%, 90%)` are not the same perceptual hue — the light variant shifts roughly 18° toward purple. OKLCH hue is stable across the full lightness range.
+- **Brightness inconsistency.** `hsl(60, 100%, 50%)` (yellow) and `hsl(240, 100%, 50%)` (blue) share the same HSL lightness number but have wildly different perceived brightness. Equal L in OKLCH means equal perceived brightness.
