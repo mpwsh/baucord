@@ -31,6 +31,7 @@ pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
 pub use protocol::MAX_CHAT_IMAGE_BYTES;
 pub use protocol::{
     admin, invite, permissions, AdminCommand, AdminError, AdminOutcome, AdminTarget,
-    ChannelDenyReason, ChannelInfo, InviteDenyReason, InviteInvalidReason, NeedInviteReason,
-    RefusedReason, RemovedKind, RestrictionKind, RoleId, ShareScope, UserId,
+    ChannelDenyReason, ChannelInfo, ChannelSpec, ChannelUiDenyReason, ConvRef, HistoryMessage,
+    InviteDenyReason, InviteInvalidReason, NeedInviteReason, RefusedReason, RemovedKind,
+    RestrictionKind, RoleId, ShareScope, UserId,
 };

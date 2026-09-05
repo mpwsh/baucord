@@ -169,12 +169,27 @@ impl ChatServer {
             })
             .collect();
         for (client, r) in hit {
-            let kind = if r.key_hash.is_some() || r.ip.is_some() {
-                RemovedKind::Banned { until: r.until }
-            } else {
-                RemovedKind::Kicked
-            };
-            self.remove_session(client, kind, &r.reason, "server");
+            self.remove_session(
+                client,
+                RemovedKind::Banned { until: r.until },
+                &r.reason,
+                "server",
+            );
+        }
+        // A kick from the CLI shows up as the session's key no longer
+        // belonging to its user.
+        let kicked: Vec<ClientId> = self
+            .user_of
+            .iter()
+            .filter(|(client, user)| {
+                self.key_of
+                    .get(*client)
+                    .is_none_or(|key| self.policy.keys.get(key).map(|k| k.user_id) != Some(**user))
+            })
+            .map(|(client, _)| *client)
+            .collect();
+        for client in kicked {
+            self.remove_session(client, RemovedKind::Kicked, "access removed", "server");
         }
         self.refresh_enforcement();
         let details: Vec<ServerMessage> = self
@@ -200,6 +215,7 @@ impl ChatServer {
                 .get(user)
                 .map(|u| u.roles.iter().copied().collect())
                 .unwrap_or_default(),
+            level: self.policy.level_of(user),
         }
     }
 
@@ -280,8 +296,9 @@ impl ChatServer {
                 need(permissions::MANAGE_INVITES)?;
                 Ok(AdminOutcome::Invites(self.list_invites()))
             }
-            AdminCommand::SetRoles { user_id, roles } => {
+            AdminCommand::SetRoles { target, roles } => {
                 need(permissions::MANAGE_ROLES)?;
+                let user_id = self.resolve_target(&target)?;
                 self.set_roles(actor, &user_id, &roles)?;
                 Ok(AdminOutcome::Done)
             }
@@ -301,7 +318,8 @@ impl ChatServer {
                     need(permissions::RESTRICT)?;
                 }
                 let (user_id, key_hash, ip) = match target {
-                    AdminTarget::User(user) => {
+                    AdminTarget::User(_) | AdminTarget::Name(_) => {
+                        let user = self.resolve_target(&target)?;
                         self.check_target(actor, &user)?;
                         (Some(user), None, None)
                     }
@@ -357,8 +375,25 @@ impl ChatServer {
                 self.lift_restriction(restriction_id, Some(actor));
                 Ok(AdminOutcome::Done)
             }
-            AdminCommand::Disconnect { user_id, reason } => {
+            AdminCommand::Unmute { target, kind } => {
+                if kind == RestrictionKind::Voice {
+                    if !permissions::has(perms, permissions::MUTE)
+                        && !permissions::has(perms, permissions::RESTRICT)
+                    {
+                        return Err(AdminError::NoPermission);
+                    }
+                } else {
+                    need(permissions::RESTRICT)?;
+                }
+                let user_id = self.resolve_target(&target)?;
+                if self.lift_all(&user_id, kind, actor) == 0 {
+                    return Err(AdminError::NoSuchRestriction);
+                }
+                Ok(AdminOutcome::Done)
+            }
+            AdminCommand::Disconnect { target, reason } => {
                 need(permissions::DISCONNECT)?;
+                let user_id = self.resolve_target(&target)?;
                 self.check_target(actor, &user_id)?;
                 let sessions = self.sessions_of(&user_id);
                 if sessions.is_empty() {
@@ -375,37 +410,28 @@ impl ChatServer {
                 );
                 Ok(AdminOutcome::Done)
             }
-            AdminCommand::Kick { user_id, reason } => {
+            AdminCommand::Kick { target, reason } => {
                 need(permissions::KICK)?;
+                let user_id = self.resolve_target(&target)?;
                 self.check_target(actor, &user_id)?;
-                let now = self.wall_now();
-                self.restrict(
-                    Restriction {
-                        id: 0,
-                        user_id: Some(user_id),
-                        key_hash: None,
-                        ip: None,
-                        kind: RestrictionKind::Server,
-                        until: None,
-                        reason,
-                        by: Some(actor),
-                        created_at: now,
-                    },
-                    &actor_name,
-                );
+                self.kick_user(actor, &actor_name, &user_id, &reason);
                 Ok(AdminOutcome::Done)
             }
             AdminCommand::Ban {
-                user_id,
+                target,
                 duration_secs,
                 reason,
             } => {
                 need(permissions::BAN)?;
+                let user_id = self.resolve_target(&target)?;
                 self.check_target(actor, &user_id)?;
                 let now = self.wall_now();
-                // Block everything known about the person: the user,
-                // the key of the live session (or their latest key), and
-                // the address they are on.
+                // Block what is known about the person: the user, the
+                // key of the live session (or their latest key), and the
+                // address they are on — unless someone else is on that
+                // address right now (a shared machine, a household
+                // behind one NAT), in which case the address is left
+                // alone and the log says so.
                 let session = self.sessions_of(&user_id).first().copied();
                 let key_hash = session
                     .and_then(|c| self.key_of.get(&c).copied())
@@ -413,6 +439,22 @@ impl ChatServer {
                 let ip = session
                     .and_then(|c| self.driver.remote_address(c))
                     .map(|a| a.ip());
+                let shared = ip.is_some_and(|ip| {
+                    self.user_of.iter().any(|(client, user)| {
+                        *user != user_id
+                            && self.driver.remote_address(*client).map(|a| a.ip()) == Some(ip)
+                    })
+                });
+                let ip = if shared {
+                    info!(
+                        "ban of {}: address {} is shared with another session; not banning it",
+                        hex(&user_id[..8]),
+                        ip.map_or_else(|| "?".to_string(), |ip| ip.to_string())
+                    );
+                    None
+                } else {
+                    ip
+                };
                 self.restrict(
                     Restriction {
                         id: 0,
@@ -429,14 +471,20 @@ impl ChatServer {
                 );
                 Ok(AdminOutcome::Done)
             }
-            AdminCommand::MoveUser {
-                user_id,
-                channel_id,
-            } => {
+            AdminCommand::Unban { target } => {
+                need(permissions::BAN)?;
+                let user_id = self.resolve_target(&target)?;
+                if self.lift_all(&user_id, RestrictionKind::Server, actor) == 0 {
+                    return Err(AdminError::NoSuchRestriction);
+                }
+                Ok(AdminOutcome::Done)
+            }
+            AdminCommand::MoveUser { target, channel_id } => {
                 need(permissions::MANAGE_CHANNELS)?;
-                if usize::from(channel_id) >= self.config.channels.len() {
+                if usize::from(channel_id) >= self.channel_list.len() {
                     return Err(AdminError::NoSuchChannel);
                 }
+                let user_id = self.resolve_target(&target)?;
                 let sessions = self.sessions_of(&user_id);
                 if sessions.is_empty() {
                     return Err(AdminError::NoSuchUser);
@@ -462,8 +510,9 @@ impl ChatServer {
                     Err(AdminError::NoSuchInvite)
                 }
             }
-            AdminCommand::LinkKey { user_id, key_hash } => {
+            AdminCommand::LinkKey { target, key_hash } => {
                 need(permissions::MANAGE_USERS)?;
+                let user_id = self.resolve_target(&target)?;
                 self.link_key(actor, &user_id, &key_hash)?;
                 Ok(AdminOutcome::Done)
             }
@@ -478,7 +527,174 @@ impl ChatServer {
                     Err(AdminError::NoSuchUser)
                 }
             }
+            AdminCommand::DeleteMessage { msg_id } => {
+                need(permissions::RESTRICT)?;
+                if self.handle_delete_message(client, msg_id, true) {
+                    self.audit(Some(actor), "message.delete", Some(msg_id.to_string()), None);
+                    Ok(AdminOutcome::Done)
+                } else {
+                    Err(AdminError::Invalid(
+                        "no such recent message (older ones cannot be deleted)".to_string(),
+                    ))
+                }
+            }
+            AdminCommand::PurgeUser { target } => {
+                need(permissions::MANAGE_USERS)?;
+                let user_id = self.resolve_target(&target)?;
+                self.check_target(actor, &user_id)?;
+                self.purge_user(actor, &user_id);
+                Ok(AdminOutcome::Done)
+            }
+            AdminCommand::LastTelemetry { target } => {
+                need(permissions::MANAGE_USERS)?;
+                let user_id = self.resolve_target(&target)?;
+                Ok(AdminOutcome::Telemetry(self.last_telemetry.get(&user_id).map(
+                    |(ts, line)| protocol::TelemetrySummary {
+                        ts: *ts,
+                        line: line.clone(),
+                    },
+                )))
+            }
         }
+    }
+
+    /// The user a target names. Ids are exact; names are the name of
+    /// record, case-insensitive; a hex prefix of at least 8 digits
+    /// matches an id. When several users share a name, an online one
+    /// wins if there is exactly one; otherwise the candidates are
+    /// listed and the id is the way to say which.
+    fn resolve_target(&self, target: &AdminTarget) -> Result<UserId, AdminError> {
+        let name = match target {
+            AdminTarget::User(id) => {
+                return if self.policy.users.contains_key(id) {
+                    Ok(*id)
+                } else {
+                    Err(AdminError::NoSuchUser)
+                };
+            }
+            AdminTarget::Name(name) => name.trim(),
+            AdminTarget::Key(_) | AdminTarget::Address(_) => {
+                return Err(AdminError::Invalid("expected a user".to_string()));
+            }
+        };
+        let lower = name.to_ascii_lowercase();
+        let looks_hex = lower.len() >= 8 && lower.bytes().all(|b| b.is_ascii_hexdigit());
+        let mut matches: Vec<UserId> = if looks_hex {
+            self.policy
+                .users
+                .keys()
+                .filter(|id| hex(&id[..]).starts_with(&lower))
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if matches.is_empty() {
+            matches = self
+                .policy
+                .users
+                .iter()
+                .filter(|(_, u)| u.name.eq_ignore_ascii_case(name))
+                .map(|(id, _)| *id)
+                .collect();
+        }
+        if matches.len() > 1 {
+            let online: Vec<UserId> = matches
+                .iter()
+                .filter(|id| !self.sessions_of(id).is_empty())
+                .copied()
+                .collect();
+            if online.len() == 1 {
+                return Ok(online[0]);
+            }
+        }
+        match matches.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(AdminError::NoSuchUser),
+            many => {
+                let mut ids: Vec<String> = many
+                    .iter()
+                    .map(|id| {
+                        let roles: Vec<&str> = self
+                            .policy
+                            .users
+                            .get(id)
+                            .map(|u| {
+                                u.roles
+                                    .iter()
+                                    .filter_map(|r| self.policy.roles.get(r))
+                                    .map(|r| r.name.as_str())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        format!(
+                            "{} ({})",
+                            hex(&id[..8]),
+                            if roles.is_empty() {
+                                "no roles".to_string()
+                            } else {
+                                roles.join(",")
+                            }
+                        )
+                    })
+                    .collect();
+                ids.sort();
+                Err(AdminError::Invalid(format!(
+                    "'{name}' names {} users — use the id (first 8 digits): {}",
+                    many.len(),
+                    ids.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Kick (spec §4.1 as decided): close the sessions, forget the
+    /// device keys and the roles. The user row stays (history keeps
+    /// its author); the next connection is an unknown device that
+    /// needs a new invite.
+    fn kick_user(&mut self, actor: UserId, actor_name: &str, user_id: &UserId, reason: &str) {
+        for session in self.sessions_of(user_id) {
+            self.remove_session(session, RemovedKind::Kicked, reason, actor_name);
+        }
+        self.policy.keys.retain(|_, k| k.user_id != *user_id);
+        self.persist.send(Command::DeleteUserKeys { user_id: *user_id });
+        let roles: Vec<RoleId> = self
+            .policy
+            .users
+            .get(user_id)
+            .map(|u| u.roles.iter().copied().collect())
+            .unwrap_or_default();
+        if let Some(u) = self.policy.users.get_mut(user_id) {
+            u.roles.clear();
+        }
+        for role in roles {
+            self.persist.send(Command::RevokeRole {
+                user_id: *user_id,
+                role_id: role,
+            });
+        }
+        self.audit(
+            Some(actor),
+            "user.kick",
+            Some(hex(&user_id[..8])),
+            Some(reason.to_string()),
+        );
+        self.refresh_enforcement();
+    }
+
+    /// Remove every restriction of `kind` on a user. Returns how many.
+    fn lift_all(&mut self, user_id: &UserId, kind: RestrictionKind, actor: UserId) -> usize {
+        let ids: Vec<u64> = self
+            .policy
+            .restrictions
+            .iter()
+            .filter(|r| r.kind == kind && r.user_id.as_ref() == Some(user_id))
+            .map(|r| r.id)
+            .collect();
+        for id in &ids {
+            self.lift_restriction(*id, Some(actor));
+        }
+        ids.len()
     }
 
     /// The rank rule (spec §8): the target must exist, must not be the
@@ -512,9 +728,9 @@ impl ChatServer {
             return Err(AdminError::NoSuchUser);
         }
         let actor_rank = self.policy.rank_of(&actor);
-        // Acting on yourself is allowed here (an admin adding a role to
-        // themselves), but never on someone at or above you.
-        if *user_id != actor && self.policy.rank_of(user_id) >= actor_rank {
+        // Equal rank is fine here — admins manage each other's roles,
+        // and their own — but never someone above you.
+        if self.policy.rank_of(user_id) > actor_rank {
             return Err(AdminError::Outranked);
         }
         for role in roles {

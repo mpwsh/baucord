@@ -447,6 +447,73 @@ pub enum TelemetryEvent {
 
 // ── Client → Server ─────────────────────────────────────────────────────
 
+/// Which conversation a history request is about (spec §6). DMs are
+/// 1.1.1; the variant exists so the shape does not change then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConvRef {
+    General,
+    Dm(UserId),
+}
+
+/// One stored message (spec §6): authored by a user who may well be
+/// offline, so it names the author rather than a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryMessage {
+    pub id: u64,
+    /// Milliseconds since the Unix epoch.
+    pub ts: u64,
+    pub user_id: UserId,
+    /// The author's name of record at the time of sending.
+    pub name: String,
+    pub text: String,
+    pub edited: bool,
+}
+
+/// Why a channel could not be created, edited or deleted (spec §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelUiDenyReason {
+    NameTaken,
+    NoPermission,
+    /// Config channels belong to the file: rename yes, delete no.
+    ConfigOwned,
+    /// The creator already owns `user_channels.max_per_user`.
+    Limit,
+    NoSuchChannel,
+    /// A malformed request: empty name, absurd limit.
+    Invalid,
+}
+
+impl ChannelUiDenyReason {
+    /// Human-readable form for UI display.
+    #[must_use]
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::NameTaken => "a channel with that name exists",
+            Self::NoPermission => "you may not do that to this channel",
+            Self::ConfigOwned => "that channel comes from the server's config file",
+            Self::Limit => "you already own as many channels as allowed",
+            Self::NoSuchChannel => "that channel does not exist",
+            Self::Invalid => "that channel request was not valid",
+        }
+    }
+}
+
+/// A user-created channel's settings, sent whole on create and edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelSpec {
+    pub name: String,
+    pub password: Option<String>,
+    pub user_limit: Option<u16>,
+    /// Joinable from this role's rank up; `None` = everyone.
+    pub min_role: Option<RoleId>,
+    /// Kept when empty; otherwise deleted after
+    /// `user_channels.temporary_after_min` empty.
+    pub permanent: bool,
+    /// Idle minutes before a member is moved to the AFK channel; `None`
+    /// = the server default.
+    pub afk_after_min: Option<u16>,
+}
+
 /// Messages sent from a client to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -564,6 +631,31 @@ pub enum ClientMessage {
         request_id: u32,
         command: AdminCommand,
     },
+
+    // ── 1.1: history (feature bit `HISTORY`) ────────────────────────
+    /// Older messages: those with an id below `before` (`None` = the
+    /// newest), at most `limit`. Answered with `History`, or
+    /// `HistoryUnavailable` when the store cannot answer in time.
+    FetchHistory {
+        conv: ConvRef,
+        before: Option<u64>,
+        limit: u16,
+    },
+    /// Replace the text of your own message.
+    EditMessage { msg_id: u64, text: String },
+    /// Remove your own message.
+    DeleteMessage { msg_id: u64 },
+
+    // ── 1.1: channels from the UI (feature bit `CHANNELS_UI`) ───────
+    /// Create a channel (needs `CREATE_CHANNELS`; spec §5).
+    CreateChannel(ChannelSpec),
+    /// Edit a channel you own (`MANAGE_OWN_CHANNELS`) or any
+    /// (`MANAGE_CHANNELS`). A config channel accepts only a rename.
+    EditChannel { channel_id: u16, spec: ChannelSpec },
+    /// Delete a channel you own, or any with `MANAGE_CHANNELS`.
+    DeleteChannel { channel_id: u16 },
+    /// Send a member of your channel back to the default channel.
+    ChannelKick { channel_id: u16, user_id: UserId },
 }
 
 impl ClientMessage {
@@ -796,6 +888,8 @@ pub enum ServerMessage {
         client_id: ClientId,
         user_id: UserId,
         roles: Vec<RoleId>,
+        /// From xp (spec §9.1), when the server tracks progress.
+        level: u16,
     },
     /// A restriction now applies to this session (spec §4.2): the UI
     /// shows it instead of letting the action fail silently. `until`
@@ -812,6 +906,47 @@ pub enum ServerMessage {
         request_id: u32,
         result: Result<AdminOutcome, AdminError>,
     },
+
+    // ── 1.1: history (feature bit `HISTORY`) ────────────────────────
+    /// A page of messages, oldest first. Right after `Init` the last
+    /// `history.replay` of the general chat arrive this way; `more`
+    /// says an older page exists (`FetchHistory` with `before` = the
+    /// first id here). Pages are at most 64 KiB.
+    History {
+        conv: ConvRef,
+        messages: Vec<HistoryMessage>,
+        more: bool,
+    },
+    /// The store could not answer in time (a stalled disk): the client
+    /// keeps what it has and may retry after `retry_secs`.
+    HistoryUnavailable { conv: ConvRef, retry_secs: u16 },
+    MessageEdited { msg_id: u64, text: String },
+    MessageDeleted { msg_id: u64 },
+    /// Chat is rate limited (`limits.chat`); the message was dropped.
+    ChatRateLimited { retry_ms: u32 },
+
+    // ── 1.1: progress (feature bit `PROGRESS`) ──────────────────────
+    /// Your xp crossed a level (spec §9.1).
+    ProgressUpdate { xp: u64, level: u16 },
+
+    // ── 1.1: channels from the UI (feature bit `CHANNELS_UI`) ───────
+    /// What `ChannelInfo` cannot say, one per channel after `Init` and
+    /// after every `ChannelListUpdated`. `stable_id` survives the
+    /// renumbering a list change causes (0 for config channels).
+    ChannelDetails {
+        channel_id: u16,
+        stable_id: u64,
+        owner: Option<UserId>,
+        min_role: Option<RoleId>,
+        permanent: bool,
+        afk_after_min: Option<u16>,
+        is_afk: bool,
+    },
+    /// A create/edit/delete/kick was refused.
+    ChannelDenied { reason: ChannelUiDenyReason },
+    /// The server moved this session to the AFK channel after
+    /// `after_min` idle minutes (spec §5).
+    MovedIdle { after_min: u16 },
 }
 
 /// Why a session was ended (spec §4.1).
@@ -1535,6 +1670,7 @@ mod tests {
             client_id: 9,
             user_id: [1u8; 32],
             roles: vec![1, 2],
+            level: 3,
         }));
         let bytes = encode_server_message(&ServerMessage::Restricted {
             kind: RestrictionKind::GeneralText,

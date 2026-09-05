@@ -63,7 +63,7 @@ error-banned = Estás baneado de este servidor{ $until }{ $reason }
 ban-for = por { $left }
 ban-indefinite = indefinidamente
 removed-disconnected = Desconectado por { $by }: { $reason }
-removed-kicked = Expulsado por { $by }: { $reason }
+removed-kicked = Expulsado por { $by }: { $reason } — vas a necesitar una invitación nueva para volver.
 removed-banned = Baneado por { $by }{ $until }{ $reason }
 removed-replaced = Iniciaste sesión desde otro dispositivo o conexión; esta se cerró.
 chat-server-not-persistent = Este servidor no guarda nada entre reinicios: roles, invitaciones y baneos duran hasta que se apaga.
@@ -79,19 +79,19 @@ invite-expires-in = vence en { $left }
 invite-never-expires = no vence
 
 # ── Moderación (comandos; spec §4, §8) ──────────────────────────────────
-chat-commands-help =
-    Comandos: /invite [rol] [24h] [usos] · /users · /restrictions · /invites · /kick nombre [motivo] · /ban nombre [7d] [motivo] · /disconnect nombre [motivo] · /mute nombre [30m] [motivo] · /unmute nombre · /restrict nombre text|dm|upload|share [30m] [motivo] · /lift id · /grant nombre rol · /revoke nombre rol · /move nombre canal · /revoke-invite código · /link nombre hash · /unlink hash
+chat-commands-help = Comandos: { $commands }
 chat-command-unknown = Comando desconocido /{ $command }. Probá /help.
 chat-command-usage = Uso: /{ $command } nombre …
-chat-command-usage-lift = Uso: /lift <id de restricción> (ver /restrictions)
 chat-command-usage-revoke-invite = Uso: /revoke-invite <código>
 chat-command-usage-unlink = Uso: /unlink <hash de clave, 64 dígitos hex> (ver /users)
 chat-command-usage-link = Uso: /link <nombre> <hash de clave, 64 dígitos hex>
-chat-command-usage-restrict = Uso: /restrict <nombre> text|dm|upload|share [30m] [motivo]
 chat-command-no-such-user = No hay nadie conectado que se llame { $name }.
 chat-admin-refused = Rechazado: { $why }.
 chat-admin-done = Listo.
-chat-admin-not-muted = No está silenciado.
+chat-server-muted-locked = El servidor te silenció; vas a poder activar el micrófono cuando se levante.
+chat-your-roles-changed = Tus roles ahora son: { $roles }
+roles-none = ninguno
+reason-none = (sin motivo)
 chat-admin-users-header = { $count } usuario(s) registrados (● conectados):
 chat-admin-restrictions-header = { $count } restricción(es):
 chat-admin-invites-header = { $count } invitación(es):
@@ -331,3 +331,19 @@ error-refused-rate-limited = Demasiados intentos fallidos — esperá un minuto 
 error-outdated = Esta versión de baucord no coincide con el servidor. Actualizá baucord y probá de nuevo.
 error-local = No se pudo iniciar la conexión: { $detail }
 error-lost-restart = El servidor se está reiniciando.
+
+# ── Historial, progreso, canales (spec §5, §6, §9) ───────────────────────
+chat-history-loaded = { $count } mensaje(s) anteriores{ $more ->
+    [yes] ; /history carga más
+   *[no] .
+}
+chat-history-unavailable = El historial no está disponible ahora; probá de nuevo en { $secs } s.
+chat-edited-mark = (editado)
+chat-message-edited = El mensaje #{ $id } fue editado: { $text }
+chat-message-deleted = El mensaje #{ $id } fue borrado.
+chat-rate-limited = Más despacio: el chat tiene límite; probá de nuevo en { $secs } s.
+chat-level-up = ¡Subiste de nivel! Ahora sos nivel { $level } ({ $xp } xp).
+chat-moved-idle = Te movieron al canal AFK después de { $min } minutos sin actividad.
+chat-command-usage-channel = Uso: /channel list · /channel create <nombre> [contraseña] · /channel keep <nombre> · /channel delete <nombre> · /channel kick <usuario>
+channel-owner-server = servidor
+chat-admin-no-telemetry = No llegó telemetría de esa persona en esta sesión.

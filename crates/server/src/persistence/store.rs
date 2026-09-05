@@ -16,11 +16,14 @@ use log::{info, warn};
 use protocol::permissions::BUILTIN_ROLES;
 use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
 
-use super::{AuditRow, MessageRow, PersistError, TelemetryEventRow, TelemetryRow};
+use super::{
+    AuditRow, MessageRow, PersistError, ProgressDelta, TelemetryEventRow, TelemetryRow,
+};
 use crate::{
     clock::WallMs,
     policy::{
-        InviteRecord, KeyRecord, Policy, Restriction, RestrictionKind, RoleRecord, UserRecord,
+        InviteRecord, KeyRecord, Policy, Restriction, RestrictionKind, RoleRecord,
+        UserChannelRecord, UserRecord,
     },
 };
 
@@ -29,7 +32,10 @@ pub const GENERAL_CONV: u64 = 1;
 
 /// Forward-only migrations; index + 1 is the schema version they
 /// produce. A database newer than this list refuses to open.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_foundation.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_foundation.sql"),
+    include_str!("migrations/0002_message_edits.sql"),
+];
 
 /// The schema version this build produces.
 #[allow(clippy::cast_possible_truncation)] // a handful of migrations
@@ -196,9 +202,11 @@ impl Sqlite {
         limit: u16,
     ) -> Result<Vec<MessageRow>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT msg_id, conv_id, ts, user_id, body FROM messages
-             WHERE conv_id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR msg_id < ?2)
-             ORDER BY msg_id DESC LIMIT ?3",
+            "SELECT m.msg_id, m.conv_id, m.ts, m.user_id, m.body, m.edited_at,
+                    COALESCE(u.name, '')
+             FROM messages m LEFT JOIN users u ON u.user_id = m.user_id
+             WHERE m.conv_id = ?1 AND m.deleted_at IS NULL AND (?2 IS NULL OR m.msg_id < ?2)
+             ORDER BY m.msg_id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
             params![ordered(conv_id), before.map(ordered), i64::from(limit)],
@@ -209,6 +217,8 @@ impl Sqlite {
                     ts: unordered(row.get(2)?),
                     user_id: row.get(3)?,
                     body: row.get(4)?,
+                    edited: row.get::<_, Option<i64>>(5)?.is_some(),
+                    name: row.get(6)?,
                 })
             },
         )?;
@@ -277,7 +287,47 @@ impl Sqlite {
         self.load_keys(&mut policy)?;
         self.load_invites(&mut policy)?;
         self.load_restrictions(&mut policy)?;
+        self.load_channels(&mut policy)?;
+        self.load_progress(&mut policy)?;
         Ok(policy)
+    }
+
+    fn load_channels(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT channel_id, name, password, user_limit, min_role, permanent, afk_after_min,
+                    created_by, created_at, empty_since
+             FROM channels WHERE source = 1 ORDER BY created_at, channel_id",
+        )?;
+        for row in stmt.query_map([], |r| {
+            Ok(UserChannelRecord {
+                stable_id: unordered(r.get(0)?),
+                name: r.get(1)?,
+                password: r.get(2)?,
+                user_limit: r.get(3)?,
+                min_role: r.get(4)?,
+                permanent: r.get::<_, i64>(5)? != 0,
+                afk_after_min: r.get(6)?,
+                owner: r.get(7)?,
+                created_at: unordered(r.get(8)?),
+                empty_since: r.get::<_, Option<i64>>(9)?.map(unordered),
+            })
+        })? {
+            let channel = row?;
+            policy.next_channel_id = policy.next_channel_id.max(channel.stable_id + 1);
+            policy.channels.push(channel);
+        }
+        Ok(())
+    }
+
+    fn load_progress(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT user_id, xp FROM user_progress")?;
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, [u8; 32]>(0)?, unordered(r.get(1)?)))
+        })? {
+            let (user, xp) = row?;
+            policy.xp.insert(user, xp);
+        }
+        Ok(())
     }
 
     fn load_roles(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
@@ -497,6 +547,18 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Forget every device key of a user.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn delete_user_keys(&self, user_id: &[u8; 32]) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM user_keys WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
     /// # Errors
     /// `SQLite` failure.
     pub fn insert_invite(&self, code: &str, invite: &InviteRecord) -> Result<(), rusqlite::Error> {
@@ -580,6 +642,115 @@ impl Sqlite {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![ordered(a.ts), a.actor, a.action, a.target, a.detail],
         )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn edit_message(&self, msg_id: u64, body: &str, ts: WallMs) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE messages SET body = ?2, edited_at = ?3 WHERE msg_id = ?1",
+            params![ordered(msg_id), body, ordered(ts)],
+        )?;
+        Ok(())
+    }
+
+    /// Soft delete: the row stays, history skips it.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn delete_message(&self, msg_id: u64, ts: WallMs) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE messages SET deleted_at = ?2 WHERE msg_id = ?1",
+            params![ordered(msg_id), ordered(ts)],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn upsert_channel(&self, c: &UserChannelRecord) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO channels (channel_id, name, password, user_limit, min_role, permanent,
+                                   afk_after_min, is_afk, source, created_by, created_at,
+                                   position, empty_since)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1, ?8, ?9, 0, ?10)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                 name = excluded.name, password = excluded.password,
+                 user_limit = excluded.user_limit, min_role = excluded.min_role,
+                 permanent = excluded.permanent, afk_after_min = excluded.afk_after_min,
+                 empty_since = excluded.empty_since",
+            params![
+                ordered(c.stable_id),
+                c.name,
+                c.password,
+                c.user_limit,
+                c.min_role,
+                i64::from(c.permanent),
+                c.afk_after_min,
+                c.owner,
+                ordered(c.created_at),
+                c.empty_since.map(ordered)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn delete_channel(&self, stable_id: u64) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM channels WHERE channel_id = ?1",
+            params![ordered(stable_id)],
+        )?;
+        Ok(())
+    }
+
+    /// Add to a user's progress counters (spec §9.1).
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn add_progress(&self, p: &ProgressDelta) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO user_progress (user_id, xp, talk_seconds, share_seconds, watch_seconds,
+                                        online_seconds, messages, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 xp = xp + excluded.xp,
+                 talk_seconds = talk_seconds + excluded.talk_seconds,
+                 share_seconds = share_seconds + excluded.share_seconds,
+                 watch_seconds = watch_seconds + excluded.watch_seconds,
+                 online_seconds = online_seconds + excluded.online_seconds,
+                 messages = messages + excluded.messages,
+                 updated_at = excluded.updated_at",
+            params![
+                p.user_id,
+                ordered(p.xp),
+                ordered(p.talk_seconds),
+                ordered(p.share_seconds),
+                ordered(p.watch_seconds),
+                ordered(p.online_seconds),
+                ordered(p.messages),
+                ordered(p.ts)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a person (spec §8): the row cascades to keys, roles,
+    /// restrictions and progress; their messages go too.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn purge_user(&self, user_id: &[u8; 32]) -> Result<(), rusqlite::Error> {
+        self.conn
+            .execute("DELETE FROM messages WHERE user_id = ?1", params![user_id])?;
+        self.conn.execute(
+            "DELETE FROM invites WHERE created_by = ?1",
+            params![user_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
         Ok(())
     }
 
@@ -972,7 +1143,110 @@ pub fn cli_set_roles(
     Ok(())
 }
 
-/// `server user kick|ban`, `server user mute`: add a restriction. The
+/// `server user kick`: forget a user's device keys and roles, so they
+/// need a new invite. A running server closes the session within 2 s.
+///
+/// # Errors
+/// No database, or a `SQLite` failure.
+pub fn cli_kick(db_path: &Path, user_id: &[u8; 32], reason: &str) -> Result<(), PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    db.delete_user_keys(user_id)?;
+    if let Some(u) = policy.users.get(user_id) {
+        for role in &u.roles {
+            db.revoke_role(user_id, *role)?;
+        }
+    }
+    db.insert_audit(&AuditRow {
+        ts: super::wall_now(),
+        actor: None,
+        action: "user.kick".to_string(),
+        target: Some(hex(&user_id[..8])),
+        detail: Some(format!("cli: {reason}")),
+    })?;
+    db.close();
+    Ok(())
+}
+
+/// `server user purge`: delete a person and their messages; one audit
+/// line remains (spec §8).
+///
+/// # Errors
+/// No database, or a `SQLite` failure.
+pub fn cli_purge(db_path: &Path, user_id: &[u8; 32]) -> Result<(), PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    db.purge_user(user_id)?;
+    db.insert_audit(&AuditRow {
+        ts: super::wall_now(),
+        actor: None,
+        action: "user.purge".to_string(),
+        target: Some(hex(&user_id[..8])),
+        detail: Some("cli".to_string()),
+    })?;
+    db.close();
+    Ok(())
+}
+
+/// One stored telemetry sample, the queryable columns (spec §9).
+#[derive(Debug, Clone)]
+pub struct TelemetryLine {
+    pub ts: WallMs,
+    pub rtt_ms: u32,
+    pub path_loss: f32,
+    pub voice_loss: Option<f32>,
+    pub groups_behind: Option<u64>,
+    pub rung: Option<u32>,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+}
+
+/// `server telemetry <who>`: the newest `limit` samples of a user
+/// since `since` (ms since the epoch), newest last.
+///
+/// # Errors
+/// No database, or a `SQLite` failure.
+pub fn cli_telemetry(
+    db_path: &Path,
+    user_id: &[u8; 32],
+    since: WallMs,
+    limit: u32,
+) -> Result<Vec<TelemetryLine>, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let mut stmt = db.conn.prepare(
+        "SELECT ts, rtt_ms, path_loss, voice_loss, groups_behind, rung, input_device,
+                output_device
+         FROM telemetry_samples WHERE user_id = ?1 AND ts >= ?2
+         ORDER BY ts DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![user_id, ordered(since), i64::from(limit)], |r| {
+        Ok(TelemetryLine {
+            ts: unordered(r.get(0)?),
+            rtt_ms: r.get(1)?,
+            path_loss: r.get(2)?,
+            voice_loss: r.get(3)?,
+            groups_behind: r.get::<_, Option<i64>>(4)?.map(unordered),
+            rung: r.get(5)?,
+            input_device: r.get(6)?,
+            output_device: r.get(7)?,
+        })
+    })?;
+    let mut lines: Vec<TelemetryLine> = rows.collect::<Result<_, _>>()?;
+    drop(stmt);
+    db.close();
+    lines.reverse();
+    Ok(lines)
+}
+
+/// `server user ban`, `server user mute`: add a restriction. The
 /// id is assigned here; a running server picks the row up within 2 s
 /// and removes a live session if it is a `server` one.
 ///
@@ -1203,6 +1477,8 @@ mod tests {
             ts: 1_000 + msg_id,
             user_id: [7u8; 32],
             body: body.to_string(),
+            name: String::new(),
+            edited: false,
         }
     }
 

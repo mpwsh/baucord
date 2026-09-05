@@ -94,13 +94,16 @@ impl VoiceRelay {
         clients: &[ClientId],
         deafened: &HashSet<ClientId>,
         muted: &HashSet<ClientId>,
+        afk_channel: Option<u16>,
         channel_of: &HashMap<ClientId, u16>,
     ) {
         for sender in clients {
             let sender_channel = channel_of.get(sender);
             // A muted sender is told and stops; this is the backstop.
-            // One set lookup per sender, before its packets.
-            let sender_muted = muted.contains(sender);
+            // One set lookup per sender, before its packets. Voice in
+            // the AFK channel goes nowhere either (spec §5).
+            let sender_muted = muted.contains(sender)
+                || (afk_channel.is_some() && sender_channel.copied() == afk_channel);
             while let Some(message) = driver.recv(*sender, Lane::Voice) {
                 self.stats.packets_received += 1;
                 if sender_muted {

@@ -112,6 +112,23 @@ pub enum KeyLookup {
     User(UserId),
 }
 
+/// A channel made from the UI (spec §5). Config channels are not here;
+/// they come from `server.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserChannelRecord {
+    pub stable_id: u64,
+    pub name: String,
+    pub password: Option<String>,
+    pub user_limit: Option<u16>,
+    pub min_role: Option<RoleId>,
+    pub permanent: bool,
+    pub afk_after_min: Option<u16>,
+    pub owner: Option<UserId>,
+    pub created_at: WallMs,
+    /// Since when nobody has been in it; the temporary sweep reads it.
+    pub empty_since: Option<WallMs>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     pub users: HashMap<UserId, UserRecord>,
@@ -121,6 +138,11 @@ pub struct Policy {
     pub restrictions: Vec<Restriction>,
     /// Next restriction id; rebased on the database at load.
     pub next_restriction_id: u64,
+    /// UI-created channels in creation order.
+    pub channels: Vec<UserChannelRecord>,
+    pub next_channel_id: u64,
+    /// Total xp per user (spec §9.1); the level is derived.
+    pub xp: HashMap<UserId, u64>,
 }
 
 impl Default for Policy {
@@ -154,7 +176,16 @@ impl Policy {
             invites: HashMap::new(),
             restrictions: Vec::new(),
             next_restriction_id: 1,
+            channels: Vec::new(),
+            next_channel_id: 1,
+            xp: HashMap::new(),
         }
+    }
+
+    /// A user's level from their xp (spec §9.1).
+    #[must_use]
+    pub fn level_of(&self, user: &UserId) -> u16 {
+        protocol::level_for_xp(self.xp.get(user).copied().unwrap_or(0))
     }
 
     // ── Reads ───────────────────────────────────────────────────────

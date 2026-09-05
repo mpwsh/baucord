@@ -36,14 +36,17 @@ persistence:
 logging:
   level: info
   stats_interval_secs: 30
-  link_stats_interval_secs: 2
+  link_stats_interval_secs: 30
   telemetry: true
   file: server.log
 channels:
-- name: Lobby
-  default: true
-  password: null
-  user_limit: null
+  - name: Faceit
+    password: null
+    user_limit: null
+  - name: Lobby
+    default: true
+    password: null
+    user_limit: null
 user_channels:
   max_per_user: 2
   temporary_after_min: 30

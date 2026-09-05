@@ -35,11 +35,11 @@ use log::{info, warn};
 use protocol::{
     features, pack_system_audio, pack_video_frame, pack_voice_with_flags, parse_system_audio,
     parse_voice, split_sender, AdminCommand, AdminError, AdminOutcome, AudioSample, Auth,
-    ChannelDenyReason, ChannelInfo, ClientId, ClientInfo, ClientKeyProof, ClientMessage,
-    DenyReason, InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason, PathSample,
-    RefusedReason, RemovedKind, RestrictionKind, RoleId, ServerMessage, ShareScope,
-    SharingSample, TelemetryEvent, TelemetrySample, UserId, VideoReassembler, ViewingSample,
-    VOICE_FLAG_RED,
+    ChannelDenyReason, ChannelInfo, ChannelSpec, ChannelUiDenyReason, ClientId, ClientInfo,
+    ClientKeyProof, ClientMessage, ConvRef, DenyReason, HistoryMessage, InviteDenyReason,
+    InviteInvalidReason, Lane, NeedInviteReason, PathSample, RefusedReason, RemovedKind,
+    RestrictionKind, RoleId, ServerMessage, ShareScope, SharingSample, TelemetryEvent,
+    TelemetrySample, UserId, VideoReassembler, ViewingSample, VOICE_FLAG_RED,
 };
 use sha2::{Digest, Sha256};
 use transport::{
@@ -237,6 +237,7 @@ pub enum NetworkMessage {
         client_id: ClientId,
         user_id: UserId,
         roles: Vec<RoleId>,
+        level: u16,
     },
     /// A restriction now applies to us (spec §4.2).
     Restricted {
@@ -252,6 +253,48 @@ pub enum NetworkMessage {
     AdminResult {
         request_id: u32,
         result: Result<AdminOutcome, AdminError>,
+    },
+    /// A page of stored messages, oldest first (spec §6).
+    History {
+        conv: ConvRef,
+        messages: Vec<HistoryMessage>,
+        more: bool,
+    },
+    HistoryUnavailable {
+        conv: ConvRef,
+        retry_secs: u16,
+    },
+    MessageEdited {
+        msg_id: u64,
+        text: String,
+    },
+    MessageDeleted {
+        msg_id: u64,
+    },
+    ChatRateLimited {
+        retry_ms: u32,
+    },
+    /// Our xp crossed a level (spec §9.1).
+    ProgressUpdate {
+        xp: u64,
+        level: u16,
+    },
+    /// Per-channel facts `ChannelInfo` cannot carry (spec §5).
+    ChannelDetails {
+        channel_id: u16,
+        stable_id: u64,
+        owner: Option<UserId>,
+        min_role: Option<RoleId>,
+        permanent: bool,
+        afk_after_min: Option<u16>,
+        is_afk: bool,
+    },
+    ChannelDenied {
+        reason: ChannelUiDenyReason,
+    },
+    /// The server moved us to the AFK channel.
+    MovedIdle {
+        after_min: u16,
     },
     InitClient {
         users: HashMap<ClientId, String>,
@@ -1247,11 +1290,13 @@ impl NetworkClient {
                 client_id,
                 user_id,
                 roles,
+                level,
             } => {
                 self.message_queue.push(NetworkMessage::UserDetails {
                     client_id,
                     user_id,
                     roles,
+                    level,
                 });
             }
             ServerMessage::Restricted {
@@ -1274,6 +1319,69 @@ impl NetworkClient {
             ServerMessage::AdminResult { request_id, result } => {
                 self.message_queue
                     .push(NetworkMessage::AdminResult { request_id, result });
+            }
+            ServerMessage::History {
+                conv,
+                messages,
+                more,
+            } => {
+                self.message_queue.push(NetworkMessage::History {
+                    conv,
+                    messages,
+                    more,
+                });
+            }
+            ServerMessage::HistoryUnavailable { conv, retry_secs } => {
+                warn!("History unavailable; retry in {retry_secs} s");
+                self.message_queue
+                    .push(NetworkMessage::HistoryUnavailable { conv, retry_secs });
+            }
+            ServerMessage::MessageEdited { msg_id, text } => {
+                self.message_queue
+                    .push(NetworkMessage::MessageEdited { msg_id, text });
+            }
+            ServerMessage::MessageDeleted { msg_id } => {
+                self.message_queue
+                    .push(NetworkMessage::MessageDeleted { msg_id });
+            }
+            ServerMessage::ChatRateLimited { retry_ms } => {
+                warn!("Chat rate limited; retry in {retry_ms} ms");
+                self.message_queue
+                    .push(NetworkMessage::ChatRateLimited { retry_ms });
+            }
+            ServerMessage::ProgressUpdate { xp, level } => {
+                info!("Progress: {xp} xp, level {level}");
+                self.message_queue
+                    .push(NetworkMessage::ProgressUpdate { xp, level });
+            }
+            ServerMessage::ChannelDetails {
+                channel_id,
+                stable_id,
+                owner,
+                min_role,
+                permanent,
+                afk_after_min,
+                is_afk,
+            } => {
+                self.message_queue.push(NetworkMessage::ChannelDetails {
+                    channel_id,
+                    stable_id,
+                    owner,
+                    min_role,
+                    permanent,
+                    afk_after_min,
+                    is_afk,
+                });
+            }
+            ServerMessage::ChannelDenied { reason } => {
+                warn!("Channel request refused: {}", reason.describe());
+                self.message_queue
+                    .push(NetworkMessage::ChannelDenied { reason });
+            }
+            ServerMessage::MovedIdle { after_min } => {
+                info!("Moved to the AFK channel after {after_min} idle minutes");
+                self.message_queue
+                    .push(NetworkMessage::MovedIdle { after_min });
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.
@@ -1801,6 +1909,32 @@ pub enum NetworkControl {
         request_id: u32,
         command: AdminCommand,
     },
+    /// Older messages (spec §6); answered by `History`.
+    FetchHistory {
+        conv: ConvRef,
+        before: Option<u64>,
+        limit: u16,
+    },
+    EditMessage {
+        msg_id: u64,
+        text: String,
+    },
+    DeleteMessage {
+        msg_id: u64,
+    },
+    /// Channels from the UI (spec §5).
+    CreateChannel(ChannelSpec),
+    EditChannel {
+        channel_id: u16,
+        spec: ChannelSpec,
+    },
+    DeleteChannel {
+        channel_id: u16,
+    },
+    ChannelKick {
+        channel_id: u16,
+        user_id: UserId,
+    },
     Disconnect,
     SendMessage(String),
     /// Send a chat image (encoded PNG; the UI caps it at
@@ -2024,6 +2158,61 @@ fn handle_control(
                     &ClientMessage::Admin {
                         request_id,
                         command,
+                    },
+                );
+            }
+        }
+        NetworkControl::FetchHistory {
+            conv,
+            before,
+            limit,
+        } => {
+            if let Some(c) = client {
+                c.send_control(
+                    now,
+                    &ClientMessage::FetchHistory {
+                        conv,
+                        before,
+                        limit,
+                    },
+                );
+            }
+        }
+        NetworkControl::EditMessage { msg_id, text } => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::EditMessage { msg_id, text });
+            }
+        }
+        NetworkControl::DeleteMessage { msg_id } => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::DeleteMessage { msg_id });
+            }
+        }
+        NetworkControl::CreateChannel(spec) => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::CreateChannel(spec));
+            }
+        }
+        NetworkControl::EditChannel { channel_id, spec } => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::EditChannel { channel_id, spec });
+            }
+        }
+        NetworkControl::DeleteChannel { channel_id } => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::DeleteChannel { channel_id });
+            }
+        }
+        NetworkControl::ChannelKick {
+            channel_id,
+            user_id,
+        } => {
+            if let Some(c) = client {
+                c.send_control(
+                    now,
+                    &ClientMessage::ChannelKick {
+                        channel_id,
+                        user_id,
                     },
                 );
             }

@@ -12,6 +12,15 @@ mod updater;
 mod viewers;
 
 fn main() {
+    // `--config-dir <dir>` or `--profile <name>`: a second settings
+    // file and identity key on the same machine — two instances for
+    // testing, or two people sharing a PC. Parsed by hand: this binary
+    // has no argument parser and two flags do not earn one. Must run
+    // before anything reads settings or the key.
+    if let Some(dir) = config_dir_from_args() {
+        client::config::set_config_dir(dir);
+    }
+
     #[cfg(debug_assertions)]
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -57,6 +66,13 @@ fn main() {
         }
     }
 
+    log::info!(
+        "Config directory: {}",
+        client::config::settings_file_path()
+            .parent()
+            .map_or_else(|| "?".to_string(), |d| d.display().to_string())
+    );
+
     // A release build aborts on panic and a GUI process has no stderr,
     // so without this a crash on any thread leaves nothing behind but a
     // log that stops mid-sentence. Write the panic — thread, message,
@@ -87,4 +103,29 @@ fn main() {
     // normal return from main() would hang waiting for them.
     // Settings are already saved by this point.
     std::process::exit(0);
+}
+
+/// `--config-dir <dir>`, `--config-dir=<dir>`, `--profile <name>`,
+/// `--profile=<name>`. The environment variable `BAUCORD_CONFIG_DIR`
+/// is read by the client crate itself and needs nothing here.
+fn config_dir_from_args() -> Option<std::path::PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+            None => (arg.clone(), None),
+        };
+        match flag.as_str() {
+            "--config-dir" => {
+                let dir = inline.or_else(|| args.next())?;
+                return Some(std::path::PathBuf::from(dir));
+            }
+            "--profile" => {
+                let name = inline.or_else(|| args.next())?;
+                return Some(client::config::profile_dir(&name));
+            }
+            _ => {}
+        }
+    }
+    None
 }

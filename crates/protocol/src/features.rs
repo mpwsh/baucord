@@ -40,12 +40,14 @@ pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
 /// What a 1.0 server offers: it logs telemetry; it only *logs* client
 /// keys, so it does not announce [`IDENTITY`].
 pub const SERVER_1_0: u64 = TELEMETRY;
-/// What a 1.1 client can do: it logs in by key, presents invites, and
-/// renders roles and restrictions.
-pub const CLIENT_1_1: u64 = CLIENT_1_0 | INVITES | ROLES;
+/// What a 1.1 client can do: it logs in by key, presents invites,
+/// renders roles and restrictions, replays history, shows progress,
+/// and makes channels.
+pub const CLIENT_1_1: u64 = CLIENT_1_0 | INVITES | ROLES | HISTORY | PROGRESS | CHANNELS_UI;
 /// What a 1.1 server offers: keys are the login, invites the door,
-/// roles decide what a session may do.
-pub const SERVER_1_1: u64 = TELEMETRY | IDENTITY | INVITES | ROLES;
+/// roles decide what a session may do, and it keeps history.
+pub const SERVER_1_1: u64 =
+    TELEMETRY | IDENTITY | INVITES | ROLES | HISTORY | PROGRESS | CHANNELS_UI;
 
 /// Bits both sides announced.
 #[must_use]

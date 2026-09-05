@@ -39,14 +39,16 @@ use transport::{
     Budget, DisconnectReason, Driver, DriverHost, Event, Fingerprint, LinkStats, ServerIdentity,
 };
 
+mod channels;
+mod history;
 mod moderation;
 
 use crate::{
     clock::{Clock, WallMs},
-    config::{validate_channel_list, ChannelSettings, Config},
+    config::{channel_infos_of, validate_channel_list, ChannelSettings, Config},
     persistence::{
-        AuditRow, Command, MessageRow, Notice, Persist, TelemetryEventRow, TelemetryRow,
-        GENERAL_CONV,
+        AskId, AuditRow, Command, MessageRow, Notice, Persist, ProgressDelta, TelemetryEventRow,
+        TelemetryRow, GENERAL_CONV,
     },
     policy::{
         self, InviteRecord, KeyHash, KeyLookup, Policy, Restriction, BOOTSTRAP_INVITE_TTL_MS,
@@ -173,6 +175,29 @@ pub struct ChatServer {
     muted: HashSet<ClientId>,
     /// Last expiry sweep of the restrictions.
     last_restriction_sweep: Instant,
+    /// The newest general-chat messages (spec §6): replayed on join,
+    /// and the set an author may still edit or delete. Primed from the
+    /// database at startup.
+    recent: VecDeque<MessageRow>,
+    /// Chat rate limit (`limits.chat`): tokens left and when they were
+    /// last topped up, per session.
+    chat_tokens: HashMap<ClientId, (f64, Instant)>,
+    /// History reads in flight: who asked, for what, how much.
+    pending_history: HashMap<AskId, (ClientId, protocol::ConvRef, u16)>,
+    /// Progress accrued this minute (spec §9.1), flushed once a minute.
+    progress: HashMap<UserId, ProgressDelta>,
+    /// Sessions that spoke since the last progress minute.
+    spoke: HashSet<ClientId>,
+    last_progress_minute: Instant,
+    /// Last activity per session (chat, speaking, joining, sharing),
+    /// for auto-AFK (spec §5).
+    last_activity: HashMap<ClientId, Instant>,
+    last_channel_sweep: Instant,
+    /// The last telemetry line per user, for the admin tooltip.
+    last_telemetry: HashMap<UserId, (WallMs, String)>,
+    /// The channel list clients see: config channels, then UI-created
+    /// ones. `channel_infos` is its wire form.
+    channel_list: Vec<ChannelSettings>,
     /// Voice-channel membership: client → channel id (index into
     /// `channel_infos`). Every admitted client has an entry.
     channel_of: HashMap<ClientId, u16>,
@@ -287,6 +312,7 @@ impl ChatServer {
         budget.socket_buffer_bytes = send_buffer_target(config.network.max_clients);
         let driver = Driver::new_server(identity, config.network.max_clients, budget)?;
 
+        let config_channels_for_list = config.channels.clone();
         let mut server = Self {
             config,
             driver,
@@ -308,6 +334,16 @@ impl ChatServer {
             deafened: HashSet::new(),
             muted: HashSet::new(),
             last_restriction_sweep: now,
+            recent: startup.recent.into_iter().collect(),
+            chat_tokens: HashMap::new(),
+            pending_history: HashMap::new(),
+            progress: HashMap::new(),
+            spoke: HashSet::new(),
+            last_progress_minute: now,
+            last_activity: HashMap::new(),
+            last_channel_sweep: now,
+            last_telemetry: HashMap::new(),
+            channel_list: config_channels_for_list,
             channel_of: HashMap::new(),
             channel_infos,
             default_channel,
@@ -334,6 +370,20 @@ impl ChatServer {
             && let Some(invite) = server.policy.invites.get(&code).cloned()
         {
             server.persist.send(Command::InsertInvite { code, invite });
+        }
+        // UI-created channels from the store join the list.
+        server.rebuild_channel_list()?;
+        if !server.policy.channels.is_empty() {
+            info!(
+                "UI channels: {}",
+                server
+                    .policy
+                    .channels
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         Ok(server)
     }
@@ -452,10 +502,20 @@ impl ChatServer {
             Some(format!("{:?} until {:?}: {}", stored.kind, stored.until, stored.reason)),
         );
         if stored.kind == RestrictionKind::Server {
+            // An address or key match can reach people the actor never
+            // named: never the actor, never anyone at or above their
+            // rank (the rank rule, spec §8, applied to the fallout).
+            let actor_rank = stored.by.map(|a| self.policy.rank_of(&a));
             let hit: Vec<ClientId> = self
                 .user_of
                 .iter()
                 .filter(|(client, user)| {
+                    if stored.by.as_ref() == Some(*user) {
+                        return false;
+                    }
+                    if actor_rank.is_some_and(|rank| self.policy.rank_of(user) >= rank) {
+                        return false;
+                    }
                     let key = self.key_of.get(*client);
                     let ip = self.driver.remote_address(**client).map(|a| a.ip());
                     stored.user_id.as_ref() == Some(*user)
@@ -464,14 +524,10 @@ impl ChatServer {
                 })
                 .map(|(client, _)| *client)
                 .collect();
-            // A kick names the user only; a ban blocks the key and the
-            // address too (spec §4.1).
-            let kind = if stored.key_hash.is_some() || stored.ip.is_some() {
-                RemovedKind::Banned {
-                    until: stored.until,
-                }
-            } else {
-                RemovedKind::Kicked
+            // A `server` restriction is a ban (a kick is not a
+            // restriction at all; it forgets the keys instead).
+            let kind = RemovedKind::Banned {
+                until: stored.until,
             };
             for client in hit {
                 self.remove_session(client, kind.clone(), &stored.reason, by_name);
@@ -609,15 +665,25 @@ impl ChatServer {
             self.last_restriction_sweep = now;
             self.sweep_restrictions();
         }
+        if now.duration_since(self.last_progress_minute) >= Duration::from_secs(60) {
+            self.last_progress_minute = now;
+            self.flush_progress();
+        }
+        if now.duration_since(self.last_channel_sweep) >= Duration::from_secs(30) {
+            self.last_channel_sweep = now;
+            self.sweep_channels();
+        }
 
         let clients = self.clients();
         let media_before = self.media_packet_count();
+        let afk = self.afk_channel();
         self.voice.process(
             &mut self.driver,
             now,
             &clients,
             &self.deafened,
             &self.muted,
+            afk,
             &self.channel_of,
         );
         self.video.process(&mut self.driver, now, &clients);
@@ -1165,9 +1231,7 @@ impl ChatServer {
     fn poll_persistence(&mut self) {
         let polled = self.persist.poll(self.now);
         for (id, outcome) in polled.answers {
-            // History replay (the first consumer) lands with step D;
-            // until then an answer has nobody to go to.
-            debug!("persistence answer {id:?}: {outcome:?}");
+            self.resolve_history_answer(id, outcome);
         }
         for notice in polled.notices {
             match notice {
@@ -1507,6 +1571,10 @@ impl ChatServer {
             );
         }
 
+        self.last_activity.insert(client_id, self.now);
+        self.send_channel_details(client_id);
+        self.replay_history(client_id);
+
         // Who everyone is, for clients that render roles (spec §8):
         // the whole roster to the newcomer, the newcomer to everyone.
         let details: Vec<ServerMessage> = self
@@ -1542,6 +1610,9 @@ impl ChatServer {
             .remove(&client_id)
             .unwrap_or_else(|| format!("User{client_id:x}"));
         self.features_of.remove(&client_id);
+        self.chat_tokens.remove(&client_id);
+        self.last_activity.remove(&client_id);
+        self.spoke.remove(&client_id);
         if let Some(user_id) = self.user_of.remove(&client_id) {
             let key_hash = self.key_of.remove(&client_id);
             let now = self.wall_now();
@@ -1635,11 +1706,15 @@ impl ChatServer {
                 ) {
                     return;
                 }
+                if !self.chat_allowed_by_rate(client_id) {
+                    return;
+                }
                 let text =
                     protocol::truncate_on_char_boundary(&text, self.config.limits.max_chat_bytes);
                 let username = self.get_username(client_id);
                 info!("[{username}]: {text}");
                 self.stats.messages_count += 1;
+                self.note_activity(client_id);
                 let (id, ts) = self.stamp();
                 self.broadcast_msg(&ServerMessage::Chat(ChatMessage {
                     id,
@@ -1651,27 +1726,63 @@ impl ChatServer {
                 // then enqueue the insert. Under backpressure this is a
                 // hole in history, never a lost message.
                 if let Some(user_id) = self.user_of.get(&client_id).copied() {
-                    self.persist.send(Command::InsertMessage(MessageRow {
+                    let row = MessageRow {
                         msg_id: id,
                         conv_id: GENERAL_CONV,
                         ts,
                         user_id,
                         body: text,
-                    }));
+                        name: username,
+                        edited: false,
+                    };
+                    self.remember_message(&row);
+                    self.persist.send(Command::InsertMessage(row));
+                    self.progress.entry(user_id).or_default().messages += 1;
                 }
             }
+            ClientMessage::FetchHistory {
+                conv,
+                before,
+                limit,
+            } => self.handle_fetch_history(client_id, conv, before, limit),
+            ClientMessage::EditMessage { msg_id, text } => {
+                self.handle_edit_message(client_id, msg_id, text);
+            }
+            ClientMessage::DeleteMessage { msg_id } => {
+                self.handle_delete_message(client_id, msg_id, false);
+            }
+            ClientMessage::CreateChannel(spec) => self.handle_create_channel(client_id, spec),
+            ClientMessage::EditChannel { channel_id, spec } => {
+                self.handle_edit_channel(client_id, channel_id, spec);
+            }
+            ClientMessage::DeleteChannel { channel_id } => {
+                self.handle_delete_channel(client_id, channel_id);
+            }
+            ClientMessage::ChannelKick {
+                channel_id,
+                user_id,
+            } => self.handle_channel_kick(client_id, channel_id, user_id),
             ClientMessage::ChatImageChunk {
                 upload_id,
                 index,
                 count,
                 data,
             } => {
-                // Told once per upload (on its first chunk), then the
-                // rest of it is dropped quietly.
+                // An image is a chat message too: a text mute silences
+                // it and it spends a rate-limit token, on top of needing
+                // `UPLOAD`. Told once per upload (on its first chunk),
+                // then the rest of it is dropped quietly.
                 let permitted = if index == 0 {
                     self.allowed(client_id, permissions::UPLOAD, RestrictionKind::Upload)
+                        && self.allowed(
+                            client_id,
+                            permissions::TEXT_GENERAL,
+                            RestrictionKind::GeneralText,
+                        )
+                        && self.chat_allowed_by_rate(client_id)
                 } else {
                     self.has_permission(client_id, permissions::UPLOAD)
+                        && self.has_permission(client_id, permissions::TEXT_GENERAL)
                 };
                 if !permitted {
                     return;
@@ -1679,6 +1790,10 @@ impl ChatServer {
                 self.handle_image_chunk(client_id, upload_id, index, count, data);
             }
             ClientMessage::Speaking(is_speaking) => {
+                if is_speaking {
+                    self.note_activity(client_id);
+                    self.spoke.insert(client_id);
+                }
                 // Broadcast to everyone including the sender: the UI
                 // treats the echo as authoritative for its own tile.
                 self.broadcast_msg(&ServerMessage::Speaking {
@@ -1709,6 +1824,7 @@ impl ChatServer {
                 height,
                 scope,
             } => {
+                self.note_activity(client_id);
                 self.handle_share_start(client_id, width, height, scope);
             }
             ClientMessage::ScreenShareStop => {
@@ -1719,6 +1835,7 @@ impl ChatServer {
                 self.broadcast_msg(&ServerMessage::ScreenShareStopped { client_id });
             }
             ClientMessage::SubscribeScreen { target_id } => {
+                self.note_activity(client_id);
                 self.handle_subscribe(client_id, target_id);
             }
             ClientMessage::UnsubscribeScreen { target_id } => {
@@ -1742,6 +1859,7 @@ impl ChatServer {
                 channel_id,
                 password,
             } => {
+                self.note_activity(client_id);
                 self.handle_join_channel(client_id, channel_id, password.as_deref());
             }
 
@@ -1818,6 +1936,11 @@ impl ChatServer {
                         self.get_username(client_id),
                         summarize_telemetry(&sample)
                     );
+                }
+                if let Some(user_id) = self.user_of.get(&client_id).copied() {
+                    let line = summarize_telemetry(&sample);
+                    self.last_telemetry
+                        .insert(user_id, (self.clock.wall_ms(self.now), line));
                 }
                 if self.persist.is_persistent()
                     && let Some(user_id) = self.user_of.get(&client_id).copied()
@@ -2044,6 +2167,21 @@ impl ChatServer {
     /// # Errors
     /// The list failed validation; nothing was changed.
     pub fn apply_channel_config(&mut self, channels: Vec<ChannelSettings>) -> Result<(), String> {
+        validate_channel_list(&channels)?;
+        let previous = std::mem::replace(&mut self.config.channels, channels);
+        if let Err(e) = self.rebuild_channel_list() {
+            self.config.channels = previous;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The renumbering itself, for the full list (config channels then
+    /// UI ones); see `apply_channel_config` for the semantics.
+    pub(crate) fn apply_channel_list(
+        &mut self,
+        channels: Vec<ChannelSettings>,
+    ) -> Result<(), String> {
         let new_default = validate_channel_list(&channels)?;
 
         #[allow(clippy::cast_possible_truncation)] // validated ≤ MAX_CHANNELS
@@ -2079,8 +2217,8 @@ impl ChatServer {
             })
             .collect();
 
-        self.config.channels = channels;
-        self.channel_infos = self.config.channel_infos();
+        self.channel_list = channels;
+        self.channel_infos = channel_infos_of(&self.channel_list);
         self.default_channel = new_default;
         self.channel_of = new_channel_of;
 
@@ -2157,7 +2295,7 @@ impl ChatServer {
         channel_id: u16,
         password: Option<&str>,
     ) {
-        let Some(target) = self.config.channels.get(usize::from(channel_id)) else {
+        let Some(target) = self.channel_list.get(usize::from(channel_id)).cloned() else {
             self.deny_join(client_id, channel_id, ChannelDenyReason::NoSuchChannel);
             return;
         };
@@ -2165,7 +2303,9 @@ impl ChatServer {
         if old_channel == Some(channel_id) {
             return; // already there — nothing to do
         }
-        if !self.has_permission(client_id, permissions::JOIN_CHANNELS) {
+        if !self.has_permission(client_id, permissions::JOIN_CHANNELS)
+            || !self.join_gate_allows(client_id, channel_id)
+        {
             self.deny_join(client_id, channel_id, ChannelDenyReason::NotPermitted);
             return;
         }

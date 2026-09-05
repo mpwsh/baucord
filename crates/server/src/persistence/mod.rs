@@ -47,7 +47,8 @@ use log::{debug, info, warn};
 use protocol::{TelemetrySample, UserId};
 
 pub use self::store::{
-    backup_to_tar, blobs_dir, check, cli_create_invite, cli_find_user, cli_lift_restriction,
+    backup_to_tar, blobs_dir, check, cli_create_invite, cli_find_user, cli_kick,
+    cli_lift_restriction, cli_purge, cli_telemetry, TelemetryLine,
     cli_list_invites, cli_load_policy, cli_restrict, cli_revoke_invite, cli_set_key,
     cli_set_roles, hex,
     parse_hex_id, BackupReport, CheckReport, GENERAL_CONV, SCHEMA_VERSION,
@@ -56,8 +57,13 @@ use self::store::{Retention, Sqlite, Store};
 use crate::{
     clock::WallMs,
     config::PersistenceSettings,
-    policy::{InviteRecord, KeyRecord, Policy, Restriction, UserRecord},
+    policy::{InviteRecord, KeyRecord, Policy, Restriction, UserChannelRecord, UserRecord},
 };
+
+/// General-chat messages the tick keeps in memory for replay and for
+/// edit/delete checks (spec §6): at least `history.replay`, and enough
+/// that the last few minutes of a lively room stay editable.
+pub const RECENT_RING: u16 = 200;
 
 /// Depth of the read-request queue. Reads are rare (a history page on
 /// join, a DM inbox) and each carries its own reply channel.
@@ -115,6 +121,24 @@ pub struct MessageRow {
     pub ts: WallMs,
     pub user_id: UserId,
     pub body: String,
+    /// The author's name of record (read side only; the users table
+    /// carries it).
+    pub name: String,
+    pub edited: bool,
+}
+
+/// A minute's worth of progress for one user (spec §9.1), added to the
+/// counters.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressDelta {
+    pub user_id: UserId,
+    pub xp: u64,
+    pub talk_seconds: u64,
+    pub share_seconds: u64,
+    pub watch_seconds: u64,
+    pub online_seconds: u64,
+    pub messages: u64,
+    pub ts: WallMs,
 }
 
 /// One telemetry sample: the columns worth querying pulled out, the
@@ -210,6 +234,14 @@ pub enum Command {
         ts: WallMs,
     },
     RevokeRole { user_id: UserId, role_id: u32 },
+    /// Forget every device key of a user (a kick).
+    DeleteUserKeys { user_id: UserId },
+    EditMessage { msg_id: u64, body: String, ts: WallMs },
+    DeleteMessage { msg_id: u64, ts: WallMs },
+    UpsertChannel(UserChannelRecord),
+    DeleteChannel { stable_id: u64 },
+    AddProgress(ProgressDelta),
+    PurgeUser { user_id: UserId },
     InsertInvite { code: String, invite: InviteRecord },
     UseInvite { code: String },
     RevokeInvite { code: String, ts: WallMs },
@@ -359,9 +391,12 @@ impl fmt::Display for PersistStats {
 pub struct StartupInfo {
     /// The persisted message-id watermark plus one.
     pub next_message_id: u64,
-    /// Users, keys, roles, invites, restrictions — empty but for the
-    /// built-in roles with persistence off.
+    /// Users, keys, roles, invites, restrictions, channels, progress —
+    /// empty but for the built-in roles with persistence off.
     pub policy: Policy,
+    /// The newest general-chat messages, oldest first: the tick's
+    /// replay ring starts from these.
+    pub recent: Vec<MessageRow>,
 }
 
 // ── The tick's handle ───────────────────────────────────────────────────
@@ -391,10 +426,11 @@ impl Persist {
     /// The database could not be opened or migrated, or the thread
     /// could not be spawned.
     pub fn spawn(settings: &PersistenceSettings) -> Result<(Self, StartupInfo), PersistError> {
-        let (store, next_message_id, policy) = if settings.enabled {
+        let (store, next_message_id, policy, recent) = if settings.enabled {
             let path = PathBuf::from(settings.path.trim());
             let (db, next) = Sqlite::open(&path)?;
             let policy = db.load_policy()?;
+            let recent = db.messages_before(GENERAL_CONV, None, RECENT_RING)?;
             info!(
                 "Policy loaded: {} users, {} keys, {} roles, {} invites, {} restrictions",
                 policy.users.len(),
@@ -403,13 +439,13 @@ impl Persist {
                 policy.invites.len(),
                 policy.restrictions.len()
             );
-            (Store::Sqlite(db), next, policy)
+            (Store::Sqlite(db), next, policy, recent)
         } else {
             info!(
                 "Persistence off: roles, invites and bans last until the process exits; \
                  nothing is written to disk"
             );
-            (Store::Memory, 1, Policy::new())
+            (Store::Memory, 1, Policy::new(), Vec::new())
         };
         let capacity = settings.write_queue.max(1);
         let (writes_tx, writes_rx) = bounded(capacity);
@@ -456,6 +492,7 @@ impl Persist {
             StartupInfo {
                 next_message_id,
                 policy,
+                recent,
             },
         ))
     }
@@ -721,6 +758,13 @@ impl Worker {
                 ts,
             } => db.grant_role(user_id, *role_id, granted_by.as_ref(), *ts),
             Command::RevokeRole { user_id, role_id } => db.revoke_role(user_id, *role_id),
+            Command::DeleteUserKeys { user_id } => db.delete_user_keys(user_id),
+            Command::EditMessage { msg_id, body, ts } => db.edit_message(*msg_id, body, *ts),
+            Command::DeleteMessage { msg_id, ts } => db.delete_message(*msg_id, *ts),
+            Command::UpsertChannel(c) => db.upsert_channel(c),
+            Command::DeleteChannel { stable_id } => db.delete_channel(*stable_id),
+            Command::AddProgress(p) => db.add_progress(p),
+            Command::PurgeUser { user_id } => db.purge_user(user_id),
             Command::InsertInvite { code, invite } => db.insert_invite(code, invite),
             Command::UseInvite { code } => db.use_invite(code),
             Command::RevokeInvite { code, ts } => db.revoke_invite(code, *ts),
@@ -826,6 +870,8 @@ mod tests {
             ts: wall_now() + msg_id,
             user_id: [3u8; 32],
             body: format!("m{msg_id}"),
+            name: String::new(),
+            edited: false,
         })
     }
 

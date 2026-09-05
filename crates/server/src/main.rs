@@ -82,6 +82,16 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// A user's stored telemetry samples (needs persistence on).
+    Telemetry {
+        who: String,
+        /// Only samples from the last `since`, e.g. `30m`, `2h`, `7d`.
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// At most this many samples, newest.
+        #[arg(long, default_value_t = 50)]
+        last: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -93,7 +103,8 @@ enum UserCommand {
     Grant { who: String, role: String },
     /// Remove a role. The last admin keeps `admin`.
     Revoke { who: String, role: String },
-    /// Revoke joining until lifted; the session is closed.
+    /// Close the session and forget their devices and roles: they need
+    /// a new invite to come back.
     Kick {
         who: String,
         #[arg(long, default_value = "")]
@@ -108,6 +119,9 @@ enum UserCommand {
         #[arg(long, default_value = "")]
         reason: String,
     },
+    /// Delete a person: their row, keys, roles, restrictions, progress
+    /// and messages. One audit line stays.
+    Purge { who: String },
     /// Drop their voice at the relay.
     Mute {
         who: String,
@@ -214,6 +228,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::User { command }) => return user_command(&config, command),
         Some(Command::Restriction { command }) => return restriction_command(&config, command),
         Some(Command::Key { command }) => return key_command(&config, command),
+        Some(Command::Telemetry { who, since, last }) => {
+            return telemetry_command(&config, &who, &since, last);
+        }
         None => {}
     }
 
@@ -583,8 +600,11 @@ fn user_command(config: &Config, command: UserCommand) -> Result<(), Box<dyn std
         }
         UserCommand::Kick { who, reason } => {
             let (user, policy) = persistence::cli_find_user(&db, &who)?;
-            let id = persistence::cli_restrict(&db, restriction_for(user, None, None, reason))?;
-            println!("kicked {} (restriction {id})", policy.users[&user].name);
+            persistence::cli_kick(&db, &user, &reason)?;
+            println!(
+                "kicked {}: their devices and roles are forgotten; they need a new invite",
+                policy.users[&user].name
+            );
             Ok(())
         }
         UserCommand::Ban {
@@ -608,6 +628,15 @@ fn user_command(config: &Config, command: UserCommand) -> Result<(), Box<dyn std
             println!("banned {} (restriction {id})", policy.users[&user].name);
             Ok(())
         }
+        UserCommand::Purge { who } => {
+            let (user, policy) = persistence::cli_find_user(&db, &who)?;
+            persistence::cli_purge(&db, &user)?;
+            println!(
+                "purged {}: row, keys, roles, restrictions, progress and messages",
+                policy.users[&user].name
+            );
+            Ok(())
+        }
         UserCommand::Mute {
             who,
             duration,
@@ -622,6 +651,40 @@ fn user_command(config: &Config, command: UserCommand) -> Result<(), Box<dyn std
             Ok(())
         }
     }
+}
+
+/// `server telemetry <who>`: the stored samples (spec §9).
+fn telemetry_command(
+    config: &Config,
+    who: &str,
+    since: &str,
+    last: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    let (user, policy) = persistence::cli_find_user(&db, who)?;
+    let window = parse_ttl(since)?.unwrap_or(u64::MAX);
+    let from = persistence_wall_now().saturating_sub(window);
+    let lines = persistence::cli_telemetry(&db, &user, from, last)?;
+    if lines.is_empty() {
+        println!("no telemetry from {} in that window", policy.users[&user].name);
+        return Ok(());
+    }
+    println!("{} — {} sample(s), oldest first:", policy.users[&user].name, lines.len());
+    for l in lines {
+        println!(
+            "{}  rtt {:>4} ms  loss {:>5.1}%  voice {}  behind {}  rung {}  in '{}'  out '{}'",
+            describe_ago(l.ts),
+            l.rtt_ms,
+            l.path_loss,
+            l.voice_loss
+                .map_or_else(|| "  -  ".to_string(), |v| format!("{v:>5.1}%")),
+            l.groups_behind.map_or_else(|| "-".to_string(), |g| g.to_string()),
+            l.rung.map_or_else(|| "-".to_string(), |r| format!("{r}%")),
+            l.input_device.as_deref().unwrap_or("?"),
+            l.output_device.as_deref().unwrap_or("?"),
+        );
+    }
+    Ok(())
 }
 
 /// `server restriction …`.

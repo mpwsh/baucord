@@ -75,8 +75,11 @@ impl RestrictionKind {
     }
 }
 
-/// Whom a restriction applies to. A ban sets all it knows about the
-/// person; the command form names one.
+/// Whom a command is about. A client that has the person in its roster
+/// sends the id; for someone offline (a ban to lift, a kick to undo)
+/// it sends the name, and the server resolves it — a name of record,
+/// case-insensitive, or a hex id prefix of at least 8 digits. An
+/// ambiguous name is refused with the candidates listed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminTarget {
     User(UserId),
@@ -84,6 +87,8 @@ pub enum AdminTarget {
     Key(UserId),
     /// A source IP address, in text.
     Address(String),
+    /// A user by name of record or id prefix, resolved by the server.
+    Name(String),
 }
 
 /// One administrative action (spec §8). `reason` texts are shown to the
@@ -93,12 +98,16 @@ pub enum AdminCommand {
     ListUsers,
     ListRestrictions,
     ListInvites,
-    /// Replace a user's role set. Needs `MANAGE_ROLES`; every role must
-    /// rank below the actor's own rank, and the last admin keeps
-    /// `admin`.
-    SetRoles { user_id: UserId, roles: Vec<RoleId> },
+    /// Replace a user's role set. Needs `MANAGE_ROLES`; no role may
+    /// rank above the actor's own, admins may edit each other, and the
+    /// last admin keeps `admin`.
+    SetRoles {
+        target: AdminTarget,
+        roles: Vec<RoleId>,
+    },
     /// Add a restriction (needs `RESTRICT`, or `MUTE` for `voice`).
-    /// `duration_secs: None` = until lifted.
+    /// `duration_secs: None` = until lifted. `/mute` is this with
+    /// `voice` or `text`.
     Restrict {
         target: AdminTarget,
         kind: RestrictionKind,
@@ -108,26 +117,45 @@ pub enum AdminCommand {
     /// Remove a restriction by id (needs `RESTRICT`, or `MUTE` for a
     /// `voice` one).
     Lift { restriction_id: u64 },
+    /// Remove every restriction of `kind` on a user (`/unmute`). Same
+    /// permission as `Restrict`.
+    Unmute {
+        target: AdminTarget,
+        kind: RestrictionKind,
+    },
     /// Close the session; access unchanged (needs `DISCONNECT`).
-    Disconnect { user_id: UserId, reason: String },
-    /// Close the session and revoke joining until lifted (needs `KICK`).
-    Kick { user_id: UserId, reason: String },
-    /// Kick, and block the key and address too (needs `BAN`).
+    Disconnect { target: AdminTarget, reason: String },
+    /// Close the session and forget the person's device keys and
+    /// roles: they need a new invite to come back, and start over as
+    /// whatever it grants (needs `KICK`). Nothing to lift.
+    Kick { target: AdminTarget, reason: String },
+    /// Close the session and block the user, their key and their
+    /// address until `duration_secs` runs out or `Unban` (needs `BAN`).
     Ban {
-        user_id: UserId,
+        target: AdminTarget,
         duration_secs: Option<u64>,
         reason: String,
     },
+    /// Remove every `server` restriction on a user (needs `BAN`).
+    Unban { target: AdminTarget },
     /// Put a user in another voice channel (needs `MANAGE_CHANNELS`).
-    MoveUser { user_id: UserId, channel_id: u16 },
+    MoveUser { target: AdminTarget, channel_id: u16 },
     /// Stop a code from admitting anyone else (needs `MANAGE_INVITES`).
     RevokeInvite { code: String },
     /// Attach a device key to a user — a retired key, or one seen in the
     /// log (needs `MANAGE_USERS`).
-    LinkKey { user_id: UserId, key_hash: UserId },
+    LinkKey { target: AdminTarget, key_hash: UserId },
     /// Retire a device key: that device is refused until re-linked
     /// (needs `MANAGE_USERS`).
     UnlinkKey { key_hash: UserId },
+    /// Remove anyone's message (needs `RESTRICT`).
+    DeleteMessage { msg_id: u64 },
+    /// Delete a person: their row, keys, roles, restrictions, progress
+    /// and messages. The audit keeps a line (needs `MANAGE_USERS`).
+    PurgeUser { target: AdminTarget },
+    /// The last telemetry sample a user sent, summarized (needs
+    /// `MANAGE_USERS`): what the roster tooltip shows.
+    LastTelemetry { target: AdminTarget },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +212,16 @@ pub enum AdminOutcome {
     Users(Vec<UserSummary>),
     Restrictions(Vec<RestrictionSummary>),
     Invites(Vec<InviteSummary>),
+    /// `None`: nothing received from that user this run.
+    Telemetry(Option<TelemetrySummary>),
+}
+
+/// A user's last telemetry, as the server logs it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetrySummary {
+    /// Milliseconds since the Unix epoch.
+    pub ts: u64,
+    pub line: String,
 }
 
 /// Why a command was refused. The client renders one line each.

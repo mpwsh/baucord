@@ -124,6 +124,15 @@ pub struct AppState {
     /// Admin requests in flight: what to do with the answer.
     pending_admin: HashMap<u32, PendingAdmin>,
     next_request_id: u32,
+    /// A server voice mute stands (spec §4.2): the mute button is
+    /// locked, and `Some(was_muted)` remembers what to restore.
+    server_muted: Option<bool>,
+    /// A server text mute stands: the composer refuses to send.
+    text_muted: Option<Option<u64>>,
+    /// The oldest history id shown, for `/history` paging.
+    oldest_history_id: Option<u64>,
+    /// Per-channel facts from `ChannelDetails`, keyed by wire id.
+    channel_details: HashMap<u16, ChannelFacts>,
     is_muted: bool,
     is_deafened: bool,
     pub is_testing_mic: bool,
@@ -340,6 +349,10 @@ pub fn run() {
         details: HashMap::new(),
         pending_admin: HashMap::new(),
         next_request_id: 1,
+        server_muted: None,
+        text_muted: None,
+        oldest_history_id: None,
+        channel_details: HashMap::new(),
         settings,
         is_muted: false,
         is_deafened: false,
@@ -675,10 +688,20 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_preview_send(move || {
         with_app(&w, |app| {
             if let Some(png) = app.pending_preview.take() {
-                // Same broadcast semantics as SendMessage: the server
-                // relays ImageMessage back to everyone (sender
-                // included), so no local echo is needed here.
-                app.network.tx.send(NetworkControl::SendImage(png)).ok();
+                if let Some(until) = app.text_muted {
+                    // The server would drop it; say so here instead.
+                    let until = format!(" {}", describe_until(until));
+                    app.show_error(&t!(
+                        "restricted-text",
+                        "until" => until.as_str(),
+                        "reason" => ""
+                    ));
+                } else {
+                    // Same broadcast semantics as SendMessage: the server
+                    // relays ImageMessage back to everyone (sender
+                    // included), so no local echo is needed here.
+                    app.network.tx.send(NetworkControl::SendImage(png)).ok();
+                }
             }
             app.preview_gif = None;
             app.main.global::<State>().set_preview_open(false);
@@ -1169,18 +1192,113 @@ impl AppState {
                     client::InviteDenyReason::RoleNotAllowed => "chat-invite-role-not-allowed",
                 }));
             }
+            NetworkMessage::History {
+                conv: _,
+                messages,
+                more,
+            } => {
+                // Oldest first; the replay lands right after the roster,
+                // a page from `/history` lands after whatever is there.
+                if let Some(first) = messages.first() {
+                    self.oldest_history_id = Some(first.id);
+                }
+                for m in &messages {
+                    let ts = format_wall_time(m.ts);
+                    let text = app_core::emoji::replace_shortcodes(&m.text);
+                    let text = if m.edited {
+                        format!("{text} {}", t!("chat-edited-mark"))
+                    } else {
+                        text
+                    };
+                    self.push_chat_message(&ts, &m.name, &text);
+                }
+                if !messages.is_empty() {
+                    let line = t!(
+                        "chat-history-loaded",
+                        "count" => messages.len(),
+                        "more" => if more { "yes" } else { "no" }
+                    );
+                    self.push_chat_system(&line);
+                }
+            }
+            NetworkMessage::HistoryUnavailable { retry_secs, .. } => {
+                self.push_chat_system(&t!("chat-history-unavailable", "secs" => retry_secs));
+            }
+            NetworkMessage::MessageEdited { msg_id, text } => {
+                let text = app_core::emoji::replace_shortcodes(&text);
+                self.push_chat_system(&t!(
+                    "chat-message-edited",
+                    "id" => msg_id,
+                    "text" => text.as_str()
+                ));
+            }
+            NetworkMessage::MessageDeleted { msg_id } => {
+                self.push_chat_system(&t!("chat-message-deleted", "id" => msg_id));
+            }
+            NetworkMessage::ChatRateLimited { retry_ms } => {
+                let secs = retry_ms.div_ceil(1000);
+                self.show_error(&t!("chat-rate-limited", "secs" => secs));
+            }
+            NetworkMessage::ProgressUpdate { xp, level } => {
+                let line = t!("chat-level-up", "level" => level, "xp" => xp);
+                self.push_chat_system(&line);
+                self.show_error(&line);
+            }
+            NetworkMessage::ChannelDetails {
+                channel_id,
+                stable_id,
+                owner,
+                permanent,
+                is_afk,
+                ..
+            } => {
+                self.channel_details.insert(
+                    channel_id,
+                    ChannelFacts {
+                        stable_id,
+                        owner,
+                        permanent,
+                        is_afk,
+                    },
+                );
+            }
+            NetworkMessage::ChannelDenied { reason } => {
+                self.show_error(reason.describe());
+                self.push_chat_system(reason.describe());
+            }
+            NetworkMessage::MovedIdle { after_min } => {
+                let line = t!("chat-moved-idle", "min" => after_min);
+                self.push_chat_system(&line);
+                self.show_error(&line);
+            }
             NetworkMessage::UserDetails {
                 client_id,
                 user_id,
                 roles,
+                level: _,
             } => {
-                self.details.insert(client_id, (user_id, roles));
+                let before = self.details.insert(client_id, (user_id, roles.clone()));
+                if Some(client_id) == self.our_client_id
+                    && let Some((_, old)) = before
+                    && old != roles
+                {
+                    let names: Vec<String> = roles.iter().map(|r| role_label(*r)).collect();
+                    let now = if names.is_empty() {
+                        t!("roles-none")
+                    } else {
+                        names.join(", ")
+                    };
+                    let what = t!("chat-your-roles-changed", "roles" => now.as_str());
+                    self.push_chat_system(&what);
+                    self.show_error(&what);
+                }
             }
             NetworkMessage::Restricted {
                 kind,
                 until,
                 reason,
             } => {
+                let until_ms = until;
                 // "… for 2 h: spam" / "… indefinitely: spam" / a role gap
                 // has neither: "… — not allowed by your role".
                 let by_role = reason.is_empty() && until.is_none();
@@ -1203,14 +1321,36 @@ impl AppState {
                 );
                 self.push_chat_system(&what);
                 self.show_error(&what);
-                // A server mute: stop sending too (spec §4.2); the relay
-                // is the backstop, not the path.
-                if kind == client::RestrictionKind::Voice && !self.is_muted {
-                    self.handle_toggle_mute();
+                match kind {
+                    // A server mute: stop sending (spec §4.2), and keep
+                    // the button locked until it lifts.
+                    client::RestrictionKind::Voice => {
+                        if self.server_muted.is_none() {
+                            self.server_muted = Some(self.is_muted);
+                        }
+                        if !self.is_muted {
+                            self.set_muted(true);
+                        }
+                    }
+                    client::RestrictionKind::GeneralText => {
+                        self.text_muted = Some(until_ms);
+                    }
+                    _ => {}
                 }
             }
             NetworkMessage::RestrictionLifted { kind } => {
                 self.push_chat_system(&t!(lifted_key(kind)));
+                match kind {
+                    client::RestrictionKind::Voice => {
+                        if let Some(was_muted) = self.server_muted.take()
+                            && !was_muted
+                        {
+                            self.set_muted(false);
+                        }
+                    }
+                    client::RestrictionKind::GeneralText => self.text_muted = None,
+                    _ => {}
+                }
             }
             NetworkMessage::AdminResult { request_id, result } => {
                 self.handle_admin_result(request_id, result);
@@ -1309,6 +1449,11 @@ impl AppState {
                     }
                     DisconnectKind::Refused(client::RefusedReason::Banned { until, reason }) => {
                         let until = describe_until(*until);
+                        let reason = if reason.is_empty() {
+                            t!("reason-none")
+                        } else {
+                            reason.clone()
+                        };
                         t!(
                             "error-banned",
                             "reason" => reason.as_str(),
@@ -1319,6 +1464,11 @@ impl AppState {
                         t!("error-outdated")
                     }
                     DisconnectKind::Removed { kind, reason, by } => {
+                        let reason = if reason.is_empty() {
+                            t!("reason-none")
+                        } else {
+                            reason.clone()
+                        };
                         let key = match kind {
                             client::RemovedKind::Disconnected => "removed-disconnected",
                             client::RemovedKind::Kicked => "removed-kicked",
@@ -1564,21 +1714,38 @@ impl AppState {
     fn handle_slash_command(&mut self, command: &str, args: &str) {
         match command {
             "invite" => self.handle_invite_command(args),
-            "help" | "commands" => self.push_chat_system(&t!("chat-commands-help")),
+            "help" | "commands" => {
+                let commands = self.commands_available();
+                let line = t!("chat-commands-help", "commands" => commands.as_str());
+                self.push_chat_system(&line);
+            }
+            "leave" => self.handle_disconnect(),
+            "quit" | "exit" => {
+                let _ = slint::quit_event_loop();
+            }
             "users" => self.send_admin(AdminCommand::ListUsers, PendingAdmin::Show),
-            "restrictions" => {
+            "restrictions" | "bans" => {
                 self.send_admin(AdminCommand::ListRestrictions, PendingAdmin::Show);
             }
             "invites" => self.send_admin(AdminCommand::ListInvites, PendingAdmin::Show),
-            "kick" | "ban" | "disconnect" | "mute" | "unmute" | "restrict" | "grant"
-            | "revoke" | "move" => self.handle_user_command(command, args),
-            "lift" => match args.trim().parse::<u64>() {
-                Ok(restriction_id) => self.send_admin(
-                    AdminCommand::Lift { restriction_id },
-                    PendingAdmin::Show,
-                ),
-                Err(_) => self.push_chat_system(&t!("chat-command-usage-lift")),
-            },
+            "telemetry" => {
+                let target = self.target_for(args.trim());
+                self.send_admin(AdminCommand::LastTelemetry { target }, PendingAdmin::Show);
+            }
+            "history" => {
+                let limit = args.trim().parse::<u16>().unwrap_or(20).clamp(1, 200);
+                self.network
+                    .tx
+                    .send(NetworkControl::FetchHistory {
+                        conv: client::ConvRef::General,
+                        before: self.oldest_history_id,
+                        limit,
+                    })
+                    .ok();
+            }
+            "channel" => self.handle_channel_command(args),
+            "kick" | "ban" | "unban" | "disconnect" | "mute" | "unmute" | "grant" | "revoke"
+            | "move" => self.handle_user_command(command, args),
             "revoke-invite" => match client::invite::normalize_code(args) {
                 Some(code) => {
                     self.send_admin(AdminCommand::RevokeInvite { code }, PendingAdmin::Show);
@@ -1593,14 +1760,14 @@ impl AppState {
             },
             "link" => {
                 let mut words = args.split_whitespace();
-                match (
-                    words.next().and_then(|name| self.user_id_of(name)),
-                    words.next().and_then(parse_hex_id),
-                ) {
-                    (Some(user_id), Some(key_hash)) => self.send_admin(
-                        AdminCommand::LinkKey { user_id, key_hash },
-                        PendingAdmin::Show,
-                    ),
+                match (words.next(), words.next().and_then(parse_hex_id)) {
+                    (Some(name), Some(key_hash)) => {
+                        let target = self.target_for(name);
+                        self.send_admin(
+                            AdminCommand::LinkKey { target, key_hash },
+                            PendingAdmin::Show,
+                        );
+                    }
                     _ => self.push_chat_system(&t!("chat-command-usage-link")),
                 }
             }
@@ -1608,21 +1775,33 @@ impl AppState {
         }
     }
 
-    /// The commands whose first word is a user online right now:
-    /// `/kick name reason`, `/ban name [7d] reason`, `/mute name [30m]
-    /// reason`, `/restrict name kind [30m] reason`, `/grant name role`,
-    /// `/revoke name role`, `/move name channel`.
+    /// The commands about a person:
+    /// `/kick name [reason]` · `/ban name [7d] [reason]` · `/unban name`
+    /// · `/disconnect name [reason]` · `/mute [voice|text] name [30m]
+    /// [reason]` · `/unmute [voice|text] name` · `/grant name role` ·
+    /// `/revoke name role` · `/move name channel`.
     fn handle_user_command(&mut self, command: &str, args: &str) {
-        let mut words = args.split_whitespace();
-        let Some(name) = words.next() else {
+        let mut words: Vec<&str> = args.split_whitespace().collect();
+        // `/mute` and `/unmute` take an optional kind before the name.
+        let mut kind = client::RestrictionKind::Voice;
+        if matches!(command, "mute" | "unmute")
+            && let Some(first) = words.first()
+            && let Some(k) = client::RestrictionKind::parse(first)
+            && matches!(
+                k,
+                client::RestrictionKind::Voice | client::RestrictionKind::GeneralText
+            )
+        {
+            kind = k;
+            words.remove(0);
+        }
+        if words.is_empty() {
             self.push_chat_system(&t!("chat-command-usage", "command" => command));
             return;
-        };
-        let Some(user_id) = self.user_id_of(name) else {
-            self.push_chat_system(&t!("chat-command-no-such-user", "name" => name));
-            return;
-        };
-        let rest: Vec<&str> = words.collect();
+        }
+        let name = words.remove(0);
+        let target = self.target_for(name);
+        let rest = words;
         // An optional duration right after the name; the rest is the reason.
         let (duration_secs, reason_words) =
             match rest.first().and_then(|w| parse_duration_secs(w)) {
@@ -1631,56 +1810,36 @@ impl AppState {
             };
         let reason = reason_words.join(" ");
         let admin = match command {
-            "kick" => AdminCommand::Kick { user_id, reason },
-            "disconnect" => AdminCommand::Disconnect { user_id, reason },
+            "kick" => AdminCommand::Kick { target, reason },
+            "disconnect" => AdminCommand::Disconnect { target, reason },
             "ban" => AdminCommand::Ban {
-                user_id,
+                target,
                 duration_secs,
                 reason,
             },
+            "unban" => AdminCommand::Unban { target },
             "mute" => AdminCommand::Restrict {
-                target: AdminTarget::User(user_id),
-                kind: client::RestrictionKind::Voice,
+                target,
+                kind,
                 duration_secs,
                 reason,
             },
-            "unmute" => {
-                // Two steps: list, then lift the voice restriction found.
-                self.send_admin(
-                    AdminCommand::ListRestrictions,
-                    PendingAdmin::UnmuteUser(user_id),
-                );
-                return;
-            }
-            "restrict" => {
-                let Some(kind) = rest.first().and_then(|w| client::RestrictionKind::parse(w))
-                else {
-                    self.push_chat_system(&t!("chat-command-usage-restrict"));
-                    return;
-                };
-                let (duration_secs, reason_words) =
-                    match rest.get(1).and_then(|w| parse_duration_secs(w)) {
-                        Some(secs) => (Some(secs), &rest[2..]),
-                        None => (None, &rest[1..]),
-                    };
-                AdminCommand::Restrict {
-                    target: AdminTarget::User(user_id),
-                    kind,
-                    duration_secs,
-                    reason: reason_words.join(" "),
-                }
-            }
+            "unmute" => AdminCommand::Unmute { target, kind },
             "grant" | "revoke" => {
                 let Some(role) = rest.first().and_then(|w| parse_role(w)) else {
                     self.push_chat_system(&t!("chat-command-usage", "command" => command));
                     return;
                 };
-                let mut roles: Vec<client::RoleId> = self
-                    .details
-                    .values()
-                    .find(|(u, _)| *u == user_id)
-                    .map(|(_, r)| r.clone())
-                    .unwrap_or_default();
+                // Their current roles, known while they are online.
+                let mut roles: Vec<client::RoleId> = match &target {
+                    AdminTarget::User(user_id) => self
+                        .details
+                        .values()
+                        .find(|(u, _)| u == user_id)
+                        .map(|(_, r)| r.clone())
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
                 if command == "grant" {
                     if !roles.contains(&role) {
                         roles.push(role);
@@ -1688,7 +1847,7 @@ impl AppState {
                 } else {
                     roles.retain(|r| *r != role);
                 }
-                AdminCommand::SetRoles { user_id, roles }
+                AdminCommand::SetRoles { target, roles }
             }
             "move" => {
                 let wanted = rest.join(" ");
@@ -1701,24 +1860,212 @@ impl AppState {
                     self.push_chat_system(&t!("chat-command-usage", "command" => command));
                     return;
                 };
-                AdminCommand::MoveUser {
-                    user_id,
-                    channel_id,
-                }
+                AdminCommand::MoveUser { target, channel_id }
             }
             _ => return,
         };
         self.send_admin(admin, PendingAdmin::Show);
     }
 
-    /// The user id behind a nickname online right now.
-    fn user_id_of(&self, name: &str) -> Option<client::UserId> {
+    /// The commands this session may use, from `Session.permissions`
+    /// (spec §8): a member sees what a member can do, not what an
+    /// admin can.
+    fn commands_available(&self) -> String {
+        use client::permissions as p;
+        let has = |bit: u64| p::has(self.permissions, bit);
+        let mut out: Vec<&str> = vec!["/help", "/history [n]", "/channel list", "/leave", "/quit"];
+        if has(p::CREATE_INVITES) {
+            out.push("/invite [role] [24h] [uses]");
+        }
+        if has(p::CREATE_CHANNELS) {
+            out.push("/channel create <name> [password]");
+        }
+        if has(p::MANAGE_OWN_CHANNELS) || has(p::MANAGE_CHANNELS) {
+            out.push("/channel keep <name>");
+            out.push("/channel delete <name>");
+            out.push("/channel kick <user>");
+        }
+        if has(p::MANAGE_CHANNELS) {
+            out.push("/move <user> <channel>");
+        }
+        if has(p::MUTE) || has(p::RESTRICT) {
+            out.push("/mute [voice|text] <user> [30m] [reason]");
+            out.push("/unmute [voice|text] <user>");
+            out.push("/bans");
+        }
+        if has(p::DISCONNECT) {
+            out.push("/disconnect <user> [reason]");
+        }
+        if has(p::KICK) {
+            out.push("/kick <user> [reason]");
+        }
+        if has(p::BAN) {
+            out.push("/ban <user> [7d] [reason]");
+            out.push("/unban <user>");
+        }
+        if has(p::MANAGE_ROLES) {
+            out.push("/grant <user> <role>");
+            out.push("/revoke <user> <role>");
+        }
+        if has(p::MANAGE_INVITES) {
+            out.push("/invites");
+            out.push("/revoke-invite <code>");
+        }
+        if has(p::MANAGE_USERS) {
+            out.push("/users");
+            out.push("/telemetry <user>");
+            out.push("/link <user> <keyhash>");
+            out.push("/unlink <keyhash>");
+        }
+        out.join(" · ")
+    }
+
+    /// `/channel create <name> [password]` · `/channel keep <name>` ·
+    /// `/channel delete <name>` · `/channel kick <user>` (spec §5).
+    /// The dialog comes with the UI step; this is enough to try it.
+    fn handle_channel_command(&mut self, args: &str) {
+        let mut words = args.split_whitespace();
+        let Some(verb) = words.next() else {
+            self.push_chat_system(&t!("chat-command-usage-channel"));
+            return;
+        };
+        match verb {
+            "list" => {
+                let lines: Vec<String> = self
+                    .channels
+                    .iter()
+                    .map(|c| {
+                        let facts = self.channel_details.get(&c.id);
+                        let owner = facts
+                            .and_then(|f| f.owner)
+                            .and_then(|o| {
+                                self.details
+                                    .iter()
+                                    .find(|(_, (u, _))| *u == o)
+                                    .and_then(|(client_id, _)| self.users.get(client_id))
+                                    .map(|u| u.username.clone())
+                            })
+                            .unwrap_or_else(|| t!("channel-owner-server"));
+                        let flags: Vec<&str> = [
+                            facts.is_some_and(|f| f.is_afk).then_some("afk"),
+                            facts.is_some_and(|f| !f.permanent).then_some("temporary"),
+                            c.locked.then_some("password"),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        format!(
+                            "#{} {} — {} — {}{}",
+                            facts.map_or(0, |f| f.stable_id),
+                            c.name,
+                            owner,
+                            if flags.is_empty() {
+                                "permanent".to_string()
+                            } else {
+                                flags.join(", ")
+                            },
+                            c.user_limit
+                                .map_or(String::new(), |l| format!(" — limit {l}"))
+                        )
+                    })
+                    .collect();
+                for line in lines {
+                    self.push_chat_system(&line);
+                }
+            }
+            "create" => {
+                let Some(name) = words.next() else {
+                    self.push_chat_system(&t!("chat-command-usage-channel"));
+                    return;
+                };
+                let password = words.next().map(str::to_string);
+                self.network
+                    .tx
+                    .send(NetworkControl::CreateChannel(client::ChannelSpec {
+                        name: name.to_string(),
+                        password,
+                        user_limit: None,
+                        min_role: None,
+                        permanent: false,
+                        afk_after_min: None,
+                    }))
+                    .ok();
+            }
+            "keep" | "delete" => {
+                let wanted = words.collect::<Vec<_>>().join(" ");
+                let Some(channel_id) = self.channel_id_named(&wanted) else {
+                    self.push_chat_system(&t!("chat-command-usage-channel"));
+                    return;
+                };
+                if verb == "delete" {
+                    self.network
+                        .tx
+                        .send(NetworkControl::DeleteChannel { channel_id })
+                        .ok();
+                } else {
+                    let Some(info) = self.channels.get(usize::from(channel_id)).cloned() else {
+                        return;
+                    };
+                    self.network
+                        .tx
+                        .send(NetworkControl::EditChannel {
+                            channel_id,
+                            spec: client::ChannelSpec {
+                                name: info.name,
+                                password: None,
+                                user_limit: info.user_limit,
+                                min_role: None,
+                                permanent: true,
+                                afk_after_min: None,
+                            },
+                        })
+                        .ok();
+                }
+            }
+            "kick" => {
+                let Some(name) = words.next() else {
+                    self.push_chat_system(&t!("chat-command-usage-channel"));
+                    return;
+                };
+                let (Some(channel_id), AdminTarget::User(user_id)) =
+                    (self.our_channel(), self.target_for(name))
+                else {
+                    self.push_chat_system(&t!("chat-command-no-such-user", "name" => name));
+                    return;
+                };
+                self.network
+                    .tx
+                    .send(NetworkControl::ChannelKick {
+                        channel_id,
+                        user_id,
+                    })
+                    .ok();
+            }
+            _ => self.push_chat_system(&t!("chat-command-usage-channel")),
+        }
+    }
+
+    /// The wire id of a channel by name, case-insensitive.
+    fn channel_id_named(&self, name: &str) -> Option<u16> {
+        self.channels
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name.trim()))
+            .and_then(|i| u16::try_from(i).ok())
+    }
+
+    /// Whom a name refers to: the id when they are in the roster right
+    /// now, else the name for the server to resolve (someone offline —
+    /// a ban to lift, a kicked person's roles).
+    fn target_for(&self, name: &str) -> AdminTarget {
         let name = name.trim_start_matches('@');
         self.users
             .iter()
             .find(|(_, u)| u.username.eq_ignore_ascii_case(name))
             .and_then(|(client_id, _)| self.details.get(client_id))
-            .map(|(user_id, _)| *user_id)
+            .map_or_else(
+                || AdminTarget::Name(name.to_string()),
+                |(user_id, _)| AdminTarget::User(*user_id),
+            )
     }
 
     fn send_admin(&mut self, command: AdminCommand, then: PendingAdmin) {
@@ -1748,23 +2095,7 @@ impl AppState {
                 return;
             }
         };
-        if let Some(PendingAdmin::UnmuteUser(user_id)) = then {
-            if let client::AdminOutcome::Restrictions(list) = &outcome
-                && let Some(r) = list.iter().find(|r| {
-                    r.user_id == Some(user_id) && r.kind == client::RestrictionKind::Voice
-                })
-            {
-                self.send_admin(
-                    AdminCommand::Lift {
-                        restriction_id: r.id,
-                    },
-                    PendingAdmin::Show,
-                );
-            } else {
-                self.push_chat_system(&t!("chat-admin-not-muted"));
-            }
-            return;
-        }
+        let PendingAdmin::Show = then.unwrap_or(PendingAdmin::Show);
         match outcome {
             client::AdminOutcome::Done => self.push_chat_system(&t!("chat-admin-done")),
             client::AdminOutcome::Users(users) => {
@@ -1810,6 +2141,13 @@ impl AppState {
                     self.push_chat_system(&line);
                 }
             }
+            client::AdminOutcome::Telemetry(sample) => match sample {
+                Some(t) => {
+                    let line = format!("{} — {}", describe_ago(t.ts), t.line);
+                    self.push_chat_system(&line);
+                }
+                None => self.push_chat_system(&t!("chat-admin-no-telemetry")),
+            },
             client::AdminOutcome::Invites(list) => {
                 self.push_chat_system(&t!("chat-admin-invites-header", "count" => list.len()));
                 for i in list {
@@ -2221,6 +2559,10 @@ impl AppState {
         self.server_persistent = true;
         self.details.clear();
         self.pending_admin.clear();
+        self.server_muted = None;
+        self.text_muted = None;
+        self.oldest_history_id = None;
+        self.channel_details.clear();
         self.is_testing_mic = false;
         self.channels.clear();
         self.pending_channel_join = None;
@@ -2309,7 +2651,17 @@ impl AppState {
     // ════════════════════════════════════════════════════════════════
 
     fn handle_toggle_mute(&mut self) {
-        self.is_muted = !self.is_muted;
+        if self.is_muted && self.server_muted.is_some() {
+            self.show_error(&t!("chat-server-muted-locked"));
+            return;
+        }
+        self.set_muted(!self.is_muted);
+    }
+
+    /// Set the mute state and tell the voice thread, the server and
+    /// the UI.
+    fn set_muted(&mut self, muted: bool) {
+        self.is_muted = muted;
         self.voice
             .tx
             .send(VoiceControl::SetMuted(self.is_muted))
@@ -2487,6 +2839,11 @@ impl AppState {
             && let Some((command, args)) = split_command(rest)
         {
             self.handle_slash_command(command, args);
+        } else if let Some(until) = self.text_muted {
+            // The server would drop it anyway; say so here instead.
+            let until = format!(" {}", describe_until(until));
+            self.show_error(&t!("restricted-text", "until" => until.as_str(), "reason" => ""));
+            return;
         } else {
             self.network.tx.send(NetworkControl::SendMessage(text)).ok();
         }
@@ -3403,13 +3760,19 @@ impl AppState {
 }
 
 /// `audio::PeerAudioSettings` ↔ app-core's `PeerAudio` mirror.
+/// What `ChannelDetails` says about a channel (spec §5).
+#[derive(Debug, Clone)]
+struct ChannelFacts {
+    stable_id: u64,
+    owner: Option<client::UserId>,
+    permanent: bool,
+    is_afk: bool,
+}
+
 /// What to do with an `AdminResult` when it arrives.
 enum PendingAdmin {
     /// Print the outcome.
     Show,
-    /// `/unmute`: find the voice restriction on this user in the list
-    /// that comes back and lift it.
-    UnmuteUser(client::UserId),
 }
 
 /// The first bytes of a user id, for log lines and the identity panel.
@@ -3420,6 +3783,14 @@ pub fn short_id(id: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
         out
     })
+}
+
+/// Milliseconds since the epoch as the chat's local `HH:MM`.
+fn format_wall_time(ms: u64) -> String {
+    let secs = i64::try_from(ms / 1000).unwrap_or(0);
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|utc| utc.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|| "--:--".to_string())
 }
 
 /// `/kick alice spam` → (`kick`, `alice spam`); `None` for a bare `/`.

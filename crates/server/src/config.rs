@@ -379,18 +379,24 @@ impl Config {
     /// a `has_password` flag; they never cross the wire).
     #[must_use]
     pub fn channel_infos(&self) -> Vec<protocol::ChannelInfo> {
-        self.channels
-            .iter()
-            .enumerate()
-            .map(|(i, ch)| protocol::ChannelInfo {
-                #[allow(clippy::cast_possible_truncation)] // validated ≤ MAX_CHANNELS
-                id: i as u16,
-                name: ch.name.trim().to_string(),
-                has_password: ch.password.is_some(),
-                user_limit: ch.user_limit,
-            })
-            .collect()
+        channel_infos_of(&self.channels)
     }
+}
+
+/// The wire form of a channel list: ids are positions.
+#[must_use]
+pub fn channel_infos_of(channels: &[ChannelSettings]) -> Vec<protocol::ChannelInfo> {
+    channels
+        .iter()
+        .enumerate()
+        .map(|(i, ch)| protocol::ChannelInfo {
+            #[allow(clippy::cast_possible_truncation)] // validated ≤ MAX_CHANNELS
+            id: i as u16,
+            name: ch.name.trim().to_string(),
+            has_password: ch.password.is_some(),
+            user_limit: ch.user_limit,
+        })
+        .collect()
 }
 
 /// Validate a candidate channel list and return the default channel's

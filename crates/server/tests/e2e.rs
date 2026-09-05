@@ -13,10 +13,10 @@ use std::{
 use protocol::{
     features,
     permissions::{self, RoleId, ROLE_ADMIN, ROLE_GUEST, ROLE_MEMBER},
-    AdminCommand, AdminError, AdminOutcome, AdminTarget, Auth, ChannelDenyReason, ClientId,
-    ClientKeyProof, ClientMessage, DenyReason, InviteDenyReason, InviteInvalidReason, Lane,
-    NeedInviteReason, RefusedReason, RemovedKind, RestrictionKind, ServerMessage, ShareScope,
-    UserId,
+    AdminCommand, AdminError, AdminOutcome, AdminTarget, Auth, ChannelDenyReason, ChannelSpec,
+    ChannelUiDenyReason, ClientId, ClientKeyProof, ClientMessage, ConvRef, DenyReason,
+    InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason, RefusedReason, RemovedKind,
+    RestrictionKind, ServerMessage, ShareScope, UserId,
 };
 use server::{
     clock::Clock,
@@ -985,23 +985,25 @@ fn members_mint_guest_codes_and_admins_choose() {
 // ── Moderation and roles (spec §4, §8) ──────────────────────────────────
 
 #[test]
-fn an_admin_kicks_a_guest_who_cannot_rejoin_until_lifted() {
+fn a_kick_forgets_the_device_so_a_new_invite_is_needed() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
     let boot = w.bootstrap_code();
     let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
-    let mut guest = w.connect("troll");
-    let guest_user = guest.key.user_id();
+    let member_code = w.invite(ROLE_MEMBER);
+    let mut troll = w.connect_as("troll", Auth::Invite { code: member_code });
+    let troll_user = troll.key.user_id();
 
+    // By name: the admin types what they see in the roster.
     admin.admin(
         &mut w,
         1,
         AdminCommand::Kick {
-            user_id: guest_user,
+            target: AdminTarget::Name("TROLL".to_string()),
             reason: "spam".to_string(),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut guest], 1), Ok(AdminOutcome::Done));
-    guest.wait_for(&mut w, &mut [&mut admin], |m| match m {
+    assert_eq!(admin.admin_result(&mut w, &mut [&mut troll], 1), Ok(AdminOutcome::Done));
+    troll.wait_for(&mut w, &mut [&mut admin], |m| match m {
         ServerMessage::Removed {
             kind: RemovedKind::Kicked,
             reason,
@@ -1010,40 +1012,29 @@ fn an_admin_kicks_a_guest_who_cannot_rejoin_until_lifted() {
         _ => None,
     });
     let deadline = w.net.now() + WAIT;
-    while guest.disconnected().is_none() {
+    while troll.disconnected().is_none() {
         assert!(w.net.now() < deadline, "kicked session never closed");
-        w.pump(&mut [&mut guest, &mut admin]);
+        w.pump(&mut [&mut troll, &mut admin]);
     }
 
-    // The key is refused until the restriction is lifted.
-    let key = Arc::clone(&guest.key);
+    // Nothing to lift: the device is simply unknown again, and the
+    // roles are gone. A fresh code gets them back in — as whatever the
+    // code grants.
+    assert!(w.server().policy().restrictions.is_empty());
+    assert!(w.server().policy().users[&troll_user].roles.is_empty());
+    let key = Arc::clone(&troll.key);
     assert_eq!(
         w.try_connect_with_key("troll", Auth::Key, Arc::clone(&key))
             .unwrap_err(),
-        RefusedReason::Banned {
-            until: None,
-            reason: "spam".to_string()
+        RefusedReason::NeedInvite {
+            why: NeedInviteReason::UnknownKey
         }
     );
-
-    admin.admin(&mut w, 2, AdminCommand::ListRestrictions);
-    let Ok(AdminOutcome::Restrictions(list)) = admin.admin_result(&mut w, &mut [], 2) else {
-        panic!("expected a restriction list");
-    };
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0].user_name.as_deref(), Some("troll"));
-    assert_eq!(list[0].by, "mpw");
-    assert_eq!(list[0].kind, RestrictionKind::Server);
-
-    admin.admin(
-        &mut w,
-        3,
-        AdminCommand::Lift {
-            restriction_id: list[0].id,
-        },
-    );
-    assert_eq!(admin.admin_result(&mut w, &mut [], 3), Ok(AdminOutcome::Done));
-    assert!(w.try_connect_with_key("troll", Auth::Key, key).is_ok());
+    let code = w.guest_code.clone();
+    let back = w.connect_with_key("troll", Auth::Invite { code }, key);
+    let (user, perms, _) = back.session().expect("session");
+    assert_eq!(user, troll_user, "same key, same user id");
+    assert_eq!(perms, permissions::GUEST_PERMISSIONS);
 }
 
 #[test]
@@ -1058,7 +1049,7 @@ fn a_ban_blocks_the_key_under_any_name_and_lifts_on_time() {
         &mut w,
         1,
         AdminCommand::Ban {
-            user_id: alice_user,
+            target: AdminTarget::User(alice_user),
             duration_secs: Some(3600),
             reason: "cool off".to_string(),
         },
@@ -1081,10 +1072,86 @@ fn a_ban_blocks_the_key_under_any_name_and_lifts_on_time() {
             .unwrap_err(),
         RefusedReason::Banned { .. }
     ));
+    // Lifted by name while she is offline — the server resolves it.
+    admin.admin(
+        &mut w,
+        2,
+        AdminCommand::Unban {
+            target: AdminTarget::Name("alice".to_string()),
+        },
+    );
+    assert_eq!(admin.admin_result(&mut w, &mut [], 2), Ok(AdminOutcome::Done));
+    assert!(w.try_connect_with_key("alice", Auth::Key, Arc::clone(&key)).is_ok());
+
+    // And a timed one runs out on its own.
+    let mut alice = w.connect_with_key("alice", Auth::Key, key);
+    admin.admin(
+        &mut w,
+        3,
+        AdminCommand::Ban {
+            target: AdminTarget::User(alice_user),
+            duration_secs: Some(60),
+            reason: "one minute".to_string(),
+        },
+    );
+    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 3), Ok(AdminOutcome::Done));
+    let key = Arc::clone(&alice.key);
     w.advance_wall(Duration::from_hours(2));
     // The sweep runs once a second of tick time.
     w.settle(&mut [&mut admin], Duration::from_secs(2));
     assert!(w.try_connect_with_key("alice", Auth::Key, key).is_ok());
+}
+
+#[test]
+fn a_ban_on_a_shared_address_hits_only_the_named_user() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    // Two people behind one address (a household NAT, one machine).
+    let shared: SocketAddr = "10.0.0.9:7001".parse().expect("addr");
+    let code = w.guest_code.clone();
+    let mut alice = w
+        .try_connect_from(shared, "alice", Auth::Invite { code: code.clone() }, None)
+        .expect("alice in");
+    let shared2: SocketAddr = "10.0.0.9:7002".parse().expect("addr");
+    let mut bob = w
+        .try_connect_from(shared2, "bob", Auth::Invite { code }, None)
+        .expect("bob in");
+    w.settle(&mut [&mut admin, &mut alice, &mut bob], Duration::from_millis(200));
+    let alice_user = alice.key.user_id();
+
+    admin.admin(
+        &mut w,
+        1,
+        AdminCommand::Ban {
+            target: AdminTarget::User(alice_user),
+            duration_secs: None,
+            reason: String::new(),
+        },
+    );
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice, &mut bob], 1),
+        Ok(AdminOutcome::Done)
+    );
+    alice.wait_for(&mut w, &mut [&mut admin, &mut bob], |m| {
+        matches!(
+            m,
+            ServerMessage::Removed {
+                kind: RemovedKind::Banned { .. },
+                ..
+            }
+        )
+        .then_some(())
+    });
+    w.settle(&mut [&mut admin, &mut alice, &mut bob], Duration::from_millis(500));
+    // Bob shares the address and stays; the admin stays; the row does
+    // not carry the shared address at all.
+    assert!(bob.disconnected().is_none(), "bob was caught by the ban");
+    assert!(admin.disconnected().is_none(), "the admin banned themselves");
+    let bans = &w.server().policy().restrictions;
+    assert_eq!(bans.len(), 1);
+    assert_eq!(bans[0].ip, None);
+    assert_eq!(bans[0].user_id, Some(alice_user));
 }
 
 #[test]
@@ -1101,7 +1168,7 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
         &mut w,
         1,
         AdminCommand::Kick {
-            user_id: admin_user,
+            target: AdminTarget::User(admin_user),
             reason: String::new(),
         },
     );
@@ -1115,7 +1182,7 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
         &mut w,
         2,
         AdminCommand::Kick {
-            user_id: admin_user,
+            target: AdminTarget::User(admin_user),
             reason: String::new(),
         },
     );
@@ -1127,7 +1194,7 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
         &mut w,
         3,
         AdminCommand::SetRoles {
-            user_id: guest_user,
+            target: AdminTarget::User(guest_user),
             roles: vec![ROLE_ADMIN],
         },
     );
@@ -1147,7 +1214,7 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
         &mut w,
         4,
         AdminCommand::Kick {
-            user_id: guest_user,
+            target: AdminTarget::User(guest_user),
             reason: String::new(),
         },
     );
@@ -1158,7 +1225,7 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
         &mut w,
         5,
         AdminCommand::SetRoles {
-            user_id: admin_user,
+            target: AdminTarget::User(admin_user),
             roles: vec![ROLE_MEMBER],
         },
     );
@@ -1167,7 +1234,7 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
         &mut w,
         6,
         AdminCommand::SetRoles {
-            user_id: guest_user,
+            target: AdminTarget::User(guest_user),
             roles: vec![ROLE_MEMBER],
         },
     );
@@ -1284,6 +1351,25 @@ fn a_text_restriction_refuses_chat_with_the_reason() {
             .any(|m| matches!(m, ServerMessage::Chat(c) if c.text == "hello?")),
         "a restricted user's chat must not be delivered"
     );
+    // Pictures are chat too.
+    admin.inbox.clear();
+    alice.send(
+        &mut w,
+        &ClientMessage::ChatImageChunk {
+            upload_id: 1,
+            index: 0,
+            count: 1,
+            data: vec![0x89, b'P', b'N', b'G'],
+        },
+    );
+    w.settle(&mut [&mut alice, &mut admin], Duration::from_millis(500));
+    assert!(
+        !admin
+            .inbox
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ChatImageChunk { .. })),
+        "a text-muted user's image must not be relayed"
+    );
 }
 
 #[test]
@@ -1308,7 +1394,7 @@ fn roles_change_live_for_the_user_and_every_roster() {
         &mut w,
         1,
         AdminCommand::SetRoles {
-            user_id: alice_user,
+            target: AdminTarget::User(alice_user),
             roles: vec![ROLE_MEMBER],
         },
     );
@@ -1407,7 +1493,7 @@ fn a_ban_written_by_the_cli_lands_on_a_live_session() {
             matches!(
                 m,
                 ServerMessage::Removed {
-                    kind: RemovedKind::Kicked,
+                    kind: RemovedKind::Banned { until: None },
                     reason,
                     ..
                 } if reason == "from the box"
@@ -1443,7 +1529,7 @@ fn an_admin_moves_a_user_past_a_channel_password() {
         &mut w,
         1,
         AdminCommand::MoveUser {
-            user_id: alice_user,
+            target: AdminTarget::User(alice_user),
             channel_id: 1,
         },
     );
@@ -1457,6 +1543,461 @@ fn an_admin_moves_a_user_past_a_channel_password() {
         .then_some(())
     });
     assert_eq!(w.server().channel_of(alice_id), Some(1));
+}
+
+// ── History, progress, channels from the UI (spec §5, §6, §9) ──────────
+
+#[test]
+fn history_replays_on_join_and_pages_back_through_the_store() {
+    let dir = temp_dir("history");
+    let mut config = persistent_config(vec![open_channel("Lobby", true)], &dir);
+    config.persistence.history.replay = 5;
+    let mut w = World::new(config);
+    let mut alice = w.connect("alice");
+    for i in 0..12 {
+        alice.send(&mut w, &ClientMessage::Chat(format!("line {i}")));
+        alice.wait_for(&mut w, &mut [], |m| match m {
+            ServerMessage::Chat(c) if c.text == format!("line {i}") => Some(()),
+            _ => None,
+        });
+    }
+
+    // The newcomer gets the last five, oldest first, with the author's
+    // name — and a `more` that leads further back.
+    let mut bob = w.connect("bob");
+    let (page, more) = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::History {
+            conv: ConvRef::General,
+            messages,
+            more,
+        } => Some((messages.clone(), *more)),
+        _ => None,
+    });
+    assert_eq!(page.len(), 5);
+    assert_eq!(page[0].text, "line 7");
+    assert_eq!(page[4].text, "line 11");
+    assert_eq!(page[0].name, "alice");
+    assert!(page.iter().all(|m| m.user_id == alice.key.user_id()));
+    assert!(more);
+
+    // Paging back: the ring covers the rest of the session.
+    bob.inbox.clear();
+    bob.send(
+        &mut w,
+        &ClientMessage::FetchHistory {
+            conv: ConvRef::General,
+            before: Some(page[0].id),
+            limit: 4,
+        },
+    );
+    let older = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::History { messages, .. } => Some(messages.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        older.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        ["line 3", "line 4", "line 5", "line 6"]
+    );
+
+    // After a restart the ring is primed from the database.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "writes never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(w);
+    let mut config = persistent_config(vec![open_channel("Lobby", true)], &dir);
+    config.persistence.history.replay = 3;
+    let mut w = World::new(config);
+    let mut carol = w.connect("carol");
+    let (page, more) = carol.wait_for(&mut w, &mut [], |m| match m {
+        ServerMessage::History { messages, more, .. } => Some((messages.clone(), *more)),
+        _ => None,
+    });
+    assert_eq!(
+        page.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        ["line 9", "line 10", "line 11"]
+    );
+    assert!(more);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stalled_store_answers_history_with_a_retry_hint() {
+    let dir = temp_dir("history-stall");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect("alice");
+    let stalled = w.server().persistence().stall();
+    std::thread::sleep(Duration::from_millis(50));
+    // A page the ring cannot answer: before the oldest id there is.
+    alice.send(
+        &mut w,
+        &ClientMessage::FetchHistory {
+            conv: ConvRef::General,
+            before: Some(1),
+            limit: 10,
+        },
+    );
+    let retry = alice.wait_for(&mut w, &mut [], |m| match m {
+        ServerMessage::HistoryUnavailable { retry_secs, .. } => Some(*retry_secs),
+        _ => None,
+    });
+    assert!(retry > 0);
+    drop(stalled);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn authors_edit_and_delete_their_own_recent_messages() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut alice = w.connect("alice");
+    let mut bob = w.connect("bob");
+    alice.send(&mut w, &ClientMessage::Chat("typo".to_string()));
+    let id = alice.wait_for(&mut w, &mut [&mut bob, &mut admin], |m| match m {
+        ServerMessage::Chat(c) if c.text == "typo" => Some(c.id),
+        _ => None,
+    });
+
+    // Bob cannot edit alice's message; alice can.
+    bob.send(
+        &mut w,
+        &ClientMessage::EditMessage {
+            msg_id: id,
+            text: "hijack".to_string(),
+        },
+    );
+    alice.send(
+        &mut w,
+        &ClientMessage::EditMessage {
+            msg_id: id,
+            text: "fixed".to_string(),
+        },
+    );
+    let text = bob.wait_for(&mut w, &mut [&mut alice, &mut admin], |m| match m {
+        ServerMessage::MessageEdited { msg_id, text } if *msg_id == id => Some(text.clone()),
+        _ => None,
+    });
+    assert_eq!(text, "fixed");
+    assert!(!bob
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::MessageEdited { text, .. } if text == "hijack")));
+
+    // A newcomer sees the edit and the flag.
+    let mut carol = w.connect("carol");
+    let page = carol.wait_for(&mut w, &mut [&mut alice, &mut bob, &mut admin], |m| match m {
+        ServerMessage::History { messages, .. } => Some(messages.clone()),
+        _ => None,
+    });
+    assert_eq!(page[0].text, "fixed");
+    assert!(page[0].edited);
+
+    // An admin deletes it for everyone.
+    admin.admin(&mut w, 1, AdminCommand::DeleteMessage { msg_id: id });
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice, &mut bob, &mut carol], 1),
+        Ok(AdminOutcome::Done)
+    );
+    carol.wait_for(&mut w, &mut [&mut alice, &mut bob, &mut admin], |m| {
+        matches!(m, ServerMessage::MessageDeleted { msg_id } if *msg_id == id).then_some(())
+    });
+    let mut dave = w.connect("dave");
+    w.settle(&mut [&mut dave], Duration::from_millis(300));
+    assert!(dave.inbox.iter().all(|m| match m {
+        ServerMessage::History { messages, .. } => messages.iter().all(|x| x.id != id),
+        _ => true,
+    }));
+}
+
+#[test]
+fn chat_is_rate_limited_per_session() {
+    let mut config = test_config(vec![open_channel("Lobby", true)]);
+    config.limits.chat.burst = 3;
+    config.limits.chat.per_secs = 3;
+    let mut w = World::new(config);
+    let mut alice = w.connect("alice");
+    let mut bob = w.connect("bob");
+    for i in 0..5 {
+        alice.send(&mut w, &ClientMessage::Chat(format!("burst {i}")));
+    }
+    alice.wait_for(&mut w, &mut [&mut bob], |m| {
+        matches!(m, ServerMessage::ChatRateLimited { .. }).then_some(())
+    });
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(500));
+    let delivered = bob
+        .inbox
+        .iter()
+        .filter(|m| matches!(m, ServerMessage::Chat(c) if c.text.starts_with("burst")))
+        .count();
+    assert_eq!(delivered, 3, "three in the burst, the rest dropped");
+    // Tokens come back with time.
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(3));
+    alice.send(&mut w, &ClientMessage::Chat("later".to_string()));
+    bob.wait_for(&mut w, &mut [&mut alice], |m| {
+        matches!(m, ServerMessage::Chat(c) if c.text == "later").then_some(())
+    });
+}
+
+#[test]
+fn progress_accrues_by_the_minute_and_levels_up() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect("alice");
+    let mut bob = w.connect("bob");
+    let alice_user = alice.key.user_id();
+    // Alice talks (with bob in the room) for two minutes: 6 xp/min.
+    for _ in 0..2 {
+        alice.send(&mut w, &ClientMessage::Speaking(true));
+        w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(61));
+    }
+    let xp = w.server().policy().xp.get(&alice_user).copied().unwrap_or(0);
+    assert_eq!(xp, 12);
+    // Chat earns nothing; a third minute of talking crosses 13 xp.
+    alice.send(&mut w, &ClientMessage::Chat("gg".to_string()));
+    alice.send(&mut w, &ClientMessage::Speaking(true));
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(61));
+    let (xp, level) = alice.wait_for(&mut w, &mut [&mut bob], |m| match m {
+        ServerMessage::ProgressUpdate { xp, level } => Some((*xp, *level)),
+        _ => None,
+    });
+    assert_eq!(level, 2);
+    assert!(xp >= 13);
+    bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::UserDetails { user_id, level, .. } if *user_id == alice_user => {
+            (*level == 2).then_some(())
+        }
+        _ => None,
+    });
+}
+
+#[test]
+fn a_purge_removes_the_person_and_their_messages() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut troll = w.connect("troll");
+    let troll_user = troll.key.user_id();
+    troll.send(&mut w, &ClientMessage::Chat("garbage".to_string()));
+    admin.wait_for(&mut w, &mut [&mut troll], |m| {
+        matches!(m, ServerMessage::Chat(c) if c.text == "garbage").then_some(())
+    });
+
+    admin.admin(
+        &mut w,
+        1,
+        AdminCommand::PurgeUser {
+            target: AdminTarget::Name("troll".to_string()),
+        },
+    );
+    assert_eq!(admin.admin_result(&mut w, &mut [&mut troll], 1), Ok(AdminOutcome::Done));
+    assert!(!w.server().policy().users.contains_key(&troll_user));
+    let mut carol = w.connect("carol");
+    w.settle(&mut [&mut carol, &mut admin], Duration::from_millis(300));
+    assert!(carol.inbox.iter().all(|m| match m {
+        ServerMessage::History { messages, .. } => messages.iter().all(|x| x.text != "garbage"),
+        _ => true,
+    }));
+}
+
+#[test]
+fn organizers_make_channels_that_gate_by_role_and_evaporate_when_empty() {
+    let mut config = test_config(vec![open_channel("Lobby", true)]);
+    config.user_channels.temporary_after_min = 1;
+    let mut w = World::new(config);
+    let org_code = w.invite(protocol::permissions::ROLE_ORGANIZER);
+    let mut org = w.connect_as("org", Auth::Invite { code: org_code });
+    let mut guest = w.connect("guest");
+    let org_id = org.id;
+
+    // A guest may not create; an organizer may, and lands in it.
+    let spec = ChannelSpec {
+        name: "Backroom".to_string(),
+        password: None,
+        user_limit: None,
+        min_role: Some(ROLE_MEMBER),
+        permanent: false,
+        afk_after_min: None,
+    };
+    guest.send(&mut w, &ClientMessage::CreateChannel(spec.clone()));
+    let reason = guest.wait_for(&mut w, &mut [&mut org], |m| match m {
+        ServerMessage::ChannelDenied { reason } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, ChannelUiDenyReason::NoPermission);
+    org.send(&mut w, &ClientMessage::CreateChannel(spec));
+    let channels = org.wait_for(&mut w, &mut [&mut guest], |m| match m {
+        ServerMessage::ChannelListUpdated { channels, .. } => Some(channels.clone()),
+        _ => None,
+    });
+    assert_eq!(channels.len(), 2);
+    assert_eq!(channels[1].name, "Backroom");
+    let backroom = channels[1].id;
+    org.wait_for(&mut w, &mut [&mut guest], |m| {
+        matches!(m, ServerMessage::UserMovedChannel { client_id, channel_id }
+            if *client_id == org_id && *channel_id == backroom)
+        .then_some(())
+    });
+    assert_eq!(w.server().channel_of(org_id), Some(backroom));
+    let org_user = org.key.user_id();
+    let details = guest.wait_for(&mut w, &mut [&mut org], |m| match m {
+        ServerMessage::ChannelDetails {
+            channel_id,
+            owner,
+            min_role,
+            permanent,
+            ..
+        } if *channel_id == backroom => Some((*owner, *min_role, *permanent)),
+        _ => None,
+    });
+    assert_eq!(details, (Some(org_user), Some(ROLE_MEMBER), false));
+
+    // The gate: a guest is refused, a member walks in.
+    guest.join(&mut w, backroom, None);
+    let reason = guest.wait_for(&mut w, &mut [&mut org], |m| match m {
+        ServerMessage::JoinChannelDenied { reason, .. } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, ChannelDenyReason::NotPermitted);
+    let member_code = w.invite(ROLE_MEMBER);
+    let mut member = w.connect_as("member", Auth::Invite { code: member_code });
+    let member_id = member.id;
+    member.join(&mut w, backroom, None);
+    member.wait_for(&mut w, &mut [&mut org, &mut guest], |m| {
+        matches!(m, ServerMessage::UserMovedChannel { client_id, channel_id }
+            if *client_id == member_id && *channel_id == backroom)
+        .then_some(())
+    });
+
+    // The owner sends the member back; everyone leaves; a minute later
+    // the temporary channel is gone and the list is back to one.
+    let member_user = member.key.user_id();
+    org.send(
+        &mut w,
+        &ClientMessage::ChannelKick {
+            channel_id: backroom,
+            user_id: member_user,
+        },
+    );
+    member.wait_for(&mut w, &mut [&mut org, &mut guest], |m| {
+        matches!(m, ServerMessage::UserMovedChannel { client_id, channel_id: 0 }
+            if *client_id == member_id)
+        .then_some(())
+    });
+    org.join(&mut w, 0, None);
+    w.settle(&mut [&mut org, &mut guest, &mut member], Duration::from_secs(35));
+    assert_eq!(w.server().policy().channels.len(), 1, "empty, but not yet long enough");
+    w.advance_wall(Duration::from_mins(2));
+    w.settle(&mut [&mut org, &mut guest, &mut member], Duration::from_secs(35));
+    let channels = guest.wait_for(&mut w, &mut [&mut org, &mut member], |m| match m {
+        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 1 => {
+            Some(channels.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(channels[0].name, "Lobby");
+    assert!(w.server().policy().channels.is_empty());
+}
+
+#[test]
+fn the_owner_edits_or_deletes_and_an_admin_can_too_but_config_channels_stay() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let org_code = w.invite(protocol::permissions::ROLE_ORGANIZER);
+    let mut org = w.connect_as("org", Auth::Invite { code: org_code });
+    let mut spec = ChannelSpec {
+        name: "Games".to_string(),
+        password: None,
+        user_limit: None,
+        min_role: None,
+        permanent: true,
+        afk_after_min: None,
+    };
+    org.send(&mut w, &ClientMessage::CreateChannel(spec.clone()));
+    let games = org.wait_for(&mut w, &mut [&mut admin], |m| match m {
+        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 2 => {
+            Some(channels[1].id)
+        }
+        _ => None,
+    });
+
+    // The config channel cannot be deleted by anyone.
+    admin.send(&mut w, &ClientMessage::DeleteChannel { channel_id: 0 });
+    let reason = admin.wait_for(&mut w, &mut [&mut org], |m| match m {
+        ServerMessage::ChannelDenied { reason } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, ChannelUiDenyReason::ConfigOwned);
+
+    // A rename by the owner, a second organizer refused, a delete by
+    // the admin.
+    spec.name = "Board games".to_string();
+    org.send(
+        &mut w,
+        &ClientMessage::EditChannel {
+            channel_id: games,
+            spec: spec.clone(),
+        },
+    );
+    org.wait_for(&mut w, &mut [&mut admin], |m| match m {
+        ServerMessage::ChannelListUpdated { channels, .. }
+            if channels.get(1).is_some_and(|c| c.name == "Board games") =>
+        {
+            Some(())
+        }
+        _ => None,
+    });
+    let other_code = w.invite(protocol::permissions::ROLE_ORGANIZER);
+    let mut other = w.connect_as("other", Auth::Invite { code: other_code });
+    other.send(&mut w, &ClientMessage::DeleteChannel { channel_id: games });
+    let reason = other.wait_for(&mut w, &mut [&mut org, &mut admin], |m| match m {
+        ServerMessage::ChannelDenied { reason } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, ChannelUiDenyReason::NoPermission);
+    admin.send(&mut w, &ClientMessage::DeleteChannel { channel_id: games });
+    admin.wait_for(&mut w, &mut [&mut org, &mut other], |m| match m {
+        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 1 => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn idle_members_are_moved_to_the_afk_channel_where_voice_goes_nowhere() {
+    let mut config = test_config(vec![
+        open_channel("Lobby", true),
+        open_channel("AFK", false),
+    ]);
+    config.user_channels.afk_channel = Some("AFK".to_string());
+    config.user_channels.afk_after_min = 1;
+    let mut w = World::new(config);
+    let mut alice = w.connect("alice");
+    let mut bob = w.connect("bob");
+    // Alice keeps busy; bob does nothing.
+    for _ in 0..3 {
+        alice.send(&mut w, &ClientMessage::Speaking(true));
+        w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(25));
+    }
+    let after = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::MovedIdle { after_min } => Some(*after_min),
+        _ => None,
+    });
+    assert_eq!(after, 1);
+    assert_eq!(w.server().channel_of(bob.id), Some(1));
+    assert_eq!(w.server().channel_of(alice.id), Some(0));
+
+    // Voice from the AFK channel goes nowhere.
+    let pkt = protocol::pack_voice(1, 20, &[0xAB; 60]).expect("voice");
+    let now = w.net.now();
+    w.net
+        .driver(bob.node)
+        .send(now, bob.peer, Lane::Voice, &pkt)
+        .expect("send voice");
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(300));
+    assert!(w.net.driver(alice.node).recv(alice.peer, Lane::Voice).is_none());
 }
 
 #[test]

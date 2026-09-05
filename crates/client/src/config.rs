@@ -637,6 +637,14 @@ impl Settings {
 /// builds always use the platform config dir, keeping state out of
 /// target/.
 fn config_base_dir() -> PathBuf {
+    if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
+    if let Ok(dir) = std::env::var(CONFIG_DIR_ENV)
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir.trim());
+    }
     #[cfg(not(debug_assertions))]
     {
         if let Some(dir) = writable_exe_dir() {
@@ -644,6 +652,34 @@ fn config_base_dir() -> PathBuf {
         }
     }
     platform_config_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Environment variable that relocates the whole config directory —
+/// settings, identity key, everything — for this process.
+pub const CONFIG_DIR_ENV: &str = "BAUCORD_CONFIG_DIR";
+
+static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Relocate the config directory for this process (`--config-dir`,
+/// `--profile`). Call before anything reads settings or the key; a
+/// second call is ignored.
+pub fn set_config_dir(dir: PathBuf) {
+    let _ = CONFIG_DIR_OVERRIDE.set(dir);
+}
+
+/// The directory a named profile lives in: a second settings file and
+/// identity under the platform config dir, so two people (or two test
+/// instances) share one machine without sharing a key.
+#[must_use]
+pub fn profile_dir(name: &str) -> PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    platform_config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("profiles")
+        .join(safe)
 }
 
 fn platform_config_dir() -> Option<PathBuf> {
@@ -683,9 +719,13 @@ pub fn client_key_path() -> PathBuf {
 }
 
 /// Whether settings live next to the executable (a portable install),
-/// for the telemetry client info.
+/// for the telemetry client info. Never true under a relocated
+/// config directory.
 #[must_use]
 pub fn is_portable_install() -> bool {
+    if CONFIG_DIR_OVERRIDE.get().is_some() || std::env::var_os(CONFIG_DIR_ENV).is_some() {
+        return false;
+    }
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
