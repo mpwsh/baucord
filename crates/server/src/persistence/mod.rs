@@ -47,8 +47,10 @@ use log::{debug, info, warn};
 use protocol::{TelemetrySample, UserId};
 
 pub use self::store::{
-    backup_to_tar, blobs_dir, check, cli_create_invite, cli_list_invites, cli_revoke_invite,
-    BackupReport, CheckReport, GENERAL_CONV, SCHEMA_VERSION,
+    backup_to_tar, blobs_dir, check, cli_create_invite, cli_find_user, cli_lift_restriction,
+    cli_list_invites, cli_load_policy, cli_restrict, cli_revoke_invite, cli_set_key,
+    cli_set_roles, hex,
+    parse_hex_id, BackupReport, CheckReport, GENERAL_CONV, SCHEMA_VERSION,
 };
 use self::store::{Retention, Sqlite, Store};
 use crate::{
@@ -92,6 +94,15 @@ pub enum PersistError {
     Thread(#[source] std::io::Error),
     #[error("no role with id {0}")]
     UnknownRole(u32),
+    #[error("no user named {0}")]
+    NoSuchUser(String),
+    #[error(
+        "'{0}' names more than one user — use an id instead (the first 8 digits do):\n  {list}",
+        list = .1.join("\n  ")
+    )]
+    Ambiguous(String, Vec<String>),
+    #[error("the last admin keeps admin")]
+    LastAdmin,
 }
 
 // ── Rows ────────────────────────────────────────────────────────────────

@@ -197,7 +197,14 @@ pub struct SharedScreenState {
     pub bitrate_scale_pct: Arc<AtomicU32>,
 }
 
+impl Default for SharedScreenState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedScreenState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             is_sharing: Arc::new(AtomicBool::new(false)),
@@ -1195,27 +1202,26 @@ fn handle_control(
                 return;
             }
 
-            if !st.peer_streams.contains_key(&client_id) {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                st.peer_streams.entry(client_id)
+            {
                 match create_decoder() {
                     Ok(decoder) => {
                         info!("Created decoder for peer {client_id} ({width}x{height})");
                         // Assume 30fps initially; will be refined when
                         // Quality is known. The buffer adapts well even
                         // if the FPS guess is off.
-                        st.peer_streams.insert(
-                            client_id,
-                            PeerStream {
-                                decoder,
-                                width,
-                                height,
-                                jitter_buffer: VideoJitterBuffer::new(30),
-                                stream_audio: None,
-                                frames_decoded_total: 0,
-                                frames_dropped_total: 0,
-                                decode_us_total: 0,
-                                rx_telemetry: (Instant::now(), 0),
-                            },
-                        );
+                        slot.insert(PeerStream {
+                            decoder,
+                            width,
+                            height,
+                            jitter_buffer: VideoJitterBuffer::new(30),
+                            stream_audio: None,
+                            frames_decoded_total: 0,
+                            frames_dropped_total: 0,
+                            decode_us_total: 0,
+                            rx_telemetry: (Instant::now(), 0),
+                        });
                     }
                     Err(e) => {
                         // Do NOT panic here — this used to be an .expect

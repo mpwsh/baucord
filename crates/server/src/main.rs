@@ -67,6 +67,72 @@ enum Command {
         #[command(subcommand)]
         command: InviteCommand,
     },
+    /// Users and their roles (needs persistence on).
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
+    /// Kicks, bans and mutes (needs persistence on).
+    Restriction {
+        #[command(subcommand)]
+        command: RestrictionCommand,
+    },
+    /// Device keys (needs persistence on).
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum UserCommand {
+    /// Every user of record with roles, keys and last-seen.
+    List,
+    /// Add a role (`admin` makes a second administrator; the bootstrap
+    /// code is the other way).
+    Grant { who: String, role: String },
+    /// Remove a role. The last admin keeps `admin`.
+    Revoke { who: String, role: String },
+    /// Revoke joining until lifted; the session is closed.
+    Kick {
+        who: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Kick, and block the key and the address too.
+    Ban {
+        who: String,
+        /// `1h`, `7d`, or `never` (default).
+        #[arg(long = "for", default_value = "never")]
+        duration: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Drop their voice at the relay.
+    Mute {
+        who: String,
+        #[arg(long = "for", default_value = "never")]
+        duration: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+enum RestrictionCommand {
+    /// Every restriction with its id.
+    List,
+    /// Remove one by id — including one an admin put on themselves.
+    Lift { id: u64 },
+}
+
+#[derive(Subcommand, Debug)]
+enum KeyCommand {
+    /// Attach a device key (64 hex digits, from `user list` or the
+    /// server log) to a user.
+    Link { who: String, key_hash: String },
+    /// Retire a device key: refused until re-linked.
+    Unlink { key_hash: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -100,7 +166,14 @@ enum DbCommand {
 }
 
 #[allow(clippy::too_many_lines)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Missing config: write defaults and continue. Present-but-invalid
@@ -138,6 +211,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             command: DbCommand::Check,
         }) => return db_check(&config),
         Some(Command::Invite { command }) => return invite_command(&config, command),
+        Some(Command::User { command }) => return user_command(&config, command),
+        Some(Command::Restriction { command }) => return restriction_command(&config, command),
+        Some(Command::Key { command }) => return key_command(&config, command),
         None => {}
     }
 
@@ -205,7 +281,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("  vouching for retired key {old}");
     }
     info!(
-        "Address: {}#{} (the 1.0 invite form: verify-only, no code)",
+        "Address for clients: {} — identity {} (pinned on first connect; paste it into \
+         Settings → Servers to verify up front)",
         config.public_endpoint(),
         identity.fingerprint()
     );
@@ -387,11 +464,7 @@ fn invite_command(
                     identity_dir.display()
                 );
             }
-            println!(
-                "baucord://{}/{code}#{}",
-                config.public_endpoint(),
-                identity.fingerprint()
-            );
+            println!("{}", protocol::invite::display_code(&code));
             println!(
                 "  grants {}, {}, {}",
                 role_name(role),
@@ -400,6 +473,11 @@ fn invite_command(
                     Some(n) => format!("{n} use(s)"),
                     None => "unlimited uses".to_string(),
                 }
+            );
+            println!(
+                "  for {} (identity {})",
+                config.public_endpoint(),
+                identity.fingerprint()
             );
             Ok(())
         }
@@ -441,6 +519,230 @@ fn invite_command(
                 Err(format!("{code}: no such code, or already revoked").into())
             }
         }
+    }
+}
+
+/// `server user …`.
+fn user_command(config: &Config, command: UserCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    match command {
+        UserCommand::List => {
+            let policy = load_policy_for_listing(&db)?;
+            if policy.users.is_empty() {
+                println!("no users yet");
+                return Ok(());
+            }
+            let mut users: Vec<_> = policy.users.iter().collect();
+            users.sort_by_key(|(_, u)| u.name.to_ascii_lowercase());
+            for (id, u) in users {
+                let roles: Vec<String> = u.roles.iter().map(|r| role_name(*r)).collect();
+                println!(
+                    "{}  {:<24} {:<20} last seen {}",
+                    persistence::hex(id),
+                    u.name,
+                    roles.join(","),
+                    describe_ago(u.last_seen)
+                );
+                for (hash, key) in policy.keys.iter().filter(|(_, k)| k.user_id == *id) {
+                    println!(
+                        "    key {}{}",
+                        persistence::hex(hash),
+                        if key.retired_at.is_some() {
+                            "  (retired)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+        UserCommand::Grant { who, role } => {
+            let (user, policy) = persistence::cli_find_user(&db, &who)?;
+            let role = parse_role(&role)?;
+            let mut roles: Vec<u32> = policy.users[&user].roles.iter().copied().collect();
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+            persistence::cli_set_roles(&db, &user, &roles)?;
+            println!("{}: {}", policy.users[&user].name, describe_roles(&roles));
+            Ok(())
+        }
+        UserCommand::Revoke { who, role } => {
+            let (user, policy) = persistence::cli_find_user(&db, &who)?;
+            let role = parse_role(&role)?;
+            let roles: Vec<u32> = policy.users[&user]
+                .roles
+                .iter()
+                .copied()
+                .filter(|r| *r != role)
+                .collect();
+            persistence::cli_set_roles(&db, &user, &roles)?;
+            println!("{}: {}", policy.users[&user].name, describe_roles(&roles));
+            Ok(())
+        }
+        UserCommand::Kick { who, reason } => {
+            let (user, policy) = persistence::cli_find_user(&db, &who)?;
+            let id = persistence::cli_restrict(&db, restriction_for(user, None, None, reason))?;
+            println!("kicked {} (restriction {id})", policy.users[&user].name);
+            Ok(())
+        }
+        UserCommand::Ban {
+            who,
+            duration,
+            reason,
+        } => {
+            let (user, policy) = persistence::cli_find_user(&db, &who)?;
+            let until = parse_ttl(&duration)?.map(|ms| persistence_wall_now() + ms);
+            // Block the key they used last as well; the address is only
+            // known to a running server.
+            let key = policy
+                .keys
+                .iter()
+                .filter(|(_, k)| k.user_id == user)
+                .max_by_key(|(_, k)| k.last_seen)
+                .map(|(hash, _)| *hash);
+            let mut r = restriction_for(user, until, None, reason);
+            r.key_hash = key;
+            let id = persistence::cli_restrict(&db, r)?;
+            println!("banned {} (restriction {id})", policy.users[&user].name);
+            Ok(())
+        }
+        UserCommand::Mute {
+            who,
+            duration,
+            reason,
+        } => {
+            let (user, policy) = persistence::cli_find_user(&db, &who)?;
+            let until = parse_ttl(&duration)?.map(|ms| persistence_wall_now() + ms);
+            let mut r = restriction_for(user, until, None, reason);
+            r.kind = protocol::RestrictionKind::Voice;
+            let id = persistence::cli_restrict(&db, r)?;
+            println!("muted {} (restriction {id})", policy.users[&user].name);
+            Ok(())
+        }
+    }
+}
+
+/// `server restriction …`.
+fn restriction_command(
+    config: &Config,
+    command: RestrictionCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    match command {
+        RestrictionCommand::List => {
+            let policy = load_policy_for_listing(&db)?;
+            if policy.restrictions.is_empty() {
+                println!("no restrictions");
+                return Ok(());
+            }
+            for r in &policy.restrictions {
+                let who = r
+                    .user_id
+                    .and_then(|u| policy.users.get(&u))
+                    .map_or_else(
+                        || {
+                            r.key_hash.map_or_else(
+                                || r.ip.map_or("?".to_string(), |ip| ip.to_string()),
+                                |k| format!("key {}", persistence::hex(&k[..8])),
+                            )
+                        },
+                        |u| u.name.clone(),
+                    );
+                println!(
+                    "{:<4} {:<8} {:<24} {:<18} {}",
+                    r.id,
+                    r.kind.name(),
+                    who,
+                    describe_expiry(r.until),
+                    r.reason
+                );
+            }
+            Ok(())
+        }
+        RestrictionCommand::Lift { id } => {
+            if persistence::cli_lift_restriction(&db, id)? {
+                println!("lifted {id}");
+                Ok(())
+            } else {
+                Err(format!("no restriction {id}").into())
+            }
+        }
+    }
+}
+
+/// `server key …`.
+fn key_command(config: &Config, command: KeyCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    match command {
+        KeyCommand::Link { who, key_hash } => {
+            let (user, policy) = persistence::cli_find_user(&db, &who)?;
+            let hash = persistence::parse_hex_id(&key_hash)
+                .ok_or("the key hash is 64 hex digits (see `user list`)")?;
+            persistence::cli_set_key(&db, &hash, Some(&user))?;
+            println!("linked to {}", policy.users[&user].name);
+            Ok(())
+        }
+        KeyCommand::Unlink { key_hash } => {
+            let hash = persistence::parse_hex_id(&key_hash)
+                .ok_or("the key hash is 64 hex digits (see `user list`)")?;
+            if persistence::cli_set_key(&db, &hash, None)? {
+                println!("unlinked");
+                Ok(())
+            } else {
+                Err("no such key".into())
+            }
+        }
+    }
+}
+
+fn load_policy_for_listing(db: &Path) -> Result<server::policy::Policy, persistence::PersistError> {
+    persistence::cli_load_policy(db)
+}
+
+fn restriction_for(
+    user: [u8; 32],
+    until: Option<u64>,
+    key_hash: Option<[u8; 32]>,
+    reason: String,
+) -> server::policy::Restriction {
+    server::policy::Restriction {
+        id: 0,
+        user_id: Some(user),
+        key_hash,
+        ip: None,
+        kind: protocol::RestrictionKind::Server,
+        until,
+        reason,
+        by: None,
+        created_at: 0,
+    }
+}
+
+fn describe_roles(roles: &[u32]) -> String {
+    if roles.is_empty() {
+        return "no roles".to_string();
+    }
+    roles
+        .iter()
+        .map(|r| role_name(*r))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// "3 min ago", "2 d ago", or "never" for a zero stamp.
+fn describe_ago(ts: u64) -> String {
+    if ts == 0 {
+        return "never".to_string();
+    }
+    let ago = persistence_wall_now().saturating_sub(ts) / 1000;
+    if ago >= 86_400 {
+        format!("{} d ago", ago / 86_400)
+    } else if ago >= 3_600 {
+        format!("{} h ago", ago / 3_600)
+    } else {
+        format!("{} min ago", ago / 60)
     }
 }
 

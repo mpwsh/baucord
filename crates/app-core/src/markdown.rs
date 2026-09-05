@@ -192,23 +192,22 @@ pub fn to_commonmark(text: &str, code_color: Option<&str>) -> (String, bool) {
                 if let Some(close) = (i + 1..chars.len())
                     .take_while(|&j| chars[j] != '\n')
                     .find(|&j| chars[j] == '`')
+                    && close > i + 1
                 {
-                    if close > i + 1 {
-                        if let Some(color) = code_color {
-                            out.push_str("<font color=\"");
-                            out.push_str(color);
-                            out.push_str("\">`");
-                            out.extend(&chars[i + 1..close]);
-                            out.push_str("`</font>");
-                        } else {
-                            out.push('`');
-                            out.extend(&chars[i + 1..close]);
-                            out.push('`');
-                        }
-                        styled = true;
-                        i = close + 1;
-                        continue;
+                    if let Some(color) = code_color {
+                        out.push_str("<font color=\"");
+                        out.push_str(color);
+                        out.push_str("\">`");
+                        out.extend(&chars[i + 1..close]);
+                        out.push_str("`</font>");
+                    } else {
+                        out.push('`');
+                        out.extend(&chars[i + 1..close]);
+                        out.push('`');
                     }
+                    styled = true;
+                    i = close + 1;
+                    continue;
                 }
                 push_escaped(&mut out, c);
                 i += 1;

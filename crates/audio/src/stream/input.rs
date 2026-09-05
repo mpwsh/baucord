@@ -1059,9 +1059,12 @@ impl SystemAudioCapture {
                 match r.process_into_buffer(&in_adapter, &mut out_adapter, None) {
                     Ok((_in_len, out_len)) => {
                         // Re-interleave: L0 R0 L1 R1 ...
-                        for i in 0..out_len {
-                            accumulator.push(resampler_output[0][i]);
-                            accumulator.push(resampler_output[1][i]);
+                        for (left, right) in resampler_output[0][..out_len]
+                            .iter()
+                            .zip(&resampler_output[1][..out_len])
+                        {
+                            accumulator.push(*left);
+                            accumulator.push(*right);
                         }
                     }
                     Err(e) => {

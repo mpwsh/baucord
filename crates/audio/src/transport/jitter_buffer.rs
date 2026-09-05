@@ -724,9 +724,9 @@ impl AdaptiveJitterBuffer {
 
                 // Sum into output mix and track energy
                 let mut peer_energy = 0.0f32;
-                for i in 0..available {
-                    out[i] += self.scratch[i];
-                    peer_energy += self.scratch[i] * self.scratch[i];
+                for (o, s) in out[..available].iter_mut().zip(&self.scratch[..available]) {
+                    *o += *s;
+                    peer_energy += *s * *s;
                 }
                 peer.playing = true;
 

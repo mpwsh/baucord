@@ -120,18 +120,16 @@ pub struct ServerEntry {
     pub name: String,
     /// `ip:port` (or `[v6]:port`) — parsed as a `SocketAddr` on connect.
     pub address: String,
-    /// Shared room password sent in `Hello`, if the server requires one
-    /// (`authentication.secure: true`).
-    ///
-    /// Stored in settings.json as plain text on purpose: this is a
-    /// shared room secret for a friends server, not a personal
-    /// credential — treat it accordingly (and don't reuse a personal
-    /// password for it). An OS-keychain integration would add a
-    /// per-platform dependency for a secret every member knows.
-    ///
-    /// (0.5 files called this `token_password`; it migrates on load.)
-    #[serde(default, alias = "token_password")]
+    /// The 1.0 room password. Servers ignore it since 1.1 (the device
+    /// key is the login and invites are the door); kept so old files
+    /// load and old entries survive a round trip.
+    #[serde(default, alias = "token_password", skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// The invite code to present on the first visit (spec §3.1),
+    /// typed when the server asks. Sent once: cleared the moment the
+    /// server admits us, because from then on the key is the login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_code: Option<String>,
     /// The server's pinned identity, `SHA256:<base64>` (spec §3.2).
     /// Filled from an invite string, or on first successful connection
     /// (trust on first use). A server presenting a different key is
@@ -156,20 +154,23 @@ impl ServerEntry {
         Self {
             name: "baucord".to_string(),
             address: "216.238.121.18:5000".to_string(),
-            password: Some("conos".to_string()),
+            password: None,
+            invite_code: None,
             fingerprint: None,
             channel_passwords: HashMap::new(),
         }
     }
 
-    /// Parse an invite string: `host:port` or `host:port#SHA256:…`
-    /// (spec §3.2). The name defaults to the address.
+    /// Parse the address line the server prints at startup:
+    /// `host:port` or `host:port#SHA256:…` (the pin is optional; it is
+    /// learned on first connect otherwise). The name defaults to the
+    /// address.
     #[must_use]
-    pub fn from_invite(invite: &str) -> Option<Self> {
-        let invite = invite.trim();
-        let (address, fingerprint) = match invite.split_once('#') {
+    pub fn from_address(line: &str) -> Option<Self> {
+        let line = line.trim();
+        let (address, fingerprint) = match line.split_once('#') {
             Some((addr, fp)) => (addr.trim(), Some(fp.trim())),
-            None => (invite, None),
+            None => (line, None),
         };
         if address.is_empty() || !address.contains(':') {
             return None;
@@ -186,17 +187,36 @@ impl ServerEntry {
             name: address.to_string(),
             address: address.to_string(),
             password: None,
+            invite_code: None,
             fingerprint,
             channel_passwords: HashMap::new(),
         })
     }
 
-    /// The invite string for this entry (with the pin, once known).
+    /// The address with the pin once known, the way the server prints
+    /// it — what to hand a friend along with a code.
     #[must_use]
-    pub fn invite(&self) -> String {
+    pub fn pinned_address(&self) -> String {
         match &self.fingerprint {
             Some(fp) => format!("{}#{fp}", self.address),
             None => self.address.clone(),
+        }
+    }
+
+    /// Take a typed code as the one to present next time. Returns
+    /// whether the input reads as a code (blank clears it).
+    pub fn set_invite_input(&mut self, input: &str) -> bool {
+        let input = input.trim();
+        if input.is_empty() {
+            self.invite_code = None;
+            return true;
+        }
+        match protocol::invite::normalize_code(input) {
+            Some(code) => {
+                self.invite_code = Some(code);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -412,6 +432,7 @@ impl From<SettingsDe> for Settings {
                         name: legacy.address.clone(),
                         address: legacy.address,
                         password: legacy.token_password,
+                        invite_code: None,
                         fingerprint: None,
                         channel_passwords: HashMap::new(),
                     }
@@ -546,6 +567,11 @@ impl Settings {
             if blank(&entry.password) {
                 entry.password = None;
             }
+            // Codes are stored canonical; anything else is not a code.
+            entry.invite_code = entry
+                .invite_code
+                .as_deref()
+                .and_then(protocol::invite::normalize_code);
             if blank(&entry.fingerprint)
                 || entry
                     .fingerprint
@@ -667,18 +693,74 @@ pub fn is_portable_install() -> bool {
 }
 
 /// Load (or create) the client's identity key. Failure is logged and
-/// treated as "no key": the session still works, without a stable user
-/// id.
+/// treated as "no key": since 1.1 that means no session — the app
+/// shows the error instead of connecting.
 #[must_use]
 pub fn load_client_key() -> Option<std::sync::Arc<transport::ClientKey>> {
     let path = client_key_path();
     match transport::ClientKey::load_or_create(&path) {
         Ok(key) => Some(std::sync::Arc::new(key)),
         Err(e) => {
-            log::warn!("client key unavailable ({e}); connecting without one");
+            log::warn!("client key unavailable ({e}); cannot connect without one");
             None
         }
     }
+}
+
+/// Copy the identity key file to `to` (Settings → Identity → Export),
+/// so another machine can be the same user.
+///
+/// # Errors
+/// No key file yet, or the copy failed.
+pub fn export_client_key(to: &std::path::Path) -> Result<(), String> {
+    let from = client_key_path();
+    if !from.is_file() {
+        return Err(format!("no identity key at {}", from.display()));
+    }
+    std::fs::copy(&from, to)
+        .map(|_| ())
+        .map_err(|e| format!("could not write {}: {e}", to.display()))
+}
+
+/// Replace the identity key with the file at `from` (Settings →
+/// Identity → Import). The file must be a PKCS#8 Ed25519 key; the
+/// current key, if any, is overwritten — this device becomes whoever
+/// the imported key is. Returns the new key.
+///
+/// # Errors
+/// Unreadable or malformed file, or the write failed.
+pub fn import_client_key(
+    from: &std::path::Path,
+) -> Result<std::sync::Arc<transport::ClientKey>, String> {
+    let der =
+        std::fs::read(from).map_err(|e| format!("could not read {}: {e}", from.display()))?;
+    transport::ClientKey::from_pkcs8(&der)?;
+    let to = client_key_path();
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(&to, &der).map_err(|e| format!("could not write {}: {e}", to.display()))?;
+    transport::ClientKey::load_or_create(&to)
+        .map(std::sync::Arc::new)
+        .map_err(|e| e.to_string())
+}
+
+/// Throw the identity key away and make a fresh one (Settings →
+/// Identity → Regenerate). The next connection is an unknown device
+/// that needs an invite: a new user, on purpose.
+///
+/// # Errors
+/// The old file could not be removed or the new one written.
+pub fn regenerate_client_key() -> Result<std::sync::Arc<transport::ClientKey>, String> {
+    let path = client_key_path();
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("could not remove {}: {e}", path.display()))?;
+    }
+    transport::ClientKey::load_or_create(&path)
+        .map(std::sync::Arc::new)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -708,7 +790,9 @@ mod tests {
         assert_eq!(e.address, "10.0.0.7:6000");
         // The 0.5 token password becomes the room password; the issuer
         // URL is gone with the issuer.
+        // The 0.5 token password still loads (a 1.1 server ignores it).
         assert_eq!(e.password.as_deref(), Some("sekrit"));
+        assert_eq!(e.invite_code, None);
         assert_eq!(e.fingerprint, None);
         // Pre-existing settings survive the migration.
         assert_eq!(s.user.nickname, "empe");
@@ -790,7 +874,7 @@ mod tests {
         assert_eq!(s.servers[0].password.as_deref(), Some("pw"));
         assert!(s.servers[0].fingerprint.is_some());
         assert_eq!(
-            s.servers[0].invite(),
+            s.servers[0].pinned_address(),
             "1.2.3.4:5000#SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         );
         // A malformed pin is dropped rather than trusted.
@@ -800,20 +884,32 @@ mod tests {
         );
         assert_eq!(s.servers[0].fingerprint, None);
 
-        let e = ServerEntry::from_invite(
+        let e = ServerEntry::from_address(
             " 10.0.0.1:5000#SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ",
         )
-        .expect("invite");
+        .expect("address");
         assert_eq!(e.address, "10.0.0.1:5000");
         assert!(e.fingerprint.is_some());
         assert_eq!(
-            ServerEntry::from_invite("10.0.0.1:5000")
+            ServerEntry::from_address("10.0.0.1:5000")
                 .expect("bare")
                 .fingerprint,
             None
         );
-        assert!(ServerEntry::from_invite("nope").is_none());
-        assert!(ServerEntry::from_invite("10.0.0.1:5000#bad").is_none());
+        assert!(ServerEntry::from_address("nope").is_none());
+        assert!(ServerEntry::from_address("10.0.0.1:5000#bad").is_none());
+
+        // Codes are stored canonical and sent once.
+        let mut s = parse(
+            r#"{ "server": "x", "servers": [ { "name": "x", "address": "1.2.3.4:5000",
+                "invite_code": "k7fq 2mx9 abcd" } ] }"#,
+        );
+        assert_eq!(s.servers[0].invite_code.as_deref(), Some("K7FQ2MX9ABCD"));
+        assert!(!s.servers[0].set_invite_input("garbage"));
+        assert!(s.servers[0].set_invite_input("abcd-efgh-jkmn"));
+        assert_eq!(s.servers[0].invite_code.as_deref(), Some("ABCDEFGHJKMN"));
+        assert!(s.servers[0].set_invite_input("  "));
+        assert_eq!(s.servers[0].invite_code, None);
     }
 
     #[test]

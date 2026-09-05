@@ -459,12 +459,15 @@ impl StreamAudioOutput {
                                 // on a full ring permanently swaps L/R
                                 // downstream. Budget free slots up front.
                                 let mut budget = ring_producer.slots() & !1_usize;
-                                for i in 0..out_len {
+                                for (left, right) in resampler_output[0][..out_len]
+                                    .iter()
+                                    .zip(&resampler_output[1][..out_len])
+                                {
                                     if budget < 2 {
                                         break; // ring full — drop remainder
                                     }
-                                    let _ = ring_producer.push(resampler_output[0][i]);
-                                    let _ = ring_producer.push(resampler_output[1][i]);
+                                    let _ = ring_producer.push(*left);
+                                    let _ = ring_producer.push(*right);
                                     budget -= 2;
                                 }
                             }

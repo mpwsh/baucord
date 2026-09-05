@@ -203,6 +203,35 @@ fn linear_to_db(linear: f32) -> f32 {
     }
 }
 
+/// Tuneable parameters for the compressor.
+///
+/// Lives inside [`InputConfig`](crate::input_config::InputConfig).
+/// All fields are atomic f32 bits for lock-free runtime adjustment.
+pub struct Knobs {
+    /// Threshold in dBFS (-60..0). Default: -18.0.
+    pub threshold_db: AtomicU32,
+
+    /// Compression ratio (1.0..20.0). Default: 4.0.
+    pub ratio: AtomicU32,
+
+    /// Soft knee width in dB (0.0..12.0). Default: 6.0.
+    pub knee_db: AtomicU32,
+
+    /// Make-up gain in dB (0.0..24.0). Default: 0.0.
+    pub makeup_db: AtomicU32,
+}
+
+impl Default for Knobs {
+    fn default() -> Self {
+        Self {
+            threshold_db: AtomicU32::new((-18.0_f32).to_bits()),
+            ratio: AtomicU32::new(4.0_f32.to_bits()),
+            knee_db: AtomicU32::new(6.0_f32.to_bits()),
+            makeup_db: AtomicU32::new(0.0_f32.to_bits()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,7 +263,7 @@ mod tests {
             comp.process_inner(&mut f, true, true);
         }
 
-        let mut output = frame.clone();
+        let mut output = frame;
         comp.process_inner(&mut output, true, true);
         let output_rms = frame_rms(&output);
 
@@ -261,7 +290,7 @@ mod tests {
             comp.process_inner(&mut f, true, true);
         }
 
-        let mut output = frame.clone();
+        let mut output = frame;
         comp.process_inner(&mut output, true, true);
         let ratio = frame_rms(&output) / input_rms;
 
@@ -331,35 +360,6 @@ mod tests {
                 "Monotonic at {input_db:.1}dB: prev={prev_gr:.4} curr={gr:.4}"
             );
             prev_gr = gr;
-        }
-    }
-}
-
-/// Tuneable parameters for the compressor.
-///
-/// Lives inside [`InputConfig`](crate::input_config::InputConfig).
-/// All fields are atomic f32 bits for lock-free runtime adjustment.
-pub struct Knobs {
-    /// Threshold in dBFS (-60..0). Default: -18.0.
-    pub threshold_db: AtomicU32,
-
-    /// Compression ratio (1.0..20.0). Default: 4.0.
-    pub ratio: AtomicU32,
-
-    /// Soft knee width in dB (0.0..12.0). Default: 6.0.
-    pub knee_db: AtomicU32,
-
-    /// Make-up gain in dB (0.0..24.0). Default: 0.0.
-    pub makeup_db: AtomicU32,
-}
-
-impl Default for Knobs {
-    fn default() -> Self {
-        Self {
-            threshold_db: AtomicU32::new((-18.0_f32).to_bits()),
-            ratio: AtomicU32::new(4.0_f32.to_bits()),
-            knee_db: AtomicU32::new(6.0_f32.to_bits()),
-            makeup_db: AtomicU32::new(0.0_f32.to_bits()),
         }
     }
 }

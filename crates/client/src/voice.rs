@@ -27,8 +27,10 @@ use crate::{config::Settings, network::NetworkControl, WakeFn};
 
 #[derive(Debug)]
 pub enum VoiceControl {
+    /// Boxed: `Settings` is by far the largest payload on this channel
+    /// and every other message would pay for it otherwise.
     Start {
-        settings: Settings,
+        settings: Box<Settings>,
         our_client_id: u64,
     },
     Stop,
@@ -73,7 +75,14 @@ pub struct SharedAudioState {
     pub jitter_buffer_ms: Arc<AtomicU32>,
 }
 
+impl Default for SharedAudioState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedAudioState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             input_level: Arc::new(AtomicU32::new(0)),

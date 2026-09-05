@@ -19,6 +19,7 @@ use protocol::{
     permissions::{self, Rank, RoleId, BUILTIN_ROLES, RANK_GUEST, ROLE_GUEST},
     InviteInvalidReason, UserId,
 };
+pub use protocol::RestrictionKind;
 
 use crate::clock::WallMs;
 
@@ -26,11 +27,11 @@ use crate::clock::WallMs;
 /// user id — a user's id *is* the hash of the key that created it.
 pub type KeyHash = UserId;
 
-/// Invite codes: 12 characters from an alphabet without `0/O/1/l/I`,
-/// so they survive being read out loud on voice (spec §3.1). 31¹² ≈
-/// 2⁵⁹ — guessing is moot even before the rate limit.
-pub const INVITE_CODE_LEN: usize = 12;
-pub const INVITE_ALPHABET: &[u8; 31] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+/// Invite codes: 12 characters from an alphabet without `0/O/1/l/I`
+/// (spec §3.1; the shape lives in `protocol::invite`). 31¹² ≈ 2⁵⁹ —
+/// guessing is moot even before the rate limit.
+pub const INVITE_CODE_LEN: usize = protocol::invite::CODE_LEN;
+pub const INVITE_ALPHABET: &[u8; 31] = protocol::invite::ALPHABET;
 /// A code lasts this long unless its creator says otherwise.
 pub const DEFAULT_INVITE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// The one-shot admin code printed at startup (spec §1.1).
@@ -74,41 +75,6 @@ pub struct InviteRecord {
     pub uses: u32,
     pub grants_role: RoleId,
     pub revoked_at: Option<WallMs>,
-}
-
-/// What a restriction takes away (spec §4.2). The discriminants are
-/// the database encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestrictionKind {
-    /// Cannot join at all (kick, ban).
-    Server = 0,
-    Voice = 1,
-    GeneralText = 2,
-    Dm = 3,
-    Upload = 4,
-    Share = 5,
-    Profile = 6,
-}
-
-impl RestrictionKind {
-    #[must_use]
-    pub fn from_db(value: i64) -> Option<Self> {
-        Some(match value {
-            0 => Self::Server,
-            1 => Self::Voice,
-            2 => Self::GeneralText,
-            3 => Self::Dm,
-            4 => Self::Upload,
-            5 => Self::Share,
-            6 => Self::Profile,
-            _ => return None,
-        })
-    }
-
-    #[must_use]
-    pub fn to_db(self) -> i64 {
-        self as i64
-    }
 }
 
 /// One row of the ban family. At least one of `user_id`, `key_hash`,
@@ -412,19 +378,11 @@ pub fn generate_invite_code() -> String {
     code
 }
 
-/// Canonical form of a code as a person typed or read it: uppercase,
-/// separators dropped. `None` if it cannot be a code at all.
+/// Canonical form of a code as a person typed or read it (see
+/// `protocol::invite::normalize_code`).
 #[must_use]
 pub fn normalize_invite_code(input: &str) -> Option<String> {
-    let code: String = input
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '-' | '_' | '.'))
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
-    if code.len() != INVITE_CODE_LEN || !code.bytes().all(|b| INVITE_ALPHABET.contains(&b)) {
-        return None;
-    }
-    Some(code)
+    protocol::invite::normalize_code(input)
 }
 
 /// The role a code grants when its creator did not choose.

@@ -107,7 +107,7 @@ pub fn decode_animation(bytes: &[u8]) -> Result<GifAnimation, ImageError> {
         let (num, den) = frame.delay().numer_denom_ms();
         // Browser convention (matched by Fl_Anim_GIF too): a zero delay
         // plays as ~100 ms.
-        let ms = if den == 0 { 100 } else { num / den };
+        let ms = num.checked_div(den).unwrap_or(100);
         let delay_ms = if ms == 0 { 100 } else { ms };
         let buf = frame.into_buffer();
         width = buf.width();
@@ -203,7 +203,7 @@ impl GifStream {
             }
         };
         let (num, den) = frame.delay().numer_denom_ms();
-        let ms = if den == 0 { 100 } else { num / den };
+        let ms = num.checked_div(den).unwrap_or(100);
         let delay_ms = if ms == 0 { 100 } else { ms };
         let buf = frame.into_buffer();
         self.width = buf.width();

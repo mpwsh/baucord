@@ -82,6 +82,9 @@ use std::{
     time::Instant,
 };
 
+/// The 10 s device-enumeration cache: when it was taken and what it saw.
+type DeviceListCache = Mutex<Option<(Instant, Vec<(String, bool)>)>>;
+
 pub use config::{PeerAudioSettings, VoiceChatConfig};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
@@ -702,7 +705,7 @@ impl VoiceChat {
         // less often, and a hot-plugged device shows up within 10 s.
         // (If the periodic receive-side underruns thin out after this
         // change, enumeration stalls were indeed the cause.)
-        static CACHE: Mutex<Option<(std::time::Instant, Vec<(String, bool)>)>> = Mutex::new(None);
+        static CACHE: DeviceListCache = Mutex::new(None);
         if let Ok(cache) = CACHE.lock() {
             if let Some((at, list)) = cache.as_ref() {
                 if at.elapsed() < std::time::Duration::from_secs(10) {
@@ -738,7 +741,7 @@ impl VoiceChat {
 
     pub fn list_output_devices() -> Result<Vec<(String, bool)>, Box<dyn std::error::Error>> {
         // Same 10 s cache as list_input_devices — see the note there.
-        static CACHE: Mutex<Option<(std::time::Instant, Vec<(String, bool)>)>> = Mutex::new(None);
+        static CACHE: DeviceListCache = Mutex::new(None);
         if let Ok(cache) = CACHE.lock() {
             if let Some((at, list)) = cache.as_ref() {
                 if at.elapsed() < std::time::Duration::from_secs(10) {

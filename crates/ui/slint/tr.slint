@@ -15,7 +15,8 @@ export global Tr {
     // Connect view
     in property <string> app-tagline: "voice, chat & screen share for your crew";
     in property <string> nickname: "Nickname";
-    in property <string> server-password: "Server password (optional)";
+    in property <string> invite-code: "Invite code";
+    in property <string> invite-code-placeholder: "e.g. K7FQ-2MX9-ABCD — only needed the first time";
     in property <string> connect: "Connect";
     in property <string> settings: "Settings";
     in property <string> quit: "Quit";
@@ -87,9 +88,14 @@ export global Tr {
     in property <string> server-remove: "Remove";
     in property <string> server-manage: "Manage servers";
     in property <string> save: "Save";
-    in property <string> connect-access-denied: "Access denied: password";
+    in property <string> server-invite-note: "Sent once, on your first visit; from then on this device's key is the login.";
     in property <string> server-fingerprint: "Server identity (SHA256:…, from the invite)";
-    in property <string> server-config-note: "The password is the room secret everyone on your server shares. The identity is learned on first connect and pinned; paste it from an invite to verify the server up front. Both apply on the next connect.";
+    in property <string> server-config-note: "The identity is learned on first connect and pinned; paste it from the server's startup log to verify the server up front. Applies on the next connect.";
+    in property <string> identity-header: "Identity";
+    in property <string> identity-export: "Export";
+    in property <string> identity-import: "Import";
+    in property <string> identity-regenerate: "Regenerate";
+    in property <string> identity-note: "This device's key is who you are on every server. Export it to be the same user on another machine; Import replaces this device's key; Regenerate makes a new one (a new user, invite needed).";
     in property <string> audio-devices-header: "Devices";
     in property <string> audio-input-device: "Input device";
     in property <string> audio-output-device: "Output device";

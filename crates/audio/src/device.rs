@@ -191,7 +191,7 @@ fn probe_input_as<T: cpal::SizedSample>(
     device: &Device,
     cfg: &StreamConfig,
 ) -> Result<(), cpal::Error> {
-    let stream = device.build_input_stream(cfg.clone(), |_: &[T], _| {}, |_| {}, None)?;
+    let stream = device.build_input_stream(*cfg, |_: &[T], _| {}, |_| {}, None)?;
     drop(stream);
     Ok(())
 }

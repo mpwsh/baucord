@@ -94,7 +94,7 @@ impl LatencyStats {
         let mut sorted = self.samples.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len();
-        if n % 2 == 0 && n >= 2 {
+        if n.is_multiple_of(2) && n >= 2 {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]

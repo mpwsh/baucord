@@ -34,10 +34,12 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use log::{info, warn};
 use protocol::{
     features, pack_system_audio, pack_video_frame, pack_voice_with_flags, parse_system_audio,
-    parse_voice, split_sender, AudioSample, Auth, ChannelDenyReason, ChannelInfo, ClientId,
-    ClientInfo, ClientKeyProof, ClientMessage, DenyReason, Lane, PathSample, RefusedReason,
-    ServerMessage, ShareScope, SharingSample, TelemetryEvent, TelemetrySample, VideoReassembler,
-    ViewingSample, VOICE_FLAG_RED,
+    parse_voice, split_sender, AdminCommand, AdminError, AdminOutcome, AudioSample, Auth,
+    ChannelDenyReason, ChannelInfo, ClientId, ClientInfo, ClientKeyProof, ClientMessage,
+    DenyReason, InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason, PathSample,
+    RefusedReason, RemovedKind, RestrictionKind, RoleId, ServerMessage, ShareScope,
+    SharingSample, TelemetryEvent, TelemetrySample, UserId, VideoReassembler, ViewingSample,
+    VOICE_FLAG_RED,
 };
 use sha2::{Digest, Sha256};
 use transport::{
@@ -105,9 +107,16 @@ const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_secs(600);
 pub enum DisconnectKind {
     /// The user clicked Disconnect.
     UserRequested,
-    /// The server refused admission (wrong password is reported
-    /// separately as `AccessDenied` because it has its own prompt).
+    /// The server refused admission. The verdicts with their own
+    /// prompt (`NeedInvite`, `InviteInvalid`, `NameInUse`) are reported
+    /// as their own messages instead.
     Refused(RefusedReason),
+    /// The server ended an admitted session on purpose (spec §4.1).
+    Removed {
+        kind: RemovedKind,
+        reason: String,
+        by: String,
+    },
     /// This client is too old (or too new) for the server.
     Outdated,
     /// Could not even start: socket, TLS setup, bad address.
@@ -136,6 +145,15 @@ pub enum LossKind {
 /// The close reason the server sends when it is shutting down for a
 /// restart. Wire contract with the server binary; do not reword.
 const SERVER_RESTART_REASON: &str = "server restarting";
+
+/// The first bytes of an id, for log lines.
+fn hex_short(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().take(8).fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
@@ -179,10 +197,62 @@ pub enum NetworkMessage {
         kind: LossKind,
         detail: String,
     },
-    /// The server refused our `Hello` for a wrong or missing room
-    /// password. The UI prompts for it and offers to save it on the
-    /// server entry.
-    AccessDenied,
+    /// This device's key is unknown to the server (or was unlinked):
+    /// the UI shows the invite-code field. `KeyRetired` needs an admin
+    /// to re-link the key; a code will not help.
+    NeedInvite {
+        why: NeedInviteReason,
+    },
+    /// The code we sent did not admit: the UI says which and keeps the
+    /// field.
+    InviteInvalid {
+        why: InviteInvalidReason,
+    },
+    /// Someone online already has that nickname (or a member holds it
+    /// and we are a guest): pick another.
+    NameInUse,
+    /// Who we are on this server, right after `Welcome` (spec §10).
+    Session {
+        user_id: UserId,
+        /// Bitset from `protocol::permissions`.
+        permissions: u64,
+        /// `false`: the server forgets roles, bans and invites when it
+        /// restarts; the UI shows a standing notice.
+        persistent: bool,
+    },
+    /// Answer to `NetworkControl::CreateInvite`.
+    InviteCreated {
+        code: String,
+        grants_role: RoleId,
+        /// Milliseconds since the Unix epoch; `None` = never.
+        expires_at: Option<u64>,
+        max_uses: Option<u32>,
+    },
+    InviteDenied {
+        reason: InviteDenyReason,
+    },
+    /// Who a session is, for the roster (spec §8): after each
+    /// `UserJoined` and once per user after `Init`.
+    UserDetails {
+        client_id: ClientId,
+        user_id: UserId,
+        roles: Vec<RoleId>,
+    },
+    /// A restriction now applies to us (spec §4.2).
+    Restricted {
+        kind: RestrictionKind,
+        until: Option<u64>,
+        reason: String,
+    },
+    /// A restriction on us ended.
+    RestrictionLifted {
+        kind: RestrictionKind,
+    },
+    /// The answer to `NetworkControl::Admin`.
+    AdminResult {
+        request_id: u32,
+        result: Result<AdminOutcome, AdminError>,
+    },
     InitClient {
         users: HashMap<ClientId, String>,
         client_id: u64,
@@ -348,8 +418,10 @@ struct IncomingImage {
 /// What we say once the transport is up.
 struct PendingHello {
     username: String,
-    password: Option<String>,
-    client_key: Option<Arc<ClientKey>>,
+    /// Presented on a first visit (spec §3.1); a known key ignores it.
+    invite_code: Option<String>,
+    /// The device key: the login (spec §3).
+    client_key: Arc<ClientKey>,
 }
 
 /// Where the session is.
@@ -436,9 +508,9 @@ impl NetworkClient {
     pub fn connect(
         server_addr: SocketAddr,
         username: &str,
-        password: Option<&str>,
+        invite_code: Option<&str>,
         fingerprint: Option<Fingerprint>,
-        client_key: Option<Arc<ClientKey>>,
+        client_key: Arc<ClientKey>,
         portable: bool,
     ) -> Result<Self, String> {
         let budget = Budget::client();
@@ -474,7 +546,7 @@ impl NetworkClient {
             phase: Phase::Connecting,
             hello: Some(PendingHello {
                 username: username.to_string(),
-                password: password.map(str::to_string),
+                invite_code: invite_code.map(str::to_string),
                 client_key,
             }),
             identity: None,
@@ -634,7 +706,10 @@ impl NetworkClient {
                 if !self.message_queue.iter().any(|m| {
                     matches!(
                         m,
-                        NetworkMessage::AccessDenied | NetworkMessage::Disconnected { .. }
+                        NetworkMessage::NeedInvite { .. }
+                            | NetworkMessage::InviteInvalid { .. }
+                            | NetworkMessage::NameInUse
+                            | NetworkMessage::Disconnected { .. }
                     )
                 }) {
                     self.message_queue.push(NetworkMessage::Disconnected {
@@ -665,22 +740,26 @@ impl NetworkClient {
         let Some(hello) = self.hello.take() else {
             return;
         };
-        let client_key = hello.client_key.as_ref().and_then(|key| {
-            let mut exported = [0u8; CLIENT_AUTH_EXPORTER_BYTES];
-            self.driver
-                .export_keying_material(self.server, CLIENT_AUTH_EXPORTER_LABEL, b"", &mut exported)
-                .map(|()| ClientKeyProof {
-                    public_key: key.public_key(),
-                    signature: key.sign(&exported),
-                })
-        });
+        let mut exported = [0u8; CLIENT_AUTH_EXPORTER_BYTES];
+        let client_key = self
+            .driver
+            .export_keying_material(self.server, CLIENT_AUTH_EXPORTER_LABEL, b"", &mut exported)
+            .map(|()| ClientKeyProof {
+                public_key: hello.client_key.public_key(),
+                signature: hello.client_key.sign(&exported),
+            });
+        if client_key.is_none() {
+            warn!("No TLS exporter after the handshake; the server will refuse the Hello");
+        }
+        let auth = match hello.invite_code {
+            Some(code) => Auth::Invite { code },
+            None => Auth::Key,
+        };
         let msg = ClientMessage::Hello {
             username: hello.username,
-            auth: Auth::Shared {
-                password: hello.password,
-            },
+            auth,
             client_key,
-            features: features::CLIENT_1_0,
+            features: features::CLIENT_1_1,
             client_version: protocol::CLIENT_VERSION.to_string(),
         };
         self.send_control(now, &msg);
@@ -908,18 +987,25 @@ impl NetworkClient {
             ServerMessage::Refused { reason } => {
                 warn!("Server refused us: {}", reason.describe());
                 self.phase = Phase::Closed;
-                match reason {
-                    RefusedReason::WrongPassword => {
-                        self.message_queue.push(NetworkMessage::AccessDenied);
-                    }
+                let verdict = match reason {
+                    RefusedReason::NeedInvite { why } => NetworkMessage::NeedInvite { why },
+                    RefusedReason::InviteInvalid { why } => NetworkMessage::InviteInvalid { why },
+                    RefusedReason::NameInUse => NetworkMessage::NameInUse,
+                    // A 1.0 server wanted its room password: this client
+                    // no longer has that door — the server is the old one.
+                    RefusedReason::WrongPassword => NetworkMessage::Disconnected {
+                        kind: DisconnectKind::Outdated,
+                        detail: "1.0 server (password admission)".to_string(),
+                    },
                     other => {
                         let detail = other.describe().to_string();
-                        self.message_queue.push(NetworkMessage::Disconnected {
+                        NetworkMessage::Disconnected {
                             kind: DisconnectKind::Refused(other),
                             detail,
-                        });
+                        }
                     }
-                }
+                };
+                self.message_queue.push(verdict);
                 self.driver.close(now, self.server, "refused");
             }
             ServerMessage::Init {
@@ -1110,24 +1196,84 @@ impl NetworkClient {
                         exercised,
                     });
             }
-            // ── 1.1 (the client half lands with the invite door) ────
+            // ── 1.1: session, removal, invites ───────────────────────
             ServerMessage::Session {
+                user_id,
                 permissions,
                 persistent,
-                ..
             } => {
-                info!("Session: permissions {permissions:#x}, persistent {persistent}");
+                info!(
+                    "Session: user {}, permissions {permissions:#x}, persistent {persistent}",
+                    hex_short(&user_id)
+                );
+                self.message_queue.push(NetworkMessage::Session {
+                    user_id,
+                    permissions,
+                    persistent,
+                });
             }
             ServerMessage::Removed { kind, reason, by } => {
-                // The server closes the connection right after; the
-                // disconnect path below reports it.
+                // The verdict is the message; the server closes 300 ms
+                // later, but there is nothing to wait for.
                 warn!("Removed from the server ({kind:?}) by {by}: {reason}");
+                self.phase = Phase::Closed;
+                let detail = format!("{kind:?} by {by}: {reason}");
+                self.message_queue.push(NetworkMessage::Disconnected {
+                    kind: DisconnectKind::Removed { kind, reason, by },
+                    detail,
+                });
+                self.driver.close(now, self.server, "removed");
             }
-            ServerMessage::InviteCreated { code, .. } => {
-                info!("Invite created: {code}");
+            ServerMessage::InviteCreated {
+                code,
+                grants_role,
+                expires_at,
+                max_uses,
+            } => {
+                info!("Invite created: {code} (role {grants_role})");
+                self.message_queue.push(NetworkMessage::InviteCreated {
+                    code,
+                    grants_role,
+                    expires_at,
+                    max_uses,
+                });
             }
             ServerMessage::InviteDenied { reason } => {
                 warn!("Invite refused: {reason:?}");
+                self.message_queue
+                    .push(NetworkMessage::InviteDenied { reason });
+            }
+            ServerMessage::UserDetails {
+                client_id,
+                user_id,
+                roles,
+            } => {
+                self.message_queue.push(NetworkMessage::UserDetails {
+                    client_id,
+                    user_id,
+                    roles,
+                });
+            }
+            ServerMessage::Restricted {
+                kind,
+                until,
+                reason,
+            } => {
+                warn!("Restricted ({}) until {until:?}: {reason}", kind.name());
+                self.message_queue.push(NetworkMessage::Restricted {
+                    kind,
+                    until,
+                    reason,
+                });
+            }
+            ServerMessage::RestrictionLifted { kind } => {
+                info!("Restriction lifted: {}", kind.name());
+                self.message_queue
+                    .push(NetworkMessage::RestrictionLifted { kind });
+            }
+            ServerMessage::AdminResult { request_id, result } => {
+                self.message_queue
+                    .push(NetworkMessage::AdminResult { request_id, result });
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.
@@ -1235,6 +1381,24 @@ impl NetworkClient {
 
     pub fn send_message(&mut self, now: Instant, text: String) {
         self.send_control(now, &ClientMessage::Chat(text));
+    }
+
+    /// Ask the server for an invite code (spec §3.1).
+    pub fn send_create_invite(
+        &mut self,
+        now: Instant,
+        grants_role: Option<RoleId>,
+        expires_secs: Option<u64>,
+        max_uses: Option<u32>,
+    ) {
+        self.send_control(
+            now,
+            &ClientMessage::CreateInvite {
+                grants_role,
+                expires_secs,
+                max_uses,
+            },
+        );
     }
 
     /// Queue a chat image for a *paced* upload: split into
@@ -1613,15 +1777,29 @@ pub enum NetworkControl {
     Connect {
         addr: SocketAddr,
         nickname: String,
-        /// The room password, for servers running `secure: true`.
-        password: Option<String>,
+        /// The invite code for a first visit, if we have one.
+        invite_code: Option<String>,
         /// The pinned server identity (`SHA256:…`); `None` = trust on
         /// first use. An unparsable value is treated as `None`.
         fingerprint: Option<String>,
-        /// Our own identity key, if the app could load one.
-        client_key: Option<Arc<ClientKey>>,
+        /// Our own identity key: the login.
+        client_key: Arc<ClientKey>,
         /// Settings live next to the executable (telemetry).
         portable: bool,
+    },
+    /// Mint an invite (spec §3.1); answered by `InviteCreated` or
+    /// `InviteDenied`.
+    CreateInvite {
+        /// `None` = guest.
+        grants_role: Option<RoleId>,
+        expires_secs: Option<u64>,
+        max_uses: Option<u32>,
+    },
+    /// An administrative action (spec §8); answered by `AdminResult`
+    /// with the same `request_id`.
+    Admin {
+        request_id: u32,
+        command: AdminCommand,
     },
     Disconnect,
     SendMessage(String),
@@ -1773,7 +1951,7 @@ fn handle_control(
         NetworkControl::Connect {
             addr,
             nickname,
-            password,
+            invite_code,
             fingerprint,
             client_key,
             portable,
@@ -1792,7 +1970,7 @@ fn handle_control(
             match NetworkClient::connect(
                 addr,
                 &nickname,
-                password.as_deref(),
+                invite_code.as_deref(),
                 pin,
                 client_key,
                 portable,
@@ -1825,6 +2003,29 @@ fn handle_control(
         NetworkControl::SendMessage(text) => {
             if let Some(c) = client {
                 c.send_message(now, text);
+            }
+        }
+        NetworkControl::CreateInvite {
+            grants_role,
+            expires_secs,
+            max_uses,
+        } => {
+            if let Some(c) = client {
+                c.send_create_invite(now, grants_role, expires_secs, max_uses);
+            }
+        }
+        NetworkControl::Admin {
+            request_id,
+            command,
+        } => {
+            if let Some(c) = client {
+                c.send_control(
+                    now,
+                    &ClientMessage::Admin {
+                        request_id,
+                        command,
+                    },
+                );
             }
         }
         NetworkControl::SendImage(data) => {

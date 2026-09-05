@@ -6,9 +6,11 @@
 // card. Values live in State so they survive failed attempts and
 // reconnects.
 //
-// When the server refuses the hello for the room password, the host flips
-// `State.password-prompt` and an inline box appears: type the server
-// password, Save stores it on the selected server, Connect retries.
+// The device key is the login; an invite code is only needed on the
+// first visit. When the server asks for one (unknown device, or a code
+// that did not admit), the host flips `State.invite-prompt` and an
+// inline box appears: type the code and Connect retries. Verdicts that stay (banned, name in use, device
+// unlinked, removed) go to `State.connect-notice`.
 
 import { IconSet } from "@lucide";
 import { Theme } from "theme.slint";
@@ -76,32 +78,31 @@ export component ConnectView inherits Rectangle {
                 }
             }
 
-            // Wrong or missing room password: ask for it and save it on
-            // the selected entry, then Connect retries.
-            if State.password-prompt : VerticalLayout {
+            // The server wants an invite code: ask for it here, then
+            // Connect retries with it.
+            if State.invite-prompt : VerticalLayout {
                 spacing: Theme.gap-sm;
                 Text {
-                    text: Tr.connect-access-denied;
-                    color: Theme.danger;
+                    text: State.invite-prompt-text;
+                    color: Theme.warning;
                     font-size: Theme.font-sm;
                     wrap: word-wrap;
                 }
-                HorizontalLayout {
-                    spacing: Theme.gap-sm;
-                    Field {
-                        horizontal-stretch: 1;
-                        text <=> State.password;
-                        secret: true;
-                        accepted => { Logic.save-password(); }
-                    }
-                    Btn {
-                        width: 84px;
-                        height: 40px;
-                        text: Tr.save;
-                        accent: true;
-                        clicked => { Logic.save-password(); }
-                    }
+                FieldLabel { text: Tr.invite-code; }
+                Field {
+                    text <=> State.invite-code;
+                    placeholder: Tr.invite-code-placeholder;
+                    accepted => { Logic.connect-clicked(); }
                 }
+            }
+
+            // A verdict that stays until the next attempt.
+            if State.connect-notice != "" : Text {
+                text: State.connect-notice;
+                color: Theme.danger;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+                wrap: word-wrap;
             }
 
             Btn {

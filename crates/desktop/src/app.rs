@@ -43,6 +43,7 @@ use audio::{PeerAudioSettings, SoundType};
 use client::{
     config::{peer_key, BindableAction, Settings},
     network::{DisconnectKind, LossKind, NetworkControl, NetworkMessage, NetworkThreadHandle},
+    AdminCommand, AdminTarget,
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
 };
@@ -106,10 +107,23 @@ pub struct AppState {
     pending_channel_join: Option<u16>,
     connected: bool,
     pub settings: Settings,
-    /// Our Ed25519 identity key (next to settings.json), sent in Hello
-    /// so the server can derive a stable user id. `None` if it could
-    /// not be loaded; the session works without it.
-    client_key: Option<Arc<transport::ClientKey>>,
+    /// Our Ed25519 identity key (next to settings.json): the login
+    /// (spec §3). `None` if it could not be loaded — then there is no
+    /// connecting until it can.
+    pub client_key: Option<Arc<transport::ClientKey>>,
+    /// What the server said we may do this session (`Session`,
+    /// spec §10); the UI renders what this allows.
+    pub permissions: u64,
+    /// `Session.persistent`: `false` earns a standing notice in chat,
+    /// pushed after `Init` (which resets the chat) rather than on
+    /// arrival.
+    server_persistent: bool,
+    /// Who each session is (`UserDetails`): user id and roles, from
+    /// the server's tables. Slash commands resolve names through it.
+    details: HashMap<u64, (client::UserId, Vec<client::RoleId>)>,
+    /// Admin requests in flight: what to do with the answer.
+    pending_admin: HashMap<u32, PendingAdmin>,
+    next_request_id: u32,
     is_muted: bool,
     is_deafened: bool,
     pub is_testing_mic: bool,
@@ -321,6 +335,11 @@ pub fn run() {
         pending_channel_join: None,
         connected: false,
         client_key: client::config::load_client_key(),
+        permissions: 0,
+        server_persistent: true,
+        details: HashMap::new(),
+        pending_admin: HashMap::new(),
+        next_request_id: 1,
         settings,
         is_muted: false,
         is_deafened: false,
@@ -462,10 +481,8 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 app.settings.server = entry.name.clone();
                 app.settings.save();
             }
-            // A pending 403 prompt referred to the previous server.
-            let s = app.main.global::<State>();
-            s.set_password_prompt(false);
-            s.set_password("".into());
+            // A pending invite prompt referred to the previous server.
+            app.clear_connect_verdicts();
             crate::settingsui::refresh_servers(app);
         });
     });
@@ -476,13 +493,6 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
             if let Some(win) = &app.settings_win {
                 win.set_tab(crate::settingsui::TAB_SERVERS);
             }
-        });
-    });
-    let w = Rc::downgrade(state);
-    logic.on_save_password(move || {
-        with_app(&w, |app| {
-            let typed = app.main.global::<State>().get_password().to_string();
-            app.save_prompt_password(&typed);
         });
     });
     let w = Rc::downgrade(state);
@@ -1065,9 +1075,145 @@ impl AppState {
             NetworkMessage::Connected => {
                 self.connected = true;
                 self.reconnect_attempts = 0;
+                self.main.global::<State>().set_error_text("".into());
+                self.clear_connect_verdicts();
+                // Admitted: from now on the key is the login, so the
+                // code has done its one job.
+                if let Some(server) = self.settings.default_server_mut()
+                    && server.invite_code.take().is_some()
+                {
+                    self.settings.save();
+                    crate::settingsui::refresh_servers(self);
+                }
+            }
+            NetworkMessage::Session {
+                user_id,
+                permissions,
+                persistent,
+            } => {
+                self.permissions = permissions;
+                self.server_persistent = persistent;
+                log::info!(
+                    "session: user {}, permissions {permissions:#x}, persistent {persistent}",
+                    short_id(&user_id)
+                );
+            }
+            NetworkMessage::NeedInvite { why } => {
                 let s = self.main.global::<State>();
-                s.set_error_text("".into());
-                s.set_password_prompt(false);
+                match why {
+                    client::NeedInviteReason::UnknownKey => {
+                        info!("Connect refused: this device needs an invite");
+                        s.set_invite_prompt_text(t!("connect-need-invite").into());
+                        s.set_invite_prompt(true);
+                    }
+                    client::NeedInviteReason::KeyRetired => {
+                        info!("Connect refused: this device was unlinked");
+                        s.set_invite_prompt(false);
+                        s.set_connect_notice(t!("connect-key-retired").into());
+                    }
+                }
+            }
+            NetworkMessage::InviteInvalid { why } => {
+                info!("Connect refused: invite {why:?}");
+                // Whatever code we stored is no good; do not resend it.
+                if let Some(server) = self.settings.default_server_mut() {
+                    server.invite_code = None;
+                }
+                self.settings.save();
+                let s = self.main.global::<State>();
+                s.set_invite_prompt_text(
+                    t!(match why {
+                        client::InviteInvalidReason::Expired => "connect-invite-expired",
+                        client::InviteInvalidReason::Revoked => "connect-invite-revoked",
+                        client::InviteInvalidReason::Exhausted => "connect-invite-exhausted",
+                        client::InviteInvalidReason::Unknown => "connect-invite-unknown",
+                    })
+                    .into(),
+                );
+                s.set_invite_code("".into());
+                s.set_invite_prompt(true);
+            }
+            NetworkMessage::NameInUse => {
+                info!("Connect refused: name in use");
+                self.main
+                    .global::<State>()
+                    .set_connect_notice(t!("connect-name-in-use").into());
+            }
+            NetworkMessage::InviteCreated {
+                code,
+                grants_role,
+                expires_at,
+                max_uses,
+            } => {
+                // A newcomer needs the server address, the port and this
+                // code, as plain text; the code goes on the clipboard.
+                let shown = client::invite::display_code(&code);
+                crate::clipboard::set_clipboard_text(&shown);
+                let role = role_label(grants_role);
+                let expiry = describe_expiry(expires_at);
+                let uses = match max_uses {
+                    Some(n) => t!("invite-uses", "count" => n),
+                    None => t!("invite-uses-unlimited"),
+                };
+                self.push_chat_system(&t!(
+                    "chat-invite-created",
+                    "code" => shown.as_str(),
+                    "role" => role.as_str(),
+                    "expiry" => expiry.as_str(),
+                    "uses" => uses.as_str()
+                ));
+            }
+            NetworkMessage::InviteDenied { reason } => {
+                self.push_chat_system(&t!(match reason {
+                    client::InviteDenyReason::NoPermission => "chat-invite-no-permission",
+                    client::InviteDenyReason::RoleNotAllowed => "chat-invite-role-not-allowed",
+                }));
+            }
+            NetworkMessage::UserDetails {
+                client_id,
+                user_id,
+                roles,
+            } => {
+                self.details.insert(client_id, (user_id, roles));
+            }
+            NetworkMessage::Restricted {
+                kind,
+                until,
+                reason,
+            } => {
+                // "… for 2 h: spam" / "… indefinitely: spam" / a role gap
+                // has neither: "… — not allowed by your role".
+                let by_role = reason.is_empty() && until.is_none();
+                let until = if by_role {
+                    String::new()
+                } else {
+                    format!(" {}", describe_until(until))
+                };
+                let reason = if by_role {
+                    format!(" — {}", t!("restricted-by-role"))
+                } else if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {reason}")
+                };
+                let what = t!(
+                    restricted_key(kind),
+                    "until" => until.as_str(),
+                    "reason" => reason.as_str()
+                );
+                self.push_chat_system(&what);
+                self.show_error(&what);
+                // A server mute: stop sending too (spec §4.2); the relay
+                // is the backstop, not the path.
+                if kind == client::RestrictionKind::Voice && !self.is_muted {
+                    self.handle_toggle_mute();
+                }
+            }
+            NetworkMessage::RestrictionLifted { kind } => {
+                self.push_chat_system(&t!(lifted_key(kind)));
+            }
+            NetworkMessage::AdminResult { request_id, result } => {
+                self.handle_admin_result(request_id, result);
             }
             NetworkMessage::ConnectionLost { kind, detail } => {
                 // Network, not credentials: come back on our own, with
@@ -1151,19 +1297,9 @@ impl AppState {
                 self.show_connect_phase();
                 self.show_error(&text);
             }
-            NetworkMessage::AccessDenied => {
-                // The server refused our Hello for the room password:
-                // surface the inline password prompt on the connect card
-                // (persistent, unlike the 5s error toast) so the user
-                // can save the password and hit Connect again.
-                info!("Connect refused: wrong or missing server password");
-                let s = self.main.global::<State>();
-                s.set_password_prompt(true);
-                s.set_password("".into());
-            }
             NetworkMessage::Disconnected { kind, detail } => {
                 log::info!("disconnected ({kind:?}): {detail}");
-                let what = match kind {
+                let what = match &kind {
                     DisconnectKind::UserRequested => t!("disconnect-reason-user"),
                     DisconnectKind::Refused(client::RefusedReason::ServerFull) => {
                         t!("error-refused-full")
@@ -1171,8 +1307,34 @@ impl AppState {
                     DisconnectKind::Refused(client::RefusedReason::RateLimited) => {
                         t!("error-refused-rate-limited")
                     }
+                    DisconnectKind::Refused(client::RefusedReason::Banned { until, reason }) => {
+                        let until = describe_until(*until);
+                        t!(
+                            "error-banned",
+                            "reason" => reason.as_str(),
+                            "until" => until.as_str()
+                        )
+                    }
                     DisconnectKind::Refused(_) | DisconnectKind::Outdated => {
                         t!("error-outdated")
+                    }
+                    DisconnectKind::Removed { kind, reason, by } => {
+                        let key = match kind {
+                            client::RemovedKind::Disconnected => "removed-disconnected",
+                            client::RemovedKind::Kicked => "removed-kicked",
+                            client::RemovedKind::Banned { .. } => "removed-banned",
+                            client::RemovedKind::Replaced => "removed-replaced",
+                        };
+                        let until = match kind {
+                            client::RemovedKind::Banned { until } => describe_until(*until),
+                            _ => String::new(),
+                        };
+                        t!(
+                            key,
+                            "by" => by.as_str(),
+                            "reason" => reason.as_str(),
+                            "until" => until.as_str()
+                        )
                     }
                     DisconnectKind::LocalError => {
                         t!("error-local", "detail" => detail.as_str())
@@ -1184,8 +1346,14 @@ impl AppState {
                     self.teardown_connection();
                     self.show_connect_phase();
                 }
-                if kind != DisconnectKind::UserRequested {
-                    self.show_error(&what);
+                match kind {
+                    DisconnectKind::UserRequested => {}
+                    // Verdicts that stay on the card until the next try.
+                    DisconnectKind::Refused(client::RefusedReason::Banned { .. })
+                    | DisconnectKind::Removed { .. } => {
+                        self.main.global::<State>().set_connect_notice(what.into());
+                    }
+                    _ => self.show_error(&what),
                 }
             }
             NetworkMessage::InitClient {
@@ -1204,6 +1372,9 @@ impl AppState {
                     &channels,
                     &memberships,
                 );
+                if !self.server_persistent {
+                    self.push_chat_system(&t!("chat-server-not-persistent"));
+                }
             }
             NetworkMessage::UserJoined {
                 client_id,
@@ -1333,18 +1504,29 @@ impl AppState {
     fn handle_connect(&mut self, nickname: &str) {
         self.reconnect_timer.stop();
         self.settings.user.nickname = nickname.to_string();
+        self.main.global::<State>().set_connect_notice("".into());
 
-        // A password typed into the 403 prompt but not yet saved still
-        // counts — clicking Connect means "use what I typed".
+        // A code (or a whole link) typed into the invite box counts —
+        // clicking Connect means "use what I typed". It is stored on
+        // the entry so a restart before admission still has it.
         let s = self.main.global::<State>();
-        if s.get_password_prompt() {
-            let typed = s.get_password().trim().to_string();
-            if !typed.is_empty() {
-                self.save_prompt_password(&typed);
+        if s.get_invite_prompt() {
+            let typed = s.get_invite_code().to_string();
+            if let Some(server) = self.settings.default_server_mut()
+                && !server.set_invite_input(&typed)
+            {
+                self.show_error(&t!("error-invite-code-malformed"));
+                return;
             }
         }
         self.settings.save();
+        crate::settingsui::refresh_servers(self);
 
+        let Some(client_key) = self.client_key.clone() else {
+            let path = client::config::client_key_path().display().to_string();
+            self.show_error(&t!("error-no-identity", "path" => path.as_str()));
+            return;
+        };
         let Some(server) = self.settings.default_server().cloned() else {
             self.show_error(&t!("error-invalid-address"));
             return;
@@ -1359,27 +1541,326 @@ impl AppState {
             .send(NetworkControl::Connect {
                 addr,
                 nickname: nickname.to_string(),
-                password: server.password,
+                invite_code: server.invite_code,
                 fingerprint: server.fingerprint,
-                client_key: self.client_key.clone(),
+                client_key,
                 portable: client::config::is_portable_install(),
             })
             .ok();
     }
 
-    /// Store `password` on the default (= dropdown-selected) server
-    /// and dismiss the 403 prompt. Empty input clears the saved one.
-    fn save_prompt_password(&mut self, password: &str) {
-        let password = password.trim();
-        if let Some(server) = self.settings.default_server_mut() {
-            server.password = (!password.is_empty()).then(|| password.to_string());
-        }
-        self.settings.save();
+    /// Dismiss the invite box and the sticky verdict line.
+    pub fn clear_connect_verdicts(&mut self) {
         let s = self.main.global::<State>();
-        s.set_password_prompt(false);
-        s.set_password("".into());
-        // Mirror into the settings window's editor if it's open.
-        crate::settingsui::refresh_servers(self);
+        s.set_invite_prompt(false);
+        s.set_invite_prompt_text("".into());
+        s.set_invite_code("".into());
+        s.set_connect_notice("".into());
+    }
+
+    /// One slash command from the composer. Moderation commands map
+    /// onto `AdminCommand` (spec §8): the server checks them, the
+    /// answer lands in chat.
+    fn handle_slash_command(&mut self, command: &str, args: &str) {
+        match command {
+            "invite" => self.handle_invite_command(args),
+            "help" | "commands" => self.push_chat_system(&t!("chat-commands-help")),
+            "users" => self.send_admin(AdminCommand::ListUsers, PendingAdmin::Show),
+            "restrictions" => {
+                self.send_admin(AdminCommand::ListRestrictions, PendingAdmin::Show);
+            }
+            "invites" => self.send_admin(AdminCommand::ListInvites, PendingAdmin::Show),
+            "kick" | "ban" | "disconnect" | "mute" | "unmute" | "restrict" | "grant"
+            | "revoke" | "move" => self.handle_user_command(command, args),
+            "lift" => match args.trim().parse::<u64>() {
+                Ok(restriction_id) => self.send_admin(
+                    AdminCommand::Lift { restriction_id },
+                    PendingAdmin::Show,
+                ),
+                Err(_) => self.push_chat_system(&t!("chat-command-usage-lift")),
+            },
+            "revoke-invite" => match client::invite::normalize_code(args) {
+                Some(code) => {
+                    self.send_admin(AdminCommand::RevokeInvite { code }, PendingAdmin::Show);
+                }
+                None => self.push_chat_system(&t!("chat-command-usage-revoke-invite")),
+            },
+            "unlink" => match parse_hex_id(args.trim()) {
+                Some(key_hash) => {
+                    self.send_admin(AdminCommand::UnlinkKey { key_hash }, PendingAdmin::Show);
+                }
+                None => self.push_chat_system(&t!("chat-command-usage-unlink")),
+            },
+            "link" => {
+                let mut words = args.split_whitespace();
+                match (
+                    words.next().and_then(|name| self.user_id_of(name)),
+                    words.next().and_then(parse_hex_id),
+                ) {
+                    (Some(user_id), Some(key_hash)) => self.send_admin(
+                        AdminCommand::LinkKey { user_id, key_hash },
+                        PendingAdmin::Show,
+                    ),
+                    _ => self.push_chat_system(&t!("chat-command-usage-link")),
+                }
+            }
+            _ => self.push_chat_system(&t!("chat-command-unknown", "command" => command)),
+        }
+    }
+
+    /// The commands whose first word is a user online right now:
+    /// `/kick name reason`, `/ban name [7d] reason`, `/mute name [30m]
+    /// reason`, `/restrict name kind [30m] reason`, `/grant name role`,
+    /// `/revoke name role`, `/move name channel`.
+    fn handle_user_command(&mut self, command: &str, args: &str) {
+        let mut words = args.split_whitespace();
+        let Some(name) = words.next() else {
+            self.push_chat_system(&t!("chat-command-usage", "command" => command));
+            return;
+        };
+        let Some(user_id) = self.user_id_of(name) else {
+            self.push_chat_system(&t!("chat-command-no-such-user", "name" => name));
+            return;
+        };
+        let rest: Vec<&str> = words.collect();
+        // An optional duration right after the name; the rest is the reason.
+        let (duration_secs, reason_words) =
+            match rest.first().and_then(|w| parse_duration_secs(w)) {
+                Some(secs) => (Some(secs), &rest[1..]),
+                None => (None, &rest[..]),
+            };
+        let reason = reason_words.join(" ");
+        let admin = match command {
+            "kick" => AdminCommand::Kick { user_id, reason },
+            "disconnect" => AdminCommand::Disconnect { user_id, reason },
+            "ban" => AdminCommand::Ban {
+                user_id,
+                duration_secs,
+                reason,
+            },
+            "mute" => AdminCommand::Restrict {
+                target: AdminTarget::User(user_id),
+                kind: client::RestrictionKind::Voice,
+                duration_secs,
+                reason,
+            },
+            "unmute" => {
+                // Two steps: list, then lift the voice restriction found.
+                self.send_admin(
+                    AdminCommand::ListRestrictions,
+                    PendingAdmin::UnmuteUser(user_id),
+                );
+                return;
+            }
+            "restrict" => {
+                let Some(kind) = rest.first().and_then(|w| client::RestrictionKind::parse(w))
+                else {
+                    self.push_chat_system(&t!("chat-command-usage-restrict"));
+                    return;
+                };
+                let (duration_secs, reason_words) =
+                    match rest.get(1).and_then(|w| parse_duration_secs(w)) {
+                        Some(secs) => (Some(secs), &rest[2..]),
+                        None => (None, &rest[1..]),
+                    };
+                AdminCommand::Restrict {
+                    target: AdminTarget::User(user_id),
+                    kind,
+                    duration_secs,
+                    reason: reason_words.join(" "),
+                }
+            }
+            "grant" | "revoke" => {
+                let Some(role) = rest.first().and_then(|w| parse_role(w)) else {
+                    self.push_chat_system(&t!("chat-command-usage", "command" => command));
+                    return;
+                };
+                let mut roles: Vec<client::RoleId> = self
+                    .details
+                    .values()
+                    .find(|(u, _)| *u == user_id)
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or_default();
+                if command == "grant" {
+                    if !roles.contains(&role) {
+                        roles.push(role);
+                    }
+                } else {
+                    roles.retain(|r| *r != role);
+                }
+                AdminCommand::SetRoles { user_id, roles }
+            }
+            "move" => {
+                let wanted = rest.join(" ");
+                let Some(channel_id) = self
+                    .channels
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(wanted.trim()))
+                    .and_then(|i| u16::try_from(i).ok())
+                else {
+                    self.push_chat_system(&t!("chat-command-usage", "command" => command));
+                    return;
+                };
+                AdminCommand::MoveUser {
+                    user_id,
+                    channel_id,
+                }
+            }
+            _ => return,
+        };
+        self.send_admin(admin, PendingAdmin::Show);
+    }
+
+    /// The user id behind a nickname online right now.
+    fn user_id_of(&self, name: &str) -> Option<client::UserId> {
+        let name = name.trim_start_matches('@');
+        self.users
+            .iter()
+            .find(|(_, u)| u.username.eq_ignore_ascii_case(name))
+            .and_then(|(client_id, _)| self.details.get(client_id))
+            .map(|(user_id, _)| *user_id)
+    }
+
+    fn send_admin(&mut self, command: AdminCommand, then: PendingAdmin) {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.pending_admin.insert(request_id, then);
+        self.network
+            .tx
+            .send(NetworkControl::Admin {
+                request_id,
+                command,
+            })
+            .ok();
+    }
+
+    fn handle_admin_result(
+        &mut self,
+        request_id: u32,
+        result: Result<client::AdminOutcome, client::AdminError>,
+    ) {
+        let then = self.pending_admin.remove(&request_id);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let why = e.describe();
+                self.push_chat_system(&t!("chat-admin-refused", "why" => why.as_str()));
+                return;
+            }
+        };
+        if let Some(PendingAdmin::UnmuteUser(user_id)) = then {
+            if let client::AdminOutcome::Restrictions(list) = &outcome
+                && let Some(r) = list.iter().find(|r| {
+                    r.user_id == Some(user_id) && r.kind == client::RestrictionKind::Voice
+                })
+            {
+                self.send_admin(
+                    AdminCommand::Lift {
+                        restriction_id: r.id,
+                    },
+                    PendingAdmin::Show,
+                );
+            } else {
+                self.push_chat_system(&t!("chat-admin-not-muted"));
+            }
+            return;
+        }
+        match outcome {
+            client::AdminOutcome::Done => self.push_chat_system(&t!("chat-admin-done")),
+            client::AdminOutcome::Users(users) => {
+                self.push_chat_system(&t!("chat-admin-users-header", "count" => users.len()));
+                for u in users {
+                    let roles: Vec<String> = u.roles.iter().map(|r| role_label(*r)).collect();
+                    let line = format!(
+                        "{}{} — {} — {} — {}",
+                        if u.client_id.is_some() { "● " } else { "○ " },
+                        u.name,
+                        if roles.is_empty() {
+                            "no roles".to_string()
+                        } else {
+                            roles.join(", ")
+                        },
+                        short_id(&u.user_id),
+                        describe_ago(u.last_seen)
+                    );
+                    self.push_chat_system(&line);
+                }
+            }
+            client::AdminOutcome::Restrictions(list) => {
+                self.push_chat_system(&t!(
+                    "chat-admin-restrictions-header",
+                    "count" => list.len()
+                ));
+                for r in list {
+                    let who = r
+                        .user_name
+                        .clone()
+                        .or_else(|| r.key_hash.map(|k| format!("key {}", short_id(&k))))
+                        .or_else(|| r.address.clone())
+                        .unwrap_or_default();
+                    let line = format!(
+                        "#{} {} {} — {} — {} — {}",
+                        r.id,
+                        r.kind.name(),
+                        who,
+                        describe_expiry(r.until),
+                        r.reason,
+                        r.by
+                    );
+                    self.push_chat_system(&line);
+                }
+            }
+            client::AdminOutcome::Invites(list) => {
+                self.push_chat_system(&t!("chat-admin-invites-header", "count" => list.len()));
+                for i in list {
+                    let uses = match i.max_uses {
+                        Some(max) => format!("{}/{max}", i.uses),
+                        None => i.uses.to_string(),
+                    };
+                    let state = if i.revoked { " (revoked)" } else { "" };
+                    let line = format!(
+                        "{} — {} — {} — uses {uses}{state}",
+                        client::invite::display_code(&i.code),
+                        role_label(i.grants_role),
+                        describe_expiry(i.expires_at)
+                    );
+                    self.push_chat_system(&line);
+                }
+            }
+        }
+    }
+
+    /// `/invite [guest|member|organizer] [<n>m|h|d] [<uses>]` from the
+    /// composer: ask the server for a code. The answer lands in chat as
+    /// a link (and on the clipboard).
+    fn handle_invite_command(&mut self, args: &str) {
+        let mut grants_role = None;
+        let mut expires_secs = None;
+        let mut max_uses = None;
+        for word in args.split_whitespace() {
+            let lower = word.to_ascii_lowercase();
+            if let Some(role) = client::permissions::BUILTIN_ROLES
+                .iter()
+                .find(|r| r.name == lower)
+            {
+                grants_role = Some(role.id);
+            } else if let Some(secs) = parse_duration_secs(&lower) {
+                expires_secs = Some(secs);
+            } else if let Ok(n) = lower.parse::<u32>() {
+                max_uses = Some(n);
+            } else {
+                self.push_chat_system(&t!("chat-invite-usage"));
+                return;
+            }
+        }
+        self.network
+            .tx
+            .send(NetworkControl::CreateInvite {
+                grants_role,
+                expires_secs,
+                max_uses,
+            })
+            .ok();
     }
 
     fn handle_init_client(
@@ -1436,7 +1917,7 @@ impl AppState {
         self.voice
             .tx
             .send(VoiceControl::Start {
-                settings: self.settings.clone(),
+                settings: Box::new(self.settings.clone()),
                 our_client_id: client_id,
             })
             .ok();
@@ -1495,6 +1976,7 @@ impl AppState {
     }
 
     fn handle_user_left(&mut self, client_id: u64, username: &str) {
+        self.details.remove(&client_id);
         self.voice.tx.send(VoiceControl::RemovePeer(client_id)).ok();
         let was_in_our_channel = self
             .users
@@ -1628,7 +2110,8 @@ impl AppState {
                 self.pending_channel_join = None;
                 self.show_error(&t!("channel-full"));
             }
-            client::ChannelDenyReason::NoSuchChannel => {
+            client::ChannelDenyReason::NoSuchChannel
+            | client::ChannelDenyReason::NotPermitted => {
                 self.pending_channel_join = None;
                 self.show_error(reason.describe());
             }
@@ -1734,6 +2217,10 @@ impl AppState {
     /// disconnects.
     fn teardown_connection(&mut self) {
         self.connected = false;
+        self.permissions = 0;
+        self.server_persistent = true;
+        self.details.clear();
+        self.pending_admin.clear();
         self.is_testing_mic = false;
         self.channels.clear();
         self.pending_channel_join = None;
@@ -1968,7 +2455,7 @@ impl AppState {
                 self.voice
                     .tx
                     .send(VoiceControl::Start {
-                        settings: self.settings.clone(),
+                        settings: Box::new(self.settings.clone()),
                         our_client_id: 0,
                     })
                     .ok();
@@ -1986,8 +2473,7 @@ impl AppState {
     /// scrubbed, char cap enforced. The server echoes `TextMessage` back
     /// to everyone (sender included), so there is no local append here.
     fn send_current_message(&mut self) {
-        let s = self.main.global::<State>();
-        let raw = s.get_draft().to_string();
+        let raw = self.main.global::<State>().get_draft().to_string();
         let rendered =
             app_core::emoji::replace_shortcodes(&app_core::chat::scrub_control_chars(raw.trim()));
         let text: String = rendered
@@ -1997,8 +2483,14 @@ impl AppState {
         if text.is_empty() {
             return;
         }
-        self.network.tx.send(NetworkControl::SendMessage(text)).ok();
-        s.set_draft("".into());
+        if let Some(rest) = text.strip_prefix('/')
+            && let Some((command, args)) = split_command(rest)
+        {
+            self.handle_slash_command(command, args);
+        } else {
+            self.network.tx.send(NetworkControl::SendMessage(text)).ok();
+        }
+        self.main.global::<State>().set_draft("".into());
         self.main.invoke_focus_composer();
     }
 
@@ -2833,8 +3325,10 @@ impl AppState {
     fn push_connect_fields(&self) {
         let s = self.main.global::<State>();
         s.set_nickname(self.settings.user.nickname.as_str().into());
-        s.set_password("".into());
-        s.set_password_prompt(false);
+        s.set_invite_prompt(false);
+        s.set_invite_prompt_text("".into());
+        s.set_invite_code("".into());
+        s.set_connect_notice("".into());
         self.push_connect_servers();
     }
 
@@ -2909,6 +3403,159 @@ impl AppState {
 }
 
 /// `audio::PeerAudioSettings` ↔ app-core's `PeerAudio` mirror.
+/// What to do with an `AdminResult` when it arrives.
+enum PendingAdmin {
+    /// Print the outcome.
+    Show,
+    /// `/unmute`: find the voice restriction on this user in the list
+    /// that comes back and lift it.
+    UnmuteUser(client::UserId),
+}
+
+/// The first bytes of a user id, for log lines and the identity panel.
+#[must_use]
+pub fn short_id(id: &[u8]) -> String {
+    use std::fmt::Write;
+    id.iter().take(8).fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+/// `/kick alice spam` → (`kick`, `alice spam`); `None` for a bare `/`.
+fn split_command(rest: &str) -> Option<(&str, &str)> {
+    let command = rest.split_whitespace().next()?;
+    if !command
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return None;
+    }
+    let args = rest[command.len()..].trim_start();
+    Some((command, args))
+}
+
+/// A role by name (`member`) or id.
+fn parse_role(text: &str) -> Option<client::RoleId> {
+    let lower = text.to_ascii_lowercase();
+    client::permissions::BUILTIN_ROLES
+        .iter()
+        .find(|r| r.name == lower)
+        .map(|r| r.id)
+        .or_else(|| lower.parse().ok())
+}
+
+/// A full 64-hex-digit id.
+fn parse_hex_id(text: &str) -> Option<client::UserId> {
+    let text = text.trim();
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The Fluent key for "you are restricted" per kind.
+fn restricted_key(kind: client::RestrictionKind) -> &'static str {
+    match kind {
+        client::RestrictionKind::Voice => "restricted-voice",
+        client::RestrictionKind::GeneralText => "restricted-text",
+        client::RestrictionKind::Dm => "restricted-dm",
+        client::RestrictionKind::Upload => "restricted-upload",
+        client::RestrictionKind::Share => "restricted-share",
+        client::RestrictionKind::Profile => "restricted-profile",
+        client::RestrictionKind::Server => "restricted-server",
+    }
+}
+
+fn lifted_key(kind: client::RestrictionKind) -> &'static str {
+    match kind {
+        client::RestrictionKind::Voice => "lifted-voice",
+        client::RestrictionKind::GeneralText => "lifted-text",
+        client::RestrictionKind::Dm => "lifted-dm",
+        client::RestrictionKind::Upload => "lifted-upload",
+        client::RestrictionKind::Share => "lifted-share",
+        client::RestrictionKind::Profile => "lifted-profile",
+        client::RestrictionKind::Server => "lifted-server",
+    }
+}
+
+/// "3 min ago", "2 d ago".
+fn describe_ago(ts: u64) -> String {
+    let ago = wall_now_ms().saturating_sub(ts) / 1000;
+    if ago >= 86_400 {
+        format!("{} d ago", ago / 86_400)
+    } else if ago >= 3_600 {
+        format!("{} h ago", ago / 3_600)
+    } else {
+        format!("{} min ago", ago / 60)
+    }
+}
+
+/// The built-in role's name, or `role <id>` for a custom one.
+fn role_label(role: client::RoleId) -> String {
+    client::permissions::BUILTIN_ROLES
+        .iter()
+        .find(|r| r.id == role)
+        .map_or_else(|| format!("role {role}"), |r| r.name.to_string())
+}
+
+/// `30m`, `1h`, `24h`, `7d` → seconds.
+fn parse_duration_secs(text: &str) -> Option<u64> {
+    let digits = text.trim_end_matches(char::is_alphabetic);
+    let n: u64 = digits.parse().ok()?;
+    let per_unit = match &text[digits.len()..] {
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    Some(n.saturating_mul(per_unit))
+}
+
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// "expires in 3 h" / "never expires", from a wall-clock deadline.
+fn describe_expiry(expires_at: Option<u64>) -> String {
+    match expires_at {
+        None => t!("invite-never-expires"),
+        Some(at) => {
+            let left = describe_left(at);
+            t!("invite-expires-in", "left" => left.as_str())
+        }
+    }
+}
+
+/// "for 2 d" / "indefinitely", for a ban deadline.
+fn describe_until(until: Option<u64>) -> String {
+    match until {
+        None => t!("ban-indefinite"),
+        Some(at) => {
+            let left = describe_left(at);
+            t!("ban-for", "left" => left.as_str())
+        }
+    }
+}
+
+/// The time between now and `at` in the largest sensible unit.
+fn describe_left(at: u64) -> String {
+    let left = at.saturating_sub(wall_now_ms()) / 1000;
+    if left >= 86_400 {
+        format!("{} d", left / 86_400)
+    } else if left >= 3_600 {
+        format!("{} h", left / 3_600)
+    } else {
+        format!("{} min", (left / 60).max(1))
+    }
+}
+
 fn peer_audio_from(a: &PeerAudioSettings) -> PeerAudio {
     PeerAudio {
         volume: a.volume,
@@ -2929,7 +3576,7 @@ fn peer_audio_to(a: PeerAudio) -> PeerAudioSettings {
 pub fn fill_tr(tr: &Tr) {
     tr.set_app_tagline(t!("app-tagline").into());
     tr.set_nickname(t!("nickname").into());
-    tr.set_server_password(t!("server-password").into());
+    tr.set_server_invite_note(t!("server-invite-note").into());
     tr.set_connect(t!("connect").into());
     tr.set_settings(t!("settings").into());
     tr.set_quit(t!("quit").into());
@@ -2987,9 +3634,15 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_server_remove(t!("server-remove").into());
     tr.set_server_manage(t!("server-manage").into());
     tr.set_save(t!("save").into());
-    tr.set_connect_access_denied(t!("connect-access-denied").into());
+    tr.set_invite_code(t!("invite-code").into());
+    tr.set_invite_code_placeholder(t!("invite-code-placeholder").into());
     tr.set_server_fingerprint(t!("server-fingerprint").into());
     tr.set_server_config_note(t!("server-config-note").into());
+    tr.set_identity_header(t!("identity-header").into());
+    tr.set_identity_export(t!("identity-export").into());
+    tr.set_identity_import(t!("identity-import").into());
+    tr.set_identity_regenerate(t!("identity-regenerate").into());
+    tr.set_identity_note(t!("identity-note").into());
     tr.set_audio_devices_header(t!("audio-devices-header").into());
     tr.set_audio_input_device(t!("audio-input-device").into());
     tr.set_audio_output_device(t!("audio-output-device").into());

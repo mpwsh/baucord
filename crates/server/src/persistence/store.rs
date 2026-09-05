@@ -809,6 +809,275 @@ pub fn cli_create_invite(
     Ok((code, invite))
 }
 
+/// `server user list` and friends: the policy tables as they stand.
+///
+/// # Errors
+/// No database at `db_path`, or a `SQLite` failure.
+pub fn cli_load_policy(db_path: &Path) -> Result<Policy, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    db.close();
+    Ok(policy)
+}
+
+/// A user named on the command line: a name of record
+/// (case-insensitive), or a user id in hex — the full 64 digits or a
+/// prefix of at least 8 that matches exactly one user. Several people
+/// with the same name are told apart by their ids.
+///
+/// # Errors
+/// No database, no such user, or an ambiguous name.
+pub fn cli_find_user(db_path: &Path, who: &str) -> Result<([u8; 32], Policy), PersistError> {
+    let policy = cli_load_policy(db_path)?;
+    let who = who.trim();
+    let lower = who.to_ascii_lowercase();
+    let looks_hex = lower.len() >= 8 && lower.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut matches: Vec<[u8; 32]> = if looks_hex {
+        policy
+            .users
+            .keys()
+            .filter(|id| hex(*id).starts_with(&lower))
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if matches.is_empty() {
+        matches = policy
+            .users
+            .iter()
+            .filter(|(_, u)| u.name.eq_ignore_ascii_case(who))
+            .map(|(id, _)| *id)
+            .collect();
+    }
+    match matches.as_slice() {
+        [one] => Ok((*one, policy)),
+        [] => Err(PersistError::NoSuchUser(who.to_string())),
+        many => {
+            let now = super::wall_now();
+            let mut lines: Vec<String> = many
+                .iter()
+                .filter_map(|id| policy.users.get(id).map(|u| (id, u)))
+                .map(|(id, u)| {
+                    let roles: Vec<&str> = u
+                        .roles
+                        .iter()
+                        .filter_map(|r| policy.roles.get(r))
+                        .map(|r| r.name.as_str())
+                        .collect();
+                    let ago = now.saturating_sub(u.last_seen) / 60_000;
+                    format!(
+                        "{} ({}, last seen {} min ago)",
+                        hex(&id[..8]),
+                        if roles.is_empty() {
+                            "no roles".to_string()
+                        } else {
+                            roles.join(",")
+                        },
+                        ago
+                    )
+                })
+                .collect();
+            lines.sort();
+            Err(PersistError::Ambiguous(who.to_string(), lines))
+        }
+    }
+}
+
+/// A full 64-hex-digit id; `None` for anything else.
+#[must_use]
+pub fn parse_hex_id(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim();
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Hex of a byte slice.
+#[must_use]
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+/// `server user grant|revoke`: replace a user's role set. The last
+/// admin keeps `admin`. A running server picks it up within 2 s.
+///
+/// # Errors
+/// No database, an unknown role, or the last admin.
+pub fn cli_set_roles(
+    db_path: &Path,
+    user_id: &[u8; 32],
+    roles: &[u32],
+) -> Result<(), PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    for role in roles {
+        if !policy.roles.contains_key(role) {
+            return Err(PersistError::UnknownRole(*role));
+        }
+    }
+    let admin_bit = protocol::permissions::ADMIN;
+    let new_perms = roles
+        .iter()
+        .filter_map(|r| policy.roles.get(r))
+        .fold(0, |acc, r| acc | r.permissions);
+    let was_admin = protocol::permissions::has(policy.permissions_of(user_id), admin_bit);
+    let others = policy
+        .users
+        .keys()
+        .filter(|u| *u != user_id)
+        .any(|u| protocol::permissions::has(policy.permissions_of(u), admin_bit));
+    if was_admin && !protocol::permissions::has(new_perms, admin_bit) && !others {
+        return Err(PersistError::LastAdmin);
+    }
+    let before: Vec<u32> = policy
+        .users
+        .get(user_id)
+        .map(|u| u.roles.iter().copied().collect())
+        .unwrap_or_default();
+    let now = super::wall_now();
+    for role in &before {
+        if !roles.contains(role) {
+            db.revoke_role(user_id, *role)?;
+        }
+    }
+    for role in roles {
+        if !before.contains(role) {
+            db.grant_role(user_id, *role, None, now)?;
+        }
+    }
+    db.insert_audit(&AuditRow {
+        ts: now,
+        actor: None,
+        action: "user.roles".to_string(),
+        target: Some(hex(&user_id[..8])),
+        detail: Some(format!("cli: {roles:?}")),
+    })?;
+    db.close();
+    Ok(())
+}
+
+/// `server user kick|ban`, `server user mute`: add a restriction. The
+/// id is assigned here; a running server picks the row up within 2 s
+/// and removes a live session if it is a `server` one.
+///
+/// # Errors
+/// No database, or a `SQLite` failure.
+pub fn cli_restrict(db_path: &Path, mut restriction: Restriction) -> Result<u64, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    restriction.id = policy.next_restriction_id;
+    restriction.created_at = super::wall_now();
+    db.insert_restriction(&restriction)?;
+    db.insert_audit(&AuditRow {
+        ts: restriction.created_at,
+        actor: None,
+        action: "restrict".to_string(),
+        target: restriction
+            .user_id
+            .map(|u| hex(&u[..8]))
+            .or_else(|| restriction.key_hash.map(|k| hex(&k[..8]))),
+        detail: Some(format!(
+            "cli: {} until {:?}: {}",
+            restriction.kind.name(),
+            restriction.until,
+            restriction.reason
+        )),
+    })?;
+    db.close();
+    Ok(restriction.id)
+}
+
+/// `server restriction lift ID`. Returns whether it existed.
+///
+/// # Errors
+/// No database, or a `SQLite` failure.
+pub fn cli_lift_restriction(db_path: &Path, id: u64) -> Result<bool, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let changed = db.conn.execute(
+        "DELETE FROM restrictions WHERE id = ?1",
+        params![ordered(id)],
+    )?;
+    if changed > 0 {
+        db.insert_audit(&AuditRow {
+            ts: super::wall_now(),
+            actor: None,
+            action: "restriction.lift".to_string(),
+            target: Some(id.to_string()),
+            detail: Some("cli".to_string()),
+        })?;
+    }
+    db.close();
+    Ok(changed > 0)
+}
+
+/// `server key link|unlink`: attach a key to a user, or retire it.
+///
+/// # Errors
+/// No database, or a `SQLite` failure.
+pub fn cli_set_key(
+    db_path: &Path,
+    key_hash: &[u8; 32],
+    link_to: Option<&[u8; 32]>,
+) -> Result<bool, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    let now = super::wall_now();
+    let existing = policy.keys.get(key_hash).cloned();
+    let (record, action) = if let Some(user) = link_to {
+        (
+            KeyRecord {
+                user_id: *user,
+                added_at: existing.as_ref().map_or(now, |k| k.added_at),
+                last_seen: now,
+                retired_at: None,
+            },
+            "key.link",
+        )
+    } else {
+        let Some(mut key) = existing else {
+            db.close();
+            return Ok(false);
+        };
+        key.retired_at = Some(now);
+        (key, "key.unlink")
+    };
+    db.upsert_key(key_hash, &record)?;
+    db.insert_audit(&AuditRow {
+        ts: now,
+        actor: None,
+        action: action.to_string(),
+        target: Some(hex(&key_hash[..8])),
+        detail: Some("cli".to_string()),
+    })?;
+    db.close();
+    Ok(true)
+}
+
 /// `server invite list`: every code, newest first.
 ///
 /// # Errors

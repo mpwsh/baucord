@@ -30,13 +30,16 @@ use protocol::{
     permissions::{self, RoleId, RANK_ADMIN, RANK_GUEST, ROLE_ADMIN},
     Auth, ChannelDenyReason, ChannelInfo, ChatMessage, ClientId, ClientKeyProof, ClientMessage,
     DenyReason, InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason, RefusedReason,
-    RemovedKind, ServerMessage, ShareScope, TelemetryEvent, TelemetrySample, UserId,
+    RemovedKind, RestrictionKind, ServerMessage, ShareScope, TelemetryEvent, TelemetrySample,
+    UserId,
 };
 use sha2::{Digest, Sha256};
 use transport::{
     identity::{verify_ed25519, CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL},
     Budget, DisconnectReason, Driver, DriverHost, Event, Fingerprint, LinkStats, ServerIdentity,
 };
+
+mod moderation;
 
 use crate::{
     clock::{Clock, WallMs},
@@ -46,8 +49,8 @@ use crate::{
         GENERAL_CONV,
     },
     policy::{
-        self, InviteRecord, KeyHash, KeyLookup, Policy, Restriction, RestrictionKind,
-        BOOTSTRAP_INVITE_TTL_MS, DEFAULT_INVITE_TTL_MS,
+        self, InviteRecord, KeyHash, KeyLookup, Policy, Restriction, BOOTSTRAP_INVITE_TTL_MS,
+        DEFAULT_INVITE_TTL_MS,
     },
     relay::{ShareInfo, VideoRelay, VoiceRelay},
 };
@@ -164,6 +167,12 @@ pub struct ChatServer {
     audio_states: HashMap<ClientId, (bool, bool)>,
     /// Clients currently deafened (voice relay skips them).
     deafened: HashSet<ClientId>,
+    /// Sessions the relay drops voice from (spec §4.2): a `voice`
+    /// restriction, or a role set without `SPEAK`. Recomputed from the
+    /// policy whenever it changes and once a second for expiries.
+    muted: HashSet<ClientId>,
+    /// Last expiry sweep of the restrictions.
+    last_restriction_sweep: Instant,
     /// Voice-channel membership: client → channel id (index into
     /// `channel_infos`). Every admitted client has an entry.
     channel_of: HashMap<ClientId, u16>,
@@ -266,19 +275,11 @@ impl ChatServer {
         );
 
         // ── Admission ───────────────────────────────────────────────
-        if config.authentication.secure {
-            info!("Secure mode: clients must present the shared password in Hello");
-        } else {
-            warn!("╔══════════════════════════════════════════════════════════════╗");
-            warn!("║ AUTHENTICATION DISABLED — running in open mode.              ║");
-            warn!("║ Anyone who can reach this UDP port can join with any name.   ║");
-            warn!("║ Set `authentication.secure: true` and a password for real    ║");
-            warn!("║ deployments. (Connections are still encrypted and pinned.)   ║");
-            warn!("╚══════════════════════════════════════════════════════════════╝");
-            if config.authentication.password.is_some() {
-                warn!("authentication.password is set but ignored while secure is false");
-            }
-        }
+        info!(
+            "Admission: device keys log in, invites are the door; {} known users, {} invites",
+            policy.users.len(),
+            policy.invites.len()
+        );
 
         // ── Transport ───────────────────────────────────────────────
         let mut budget = Budget::server();
@@ -305,6 +306,8 @@ impl ChatServer {
             features_of: HashMap::new(),
             audio_states: HashMap::new(),
             deafened: HashSet::new(),
+            muted: HashSet::new(),
+            last_restriction_sweep: now,
             channel_of: HashMap::new(),
             channel_infos,
             default_channel,
@@ -371,6 +374,18 @@ impl ChatServer {
     #[must_use]
     pub fn user_of(&self, client: ClientId) -> Option<UserId> {
         self.user_of.get(&client).copied()
+    }
+
+    /// The voice channel a session is in.
+    #[must_use]
+    pub fn channel_of(&self, client: ClientId) -> Option<u16> {
+        self.channel_of.get(&client).copied()
+    }
+
+    /// How many sessions are sharing their screen right now.
+    #[must_use]
+    pub fn video_sharer_count(&self) -> usize {
+        self.video.sharer_count()
     }
 
     /// Mint an invite (spec §3.1). One implementation behind the
@@ -449,17 +464,29 @@ impl ChatServer {
                 })
                 .map(|(client, _)| *client)
                 .collect();
+            // A kick names the user only; a ban blocks the key and the
+            // address too (spec §4.1).
+            let kind = if stored.key_hash.is_some() || stored.ip.is_some() {
+                RemovedKind::Banned {
+                    until: stored.until,
+                }
+            } else {
+                RemovedKind::Kicked
+            };
             for client in hit {
-                self.remove_session(
-                    client,
-                    RemovedKind::Banned {
-                        until: stored.until,
-                    },
-                    &stored.reason,
-                    by_name,
-                );
+                self.remove_session(client, kind.clone(), &stored.reason, by_name);
+            }
+        } else if let Some(user) = stored.user_id {
+            let msg = ServerMessage::Restricted {
+                kind: stored.kind,
+                until: stored.until,
+                reason: stored.reason.clone(),
+            };
+            for client in self.sessions_of(&user) {
+                self.send_if_roles(client, &msg);
             }
         }
+        self.refresh_enforcement();
         stored
     }
 
@@ -509,13 +536,24 @@ impl ChatServer {
         true
     }
 
-    /// Lift a restriction by id.
-    pub fn lift_restriction(&mut self, id: u64) -> bool {
-        let removed = self.policy.remove_restriction(id);
-        if removed {
-            self.persist.send(Command::DeleteRestriction { id });
+    /// Lift a restriction by id. A live session it applied to is told.
+    pub fn lift_restriction(&mut self, id: u64, by: Option<UserId>) -> bool {
+        let Some(gone) = self.policy.restrictions.iter().find(|r| r.id == id).cloned() else {
+            return false;
+        };
+        self.policy.remove_restriction(id);
+        self.persist.send(Command::DeleteRestriction { id });
+        self.audit(by, "restriction.lift", Some(id.to_string()), None);
+        if let Some(user) = gone.user_id
+            && gone.kind != RestrictionKind::Server
+        {
+            let msg = ServerMessage::RestrictionLifted { kind: gone.kind };
+            for client in self.sessions_of(&user) {
+                self.send_if_roles(client, &msg);
+            }
         }
-        removed
+        self.refresh_enforcement();
+        true
     }
 
     /// Wall time of the current tick.
@@ -567,6 +605,10 @@ impl ChatServer {
         self.process_control_messages();
         self.expire_pending();
         self.poll_persistence();
+        if now.duration_since(self.last_restriction_sweep) >= Duration::from_secs(1) {
+            self.last_restriction_sweep = now;
+            self.sweep_restrictions();
+        }
 
         let clients = self.clients();
         let media_before = self.media_packet_count();
@@ -575,6 +617,7 @@ impl ChatServer {
             now,
             &clients,
             &self.deafened,
+            &self.muted,
             &self.channel_of,
         );
         self.video.process(&mut self.driver, now, &clients);
@@ -995,28 +1038,6 @@ impl ChatServer {
         }
     }
 
-    /// A user's roles unioned, minus what active restrictions take
-    /// away (spec §4.2).
-    fn effective_permissions(&self, user: &UserId) -> u64 {
-        let now = self.wall_now();
-        let mut perms = self.policy.permissions_of(user);
-        for r in &self.policy.restrictions {
-            if !r.active(now) || r.user_id.as_ref() != Some(user) {
-                continue;
-            }
-            perms &= !match r.kind {
-                RestrictionKind::Server => permissions::JOIN_CHANNELS,
-                RestrictionKind::Voice => permissions::SPEAK,
-                RestrictionKind::GeneralText => permissions::TEXT_GENERAL,
-                RestrictionKind::Dm => permissions::DM,
-                RestrictionKind::Upload => permissions::UPLOAD,
-                RestrictionKind::Share => permissions::SHARE,
-                RestrictionKind::Profile => 0,
-            };
-        }
-        perms
-    }
-
     /// Queue the current user row for the store.
     fn persist_user(&mut self, user_id: &UserId) {
         if let Some(user) = self.policy.users.get(user_id).cloned() {
@@ -1158,6 +1179,7 @@ impl ChatServer {
                         policy.restrictions.len()
                     );
                     self.policy = *policy;
+                    self.apply_reloaded_policy();
                 }
             }
         }
@@ -1485,6 +1507,18 @@ impl ChatServer {
             );
         }
 
+        // Who everyone is, for clients that render roles (spec §8):
+        // the whole roster to the newcomer, the newcomer to everyone.
+        let details: Vec<ServerMessage> = self
+            .user_of
+            .iter()
+            .filter(|(c, _)| **c != client_id)
+            .map(|(c, u)| self.user_details(*c, u))
+            .collect();
+        for msg in details {
+            self.send_if_roles(client_id, &msg);
+        }
+
         self.broadcast_msg_except(
             client_id,
             &ServerMessage::UserJoined {
@@ -1493,6 +1527,13 @@ impl ChatServer {
                 channel_id: self.default_channel,
             },
         );
+        if let Some(user_id) = self.user_of.get(&client_id).copied() {
+            let msg = self.user_details(client_id, &user_id);
+            for peer in self.clients() {
+                self.send_if_roles(peer, &msg);
+            }
+        }
+        self.refresh_enforcement();
     }
 
     fn handle_client_disconnected(&mut self, client_id: ClientId, reason: &DisconnectReason) {
@@ -1587,6 +1628,13 @@ impl ChatServer {
                 debug!("{client_id:#x} sent a second Hello; ignored");
             }
             ClientMessage::Chat(text) => {
+                if !self.allowed(
+                    client_id,
+                    permissions::TEXT_GENERAL,
+                    RestrictionKind::GeneralText,
+                ) {
+                    return;
+                }
                 let text =
                     protocol::truncate_on_char_boundary(&text, self.config.limits.max_chat_bytes);
                 let username = self.get_username(client_id);
@@ -1618,6 +1666,16 @@ impl ChatServer {
                 count,
                 data,
             } => {
+                // Told once per upload (on its first chunk), then the
+                // rest of it is dropped quietly.
+                let permitted = if index == 0 {
+                    self.allowed(client_id, permissions::UPLOAD, RestrictionKind::Upload)
+                } else {
+                    self.has_permission(client_id, permissions::UPLOAD)
+                };
+                if !permitted {
+                    return;
+                }
                 self.handle_image_chunk(client_id, upload_id, index, count, data);
             }
             ClientMessage::Speaking(is_speaking) => {
@@ -1737,6 +1795,18 @@ impl ChatServer {
                 self.send_msg(client_id, &answer);
             }
 
+            // ── Administration (spec §8) ────────────────────────────
+            ClientMessage::Admin {
+                request_id,
+                command,
+            } => {
+                let result = self.handle_admin(client_id, command);
+                self.send_msg(
+                    client_id,
+                    &ServerMessage::AdminResult { request_id, result },
+                );
+            }
+
             // ── Telemetry ───────────────────────────────────────────
             ClientMessage::Telemetry(sample) => {
                 if !self.accepts_telemetry(client_id) {
@@ -1822,10 +1892,22 @@ impl ChatServer {
             return;
         }
 
+        if !self.allowed(client_id, permissions::SHARE, RestrictionKind::Share) {
+            self.send_msg(
+                client_id,
+                &ServerMessage::ShareDenied {
+                    reason: DenyReason::NotPermitted,
+                },
+            );
+            return;
+        }
+
         // Admission control: cap concurrent shares. Re-announcing an
-        // existing share (e.g. quality change) is always allowed.
+        // existing share (e.g. quality change) is always allowed;
+        // `BYPASS_LIMITS` ignores the cap.
         if !self.video.is_sharing(client_id)
             && self.video.sharer_count() >= self.config.limits.max_sharers
+            && !self.has_permission(client_id, permissions::BYPASS_LIMITS)
         {
             info!(
                 "Share denied for {client_id:#x}: {} of {} share slots in use",
@@ -2083,6 +2165,10 @@ impl ChatServer {
         if old_channel == Some(channel_id) {
             return; // already there — nothing to do
         }
+        if !self.has_permission(client_id, permissions::JOIN_CHANNELS) {
+            self.deny_join(client_id, channel_id, ChannelDenyReason::NotPermitted);
+            return;
+        }
         if let Some(expected) = target.password.as_deref()
             && password != Some(expected)
         {
@@ -2101,10 +2187,22 @@ impl ChatServer {
             return;
         }
 
+        self.place_in_channel(client_id, channel_id);
+    }
+
+    /// Move a session to `channel_id` with no checks: the join path
+    /// has done them, an admin `MoveUser` bypasses them.
+    pub(crate) fn place_in_channel(&mut self, client_id: ClientId, channel_id: u16) {
+        let old_channel = self.channel_of.get(&client_id).copied();
+        if old_channel == Some(channel_id) {
+            return;
+        }
         info!(
             "{} moved to channel '{}'",
             self.get_username(client_id),
-            target.name,
+            self.channel_infos
+                .get(usize::from(channel_id))
+                .map_or("?", |c| c.name.as_str()),
         );
         self.channel_of.insert(client_id, channel_id);
         self.broadcast_msg(&ServerMessage::UserMovedChannel {
@@ -2267,6 +2365,7 @@ impl ChatServer {
         // that actually protects the uplink.
         if !self.video.is_subscribed(client_id, target_id)
             && self.video.viewer_count(target_id) >= self.config.limits.max_viewers_per_stream
+            && !self.has_permission(client_id, permissions::BYPASS_LIMITS)
         {
             info!(
                 "Subscribe denied for {client_id:#x} → {target_id:#x}: viewer limit {} reached",
@@ -2660,8 +2759,9 @@ fn mint_bootstrap_invite(
         },
     );
     warn!(
-        "No admin yet. Bootstrap invite (admin, 1 use, 1 h): \
-         baucord://{endpoint}/{code}#{fingerprint}"
+        "No admin yet. Bootstrap invite (admin, 1 use, 1 h): code {} for {endpoint} \
+         (identity {fingerprint})",
+        protocol::invite::display_code(&code)
     );
     Some(code)
 }

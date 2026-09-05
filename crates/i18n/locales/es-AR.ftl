@@ -31,7 +31,9 @@ language-note =
     actualizan al reabrirlas, y el historial del chat conserva su
     idioma original.
 # ── Server config (connect + settings) ──────────────────────────────────
-server-password = Contraseña del servidor (opcional)
+invite-code = Código de invitación
+invite-code-placeholder = p. ej. K7FQ-2MX9-ABCD — solo hace falta la primera vez
+server-invite-note = Se manda una sola vez, en tu primera visita; después la clave de este dispositivo es el login.
 settings-server = Servidor
 tab-servers = Servidores
 server-name = Nombre
@@ -43,10 +45,82 @@ server-remove = Quitar
 server-manage = Administrar servidores
 server-new-name = Servidor nuevo
 save = Guardar
-connect-access-denied = Acceso denegado: contraseña — escribila abajo, Guardá y volvé a Conectar
 server-fingerprint = Identidad del servidor (SHA256:…, de la invitación; se aprende en la primera conexión)
 server-config-note =
-    La contraseña es el secreto de la sala que comparten todos en tu servidor. La identidad se aprende en la primera conexión y queda fijada; pegala desde una invitación para verificar el servidor de antemano. Ambas aplican en la próxima conexión.
+    La identidad se aprende en la primera conexión y queda fijada; pegala desde el log de inicio del servidor para verificarlo de antemano. Aplica en la próxima conexión.
+
+# ── Veredictos de admisión (tarjeta de conexión) ────────────────────────
+connect-need-invite = Este servidor todavía no conoce este dispositivo. Escribí el código de invitación que te dieron y apretá Conectar.
+connect-invite-expired = Ese código de invitación venció — pedí uno nuevo.
+connect-invite-revoked = Ese código de invitación fue revocado — pedí uno nuevo.
+connect-invite-exhausted = Ese código de invitación ya se usó — pedí uno nuevo.
+connect-invite-unknown = Ese no es un código de invitación válido. Revisalo y probá de nuevo.
+connect-key-retired = Este dispositivo fue desvinculado de tu usuario en este servidor. Pedile a un admin que lo vuelva a vincular, o regenerá tu identidad en Ajustes para empezar como usuario nuevo.
+connect-name-in-use = Ese apodo ya está en uso en este servidor — elegí otro.
+error-invite-code-malformed = Eso no parece un código ni un link de invitación.
+error-no-identity = No se pudo cargar tu clave de identidad ({ $path }). Arreglá o borrá el archivo y reiniciá.
+error-banned = Estás baneado de este servidor{ $until }{ $reason }
+ban-for = por { $left }
+ban-indefinite = indefinidamente
+removed-disconnected = Desconectado por { $by }: { $reason }
+removed-kicked = Expulsado por { $by }: { $reason }
+removed-banned = Baneado por { $by }{ $until }{ $reason }
+removed-replaced = Iniciaste sesión desde otro dispositivo o conexión; esta se cerró.
+chat-server-not-persistent = Este servidor no guarda nada entre reinicios: roles, invitaciones y baneos duran hasta que se apaga.
+
+# ── Invitaciones (/invite en el compositor) ─────────────────────────────
+chat-invite-created = Código de invitación { $code } (copiado) — { $role }, { $expiry }, { $uses }. Pasalo junto con la dirección y el puerto del servidor.
+chat-invite-usage = Uso: /invite [guest|member|organizer] [24h|7d] [usos]
+chat-invite-no-permission = No podés crear esa invitación acá.
+chat-invite-role-not-allowed = Los códigos de invitación no pueden dar ese rol.
+invite-uses = { $count } uso(s)
+invite-uses-unlimited = usos ilimitados
+invite-expires-in = vence en { $left }
+invite-never-expires = no vence
+
+# ── Moderación (comandos; spec §4, §8) ──────────────────────────────────
+chat-commands-help =
+    Comandos: /invite [rol] [24h] [usos] · /users · /restrictions · /invites · /kick nombre [motivo] · /ban nombre [7d] [motivo] · /disconnect nombre [motivo] · /mute nombre [30m] [motivo] · /unmute nombre · /restrict nombre text|dm|upload|share [30m] [motivo] · /lift id · /grant nombre rol · /revoke nombre rol · /move nombre canal · /revoke-invite código · /link nombre hash · /unlink hash
+chat-command-unknown = Comando desconocido /{ $command }. Probá /help.
+chat-command-usage = Uso: /{ $command } nombre …
+chat-command-usage-lift = Uso: /lift <id de restricción> (ver /restrictions)
+chat-command-usage-revoke-invite = Uso: /revoke-invite <código>
+chat-command-usage-unlink = Uso: /unlink <hash de clave, 64 dígitos hex> (ver /users)
+chat-command-usage-link = Uso: /link <nombre> <hash de clave, 64 dígitos hex>
+chat-command-usage-restrict = Uso: /restrict <nombre> text|dm|upload|share [30m] [motivo]
+chat-command-no-such-user = No hay nadie conectado que se llame { $name }.
+chat-admin-refused = Rechazado: { $why }.
+chat-admin-done = Listo.
+chat-admin-not-muted = No está silenciado.
+chat-admin-users-header = { $count } usuario(s) registrados (● conectados):
+chat-admin-restrictions-header = { $count } restricción(es):
+chat-admin-invites-header = { $count } invitación(es):
+restricted-voice = El servidor te silenció{ $until }{ $reason }
+restricted-text = No podés escribir en el chat{ $until }{ $reason }
+restricted-dm = No podés mandar mensajes directos{ $until }{ $reason }
+restricted-upload = No podés subir archivos{ $until }{ $reason }
+restricted-share = No podés compartir pantalla{ $until }{ $reason }
+restricted-profile = No podés cambiar tu perfil{ $until }{ $reason }
+restricted-server = No podés entrar{ $until }{ $reason }
+lifted-voice = Te levantaron el silencio.
+lifted-text = Ya podés escribir en el chat de nuevo.
+lifted-dm = Ya podés mandar mensajes directos de nuevo.
+lifted-upload = Ya podés subir archivos de nuevo.
+lifted-share = Ya podés compartir pantalla de nuevo.
+lifted-profile = Ya podés cambiar tu perfil de nuevo.
+lifted-server = Ya podés entrar de nuevo.
+restricted-by-role = tu rol no lo permite
+
+# ── Identidad (Ajustes → General) ───────────────────────────────────────
+identity-header = Identidad
+identity-export = Exportar
+identity-import = Importar
+identity-regenerate = Regenerar
+identity-note = La clave de este dispositivo es quién sos en todos los servidores. Exportala para ser el mismo usuario en otra máquina; Importar reemplaza la clave de este dispositivo; Regenerar crea una nueva (usuario nuevo — vas a necesitar una invitación).
+identity-missing = sin clave de identidad
+identity-exported = Identidad exportada.
+identity-imported = Identidad importada — ahora sos esta clave. Reconectá para usarla.
+identity-regenerated = Nueva identidad creada. La próxima conexión necesita una invitación.
 
 # ── Barra lateral ───────────────────────────────────────────────────────
 users-count = Usuarios: { $count }

@@ -15,7 +15,7 @@ export enum Phase {
     downloading,     // update download in progress
     download-done,   // zip staged, offer install
     download-failed, // download error
-    connect,         // nickname + password form
+    connect,         // nickname + server form (and the invite box)
     main,            // sidebar + chat
 }
 
@@ -77,12 +77,18 @@ export global State {
 
     // Connect view
     in-out property <string> nickname;
-    /// Typed into the 403 prompt; Save writes it onto the selected
-    /// server's token-password.
-    in-out property <string> password;
     in property <[string]> server-names;   // saved servers, by name
     in-out property <int> server-index: 0; // dropdown pick = default server
-    in property <bool> password-prompt: false; // refused (password) → show the save box
+    /// The server asked for an invite (unknown device, or the code did
+    /// not admit): show the code box with this explanation.
+    in property <bool> invite-prompt: false;
+    in property <string> invite-prompt-text;
+    /// Typed into the code box. Connect sends it; it is stored on the
+    /// selected server until the server admits us.
+    in-out property <string> invite-code;
+    /// A verdict that stays until the next attempt (banned, name in
+    /// use, device unlinked, removed by an admin).
+    in property <string> connect-notice;
     in property <string> error-text;       // 5s toast, cleared by host
     in property <string> device-warning;   // "saved mic missing" notice
 
@@ -150,8 +156,6 @@ export global Logic {
     callback connect-server-selected(int);
     /// Pencil icon — open Settings on the Servers tab.
     callback edit-servers();
-    /// Save the typed password onto the selected server (403 prompt).
-    callback save-password();
     callback open-settings();
     callback quit();
 

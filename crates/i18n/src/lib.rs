@@ -134,7 +134,7 @@ fn build_bundle(locale: &Locale) -> Bundle {
             for err in &errors {
                 log::error!("i18n: parse error in {}: {err}", locale.code);
             }
-            let _ = bundle.add_resource_overriding(resource);
+            bundle.add_resource_overriding(resource);
         }
     }
     bundle

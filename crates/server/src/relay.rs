@@ -41,6 +41,9 @@ pub struct VoiceStats {
     pub packets_dropped_malformed: u64,
     /// Per-recipient sends skipped because the recipient is deafened.
     pub sends_skipped_deafened: u64,
+    /// Packets dropped because the sender is muted by the server
+    /// (spec §4.2): a `voice` restriction, or no `SPEAK`.
+    pub packets_dropped_muted: u64,
     /// Per-recipient sends skipped because the recipient is in a
     /// different voice channel than the speaker.
     pub sends_skipped_other_channel: u64,
@@ -90,12 +93,20 @@ impl VoiceRelay {
         now: Instant,
         clients: &[ClientId],
         deafened: &HashSet<ClientId>,
+        muted: &HashSet<ClientId>,
         channel_of: &HashMap<ClientId, u16>,
     ) {
         for sender in clients {
             let sender_channel = channel_of.get(sender);
+            // A muted sender is told and stops; this is the backstop.
+            // One set lookup per sender, before its packets.
+            let sender_muted = muted.contains(sender);
             while let Some(message) = driver.recv(*sender, Lane::Voice) {
                 self.stats.packets_received += 1;
+                if sender_muted {
+                    self.stats.packets_dropped_muted += 1;
+                    continue;
+                }
 
                 // Single source of validation: the shared parser.
                 let Some((hdr, _)) = parse_voice(&message) else {
@@ -144,12 +155,15 @@ impl VoiceRelay {
             self.stats.bytes_relayed as f64 / 1_048_576.0,
         );
         if self.stats.packets_dropped_malformed > 0
+            || self.stats.packets_dropped_muted > 0
             || self.stats.sends_skipped_deafened > 0
             || self.stats.sends_skipped_other_channel > 0
         {
             info!(
-                "Voice — malformed drops: {}, deafened skips: {}, other-channel skips: {}",
+                "Voice — malformed drops: {}, muted drops: {}, deafened skips: {}, \
+                 other-channel skips: {}",
                 self.stats.packets_dropped_malformed,
+                self.stats.packets_dropped_muted,
                 self.stats.sends_skipped_deafened,
                 self.stats.sends_skipped_other_channel,
             );

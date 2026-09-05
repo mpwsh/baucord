@@ -30,7 +30,9 @@ language-note =
     Applies immediately. Windows that are already open update when
     reopened, and chat history keeps its original language.
 # ── Server config (connect + settings) ──────────────────────────────────
-server-password = Server password (optional)
+invite-code = Invite code
+invite-code-placeholder = e.g. K7FQ-2MX9-ABCD — only needed the first time
+server-invite-note = Sent once, on your first visit; from then on this device's key is the login.
 settings-server = Server
 tab-servers = Servers
 server-name = Name
@@ -42,10 +44,82 @@ server-remove = Remove
 server-manage = Manage servers
 server-new-name = New server
 save = Save
-connect-access-denied = Access denied: wrong or missing server password — enter it below and Save, then Connect again
 server-fingerprint = Server identity (SHA256:…, from the invite; learned on first connect)
 server-config-note =
-    The password is the room secret everyone on your server shares. The identity is learned on first connect and pinned; paste it from an invite to verify the server up front. Both apply on the next connect.
+    The identity is learned on first connect and pinned; paste it from the server's startup log to verify the server up front. Applies on the next connect.
+
+# ── Admission verdicts (connect card) ───────────────────────────────────
+connect-need-invite = This server doesn't know this device yet. Enter the invite code you were given and press Connect.
+connect-invite-expired = That invite code has expired — ask for a new one.
+connect-invite-revoked = That invite code was revoked — ask for a new one.
+connect-invite-exhausted = That invite code has been used up — ask for a new one.
+connect-invite-unknown = That's not a valid invite code. Check it and try again.
+connect-key-retired = This device was removed from your user on this server. Ask an admin to re-link it, or regenerate your identity in Settings to start over as a new user.
+connect-name-in-use = That nickname is taken on this server right now — pick another.
+error-invite-code-malformed = That doesn't look like an invite code or link.
+error-no-identity = Couldn't load your identity key ({ $path }). Fix or delete the file and restart.
+error-banned = You are banned from this server{ $until }{ $reason }
+ban-for = for { $left }
+ban-indefinite = indefinitely
+removed-disconnected = Disconnected by { $by }: { $reason }
+removed-kicked = Kicked by { $by }: { $reason }
+removed-banned = Banned by { $by }{ $until }{ $reason }
+removed-replaced = You signed in from another device or connection; this one was closed.
+chat-server-not-persistent = This server keeps nothing between restarts: roles, invites and bans last until it stops.
+
+# ── Invites (/invite in the composer) ───────────────────────────────────
+chat-invite-created = Invite code { $code } (copied) — { $role }, { $expiry }, { $uses }. Give it together with the server's address and port.
+chat-invite-usage = Usage: /invite [guest|member|organizer] [24h|7d] [uses]
+chat-invite-no-permission = You can't create that invite here.
+chat-invite-role-not-allowed = Invite codes can't grant that role.
+invite-uses = { $count } use(s)
+invite-uses-unlimited = unlimited uses
+invite-expires-in = expires in { $left }
+invite-never-expires = never expires
+
+# ── Moderation (slash commands; spec §4, §8) ────────────────────────────
+chat-commands-help =
+    Commands: /invite [role] [24h] [uses] · /users · /restrictions · /invites · /kick name [reason] · /ban name [7d] [reason] · /disconnect name [reason] · /mute name [30m] [reason] · /unmute name · /restrict name text|dm|upload|share [30m] [reason] · /lift id · /grant name role · /revoke name role · /move name channel · /revoke-invite code · /link name keyhash · /unlink keyhash
+chat-command-unknown = Unknown command /{ $command }. Try /help.
+chat-command-usage = Usage: /{ $command } name …
+chat-command-usage-lift = Usage: /lift <restriction id> (see /restrictions)
+chat-command-usage-revoke-invite = Usage: /revoke-invite <code>
+chat-command-usage-unlink = Usage: /unlink <key hash, 64 hex digits> (see /users)
+chat-command-usage-link = Usage: /link <name> <key hash, 64 hex digits>
+chat-command-usage-restrict = Usage: /restrict <name> text|dm|upload|share [30m] [reason]
+chat-command-no-such-user = Nobody online is called { $name }.
+chat-admin-refused = Refused: { $why }.
+chat-admin-done = Done.
+chat-admin-not-muted = They are not muted.
+chat-admin-users-header = { $count } user(s) of record (● online):
+chat-admin-restrictions-header = { $count } restriction(s):
+chat-admin-invites-header = { $count } invite(s):
+restricted-voice = You have been muted by the server{ $until }{ $reason }
+restricted-text = You may not write in chat{ $until }{ $reason }
+restricted-dm = You may not send direct messages{ $until }{ $reason }
+restricted-upload = You may not upload files{ $until }{ $reason }
+restricted-share = You may not share your screen{ $until }{ $reason }
+restricted-profile = You may not change your profile{ $until }{ $reason }
+restricted-server = You may not join{ $until }{ $reason }
+lifted-voice = Your mute was lifted.
+lifted-text = You may write in chat again.
+lifted-dm = You may send direct messages again.
+lifted-upload = You may upload files again.
+lifted-share = You may share your screen again.
+lifted-profile = You may change your profile again.
+lifted-server = You may join again.
+restricted-by-role = not allowed by your role
+
+# ── Identity (Settings → General) ───────────────────────────────────────
+identity-header = Identity
+identity-export = Export
+identity-import = Import
+identity-regenerate = Regenerate
+identity-note = This device's key is who you are on every server. Export it to be the same user on another machine; Import replaces this device's key; Regenerate makes a new one (a new user — you'll need an invite).
+identity-missing = no identity key
+identity-exported = Identity exported.
+identity-imported = Identity imported — you are now this key. Reconnect to use it.
+identity-regenerated = New identity created. The next connection needs an invite.
 
 # ── Sidebar ─────────────────────────────────────────────────────────────
 users-count = Users: { $count }

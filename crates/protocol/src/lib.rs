@@ -16,8 +16,10 @@
 //!   the TLS handshake instead of misbehaving mid-session. Additive
 //!   changes ride on [`features`] bits (new messages, never new fields).
 
+pub mod admin;
 pub mod features;
 pub mod frame;
+pub mod invite;
 pub mod lanes;
 pub mod messages;
 pub mod permissions;
@@ -44,6 +46,7 @@ pub use messages::{
     IMAGE_CHUNK_BYTES, MAX_CHAT_IMAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_IMAGE_CHUNKS,
     MAX_IMAGE_MESSAGE_BYTES, MAX_LOG_UPLOAD_BYTES, MAX_LOG_UPLOAD_CHUNKS, MEDIA_UPLOAD_PACE,
 };
+pub use admin::{AdminCommand, AdminError, AdminOutcome, AdminTarget, RestrictionKind};
 pub use permissions::{Rank, RoleId};
 pub use relayed::{split_sender, wrap_sender, RELAY_SENDER_BYTES};
 pub use system_audio::{

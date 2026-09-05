@@ -20,6 +20,11 @@ export global SettingsState {
     // General
     in property <[string]> languages;         // ["System", "English", …]
     in-out property <int> language-index: 0;
+    /// Identity: this device's user id (the key's hash, shortened),
+    /// where the key file lives, and the result of the last action.
+    in property <string> identity-id;
+    in property <string> identity-path;
+    in property <string> identity-status;
 
     // Servers — the list plus the editor for the selected entry. The
     // host mirrors edits into settings and rebuilds `servers` rows.
@@ -29,7 +34,9 @@ export global SettingsState {
     in-out property <string> server-ip;
     in-out property <string> server-port;
     in-out property <string> server-fingerprint;
-    in-out property <string> server-password;
+    /// The code to present on the first visit, if any (a pasted link
+    /// is accepted; only its code is kept).
+    in-out property <string> server-invite-code;
 
     // Audio
     in property <[string]> input-devices;     // index 0 = "System default"
@@ -71,7 +78,12 @@ export global SettingsLogic {
     callback server-ip-edited(string);
     callback server-port-edited(string);
     callback server-fingerprint-edited(string);
-    callback server-password-edited(string);
+    callback server-invite-edited(string);
+
+    // Identity (spec §3.3): the key file is the login.
+    callback identity-export();
+    callback identity-import();
+    callback identity-regenerate();
 
     callback input-device-selected(int);
     callback output-device-selected(int);
@@ -122,6 +134,30 @@ component GeneralPanel inherits VerticalLayout {
         selected(i) => { SettingsLogic.language-selected(i); }
     }
     Hint { text: Tr.language-note; }
+
+    // Identity: the device key is who you are on every server.
+    SectionHeader { text: Tr.identity-header; }
+    Text {
+        text: SettingsState.identity-id;
+        color: Theme.text-primary;
+        font-size: Theme.font-body;
+        font-family: "monospace";
+    }
+    Hint { text: SettingsState.identity-path; }
+    HorizontalLayout {
+        spacing: Theme.gap-sm;
+        Btn { text: Tr.identity-export; clicked => { SettingsLogic.identity-export(); } }
+        Btn { text: Tr.identity-import; clicked => { SettingsLogic.identity-import(); } }
+        Btn { text: Tr.identity-regenerate; clicked => { SettingsLogic.identity-regenerate(); } }
+        Rectangle { }   // keep the buttons their natural width
+    }
+    Hint { text: Tr.identity-note; }
+    if SettingsState.identity-status != "" : Text {
+        text: SettingsState.identity-status;
+        color: Theme.text-secondary;
+        font-size: Theme.font-sm;
+        wrap: word-wrap;
+    }
     Rectangle { }
 }
 
@@ -251,12 +287,13 @@ component ServersPanel inherits VerticalLayout {
             }
         }
     }
-    FieldLabel { text: Tr.server-password; }
+    FieldLabel { text: Tr.invite-code; }
     Field {
-        text <=> SettingsState.server-password;
-        secret: true;
-        edited => { SettingsLogic.server-password-edited(self.text); }
+        text <=> SettingsState.server-invite-code;
+        placeholder: Tr.invite-code-placeholder;
+        edited => { SettingsLogic.server-invite-edited(self.text); }
     }
+    Hint { text: Tr.server-invite-note; }
     FieldLabel { text: Tr.server-fingerprint; }
     Field {
         text <=> SettingsState.server-fingerprint;

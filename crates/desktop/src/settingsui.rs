@@ -68,6 +68,32 @@ fn push_server_rows(app: &AppState) {
         .set_servers(ModelRc::new(VecModel::from(rows)));
 }
 
+/// One line under the identity buttons: what just happened.
+fn set_identity_status(app: &AppState, text: &str) {
+    if let Some(win) = &app.settings_win {
+        win.global::<SettingsState>()
+            .set_identity_status(text.into());
+    }
+}
+
+/// The identity line: this device's user id (its key's hash) and
+/// where the key file lives.
+pub fn refresh_identity(app: &AppState) {
+    let Some(win) = &app.settings_win else { return };
+    let s = win.global::<SettingsState>();
+    let id = app.client_key.as_ref().map_or_else(
+        || t!("identity-missing"),
+        |key| app::short_id(&key.user_id()),
+    );
+    s.set_identity_id(id.into());
+    s.set_identity_path(
+        client::config::client_key_path()
+            .display()
+            .to_string()
+            .into(),
+    );
+}
+
 /// Fill the editor fields from the selected entry.
 fn fill_server_editor(app: &AppState) {
     let Some(win) = &app.settings_win else { return };
@@ -77,9 +103,9 @@ fn fill_server_editor(app: &AppState) {
     s.set_server_name(entry.map_or("", |e| e.name.as_str()).into());
     s.set_server_ip(ip.into());
     s.set_server_port(port.into());
-    s.set_server_password(
+    s.set_server_invite_code(
         entry
-            .and_then(|e| e.password.as_deref())
+            .and_then(|e| e.invite_code.as_deref())
             .unwrap_or("")
             .into(),
     );
@@ -92,7 +118,7 @@ fn fill_server_editor(app: &AppState) {
 }
 
 /// Refresh the Servers tab (rows + editor) after an external change —
-/// the connect view's dropdown pick or 403 password save. No-op while
+/// the connect view's dropdown pick or an invite code used. No-op while
 /// the settings window was never created.
 pub fn refresh_servers(app: &AppState) {
     if app.settings_win.is_some() {
@@ -177,6 +203,8 @@ pub fn populate(app: &mut AppState) {
         .map_or(0, |i| i + 1);
     s.set_languages(ModelRc::new(VecModel::from(langs)));
     s.set_language_index(i32::try_from(lang_index).unwrap_or(0));
+    s.set_identity_status("".into());
+    refresh_identity(app);
 
     // Servers tab: rows + editor, selection starting on the default.
     let default_pos = app
@@ -299,6 +327,7 @@ fn wire(win: &SettingsWindow) {
                 name,
                 address: String::new(),
                 password: None,
+                invite_code: None,
                 fingerprint: None,
                 channel_passwords: std::collections::HashMap::new(),
             });
@@ -387,13 +416,66 @@ fn wire(win: &SettingsWindow) {
             app.settings.servers[index].fingerprint = valid.then(|| pin.to_string());
         });
     });
-    logic.on_server_password_edited(|text| {
+    logic.on_server_invite_edited(|text| {
         app::with_current(move |app| {
             let Some(index) = selected_server(app) else {
                 return;
             };
-            let trimmed = text.trim().to_string();
-            app.settings.servers[index].password = (!trimmed.is_empty()).then_some(trimmed);
+            // A code or a whole link; anything else leaves the stored
+            // code alone until the field reads as one.
+            app.settings.servers[index].set_invite_input(&text);
+        });
+    });
+
+    // ── Identity (spec §3.3) ────────────────────────────────────────
+    logic.on_identity_export(|| {
+        std::thread::spawn(|| {
+            let picked = pollster::block_on(
+                rfd::AsyncFileDialog::new()
+                    .set_file_name("baucord-identity.key")
+                    .save_file(),
+            );
+            if let Some(handle) = picked {
+                let path = handle.path().to_path_buf();
+                let _ = slint::invoke_from_event_loop(move || {
+                    app::with_current(move |app| {
+                        match client::config::export_client_key(&path) {
+                            Ok(()) => set_identity_status(app, &t!("identity-exported")),
+                            Err(e) => app.show_error(&e),
+                        }
+                    });
+                });
+            }
+        });
+    });
+    logic.on_identity_import(|| {
+        std::thread::spawn(|| {
+            let picked = pollster::block_on(rfd::AsyncFileDialog::new().pick_file());
+            if let Some(handle) = picked {
+                let path = handle.path().to_path_buf();
+                let _ = slint::invoke_from_event_loop(move || {
+                    app::with_current(move |app| {
+                        match client::config::import_client_key(&path) {
+                            Ok(key) => {
+                                app.client_key = Some(key);
+                                set_identity_status(app, &t!("identity-imported"));
+                                refresh_identity(app);
+                            }
+                            Err(e) => app.show_error(&e),
+                        }
+                    });
+                });
+            }
+        });
+    });
+    logic.on_identity_regenerate(|| {
+        app::with_current(|app| match client::config::regenerate_client_key() {
+            Ok(key) => {
+                app.client_key = Some(key);
+                set_identity_status(app, &t!("identity-regenerated"));
+                refresh_identity(app);
+            }
+            Err(e) => app.show_error(&e),
         });
     });
 

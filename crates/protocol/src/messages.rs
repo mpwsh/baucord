@@ -15,7 +15,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{lanes::Lane, permissions::RoleId};
+use crate::{
+    admin::{AdminCommand, AdminError, AdminOutcome, RestrictionKind},
+    lanes::Lane,
+    permissions::RoleId,
+};
 
 /// Transport-assigned identity of a connection, valid for its lifetime.
 /// The server assigns a random non-zero id at admission and every peer
@@ -114,6 +118,9 @@ pub enum DenyReason {
     /// The stream is channel-scoped and the viewer is in a different
     /// voice channel.
     NotInChannel,
+    // ── 1.1 ─────────────────────────────────────────────────────────
+    /// The user's roles do not allow it, or a restriction removed it.
+    NotPermitted,
 }
 
 impl DenyReason {
@@ -126,6 +133,7 @@ impl DenyReason {
             DenyReason::NotSharing => "that user is not sharing their screen",
             DenyReason::InvalidDimensions => "the share dimensions were rejected",
             DenyReason::NotInChannel => "this stream is only visible in its voice channel",
+            DenyReason::NotPermitted => "you are not allowed to share here",
         }
     }
 }
@@ -173,6 +181,9 @@ pub enum ChannelDenyReason {
     WrongPassword,
     /// The channel is at its user limit.
     ChannelFull,
+    // ── 1.1 ─────────────────────────────────────────────────────────
+    /// The user's roles do not allow joining channels.
+    NotPermitted,
 }
 
 impl ChannelDenyReason {
@@ -183,6 +194,7 @@ impl ChannelDenyReason {
             ChannelDenyReason::NoSuchChannel => "that channel does not exist",
             ChannelDenyReason::WrongPassword => "wrong channel password",
             ChannelDenyReason::ChannelFull => "the channel is full",
+            ChannelDenyReason::NotPermitted => "you are not allowed to join channels",
         }
     }
 }
@@ -543,6 +555,15 @@ pub enum ClientMessage {
         /// `None` = unlimited.
         max_uses: Option<u32>,
     },
+
+    // ── 1.1: administration (feature bit `ROLES`) ───────────────────
+    /// An administrative action (spec §8), checked like any other
+    /// message and audited by the server. Answered with `AdminResult`
+    /// carrying the same `request_id`.
+    Admin {
+        request_id: u32,
+        command: AdminCommand,
+    },
 }
 
 impl ClientMessage {
@@ -766,6 +787,31 @@ pub enum ServerMessage {
     },
     /// `CreateInvite` was refused.
     InviteDenied { reason: InviteDenyReason },
+
+    // ── 1.1: roles and moderation (feature bit `ROLES`) ─────────────
+    /// Who a session is, for the roster: after each `UserJoined`, and
+    /// once per user after `Init`. Roles come from the server's tables;
+    /// no client asserts its own (spec §8).
+    UserDetails {
+        client_id: ClientId,
+        user_id: UserId,
+        roles: Vec<RoleId>,
+    },
+    /// A restriction now applies to this session (spec §4.2): the UI
+    /// shows it instead of letting the action fail silently. `until`
+    /// in milliseconds since the Unix epoch; `None` = until lifted.
+    Restricted {
+        kind: RestrictionKind,
+        until: Option<u64>,
+        reason: String,
+    },
+    /// A restriction on this session ended (lifted, or ran out).
+    RestrictionLifted { kind: RestrictionKind },
+    /// The answer to `ClientMessage::Admin`.
+    AdminResult {
+        request_id: u32,
+        result: Result<AdminOutcome, AdminError>,
+    },
 }
 
 /// Why a session was ended (spec §4.1).
@@ -1426,6 +1472,82 @@ mod tests {
             decode_server_message(&bytes),
             Some(ServerMessage::InviteDenied {
                 reason: InviteDenyReason::RoleNotAllowed
+            })
+        ));
+    }
+
+    #[test]
+    fn admin_messages_roundtrip() {
+        use crate::admin::{AdminTarget, KeySummary, UserSummary};
+        // The message enums carry floats and skip `PartialEq`; a round
+        // trip that re-encodes to the same bytes is the equality here.
+        let client_roundtrips = |msg: &ClientMessage| {
+            let bytes = encode_client_message(msg).unwrap();
+            let again = decode_client_message(&bytes).expect("decodes");
+            encode_client_message(&again).unwrap() == bytes
+        };
+        let server_roundtrips = |msg: &ServerMessage| {
+            let bytes = encode_server_message(msg).unwrap();
+            let again = decode_server_message(&bytes).expect("decodes");
+            encode_server_message(&again).unwrap() == bytes
+        };
+
+        let cmd = ClientMessage::Admin {
+            request_id: 7,
+            command: AdminCommand::Restrict {
+                target: AdminTarget::User([1u8; 32]),
+                kind: RestrictionKind::Voice,
+                duration_secs: Some(1800),
+                reason: "spam".to_string(),
+            },
+        };
+        assert_eq!(cmd.lane(), Lane::Control);
+        assert!(client_roundtrips(&cmd));
+
+        assert!(server_roundtrips(&ServerMessage::AdminResult {
+            request_id: 7,
+            result: Ok(AdminOutcome::Users(vec![UserSummary {
+                user_id: [1u8; 32],
+                name: "alice".to_string(),
+                roles: vec![crate::permissions::ROLE_MEMBER],
+                client_id: Some(9),
+                last_seen: 5,
+                keys: vec![KeySummary {
+                    key_hash: [1u8; 32],
+                    retired: false,
+                    last_seen: 5,
+                }],
+            }])),
+        }));
+        let bytes = encode_server_message(&ServerMessage::AdminResult {
+            request_id: 8,
+            result: Err(AdminError::Outranked),
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes),
+            Some(ServerMessage::AdminResult {
+                request_id: 8,
+                result: Err(AdminError::Outranked)
+            })
+        ));
+        assert!(server_roundtrips(&ServerMessage::UserDetails {
+            client_id: 9,
+            user_id: [1u8; 32],
+            roles: vec![1, 2],
+        }));
+        let bytes = encode_server_message(&ServerMessage::Restricted {
+            kind: RestrictionKind::GeneralText,
+            until: None,
+            reason: "be nice".to_string(),
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_server_message(&bytes),
+            Some(ServerMessage::Restricted {
+                kind: RestrictionKind::GeneralText,
+                until: None,
+                ..
             })
         ));
     }
