@@ -19,7 +19,7 @@ pub mod convert {
     //! app-core → generated-struct conversions.
 
     use app_core::{
-        chat::ChatItem,
+        chat::{ChatItem, Meta},
         roster::{split_id, ChannelRow, RosterItem, RosterRow},
     };
 
@@ -41,10 +41,22 @@ pub mod convert {
             self_deafened: r.self_deafened,
             sharing: r.sharing,
             is_channel: false,
-            channel_id: -1,
+            channel_id: i32::from(r.channel_id),
             locked: false,
             member_label: "".into(),
             is_our_channel: false,
+            role: r.role.as_int(),
+            level: i32::from(r.level),
+            // The shell fills these from what the session may do.
+            tooltip: "".into(),
+            outranked: false,
+            role_editable: false,
+            channel_kickable: false,
+            members_only: false,
+            temporary: false,
+            is_afk: false,
+            owned: false,
+            from_config: false,
         }
     }
 
@@ -71,6 +83,17 @@ pub mod convert {
                 None => c.members.to_string().into(),
             },
             is_our_channel: c.is_ours,
+            role: 0,
+            level: 0,
+            tooltip: "".into(),
+            outranked: false,
+            role_editable: false,
+            channel_kickable: false,
+            members_only: c.members_only,
+            temporary: c.temporary,
+            is_afk: c.is_afk,
+            owned: c.owned,
+            from_config: c.from_config,
         }
     }
 
@@ -88,66 +111,59 @@ pub mod convert {
     /// swaps) via `VecModel::set_row_data`.
     #[must_use]
     pub fn chat_row(item: &ChatItem, row_id: i32) -> ChatRow {
-        match item {
-            ChatItem::Message { ts, user, body } => ChatRow {
-                kind: 0,
-                ts: ts.as_str().into(),
-                user: user.as_str().into(),
-                body: body.as_str().into(),
-                styled: false,
-                body_styled: Default::default(),
-                image: slint::Image::default(),
-                img_w: 0.0,
-                img_h: 0.0,
-                row_id,
-                is_gif: false,
-            },
-            ChatItem::System { body } => ChatRow {
-                kind: 1,
-                ts: "".into(),
-                user: "".into(),
-                body: body.as_str().into(),
-                styled: false,
-                body_styled: Default::default(),
-                image: slint::Image::default(),
-                img_w: 0.0,
-                img_h: 0.0,
-                row_id,
-                is_gif: false,
-            },
-            ChatItem::Code { ts, user, code } => ChatRow {
-                kind: 3,
-                ts: ts.as_str().into(),
-                user: user.as_str().into(),
-                body: code.as_str().into(),
-                styled: false,
-                body_styled: Default::default(),
-                image: slint::Image::default(),
-                img_w: 0.0,
-                img_h: 0.0,
-                row_id,
-                is_gif: false,
-            },
-            #[allow(clippy::cast_precision_loss)]
-            ChatItem::Image {
-                ts,
-                user,
-                width,
-                height,
-                is_gif,
-                ..
-            } => ChatRow {
-                kind: 2,
-                ts: ts.as_str().into(),
-                user: user.as_str().into(),
+        // Every field a system row has no use for, in one place.
+        let base = |kind: i32, meta: Option<&Meta>| {
+            let (lo, hi) = split_id(meta.map_or(0, |m| m.id));
+            ChatRow {
+                kind,
+                ts: meta.map_or("", |m| m.ts.as_str()).into(),
+                user: meta.map_or("", |m| m.user.as_str()).into(),
                 body: "".into(),
                 styled: false,
                 body_styled: Default::default(),
                 image: slint::Image::default(),
+                img_w: 0.0,
+                img_h: 0.0,
+                row_id,
+                is_gif: false,
+                msg_id_lo: lo,
+                msg_id_hi: hi,
+                own: meta.is_some_and(|m| m.own),
+                edited: false,
+                deleted: false,
+            }
+        };
+        match item {
+            ChatItem::Message {
+                meta,
+                body,
+                edited,
+                deleted,
+            } => ChatRow {
+                body: body.as_str().into(),
+                edited: *edited,
+                deleted: *deleted,
+                ..base(0, Some(meta))
+            },
+            ChatItem::System { body } => ChatRow {
+                body: body.as_str().into(),
+                ..base(1, None)
+            },
+            ChatItem::Code { meta, code } => ChatRow {
+                body: code.as_str().into(),
+                ..base(3, Some(meta))
+            },
+            #[allow(clippy::cast_precision_loss)]
+            ChatItem::Image {
+                meta,
+                width,
+                height,
+                is_gif,
+            } => ChatRow {
                 img_w: *width as f32,
                 img_h: *height as f32,
-                row_id,
                 is_gif: *is_gif,
+                ..base(2, Some(meta))
             },
         }
     }

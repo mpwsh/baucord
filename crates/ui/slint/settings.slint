@@ -1,33 +1,73 @@
 // settings.slint — the settings window.
 //
-// Left nav (Audio / General / Keyboard / Servers / Credits / About),
-// scrollable content, Save & close + Reset row — the FLTK layout,
-// rounded.
+// Left nav (Profile / General / Audio / Keyboard / Servers / About),
+// scrollable content, Save & close + Reset row.
 //
 // Live semantics carry over: every control applies immediately through
 // a callback (per keystroke / per tick), persistence happens when the
 // window closes. Meters read levels the shell pushes at 8 Hz while the
-// window is open (the shell stops the timer on close — the FLTK build
-// leaked one timer per open until its alive-probe fired).
+// window is open (the shell stops the timer on close).
+//
+// Layout grammar, the same on every tab: a `PanelHeader` (what this
+// tab is about, one line), then `Setting` groups — label, control,
+// optional hint — with one spacing token between groups and a smaller
+// one inside them, so the eye reads label→control→hint as one unit.
 
 import { ScrollView } from "std-widgets.slint";
+import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { KeybindRow, ServerRow } from "globals.slint";
-import { Btn, Field, FieldLabel, Hint, SectionHeader, Sep, HSlider, VuMeter, GateMeter, Dropdown } from "widgets.slint";
+import { Btn, Field, FieldLabel, Hint, SectionHeader, Sep, HSlider, VuMeter, GateMeter, Dropdown, CheckRow } from "widgets.slint";
 
 export global SettingsState {
-    // General
-    in property <[string]> languages;         // ["System", "English", …]
-    in-out property <int> language-index: 0;
+    // ── Profile (spec §7.1: kept here, sent to servers in 1.1.2) ──
+    in-out property <string> nickname;
+    /// "On <server>: Member · Level 3", or a not-connected line.
+    in property <string> role-line;
+    in property <bool> connected: false;
+    /// The palette (all pass 3:1 on the chat background; none in the
+    /// gold band, which the server reserves for admins).
+    in property <[color]> name-colors;
+    in-out property <int> name-color-index: -1;  // -1 = theme default
+    in property <[string]> name-styles;          // Normal / Bold / Italic
+    in-out property <int> name-style-index: 0;
+    in property <image> avatar;
+    in property <bool> has-avatar: false;
+    /// The nickname's first letter, for the avatar fallback (.slint
+    /// has no substring).
+    in property <string> initial: "?";
     /// Identity: this device's user id (the key's hash, shortened),
     /// where the key file lives, and the result of the last action.
     in property <string> identity-id;
     in property <string> identity-path;
     in property <string> identity-status;
+    /// Regenerate asks twice: the first click arms, the second acts.
+    in property <bool> identity-regenerate-armed: false;
 
-    // Servers — the list plus the editor for the selected entry. The
-    // host mirrors edits into settings and rebuilds `servers` rows.
+    // ── General ──
+    in property <[string]> languages;         // ["System", "English", …]
+    in-out property <int> language-index: 0;
+    in property <[string]> text-sizes;        // Small / Default / Large / Larger
+    in-out property <int> text-size-index: 1;
+    in property <string> config-path;
+    // Startup
+    in-out property <bool> auto-connect: false;
+    in-out property <bool> start-minimized: false;
+    in property <bool> tray-available: false; // start-minimized needs the tray
+    in-out property <bool> check-updates: true;
+    // Sounds: a master switch, then the two that exist. Ordinary chat
+    // messages never make a sound.
+    in-out property <bool> sounds-enabled: true;
+    in-out property <bool> join-leave-sounds: true;
+    in-out property <bool> mention-sound: false;
+    // Chat
+    in-out property <bool> show-timestamps: true;
+    in-out property <bool> compact-rows: false;
+    in property <[string]> image-sizes;       // 512 KB … Max
+    in-out property <int> image-size-index: 0;
+
+    // ── Servers — the list plus the editor for the selected entry ──
     in property <[ServerRow]> servers;
     in-out property <int> server-index: 0;    // selected for editing
     in-out property <string> server-name;
@@ -38,7 +78,7 @@ export global SettingsState {
     /// is accepted; only its code is kept).
     in-out property <string> server-invite-code;
 
-    // Audio
+    // ── Audio ──
     in property <[string]> input-devices;     // index 0 = "System default"
     in property <[string]> output-devices;
     in-out property <int> input-index: 0;
@@ -51,13 +91,17 @@ export global SettingsState {
     in property <string> sensitivity-line;    // localized, host-formatted
     in property <bool> testing-mic: false;
     in property <string> test-hint;
+    /// Voice activity / push to talk, and the PTT key as bound.
+    in property <[string]> transmission-modes;
+    in-out property <int> transmission-index: 0;
+    in property <string> ptt-bind;
 
-    // Keyboard
+    // ── Keyboard ──
     in property <[KeybindRow]> keybinds;
     /// True while some row is recording — arms the window's key capture.
     in property <bool> capturing: false;
 
-    // Credits / About — host-formatted blocks
+    // ── About — host-formatted blocks ──
     in property <string> credits-super-heading;
     in property <[string]> credits-super;     // gold-highlighted honors
     in property <string> credits-beta-heading;
@@ -67,7 +111,31 @@ export global SettingsState {
 }
 
 export global SettingsLogic {
+    // Profile
+    callback nickname-edited(string);
+    callback name-color-selected(int);        // -1 = default
+    callback name-style-selected(int);
+    callback avatar-pick();
+    callback avatar-clear();
+    // Identity (spec §3.3): the key file is the login.
+    callback identity-export();
+    callback identity-import();
+    callback identity-regenerate();
+    callback identity-regenerate-disarm();
+
+    // General
     callback language-selected(int);
+    callback text-size-selected(int);
+    callback open-config-folder();
+    callback auto-connect-changed(bool);
+    callback start-minimized-changed(bool);
+    callback check-updates-changed(bool);
+    callback sounds-enabled-changed(bool);
+    callback join-leave-sounds-changed(bool);
+    callback mention-sound-changed(bool);
+    callback show-timestamps-changed(bool);
+    callback compact-rows-changed(bool);
+    callback image-size-selected(int);
 
     // Servers tab
     callback server-selected(int);
@@ -80,75 +148,294 @@ export global SettingsLogic {
     callback server-fingerprint-edited(string);
     callback server-invite-edited(string);
 
-    // Identity (spec §3.3): the key file is the login.
-    callback identity-export();
-    callback identity-import();
-    callback identity-regenerate();
-
+    // Audio
     callback input-device-selected(int);
     callback output-device-selected(int);
     callback gate-threshold-changed(float);
     callback input-gain-changed(float);
     callback output-gain-changed(float);
     callback toggle-test-mic();
+    callback transmission-selected(int);
+
+    // Keyboard
     callback record-keybind(int);
     /// A key landed while recording: (key-text, ctrl, alt, shift).
     /// The host filters bare modifiers and maps text → key codes.
     callback capture-key(string, bool, bool, bool);
     callback capture-cancel();
     callback capture-clear();
-    callback open-config-folder();
+
     callback save-and-close();
     callback reset-defaults();
     callback closed();
 }
 
+// ── Building blocks ────────────────────────────────────────────────────
+
 component NavItem inherits Rectangle {
     in property <string> text;
+    in property <Icon> icon;
     in property <bool> active;
     callback clicked;
     height: 36px;
     border-radius: Theme.radius-md;
     background: active ? Theme.accent : t.has-hover ? Theme.hover : transparent;
     animate background { duration: 150ms; }
-    Text {
-        x: Theme.gap-md;
-        width: parent.width - 2 * Theme.gap-md;
-        height: 100%;
-        vertical-alignment: center;
-        text: root.text;
-        color: root.active ? Theme.on-accent : Theme.text-secondary;
-        font-size: Theme.font-body;
-        font-weight: root.active ? 600 : 400;
+    HorizontalLayout {
+        padding-left: Theme.gap-md;
+        padding-right: Theme.gap-md;
+        spacing: Theme.gap-sm;
+        Rectangle {
+            width: 16px;
+            IconDisplay {
+                icon: root.icon;
+                size: 16px;
+                stroke: root.active ? Theme.on-accent : Theme.text-muted;
+            }
+        }
+        Text {
+            vertical-alignment: center;
+            text: root.text;
+            color: root.active ? Theme.on-accent : Theme.text-secondary;
+            font-size: Theme.font-body;
+            font-weight: root.active ? 600 : 400;
+            horizontal-stretch: 1;
+        }
     }
     t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
 }
 
-component GeneralPanel inherits VerticalLayout {
-    spacing: Theme.gap-md;
-    SectionHeader { text: Tr.tab-general; }
-    FieldLabel { text: Tr.language; }
-    Dropdown {
-        options: SettingsState.languages;
-        current <=> SettingsState.language-index;
-        selected(i) => { SettingsLogic.language-selected(i); }
+/// The first thing on a tab: what it is about, in one line.
+component PanelHeader inherits VerticalLayout {
+    in property <string> title;
+    in property <string> lead;
+    spacing: 2px;
+    padding-bottom: Theme.gap-xs;
+    Text {
+        text: root.title;
+        color: Theme.text-primary;
+        font-size: Theme.font-lg;
+        font-weight: 600;
     }
-    Hint { text: Tr.language-note; }
+    if root.lead != "" : Text {
+        text: root.lead;
+        color: Theme.text-muted;
+        font-size: Theme.font-sm;
+        wrap: word-wrap;
+    }
+}
+
+/// Label, control, optional hint — one unit.
+component Setting inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint;
+    spacing: Theme.gap-xs;
+    FieldLabel { text: root.label; }
+    @children
+    if root.hint != "" : Hint { text: root.hint; }
+}
+
+/// A round avatar with an initial as the fallback.
+component AvatarView inherits Rectangle {
+    in property <image> source;
+    in property <bool> has-image: false;
+    in property <string> initial;
+    in property <length> diameter: 64px;
+    width: diameter;
+    height: diameter;
+    border-radius: diameter / 2;
+    background: has-image ? transparent : Theme.bg-tertiary;
+    border-width: has-image ? 0px : 1px;
+    border-color: Theme.border;
+    clip: true;
+    if has-image : Image {
+        width: 100%;
+        height: 100%;
+        source: root.source;
+        image-fit: cover;
+    }
+    if !has-image : Text {
+        text: root.initial;
+        color: Theme.text-secondary;
+        font-size: root.diameter * 0.4;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// One color in the palette; index -1 is "theme default".
+component Swatch inherits Rectangle {
+    in property <color> tint;
+    in property <bool> is-default: false;
+    in property <bool> selected: false;
+    callback clicked;
+    width: 28px;
+    height: 28px;
+    Rectangle {
+        width: 22px;
+        height: 22px;
+        border-radius: 11px;
+        background: root.is-default ? transparent : root.tint;
+        border-width: root.is-default ? 2px : 0px;
+        border-color: Theme.text-muted;
+        if root.is-default : Rectangle {
+            width: 2px;
+            height: 22px;
+            background: Theme.text-muted;
+            transform-rotation: 45deg;
+        }
+    }
+    // Selection ring, outside the dot so the color stays whole.
+    if root.selected : Rectangle {
+        width: 28px;
+        height: 28px;
+        border-radius: 14px;
+        border-width: 2px;
+        border-color: Theme.text-primary;
+    }
+    t := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── Panels ──────────────────────────────────────────────────────────────
+
+component ProfilePanel inherits VerticalLayout {
+    spacing: Theme.gap-lg;
+    PanelHeader { title: Tr.tab-profile; lead: Tr.profile-lead; }
+
+    // Who you are, as the roster would show it.
+    HorizontalLayout {
+        spacing: Theme.gap-md;
+        AvatarView {
+            source: SettingsState.avatar;
+            has-image: SettingsState.has-avatar;
+            initial: SettingsState.initial;
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: SettingsState.nickname == "" ? Tr.profile-no-name : SettingsState.nickname;
+                color: SettingsState.name-color-index >= 0
+                    && SettingsState.name-color-index < SettingsState.name-colors.length
+                    ? SettingsState.name-colors[SettingsState.name-color-index]
+                    : Theme.text-primary;
+                font-size: Theme.font-md;
+                font-weight: SettingsState.name-style-index == 1 ? 700 : 500;
+                font-italic: SettingsState.name-style-index == 2;
+                overflow: elide;
+            }
+            Text {
+                text: SettingsState.role-line;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                overflow: elide;
+            }
+        }
+    }
+
+    Setting {
+        label: Tr.nickname;
+        hint: Tr.profile-nickname-hint;
+        Field {
+            text <=> SettingsState.nickname;
+            edited => { SettingsLogic.nickname-edited(self.text); }
+        }
+    }
+
+    Setting {
+        label: Tr.profile-name-color;
+        hint: Tr.profile-name-color-hint;
+        VerticalLayout {
+            spacing: Theme.gap-xs;
+            HorizontalLayout {
+                spacing: Theme.gap-xs;
+                Swatch {
+                    is-default: true;
+                    selected: SettingsState.name-color-index < 0;
+                    clicked => { SettingsState.name-color-index = -1; SettingsLogic.name-color-selected(-1); }
+                }
+                for i in 8 : Swatch {
+                    tint: i < SettingsState.name-colors.length ? SettingsState.name-colors[i] : transparent;
+                    selected: SettingsState.name-color-index == i;
+                    clicked => { SettingsState.name-color-index = i; SettingsLogic.name-color-selected(i); }
+                }
+                Rectangle { }
+            }
+            HorizontalLayout {
+                spacing: Theme.gap-xs;
+                Rectangle { width: 28px; }
+                for i in 8 : Swatch {
+                    tint: i + 8 < SettingsState.name-colors.length ? SettingsState.name-colors[i + 8] : transparent;
+                    selected: SettingsState.name-color-index == i + 8;
+                    clicked => { SettingsState.name-color-index = i + 8; SettingsLogic.name-color-selected(i + 8); }
+                }
+                Rectangle { }
+            }
+        }
+    }
+
+    Setting {
+        label: Tr.profile-name-style;
+        Dropdown {
+            options: SettingsState.name-styles;
+            current <=> SettingsState.name-style-index;
+            selected(i) => { SettingsLogic.name-style-selected(i); }
+        }
+    }
+
+    Setting {
+        label: Tr.profile-avatar;
+        hint: Tr.profile-avatar-hint;
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn { text: Tr.profile-avatar-choose; clicked => { SettingsLogic.avatar-pick(); } }
+            if SettingsState.has-avatar : Btn {
+                text: Tr.profile-avatar-remove;
+                clicked => { SettingsLogic.avatar-clear(); }
+            }
+            Rectangle { }
+        }
+    }
+    Hint { text: Tr.profile-note; }
+
+    Sep { }
 
     // Identity: the device key is who you are on every server.
     SectionHeader { text: Tr.identity-header; }
-    Text {
-        text: SettingsState.identity-id;
-        color: Theme.text-primary;
-        font-size: Theme.font-body;
-        font-family: "monospace";
+    HorizontalLayout {
+        spacing: Theme.gap-sm;
+        Rectangle {
+            width: 16px;
+            IconDisplay { icon: IconSet.KeyRound; size: 16px; stroke: Theme.text-muted; }
+        }
+        Text {
+            text: SettingsState.identity-id;
+            color: Theme.text-primary;
+            font-size: Theme.font-body;
+            font-family: "monospace";
+            vertical-alignment: center;
+        }
     }
     Hint { text: SettingsState.identity-path; }
     HorizontalLayout {
         spacing: Theme.gap-sm;
         Btn { text: Tr.identity-export; clicked => { SettingsLogic.identity-export(); } }
         Btn { text: Tr.identity-import; clicked => { SettingsLogic.identity-import(); } }
-        Btn { text: Tr.identity-regenerate; clicked => { SettingsLogic.identity-regenerate(); } }
+        // Armed on the first click, done on the second: a new key is a
+        // new user, and the old one is gone for good.
+        Btn {
+            text: SettingsState.identity-regenerate-armed ? Tr.identity-regenerate-confirm : Tr.identity-regenerate;
+            danger: SettingsState.identity-regenerate-armed;
+            clicked => { SettingsLogic.identity-regenerate(); }
+        }
+        if SettingsState.identity-regenerate-armed : Btn {
+            text: Tr.cancel;
+            clicked => { SettingsLogic.identity-regenerate-disarm(); }
+        }
         Rectangle { }   // keep the buttons their natural width
     }
     Hint { text: Tr.identity-note; }
@@ -161,81 +448,212 @@ component GeneralPanel inherits VerticalLayout {
     Rectangle { }
 }
 
+component GeneralPanel inherits VerticalLayout {
+    spacing: Theme.gap-lg;
+    PanelHeader { title: Tr.tab-general; lead: Tr.general-lead; }
+    Setting {
+        label: Tr.language;
+        hint: Tr.language-note;
+        Dropdown {
+            options: SettingsState.languages;
+            current <=> SettingsState.language-index;
+            selected(i) => { SettingsLogic.language-selected(i); }
+        }
+    }
+    Setting {
+        label: Tr.text-size;
+        hint: Tr.text-size-hint;
+        Dropdown {
+            options: SettingsState.text-sizes;
+            current <=> SettingsState.text-size-index;
+            selected(i) => { SettingsLogic.text-size-selected(i); }
+        }
+    }
+
+    Sep { }
+    SectionHeader { text: Tr.startup-header; }
+    VerticalLayout {
+        spacing: 2px;
+        CheckRow {
+            text: Tr.startup-auto-connect;
+            hint: Tr.startup-auto-connect-hint;
+            checked <=> SettingsState.auto-connect;
+            toggled(on) => { SettingsLogic.auto-connect-changed(on); }
+        }
+        if SettingsState.tray-available : CheckRow {
+            text: Tr.startup-minimized;
+            hint: Tr.startup-minimized-hint;
+            checked <=> SettingsState.start-minimized;
+            toggled(on) => { SettingsLogic.start-minimized-changed(on); }
+        }
+        CheckRow {
+            text: Tr.startup-check-updates;
+            hint: Tr.startup-check-updates-hint;
+            checked <=> SettingsState.check-updates;
+            toggled(on) => { SettingsLogic.check-updates-changed(on); }
+        }
+    }
+
+    Sep { }
+    SectionHeader { text: Tr.sounds-header; }
+    VerticalLayout {
+        spacing: 2px;
+        CheckRow {
+            text: Tr.sounds-enabled;
+            hint: Tr.sounds-enabled-hint;
+            checked <=> SettingsState.sounds-enabled;
+            toggled(on) => { SettingsLogic.sounds-enabled-changed(on); }
+        }
+        // The individual picks, indented under the master switch and
+        // greyed while it is off.
+        HorizontalLayout {
+            padding-left: Theme.gap-lg;
+            VerticalLayout {
+                spacing: 2px;
+                opacity: SettingsState.sounds-enabled ? 1.0 : 0.45;
+                CheckRow {
+                    text: Tr.sounds-join-leave;
+                    enabled: SettingsState.sounds-enabled;
+                    checked <=> SettingsState.join-leave-sounds;
+                    toggled(on) => { SettingsLogic.join-leave-sounds-changed(on); }
+                }
+                CheckRow {
+                    text: Tr.sounds-mention;
+                    hint: Tr.sounds-mention-hint;
+                    enabled: SettingsState.sounds-enabled;
+                    checked <=> SettingsState.mention-sound;
+                    toggled(on) => { SettingsLogic.mention-sound-changed(on); }
+                }
+            }
+        }
+    }
+
+    Sep { }
+    SectionHeader { text: Tr.chat-header; }
+    VerticalLayout {
+        spacing: 2px;
+        CheckRow {
+            text: Tr.chat-show-timestamps;
+            checked <=> SettingsState.show-timestamps;
+            toggled(on) => { SettingsLogic.show-timestamps-changed(on); }
+        }
+        CheckRow {
+            text: Tr.chat-compact-rows;
+            checked <=> SettingsState.compact-rows;
+            toggled(on) => { SettingsLogic.compact-rows-changed(on); }
+        }
+    }
+    Setting {
+        label: Tr.chat-image-size;
+        hint: Tr.chat-image-size-hint;
+        Dropdown {
+            options: SettingsState.image-sizes;
+            current <=> SettingsState.image-size-index;
+            selected(i) => { SettingsLogic.image-size-selected(i); }
+        }
+    }
+
+    Sep { }
+    SectionHeader { text: Tr.files-header; }
+    Hint { text: Tr.about-config-file + " " + SettingsState.config-path; }
+    HorizontalLayout {
+        spacing: Theme.gap-sm;
+        Btn {
+            text: Tr.about-open-config;
+            clicked => { SettingsLogic.open-config-folder(); }
+        }
+        Rectangle { }   // keep the button its natural width
+    }
+    Hint { text: Tr.files-note; }
+
+    Sep { }
+    SectionHeader { text: Tr.privacy-header; }
+    Text {
+        text: Tr.privacy-note;
+        color: Theme.text-secondary;
+        font-size: Theme.font-sm;
+        wrap: word-wrap;
+    }
+    Rectangle { }
+}
+
 component ServersPanel inherits VerticalLayout {
-    spacing: Theme.gap-md;
-    SectionHeader { text: Tr.tab-servers; }
+    spacing: Theme.gap-lg;
+    PanelHeader { title: Tr.tab-servers; lead: Tr.servers-lead; }
 
     // Saved servers. Clicking a row selects it for the editor below;
     // the radio dot on the left marks/sets the default (the entry the
     // connect screen preselects at startup).
-    for srv[i] in SettingsState.servers : Rectangle {
-        height: 48px;
-        border-radius: Theme.radius-md;
-        background: i == SettingsState.server-index ? Theme.bg-tertiary
-            : row-t.has-hover ? Theme.hover : transparent;
-        animate background { duration: 150ms; }
-        row-t := TouchArea {
-            mouse-cursor: pointer;
-            clicked => {
-                SettingsState.server-index = i;
-                SettingsLogic.server-selected(i);
+    VerticalLayout {
+        spacing: 2px;
+        for srv[i] in SettingsState.servers : Rectangle {
+            height: 48px;
+            border-radius: Theme.radius-md;
+            background: i == SettingsState.server-index ? Theme.bg-tertiary
+                : row-t.has-hover ? Theme.hover : transparent;
+            animate background { duration: 150ms; }
+            row-t := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    SettingsState.server-index = i;
+                    SettingsLogic.server-selected(i);
+                }
             }
-        }
-        HorizontalLayout {
-            padding-left: Theme.gap-md;
-            padding-right: Theme.gap-md;
-            spacing: Theme.gap-md;
-            // Default radio dot — sits above the row's TouchArea, so
-            // its clicks don't also reselect… they do both, which is
-            // what you want anyway (see callback).
-            Rectangle {
-                width: 18px;
-                ring := Rectangle {
-                    y: (parent.height - self.height) / 2;
+            HorizontalLayout {
+                padding-left: Theme.gap-md;
+                padding-right: Theme.gap-md;
+                spacing: Theme.gap-md;
+                // Default radio dot: sits above the row's TouchArea, so
+                // a click both selects and sets the default.
+                Rectangle {
                     width: 18px;
-                    height: 18px;
-                    border-radius: 9px;
-                    border-width: 2px;
-                    border-color: srv.is-default ? Theme.accent
-                        : dot-t.has-hover ? Theme.text-secondary : Theme.border;
-                    if srv.is-default : Rectangle {
-                        width: 8px;
-                        height: 8px;
-                        border-radius: 4px;
-                        background: Theme.accent;
-                    }
-                    dot-t := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => {
-                            SettingsState.server-index = i;
-                            SettingsLogic.server-set-default(i);
+                    ring := Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 9px;
+                        border-width: 2px;
+                        border-color: srv.is-default ? Theme.accent
+                            : dot-t.has-hover ? Theme.text-secondary : Theme.border;
+                        if srv.is-default : Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: Theme.accent;
+                        }
+                        dot-t := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                SettingsState.server-index = i;
+                                SettingsLogic.server-set-default(i);
+                            }
                         }
                     }
                 }
-            }
-            VerticalLayout {
-                horizontal-stretch: 1;
-                alignment: center;
-                spacing: 1px;
-                Text {
-                    text: srv.name;
-                    color: Theme.text-primary;
-                    font-size: Theme.font-body;
-                    font-weight: 600;
-                    overflow: elide;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 1px;
+                    Text {
+                        text: srv.name;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-body;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: srv.address;
+                        color: Theme.text-muted;
+                        font-size: Theme.font-sm;
+                        overflow: elide;
+                    }
                 }
-                Text {
-                    text: srv.address;
-                    color: Theme.text-muted;
+                if srv.is-default : Text {
+                    text: Tr.server-default;
+                    color: Theme.accent-text;
                     font-size: Theme.font-sm;
-                    overflow: elide;
+                    vertical-alignment: center;
                 }
-            }
-            if srv.is-default : Text {
-                text: Tr.server-default;
-                color: Theme.accent;
-                font-size: Theme.font-sm;
-                vertical-alignment: center;
             }
         }
     }
@@ -261,152 +679,207 @@ component ServersPanel inherits VerticalLayout {
 
     // Editor for the selected entry — live like every other settings
     // control; the host mirrors keystrokes into the settings model.
-    FieldLabel { text: Tr.server-name; }
-    Field {
-        text <=> SettingsState.server-name;
-        edited => { SettingsLogic.server-name-edited(self.text); }
+    Setting {
+        label: Tr.server-name;
+        Field {
+            text <=> SettingsState.server-name;
+            edited => { SettingsLogic.server-name-edited(self.text); }
+        }
     }
     HorizontalLayout {
         spacing: Theme.gap-sm;
-        VerticalLayout {
+        Setting {
             horizontal-stretch: 1;
-            spacing: Theme.gap-xs;
-            FieldLabel { text: Tr.server-ip; }
+            label: Tr.server-ip;
             Field {
                 text <=> SettingsState.server-ip;
                 edited => { SettingsLogic.server-ip-edited(self.text); }
             }
         }
-        VerticalLayout {
+        Setting {
             width: 110px;
-            spacing: Theme.gap-xs;
-            FieldLabel { text: Tr.server-port; }
+            label: Tr.server-port;
             Field {
                 text <=> SettingsState.server-port;
                 edited => { SettingsLogic.server-port-edited(self.text); }
             }
         }
     }
-    FieldLabel { text: Tr.invite-code; }
-    Field {
-        text <=> SettingsState.server-invite-code;
-        placeholder: Tr.invite-code-placeholder;
-        edited => { SettingsLogic.server-invite-edited(self.text); }
+    Setting {
+        label: Tr.invite-code;
+        hint: Tr.server-invite-note;
+        Field {
+            text <=> SettingsState.server-invite-code;
+            placeholder: Tr.invite-code-placeholder;
+            edited => { SettingsLogic.server-invite-edited(self.text); }
+        }
     }
-    Hint { text: Tr.server-invite-note; }
-    FieldLabel { text: Tr.server-fingerprint; }
-    Field {
-        text <=> SettingsState.server-fingerprint;
-        edited => { SettingsLogic.server-fingerprint-edited(self.text); }
+    Setting {
+        label: Tr.server-fingerprint;
+        hint: Tr.server-config-note;
+        Field {
+            text <=> SettingsState.server-fingerprint;
+            edited => { SettingsLogic.server-fingerprint-edited(self.text); }
+        }
     }
-    Hint { text: Tr.server-config-note; }
     Rectangle { }
 }
 
 component AudioPanel inherits VerticalLayout {
-    spacing: Theme.gap-sm;
-    SectionHeader { text: Tr.audio-devices-header; }
-    FieldLabel { text: Tr.audio-input-device; }
-    Dropdown {
-        options: SettingsState.input-devices;
-        current <=> SettingsState.input-index;
-        selected(i) => { SettingsLogic.input-device-selected(i); }
+    spacing: Theme.gap-lg;
+    PanelHeader { title: Tr.tab-audio; lead: Tr.audio-lead; }
+    Setting {
+        label: Tr.audio-input-device;
+        Dropdown {
+            options: SettingsState.input-devices;
+            current <=> SettingsState.input-index;
+            selected(i) => { SettingsLogic.input-device-selected(i); }
+        }
     }
-    FieldLabel { text: Tr.audio-output-device; }
-    Dropdown {
-        options: SettingsState.output-devices;
-        current <=> SettingsState.output-index;
-        selected(i) => { SettingsLogic.output-device-selected(i); }
+    Setting {
+        label: Tr.audio-output-device;
+        Dropdown {
+            options: SettingsState.output-devices;
+            current <=> SettingsState.output-index;
+            selected(i) => { SettingsLogic.output-device-selected(i); }
+        }
+    }
+    Setting {
+        label: Tr.audio-transmission;
+        hint: SettingsState.transmission-index == 1
+            ? (SettingsState.ptt-bind == "" ? Tr.audio-ptt-unbound : Tr.audio-ptt-hint + " " + SettingsState.ptt-bind)
+            : Tr.audio-vad-hint;
+        Dropdown {
+            options: SettingsState.transmission-modes;
+            current <=> SettingsState.transmission-index;
+            selected(i) => { SettingsLogic.transmission-selected(i); }
+        }
     }
     Sep { }
     SectionHeader { text: Tr.audio-input-header; }
-    FieldLabel { text: Tr.audio-capture-level; }
-    GateMeter {
-        level: SettingsState.mic-level;
-        threshold: SettingsState.gate-threshold;
+    Setting {
+        label: Tr.audio-capture-level;
+        GateMeter {
+            level: SettingsState.mic-level;
+            threshold: SettingsState.gate-threshold;
+        }
     }
-    FieldLabel { text: Tr.audio-input-gain; }
+    Setting {
+        label: Tr.audio-input-gain;
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            HSlider {
+                horizontal-stretch: 1;
+                minimum: 0.0; maximum: 2.0;
+                value <=> SettingsState.input-gain;
+                live-changed(v) => { SettingsLogic.input-gain-changed(v); }
+            }
+            Text {
+                width: 44px;
+                text: "\{Math.round(SettingsState.input-gain * 100)}%";
+                color: Theme.text-muted; font-size: Theme.font-sm;
+                vertical-alignment: center; horizontal-alignment: right;
+            }
+        }
+    }
+    Setting {
+        label: Tr.audio-input-sensitivity;
+        hint: Tr.audio-gate-hint;
+        HSlider {
+            minimum: 0.005; maximum: 0.10;
+            value <=> SettingsState.gate-threshold;
+            live-changed(v) => { SettingsLogic.gate-threshold-changed(v); }
+        }
+        Hint { text: SettingsState.sensitivity-line; }
+    }
     HorizontalLayout {
         spacing: Theme.gap-sm;
-        HSlider {
+        Btn {
+            text: SettingsState.testing-mic ? Tr.audio-stop-testing : Tr.audio-test-mic;
+            engaged: SettingsState.testing-mic;
+            clicked => { SettingsLogic.toggle-test-mic(); }
+        }
+        Hint {
+            text: SettingsState.test-hint;
+            color: SettingsState.testing-mic ? Theme.warning : Theme.text-muted;
+            vertical-alignment: center;
             horizontal-stretch: 1;
-            minimum: 0.0; maximum: 2.0;
-            value <=> SettingsState.input-gain;
-            live-changed(v) => { SettingsLogic.input-gain-changed(v); }
         }
-        Text {
-            width: 44px;
-            text: "\{Math.round(SettingsState.input-gain * 100)}%";
-            color: Theme.text-muted; font-size: Theme.font-sm;
-            vertical-alignment: center; horizontal-alignment: right;
-        }
-    }
-    FieldLabel { text: Tr.audio-input-sensitivity; }
-    HSlider {
-        minimum: 0.005; maximum: 0.10;
-        value <=> SettingsState.gate-threshold;
-        live-changed(v) => { SettingsLogic.gate-threshold-changed(v); }
-    }
-    Hint { text: SettingsState.sensitivity-line; }
-    Hint { text: Tr.audio-gate-hint; }
-    Btn {
-        text: SettingsState.testing-mic ? Tr.audio-stop-testing : Tr.audio-test-mic;
-        engaged: SettingsState.testing-mic;
-        clicked => { SettingsLogic.toggle-test-mic(); }
-    }
-    Hint {
-        text: SettingsState.test-hint;
-        color: SettingsState.testing-mic ? Theme.warning : Theme.text-muted;
     }
     Sep { }
     SectionHeader { text: Tr.audio-output-header; }
     VuMeter { level: SettingsState.out-level; }
-    FieldLabel { text: Tr.audio-master-volume; }
-    HorizontalLayout {
-        spacing: Theme.gap-sm;
-        HSlider {
-            horizontal-stretch: 1;
-            minimum: 0.0; maximum: 2.0;
-            value <=> SettingsState.output-gain;
-            live-changed(v) => { SettingsLogic.output-gain-changed(v); }
-        }
-        Text {
-            width: 44px;
-            text: "\{Math.round(SettingsState.output-gain * 100)}%";
-            color: Theme.text-muted; font-size: Theme.font-sm;
-            vertical-alignment: center; horizontal-alignment: right;
+    Setting {
+        label: Tr.audio-master-volume;
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            HSlider {
+                horizontal-stretch: 1;
+                minimum: 0.0; maximum: 2.0;
+                value <=> SettingsState.output-gain;
+                live-changed(v) => { SettingsLogic.output-gain-changed(v); }
+            }
+            Text {
+                width: 44px;
+                text: "\{Math.round(SettingsState.output-gain * 100)}%";
+                color: Theme.text-muted; font-size: Theme.font-sm;
+                vertical-alignment: center; horizontal-alignment: right;
+            }
         }
     }
     Rectangle { }
 }
 
 component KeyboardPanel inherits VerticalLayout {
-    spacing: Theme.gap-md;
-    SectionHeader { text: Tr.keybinds-header; }
-    Hint { text: Tr.keybinds-hint; }
-    for kb[i] in SettingsState.keybinds : HorizontalLayout {
-        spacing: Theme.gap-sm;
-        height: 40px;
-        Text {
-            text: kb.action-label;
-            color: Theme.text-primary;
-            font-size: Theme.font-body;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-        }
-        Btn {
-            width: 180px;
-            text: kb.recording ? Tr.keybind-press-combo
-                : kb.bind == "" ? Tr.keybind-not-set : kb.bind;
-            engaged: kb.recording;
-            clicked => { SettingsLogic.record-keybind(i); }
+    spacing: Theme.gap-lg;
+    PanelHeader { title: Tr.tab-keyboard; lead: Tr.keybinds-hint; }
+    VerticalLayout {
+        spacing: Theme.gap-xs;
+        for kb[i] in SettingsState.keybinds : Rectangle {
+            height: 44px;
+            border-radius: Theme.radius-md;
+            background: kb.recording ? Theme.bg-tertiary : transparent;
+            animate background { duration: 150ms; }
+            HorizontalLayout {
+                padding-left: Theme.gap-sm;
+                padding-right: Theme.gap-xs;
+                spacing: Theme.gap-sm;
+                Text {
+                    text: kb.action-label;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-body;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Btn {
+                    width: 180px;
+                    text: kb.recording ? Tr.keybind-press-combo
+                        : kb.bind == "" ? Tr.keybind-not-set : kb.bind;
+                    engaged: kb.recording;
+                    clicked => { SettingsLogic.record-keybind(i); }
+                }
+            }
         }
     }
     Rectangle { }
 }
 
-component CreditsPanel inherits VerticalLayout {
-    spacing: Theme.gap-md;
+component AboutPanel inherits VerticalLayout {
+    spacing: Theme.gap-lg;
+    PanelHeader { title: Tr.tab-about; }
+    Text {
+        text: SettingsState.about-head;
+        color: Theme.text-secondary;
+        font-size: Theme.font-body;
+        wrap: word-wrap;
+    }
+    Text {
+        text: SettingsState.about-tech;
+        color: Theme.text-secondary;
+        font-size: Theme.font-body;
+        wrap: word-wrap;
+    }
+    Sep { }
     SectionHeader { text: Tr.tab-credits; }
     VerticalLayout {
         spacing: 2px;
@@ -438,41 +911,17 @@ component CreditsPanel inherits VerticalLayout {
     Rectangle { }
 }
 
-component AboutPanel inherits VerticalLayout {
-    spacing: Theme.gap-md;
-    SectionHeader { text: Tr.tab-about; }
-    Text {
-        text: SettingsState.about-head;
-        color: Theme.text-secondary;
-        font-size: Theme.font-body;
-        wrap: word-wrap;
-    }
-    // Right under the config-file line: settings live next to the
-    // executable (no appdata), and this opens that folder.
-    HorizontalLayout {
-        Btn {
-            text: "📁  " + Tr.about-open-config;
-            clicked => { SettingsLogic.open-config-folder(); }
-        }
-        Rectangle { }   // keep the button its natural width
-    }
-    Text {
-        text: SettingsState.about-tech;
-        color: Theme.text-secondary;
-        font-size: Theme.font-body;
-        wrap: word-wrap;
-    }
-    Rectangle { }
-}
+// ── Window ──────────────────────────────────────────────────────────────
 
 export component SettingsWindow inherits Window {
     title: Tr.settings-title;
     background: Theme.bg-primary;
-    preferred-width: 720px;
-    preferred-height: 640px;
-    min-width: 620px;
+    preferred-width: 760px;
+    preferred-height: 660px;
+    min-width: 640px;
     min-height: 520px;
 
+    /// 0 profile, 1 general, 2 audio, 3 keyboard, 4 servers, 5 about.
     in-out property <int> tab: 0;
 
     // Same Windows minimize→restore workaround as MainWindow: the OS
@@ -499,58 +948,66 @@ export component SettingsWindow inherits Window {
             accept
         }
 
-    HorizontalLayout {
-        // Nav
-        Rectangle {
-            width: 168px;
-            background: Theme.surface;
-            VerticalLayout {
-                padding: Theme.gap-md;
-                spacing: Theme.gap-xs;
-                NavItem { text: Tr.tab-audio;    active: root.tab == 0; clicked => { root.tab = 0; } }
-                NavItem { text: Tr.tab-general;  active: root.tab == 1; clicked => { root.tab = 1; } }
-                NavItem { text: Tr.tab-keyboard; active: root.tab == 2; clicked => { root.tab = 2; } }
-                NavItem { text: Tr.tab-servers;  active: root.tab == 3; clicked => { root.tab = 3; } }
-                NavItem { text: Tr.tab-credits;  active: root.tab == 4; clicked => { root.tab = 4; } }
-                NavItem { text: Tr.tab-about;    active: root.tab == 5; clicked => { root.tab = 5; } }
-                Rectangle { }
-            }
-        }
-        // Content + button row
-        VerticalLayout {
-            ScrollView {
-                vertical-stretch: 1;
-                VerticalLayout {
-                    padding: Theme.gap-xl;
-                    if root.tab == 0 : AudioPanel { }
-                    if root.tab == 1 : GeneralPanel { }
-                    if root.tab == 2 : KeyboardPanel { }
-                    if root.tab == 3 : ServersPanel { }
-                    if root.tab == 4 : CreditsPanel { }
-                    if root.tab == 5 : AboutPanel { }
-                }
-            }
+        HorizontalLayout {
+            // Nav
             Rectangle {
-                height: 64px;
-                background: Theme.bg-primary;
-                HorizontalLayout {
+                width: 188px;
+                background: Theme.surface;
+                VerticalLayout {
                     padding: Theme.gap-md;
-                    spacing: Theme.gap-sm;
+                    spacing: Theme.gap-xs;
+                    NavItem { text: Tr.tab-profile;  icon: IconSet.UserRound;         active: root.tab == 0; clicked => { root.tab = 0; } }
+                    NavItem { text: Tr.tab-general;  icon: IconSet.SlidersHorizontal; active: root.tab == 1; clicked => { root.tab = 1; } }
+                    NavItem { text: Tr.tab-audio;    icon: IconSet.Volume2;           active: root.tab == 2; clicked => { root.tab = 2; } }
+                    NavItem { text: Tr.tab-keyboard; icon: IconSet.Keyboard;          active: root.tab == 3; clicked => { root.tab = 3; } }
+                    NavItem { text: Tr.tab-servers;  icon: IconSet.Server;            active: root.tab == 4; clicked => { root.tab = 4; } }
                     Rectangle { }
-                    Btn {
-                        width: 170px;
-                        text: Tr.reset-defaults;
-                        clicked => { SettingsLogic.reset-defaults(); }
+                    NavItem { text: Tr.tab-about;    icon: IconSet.Info;              active: root.tab == 5; clicked => { root.tab = 5; } }
+                }
+            }
+            // Content + button row
+            VerticalLayout {
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: Theme.gap-xl;
+                        // Readable measure: the content column stops
+                        // growing past ~560px on a wide window.
+                        HorizontalLayout {
+                            VerticalLayout {
+                                max-width: 560px;
+                                horizontal-stretch: 100;
+                                if root.tab == 0 : ProfilePanel { }
+                                if root.tab == 1 : GeneralPanel { }
+                                if root.tab == 2 : AudioPanel { }
+                                if root.tab == 3 : KeyboardPanel { }
+                                if root.tab == 4 : ServersPanel { }
+                                if root.tab == 5 : AboutPanel { }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
                     }
-                    Btn {
-                        width: 170px;
-                        text: Tr.save-and-close;
-                        accent: true;
-                        clicked => { SettingsLogic.save-and-close(); }
+                }
+                Rectangle {
+                    height: 64px;
+                    background: Theme.bg-primary;
+                    Rectangle { y: 0; height: 1px; width: 100%; background: Theme.border; }
+                    HorizontalLayout {
+                        padding: Theme.gap-md;
+                        spacing: Theme.gap-sm;
+                        Rectangle { }
+                        Btn {
+                            text: Tr.reset-defaults;
+                            clicked => { SettingsLogic.reset-defaults(); }
+                        }
+                        Btn {
+                            text: Tr.save-and-close;
+                            accent: true;
+                            clicked => { SettingsLogic.save-and-close(); }
+                        }
                     }
                 }
             }
         }
-    }
     }
 }

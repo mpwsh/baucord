@@ -14,7 +14,7 @@ use crate::app::{self, AppState};
 // ── Stream viewer ───────────────────────────────────────────────────────
 
 pub struct Viewer {
-    win: StreamViewerWindow,
+    pub win: StreamViewerWindow,
     fps: FpsCounter,
     ring: FrameRing,
     total_bytes: u64,
@@ -33,9 +33,11 @@ impl Viewer {
         peer_name: &str,
         width: u32,
         height: u32,
+        text_scale: f32,
     ) -> Result<Self, slint::PlatformError> {
         let win = StreamViewerWindow::new()?;
         app::fill_tr(&win.global::<ui::Tr>());
+        win.global::<ui::Theme>().set_scale(text_scale);
         win.set_peer_name(peer_name.into());
         win.window().set_size(slint::LogicalSize::new(
             width.clamp(320, 1920) as f32,

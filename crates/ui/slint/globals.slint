@@ -41,7 +41,29 @@ export struct UserRow {
     locked: bool,           // channel requires a password
     member-label: string,   // "3" or "3/8" with a user limit
     is-our-channel: bool,   // the channel we are in (highlight, no-op click)
+    // 1.1 — from the server's tables (UserDetails / ChannelDetails).
+    // For user rows `channel-id` is the channel they are in.
+    role: int,              // users: 0 unknown, 1 guest, 2 member, 3 organizer, 4 admin
+    level: int,             // users: progress level, 0 = unknown
+    tooltip: string,        // users: level, role, and (for admins) last telemetry
+    outranked: bool,        // users: rank strictly below ours — mute/disconnect/kick/ban apply
+    role-editable: bool,    // users: rank at or below ours — the role submenu applies
+    channel-kickable: bool, // users: we own their channel (or manage all) — send to default
+    members-only: bool,     // channels: a min-role gate exists
+    temporary: bool,        // channels: evaporates when left empty
+    is-afk: bool,           // channels: the server's AFK room
+    owned: bool,            // channels: this session created it
+    from-config: bool,      // channels: the server's file owns it (no delete/rename)
 }
+
+/// A channel as the "Move to" submenu lists it (visible ones only).
+export struct ChannelOption { id: int, name: string }
+
+/// The toast's register: what color and glyph it carries.
+export enum ToastKind { info, success, warning, error }
+
+/// What a moderation dialog is about to do (spec §4.1 / §4.2).
+export enum ModAction { mute-voice, mute-chat, unmute-voice, unmute-chat, disconnect, kick, ban }
 
 /// One chat row. `kind`: 0 = message, 1 = system, 2 = image, 3 = code
 /// (a ```-fenced block; links stay inline in kind-0 rows via
@@ -58,6 +80,13 @@ export struct ChatRow {
     img-h: float,
     row-id: int,         // stable id for gif hover/click callbacks
     is-gif: bool,
+    // 1.1 — the server's message id (u64, split like client ids) and
+    // what it lets the row do.
+    msg-id-lo: int,
+    msg-id-hi: int,
+    own: bool,           // authored by this session: edit/delete in the menu
+    edited: bool,        // "(edited)" mark after the body
+    deleted: bool,       // body gone: muted placeholder, no menu
 }
 
 export struct EmojiRow  { glyph: string, code: string, section: string }
@@ -90,6 +119,7 @@ export global State {
     /// use, device unlinked, removed by an admin).
     in property <string> connect-notice;
     in property <string> error-text;       // 5s toast, cleared by host
+    in property <ToastKind> toast-kind: ToastKind.error;
     in property <string> device-warning;   // "saved mic missing" notice
 
     // Roster / sidebar
@@ -97,6 +127,13 @@ export global State {
     in property <string> users-count-label;
     in property <bool> muted;
     in property <bool> deafened;
+    /// Push-to-talk: the mic is closed until the key is held.
+    in property <bool> ptt-mode: false;
+    in property <bool> ptt-held: false;
+    in property <string> ptt-tooltip;      // "Push to talk — hold F10"
+    // Chat preferences (Settings → General → Chat)
+    in property <bool> show-timestamps: true;
+    in property <bool> compact-rows: false;
     in property <bool> sharing;
     in property <string> status-text;      // "● Connected"
     in property <color> status-color: #2BAC76;
@@ -110,6 +147,37 @@ export global State {
     in-out property <string> draft;
     in property <int> max-chars: 400;
     in property <string> upload-line;      // "" when idle
+    /// Older pages exist on the server (History.more): the "load
+    /// earlier" control appears at the top of the list.
+    in property <bool> history-more: false;
+    in property <bool> history-loading: false;
+    /// The composer is rewriting one of our messages (Enter saves,
+    /// Escape restores the draft).
+    in property <bool> editing: false;
+    /// RESTRICT: the delete entry appears on everyone's messages.
+    in property <bool> perm-delete-any: false;
+
+    // Channel dialog (create, or edit one we may manage; spec §5)
+    in property <bool> channel-dialog-open: false;
+    in property <bool> channel-dialog-editing: false;   // false = create
+    in property <string> channel-dialog-title;
+    in-out property <string> channel-dialog-name;
+    in-out property <string> channel-dialog-password;
+    in-out property <string> channel-dialog-limit;      // "" = unlimited
+    in-out property <string> channel-dialog-afk;        // minutes; "" = server default
+    in-out property <bool> channel-dialog-keep: false;  // permanent
+    in-out property <bool> channel-dialog-members-only: false;
+    in property <string> channel-dialog-error;          // "" when none
+    /// Editing a protected channel whose password this device never
+    /// saw: the server needs it resent or it is cleared.
+    in property <string> channel-dialog-password-note;
+
+    // Generic confirm (delete a message or a channel): the host
+    // remembers what is being confirmed.
+    in property <bool> confirm-open: false;
+    in property <string> confirm-title;
+    in property <string> confirm-body;
+    in property <string> confirm-label;     // verb-first, repeats the consequence
 
     // Emoji picker (from app-core's catalog)
     in property <[EmojiRow]> emoji;
@@ -135,6 +203,37 @@ export global State {
 
     // Per-user audio popover (opened by Logic.user-menu)
     in property <bool> user-popup-open: false;
+
+    // ── 1.1: what this session may do (Session.permissions, rendered
+    // as bools — Slint has no 64-bit int). The server decides; these
+    // only choose what to draw.
+    in property <bool> perm-mute: false;        // MUTE or RESTRICT
+    in property <bool> perm-disconnect: false;
+    in property <bool> perm-kick: false;
+    in property <bool> perm-ban: false;
+    in property <bool> perm-move: false;        // MANAGE_CHANNELS
+    in property <bool> perm-roles: false;       // MANAGE_ROLES
+    in property <bool> perm-users: false;       // MANAGE_USERS (telemetry tooltip)
+    in property <bool> perm-create-channels: false;
+    in property <bool> perm-manage-own: false;  // MANAGE_OWN_CHANNELS
+    /// Our highest built-in role (same scale as UserRow.role): the
+    /// role submenu offers roles up to it.
+    in property <int> our-role: 0;
+    /// `Session.persistent`: false earns a standing notice on
+    /// moderation dialogs and in chat (spec §1.1).
+    in property <bool> server-persistent: true;
+    /// Channels this session can see, for the "Move to" submenu.
+    in property <[ChannelOption]> channel-options;
+
+    // Moderation dialog (kick / ban / disconnect / mute with a reason)
+    in property <bool> moderation-open: false;
+    in property <ModAction> moderation-action: ModAction.kick;
+    in property <string> moderation-title;         // "Kick alice?"
+    in property <string> moderation-hint;          // what it means
+    in property <string> moderation-confirm-label; // "Kick alice"
+    in property <[string]> moderation-durations;   // ban / mute only; empty = none
+    in-out property <int> moderation-duration: 0;
+    in-out property <string> moderation-reason;
 
     // Image viewer overlay (chat image tapped) — replaces the old
     // separate gallery window.
@@ -170,6 +269,18 @@ export global Logic {
     callback popup-reset-audio(int);
     callback popup-watch(int);
     callback popup-closed();
+    // 1.1 — roster moderation (row index → the host resolves the user)
+    /// The pointer entered/left a user row: the host fetches the last
+    /// telemetry for the tooltip when it may.
+    callback user-hovered(int, bool);
+    /// Open the dialog for an action with a reason (kick/ban/…), or
+    /// send it right away (the unmutes).
+    callback user-moderate(int, ModAction);
+    callback user-move(int, int);              // row index, channel id
+    callback user-set-role(int, int);          // row index, role (1 guest … 4 admin)
+    callback user-channel-kick(int);           // send back to the default channel
+    callback moderation-confirm();             // reads State.moderation-*
+    callback moderation-cancel();
 
     // Chat
     callback send-message();
@@ -177,8 +288,15 @@ export global Logic {
     /// Shift+Enter: splice a newline at the caret (byte offsets; the
     /// host owns string surgery — .slint has no substring ops).
     callback composer-newline(cursor: int, anchor: int);
-    /// macOS Ctrl+A / Ctrl+E: move the caret to the line start/end.
+    /// macOS Ctrl+A / Ctrl+E (and ⌘←/⌘→): the caret to the line start/end.
     callback composer-line-edge(cursor: int, to-end: bool);
+    /// ⌘↓: the caret to the end of the draft (a byte offset the host
+    /// knows; .slint has no byte length).
+    callback composer-doc-end();
+    /// A printable key landed on a chat row (focus went there with a
+    /// text selection): the host appends it to the draft and refocuses
+    /// the composer, so typing anywhere in the chat writes a message.
+    callback type-through(string);
     callback attach-image();
     // Wipe the local chat history/images (each user clears their own).
     callback clear-chat();
@@ -188,6 +306,13 @@ export global Logic {
     callback copy-text(string);
     callback row-save-image(int);
     callback row-open-image(int);
+    /// Message id halves (see UserRow's client id split).
+    callback row-edit(int, int);
+    callback row-delete(int, int);
+    callback edit-cancel();
+    callback load-earlier();
+    callback confirm-accept();
+    callback confirm-cancel();
     /// Image viewer overlay: step -1/+1, save current, close.
     callback viewer-step(int);
     callback viewer-save();
@@ -205,12 +330,21 @@ export global Logic {
     callback channel-clicked(int);        // channel id (header row tapped)
     callback channel-password-ok();       // reads State.channel-password
     callback channel-password-cancel();
+    // 1.1 — channels from the UI (spec §5)
+    callback channel-create();            // the `+`: open the dialog empty
+    callback channel-edit(int);           // channel id: open the dialog filled
+    callback channel-delete(int);         // channel id: confirm, then delete
+    callback channel-dialog-save();       // reads State.channel-dialog-*
+    callback channel-dialog-cancel();
 
     // Startup / update flow
     callback update-now();
     callback update-skip();
     callback update-cancel();
     callback update-install();
+
+    /// The toast was clicked: hide it now.
+    callback toast-dismiss();
 
     // Window lifecycle
     callback main-close-requested();

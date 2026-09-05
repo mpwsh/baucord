@@ -2,8 +2,15 @@
 //
 // Feature parity with the FLTK sidebar, restyled:
 //  - rows: speaking dot, name (accent for self, grey when locally
-//    muted), volume badge, remote mute/deafen icon, LIVE chip, and a
-//    hover "…" that opens the per-user popover (also right-click);
+//    muted), role badge (guest ring / organizer wrench / admin shield),
+//    volume badge, remote mute/deafen icon, LIVE chip;
+//  - the row's menu (right-click, left-click, or the "…" affordance)
+//    is a ContextMenuArea: audio items for everyone, and the
+//    moderation items only when `Session.permissions` and the rank
+//    rule allow them — the server would refuse anything else, so it is
+//    never advertised (spec §8);
+//  - a hover tooltip with the level and role, plus the last telemetry
+//    for admins (spec §8 "connection info");
 //  - row tint for locally-muted / volume-adjusted users;
 //  - stream-stats block while sharing (amber when degraded);
 //  - status / latency / resource lines;
@@ -17,8 +24,15 @@ import { ListView } from "std-widgets.slint";
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, UserRow } from "globals.slint";
+import { State, Logic, UserRow, ModAction } from "globals.slint";
 import { IconBtn, Btn } from "widgets.slint";
+
+/// Which row the pointer is on, for the tooltip the sidebar draws
+/// outside the (clipping) list. Window-relative `y` of the row.
+global RosterTip {
+    in-out property <int> index: -1;
+    in-out property <length> y;
+}
 
 component UserRowView inherits Rectangle {
     in property <UserRow> user;
@@ -35,146 +49,299 @@ component UserRowView inherits Rectangle {
         : transparent;
     animate background { duration: 150ms; }
 
-    // The whole row is the click target — a hover-gated button was
-    // impossible to hit (its own TouchArea stole the hover that made
-    // it visible). Channel headers join on click; user rows open the
-    // per-user menu on left or right click.
-    touch := TouchArea {
-        mouse-cursor: (user.is-channel && !user.is-our-channel) || (!user.is-channel && !user.is-us)
-            ? MouseCursor.pointer : MouseCursor.default;
-        clicked => {
-            if (user.is-channel) {
-                if (!user.is-our-channel) { Logic.channel-clicked(user.channel-id); }
-            } else if (!user.is-us) {
-                Logic.user-menu(root.index);
-            }
-        }
-        pointer-event(ev) => {
-            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right
-                && !user.is-channel && !user.is-us) {
-                Logic.user-menu(root.index);
-            }
-        }
+    // Any moderation entry at all? Decides the separator.
+    property <bool> moderates: !user.is-channel && !user.is-us && (
+        (State.perm-roles && user.role-editable)
+        || State.perm-move
+        || user.channel-kickable
+        || (user.outranked && (State.perm-mute || State.perm-disconnect
+            || State.perm-kick || State.perm-ban)));
+
+    pure function role-name(r: int) -> string {
+        return r == 1 ? Tr.role-guest
+            : r == 2 ? Tr.role-member
+            : r == 3 ? Tr.role-organizer
+            : r == 4 ? Tr.role-admin
+            : "";
     }
 
-    // ── Channel header row ──────────────────────────────────────────
-    if user.is-channel : HorizontalLayout {
-        padding-left: Theme.gap-xs;
-        padding-right: Theme.gap-xs;
-        spacing: Theme.gap-xs;
+    // A channel header we may manage (the server's `may_manage`): our
+    // own with MANAGE_OWN_CHANNELS, or any user channel with
+    // MANAGE_CHANNELS. Config channels get a one-line explanation
+    // instead of actions.
+    property <bool> channel-manageable: user.is-channel && !user.from-config
+        && ((user.owned && State.perm-manage-own) || State.perm-move);
 
-        Text {
-            text: user.name;
-            color: user.is-our-channel ? Theme.accent : Theme.text-secondary;
-            font-size: Theme.font-body;
-            font-weight: 700;
-            vertical-alignment: center;
-            overflow: elide;
-            horizontal-stretch: 1;
-        }
-        if user.locked : Rectangle {
-            width: 12px;
-            IconDisplay {
-                icon: IconSet.Lock;
-                size: 12px;
-                stroke: Theme.text-muted;
+    menu := ContextMenuArea {
+        // Our own row has nothing to offer; a channel header only when
+        // there is something to say about it.
+        enabled: user.is-channel
+            ? (root.channel-manageable || (user.from-config && (State.perm-move || State.perm-create-channels)))
+            : !user.is-us;
+        Menu {
+            // ── Channel header ─────────────────────────────────────
+            if user.is-channel && user.from-config : MenuItem {
+                title: Tr.menu-channel-config-owned;
+                enabled: false;
+            }
+            if root.channel-manageable : MenuItem {
+                title: Tr.menu-channel-edit;
+                activated => { Logic.channel-edit(user.channel-id); }
+            }
+            if root.channel-manageable : MenuItem {
+                title: Tr.menu-channel-delete;
+                activated => { Logic.channel-delete(user.channel-id); }
+            }
+
+            // ── Audio, for every user row ──────────────────────────
+            if !user.is-channel : MenuItem {
+                title: Tr.menu-volume;
+                activated => { Logic.user-menu(root.index); }
+            }
+            if !user.is-channel : MenuItem {
+                title: user.local-muted ? Tr.menu-unmute-for-me : Tr.menu-mute-for-me;
+                activated => { Logic.popup-toggle-mute(root.index); }
+            }
+            if !user.is-channel : MenuItem {
+                title: Tr.reset-audio;
+                activated => { Logic.popup-reset-audio(root.index); }
+            }
+            if !user.is-channel && user.sharing : MenuItem {
+                title: Tr.watch-stream;
+                activated => { Logic.popup-watch(root.index); }
+            }
+
+            // ── Moderation, permission- and rank-gated ─────────────
+            if root.moderates : MenuSeparator { }
+            if State.perm-roles && user.role-editable : Menu {
+                title: Tr.menu-role;
+                // Roles up to our own; the one they hold is greyed.
+                for r in 4 : MenuItem {
+                    title: root.role-name(r + 1);
+                    enabled: r + 1 <= State.our-role && user.role != r + 1;
+                    activated => { Logic.user-set-role(root.index, r + 1); }
+                }
+            }
+            if State.perm-move : Menu {
+                title: Tr.menu-move-to;
+                for ch in State.channel-options : MenuItem {
+                    title: ch.name;
+                    enabled: ch.id != user.channel-id;
+                    activated => { Logic.user-move(root.index, ch.id); }
+                }
+            }
+            if user.channel-kickable : MenuItem {
+                title: Tr.menu-channel-kick;
+                activated => { Logic.user-channel-kick(root.index); }
+            }
+            if user.outranked && State.perm-mute : Menu {
+                title: Tr.menu-mute;
+                MenuItem {
+                    title: Tr.menu-mute-voice;
+                    activated => { Logic.user-moderate(root.index, ModAction.mute-voice); }
+                }
+                MenuItem {
+                    title: Tr.menu-mute-chat;
+                    activated => { Logic.user-moderate(root.index, ModAction.mute-chat); }
+                }
+                MenuSeparator { }
+                MenuItem {
+                    title: Tr.menu-unmute-voice;
+                    activated => { Logic.user-moderate(root.index, ModAction.unmute-voice); }
+                }
+                MenuItem {
+                    title: Tr.menu-unmute-chat;
+                    activated => { Logic.user-moderate(root.index, ModAction.unmute-chat); }
+                }
+            }
+            if user.outranked && State.perm-disconnect : MenuItem {
+                title: Tr.menu-disconnect;
+                activated => { Logic.user-moderate(root.index, ModAction.disconnect); }
+            }
+            if user.outranked && State.perm-kick : MenuItem {
+                title: Tr.menu-kick;
+                activated => { Logic.user-moderate(root.index, ModAction.kick); }
+            }
+            if user.outranked && State.perm-ban : MenuItem {
+                title: Tr.menu-ban;
+                activated => { Logic.user-moderate(root.index, ModAction.ban); }
             }
         }
-        Text {
-            text: user.member-label;
-            color: Theme.text-muted;
-            font-size: Theme.font-xs;
-            vertical-alignment: center;
-        }
-    }
 
-    // ── User row ────────────────────────────────────────────────────
-    if !user.is-channel : HorizontalLayout {
-        padding-left: Theme.gap-md;   // indent members under their channel
-        padding-right: Theme.gap-xs;
-        spacing: Theme.gap-sm;
-
-        // Speaking indicator: filled green dot while speaking, ring
-        // otherwise, crossed grey when locally muted.
-        Rectangle {
-            width: 14px;
-            dot := Rectangle {
-                width: 10px; height: 10px;
-                border-radius: 5px;
-                background: user.speaking && !user.local-muted ? Theme.success : transparent;
-                border-width: user.speaking && !user.local-muted ? 0px : 2px;
-                border-color: Theme.text-muted;
-                animate background { duration: 100ms; }
+        // The whole row is the click target — a hover-gated button was
+        // impossible to hit (its own TouchArea stole the hover that made
+        // it visible). Channel headers join on click; user rows open
+        // the menu on left click (right-click is the area's own).
+        touch := TouchArea {
+            mouse-cursor: (user.is-channel && !user.is-our-channel) || (!user.is-channel && !user.is-us)
+                ? MouseCursor.pointer : MouseCursor.default;
+            clicked => {
+                if (user.is-channel) {
+                    if (!user.is-our-channel) { Logic.channel-clicked(user.channel-id); }
+                } else if (!user.is-us) {
+                    menu.show({ x: self.mouse-x, y: self.mouse-y });
+                }
             }
-            if user.local-muted : Rectangle {
-                width: 14px; height: 2px;
-                background: Theme.text-muted;
-                // diagonal strike
-                transform-rotation: -45deg;
+            changed has-hover => {
+                if (!user.is-channel) {
+                    if (self.has-hover) {
+                        RosterTip.index = root.index;
+                        RosterTip.y = root.absolute-position.y;
+                        Logic.user-hovered(root.index, true);
+                    } else if (RosterTip.index == root.index) {
+                        RosterTip.index = -1;
+                        Logic.user-hovered(root.index, false);
+                    }
+                }
             }
         }
 
-        name := Text {
-            text: user.name;
-            color: user.is-us ? Theme.accent
-                : user.local-muted ? Theme.text-muted
-                : Theme.text-primary;
-            font-size: Theme.font-body;
-            font-weight: user.is-us ? 600 : 400;
-            vertical-alignment: center;
-            overflow: elide;
-            horizontal-stretch: 1;
-        }
+        // ── Channel header row ──────────────────────────────────────
+        if user.is-channel : HorizontalLayout {
+            padding-left: Theme.gap-xs;
+            padding-right: Theme.gap-xs;
+            spacing: Theme.gap-xs;
 
-        // Volume badge for non-default remote volume.
-        if !user.is-us && user.volume-pct != 100 : Rectangle {
-            width: badge.preferred-width + 10px;
-            height: 18px;
-            y: (parent.height - self.height) / 2;
-            border-radius: 9px;
-            background: Theme.bg-tertiary;
-            badge := Text {
-                text: "\{user.volume-pct}%";
-                color: Theme.text-secondary;
-                font-size: Theme.font-xs;
-            }
-        }
-
-        // Remote (or own) self-mute / deafen status icon.
-        if user.self-deafened || user.self-muted : Rectangle {
-            width: 15px;
-            IconDisplay {
-                icon: user.self-deafened ? IconSet.HeadphoneOff : IconSet.MicOff;
-                size: 15px;
-                stroke: Theme.text-muted;
-            }
-        }
-
-        // LIVE chip / hover "…" menu.
-        if user.sharing : Rectangle {
-            width: live.preferred-width + 14px;
-            height: 20px;
-            y: (parent.height - self.height) / 2;
-            border-radius: 10px;
-            background: Theme.danger;
-            live := Text {
-                text: Tr.live;
-                color: Theme.on-accent;
-                font-size: Theme.font-xs;
+            Text {
+                text: user.name;
+                color: user.is-our-channel ? Theme.accent-text : Theme.text-secondary;
+                font-size: Theme.font-body;
                 font-weight: 700;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
             }
-            lt := TouchArea {
-                mouse-cursor: pointer;
-                clicked => { if (!user.is-us) { Logic.user-menu(root.index); } }
+            if user.temporary : Rectangle {
+                width: 12px;
+                IconDisplay {
+                    icon: IconSet.Hourglass;
+                    size: 12px;
+                    stroke: Theme.text-muted;
+                }
+            }
+            if user.members-only : Rectangle {
+                width: 12px;
+                IconDisplay {
+                    icon: IconSet.Users;
+                    size: 12px;
+                    stroke: Theme.text-muted;
+                }
+            }
+            if user.locked : Rectangle {
+                width: 12px;
+                IconDisplay {
+                    icon: IconSet.Lock;
+                    size: 12px;
+                    stroke: Theme.text-muted;
+                }
+            }
+            Text {
+                text: user.member-label;
+                color: Theme.text-muted;
+                font-size: Theme.font-xs;
+                vertical-alignment: center;
             }
         }
-        // Pure affordance — clicks land on the row's own TouchArea.
-        if !user.sharing && !user.is-us && touch.has-hover : Rectangle {
-            width: 14px;
-            IconDisplay {
-                icon: IconSet.Ellipsis;
-                size: 14px;
-                stroke: Theme.text-muted;
+
+        // ── User row ────────────────────────────────────────────────
+        if !user.is-channel : HorizontalLayout {
+            padding-left: Theme.gap-md;   // indent members under their channel
+            padding-right: Theme.gap-xs;
+            spacing: Theme.gap-sm;
+
+            // Speaking indicator: filled green dot while speaking, ring
+            // otherwise, crossed grey when locally muted.
+            Rectangle {
+                width: 14px;
+                dot := Rectangle {
+                    width: 10px; height: 10px;
+                    border-radius: 5px;
+                    background: user.speaking && !user.local-muted ? Theme.success : transparent;
+                    border-width: user.speaking && !user.local-muted ? 0px : 2px;
+                    border-color: Theme.text-muted;
+                    animate background { duration: 100ms; }
+                }
+                if user.local-muted : Rectangle {
+                    width: 14px; height: 2px;
+                    background: Theme.text-muted;
+                    // diagonal strike
+                    transform-rotation: -45deg;
+                }
+            }
+
+            name := Text {
+                text: user.name;
+                color: user.is-us ? Theme.accent-text
+                    : user.local-muted ? Theme.text-muted
+                    : Theme.text-primary;
+                font-size: Theme.font-body;
+                font-weight: user.is-us ? 600 : 400;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+
+            // Role badge (spec §4, §8): the server's roster says who
+            // is what; the name string itself is never altered.
+            if user.role == 1 || user.role == 3 || user.role == 4 : Rectangle {
+                width: 14px;
+                IconDisplay {
+                    icon: user.role == 4 ? IconSet.Shield
+                        : user.role == 3 ? IconSet.Wrench
+                        : IconSet.CircleDashed;
+                    size: 14px;
+                    stroke: user.role == 4 ? Theme.gold
+                        : user.role == 3 ? Theme.text-secondary
+                        : Theme.text-muted;
+                }
+            }
+
+            // Volume badge for non-default remote volume.
+            if !user.is-us && user.volume-pct != 100 : Rectangle {
+                width: badge.preferred-width + 10px;
+                height: 18px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 9px;
+                background: Theme.bg-tertiary;
+                badge := Text {
+                    text: "\{user.volume-pct}%";
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-xs;
+                }
+            }
+
+            // Remote (or own) self-mute / deafen status icon.
+            if user.self-deafened || user.self-muted : Rectangle {
+                width: 15px;
+                IconDisplay {
+                    icon: user.self-deafened ? IconSet.HeadphoneOff : IconSet.MicOff;
+                    size: 15px;
+                    stroke: Theme.text-muted;
+                }
+            }
+
+            // LIVE chip / hover "…" menu.
+            if user.sharing : Rectangle {
+                width: live.preferred-width + 14px;
+                height: 20px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 10px;
+                background: Theme.danger;
+                live := Text {
+                    text: Tr.live;
+                    color: Theme.on-accent;
+                    font-size: Theme.font-xs;
+                    font-weight: 700;
+                }
+            }
+            // Pure affordance — clicks land on the row's own TouchArea.
+            if !user.sharing && !user.is-us && touch.has-hover : Rectangle {
+                width: 14px;
+                IconDisplay {
+                    icon: IconSet.Ellipsis;
+                    size: 14px;
+                    stroke: Theme.text-muted;
+                }
             }
         }
     }
@@ -187,11 +354,25 @@ export component Sidebar inherits Rectangle {
         padding: Theme.gap-md;
         spacing: Theme.gap-md;
 
-        Text {
-            text: State.users-count-label;
-            color: Theme.text-secondary;
-            font-size: Theme.font-body;
-            font-weight: 600;
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Text {
+                text: State.users-count-label;
+                color: Theme.text-secondary;
+                font-size: Theme.font-body;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            // `+`: only when the server said we may (spec §5).
+            if State.perm-create-channels : IconBtn {
+                size: 28px;
+                icon-size: 16px;
+                icon: IconSet.Plus;
+                tooltip: Tr.channel-new;
+                tooltip-below: true;
+                clicked => { Logic.channel-create(); }
+            }
         }
 
         list := ListView {
@@ -241,7 +422,7 @@ export component Sidebar inherits Rectangle {
             }
             if State.upload-line != "" : Text {
                 text: State.upload-line;
-                color: Theme.accent;
+                color: Theme.accent-text;
                 font-size: Theme.font-xs;
             }
         }
@@ -255,11 +436,14 @@ export component Sidebar inherits Rectangle {
                 padding: 6px;
                 spacing: Theme.gap-xs;
                 alignment: space-around;
+                // In push-to-talk mode the mic lights up while the key
+                // is held; a click still toggles the hard mute.
                 IconBtn {
                     icon: State.muted ? IconSet.MicOff : IconSet.Mic;
-                    active: State.muted;
-                    active-danger: true;
-                    tooltip: State.muted ? Tr.unmute : Tr.mute;
+                    active: State.muted || (State.ptt-mode && State.ptt-held);
+                    active-danger: State.muted;
+                    tooltip: State.muted ? Tr.unmute
+                        : State.ptt-mode ? State.ptt-tooltip : Tr.mute;
                     clicked => { Logic.toggle-mute(); }
                 }
                 IconBtn {
@@ -288,6 +472,40 @@ export component Sidebar inherits Rectangle {
             text: Tr.disconnect;
             accent: true;
             clicked => { Logic.disconnect(); }
+        }
+    }
+
+    // ── Hover tooltip (level, role, and the last telemetry for admins) ──
+    // Drawn here, outside the list's clip, anchored to the hovered
+    // row's window position; shown after a short dwell like a native
+    // tooltip. The text binds to the row, so telemetry that arrives
+    // while the pointer rests updates it live.
+    property <int> tip-shown-for: -1;
+    Timer {
+        interval: 450ms;
+        running: RosterTip.index >= 0 && root.tip-shown-for != RosterTip.index;
+        triggered => { root.tip-shown-for = RosterTip.index; }
+    }
+    if RosterTip.index >= 0 && RosterTip.index < State.users.length
+        && root.tip-shown-for == RosterTip.index
+        && State.users[RosterTip.index].tooltip != "" : Rectangle {
+        property <length> anchor-y: RosterTip.y - root.absolute-position.y + 40px;
+        x: Theme.gap-md;
+        y: Math.min(self.anchor-y, root.height - self.height - Theme.gap-sm);
+        width: root.width - 2 * Theme.gap-md;
+        height: tip-text.preferred-height + 2 * Theme.gap-sm;
+        border-radius: Theme.radius-sm;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        tip-text := Text {
+            x: Theme.gap-sm;
+            y: Theme.gap-sm;
+            width: parent.width - 2 * Theme.gap-sm;
+            text: State.users[RosterTip.index].tooltip;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
         }
     }
 }

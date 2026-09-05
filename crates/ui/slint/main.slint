@@ -6,21 +6,21 @@
 // an overlay here — which retires the orphaned-popup / focus-churn
 // machinery wholesale (there is nothing to strand on the desktop).
 
-import { IconSet } from "@lucide";
+import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow } from "globals.slint";
+import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind } from "globals.slint";
 import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
-import { Btn, IconBtn, Card, HSlider, Sep, Field, FieldLabel, Dropdown } from "widgets.slint";
+import { Btn, IconBtn, Card, HSlider, Field, FieldLabel, Hint, Dropdown, CheckRow } from "widgets.slint";
 import { SettingsWindow, SettingsState, SettingsLogic } from "settings.slint";
 import { StreamViewerWindow } from "viewer.slint";
 
 import { BaucordTray } from "tray.slint";
 
-export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow }
+export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind }
 
 export component MainWindow inherits Window {
     title: "baucord";
@@ -82,21 +82,53 @@ export component MainWindow inherits Window {
         }
     }
 
-    // ── Error toast (any phase; connect view also shows inline) ────
-    if State.error-text != "" && State.phase == Phase.main : Rectangle {
+    // ── Toast (any phase; the connect view also shows it inline) ───
+    // One register per kind: the glyph and the border carry the color,
+    // the message stays in primary text so it reads on the tint. A
+    // click dismisses it before the 5 s timer does.
+    if State.error-text != "" && State.phase == Phase.main : toast-box := Rectangle {
+        property <color> tone: State.toast-kind == ToastKind.error ? Theme.danger
+            : State.toast-kind == ToastKind.warning ? Theme.warning
+            : State.toast-kind == ToastKind.success ? Theme.success
+            : Theme.accent-text;
         x: (root.width - self.width) / 2;
         y: Theme.gap-lg;
-        width: Math.min(toast.preferred-width + 32px, root.width - 2 * Theme.gap-lg);
-        height: toast.preferred-height + 20px;
+        width: Math.min(toast-row.preferred-width + 2 * Theme.gap-md, root.width - 2 * Theme.gap-lg);
+        height: toast-row.preferred-height + 2 * Theme.gap-sm + 4px;
         border-radius: Theme.radius-md;
-        background: #2E1C23;
+        background: Theme.bg-tertiary;
         border-width: 1px;
-        border-color: Theme.danger;
-        toast := Text {
-            text: State.error-text;
-            color: Theme.danger;
-            font-size: Theme.font-body;
-            wrap: word-wrap;
+        border-color: self.tone.with-alpha(0.6);
+        drop-shadow-color: #00000066;
+        drop-shadow-blur: 12px;
+        drop-shadow-offset-y: 4px;
+        toast-row := HorizontalLayout {
+            padding-left: Theme.gap-md;
+            padding-right: Theme.gap-md;
+            spacing: Theme.gap-sm;
+            Rectangle {
+                width: 16px;
+                IconDisplay {
+                    icon: State.toast-kind == ToastKind.error ? IconSet.CircleX
+                        : State.toast-kind == ToastKind.warning ? IconSet.TriangleAlert
+                        : State.toast-kind == ToastKind.success ? IconSet.CircleCheck
+                        : IconSet.Info;
+                    size: 16px;
+                    stroke: toast-box.tone;
+                }
+            }
+            toast := Text {
+                text: State.error-text;
+                color: Theme.text-primary;
+                font-size: Theme.font-body;
+                vertical-alignment: center;
+                wrap: word-wrap;
+                max-width: root.width - 2 * Theme.gap-lg - 48px;
+            }
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { Logic.toast-dismiss(); }
         }
     }
 
@@ -370,9 +402,226 @@ export component MainWindow inherits Window {
                             clicked => { Logic.channel-password-cancel(); }
                         }
                         Btn {
-                            text: Tr.save;
+                            text: Tr.channel-join;
                             accent: true;
                             clicked => { Logic.channel-password-ok(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Channel dialog (create / edit; spec §5) ────────────────────
+    // The host validates the numbers and sends the spec; the dialog
+    // stays open until the server's list update (success) or its
+    // refusal, shown inline. Escape cancels, Enter in a field saves.
+    if State.channel-dialog-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { Logic.channel-dialog-cancel(); } }
+        ch-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { Logic.channel-dialog-cancel(); return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: Math.min(400px, root.width - 48px);
+                height: chd.preferred-height;
+                TouchArea { }
+                chd := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: State.channel-dialog-title;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    VerticalLayout {
+                        spacing: Theme.gap-xs;
+                        FieldLabel { text: Tr.channel-name; }
+                        Field {
+                            text <=> State.channel-dialog-name;
+                            placeholder: Tr.channel-name-placeholder;
+                            init => { self.focus-input(); }
+                            accepted => { Logic.channel-dialog-save(); }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: Theme.gap-xs;
+                        FieldLabel { text: Tr.channel-password-title; }
+                        Field {
+                            text <=> State.channel-dialog-password;
+                            placeholder: Tr.channel-password-placeholder;
+                            secret: true;
+                            accepted => { Logic.channel-dialog-save(); }
+                        }
+                        if State.channel-dialog-password-note != "" : Hint {
+                            text: State.channel-dialog-password-note;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap-md;
+                        VerticalLayout {
+                            spacing: Theme.gap-xs;
+                            FieldLabel { text: Tr.channel-limit; }
+                            Field {
+                                text <=> State.channel-dialog-limit;
+                                placeholder: Tr.channel-limit-placeholder;
+                                accepted => { Logic.channel-dialog-save(); }
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: Theme.gap-xs;
+                            FieldLabel { text: Tr.channel-afk; }
+                            Field {
+                                text <=> State.channel-dialog-afk;
+                                placeholder: Tr.channel-afk-placeholder;
+                                accepted => { Logic.channel-dialog-save(); }
+                            }
+                        }
+                    }
+                    CheckRow {
+                        text: Tr.channel-keep;
+                        hint: Tr.channel-keep-hint;
+                        checked <=> State.channel-dialog-keep;
+                    }
+                    CheckRow {
+                        text: Tr.channel-members-only;
+                        hint: Tr.channel-members-only-hint;
+                        checked <=> State.channel-dialog-members-only;
+                    }
+                    if State.channel-dialog-error != "" : Text {
+                        text: State.channel-dialog-error;
+                        color: Theme.danger;
+                        font-size: Theme.font-sm;
+                        wrap: word-wrap;
+                    }
+                    if !State.server-persistent : Hint { text: Tr.channel-not-persistent-note; }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn { text: Tr.cancel; clicked => { Logic.channel-dialog-cancel(); } }
+                        Btn {
+                            text: State.channel-dialog-editing ? Tr.channel-save : Tr.channel-create;
+                            accent: true;
+                            clicked => { Logic.channel-dialog-save(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Generic confirm (delete a message, later a channel) ────────
+    // Title and button repeat the consequence; Enter confirms, Escape
+    // cancels. The host remembers what is being confirmed.
+    if State.confirm-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { Logic.confirm-cancel(); } }
+        confirm-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { Logic.confirm-cancel(); return accept; }
+                if (ev.text == Key.Return) { Logic.confirm-accept(); return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: Math.min(360px, root.width - 48px);
+                height: cf.preferred-height;
+                TouchArea { }
+                cf := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: State.confirm-title;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    if State.confirm-body != "" : Hint { text: State.confirm-body; }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn { text: Tr.cancel; clicked => { Logic.confirm-cancel(); } }
+                        Btn {
+                            text: State.confirm-label;
+                            danger: true;
+                            clicked => { Logic.confirm-accept(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Moderation dialog (kick / ban / disconnect / mute) ─────────
+    // Opened by the shell from the roster menu. The title and the
+    // confirm label repeat the consequence, so the dialog is
+    // answerable without reading the body; Escape cancels, Enter in
+    // the reason field confirms.
+    if State.moderation-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { Logic.moderation-cancel(); } }
+        mod-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { Logic.moderation-cancel(); return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: Math.min(380px, root.width - 48px);
+                height: md.preferred-height;
+                TouchArea { }
+                md := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: State.moderation-title;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    Hint { text: State.moderation-hint; }
+                    if State.moderation-durations.length > 0 : VerticalLayout {
+                        spacing: Theme.gap-xs;
+                        FieldLabel { text: Tr.moderation-duration; }
+                        Dropdown {
+                            options: State.moderation-durations;
+                            current <=> State.moderation-duration;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: Theme.gap-xs;
+                        FieldLabel { text: Tr.moderation-reason; }
+                        Field {
+                            placeholder: Tr.moderation-reason-placeholder;
+                            text <=> State.moderation-reason;
+                            init => { self.focus-input(); }
+                            accepted => { Logic.moderation-confirm(); }
+                        }
+                    }
+                    if !State.server-persistent : Hint { text: Tr.server-not-persistent-note; }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn { text: Tr.cancel; clicked => { Logic.moderation-cancel(); } }
+                        Btn {
+                            text: State.moderation-confirm-label;
+                            // Mutes and disconnects are reversible; the
+                            // raspberry fill is for the two that are not.
+                            danger: State.moderation-action == ModAction.kick
+                                || State.moderation-action == ModAction.ban;
+                            accent: State.moderation-action != ModAction.kick
+                                && State.moderation-action != ModAction.ban;
+                            clicked => { Logic.moderation-confirm(); }
                         }
                     }
                 }
@@ -403,6 +652,8 @@ export component MainWindow inherits Window {
                 up := VerticalLayout {
                     padding: Theme.gap-lg;
                     spacing: Theme.gap-md;
+                    // Only the slider lives here now; mute, reset and
+                    // watch moved to the row's menu with the rest.
                     Text {
                         text: State.users[State.popup-user-index].name;
                         color: Theme.text-primary;
@@ -429,21 +680,6 @@ export component MainWindow inherits Window {
                             vertical-alignment: center;
                             horizontal-alignment: right;
                         }
-                    }
-                    Sep { }
-                    Btn {
-                        text: State.users[State.popup-user-index].local-muted ? Tr.unmute : Tr.mute;
-                        danger: State.users[State.popup-user-index].local-muted;
-                        clicked => { Logic.popup-toggle-mute(State.popup-user-index); }
-                    }
-                    Btn {
-                        text: Tr.reset-audio;
-                        clicked => { Logic.popup-reset-audio(State.popup-user-index); }
-                    }
-                    if State.users[State.popup-user-index].sharing : Btn {
-                        text: Tr.watch-stream;
-                        accent: true;
-                        clicked => { Logic.popup-watch(State.popup-user-index); }
                     }
                 }
             }

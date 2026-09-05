@@ -15,7 +15,7 @@
 import { IconSet } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic } from "globals.slint";
+import { State, Logic, ToastKind } from "globals.slint";
 import { Btn, Field, FieldLabel, IconBtn, Dropdown } from "widgets.slint";
 
 export component ConnectView inherits Rectangle {
@@ -45,10 +45,15 @@ export component ConnectView inherits Rectangle {
                 horizontal-alignment: center;
             }
 
-            // Error line — reserved height so the form never jumps.
+            // Notice line — reserved height so the form never jumps;
+            // colored by the toast's register (a reconnect countdown is
+            // not an error).
             Text {
                 text: State.error-text;
-                color: Theme.danger;
+                color: State.toast-kind == ToastKind.error ? Theme.danger
+                    : State.toast-kind == ToastKind.warning ? Theme.warning
+                    : State.toast-kind == ToastKind.success ? Theme.success
+                    : Theme.text-secondary;
                 font-size: Theme.font-sm;
                 horizontal-alignment: center;
                 wrap: word-wrap;

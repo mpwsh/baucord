@@ -16,9 +16,7 @@ use log::{info, warn};
 use protocol::permissions::BUILTIN_ROLES;
 use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
 
-use super::{
-    AuditRow, MessageRow, PersistError, ProgressDelta, TelemetryEventRow, TelemetryRow,
-};
+use super::{AuditRow, MessageRow, PersistError, ProgressDelta, TelemetryEventRow, TelemetryRow};
 use crate::{
     clock::WallMs,
     policy::{
@@ -108,21 +106,17 @@ impl Sqlite {
         )?;
         migrate(&mut conn)?;
         sync_builtin_roles(&conn)?;
-        let watermark: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(msg_id), 0) FROM messages",
-            [],
-            |row| row.get(0),
-        )?;
+        let watermark: i64 =
+            conn.query_row("SELECT COALESCE(MAX(msg_id), 0) FROM messages", [], |row| {
+                row.get(0)
+            })?;
         let next_message_id = u64::try_from(watermark).unwrap_or(0).saturating_add(1);
         let data_version = read_data_version(&conn)?;
         info!(
             "Database {} open (schema {SCHEMA_VERSION}, next message id {next_message_id})",
             path.display()
         );
-        Ok((
-            Self { conn, data_version },
-            next_message_id,
-        ))
+        Ok((Self { conn, data_version }, next_message_id))
     }
 
     /// Insert one general-chat (or DM) message. A duplicate id is
@@ -321,9 +315,7 @@ impl Sqlite {
 
     fn load_progress(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
         let mut stmt = self.conn.prepare("SELECT user_id, xp FROM user_progress")?;
-        for row in stmt.query_map([], |r| {
-            Ok((r.get::<_, [u8; 32]>(0)?, unordered(r.get(1)?)))
-        })? {
+        for row in stmt.query_map([], |r| Ok((r.get::<_, [u8; 32]>(0)?, unordered(r.get(1)?))))? {
             let (user, xp) = row?;
             policy.xp.insert(user, xp);
         }
@@ -370,7 +362,9 @@ impl Sqlite {
             let (id, user) = row?;
             policy.users.insert(id, user);
         }
-        let mut stmt = self.conn.prepare("SELECT user_id, role_id FROM user_roles")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id, role_id FROM user_roles")?;
         for row in stmt.query_map([], |r| Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, u32>(1)?)))? {
             let (user, role) = row?;
             if let Some(u) = policy.users.get_mut(&user) {
@@ -552,10 +546,8 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn delete_user_keys(&self, user_id: &[u8; 32]) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "DELETE FROM user_keys WHERE user_id = ?1",
-            params![user_id],
-        )?;
+        self.conn
+            .execute("DELETE FROM user_keys WHERE user_id = ?1", params![user_id])?;
         Ok(())
     }
 
@@ -974,7 +966,9 @@ pub fn cli_create_invite(
         actor: None,
         action: "invite.create".to_string(),
         target: Some(code.clone()),
-        detail: Some(format!("cli: role {role}, max_uses {max_uses:?}, ttl_ms {ttl_ms:?}")),
+        detail: Some(format!(
+            "cli: role {role}, max_uses {max_uses:?}, ttl_ms {ttl_ms:?}"
+        )),
     })?;
     db.close();
     Ok((code, invite))
@@ -1364,7 +1358,11 @@ pub fn cli_list_invites(db_path: &Path) -> Result<Vec<(String, InviteRecord)>, P
     let policy = db.load_policy()?;
     db.close();
     let mut invites: Vec<(String, InviteRecord)> = policy.invites.into_iter().collect();
-    invites.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at).then_with(|| a.0.cmp(&b.0)));
+    invites.sort_by(|a, b| {
+        b.1.created_at
+            .cmp(&a.1.created_at)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     Ok(invites)
 }
 
@@ -1528,16 +1526,12 @@ mod tests {
         for id in 1..=5 {
             db.insert_message(&row(id, "x")).expect("insert");
         }
-        let page = db
-            .messages_before(GENERAL_CONV, None, 2)
-            .expect("read");
+        let page = db.messages_before(GENERAL_CONV, None, 2).expect("read");
         assert_eq!(
             page.iter().map(|m| m.msg_id).collect::<Vec<_>>(),
             vec![4, 5]
         );
-        let older = db
-            .messages_before(GENERAL_CONV, Some(4), 10)
-            .expect("read");
+        let older = db.messages_before(GENERAL_CONV, Some(4), 10).expect("read");
         assert_eq!(
             older.iter().map(|m| m.msg_id).collect::<Vec<_>>(),
             vec![1, 2, 3]
@@ -1549,9 +1543,7 @@ mod tests {
         let db = memory();
         db.insert_message(&row(1, "first")).expect("insert");
         db.insert_message(&row(1, "again")).expect("dup insert");
-        let page = db
-            .messages_before(GENERAL_CONV, None, 10)
-            .expect("read");
+        let page = db.messages_before(GENERAL_CONV, None, 10).expect("read");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].body, "first");
     }
@@ -1580,9 +1572,7 @@ mod tests {
             )
             .expect("prune");
         assert_eq!(removed, 1);
-        let left = db
-            .messages_before(GENERAL_CONV, None, 10)
-            .expect("read");
+        let left = db.messages_before(GENERAL_CONV, None, 10).expect("read");
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].body, "new");
     }

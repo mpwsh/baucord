@@ -48,10 +48,9 @@ use protocol::{TelemetrySample, UserId};
 
 pub use self::store::{
     backup_to_tar, blobs_dir, check, cli_create_invite, cli_find_user, cli_kick,
-    cli_lift_restriction, cli_purge, cli_telemetry, TelemetryLine,
-    cli_list_invites, cli_load_policy, cli_restrict, cli_revoke_invite, cli_set_key,
-    cli_set_roles, hex,
-    parse_hex_id, BackupReport, CheckReport, GENERAL_CONV, SCHEMA_VERSION,
+    cli_lift_restriction, cli_list_invites, cli_load_policy, cli_purge, cli_restrict,
+    cli_revoke_invite, cli_set_key, cli_set_roles, cli_telemetry, hex, parse_hex_id, BackupReport,
+    CheckReport, TelemetryLine, GENERAL_CONV, SCHEMA_VERSION,
 };
 use self::store::{Retention, Sqlite, Store};
 use crate::{
@@ -224,29 +223,61 @@ pub enum Command {
     TelemetryEvent(TelemetryEventRow),
     // ── Policy (spec §3–§4): the tick applied it in memory first ───
     /// Create a user, or refresh their name of record and last-seen.
-    UpsertUser { user_id: UserId, user: UserRecord },
+    UpsertUser {
+        user_id: UserId,
+        user: UserRecord,
+    },
     /// Link a key to a user, or refresh its last-seen / retired state.
-    UpsertKey { key_hash: UserId, key: KeyRecord },
+    UpsertKey {
+        key_hash: UserId,
+        key: KeyRecord,
+    },
     GrantRole {
         user_id: UserId,
         role_id: u32,
         granted_by: Option<UserId>,
         ts: WallMs,
     },
-    RevokeRole { user_id: UserId, role_id: u32 },
+    RevokeRole {
+        user_id: UserId,
+        role_id: u32,
+    },
     /// Forget every device key of a user (a kick).
-    DeleteUserKeys { user_id: UserId },
-    EditMessage { msg_id: u64, body: String, ts: WallMs },
-    DeleteMessage { msg_id: u64, ts: WallMs },
+    DeleteUserKeys {
+        user_id: UserId,
+    },
+    EditMessage {
+        msg_id: u64,
+        body: String,
+        ts: WallMs,
+    },
+    DeleteMessage {
+        msg_id: u64,
+        ts: WallMs,
+    },
     UpsertChannel(UserChannelRecord),
-    DeleteChannel { stable_id: u64 },
+    DeleteChannel {
+        stable_id: u64,
+    },
     AddProgress(ProgressDelta),
-    PurgeUser { user_id: UserId },
-    InsertInvite { code: String, invite: InviteRecord },
-    UseInvite { code: String },
-    RevokeInvite { code: String, ts: WallMs },
+    PurgeUser {
+        user_id: UserId,
+    },
+    InsertInvite {
+        code: String,
+        invite: InviteRecord,
+    },
+    UseInvite {
+        code: String,
+    },
+    RevokeInvite {
+        code: String,
+        ts: WallMs,
+    },
     InsertRestriction(Restriction),
-    DeleteRestriction { id: u64 },
+    DeleteRestriction {
+        id: u64,
+    },
     Audit(AuditRow),
 }
 
@@ -296,7 +327,10 @@ pub enum Outcome {
 }
 
 enum Request {
-    Query { query: Query, reply: Sender<Answer> },
+    Query {
+        query: Query,
+        reply: Sender<Answer>,
+    },
     /// Test hook: park the thread until the sender side is dropped.
     Stall(Receiver<()>),
 }
@@ -531,7 +565,10 @@ impl Persist {
         if !self.persistent {
             return Err(rows);
         }
-        match self.writes.try_send(Envelope::Write(Command::Telemetry(rows))) {
+        match self
+            .writes
+            .try_send(Envelope::Write(Command::Telemetry(rows)))
+        {
             Ok(()) => Ok(()),
             Err(
                 TrySendError::Full(Envelope::Write(Command::Telemetry(rows)))
@@ -616,8 +653,7 @@ impl Persist {
             persistent: self.persistent,
             queued: self.writes.len(),
             capacity: self.capacity,
-            dropped_writes: self.dropped_writes
-                + c.drained_dropped.load(Ordering::Relaxed),
+            dropped_writes: self.dropped_writes + c.drained_dropped.load(Ordering::Relaxed),
             written: c.written.load(Ordering::Relaxed),
             write_errors: c.write_errors.load(Ordering::Relaxed),
             timed_out_reads: self.timed_out_reads,
@@ -792,7 +828,9 @@ impl Worker {
             self.last_version_poll = now;
             match db.changed_externally() {
                 Ok(true) => {
-                    self.counters.external_changes.fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .external_changes
+                        .fetch_add(1, Ordering::Relaxed);
                     info!("Database changed by another process (the CLI, or a hand edit)");
                     match db.load_policy() {
                         Ok(policy) => {
@@ -831,7 +869,9 @@ impl Worker {
             match envelope {
                 Envelope::Write(command) if Instant::now() < deadline => self.apply(&command),
                 Envelope::Write(_) => {
-                    self.counters.drained_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .drained_dropped
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Envelope::Shutdown => {}
             }

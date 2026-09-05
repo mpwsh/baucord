@@ -36,21 +36,23 @@ use std::{
 };
 
 use app_core::{
-    chat::ChatHistory,
-    roster::{self, ChannelMeta, PeerAudio, UserState},
+    chat::{ChatHistory, Meta},
+    roster::{self, ChannelMeta, PeerAudio, Role, UserState},
 };
 use audio::{PeerAudioSettings, SoundType};
 use client::{
     config::{peer_key, BindableAction, Settings},
     network::{DisconnectKind, LossKind, NetworkControl, NetworkMessage, NetworkThreadHandle},
-    AdminCommand, AdminTarget,
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
+    AdminCommand, AdminTarget,
 };
 use i18n::t;
 use log::{info, warn};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
-use ui::{ChatRow, Logic, MainWindow, Phase, State, Tr, UserRow};
+use ui::{
+    ChannelOption, ChatRow, Logic, MainWindow, ModAction, Phase, State, ToastKind, Tr, UserRow,
+};
 
 use crate::{
     hotkeys::HotkeyManager,
@@ -99,13 +101,17 @@ pub struct AppState {
     our_client_id: Option<u64>,
     /// Server display name (from Init) — prefixes server-originated
     /// system chat lines, same style as the greeting.
-    server_name: String,
-    /// Voice channels this server defines (from Init), in id order.
+    pub server_name: String,
+    /// Voice channels this server defines (from Init), in id order —
+    /// derived from `channel_infos` + `channel_details` + our rank by
+    /// `rebuild_channels`.
     channels: Vec<ChannelMeta>,
+    /// The wire list as last received (`Init` / `ChannelListUpdated`).
+    channel_infos: Vec<client::ChannelInfo>,
     /// Channel a JoinChannel is in flight for (the password prompt's
     /// target; also lets a WrongPassword reply reopen the prompt).
     pending_channel_join: Option<u16>,
-    connected: bool,
+    pub connected: bool,
     pub settings: Settings,
     /// Our Ed25519 identity key (next to settings.json): the login
     /// (spec §3). `None` if it could not be loaded — then there is no
@@ -114,6 +120,9 @@ pub struct AppState {
     /// What the server said we may do this session (`Session`,
     /// spec §10); the UI renders what this allows.
     pub permissions: u64,
+    /// Who we are on this server (`Session.user_id`): history rows
+    /// authored by this id are ours to edit and delete.
+    our_user_id: Option<client::UserId>,
     /// `Session.persistent`: `false` earns a standing notice in chat,
     /// pushed after `Init` (which resets the chat) rather than on
     /// arrival.
@@ -124,13 +133,42 @@ pub struct AppState {
     /// Admin requests in flight: what to do with the answer.
     pending_admin: HashMap<u32, PendingAdmin>,
     next_request_id: u32,
+    /// The last telemetry fetched per session for the roster tooltip
+    /// (spec §8), and when, so a hover does not ask twice in ten
+    /// seconds.
+    telemetry_notes: HashMap<u64, TelemetryNote>,
+    /// The moderation dialog's subject while it is open.
+    moderation: Option<Moderation>,
+    /// The "Move to" submenu's model, rebuilt with the channel list.
+    channel_options: Rc<VecModel<ChannelOption>>,
     /// A server voice mute stands (spec §4.2): the mute button is
     /// locked, and `Some(was_muted)` remembers what to restore.
     server_muted: Option<bool>,
     /// A server text mute stands: the composer refuses to send.
     text_muted: Option<Option<u64>>,
-    /// The oldest history id shown, for `/history` paging.
+    /// The oldest history id shown, for paging ("load earlier",
+    /// `/history`).
     oldest_history_id: Option<u64>,
+    /// A `FetchHistory` we asked for is in flight: its page goes in
+    /// front of the list; the replay after `Init` is appended.
+    history_page_pending: bool,
+    /// The full text of our own messages by id (rows hold segments):
+    /// what the composer starts from on "Edit message".
+    own_texts: HashMap<u64, String>,
+    /// The composer is rewriting one of our messages.
+    editing: Option<Editing>,
+    /// An edit / delete we sent, until the server's echo confirms it;
+    /// the server is silent when it refuses (too old), so a timer
+    /// says so instead.
+    pending_edit: Option<u64>,
+    pending_delete: Option<u64>,
+    /// What the generic confirm dialog is about.
+    pending_confirm: Option<Confirm>,
+    /// The channel dialog while it is open.
+    channel_dialog: Option<ChannelDialog>,
+    /// The connect screen has been reached once: auto-connect and
+    /// start-in-tray apply only then, not after a disconnect.
+    startup_done: bool,
     /// Per-channel facts from `ChannelDetails`, keyed by wire id.
     channel_details: HashMap<u16, ChannelFacts>,
     is_muted: bool,
@@ -316,10 +354,13 @@ pub fn run() {
 
     let chat_model = Rc::new(VecModel::<ChatRow>::default());
     let users_model = Rc::new(VecModel::<UserRow>::default());
+    let channel_options = Rc::new(VecModel::<ChannelOption>::default());
     main.global::<State>()
         .set_chat(ModelRc::from(chat_model.clone()));
     main.global::<State>()
         .set_users(ModelRc::from(users_model.clone()));
+    main.global::<State>()
+        .set_channel_options(ModelRc::from(channel_options.clone()));
 
     // The emoji palette — straight from the shared catalog.
     let emoji_rows: Vec<ui::EmojiRow> = app_core::EMOJI
@@ -341,17 +382,30 @@ pub fn run() {
         our_client_id: None,
         server_name: String::new(),
         channels: Vec::new(),
+        channel_infos: Vec::new(),
         pending_channel_join: None,
         connected: false,
         client_key: client::config::load_client_key(),
         permissions: 0,
+        our_user_id: None,
         server_persistent: true,
         details: HashMap::new(),
         pending_admin: HashMap::new(),
         next_request_id: 1,
+        telemetry_notes: HashMap::new(),
+        moderation: None,
+        channel_options,
         server_muted: None,
         text_muted: None,
         oldest_history_id: None,
+        history_page_pending: false,
+        own_texts: HashMap::new(),
+        editing: None,
+        pending_edit: None,
+        pending_delete: None,
+        pending_confirm: None,
+        channel_dialog: None,
+        startup_done: false,
         channel_details: HashMap::new(),
         settings,
         is_muted: false,
@@ -403,6 +457,7 @@ pub fn run() {
 
         st.push_tr();
         st.push_connect_fields();
+        st.apply_text_scale();
         st.main.global::<State>().set_phase(Phase::Splash);
 
         // Seed the initial device snapshot so the first poll has
@@ -414,13 +469,20 @@ pub fn run() {
 
     wire_logic(&state);
     start_timers(&state);
-    crate::updater::spawn_version_check();
 
-    state
-        .borrow()
-        .main
-        .show()
-        .expect("failed to show the main window");
+    // "Start in the tray": the window stays hidden until the tray icon
+    // shows it (only meaningful when the tray is compiled in).
+    let start_hidden = {
+        let st = state.borrow();
+        st.settings.startup.start_minimized && cfg!(feature = "tray")
+    };
+    if !start_hidden {
+        state
+            .borrow()
+            .main
+            .show()
+            .expect("failed to show the main window");
+    }
     {
         let weak = state.borrow().main.as_weak();
         let armed = state.borrow().main_repaint_arm.clone();
@@ -429,6 +491,18 @@ pub fn run() {
                 main.set_repaint_flip(!main.get_repaint_flip());
             }
         });
+    }
+    {
+        let st = state.borrow();
+        st.push_ui_prefs();
+        st.apply_push_to_talk();
+    }
+    // The version check gates the splash; without it, straight to the
+    // connect screen (and whatever startup asks for there).
+    if state.borrow().settings.startup.check_updates {
+        crate::updater::spawn_version_check();
+    } else {
+        state.borrow_mut().show_connect_phase();
     }
 
     // Tray icon: created from inside the running event loop (macOS
@@ -577,6 +651,70 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         });
     });
 
+    // ── Roster moderation (spec §4.1, §8) ────────────────────────
+    let w = Rc::downgrade(state);
+    logic.on_user_hovered(move |index, hovering| {
+        if hovering {
+            with_app(&w, |app| app.user_hovered(index));
+        }
+    });
+    let w = Rc::downgrade(state);
+    logic.on_user_moderate(move |index, action| {
+        with_app(&w, |app| app.moderate(index, action));
+    });
+    let w = Rc::downgrade(state);
+    logic.on_user_move(move |index, channel_id| {
+        with_app(&w, |app| {
+            if let (Some(target), Ok(channel_id)) =
+                (app.admin_target_at(index), u16::try_from(channel_id))
+            {
+                app.send_admin(
+                    AdminCommand::MoveUser { target, channel_id },
+                    PendingAdmin::Show,
+                );
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_user_set_role(move |index, role| {
+        with_app(&w, |app| {
+            if let (Some(target), Ok(role)) = (app.admin_target_at(index), u32::try_from(role)) {
+                // The built-ins nest, so one role is the whole set.
+                app.send_admin(
+                    AdminCommand::SetRoles {
+                        target,
+                        roles: vec![role],
+                    },
+                    PendingAdmin::Show,
+                );
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_user_channel_kick(move |index| {
+        with_app(&w, |app| {
+            let Some(client_id) = app.user_id_at(index) else {
+                return;
+            };
+            let (Some((user_id, _)), Some(user)) =
+                (app.details.get(&client_id), app.users.get(&client_id))
+            else {
+                return;
+            };
+            app.network
+                .tx
+                .send(NetworkControl::ChannelKick {
+                    channel_id: user.channel_id,
+                    user_id: *user_id,
+                })
+                .ok();
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_moderation_confirm(move || with_app(&w, AppState::confirm_moderation));
+    let w = Rc::downgrade(state);
+    logic.on_moderation_cancel(move || with_app(&w, AppState::cancel_moderation));
+
     // ── Chat ────────────────────────────────────────────────────
     let w = Rc::downgrade(state);
     logic.on_send_message(move || with_app(&w, AppState::send_current_message));
@@ -633,6 +771,37 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         });
     });
     let w = Rc::downgrade(state);
+    logic.on_composer_doc_end(move || {
+        with_app(&w, |app| {
+            let len = app.main.global::<State>().get_draft().len();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            app.main.invoke_composer_set_cursor(len as i32);
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_type_through(move |text| {
+        with_app(&w, |app| {
+            // Only what a person would have typed: one printable
+            // character, not a special key (Slint names those with
+            // private-use code points) or a control character.
+            let printable = text.chars().count() == 1
+                && text
+                    .chars()
+                    .all(|c| !c.is_control() && !('\u{E000}'..='\u{F8FF}').contains(&c));
+            if !printable {
+                return;
+            }
+            let s = app.main.global::<State>();
+            let mut draft = s.get_draft().to_string();
+            draft.push_str(text.as_str());
+            s.set_draft(draft.into());
+            app.main.invoke_focus_composer();
+            let len = s.get_draft().len();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            app.main.invoke_composer_set_cursor(len as i32);
+        });
+    });
+    let w = Rc::downgrade(state);
     logic.on_emoji_picked(move |glyph| {
         with_app(&w, |app| {
             let s = app.main.global::<State>();
@@ -682,6 +851,29 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_gif_hover(move |row_id, entering| {
         with_app(&w, |app| app.gif_hover(row_id, entering));
     });
+    let w = Rc::downgrade(state);
+    logic.on_row_edit(move |lo, hi| {
+        with_app(&w, |app| app.row_edit(roster::join_id(lo, hi)));
+    });
+    let w = Rc::downgrade(state);
+    logic.on_row_delete(move |lo, hi| {
+        with_app(&w, |app| app.row_delete(roster::join_id(lo, hi)));
+    });
+    let w = Rc::downgrade(state);
+    logic.on_edit_cancel(move || with_app(&w, AppState::edit_cancel));
+    let w = Rc::downgrade(state);
+    logic.on_load_earlier(move || with_app(&w, |app| app.load_earlier(50)));
+    let w = Rc::downgrade(state);
+    logic.on_confirm_accept(move || with_app(&w, AppState::confirm_accept));
+    let w = Rc::downgrade(state);
+    logic.on_confirm_cancel(move || with_app(&w, AppState::confirm_cancel));
+    let w = Rc::downgrade(state);
+    logic.on_toast_dismiss(move || {
+        with_app(&w, |app| {
+            app.error_timer.stop();
+            app.main.global::<State>().set_error_text("".into());
+        });
+    });
 
     // ── Image preview overlay ───────────────────────────────────
     let w = Rc::downgrade(state);
@@ -691,11 +883,14 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 if let Some(until) = app.text_muted {
                     // The server would drop it; say so here instead.
                     let until = format!(" {}", describe_until(until));
-                    app.show_error(&t!(
-                        "restricted-text",
-                        "until" => until.as_str(),
-                        "reason" => ""
-                    ));
+                    app.show_toast(
+                        ToastKind::Warning,
+                        &t!(
+                            "restricted-text",
+                            "until" => until.as_str(),
+                            "reason" => ""
+                        ),
+                    );
                 } else {
                     // Same broadcast semantics as SendMessage: the server
                     // relays ImageMessage back to everyone (sender
@@ -765,6 +960,28 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_channel_password_cancel(move || {
         with_app(&w, AppState::channel_password_cancel);
     });
+    let w = Rc::downgrade(state);
+    logic.on_channel_create(move || with_app(&w, AppState::channel_create));
+    let w = Rc::downgrade(state);
+    logic.on_channel_edit(move |channel_id| {
+        with_app(&w, |app| {
+            if let Ok(id) = u16::try_from(channel_id) {
+                app.channel_edit(id);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_channel_delete(move |channel_id| {
+        with_app(&w, |app| {
+            if let Ok(id) = u16::try_from(channel_id) {
+                app.channel_delete(id);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_channel_dialog_save(move || with_app(&w, AppState::channel_dialog_save));
+    let w = Rc::downgrade(state);
+    logic.on_channel_dialog_cancel(move || with_app(&w, AppState::channel_dialog_cancel));
 
     // ── Update flow ─────────────────────────────────────────────
     let w = Rc::downgrade(state);
@@ -909,15 +1126,20 @@ impl AppState {
                 hotkey_actions.push(action);
             }
         }
-        for action in hotkey_actions {
+        for (action, pressed) in hotkey_actions {
             if !st.connected {
                 continue;
             }
-            match action {
-                BindableAction::ToggleMute => st.handle_toggle_mute(),
-                BindableAction::ToggleDeafen => st.handle_toggle_deafen(),
-                BindableAction::ToggleScreenShare => st.handle_toggle_screenshare(),
-                BindableAction::PushToTalk => {}
+            match (action, pressed) {
+                // A hold, not a toggle: both edges matter.
+                (BindableAction::PushToTalk, held) => {
+                    st.voice.tx.send(VoiceControl::PushToTalkHeld(held)).ok();
+                    st.main.global::<State>().set_ptt_held(held);
+                }
+                (_, false) => {}
+                (BindableAction::ToggleMute, true) => st.handle_toggle_mute(),
+                (BindableAction::ToggleDeafen, true) => st.handle_toggle_deafen(),
+                (BindableAction::ToggleScreenShare, true) => st.handle_toggle_screenshare(),
             }
         }
 
@@ -1115,11 +1337,13 @@ impl AppState {
                 persistent,
             } => {
                 self.permissions = permissions;
+                self.our_user_id = Some(user_id);
                 self.server_persistent = persistent;
                 log::info!(
                     "session: user {}, permissions {permissions:#x}, persistent {persistent}",
                     short_id(&user_id)
                 );
+                self.push_permissions();
             }
             NetworkMessage::NeedInvite { why } => {
                 let s = self.main.global::<State>();
@@ -1197,87 +1421,166 @@ impl AppState {
                 messages,
                 more,
             } => {
-                // Oldest first; the replay lands right after the roster,
-                // a page from `/history` lands after whatever is there.
+                // Oldest first. A page we asked for goes in front of
+                // the list; the replay right after the roster is
+                // appended (nothing live precedes it).
                 if let Some(first) = messages.first() {
                     self.oldest_history_id = Some(first.id);
                 }
                 for m in &messages {
-                    let ts = format_wall_time(m.ts);
-                    let text = app_core::emoji::replace_shortcodes(&m.text);
-                    let text = if m.edited {
-                        format!("{text} {}", t!("chat-edited-mark"))
-                    } else {
-                        text
-                    };
-                    self.push_chat_message(&ts, &m.name, &text);
+                    if Some(m.user_id) == self.our_user_id {
+                        self.own_texts.insert(m.id, m.text.clone());
+                    }
                 }
-                if !messages.is_empty() {
-                    let line = t!(
-                        "chat-history-loaded",
-                        "count" => messages.len(),
-                        "more" => if more { "yes" } else { "no" }
-                    );
-                    self.push_chat_system(&line);
+                let prepared: Vec<(Meta, String, bool)> = messages
+                    .iter()
+                    .map(|m| {
+                        let meta = Meta {
+                            id: m.id,
+                            ts: format_wall_time(m.ts),
+                            user: m.name.clone(),
+                            own: Some(m.user_id) == self.our_user_id,
+                        };
+                        (meta, app_core::emoji::replace_shortcodes(&m.text), m.edited)
+                    })
+                    .collect();
+                let s = self.main.global::<State>();
+                s.set_history_more(more);
+                s.set_history_loading(false);
+                if self.history_page_pending {
+                    self.history_page_pending = false;
+                    if prepared.is_empty() {
+                        self.push_chat_system(&t!("chat-no-earlier"));
+                    } else {
+                        let page = prepared
+                            .iter()
+                            .map(|(meta, body, edited)| (meta, body.as_str(), *edited));
+                        let inserted = self.history.prepend_messages(page);
+                        self.sync_prepend(inserted);
+                    }
+                } else {
+                    for (meta, body, edited) in &prepared {
+                        self.push_chat_message(meta, body, *edited);
+                    }
+                    if !prepared.is_empty() {
+                        let line = t!(
+                            "chat-history-loaded",
+                            "count" => prepared.len(),
+                            "more" => if more { "yes" } else { "no" }
+                        );
+                        self.push_chat_system(&line);
+                    }
                 }
             }
             NetworkMessage::HistoryUnavailable { retry_secs, .. } => {
+                self.history_page_pending = false;
+                self.main.global::<State>().set_history_loading(false);
                 self.push_chat_system(&t!("chat-history-unavailable", "secs" => retry_secs));
             }
             NetworkMessage::MessageEdited { msg_id, text } => {
+                if self.pending_edit == Some(msg_id) {
+                    self.pending_edit = None;
+                }
+                if let Some(own) = self.own_texts.get_mut(&msg_id) {
+                    own.clone_from(&text);
+                }
                 let text = app_core::emoji::replace_shortcodes(&text);
-                self.push_chat_system(&t!(
-                    "chat-message-edited",
-                    "id" => msg_id,
-                    "text" => text.as_str()
-                ));
+                // In place when the message is on screen; a notice
+                // when it scrolled out of the window (or predates it).
+                match self.history.edit_message(msg_id, &text) {
+                    Some(delta) => self.sync_range(&delta),
+                    None => self.push_chat_system(&t!(
+                        "chat-message-edited",
+                        "id" => msg_id,
+                        "text" => text.as_str()
+                    )),
+                }
             }
             NetworkMessage::MessageDeleted { msg_id } => {
-                self.push_chat_system(&t!("chat-message-deleted", "id" => msg_id));
+                if self.pending_delete == Some(msg_id) {
+                    self.pending_delete = None;
+                }
+                self.own_texts.remove(&msg_id);
+                if self.editing.as_ref().is_some_and(|e| e.msg_id == msg_id) {
+                    self.edit_cancel();
+                }
+                match self.history.delete_message(msg_id) {
+                    Some(delta) => self.sync_range(&delta),
+                    None => self.push_chat_system(&t!("chat-message-deleted", "id" => msg_id)),
+                }
             }
             NetworkMessage::ChatRateLimited { retry_ms } => {
                 let secs = retry_ms.div_ceil(1000);
-                self.show_error(&t!("chat-rate-limited", "secs" => secs));
+                self.show_toast(ToastKind::Warning, &t!("chat-rate-limited", "secs" => secs));
             }
             NetworkMessage::ProgressUpdate { xp, level } => {
                 let line = t!("chat-level-up", "level" => level, "xp" => xp);
                 self.push_chat_system(&line);
-                self.show_error(&line);
+                self.show_toast(ToastKind::Success, &line);
             }
             NetworkMessage::ChannelDetails {
                 channel_id,
                 stable_id,
                 owner,
+                min_role,
                 permanent,
+                afk_after_min,
                 is_afk,
-                ..
             } => {
                 self.channel_details.insert(
                     channel_id,
                     ChannelFacts {
                         stable_id,
                         owner,
+                        min_role,
                         permanent,
+                        afk_after_min,
                         is_afk,
                     },
                 );
+                // One per channel after every list: cheap to re-derive
+                // the sidebar each time, and the gates are right the
+                // moment the last one lands.
+                self.rebuild_channels();
+                self.update_user_list();
             }
             NetworkMessage::ChannelDenied { reason } => {
-                self.show_error(reason.describe());
-                self.push_chat_system(reason.describe());
+                let what = t!(channel_denied_key(reason));
+                if let Some(dialog) = self.channel_dialog.as_mut()
+                    && dialog.pending
+                {
+                    dialog.pending = false;
+                    self.main
+                        .global::<State>()
+                        .set_channel_dialog_error(what.into());
+                } else {
+                    self.show_error(&what);
+                    self.push_chat_system(&what);
+                }
             }
             NetworkMessage::MovedIdle { after_min } => {
                 let line = t!("chat-moved-idle", "min" => after_min);
                 self.push_chat_system(&line);
-                self.show_error(&line);
+                self.show_toast(ToastKind::Info, &line);
             }
             NetworkMessage::UserDetails {
                 client_id,
                 user_id,
                 roles,
-                level: _,
+                level,
             } => {
                 let before = self.details.insert(client_id, (user_id, roles.clone()));
+                if let Some(user) = self.users.get_mut(&client_id) {
+                    user.role = role_of(&roles);
+                    user.level = level;
+                }
+                if Some(client_id) == self.our_client_id {
+                    // Our own rank decides which gated channels we see
+                    // and which roles the menu may hand out.
+                    self.rebuild_channels();
+                    self.push_permissions();
+                }
+                self.update_user_list();
                 if Some(client_id) == self.our_client_id
                     && let Some((_, old)) = before
                     && old != roles
@@ -1290,7 +1593,7 @@ impl AppState {
                     };
                     let what = t!("chat-your-roles-changed", "roles" => now.as_str());
                     self.push_chat_system(&what);
-                    self.show_error(&what);
+                    self.show_toast(ToastKind::Info, &what);
                 }
             }
             NetworkMessage::Restricted {
@@ -1320,7 +1623,7 @@ impl AppState {
                     "reason" => reason.as_str()
                 );
                 self.push_chat_system(&what);
-                self.show_error(&what);
+                self.show_toast(ToastKind::Warning, &what);
                 match kind {
                     // A server mute: stop sending (spec §4.2), and keep
                     // the button locked until it lifts.
@@ -1378,10 +1681,13 @@ impl AppState {
                     self.reconnect_attempts += 1;
                     let secs = (2u64 << (self.reconnect_attempts - 1)).min(30);
                     let secs_text = secs.to_string();
-                    self.show_error(&format!(
-                        "{what} {}",
-                        t!("error-reconnecting", "secs" => secs_text.as_str())
-                    ));
+                    self.show_toast(
+                        ToastKind::Warning,
+                        &format!(
+                            "{what} {}",
+                            t!("error-reconnecting", "secs" => secs_text.as_str())
+                        ),
+                    );
                     let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
                     if let Some(weak) = weak {
                         self.reconnect_timer.start(
@@ -1503,6 +1809,10 @@ impl AppState {
                     | DisconnectKind::Removed { .. } => {
                         self.main.global::<State>().set_connect_notice(what.into());
                     }
+                    // A full server is theirs, not ours: a warning.
+                    DisconnectKind::Refused(client::RefusedReason::ServerFull) => {
+                        self.show_toast(ToastKind::Warning, &what);
+                    }
                     _ => self.show_error(&what),
                 }
             }
@@ -1522,9 +1832,6 @@ impl AppState {
                     &channels,
                     &memberships,
                 );
-                if !self.server_persistent {
-                    self.push_chat_system(&t!("chat-server-not-persistent"));
-                }
             }
             NetworkMessage::UserJoined {
                 client_id,
@@ -1546,11 +1853,33 @@ impl AppState {
                 client_id,
                 username,
             } => self.handle_user_left(client_id, &username),
-            NetworkMessage::TextMessage { username, text } => {
-                let timestamp = chrono::Local::now().format("%H:%M").to_string();
+            NetworkMessage::TextMessage {
+                client_id,
+                id,
+                ts,
+                username,
+                text,
+            } => {
+                let meta = Meta {
+                    id,
+                    ts: format_wall_time(ts),
+                    user: username,
+                    own: Some(client_id) == self.our_client_id,
+                };
+                if meta.own {
+                    self.own_texts.insert(id, text.clone());
+                }
                 // Render shortcodes from clients that send them raw.
                 let text = app_core::emoji::replace_shortcodes(&text);
-                self.push_chat_message(&timestamp, &username, &text);
+                self.push_chat_message(&meta, &text, false);
+                // Ordinary messages are silent by design; a mention may
+                // chime if the person asked for it.
+                if !meta.own && self.settings.sounds.mention_on() && self.mentions_us(&text) {
+                    self.voice
+                        .tx
+                        .send(VoiceControl::PlaySound(SoundType::Mention))
+                        .ok();
+                }
             }
             NetworkMessage::UploadProgress { pct } => {
                 let s = self.main.global::<State>();
@@ -1560,9 +1889,20 @@ impl AppState {
                     s.set_upload_line(t!("chat-upload-progress", "pct" => u32::from(pct)).into());
                 }
             }
-            NetworkMessage::ImageMessage { username, data } => {
-                let timestamp = chrono::Local::now().format("%H:%M").to_string();
-                if !media::push_image_row(self, &timestamp, &username, data) {
+            NetworkMessage::ImageMessage {
+                client_id,
+                id,
+                ts,
+                username,
+                data,
+            } => {
+                let meta = Meta {
+                    id,
+                    ts: format_wall_time(ts),
+                    user: username.clone(),
+                    own: Some(client_id) == self.our_client_id,
+                };
+                if !media::push_image_row(self, &meta, data) {
                     self.push_chat_system(
                         &t!("chat-image-undisplayable", "name" => username.as_str()),
                     );
@@ -1734,14 +2074,7 @@ impl AppState {
             }
             "history" => {
                 let limit = args.trim().parse::<u16>().unwrap_or(20).clamp(1, 200);
-                self.network
-                    .tx
-                    .send(NetworkControl::FetchHistory {
-                        conv: client::ConvRef::General,
-                        before: self.oldest_history_id,
-                        limit,
-                    })
-                    .ok();
+                self.load_earlier(limit);
             }
             "channel" => self.handle_channel_command(args),
             "kick" | "ban" | "unban" | "disconnect" | "mute" | "unmute" | "grant" | "revoke"
@@ -1803,11 +2136,11 @@ impl AppState {
         let target = self.target_for(name);
         let rest = words;
         // An optional duration right after the name; the rest is the reason.
-        let (duration_secs, reason_words) =
-            match rest.first().and_then(|w| parse_duration_secs(w)) {
-                Some(secs) => (Some(secs), &rest[1..]),
-                None => (None, &rest[..]),
-            };
+        let (duration_secs, reason_words) = match rest.first().and_then(|w| parse_duration_secs(w))
+        {
+            Some(secs) => (Some(secs), &rest[1..]),
+            None => (None, &rest[..]),
+        };
         let reason = reason_words.join(" ");
         let admin = match command {
             "kick" => AdminCommand::Kick { target, reason },
@@ -1979,17 +2312,14 @@ impl AppState {
                     return;
                 };
                 let password = words.next().map(str::to_string);
-                self.network
-                    .tx
-                    .send(NetworkControl::CreateChannel(client::ChannelSpec {
-                        name: name.to_string(),
-                        password,
-                        user_limit: None,
-                        min_role: None,
-                        permanent: false,
-                        afk_after_min: None,
-                    }))
-                    .ok();
+                self.create_channel(client::ChannelSpec {
+                    name: name.to_string(),
+                    password,
+                    user_limit: None,
+                    min_role: None,
+                    permanent: false,
+                    afk_after_min: None,
+                });
             }
             "keep" | "delete" => {
                 let wanted = words.collect::<Vec<_>>().join(" ");
@@ -2002,24 +2332,9 @@ impl AppState {
                         .tx
                         .send(NetworkControl::DeleteChannel { channel_id })
                         .ok();
-                } else {
-                    let Some(info) = self.channels.get(usize::from(channel_id)).cloned() else {
-                        return;
-                    };
-                    self.network
-                        .tx
-                        .send(NetworkControl::EditChannel {
-                            channel_id,
-                            spec: client::ChannelSpec {
-                                name: info.name,
-                                password: None,
-                                user_limit: info.user_limit,
-                                min_role: None,
-                                permanent: true,
-                                afk_after_min: None,
-                            },
-                        })
-                        .ok();
+                } else if let Some(mut spec) = self.current_spec(channel_id) {
+                    spec.permanent = true;
+                    self.edit_channel(channel_id, spec);
                 }
             }
             "kick" => {
@@ -2043,6 +2358,201 @@ impl AppState {
             }
             _ => self.push_chat_system(&t!("chat-command-usage-channel")),
         }
+    }
+
+    /// Ask the server for a channel; remember its password locally so
+    /// the creator joins it without a prompt and can edit it later
+    /// (the server never sends passwords back).
+    fn create_channel(&mut self, spec: client::ChannelSpec) {
+        if let Some(password) = spec.password.clone()
+            && let Some(server) = self.settings.default_server_mut()
+        {
+            server.channel_passwords.insert(spec.name.clone(), password);
+            self.settings.save();
+        }
+        self.network
+            .tx
+            .send(NetworkControl::CreateChannel(spec))
+            .ok();
+    }
+
+    /// Send a whole new spec for a channel (the server replaces every
+    /// field), keeping the local password copy in step.
+    fn edit_channel(&mut self, channel_id: u16, spec: client::ChannelSpec) {
+        if let Some(server) = self.settings.default_server_mut() {
+            let old_name = self
+                .channels
+                .iter()
+                .find(|c| c.id == channel_id)
+                .map(|c| c.name.clone());
+            if let Some(old) = old_name
+                && old != spec.name
+            {
+                server.channel_passwords.remove(&old);
+            }
+            match &spec.password {
+                Some(p) => {
+                    server
+                        .channel_passwords
+                        .insert(spec.name.clone(), p.clone());
+                }
+                None => {
+                    server.channel_passwords.remove(&spec.name);
+                }
+            }
+            self.settings.save();
+        }
+        self.network
+            .tx
+            .send(NetworkControl::EditChannel { channel_id, spec })
+            .ok();
+    }
+
+    /// A channel's settings as this client knows them: the wire info,
+    /// the facts, and the password only if it was saved locally (the
+    /// server never sends it, so an edit without it clears it).
+    fn current_spec(&self, channel_id: u16) -> Option<client::ChannelSpec> {
+        let info = self.channel_infos.get(usize::from(channel_id))?;
+        let facts = self.channel_details.get(&channel_id);
+        let password = if info.has_password {
+            self.settings
+                .default_server()
+                .and_then(|server| server.channel_passwords.get(&info.name).cloned())
+        } else {
+            None
+        };
+        Some(client::ChannelSpec {
+            name: info.name.clone(),
+            password,
+            user_limit: info.user_limit,
+            min_role: facts.and_then(|f| f.min_role),
+            permanent: facts.is_none_or(|f| f.permanent),
+            afk_after_min: facts.and_then(|f| f.afk_after_min),
+        })
+    }
+
+    /// The `+`: an empty dialog.
+    fn channel_create(&mut self) {
+        self.channel_dialog = Some(ChannelDialog {
+            editing: None,
+            min_role: None,
+            pending: false,
+        });
+        let s = self.main.global::<State>();
+        s.set_channel_dialog_editing(false);
+        s.set_channel_dialog_title(t!("channel-dialog-title-new").into());
+        s.set_channel_dialog_name("".into());
+        s.set_channel_dialog_password("".into());
+        s.set_channel_dialog_password_note("".into());
+        s.set_channel_dialog_limit("".into());
+        s.set_channel_dialog_afk("".into());
+        s.set_channel_dialog_keep(false);
+        s.set_channel_dialog_members_only(false);
+        s.set_channel_dialog_error("".into());
+        s.set_channel_dialog_open(true);
+    }
+
+    /// "Edit channel…": the dialog filled with what this client knows
+    /// (spec §5; the password only when it was saved here).
+    fn channel_edit(&mut self, channel_id: u16) {
+        let Some(spec) = self.current_spec(channel_id) else {
+            return;
+        };
+        let has_password = self
+            .channel_infos
+            .get(usize::from(channel_id))
+            .is_some_and(|c| c.has_password);
+        self.channel_dialog = Some(ChannelDialog {
+            editing: Some(channel_id),
+            min_role: spec.min_role,
+            pending: false,
+        });
+        let s = self.main.global::<State>();
+        s.set_channel_dialog_editing(true);
+        s.set_channel_dialog_title(
+            t!("channel-dialog-title-edit", "name" => spec.name.as_str()).into(),
+        );
+        s.set_channel_dialog_name(spec.name.into());
+        s.set_channel_dialog_password_note(if has_password && spec.password.is_none() {
+            t!("channel-password-unknown").into()
+        } else {
+            "".into()
+        });
+        s.set_channel_dialog_password(spec.password.unwrap_or_default().into());
+        s.set_channel_dialog_limit(
+            spec.user_limit
+                .map_or(String::new(), |l| l.to_string())
+                .into(),
+        );
+        s.set_channel_dialog_afk(
+            spec.afk_after_min
+                .map_or(String::new(), |m| m.to_string())
+                .into(),
+        );
+        s.set_channel_dialog_keep(spec.permanent);
+        s.set_channel_dialog_members_only(spec.min_role.is_some());
+        s.set_channel_dialog_error("".into());
+        s.set_channel_dialog_open(true);
+    }
+
+    /// "Delete channel…": confirm with the name, then send.
+    fn channel_delete(&mut self, channel_id: u16) {
+        let name = self.channel_name(channel_id);
+        self.pending_confirm = Some(Confirm::DeleteChannel { channel_id });
+        let s = self.main.global::<State>();
+        s.set_confirm_title(t!("confirm-delete-channel-title", "name" => name.as_str()).into());
+        s.set_confirm_body(t!("confirm-delete-channel-body").into());
+        s.set_confirm_label(t!("confirm-delete-channel").into());
+        s.set_confirm_open(true);
+    }
+
+    /// Save on the dialog: validate what the server would refuse as
+    /// `Invalid` here, with a sentence per field, then send the spec.
+    fn channel_dialog_save(&mut self) {
+        let Some(dialog) = self.channel_dialog.as_mut() else {
+            return;
+        };
+        if dialog.pending {
+            return;
+        }
+        let s = self.main.global::<State>();
+        let name = s.get_channel_dialog_name().trim().to_string();
+        if name.is_empty() || name.chars().count() > 40 {
+            s.set_channel_dialog_error(t!("channel-error-name").into());
+            return;
+        }
+        let Ok(user_limit) = parse_optional_count(s.get_channel_dialog_limit().as_str()) else {
+            s.set_channel_dialog_error(t!("channel-error-limit").into());
+            return;
+        };
+        let Ok(afk_after_min) = parse_optional_count(s.get_channel_dialog_afk().as_str()) else {
+            s.set_channel_dialog_error(t!("channel-error-afk").into());
+            return;
+        };
+        let password = s.get_channel_dialog_password().trim().to_string();
+        let min_role = s
+            .get_channel_dialog_members_only()
+            .then(|| dialog.min_role.unwrap_or(client::permissions::ROLE_MEMBER));
+        let spec = client::ChannelSpec {
+            name,
+            password: (!password.is_empty()).then_some(password),
+            user_limit,
+            min_role,
+            permanent: s.get_channel_dialog_keep(),
+            afk_after_min,
+        };
+        s.set_channel_dialog_error("".into());
+        dialog.pending = true;
+        let editing = dialog.editing;
+        match editing {
+            Some(channel_id) => self.edit_channel(channel_id, spec),
+            None => self.create_channel(spec),
+        }
+    }
+
+    fn channel_dialog_cancel(&mut self) {
+        self.channel_dialog = None;
+        self.main.global::<State>().set_channel_dialog_open(false);
     }
 
     /// The wire id of a channel by name, case-insensitive.
@@ -2086,16 +2596,48 @@ impl AppState {
         request_id: u32,
         result: Result<client::AdminOutcome, client::AdminError>,
     ) {
-        let then = self.pending_admin.remove(&request_id);
+        let then = self
+            .pending_admin
+            .remove(&request_id)
+            .unwrap_or(PendingAdmin::Show);
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(e) => {
+                if let PendingAdmin::Telemetry(client_id) = then {
+                    // A tooltip fetch that was refused is a log line,
+                    // not a chat notice.
+                    log::info!("telemetry for {client_id:#x} refused: {}", e.describe());
+                    return;
+                }
                 let why = e.describe();
                 self.push_chat_system(&t!("chat-admin-refused", "why" => why.as_str()));
                 return;
             }
         };
-        let PendingAdmin::Show = then.unwrap_or(PendingAdmin::Show);
+        if let PendingAdmin::Telemetry(client_id) = then {
+            if let client::AdminOutcome::Telemetry(sample) = outcome {
+                let text = match sample {
+                    Some(t) => {
+                        let ago = describe_ago(t.ts);
+                        format!(
+                            "{}\n{}",
+                            t!("tooltip-telemetry-age", "ago" => ago.as_str()),
+                            t.line.replace(" | ", "\n")
+                        )
+                    }
+                    None => t!("tooltip-no-telemetry"),
+                };
+                self.telemetry_notes.insert(
+                    client_id,
+                    TelemetryNote {
+                        fetched: Instant::now(),
+                        text,
+                    },
+                );
+                self.update_user_list();
+            }
+            return;
+        }
         match outcome {
             client::AdminOutcome::Done => self.push_chat_system(&t!("chat-admin-done")),
             client::AdminOutcome::Users(users) => {
@@ -2104,7 +2646,11 @@ impl AppState {
                     let roles: Vec<String> = u.roles.iter().map(|r| role_label(*r)).collect();
                     let line = format!(
                         "{}{} — {} — {} — {}",
-                        if u.client_id.is_some() { "● " } else { "○ " },
+                        if u.client_id.is_some() {
+                            "● "
+                        } else {
+                            "○ "
+                        },
                         u.name,
                         if roles.is_empty() {
                             "no roles".to_string()
@@ -2216,39 +2762,29 @@ impl AppState {
         self.chat_model.set_vec(Vec::new());
         self.images.clear();
         self.gifs.clear();
+        self.reset_chat_flow();
 
         self.main.global::<State>().set_phase(Phase::Main);
 
         self.our_client_id = Some(client_id);
         self.server_name = server_name.to_string();
-        self.channels = channels
-            .iter()
-            .map(|c| ChannelMeta {
-                id: c.id,
-                name: c.name.clone(),
-                locked: c.has_password,
-                user_limit: c.user_limit,
-            })
-            .collect();
+        // `ChannelDetails` follow, one per channel, and are keyed by
+        // these ids — a stale set from an earlier list must not leak.
+        self.channel_infos = channels.to_vec();
+        self.channel_details.clear();
+        self.rebuild_channels();
         self.pending_channel_join = None;
         let default_audio = PeerAudioSettings::default();
         for (&id, name) in users {
-            self.users.insert(
-                id,
-                UserState {
-                    username: name.clone(),
-                    is_speaking: false,
-                    audio: peer_audio_from(
-                        self.settings
-                            .peer_settings
-                            .get(&peer_key(name))
-                            .unwrap_or(&default_audio),
-                    ),
-                    is_self_muted: false,
-                    is_self_deafened: false,
-                    channel_id: memberships.get(&id).copied().unwrap_or_default(),
-                },
+            let audio = peer_audio_from(
+                self.settings
+                    .peer_settings
+                    .get(&peer_key(name))
+                    .unwrap_or(&default_audio),
             );
+            let channel_id = memberships.get(&id).copied().unwrap_or_default();
+            self.users
+                .insert(id, UserState::new(name.clone(), audio, channel_id));
         }
 
         // Start voice engine
@@ -2261,10 +2797,7 @@ impl AppState {
             .ok();
         // Join ding, queued behind Start on the same channel so it
         // plays on the freshly started (or still-running) engine.
-        self.voice
-            .tx
-            .send(VoiceControl::PlaySound(SoundType::UserJoined))
-            .ok();
+        self.play_chime(SoundType::UserJoined);
 
         // Sync per-user audio settings to voice engine
         for (&id, user) in &self.users {
@@ -2298,23 +2831,24 @@ impl AppState {
             .ok();
 
         self.push_chat_system(&t!("chat-user-joined", "name" => username.as_str()));
-        self.users.insert(
-            client_id,
-            UserState::new(username, peer_audio_from(&saved), channel_id),
-        );
+        let mut user = UserState::new(username, peer_audio_from(&saved), channel_id);
+        // `UserDetails` normally follows `UserJoined`; if it got here
+        // first (a replaced session's details), honor it.
+        if let Some((_, roles)) = self.details.get(&client_id) {
+            user.role = role_of(roles);
+        }
+        self.users.insert(client_id, user);
         // Join ding only for arrivals into *our* channel — like the
         // classics, other rooms come and go silently.
         if Some(channel_id) == self.our_channel() {
-            self.voice
-                .tx
-                .send(VoiceControl::PlaySound(SoundType::UserJoined))
-                .ok();
+            self.play_chime(SoundType::UserJoined);
         }
         self.update_user_list();
     }
 
     fn handle_user_left(&mut self, client_id: u64, username: &str) {
         self.details.remove(&client_id);
+        self.telemetry_notes.remove(&client_id);
         self.voice.tx.send(VoiceControl::RemovePeer(client_id)).ok();
         let was_in_our_channel = self
             .users
@@ -2330,10 +2864,7 @@ impl AppState {
 
         self.push_chat_system(&t!("chat-user-left", "name" => username));
         if was_in_our_channel {
-            self.voice
-                .tx
-                .send(VoiceControl::PlaySound(SoundType::UserLeft))
-                .ok();
+            self.play_chime(SoundType::UserLeft);
         }
         self.update_user_list();
     }
@@ -2369,22 +2900,13 @@ impl AppState {
             let state = self.main.global::<State>();
             state.set_channel_prompt_open(false);
             state.set_channel_password("".into());
-            self.voice
-                .tx
-                .send(VoiceControl::PlaySound(SoundType::UserJoined))
-                .ok();
+            self.play_chime(SoundType::UserJoined);
         } else if Some(channel_id) == our_channel_before {
             // Someone stepped into our room.
-            self.voice
-                .tx
-                .send(VoiceControl::PlaySound(SoundType::UserJoined))
-                .ok();
+            self.play_chime(SoundType::UserJoined);
         } else if old.is_some() && old == our_channel_before {
             // Someone stepped out of our room.
-            self.voice
-                .tx
-                .send(VoiceControl::PlaySound(SoundType::UserLeft))
-                .ok();
+            self.play_chime(SoundType::UserLeft);
         }
         self.update_user_list();
     }
@@ -2405,15 +2927,11 @@ impl AppState {
                 .map(|c| c.name.clone())
         });
 
-        self.channels = channels
-            .iter()
-            .map(|c| ChannelMeta {
-                id: c.id,
-                name: c.name.clone(),
-                locked: c.has_password,
-                user_limit: c.user_limit,
-            })
-            .collect();
+        // Ids are renumbered: the facts keyed by the old ids are void
+        // until the server's fresh `ChannelDetails` land.
+        self.channel_infos = channels.to_vec();
+        self.channel_details.clear();
+        self.rebuild_channels();
         for (id, channel_id) in memberships {
             if let Some(user) = self.users.get_mut(id) {
                 user.channel_id = *channel_id;
@@ -2434,7 +2952,181 @@ impl AppState {
             self.server_name,
             t!("chat-channels-updated"),
         ));
+        // The list the server just sent is the answer to a create or
+        // an edit the dialog is waiting on.
+        if self.channel_dialog.as_ref().is_some_and(|d| d.pending) {
+            self.channel_dialog_cancel();
+        }
         self.update_user_list();
+    }
+
+    /// Derive the sidebar's channel list from the wire list, the
+    /// per-channel facts and what this session may see (spec §12: a
+    /// `min_role` above our rank hides the channel; `MANAGE_CHANNELS`
+    /// sees everything).
+    fn rebuild_channels(&mut self) {
+        let our_rank = self.our_rank();
+        let sees_all =
+            client::permissions::has(self.permissions, client::permissions::MANAGE_CHANNELS);
+        self.channels = self
+            .channel_infos
+            .iter()
+            .map(|c| {
+                let facts = self.channel_details.get(&c.id);
+                let gate_rank = facts.and_then(|f| f.min_role).and_then(builtin_rank);
+                ChannelMeta {
+                    id: c.id,
+                    name: c.name.clone(),
+                    locked: c.has_password,
+                    user_limit: c.user_limit,
+                    members_only: facts.is_some_and(|f| f.min_role.is_some()),
+                    temporary: facts.is_some_and(|f| !f.permanent),
+                    is_afk: facts.is_some_and(|f| f.is_afk),
+                    owned: facts
+                        .and_then(|f| f.owner)
+                        .is_some_and(|owner| Some(owner) == self.our_user_id),
+                    // Config channels have no owner and stable id 0.
+                    from_config: facts.is_none_or(|f| f.stable_id == 0),
+                    // A gate we cannot rank (a custom role) is left to
+                    // the server: the channel stays visible and
+                    // `JoinChannel` says no.
+                    hidden: !sees_all && gate_rank.is_some_and(|needed| needed > our_rank),
+                }
+            })
+            .collect();
+        let options: Vec<ChannelOption> = self
+            .channels
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| ChannelOption {
+                id: i32::from(c.id),
+                name: c.name.as_str().into(),
+            })
+            .collect();
+        self.channel_options.set_vec(options);
+    }
+
+    /// What this session may do, as the bools the UI draws from
+    /// (spec §8: the server decides; the client renders).
+    fn push_permissions(&self) {
+        use client::permissions as p;
+        let has = |bit: u64| p::has(self.permissions, bit);
+        let s = self.main.global::<State>();
+        s.set_perm_mute(has(p::MUTE) || has(p::RESTRICT));
+        s.set_perm_disconnect(has(p::DISCONNECT));
+        s.set_perm_kick(has(p::KICK));
+        s.set_perm_ban(has(p::BAN));
+        s.set_perm_move(has(p::MANAGE_CHANNELS));
+        s.set_perm_roles(has(p::MANAGE_ROLES));
+        s.set_perm_users(has(p::MANAGE_USERS));
+        s.set_perm_create_channels(has(p::CREATE_CHANNELS));
+        s.set_perm_manage_own(has(p::MANAGE_OWN_CHANNELS));
+        s.set_perm_delete_any(has(p::RESTRICT));
+        s.set_our_role(
+            self.our_client_id
+                .and_then(|id| self.details.get(&id))
+                .map_or(0, |(_, roles)| role_of(roles).as_int()),
+        );
+        s.set_server_persistent(self.server_persistent);
+        crate::settingsui::refresh_role_line(self);
+    }
+
+    /// Does a message name us — the nickname as a whole word, or
+    /// `@nickname`? Case-insensitive.
+    fn mentions_us(&self, text: &str) -> bool {
+        let nick = self.settings.user.nickname.trim().to_lowercase();
+        if nick.is_empty() {
+            return false;
+        }
+        text.to_lowercase()
+            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '@'))
+            .any(|word| word.trim_start_matches('@') == nick)
+    }
+
+    /// The chat preferences the rows read (Settings → General → Chat).
+    pub fn push_ui_prefs(&self) {
+        let s = self.main.global::<State>();
+        s.set_show_timestamps(self.settings.ui.show_timestamps);
+        s.set_compact_rows(self.settings.ui.compact_rows);
+    }
+
+    /// Push-to-talk on or off: tell the engine, and the mic button
+    /// what to say.
+    pub fn apply_push_to_talk(&self) {
+        let on = self.settings.audio.push_to_talk;
+        self.voice.tx.send(VoiceControl::SetPushToTalk(on)).ok();
+        let bind = self.settings.bind_for(BindableAction::PushToTalk);
+        let s = self.main.global::<State>();
+        s.set_ptt_mode(on);
+        s.set_ptt_held(false);
+        s.set_ptt_tooltip(
+            format!(
+                "{} {}",
+                t!("ptt-tooltip"),
+                if bind.is_empty() { "—" } else { bind }
+            )
+            .into(),
+        );
+    }
+
+    /// The byte budget an outgoing image is shrunk to fit: the setting,
+    /// never above the wire cap.
+    pub fn image_budget(&self) -> usize {
+        let wanted = usize::try_from(self.settings.ui.image_max_kb)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024);
+        wanted.clamp(64 * 1024, client::MAX_CHAT_IMAGE_BYTES)
+    }
+
+    /// The join / leave chime, unless the settings silence it.
+    fn play_chime(&self, sound: SoundType) {
+        if self.settings.sounds.join_leave_on() {
+            self.voice.tx.send(VoiceControl::PlaySound(sound)).ok();
+        }
+    }
+
+    /// Our role badge and level as the roster knows them (for the
+    /// profile tab).
+    pub fn our_role_and_level(&self) -> (Role, u16) {
+        self.our_client_id
+            .and_then(|id| self.users.get(&id))
+            .map_or((Role::Unknown, 0), |u| (u.role, u.level))
+    }
+
+    /// Push the "Text size" setting to every window's Theme (globals
+    /// are per window instance).
+    pub fn apply_text_scale(&self) {
+        let scale = self.settings.ui.text_scale;
+        self.main.global::<ui::Theme>().set_scale(scale);
+        if let Some(win) = &self.settings_win {
+            win.global::<ui::Theme>().set_scale(scale);
+        }
+        for viewer in self.viewers.values() {
+            viewer.win.global::<ui::Theme>().set_scale(scale);
+        }
+    }
+
+    /// A session's highest built-in rank; a guest's until its details
+    /// arrive.
+    fn rank_of_client(&self, client_id: u64) -> client::permissions::Rank {
+        self.details
+            .get(&client_id)
+            .map_or(client::permissions::RANK_GUEST, |(_, roles)| {
+                roles
+                    .iter()
+                    .filter_map(|r| builtin_rank(*r))
+                    .max()
+                    .unwrap_or(client::permissions::RANK_GUEST)
+            })
+    }
+
+    /// Our highest built-in rank, from our roles; a guest's when the
+    /// details have not arrived yet.
+    fn our_rank(&self) -> client::permissions::Rank {
+        self.our_client_id
+            .map_or(client::permissions::RANK_GUEST, |id| {
+                self.rank_of_client(id)
+            })
     }
 
     fn handle_channel_join_denied(&mut self, channel_id: u16, reason: client::ChannelDenyReason) {
@@ -2446,10 +3138,9 @@ impl AppState {
             }
             client::ChannelDenyReason::ChannelFull => {
                 self.pending_channel_join = None;
-                self.show_error(&t!("channel-full"));
+                self.show_toast(ToastKind::Warning, &t!("channel-full"));
             }
-            client::ChannelDenyReason::NoSuchChannel
-            | client::ChannelDenyReason::NotPermitted => {
+            client::ChannelDenyReason::NoSuchChannel | client::ChannelDenyReason::NotPermitted => {
                 self.pending_channel_join = None;
                 self.show_error(reason.describe());
             }
@@ -2556,6 +3247,7 @@ impl AppState {
     fn teardown_connection(&mut self) {
         self.connected = false;
         self.permissions = 0;
+        self.our_user_id = None;
         self.server_persistent = true;
         self.details.clear();
         self.pending_admin.clear();
@@ -2563,8 +3255,15 @@ impl AppState {
         self.text_muted = None;
         self.oldest_history_id = None;
         self.channel_details.clear();
+        self.telemetry_notes.clear();
+        self.moderation = None;
+        self.reset_chat_flow();
         self.is_testing_mic = false;
         self.channels.clear();
+        self.channel_infos.clear();
+        self.channel_options.set_vec(Vec::new());
+        self.main.global::<State>().set_moderation_open(false);
+        self.push_permissions();
         self.pending_channel_join = None;
         {
             let state = self.main.global::<State>();
@@ -2581,10 +3280,7 @@ impl AppState {
         // engine immediately would cut the sound off, so the Stop is
         // deferred. Its closure skips the Stop if a new session or mic
         // test started in the meantime.
-        self.voice
-            .tx
-            .send(VoiceControl::PlaySound(SoundType::UserLeft))
-            .ok();
+        self.play_chime(SoundType::UserLeft);
         let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
         if let Some(weak) = weak {
             slint::Timer::single_shot(Duration::from_millis(900), move || {
@@ -2643,7 +3339,18 @@ impl AppState {
     pub fn show_connect_phase(&mut self) {
         self.refresh_device_warning();
         self.main.global::<State>().set_phase(Phase::Connect);
-        self.show_main();
+        let first = !self.startup_done;
+        self.startup_done = true;
+        let stay_hidden = first && self.settings.startup.start_minimized && cfg!(feature = "tray");
+        if !stay_hidden {
+            self.show_main();
+        }
+        if first && self.settings.startup.auto_connect {
+            let nickname = self.settings.user.nickname.trim().to_string();
+            if !nickname.is_empty() {
+                self.handle_connect(&nickname);
+            }
+        }
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -2652,7 +3359,7 @@ impl AppState {
 
     fn handle_toggle_mute(&mut self) {
         if self.is_muted && self.server_muted.is_some() {
-            self.show_error(&t!("chat-server-muted-locked"));
+            self.show_toast(ToastKind::Warning, &t!("chat-server-muted-locked"));
             return;
         }
         self.set_muted(!self.is_muted);
@@ -2832,6 +3539,25 @@ impl AppState {
             .chars()
             .take(app_core::chat::MAX_MESSAGE_CHARS)
             .collect();
+        if let Some(edit) = self.editing.take() {
+            // Rewriting one of ours: an empty result is a cancel, not
+            // a deletion.
+            self.main.global::<State>().set_editing(false);
+            if !text.is_empty() && self.own_texts.get(&edit.msg_id) != Some(&text) {
+                self.network
+                    .tx
+                    .send(NetworkControl::EditMessage {
+                        msg_id: edit.msg_id,
+                        text,
+                    })
+                    .ok();
+                self.pending_edit = Some(edit.msg_id);
+                self.arm_apply_timeout(edit.msg_id, false);
+            }
+            self.main.global::<State>().set_draft("".into());
+            self.main.invoke_focus_composer();
+            return;
+        }
         if text.is_empty() {
             return;
         }
@@ -2842,7 +3568,10 @@ impl AppState {
         } else if let Some(until) = self.text_muted {
             // The server would drop it anyway; say so here instead.
             let until = format!(" {}", describe_until(until));
-            self.show_error(&t!("restricted-text", "until" => until.as_str(), "reason" => ""));
+            self.show_toast(
+                ToastKind::Warning,
+                &t!("restricted-text", "until" => until.as_str(), "reason" => ""),
+            );
             return;
         } else {
             self.network.tx.send(NetworkControl::SendMessage(text)).ok();
@@ -2883,6 +3612,153 @@ impl AppState {
         s.set_popup_user_index(index);
         s.set_popup_volume(volume);
         s.set_user_popup_open(true);
+    }
+
+    /// The server-side identity behind roster row `index`, as an admin
+    /// command names it.
+    fn admin_target_at(&self, index: i32) -> Option<AdminTarget> {
+        let client_id = self.user_id_at(index)?;
+        let (user_id, _) = self.details.get(&client_id)?;
+        Some(AdminTarget::User(*user_id))
+    }
+
+    /// A moderation entry was picked for the user at row `index`: the
+    /// unmutes go straight out; everything else opens the dialog for a
+    /// duration and a reason (spec §4.1).
+    fn moderate(&mut self, index: i32, action: ModAction) {
+        let Some(client_id) = self.user_id_at(index) else {
+            return;
+        };
+        let Some(target) = self.admin_target_at(index) else {
+            return;
+        };
+        let kind_for = |a: ModAction| match a {
+            ModAction::MuteVoice | ModAction::UnmuteVoice => client::RestrictionKind::Voice,
+            _ => client::RestrictionKind::GeneralText,
+        };
+        match action {
+            ModAction::UnmuteVoice | ModAction::UnmuteChat => {
+                let kind = kind_for(action);
+                self.send_admin(AdminCommand::Unmute { target, kind }, PendingAdmin::Show);
+                return;
+            }
+            ModAction::MuteVoice
+            | ModAction::MuteChat
+            | ModAction::Disconnect
+            | ModAction::Kick
+            | ModAction::Ban => {}
+        }
+        let name = self.username_of(client_id);
+        let (title, hint, confirm) = match action {
+            ModAction::MuteVoice => (
+                "mod-title-mute-voice",
+                "mod-hint-mute-voice",
+                "mod-confirm-mute",
+            ),
+            ModAction::MuteChat => (
+                "mod-title-mute-chat",
+                "mod-hint-mute-chat",
+                "mod-confirm-mute",
+            ),
+            ModAction::Disconnect => (
+                "mod-title-disconnect",
+                "mod-hint-disconnect",
+                "mod-confirm-disconnect",
+            ),
+            ModAction::Kick => ("mod-title-kick", "mod-hint-kick", "mod-confirm-kick"),
+            ModAction::Ban | ModAction::UnmuteVoice | ModAction::UnmuteChat => {
+                ("mod-title-ban", "mod-hint-ban", "mod-confirm-ban")
+            }
+        };
+        // Durations: a mute defaults to half an hour, a ban to a day;
+        // disconnect and kick have none.
+        let (durations, default): (&[(&str, Option<u64>)], i32) = match action {
+            ModAction::MuteVoice | ModAction::MuteChat => (
+                &[
+                    ("duration-10m", Some(10 * 60)),
+                    ("duration-30m", Some(30 * 60)),
+                    ("duration-2h", Some(2 * 3600)),
+                    ("duration-24h", Some(24 * 3600)),
+                    ("duration-forever", None),
+                ],
+                1,
+            ),
+            ModAction::Ban => (
+                &[
+                    ("duration-24h", Some(24 * 3600)),
+                    ("duration-7d", Some(7 * 86_400)),
+                    ("duration-30d", Some(30 * 86_400)),
+                    ("duration-forever", None),
+                ],
+                0,
+            ),
+            _ => (&[], 0),
+        };
+        let labels: Vec<slint::SharedString> =
+            durations.iter().map(|(k, _)| t!(k).into()).collect();
+        self.moderation = Some(Moderation {
+            action,
+            client_id,
+            duration_secs: durations.iter().map(|(_, secs)| *secs).collect(),
+        });
+        let s = self.main.global::<State>();
+        s.set_moderation_action(action);
+        s.set_moderation_title(t!(title, "name" => name.as_str()).into());
+        s.set_moderation_hint(t!(hint).into());
+        s.set_moderation_confirm_label(t!(confirm, "name" => name.as_str()).into());
+        s.set_moderation_durations(ModelRc::new(VecModel::from(labels)));
+        s.set_moderation_duration(default);
+        s.set_moderation_reason("".into());
+        s.set_moderation_open(true);
+    }
+
+    fn confirm_moderation(&mut self) {
+        let Some(m) = self.moderation.take() else {
+            self.cancel_moderation();
+            return;
+        };
+        let s = self.main.global::<State>();
+        let reason = s.get_moderation_reason().trim().to_string();
+        let duration_secs = usize::try_from(s.get_moderation_duration())
+            .ok()
+            .and_then(|i| m.duration_secs.get(i).copied())
+            .flatten();
+        s.set_moderation_open(false);
+        s.set_moderation_reason("".into());
+        // The person may have left while the dialog was open.
+        let Some((user_id, _)) = self.details.get(&m.client_id) else {
+            return;
+        };
+        let target = AdminTarget::User(*user_id);
+        let command = match m.action {
+            ModAction::MuteVoice | ModAction::MuteChat => AdminCommand::Restrict {
+                target,
+                kind: if m.action == ModAction::MuteVoice {
+                    client::RestrictionKind::Voice
+                } else {
+                    client::RestrictionKind::GeneralText
+                },
+                duration_secs,
+                reason,
+            },
+            ModAction::Disconnect => AdminCommand::Disconnect { target, reason },
+            ModAction::Kick => AdminCommand::Kick { target, reason },
+            ModAction::Ban => AdminCommand::Ban {
+                target,
+                duration_secs,
+                reason,
+            },
+            ModAction::UnmuteVoice | ModAction::UnmuteChat => return,
+        };
+        self.send_admin(command, PendingAdmin::Show);
+        self.main.invoke_focus_composer();
+    }
+
+    fn cancel_moderation(&mut self) {
+        self.moderation = None;
+        let s = self.main.global::<State>();
+        s.set_moderation_open(false);
+        s.set_moderation_reason("".into());
     }
 
     fn handle_mute_user(&mut self, client_id: u64, username: &str, muted: bool) {
@@ -2965,7 +3841,13 @@ impl AppState {
                 if app.viewers.contains_key(&client_id) {
                     return;
                 }
-                match Viewer::open(client_id, &username, share_w, share_h) {
+                match Viewer::open(
+                    client_id,
+                    &username,
+                    share_w,
+                    share_h,
+                    app.settings.ui.text_scale,
+                ) {
                     Ok(viewer) => {
                         app.viewers.insert(client_id, viewer);
                         app.network
@@ -3152,6 +4034,10 @@ impl AppState {
 
     pub fn apply_reset_defaults(&mut self) {
         self.settings.reset();
+        let _ = std::fs::remove_file(client::config::avatar_path());
+        self.apply_text_scale();
+        self.push_ui_prefs();
+        self.apply_push_to_talk();
         // Push the defaults to the running subsystems so behavior
         // matches the file immediately.
         self.voice
@@ -3220,43 +4106,65 @@ impl AppState {
     fn sync_history_tail(&mut self, delta: &app_core::chat::HistoryDelta) {
         for _ in 0..delta.dropped_front {
             if self.chat_model.row_count() > 0 {
-                let old = self.chat_model.row_data(0);
-                self.chat_model.remove(0);
-                if let Some(old) = old {
-                    // Free any GIF/image state owned by the dropped row.
-                    self.gifs.remove(&old.row_id);
-                    self.images.remove(&old.row_id);
-                }
+                self.evict_row(0);
             }
         }
-        // Pre-draw the ids (next_id needs &mut history; rows() holds &).
+        let len = self.history.rows().len();
+        for i in (len - delta.appended)..len {
+            let row = self.chat_row_at(i);
+            self.chat_model.push(row);
+        }
+    }
+
+    /// Mirror a splice (an edit or a deletion) into the model: the
+    /// replaced rows go, the new ones take their place, and the rest
+    /// of the list — and the scroll position — stay where they were.
+    fn sync_range(&mut self, delta: &app_core::chat::RangeDelta) {
+        for _ in 0..delta.removed {
+            if delta.start < self.chat_model.row_count() {
+                self.evict_row(delta.start);
+            }
+        }
+        for offset in 0..delta.inserted {
+            let index = delta.start + offset;
+            let row = self.chat_row_at(index);
+            self.chat_model.insert(index, row);
+        }
+    }
+
+    /// Remove model row `index` and free any GIF/image state it owned.
+    fn evict_row(&mut self, index: usize) {
+        let old = self.chat_model.row_data(index);
+        self.chat_model.remove(index);
+        if let Some(old) = old {
+            self.gifs.remove(&old.row_id);
+            self.images.remove(&old.row_id);
+        }
+    }
+
+    /// The model row for history row `index`, with a fresh row id.
+    fn chat_row_at(&mut self, index: usize) -> ChatRow {
         // Truncating u64→i32 is deliberate: ids only need uniqueness
         // within the 500-row window, and 2^31 messages per session is
         // out of scope by ~six orders of magnitude.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let ids: Vec<i32> = (0..delta.appended)
-            .map(|_| self.history.next_id() as i32)
-            .collect();
-        let rows = self.history.rows();
-        let start = rows.len() - delta.appended;
-        for (item, row_id) in rows[start..].iter().zip(ids) {
-            let mut row = ui::convert::chat_row(item, row_id);
-            // Message rows carrying WhatsApp-style markup (*bold*,
-            // _italic_, `code`) get a pre-parsed StyledText; plain
-            // ones skip it and stay mouse-selectable. to_commonmark
-            // escapes everything else, so from_markdown can only fail
-            // on pathological input — which then renders plain.
-            if row.kind == 0 {
-                // Tint matches Theme.mono-text in theme.slint.
-                let (cm, styled) =
-                    app_core::markdown::to_commonmark(row.body.as_str(), Some("#86AA90"));
-                if styled && let Ok(st) = slint::StyledText::from_markdown(&cm) {
-                    row.body_styled = st;
-                    row.styled = true;
-                }
+        let row_id = self.history.next_id() as i32;
+        let mut row = ui::convert::chat_row(&self.history.rows()[index], row_id);
+        // Message rows carrying WhatsApp-style markup (*bold*,
+        // _italic_, `code`) get a pre-parsed StyledText; plain
+        // ones skip it and stay mouse-selectable. to_commonmark
+        // escapes everything else, so from_markdown can only fail
+        // on pathological input — which then renders plain.
+        if row.kind == 0 && !row.deleted {
+            // Tint matches Theme.mono-text in theme.slint.
+            let (cm, styled) =
+                app_core::markdown::to_commonmark(row.body.as_str(), Some("#86AA90"));
+            if styled && let Ok(st) = slint::StyledText::from_markdown(&cm) {
+                row.body_styled = st;
+                row.styled = true;
             }
-            self.chat_model.push(row);
         }
+        row
     }
 
     /// Public mirror-sync for media.rs (image rows).
@@ -3269,9 +4177,177 @@ impl AppState {
         self.sync_history_tail(&delta);
     }
 
-    pub fn push_chat_message(&mut self, ts: &str, user: &str, body: &str) {
-        let delta = self.history.push_message(ts, user, body);
+    pub fn push_chat_message(&mut self, meta: &Meta, body: &str, edited: bool) {
+        let delta = self.history.push_message(meta, body, edited);
         self.sync_history_tail(&delta);
+    }
+
+    /// Mirror `inserted` rows put at the front of the history.
+    fn sync_prepend(&mut self, inserted: usize) {
+        for i in 0..inserted {
+            let row = self.chat_row_at(i);
+            self.chat_model.insert(i, row);
+        }
+    }
+
+    /// Ask the server for the page before the oldest message shown.
+    fn load_earlier(&mut self, limit: u16) {
+        if self.history_page_pending {
+            return;
+        }
+        self.history_page_pending = true;
+        self.main.global::<State>().set_history_loading(true);
+        self.network
+            .tx
+            .send(NetworkControl::FetchHistory {
+                conv: client::ConvRef::General,
+                before: self.oldest_history_id,
+                limit,
+            })
+            .ok();
+    }
+
+    /// "Edit message" on one of ours: the composer starts from its
+    /// full text; the draft that was there comes back on cancel.
+    fn row_edit(&mut self, msg_id: u64) {
+        let Some(text) = self.own_texts.get(&msg_id).cloned() else {
+            return;
+        };
+        let s = self.main.global::<State>();
+        let previous_draft = if self.editing.is_some() {
+            // Switching from one edit to another keeps the first
+            // draft, not the half-edited text.
+            self.editing
+                .take()
+                .map(|e| e.previous_draft)
+                .unwrap_or_default()
+        } else {
+            s.get_draft().to_string()
+        };
+        self.editing = Some(Editing {
+            msg_id,
+            previous_draft,
+        });
+        s.set_draft(text.into());
+        s.set_editing(true);
+        self.main.invoke_focus_composer();
+    }
+
+    fn edit_cancel(&mut self) {
+        let s = self.main.global::<State>();
+        if let Some(edit) = self.editing.take() {
+            s.set_draft(edit.previous_draft.into());
+        }
+        s.set_editing(false);
+        self.main.invoke_focus_composer();
+    }
+
+    /// "Delete message": ours through the author path, anyone's
+    /// through the admin path when we hold `RESTRICT`; both confirm
+    /// first.
+    fn row_delete(&mut self, msg_id: u64) {
+        let own = self.history.rows().iter().any(|r| match r {
+            app_core::chat::ChatItem::Message { meta, .. }
+            | app_core::chat::ChatItem::Code { meta, .. } => meta.id == msg_id && meta.own,
+            _ => false,
+        });
+        let by_admin = !own;
+        if by_admin && !client::permissions::has(self.permissions, client::permissions::RESTRICT) {
+            return;
+        }
+        self.pending_confirm = Some(Confirm::DeleteMessage { msg_id, by_admin });
+        let s = self.main.global::<State>();
+        s.set_confirm_title(t!("confirm-delete-message-title").into());
+        s.set_confirm_body(
+            t!(if by_admin {
+                "confirm-delete-message-body-admin"
+            } else {
+                "confirm-delete-message-body"
+            })
+            .into(),
+        );
+        s.set_confirm_label(t!("confirm-delete-message").into());
+        s.set_confirm_open(true);
+    }
+
+    fn confirm_accept(&mut self) {
+        let s = self.main.global::<State>();
+        s.set_confirm_open(false);
+        match self.pending_confirm.take() {
+            Some(Confirm::DeleteMessage { msg_id, by_admin }) => {
+                if by_admin {
+                    self.send_admin(AdminCommand::DeleteMessage { msg_id }, PendingAdmin::Show);
+                } else {
+                    self.network
+                        .tx
+                        .send(NetworkControl::DeleteMessage { msg_id })
+                        .ok();
+                    self.pending_delete = Some(msg_id);
+                    self.arm_apply_timeout(msg_id, true);
+                }
+            }
+            Some(Confirm::DeleteChannel { channel_id }) => {
+                self.network
+                    .tx
+                    .send(NetworkControl::DeleteChannel { channel_id })
+                    .ok();
+            }
+            None => {}
+        }
+        self.main.invoke_focus_composer();
+    }
+
+    fn confirm_cancel(&mut self) {
+        self.pending_confirm = None;
+        self.main.global::<State>().set_confirm_open(false);
+        self.main.invoke_focus_composer();
+    }
+
+    /// The server answers an edit or a deletion only by echoing it;
+    /// when it refuses (the message left its ring) it says nothing.
+    /// After three seconds without the echo, say so here.
+    fn arm_apply_timeout(&self, msg_id: u64, delete: bool) {
+        let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+        let Some(weak) = weak else {
+            return;
+        };
+        slint::Timer::single_shot(Duration::from_secs(3), move || {
+            with_app(&weak, |app| {
+                let still = if delete {
+                    app.pending_delete.take_if(|id| *id == msg_id).is_some()
+                } else {
+                    app.pending_edit.take_if(|id| *id == msg_id).is_some()
+                };
+                if still {
+                    app.show_toast(
+                        ToastKind::Warning,
+                        &t!(if delete {
+                            "chat-delete-not-applied"
+                        } else {
+                            "chat-edit-not-applied"
+                        }),
+                    );
+                }
+            });
+        });
+    }
+
+    /// Forget every in-flight chat interaction (a fresh session, or
+    /// none): edits, confirms, paging.
+    fn reset_chat_flow(&mut self) {
+        self.own_texts.clear();
+        self.editing = None;
+        self.pending_edit = None;
+        self.pending_delete = None;
+        self.pending_confirm = None;
+        self.channel_dialog = None;
+        self.history_page_pending = false;
+        let s = self.main.global::<State>();
+        s.set_editing(false);
+        s.set_confirm_open(false);
+        s.set_channel_dialog_open(false);
+        s.set_history_more(false);
+        s.set_history_loading(false);
     }
 
     /// Media-row plumbing lives in `media.rs`; these expose the model
@@ -3448,7 +4524,16 @@ impl AppState {
         // In-place update: write rows positionally, growing/shrinking
         // only when membership changed — preserves the ListView's
         // scroll offset exactly like the FLTK incremental path.
-        let converted: Vec<UserRow> = items.iter().map(ui::convert::roster_item).collect();
+        let converted: Vec<UserRow> = items
+            .iter()
+            .map(|item| {
+                let mut row = ui::convert::roster_item(item);
+                if let roster::RosterItem::User(user) = item {
+                    self.decorate_user_row(&mut row, user);
+                }
+                row
+            })
+            .collect();
         let current = self.users_model.row_count();
         for (i, row) in converted.iter().enumerate() {
             if i < current {
@@ -3463,6 +4548,86 @@ impl AppState {
         self.main
             .global::<State>()
             .set_users_count_label(t!("users-count", "count" => self.users.len()).into());
+    }
+
+    /// What the roster menu and tooltip need beyond the view model:
+    /// the rank rule against us (spec §8) and the session's channel
+    /// powers, plus the tooltip text.
+    fn decorate_user_row(&self, row: &mut UserRow, user: &roster::RosterRow) {
+        use client::permissions as p;
+        if user.is_us {
+            row.tooltip = self.user_tooltip(user).into();
+            return;
+        }
+        let ours = self.our_rank();
+        let theirs = self.rank_of_client(user.client_id);
+        row.outranked = theirs < ours;
+        row.role_editable = theirs <= ours;
+        let owns_their_channel = self
+            .channels
+            .iter()
+            .any(|c| c.id == user.channel_id && c.owned);
+        row.channel_kickable = p::has(self.permissions, p::MANAGE_CHANNELS)
+            || (owns_their_channel && p::has(self.permissions, p::MANAGE_OWN_CHANNELS));
+        row.tooltip = self.user_tooltip(user).into();
+    }
+
+    /// "Level 3 · Member", plus the last telemetry for sessions that
+    /// may see it — or a note that none arrived yet.
+    fn user_tooltip(&self, user: &roster::RosterRow) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        let role = match user.role {
+            Role::Guest => Some(t!("role-guest")),
+            Role::Member => Some(t!("role-member")),
+            Role::Organizer => Some(t!("role-organizer")),
+            Role::Admin => Some(t!("role-admin")),
+            Role::Unknown => None,
+        };
+        let level = (user.level > 0).then(|| t!("tooltip-level", "level" => u32::from(user.level)));
+        match (level, role) {
+            (Some(l), Some(r)) => lines.push(format!("{l} · {r}")),
+            (Some(l), None) => lines.push(l),
+            (None, Some(r)) => lines.push(r),
+            (None, None) => {}
+        }
+        if client::permissions::has(self.permissions, client::permissions::MANAGE_USERS)
+            && !user.is_us
+        {
+            match self.telemetry_notes.get(&user.client_id) {
+                Some(note) => lines.push(note.text.clone()),
+                None => lines.push(t!("tooltip-no-telemetry")),
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// The pointer rests on a user row: fetch their last telemetry
+    /// for the tooltip when we may, at most once every ten seconds.
+    fn user_hovered(&mut self, index: i32) {
+        if !client::permissions::has(self.permissions, client::permissions::MANAGE_USERS) {
+            return;
+        }
+        let Some(client_id) = self.user_id_at(index) else {
+            return;
+        };
+        if Some(client_id) == self.our_client_id {
+            return;
+        }
+        let fresh = self
+            .telemetry_notes
+            .get(&client_id)
+            .is_some_and(|n| n.fetched.elapsed() < Duration::from_secs(10));
+        if fresh {
+            return;
+        }
+        let Some((user_id, _)) = self.details.get(&client_id) else {
+            return;
+        };
+        let target = AdminTarget::User(*user_id);
+        self.send_admin(
+            AdminCommand::LastTelemetry { target },
+            PendingAdmin::Telemetry(client_id),
+        );
     }
 
     fn update_latency(
@@ -3602,7 +4767,16 @@ impl AppState {
     }
 
     pub fn show_error(&mut self, error: &str) {
-        self.main.global::<State>().set_error_text(error.into());
+        self.show_toast(ToastKind::Error, error);
+    }
+
+    /// A transient notice in the toast's register: info for what just
+    /// happened, success for good news, warning for something to act
+    /// on, error for what failed.
+    pub fn show_toast(&mut self, kind: ToastKind, text: &str) {
+        let s = self.main.global::<State>();
+        s.set_toast_kind(kind);
+        s.set_error_text(text.into());
         let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
         if let Some(weak) = weak {
             self.error_timer.start(
@@ -3762,10 +4936,13 @@ impl AppState {
 /// `audio::PeerAudioSettings` ↔ app-core's `PeerAudio` mirror.
 /// What `ChannelDetails` says about a channel (spec §5).
 #[derive(Debug, Clone)]
+/// What `ChannelDetails` says about a channel beyond `ChannelInfo`.
 struct ChannelFacts {
     stable_id: u64,
     owner: Option<client::UserId>,
+    min_role: Option<client::RoleId>,
     permanent: bool,
+    afk_after_min: Option<u16>,
     is_afk: bool,
 }
 
@@ -3773,6 +4950,61 @@ struct ChannelFacts {
 enum PendingAdmin {
     /// Print the outcome.
     Show,
+    /// A roster-tooltip fetch for this session: keep it, say nothing.
+    Telemetry(u64),
+}
+
+/// The composer is rewriting message `msg_id`; the draft it replaced
+/// comes back on cancel.
+struct Editing {
+    msg_id: u64,
+    previous_draft: String,
+}
+
+/// What the generic confirm dialog will do.
+enum Confirm {
+    DeleteMessage { msg_id: u64, by_admin: bool },
+    DeleteChannel { channel_id: u16 },
+}
+
+/// The channel dialog's subject (spec §5).
+struct ChannelDialog {
+    /// The wire id being edited; `None` = creating.
+    editing: Option<u16>,
+    /// The gate the channel had, kept as is while "members only"
+    /// stays ticked (it may be a rank above member).
+    min_role: Option<client::RoleId>,
+    /// A spec went out; the server's list update closes the dialog,
+    /// its refusal lands inline.
+    pending: bool,
+}
+
+/// The message key for a channel refusal.
+fn channel_denied_key(reason: client::ChannelUiDenyReason) -> &'static str {
+    use client::ChannelUiDenyReason as R;
+    match reason {
+        R::NameTaken => "channel-denied-name-taken",
+        R::NoPermission => "channel-denied-no-permission",
+        R::ConfigOwned => "channel-denied-config-owned",
+        R::Limit => "channel-denied-limit",
+        R::NoSuchChannel => "channel-denied-no-such",
+        R::Invalid => "channel-denied-invalid",
+    }
+}
+
+/// The last telemetry line for a session, formatted for the tooltip.
+struct TelemetryNote {
+    fetched: Instant,
+    text: String,
+}
+
+/// The moderation dialog's subject.
+struct Moderation {
+    action: ModAction,
+    client_id: u64,
+    /// The seconds behind each entry of `State.moderation-durations`;
+    /// `None` = until lifted.
+    duration_secs: Vec<Option<u64>>,
 }
 
 /// The first bytes of a user id, for log lines and the identity panel.
@@ -3789,7 +5021,11 @@ pub fn short_id(id: &[u8]) -> String {
 fn format_wall_time(ms: u64) -> String {
     let secs = i64::try_from(ms / 1000).unwrap_or(0);
     chrono::DateTime::from_timestamp(secs, 0)
-        .map(|utc| utc.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| "--:--".to_string())
 }
 
@@ -3867,11 +5103,51 @@ fn describe_ago(ts: u64) -> String {
 }
 
 /// The built-in role's name, or `role <id>` for a custom one.
+/// The roster's badge for a role set: the highest built-in role.
+/// Custom roles (`server role`, later) are invisible here until they
+/// carry a badge of their own.
+fn role_of(roles: &[client::RoleId]) -> Role {
+    use client::permissions as p;
+    roles
+        .iter()
+        .map(|r| match *r {
+            p::ROLE_ADMIN => Role::Admin,
+            p::ROLE_ORGANIZER => Role::Organizer,
+            p::ROLE_MEMBER => Role::Member,
+            p::ROLE_GUEST => Role::Guest,
+            _ => Role::Unknown,
+        })
+        .max()
+        .unwrap_or(Role::Unknown)
+}
+
+/// The rank of a built-in role; `None` for a custom one.
+fn builtin_rank(role: client::RoleId) -> Option<client::permissions::Rank> {
+    client::permissions::BUILTIN_ROLES
+        .iter()
+        .find(|r| r.id == role)
+        .map(|r| r.rank)
+}
+
 fn role_label(role: client::RoleId) -> String {
     client::permissions::BUILTIN_ROLES
         .iter()
         .find(|r| r.id == role)
         .map_or_else(|| format!("role {role}"), |r| r.name.to_string())
+}
+
+/// A dialog field that is either empty (`Ok(None)`) or a whole number
+/// of at least 1; anything else is the error.
+fn parse_optional_count(text: &str) -> Result<Option<u16>, ()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<u16>()
+        .ok()
+        .filter(|n| *n >= 1)
+        .map(Some)
+        .ok_or(())
 }
 
 /// `30m`, `1h`, `24h`, `7d` → seconds.
@@ -3957,6 +5233,24 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_undeafen(t!("undeafen").into());
     tr.set_share_screen(t!("share-screen").into());
     tr.set_channel_password_title(t!("channel-password-title").into());
+    tr.set_channel_new(t!("channel-new").into());
+    tr.set_channel_name(t!("channel-name").into());
+    tr.set_channel_name_placeholder(t!("channel-name-placeholder").into());
+    tr.set_channel_password_placeholder(t!("channel-password-placeholder").into());
+    tr.set_channel_limit(t!("channel-limit").into());
+    tr.set_channel_limit_placeholder(t!("channel-limit-placeholder").into());
+    tr.set_channel_afk(t!("channel-afk").into());
+    tr.set_channel_afk_placeholder(t!("channel-afk-placeholder").into());
+    tr.set_channel_keep(t!("channel-keep").into());
+    tr.set_channel_keep_hint(t!("channel-keep-hint").into());
+    tr.set_channel_members_only(t!("channel-members-only").into());
+    tr.set_channel_members_only_hint(t!("channel-members-only-hint").into());
+    tr.set_channel_create(t!("channel-create").into());
+    tr.set_channel_save(t!("channel-save").into());
+    tr.set_channel_not_persistent_note(t!("channel-not-persistent-note").into());
+    tr.set_menu_channel_edit(t!("menu-channel-edit").into());
+    tr.set_menu_channel_delete(t!("menu-channel-delete").into());
+    tr.set_menu_channel_config_owned(t!("menu-channel-config-owned").into());
     tr.set_share_visibility(t!("share-visibility").into());
     tr.set_share_channel_only(t!("share-channel-only").into());
     tr.set_share_everyone(t!("share-everyone").into());
@@ -3966,6 +5260,28 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_user_volume(t!("user-volume").into());
     tr.set_watch_stream(t!("watch-stream").into());
     tr.set_reset_audio(t!("reset-audio").into());
+    tr.set_menu_volume(t!("menu-volume").into());
+    tr.set_menu_mute_for_me(t!("menu-mute-for-me").into());
+    tr.set_menu_unmute_for_me(t!("menu-unmute-for-me").into());
+    tr.set_menu_role(t!("menu-role").into());
+    tr.set_menu_move_to(t!("menu-move-to").into());
+    tr.set_menu_channel_kick(t!("menu-channel-kick").into());
+    tr.set_menu_mute(t!("menu-mute").into());
+    tr.set_menu_mute_voice(t!("menu-mute-voice").into());
+    tr.set_menu_mute_chat(t!("menu-mute-chat").into());
+    tr.set_menu_unmute_voice(t!("menu-unmute-voice").into());
+    tr.set_menu_unmute_chat(t!("menu-unmute-chat").into());
+    tr.set_menu_disconnect(t!("menu-disconnect").into());
+    tr.set_menu_kick(t!("menu-kick").into());
+    tr.set_menu_ban(t!("menu-ban").into());
+    tr.set_role_guest(t!("role-guest").into());
+    tr.set_role_member(t!("role-member").into());
+    tr.set_role_organizer(t!("role-organizer").into());
+    tr.set_role_admin(t!("role-admin").into());
+    tr.set_moderation_duration(t!("moderation-duration").into());
+    tr.set_moderation_reason(t!("moderation-reason").into());
+    tr.set_moderation_reason_placeholder(t!("moderation-reason-placeholder").into());
+    tr.set_server_not_persistent_note(t!("server-not-persistent-note").into());
     tr.set_send(t!("send").into());
     tr.set_cancel(t!("cancel").into());
     tr.set_chat_emoji_tooltip(t!("chat-emoji-tooltip").into());
@@ -3976,15 +5292,27 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_menu_copy(t!("menu-copy").into());
     tr.set_menu_paste(t!("menu-paste").into());
     tr.set_menu_copy_message(t!("menu-copy-message").into());
+    tr.set_menu_select_text(t!("menu-select-text").into());
+    tr.set_menu_show_formatting(t!("menu-show-formatting").into());
+    tr.set_channel_join(t!("channel-join").into());
     tr.set_menu_copy_link(t!("menu-copy-link").into());
     tr.set_menu_open_link(t!("menu-open-link").into());
     tr.set_menu_save_image(t!("menu-save-image").into());
     tr.set_menu_open_image(t!("menu-open-image").into());
+    tr.set_chat_edited_mark(t!("chat-edited-mark").into());
+    tr.set_chat_deleted_placeholder(t!("chat-deleted-placeholder").into());
+    tr.set_menu_edit_message(t!("menu-edit-message").into());
+    tr.set_menu_delete_message(t!("menu-delete-message").into());
+    tr.set_chat_editing(t!("chat-editing").into());
+    tr.set_chat_load_earlier(t!("chat-load-earlier").into());
+    tr.set_chat_loading(t!("chat-loading").into());
+    tr.set_banner_not_persistent(t!("chat-server-not-persistent").into());
     tr.set_monitor(t!("monitor").into());
     tr.set_quality(t!("quality").into());
     tr.set_start_sharing(t!("start-sharing").into());
     tr.set_stop_watching(t!("stop-watching").into());
     tr.set_settings_title(t!("settings-title").into());
+    tr.set_tab_profile(t!("tab-profile").into());
     tr.set_tab_general(t!("tab-general").into());
     tr.set_tab_audio(t!("tab-audio").into());
     tr.set_tab_keyboard(t!("tab-keyboard").into());
@@ -4013,6 +5341,51 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_identity_export(t!("identity-export").into());
     tr.set_identity_import(t!("identity-import").into());
     tr.set_identity_regenerate(t!("identity-regenerate").into());
+    tr.set_identity_regenerate_confirm(t!("identity-regenerate-confirm").into());
+    tr.set_profile_lead(t!("profile-lead").into());
+    tr.set_profile_no_name(t!("profile-no-name").into());
+    tr.set_profile_nickname_hint(t!("profile-nickname-hint").into());
+    tr.set_profile_name_color(t!("profile-name-color").into());
+    tr.set_profile_name_color_hint(t!("profile-name-color-hint").into());
+    tr.set_profile_name_style(t!("profile-name-style").into());
+    tr.set_profile_avatar(t!("profile-avatar").into());
+    tr.set_profile_avatar_hint(t!("profile-avatar-hint").into());
+    tr.set_profile_avatar_choose(t!("profile-avatar-choose").into());
+    tr.set_profile_avatar_remove(t!("profile-avatar-remove").into());
+    tr.set_profile_note(t!("profile-note").into());
+    tr.set_general_lead(t!("general-lead").into());
+    tr.set_text_size(t!("text-size").into());
+    tr.set_text_size_hint(t!("text-size-hint").into());
+    tr.set_sounds_header(t!("sounds-header").into());
+    tr.set_sounds_enabled(t!("sounds-enabled").into());
+    tr.set_sounds_enabled_hint(t!("sounds-enabled-hint").into());
+    tr.set_sounds_join_leave(t!("sounds-join-leave").into());
+    tr.set_sounds_mention(t!("sounds-mention").into());
+    tr.set_sounds_mention_hint(t!("sounds-mention-hint").into());
+    tr.set_startup_header(t!("startup-header").into());
+    tr.set_startup_auto_connect(t!("startup-auto-connect").into());
+    tr.set_startup_auto_connect_hint(t!("startup-auto-connect-hint").into());
+    tr.set_startup_minimized(t!("startup-minimized").into());
+    tr.set_startup_minimized_hint(t!("startup-minimized-hint").into());
+    tr.set_startup_check_updates(t!("startup-check-updates").into());
+    tr.set_startup_check_updates_hint(t!("startup-check-updates-hint").into());
+    tr.set_chat_header(t!("chat-header").into());
+    tr.set_chat_show_timestamps(t!("chat-show-timestamps").into());
+    tr.set_chat_compact_rows(t!("chat-compact-rows").into());
+    tr.set_chat_image_size(t!("chat-image-size").into());
+    tr.set_chat_image_size_hint(t!("chat-image-size-hint").into());
+    tr.set_privacy_header(t!("privacy-header").into());
+    tr.set_privacy_note(t!("privacy-note").into());
+    tr.set_audio_transmission(t!("audio-transmission").into());
+    tr.set_audio_vad_hint(t!("audio-vad-hint").into());
+    tr.set_audio_ptt_hint(t!("audio-ptt-hint").into());
+    tr.set_audio_ptt_unbound(t!("audio-ptt-unbound").into());
+    tr.set_ptt_tooltip(t!("ptt-tooltip").into());
+    tr.set_files_header(t!("files-header").into());
+    tr.set_about_config_file(t!("about-config-file").into());
+    tr.set_files_note(t!("files-note").into());
+    tr.set_servers_lead(t!("servers-lead").into());
+    tr.set_audio_lead(t!("audio-lead").into());
     tr.set_identity_note(t!("identity-note").into());
     tr.set_audio_devices_header(t!("audio-devices-header").into());
     tr.set_audio_input_device(t!("audio-input-device").into());

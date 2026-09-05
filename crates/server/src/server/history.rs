@@ -48,10 +48,7 @@ impl ChatServer {
         let burst = f64::from(limit.burst.max(1));
         let per_secs = limit.per_secs.max(1);
         let now = self.now;
-        let (tokens, last) = self
-            .chat_tokens
-            .entry(client)
-            .or_insert((burst, now));
+        let (tokens, last) = self.chat_tokens.entry(client).or_insert((burst, now));
         let refill = now.duration_since(*last).as_secs_f64() * burst / per_secs as f64;
         *tokens = (*tokens + refill).min(burst);
         *last = now;
@@ -66,7 +63,11 @@ impl ChatServer {
             "{} ({client:#x}) chat rate limited; retry in {retry_ms} ms",
             self.get_username(client)
         );
-        self.send_if(client, features::HISTORY, &ServerMessage::ChatRateLimited { retry_ms });
+        self.send_if(
+            client,
+            features::HISTORY,
+            &ServerMessage::ChatRateLimited { retry_ms },
+        );
         false
     }
 
@@ -249,7 +250,11 @@ impl ChatServer {
         msg_id: u64,
         text: String,
     ) {
-        if !self.allowed(client, permissions::TEXT_GENERAL, RestrictionKind::GeneralText) {
+        if !self.allowed(
+            client,
+            permissions::TEXT_GENERAL,
+            RestrictionKind::GeneralText,
+        ) {
             return;
         }
         let Some(user) = self.user_of.get(&client).copied() else {
@@ -273,7 +278,10 @@ impl ChatServer {
             body: text.clone(),
             ts,
         });
-        info!("{} ({client:#x}) edited message {msg_id}", self.get_username(client));
+        info!(
+            "{} ({client:#x}) edited message {msg_id}",
+            self.get_username(client)
+        );
         self.broadcast_msg(&ServerMessage::MessageEdited { msg_id, text });
     }
 
@@ -323,11 +331,13 @@ impl ChatServer {
                     .any(|(other, ch)| other != client && *ch == c)
             });
             let talked = self.spoke.contains(client) && others_in_channel;
-            let watching = self.video.sharers().keys().any(|sharer| {
-                *sharer != *client && self.video.is_subscribed(*client, *sharer)
-            });
-            let sharing_to_someone = self.video.is_sharing(*client)
-                && self.video.viewer_count(*client) > 0;
+            let watching = self
+                .video
+                .sharers()
+                .keys()
+                .any(|sharer| *sharer != *client && self.video.is_subscribed(*client, *sharer));
+            let sharing_to_someone =
+                self.video.is_sharing(*client) && self.video.viewer_count(*client) > 0;
             let p = self.progress.entry(user).or_default();
             p.xp += XP_ONLINE;
             p.online_seconds += 60;
@@ -379,9 +389,7 @@ impl ChatServer {
 
     /// Whether the session negotiated `bit`.
     pub(super) fn has_feature(&self, client: protocol::ClientId, bit: u64) -> bool {
-        self.features_of
-            .get(&client)
-            .is_some_and(|f| f & bit != 0)
+        self.features_of.get(&client).is_some_and(|f| f & bit != 0)
     }
 
     /// Send only when the session negotiated `bit`.

@@ -703,7 +703,9 @@ pub enum ServerMessage {
     },
 
     /// Admission refused; the server closes the connection after this.
-    Refused { reason: RefusedReason },
+    Refused {
+        reason: RefusedReason,
+    },
 
     /// Initialization payload for a newly connected client: the current
     /// user list, our authoritative client id, server name and greeting,
@@ -726,7 +728,9 @@ pub enum ServerMessage {
     },
 
     /// A client disconnected.
-    UserLeft { client_id: ClientId },
+    UserLeft {
+        client_id: ClientId,
+    },
 
     /// A chat message from a client.
     Chat(ChatMessage),
@@ -759,10 +763,14 @@ pub enum ServerMessage {
     /// streams, the stream became invisible to *you* (the sharer or you
     /// moved channels). Either way: clear the LIVE badge and close any
     /// viewer window for this stream.
-    ScreenShareStopped { client_id: ClientId },
+    ScreenShareStopped {
+        client_id: ClientId,
+    },
 
     /// The server refused our `ScreenShareStart`.
-    ShareDenied { reason: DenyReason },
+    ShareDenied {
+        reason: DenyReason,
+    },
 
     /// The server refused our `SubscribeScreen`.
     SubscribeDenied {
@@ -772,7 +780,9 @@ pub enum ServerMessage {
 
     /// A viewer needs a keyframe from us — force an IDR.
     /// Signal channel: must not queue behind chat.
-    KeyframeRequested { viewer_id: ClientId },
+    KeyframeRequested {
+        viewer_id: ClientId,
+    },
 
     /// Periodic health report for a stream we are sharing, aggregated
     /// across our viewers. Drives sender-side rate adaptation.
@@ -878,7 +888,9 @@ pub enum ServerMessage {
         max_uses: Option<u32>,
     },
     /// `CreateInvite` was refused.
-    InviteDenied { reason: InviteDenyReason },
+    InviteDenied {
+        reason: InviteDenyReason,
+    },
 
     // ── 1.1: roles and moderation (feature bit `ROLES`) ─────────────
     /// Who a session is, for the roster: after each `UserJoined`, and
@@ -900,7 +912,9 @@ pub enum ServerMessage {
         reason: String,
     },
     /// A restriction on this session ended (lifted, or ran out).
-    RestrictionLifted { kind: RestrictionKind },
+    RestrictionLifted {
+        kind: RestrictionKind,
+    },
     /// The answer to `ClientMessage::Admin`.
     AdminResult {
         request_id: u32,
@@ -919,15 +933,28 @@ pub enum ServerMessage {
     },
     /// The store could not answer in time (a stalled disk): the client
     /// keeps what it has and may retry after `retry_secs`.
-    HistoryUnavailable { conv: ConvRef, retry_secs: u16 },
-    MessageEdited { msg_id: u64, text: String },
-    MessageDeleted { msg_id: u64 },
+    HistoryUnavailable {
+        conv: ConvRef,
+        retry_secs: u16,
+    },
+    MessageEdited {
+        msg_id: u64,
+        text: String,
+    },
+    MessageDeleted {
+        msg_id: u64,
+    },
     /// Chat is rate limited (`limits.chat`); the message was dropped.
-    ChatRateLimited { retry_ms: u32 },
+    ChatRateLimited {
+        retry_ms: u32,
+    },
 
     // ── 1.1: progress (feature bit `PROGRESS`) ──────────────────────
     /// Your xp crossed a level (spec §9.1).
-    ProgressUpdate { xp: u64, level: u16 },
+    ProgressUpdate {
+        xp: u64,
+        level: u16,
+    },
 
     // ── 1.1: channels from the UI (feature bit `CHANNELS_UI`) ───────
     /// What `ChannelInfo` cannot say, one per channel after `Init` and
@@ -943,10 +970,14 @@ pub enum ServerMessage {
         is_afk: bool,
     },
     /// A create/edit/delete/kick was refused.
-    ChannelDenied { reason: ChannelUiDenyReason },
+    ChannelDenied {
+        reason: ChannelUiDenyReason,
+    },
     /// The server moved this session to the AFK channel after
     /// `after_min` idle minutes (spec §5).
-    MovedIdle { after_min: u16 },
+    MovedIdle {
+        after_min: u16,
+    },
 }
 
 /// Why a session was ended (spec §4.1).

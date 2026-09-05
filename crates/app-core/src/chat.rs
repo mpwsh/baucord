@@ -5,6 +5,11 @@
 //! code becomes its own [`ChatItem::Code`] row; links stay inline in
 //! the message text (the markdown translator linkifies them for
 //! StyledText).
+//!
+//! Every user-authored row carries the server's message id, so an
+//! edit or a deletion that arrives later can find its rows
+//! ([`ChatHistory::edit_message`], [`ChatHistory::delete_message`]) and
+//! the UI can offer edit/delete on the rows the session owns.
 
 /// History cap — oldest rows are dropped past this.
 pub const MAX_ROWS: usize = 500;
@@ -12,30 +17,57 @@ pub const MAX_ROWS: usize = 500;
 /// Character cap for an outgoing message (matches the wire check).
 pub const MAX_MESSAGE_CHARS: usize = 400;
 
+/// Who sent a message and when, as the rows need it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Meta {
+    /// The server's message id. Rows of one message share it.
+    pub id: u64,
+    /// Local `HH:MM`, already formatted.
+    pub ts: String,
+    pub user: String,
+    /// Authored by this session's user: the edit/delete menu appears.
+    pub own: bool,
+}
+
 /// One row of chat history.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatItem {
     Message {
-        ts: String,
-        user: String,
+        meta: Meta,
         body: String,
+        /// The server marked it edited (a later edit, or replayed as such).
+        edited: bool,
+        /// Deleted for everyone: the header stays, the body is a
+        /// muted placeholder, the menu is gone.
+        deleted: bool,
     },
     System {
         body: String,
     },
     /// A ```-fenced code block extracted from a message.
     Code {
-        ts: String,
-        user: String,
+        meta: Meta,
         code: String,
     },
     Image {
-        ts: String,
-        user: String,
+        meta: Meta,
         width: u32,
         height: u32,
         is_gif: bool,
     },
+}
+
+impl ChatItem {
+    /// The message id of a user-authored row; `None` for system rows.
+    #[must_use]
+    pub fn message_id(&self) -> Option<u64> {
+        match self {
+            ChatItem::Message { meta, .. }
+            | ChatItem::Code { meta, .. }
+            | ChatItem::Image { meta, .. } => Some(meta.id),
+            ChatItem::System { .. } => None,
+        }
+    }
 }
 
 /// Rows dropped from the front + rows appended, for incremental model
@@ -43,6 +75,15 @@ pub enum ChatItem {
 pub struct HistoryDelta {
     pub dropped_front: usize,
     pub appended: usize,
+}
+
+/// A splice in the middle of the history: `removed` rows at `start`
+/// were replaced by `inserted` rows at the same position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeDelta {
+    pub start: usize,
+    pub removed: usize,
+    pub inserted: usize,
 }
 
 #[derive(Default)]
@@ -76,29 +117,28 @@ impl ChatHistory {
     /// [`ChatItem::Code`] rows (monospace panels in the UI); links
     /// render inline inside the message text (the markdown translator
     /// linkifies them for StyledText).
-    pub fn push_message(&mut self, ts: &str, user: &str, body: &str) -> HistoryDelta {
-        let mut appended = 0;
-        for segment in crate::markdown::split_fences(body) {
-            match segment {
-                crate::markdown::Segment::Text(text) => {
-                    self.rows.push(ChatItem::Message {
-                        ts: ts.into(),
-                        user: user.into(),
-                        body: text,
-                    });
-                    appended += 1;
-                }
-                crate::markdown::Segment::Code(code) => {
-                    self.rows.push(ChatItem::Code {
-                        ts: ts.into(),
-                        user: user.into(),
-                        code,
-                    });
-                    appended += 1;
-                }
-            }
-        }
+    pub fn push_message(&mut self, meta: &Meta, body: &str, edited: bool) -> HistoryDelta {
+        let rows = Self::segments(meta, body, edited);
+        let appended = rows.len();
+        self.rows.extend(rows);
         self.cap(appended)
+    }
+
+    /// A page of older messages, oldest first, put in front of what is
+    /// shown ("load earlier"). Returns how many rows went in. Not
+    /// capped here: the reader asked for these; the next append trims
+    /// from the front as usual.
+    pub fn prepend_messages<'a>(
+        &mut self,
+        messages: impl IntoIterator<Item = (&'a Meta, &'a str, bool)>,
+    ) -> usize {
+        let rows: Vec<ChatItem> = messages
+            .into_iter()
+            .flat_map(|(meta, body, edited)| Self::segments(meta, body, edited))
+            .collect();
+        let inserted = rows.len();
+        self.rows.splice(0..0, rows);
+        inserted
     }
 
     pub fn push_system(&mut self, body: &str) -> HistoryDelta {
@@ -114,20 +154,93 @@ impl ChatHistory {
     /// them back.
     pub fn push_image(
         &mut self,
-        ts: &str,
-        user: &str,
+        meta: &Meta,
         width: u32,
         height: u32,
         is_gif: bool,
     ) -> HistoryDelta {
         self.rows.push(ChatItem::Image {
-            ts: ts.into(),
-            user: user.into(),
+            meta: meta.clone(),
             width,
             height,
             is_gif,
         });
         self.cap(1)
+    }
+
+    /// A message was retexted for everyone: its rows are replaced by
+    /// the new text's rows (re-split on fences) at the same place,
+    /// flagged edited. `None` when the message is not in the window
+    /// (older than [`MAX_ROWS`], or from before this session).
+    pub fn edit_message(&mut self, id: u64, body: &str) -> Option<RangeDelta> {
+        let (start, end) = self.span_of(id)?;
+        let (ChatItem::Message { meta, .. } | ChatItem::Code { meta, .. }) = &self.rows[start]
+        else {
+            // Images cannot be edited; the server never sends this.
+            return None;
+        };
+        let rows = Self::segments(meta, body, true);
+        let inserted = rows.len();
+        self.rows.splice(start..end, rows);
+        Some(RangeDelta {
+            start,
+            removed: end - start,
+            inserted,
+        })
+    }
+
+    /// A message was removed for everyone: its rows collapse into one
+    /// placeholder row that keeps the header (who, when) and says the
+    /// body is gone.
+    pub fn delete_message(&mut self, id: u64) -> Option<RangeDelta> {
+        let (start, end) = self.span_of(id)?;
+        let (ChatItem::Message { meta, .. }
+        | ChatItem::Code { meta, .. }
+        | ChatItem::Image { meta, .. }) = &self.rows[start]
+        else {
+            return None;
+        };
+        let placeholder = ChatItem::Message {
+            meta: meta.clone(),
+            body: String::new(),
+            edited: false,
+            deleted: true,
+        };
+        self.rows.splice(start..end, [placeholder]);
+        Some(RangeDelta {
+            start,
+            removed: end - start,
+            inserted: 1,
+        })
+    }
+
+    /// The contiguous run of rows that belong to message `id`.
+    fn span_of(&self, id: u64) -> Option<(usize, usize)> {
+        let start = self.rows.iter().position(|r| r.message_id() == Some(id))?;
+        let end = self.rows[start..]
+            .iter()
+            .position(|r| r.message_id() != Some(id))
+            .map_or(self.rows.len(), |n| start + n);
+        Some((start, end))
+    }
+
+    /// One message → its rows, fences split out.
+    fn segments(meta: &Meta, body: &str, edited: bool) -> Vec<ChatItem> {
+        crate::markdown::split_fences(body)
+            .into_iter()
+            .map(|segment| match segment {
+                crate::markdown::Segment::Text(text) => ChatItem::Message {
+                    meta: meta.clone(),
+                    body: text,
+                    edited,
+                    deleted: false,
+                },
+                crate::markdown::Segment::Code(code) => ChatItem::Code {
+                    meta: meta.clone(),
+                    code,
+                },
+            })
+            .collect()
     }
 
     fn cap(&mut self, appended: usize) -> HistoryDelta {
@@ -158,6 +271,15 @@ pub fn scrub_control_chars(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn meta(id: u64) -> Meta {
+        Meta {
+            id,
+            ts: "12:00".into(),
+            user: "a".into(),
+            own: false,
+        }
+    }
+
     #[test]
     fn history_caps_at_max_rows() {
         let mut h = ChatHistory::new();
@@ -177,9 +299,9 @@ mod tests {
     fn code_fences_become_rows() {
         let mut h = ChatHistory::new();
         let d = h.push_message(
-            "12:00",
-            "a",
+            &meta(1),
             "look:\n```\nlet x = 1;\n```\nand https://x.test",
+            false,
         );
         // Links stay inline in the message text (linkified at render
         // time) — no extra rows.
@@ -187,12 +309,13 @@ mod tests {
         assert!(matches!(&h.rows()[0], ChatItem::Message { body, .. } if body == "look:"));
         assert!(matches!(&h.rows()[1], ChatItem::Code { code, .. } if code == "let x = 1;"));
         assert!(matches!(&h.rows()[2], ChatItem::Message { body, .. } if body.contains("https")));
+        assert!(h.rows().iter().all(|r| r.message_id() == Some(1)));
     }
 
     #[test]
     fn links_inside_code_stay_code() {
         let mut h = ChatHistory::new();
-        let d = h.push_message("12:00", "a", "```\nhttps://not-a-link.test\n```");
+        let d = h.push_message(&meta(1), "```\nhttps://not-a-link.test\n```", false);
         assert_eq!(d.appended, 1);
         assert!(matches!(&h.rows()[0], ChatItem::Code { .. }));
     }
@@ -200,12 +323,78 @@ mod tests {
     #[test]
     fn message_links_stay_inline() {
         let mut h = ChatHistory::new();
-        let d = h.push_message("12:00", "a", "see https://x.test/a and www.y.test");
+        let d = h.push_message(&meta(1), "see https://x.test/a and www.y.test", false);
         // One row: links render inline via the markdown translator.
         assert_eq!(d.appended, 1);
         assert!(
             matches!(&h.rows()[0], ChatItem::Message { body, .. } if body.contains("www.y.test"))
         );
+    }
+
+    #[test]
+    fn edit_replaces_every_row_of_the_message_in_place() {
+        let mut h = ChatHistory::new();
+        h.push_system("before");
+        h.push_message(&meta(7), "one\n```\ncode\n```", false);
+        h.push_message(&meta(8), "after", false);
+        let d = h
+            .edit_message(7, "fixed")
+            .expect("message is in the window");
+        assert_eq!(
+            d,
+            RangeDelta {
+                start: 1,
+                removed: 2,
+                inserted: 1
+            }
+        );
+        assert_eq!(h.rows().len(), 3);
+        assert!(matches!(
+            &h.rows()[1],
+            ChatItem::Message { body, edited: true, .. } if body == "fixed"
+        ));
+        assert!(matches!(&h.rows()[2], ChatItem::Message { body, .. } if body == "after"));
+    }
+
+    #[test]
+    fn delete_leaves_one_placeholder_with_the_header() {
+        let mut h = ChatHistory::new();
+        h.push_message(&meta(7), "one\n```\ncode\n```", false);
+        let d = h.delete_message(7).expect("message is in the window");
+        assert_eq!(
+            d,
+            RangeDelta {
+                start: 0,
+                removed: 2,
+                inserted: 1
+            }
+        );
+        assert_eq!(h.rows().len(), 1);
+        assert!(matches!(
+            &h.rows()[0],
+            ChatItem::Message { meta, deleted: true, .. } if meta.id == 7
+        ));
+    }
+
+    #[test]
+    fn prepended_pages_go_in_front_in_order() {
+        let mut h = ChatHistory::new();
+        h.push_message(&meta(10), "newest", false);
+        let older = [(meta(3), "three"), (meta(4), "four\n```\nx\n```")];
+        let n = h.prepend_messages(older.iter().map(|(m, b)| (m, *b, false)));
+        assert_eq!(n, 3);
+        assert_eq!(h.rows().len(), 4);
+        assert!(matches!(&h.rows()[0], ChatItem::Message { body, .. } if body == "three"));
+        assert!(matches!(&h.rows()[2], ChatItem::Code { .. }));
+        assert!(matches!(&h.rows()[3], ChatItem::Message { body, .. } if body == "newest"));
+    }
+
+    #[test]
+    fn edits_of_unknown_messages_are_none() {
+        let mut h = ChatHistory::new();
+        h.push_message(&meta(1), "x", false);
+        assert!(h.edit_message(2, "y").is_none());
+        assert!(h.delete_message(2).is_none());
     }
 
     #[test]

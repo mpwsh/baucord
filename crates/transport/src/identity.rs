@@ -245,8 +245,8 @@ impl ClientKey {
     #[must_use]
     pub fn generate() -> Self {
         let rng = ring::rand::SystemRandom::new();
-        let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
-            .expect("system RNG available");
+        let doc =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("system RNG available");
         Self::from_pkcs8(doc.as_ref()).expect("freshly generated key parses")
     }
 

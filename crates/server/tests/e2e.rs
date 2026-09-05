@@ -45,6 +45,9 @@ fn test_config(channels: Vec<ChannelSettings>) -> Config {
     config.logging.link_stats_interval_secs = 0;
     // Memory mode unless a test turns the store on at a temp path.
     config.persistence.enabled = false;
+    // Scenarios send a dozen lines in a few simulated milliseconds;
+    // only `chat_is_rate_limited_per_session` wants the default bite.
+    config.limits.chat.burst = 1000;
     config
 }
 
@@ -156,8 +159,8 @@ impl World {
     /// the interval (invite expiry, restriction `until`).
     fn advance_wall(&mut self, by: Duration) {
         let now = self.net.now();
-        let wall = self.server().clock().wall_ms(now)
-            + u64::try_from(by.as_millis()).expect("fits");
+        let wall =
+            self.server().clock().wall_ms(now) + u64::try_from(by.as_millis()).expect("fits");
         self.server().set_clock(Clock::fixed(wall, now));
     }
 
@@ -642,7 +645,9 @@ fn a_1_0_client_is_refused_with_bad_hello() {
 fn an_unknown_key_needs_an_invite_and_that_does_not_count_as_a_failure() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
     for _ in 0..8 {
-        let err = w.try_connect("newcomer", Auth::Key).expect_err("unknown key");
+        let err = w
+            .try_connect("newcomer", Auth::Key)
+            .expect_err("unknown key");
         assert_eq!(
             err,
             RefusedReason::NeedInvite {
@@ -658,7 +663,11 @@ fn an_invite_admits_once_and_the_key_logs_in_from_then_on() {
     let code = w.invite(ROLE_GUEST);
     let a = w.connect_as("alice", Auth::Invite { code: code.clone() });
     let (user_id, perms, _) = a.session().expect("session");
-    assert_eq!(user_id, a.key.user_id(), "user id is the founding key's hash");
+    assert_eq!(
+        user_id,
+        a.key.user_id(),
+        "user id is the founding key's hash"
+    );
     assert_eq!(perms, permissions::GUEST_PERMISSIONS);
     assert_eq!(w.server().policy().invites[&code].uses, 1);
     assert_eq!(
@@ -774,7 +783,9 @@ fn expired_exhausted_and_revoked_codes_are_told_apart() {
         &code[4..8],
         &code[8..].to_ascii_lowercase()
     );
-    assert!(w.try_connect("spoken", Auth::Invite { code: spoken }).is_ok());
+    assert!(w
+        .try_connect("spoken", Auth::Invite { code: spoken })
+        .is_ok());
 }
 
 #[test]
@@ -1002,7 +1013,10 @@ fn a_kick_forgets_the_device_so_a_new_invite_is_needed() {
             reason: "spam".to_string(),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut troll], 1), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut troll], 1),
+        Ok(AdminOutcome::Done)
+    );
     troll.wait_for(&mut w, &mut [&mut admin], |m| match m {
         ServerMessage::Removed {
             kind: RemovedKind::Kicked,
@@ -1054,7 +1068,10 @@ fn a_ban_blocks_the_key_under_any_name_and_lifts_on_time() {
             reason: "cool off".to_string(),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 1), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 1),
+        Ok(AdminOutcome::Done)
+    );
     let until = alice.wait_for(&mut w, &mut [&mut admin], |m| match m {
         ServerMessage::Removed {
             kind: RemovedKind::Banned { until },
@@ -1080,8 +1097,13 @@ fn a_ban_blocks_the_key_under_any_name_and_lifts_on_time() {
             target: AdminTarget::Name("alice".to_string()),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [], 2), Ok(AdminOutcome::Done));
-    assert!(w.try_connect_with_key("alice", Auth::Key, Arc::clone(&key)).is_ok());
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [], 2),
+        Ok(AdminOutcome::Done)
+    );
+    assert!(w
+        .try_connect_with_key("alice", Auth::Key, Arc::clone(&key))
+        .is_ok());
 
     // And a timed one runs out on its own.
     let mut alice = w.connect_with_key("alice", Auth::Key, key);
@@ -1094,7 +1116,10 @@ fn a_ban_blocks_the_key_under_any_name_and_lifts_on_time() {
             reason: "one minute".to_string(),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 3), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 3),
+        Ok(AdminOutcome::Done)
+    );
     let key = Arc::clone(&alice.key);
     w.advance_wall(Duration::from_hours(2));
     // The sweep runs once a second of tick time.
@@ -1117,7 +1142,10 @@ fn a_ban_on_a_shared_address_hits_only_the_named_user() {
     let mut bob = w
         .try_connect_from(shared2, "bob", Auth::Invite { code }, None)
         .expect("bob in");
-    w.settle(&mut [&mut admin, &mut alice, &mut bob], Duration::from_millis(200));
+    w.settle(
+        &mut [&mut admin, &mut alice, &mut bob],
+        Duration::from_millis(200),
+    );
     let alice_user = alice.key.user_id();
 
     admin.admin(
@@ -1143,11 +1171,17 @@ fn a_ban_on_a_shared_address_hits_only_the_named_user() {
         )
         .then_some(())
     });
-    w.settle(&mut [&mut admin, &mut alice, &mut bob], Duration::from_millis(500));
+    w.settle(
+        &mut [&mut admin, &mut alice, &mut bob],
+        Duration::from_millis(500),
+    );
     // Bob shares the address and stays; the admin stays; the row does
     // not carry the shared address at all.
     assert!(bob.disconnected().is_none(), "bob was caught by the ban");
-    assert!(admin.disconnected().is_none(), "the admin banned themselves");
+    assert!(
+        admin.disconnected().is_none(),
+        "the admin banned themselves"
+    );
     let bans = &w.server().policy().restrictions;
     assert_eq!(bans.len(), 1);
     assert_eq!(bans[0].ip, None);
@@ -1186,7 +1220,10 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
             reason: String::new(),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [], 2), Err(AdminError::Yourself));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [], 2),
+        Err(AdminError::Yourself)
+    );
 
     // Promote the guest to admin: now they are equal, and neither can
     // touch the other.
@@ -1198,7 +1235,10 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
             roles: vec![ROLE_ADMIN],
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut guest], 3), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut guest], 3),
+        Ok(AdminOutcome::Done)
+    );
     let (_, perms, _) = guest.wait_for(&mut w, &mut [&mut admin], |m| match m {
         ServerMessage::Session {
             user_id,
@@ -1218,7 +1258,10 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
             reason: String::new(),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut guest], 4), Err(AdminError::Outranked));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut guest], 4),
+        Err(AdminError::Outranked)
+    );
 
     // Two admins: one may step down; the last one may not.
     admin.admin(
@@ -1229,7 +1272,10 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
             roles: vec![ROLE_MEMBER],
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut guest], 5), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut guest], 5),
+        Ok(AdminOutcome::Done)
+    );
     guest.admin(
         &mut w,
         6,
@@ -1238,7 +1284,10 @@ fn nobody_acts_on_themselves_or_on_an_equal_rank() {
             roles: vec![ROLE_MEMBER],
         },
     );
-    assert_eq!(guest.admin_result(&mut w, &mut [&mut admin], 6), Err(AdminError::LastAdmin));
+    assert_eq!(
+        guest.admin_result(&mut w, &mut [&mut admin], 6),
+        Err(AdminError::LastAdmin)
+    );
 }
 
 #[test]
@@ -1271,7 +1320,10 @@ fn a_mute_drops_voice_at_the_relay_and_the_client_is_told_both_ways() {
         }
         got
     };
-    assert_eq!(voice_reaches_bob(&mut w, &mut alice, &mut bob, &mut admin, 0), 20);
+    assert_eq!(
+        voice_reaches_bob(&mut w, &mut alice, &mut bob, &mut admin, 0),
+        20
+    );
 
     admin.admin(
         &mut w,
@@ -1296,11 +1348,17 @@ fn a_mute_drops_voice_at_the_relay_and_the_client_is_told_both_ways() {
         _ => None,
     });
     assert!(until.is_some());
-    assert_eq!(voice_reaches_bob(&mut w, &mut alice, &mut bob, &mut admin, 100), 0);
+    assert_eq!(
+        voice_reaches_bob(&mut w, &mut alice, &mut bob, &mut admin, 100),
+        0
+    );
 
     // Time runs out: the sweep lifts it and says so.
     w.advance_wall(Duration::from_mins(31));
-    w.settle(&mut [&mut alice, &mut bob, &mut admin], Duration::from_secs(2));
+    w.settle(
+        &mut [&mut alice, &mut bob, &mut admin],
+        Duration::from_secs(2),
+    );
     alice.wait_for(&mut w, &mut [&mut admin, &mut bob], |m| {
         matches!(
             m,
@@ -1310,7 +1368,10 @@ fn a_mute_drops_voice_at_the_relay_and_the_client_is_told_both_ways() {
         )
         .then_some(())
     });
-    assert_eq!(voice_reaches_bob(&mut w, &mut alice, &mut bob, &mut admin, 200), 20);
+    assert_eq!(
+        voice_reaches_bob(&mut w, &mut alice, &mut bob, &mut admin, 200),
+        20
+    );
 }
 
 #[test]
@@ -1318,7 +1379,8 @@ fn a_text_restriction_refuses_chat_with_the_reason() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
     let boot = w.bootstrap_code();
     let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
-    let mut alice = w.connect("alice");
+    // A member: she holds `UPLOAD`, so the mute alone decides the image.
+    let mut alice = w.connect_member("alice");
     let alice_user = alice.key.user_id();
 
     admin.admin(
@@ -1331,7 +1393,10 @@ fn a_text_restriction_refuses_chat_with_the_reason() {
             reason: "be nice".to_string(),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 1), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 1),
+        Ok(AdminOutcome::Done)
+    );
     alice.inbox.clear();
     admin.inbox.clear();
     alice.send(&mut w, &ClientMessage::Chat("hello?".to_string()));
@@ -1353,22 +1418,44 @@ fn a_text_restriction_refuses_chat_with_the_reason() {
     );
     // Pictures are chat too.
     admin.inbox.clear();
-    alice.send(
+    alice.send_image(&mut w, 1, &png_blob(1, 4 * 1024));
+    w.settle(&mut [&mut alice, &mut admin], Duration::from_secs(2));
+    assert_eq!(
+        admin.images_completed(),
+        0,
+        "a text-muted user's image must not be relayed"
+    );
+
+    // Lifted: the same image goes through, so the block above was the
+    // mute and not something else.
+    admin.admin(
         &mut w,
-        &ClientMessage::ChatImageChunk {
-            upload_id: 1,
-            index: 0,
-            count: 1,
-            data: vec![0x89, b'P', b'N', b'G'],
+        2,
+        AdminCommand::Unmute {
+            target: AdminTarget::User(alice_user),
+            kind: RestrictionKind::GeneralText,
         },
     );
-    w.settle(&mut [&mut alice, &mut admin], Duration::from_millis(500));
-    assert!(
-        !admin
-            .inbox
-            .iter()
-            .any(|m| matches!(m, ServerMessage::ChatImageChunk { .. })),
-        "a text-muted user's image must not be relayed"
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 2),
+        Ok(AdminOutcome::Done)
+    );
+    alice.wait_for(&mut w, &mut [&mut admin], |m| {
+        matches!(
+            m,
+            ServerMessage::RestrictionLifted {
+                kind: RestrictionKind::GeneralText
+            }
+        )
+        .then_some(())
+    });
+    admin.inbox.clear();
+    alice.send_image(&mut w, 2, &png_blob(2, 4 * 1024));
+    w.settle(&mut [&mut alice, &mut admin], Duration::from_secs(2));
+    assert_eq!(
+        admin.images_completed(),
+        1,
+        "an unmuted member's image relays"
     );
 }
 
@@ -1398,7 +1485,10 @@ fn roles_change_live_for_the_user_and_every_roster() {
             roles: vec![ROLE_MEMBER],
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 1), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 1),
+        Ok(AdminOutcome::Done)
+    );
     let perms = alice.wait_for(&mut w, &mut [&mut admin], |m| match m {
         ServerMessage::Session { permissions, .. } => Some(*permissions),
         _ => None,
@@ -1411,7 +1501,10 @@ fn roles_change_live_for_the_user_and_every_roster() {
         _ => None,
     });
     assert_eq!(roles, vec![ROLE_MEMBER]);
-    assert_eq!(w.server().policy().rank_of(&alice_user), permissions::RANK_MEMBER);
+    assert_eq!(
+        w.server().policy().rank_of(&alice_user),
+        permissions::RANK_MEMBER
+    );
 }
 
 #[test]
@@ -1501,7 +1594,10 @@ fn a_ban_written_by_the_cli_lands_on_a_live_session() {
         }) {
             break;
         }
-        assert!(Instant::now() < deadline, "the CLI ban never reached the session");
+        assert!(
+            Instant::now() < deadline,
+            "the CLI ban never reached the session"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(server::persistence::cli_lift_restriction(&db, id).expect("lift"));
@@ -1533,7 +1629,10 @@ fn an_admin_moves_a_user_past_a_channel_password() {
             channel_id: 1,
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 1), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 1),
+        Ok(AdminOutcome::Done)
+    );
     let alice_id = alice.id;
     alice.wait_for(&mut w, &mut [&mut admin], |m| {
         matches!(
@@ -1689,10 +1788,14 @@ fn authors_edit_and_delete_their_own_recent_messages() {
 
     // A newcomer sees the edit and the flag.
     let mut carol = w.connect("carol");
-    let page = carol.wait_for(&mut w, &mut [&mut alice, &mut bob, &mut admin], |m| match m {
-        ServerMessage::History { messages, .. } => Some(messages.clone()),
-        _ => None,
-    });
+    let page = carol.wait_for(
+        &mut w,
+        &mut [&mut alice, &mut bob, &mut admin],
+        |m| match m {
+            ServerMessage::History { messages, .. } => Some(messages.clone()),
+            _ => None,
+        },
+    );
     assert_eq!(page[0].text, "fixed");
     assert!(page[0].edited);
 
@@ -1753,7 +1856,13 @@ fn progress_accrues_by_the_minute_and_levels_up() {
         alice.send(&mut w, &ClientMessage::Speaking(true));
         w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(61));
     }
-    let xp = w.server().policy().xp.get(&alice_user).copied().unwrap_or(0);
+    let xp = w
+        .server()
+        .policy()
+        .xp
+        .get(&alice_user)
+        .copied()
+        .unwrap_or(0);
     assert_eq!(xp, 12);
     // Chat earns nothing; a third minute of talking crosses 13 xp.
     alice.send(&mut w, &ClientMessage::Chat("gg".to_string()));
@@ -1792,7 +1901,10 @@ fn a_purge_removes_the_person_and_their_messages() {
             target: AdminTarget::Name("troll".to_string()),
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut troll], 1), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut troll], 1),
+        Ok(AdminOutcome::Done)
+    );
     assert!(!w.server().policy().users.contains_key(&troll_user));
     let mut carol = w.connect("carol");
     w.settle(&mut [&mut carol, &mut admin], Duration::from_millis(300));
@@ -1887,10 +1999,20 @@ fn organizers_make_channels_that_gate_by_role_and_evaporate_when_empty() {
         .then_some(())
     });
     org.join(&mut w, 0, None);
-    w.settle(&mut [&mut org, &mut guest, &mut member], Duration::from_secs(35));
-    assert_eq!(w.server().policy().channels.len(), 1, "empty, but not yet long enough");
+    w.settle(
+        &mut [&mut org, &mut guest, &mut member],
+        Duration::from_secs(35),
+    );
+    assert_eq!(
+        w.server().policy().channels.len(),
+        1,
+        "empty, but not yet long enough"
+    );
     w.advance_wall(Duration::from_mins(2));
-    w.settle(&mut [&mut org, &mut guest, &mut member], Duration::from_secs(35));
+    w.settle(
+        &mut [&mut org, &mut guest, &mut member],
+        Duration::from_secs(35),
+    );
     let channels = guest.wait_for(&mut w, &mut [&mut org, &mut member], |m| match m {
         ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 1 => {
             Some(channels.clone())
@@ -1976,10 +2098,13 @@ fn idle_members_are_moved_to_the_afk_channel_where_voice_goes_nowhere() {
     let mut w = World::new(config);
     let mut alice = w.connect("alice");
     let mut bob = w.connect("bob");
-    // Alice keeps busy; bob does nothing.
+    // Alice keeps busy; bob does nothing. The channel sweep runs every
+    // 30 s: at 60 s bob is a few hundred ms short of a minute idle (he
+    // was admitted after the server started), at 90 s he is well past
+    // it, and alice's last activity is 28 s old.
     for _ in 0..3 {
         alice.send(&mut w, &ClientMessage::Speaking(true));
-        w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(25));
+        w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(31));
     }
     let after = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
         ServerMessage::MovedIdle { after_min } => Some(*after_min),
@@ -1997,7 +2122,11 @@ fn idle_members_are_moved_to_the_afk_channel_where_voice_goes_nowhere() {
         .send(now, bob.peer, Lane::Voice, &pkt)
         .expect("send voice");
     w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(300));
-    assert!(w.net.driver(alice.node).recv(alice.peer, Lane::Voice).is_none());
+    assert!(w
+        .net
+        .driver(alice.node)
+        .recv(alice.peer, Lane::Voice)
+        .is_none());
 }
 
 #[test]
@@ -2875,7 +3004,10 @@ fn a_stalled_persistence_thread_never_touches_the_media_path() {
             break;
         }
         written_before = stats.written;
-        assert!(Instant::now() < deadline, "admission rows never landed: {stats}");
+        assert!(
+            Instant::now() < deadline,
+            "admission rows never landed: {stats}"
+        );
     }
 
     // The disk stalls. The thread is real; give it a moment to park.
@@ -2988,6 +3120,9 @@ fn persistence_off_writes_nothing_to_disk() {
     assert!(!stats.persistent);
     assert_eq!(stats.dropped_writes, 0);
     drop(w);
-    assert!(!dir.join("baucord.db").exists(), "memory mode must not create a database");
+    assert!(
+        !dir.join("baucord.db").exists(),
+        "memory mode must not create a database"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

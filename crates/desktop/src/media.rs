@@ -51,7 +51,7 @@ fn describe(err: &ImageError) -> String {
 
 /// Append an image message to chat. Returns false if the bytes don't
 /// decode (the caller posts a system-row notice instead).
-pub fn push_image_row(app: &mut AppState, ts: &str, user: &str, data: Vec<u8>) -> bool {
+pub fn push_image_row(app: &mut AppState, meta: &app_core::chat::Meta, data: Vec<u8>) -> bool {
     // Preview-sized texture for the row (the layout box still comes
     // from the original dimensions); the gallery viewer decodes the
     // full resolution from `app.images` on demand.
@@ -60,7 +60,7 @@ pub fn push_image_row(app: &mut AppState, ts: &str, user: &str, data: Vec<u8>) -
     };
     let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);
 
-    let delta = app.history_mut().push_image(ts, user, w, h, is_gif);
+    let delta = app.history_mut().push_image(meta, w, h, is_gif);
     // sync_history_tail equivalent: history rows were appended; mirror
     // them (push_image appends exactly one row and may drop from front).
     app.sync_delta(&delta);
@@ -308,7 +308,7 @@ pub fn paste_into_chat(app: &mut AppState) {
 
     // 2. Native image data (PNG from screenshots etc.).
     if let Some(png) = crate::clipboard::clipboard_png() {
-        match images::load_image_bytes(png, client::MAX_CHAT_IMAGE_BYTES) {
+        match images::load_image_bytes(png, app.image_budget()) {
             Ok(bytes) => {
                 show_preview(app, bytes);
                 return;
@@ -347,7 +347,7 @@ pub fn paste_into_chat(app: &mut AppState) {
 /// Load an image file from disk into the preview.
 fn attach_path(app: &mut AppState, path: &std::path::Path) {
     match std::fs::read(path) {
-        Ok(raw) => match images::load_image_bytes(raw, client::MAX_CHAT_IMAGE_BYTES) {
+        Ok(raw) => match images::load_image_bytes(raw, app.image_budget()) {
             Ok(bytes) => show_preview(app, bytes),
             Err(e) => app.show_error(&describe(&e)),
         },
@@ -388,7 +388,7 @@ fn fetch_image_url(app: &mut AppState, url: &str) {
             crate::app::with_current(move |app| {
                 app.main.global::<State>().set_upload_line("".into());
                 match result {
-                    Ok(raw) => match images::load_image_bytes(raw, client::MAX_CHAT_IMAGE_BYTES) {
+                    Ok(raw) => match images::load_image_bytes(raw, app.image_budget()) {
                         Ok(bytes) => show_preview(app, bytes),
                         Err(e) => app.show_error(&describe(&e)),
                     },

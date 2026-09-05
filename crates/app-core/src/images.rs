@@ -201,6 +201,31 @@ pub fn decode_bounded(bytes: &[u8]) -> Result<image::DynamicImage, ImageError> {
         .map_err(|e| ImageError::Codec(e.to_string()))
 }
 
+/// Size of the profile avatar the client keeps and uploads (spec §7.1).
+pub const AVATAR_SIDE: u32 = 128;
+
+/// Turn any picked image into the avatar the profile keeps: decoded
+/// with the usual bounds, center-cropped to a square, scaled to
+/// [`AVATAR_SIDE`], encoded as PNG.
+///
+/// # Errors
+/// The decode errors of [`decode_bounded`], or [`ImageError::Codec`]
+/// if the PNG encoder fails.
+pub fn avatar_png(bytes: &[u8]) -> Result<Vec<u8>, ImageError> {
+    let decoded = decode_bounded(bytes)?;
+    let square = decoded.resize_to_fill(
+        AVATAR_SIDE,
+        AVATAR_SIDE,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut out = Cursor::new(Vec::new());
+    square
+        .to_rgba8()
+        .write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|e| ImageError::Codec(e.to_string()))?;
+    Ok(out.into_inner())
+}
+
 /// Does this GIF contain more than one image descriptor? Scans for the
 /// second `0x2C` image-separator at block level — cheap and
 /// false-positive-free compared to decoding. Conservative on parse

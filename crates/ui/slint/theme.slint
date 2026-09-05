@@ -11,7 +11,9 @@
 // | gunmetal  | #222529   | raised panels        |
 // | fog       | #D1D2D3   | primary text         |
 // | steel     | #ABADB0   | secondary text       |
-// | cobalt    | #1264A3   | accent               |
+// | ash       | #929598   | muted text (4.5:1 on every surface) |
+// | cobalt    | #1264A3   | accent fills         |
+// | sky       | #4A9AE0   | accent as text: names, links (4.5:1+) |
 // | green     | #2BAC76   | positive / speaking  |
 // | amber     | #ECB22E   | caution              |
 // | raspberry | #E01E5A   | errors / live        |
@@ -29,13 +31,19 @@ export global Theme {
     // ── Text ───────────────────────────────────────────────────────
     out property <color> text-primary:   #D1D2D3;
     out property <color> text-secondary: #ABADB0;
-    out property <color> text-muted:     #808386;
+    // Measured, not eyeballed: 5.6:1 on graphite, 5.1:1 on gunmetal,
+    // 4.5:1 on the tertiary panels — the old #808386 fell short of
+    // AA on all three at the 11–12 px it is used at.
+    out property <color> text-muted:     #929598;
     out property <color> mono-text:      #86AA90;
     out property <color> on-accent:      #FFFFFF;
 
     // ── Accents & status ───────────────────────────────────────────
-    out property <color> accent:       #1264A3;
+    out property <color> accent:       #1264A3;   // fills: buttons, selection
     out property <color> accent-hover: #0E5082;
+    // Cobalt is a fill, not a text color: 2.7:1 on graphite. This is
+    // the same hue lifted until names and links read (5.6:1).
+    out property <color> accent-text:  #4A9AE0;
     out property <color> success:      #2BAC76;
     out property <color> warning:      #ECB22E;
     out property <color> gold:         #ECB22E;   // honors (credits super-testers) — amber hue, celebratory role
@@ -59,10 +67,16 @@ export global Theme {
     out property <length> gap-xl: 24px;
 
     // ── Type scale ─────────────────────────────────────────────────
-    out property <length> font-xs:   10px;
-    out property <length> font-sm:   11px;
-    out property <length> font-body: 13px;
-    out property <length> font-md:   14px;
-    out property <length> font-lg:   16px;
-    out property <length> font-title: 30px;
+    // 11 px is the floor: counts, timestamps and hints sit there, body
+    // one step up. (10/11 read as noise at typical desktop DPI.)
+    // `scale` is the "Text size" setting; the host sets it on every
+    // window's Theme (globals are per window instance). Rounded to
+    // whole pixels so glyphs stay crisp.
+    in-out property <float> scale: 1.0;
+    out property <length> font-xs:    Math.round(11 * scale) * 1px;
+    out property <length> font-sm:    Math.round(12 * scale) * 1px;
+    out property <length> font-body:  Math.round(13 * scale) * 1px;
+    out property <length> font-md:    Math.round(14 * scale) * 1px;
+    out property <length> font-lg:    Math.round(16 * scale) * 1px;
+    out property <length> font-title: Math.round(30 * scale) * 1px;
 }

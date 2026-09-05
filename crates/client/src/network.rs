@@ -331,13 +331,24 @@ pub enum NetworkMessage {
         client_id: ClientId,
         username: String,
     },
+    /// A general-chat message. `id` is the server's message id — the
+    /// handle for edit/delete and for matching `MessageEdited` /
+    /// `MessageDeleted` to a row; `ts` is the server wall clock in
+    /// milliseconds since the Unix epoch.
     TextMessage {
+        client_id: ClientId,
+        id: u64,
+        ts: u64,
         username: String,
         text: String,
     },
     /// A chat image from a user (encoded PNG/JPEG/GIF bytes, ≤
-    /// `protocol::MAX_CHAT_IMAGE_BYTES`, content hash verified).
+    /// `protocol::MAX_CHAT_IMAGE_BYTES`, content hash verified). Same
+    /// `id` / `ts` stamping as a text message.
     ImageMessage {
+        client_id: ClientId,
+        id: u64,
+        ts: u64,
         username: String,
         data: Vec<u8>,
     },
@@ -1120,6 +1131,9 @@ impl NetworkClient {
             ServerMessage::Chat(msg) => {
                 let username = self.username_of(msg.client_id);
                 self.message_queue.push(NetworkMessage::TextMessage {
+                    client_id: msg.client_id,
+                    id: msg.id,
+                    ts: msg.ts,
                     username,
                     text: msg.text,
                 });
@@ -1129,15 +1143,21 @@ impl NetworkClient {
                 upload_id,
                 index,
                 count,
+                id,
+                ts,
                 hash,
                 data,
-                ..
             } => {
+                // `id` / `ts` repeat on every chunk of one upload; the
+                // last one to land is as good as any.
                 if let Some(image) =
                     self.accept_image_chunk(now, client_id, upload_id, index, count, hash, data)
                 {
                     let username = self.username_of(client_id);
                     self.message_queue.push(NetworkMessage::ImageMessage {
+                        client_id,
+                        id,
+                        ts,
                         username,
                         data: image,
                     });

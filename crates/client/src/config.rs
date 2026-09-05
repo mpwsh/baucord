@@ -27,14 +27,13 @@ pub enum BindableAction {
 }
 
 impl BindableAction {
-    /// Actions shown in the keybind UI. `PushToTalk` is intentionally
-    /// excluded (not implemented yet) — but the enum variant must stay:
-    /// removing it would break deserialization of settings.json files
-    /// that already contain a `push_to_talk` keybind entry.
+    /// Actions shown in the keybind UI. Push to talk is a hold, not a
+    /// toggle: the hotkey layer forwards its release as well.
     pub const ALL: &'static [BindableAction] = &[
         BindableAction::ToggleMute,
         BindableAction::ToggleDeafen,
         BindableAction::ToggleScreenShare,
+        BindableAction::PushToTalk,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -113,6 +112,137 @@ pub struct UserSettings {
     pub nickname: String,
 }
 
+/// How the app itself reads and sounds — nothing a server sees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UiSettings {
+    /// Multiplier on every font size in the UI (1.0 = the design size).
+    #[serde(default = "default_text_scale")]
+    pub text_scale: f32,
+    /// `[HH:MM]` in front of chat rows.
+    #[serde(default = "default_true")]
+    pub show_timestamps: bool,
+    /// Tighter chat rows.
+    #[serde(default)]
+    pub compact_rows: bool,
+    /// Outgoing chat images are shrunk to fit this many KB; the wire
+    /// cap (`protocol::MAX_CHAT_IMAGE_BYTES`) is the ceiling.
+    #[serde(default = "default_image_max_kb")]
+    pub image_max_kb: u32,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            text_scale: default_text_scale(),
+            show_timestamps: true,
+            compact_rows: false,
+            image_max_kb: default_image_max_kb(),
+        }
+    }
+}
+
+fn default_text_scale() -> f32 {
+    1.0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_image_max_kb() -> u32 {
+    u32::try_from(protocol::MAX_CHAT_IMAGE_BYTES / 1024).unwrap_or(u32::MAX)
+}
+
+/// Which notification sounds play. `enabled` is the master switch;
+/// the rest pick. Ordinary chat messages never make a sound — a busy
+/// general chat must not be able to disturb anyone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SoundSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Someone joins or leaves our channel.
+    #[serde(default = "default_true")]
+    pub join_leave: bool,
+    /// A message names us (the nickname as a word, or `@nickname`).
+    /// Off by default.
+    #[serde(default)]
+    pub mention: bool,
+}
+
+impl Default for SoundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            join_leave: true,
+            mention: false,
+        }
+    }
+}
+
+impl SoundSettings {
+    /// Whether a given sound plays: the master switch, then its own.
+    #[must_use]
+    pub fn join_leave_on(&self) -> bool {
+        self.enabled && self.join_leave
+    }
+
+    #[must_use]
+    pub fn mention_on(&self) -> bool {
+        self.enabled && self.mention
+    }
+}
+
+/// What happens when the app launches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartupSettings {
+    /// Connect to the default server as soon as the connect screen
+    /// would appear (needs a nickname).
+    #[serde(default)]
+    pub auto_connect: bool,
+    /// Start in the tray without showing the window (builds with the
+    /// tray only; ignored otherwise).
+    #[serde(default)]
+    pub start_minimized: bool,
+    /// Look for a newer release before showing the connect screen.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+}
+
+impl Default for StartupSettings {
+    fn default() -> Self {
+        Self {
+            auto_connect: false,
+            start_minimized: false,
+            check_updates: true,
+        }
+    }
+}
+
+/// How the user's name is drawn (spec §7.1). Kept here, sent in
+/// `SetProfile` once servers carry profiles (1.1.2).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NameStyle {
+    #[default]
+    Normal,
+    Bold,
+    Italic,
+}
+
+/// The client-held profile (spec §7.1): name color, name style, and
+/// whether an avatar file sits next to the settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProfileSettings {
+    /// `0xRRGGBB`; `None` = the theme's default name color.
+    #[serde(default)]
+    pub name_color: Option<u32>,
+    #[serde(default)]
+    pub name_style: NameStyle,
+    /// `avatar.png` (128×128) exists in the config directory.
+    #[serde(default)]
+    pub avatar: bool,
+}
+
 /// One saved server the user can connect to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerEntry {
@@ -123,7 +253,11 @@ pub struct ServerEntry {
     /// The 1.0 room password. Servers ignore it since 1.1 (the device
     /// key is the login and invites are the door); kept so old files
     /// load and old entries survive a round trip.
-    #[serde(default, alias = "token_password", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "token_password",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub password: Option<String>,
     /// The invite code to present on the first visit (spec §3.1),
     /// typed when the server asks. Sent once: cleared the moment the
@@ -273,6 +407,10 @@ pub struct AudioSettings {
     pub input: AudioInputSettings,
     pub output: AudioOutputSettings,
     pub gate_threshold: f32,
+    /// Transmit only while the push-to-talk key is held (the gate
+    /// still applies); off = voice activity.
+    #[serde(default)]
+    pub push_to_talk: bool,
 }
 
 impl Default for AudioSettings {
@@ -281,6 +419,7 @@ impl Default for AudioSettings {
             input: AudioInputSettings::default(),
             output: AudioOutputSettings::default(),
             gate_threshold: 0.010,
+            push_to_talk: false,
         }
     }
 }
@@ -374,6 +513,14 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub share: ShareSettings,
+    #[serde(default)]
+    pub ui: UiSettings,
+    #[serde(default)]
+    pub profile: ProfileSettings,
+    #[serde(default)]
+    pub startup: StartupSettings,
+    #[serde(default)]
+    pub sounds: SoundSettings,
 }
 
 /// Deserialization shadow of [`Settings`]: `server` accepts both the
@@ -401,6 +548,14 @@ struct SettingsDe {
     language: Option<String>,
     #[serde(default)]
     share: ShareSettings,
+    #[serde(default)]
+    ui: UiSettings,
+    #[serde(default)]
+    profile: ProfileSettings,
+    #[serde(default)]
+    startup: StartupSettings,
+    #[serde(default)]
+    sounds: SoundSettings,
 }
 
 #[derive(Deserialize)]
@@ -454,6 +609,10 @@ impl From<SettingsDe> for Settings {
             peer_settings: de.peer_settings,
             language: de.language,
             share: de.share,
+            ui: de.ui,
+            profile: de.profile,
+            startup: de.startup,
+            sounds: de.sounds,
         };
         settings.normalize_servers();
         settings
@@ -472,6 +631,10 @@ impl Default for Settings {
             peer_settings: HashMap::new(),
             language: None,
             share: ShareSettings::default(),
+            ui: UiSettings::default(),
+            profile: ProfileSettings::default(),
+            startup: StartupSettings::default(),
+            sounds: SoundSettings::default(),
         }
     }
 }
@@ -674,7 +837,13 @@ pub fn set_config_dir(dir: PathBuf) {
 pub fn profile_dir(name: &str) -> PathBuf {
     let safe: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     platform_config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -716,6 +885,12 @@ pub fn settings_file_path() -> PathBuf {
 #[must_use]
 pub fn client_key_path() -> PathBuf {
     config_base_dir().join("identity.key")
+}
+
+/// Where the profile avatar lives (128×128 PNG): next to settings.json.
+#[must_use]
+pub fn avatar_path() -> PathBuf {
+    config_base_dir().join("avatar.png")
 }
 
 /// Whether settings live next to the executable (a portable install),
@@ -772,8 +947,7 @@ pub fn export_client_key(to: &std::path::Path) -> Result<(), String> {
 pub fn import_client_key(
     from: &std::path::Path,
 ) -> Result<std::sync::Arc<transport::ClientKey>, String> {
-    let der =
-        std::fs::read(from).map_err(|e| format!("could not read {}: {e}", from.display()))?;
+    let der = std::fs::read(from).map_err(|e| format!("could not read {}: {e}", from.display()))?;
     transport::ClientKey::from_pkcs8(&der)?;
     let to = client_key_path();
     if let Some(dir) = to.parent() {

@@ -530,7 +530,12 @@ impl ChatServer {
             AdminCommand::DeleteMessage { msg_id } => {
                 need(permissions::RESTRICT)?;
                 if self.handle_delete_message(client, msg_id, true) {
-                    self.audit(Some(actor), "message.delete", Some(msg_id.to_string()), None);
+                    self.audit(
+                        Some(actor),
+                        "message.delete",
+                        Some(msg_id.to_string()),
+                        None,
+                    );
                     Ok(AdminOutcome::Done)
                 } else {
                     Err(AdminError::Invalid(
@@ -548,12 +553,14 @@ impl ChatServer {
             AdminCommand::LastTelemetry { target } => {
                 need(permissions::MANAGE_USERS)?;
                 let user_id = self.resolve_target(&target)?;
-                Ok(AdminOutcome::Telemetry(self.last_telemetry.get(&user_id).map(
-                    |(ts, line)| protocol::TelemetrySummary {
-                        ts: *ts,
-                        line: line.clone(),
-                    },
-                )))
+                Ok(AdminOutcome::Telemetry(
+                    self.last_telemetry.get(&user_id).map(|(ts, line)| {
+                        protocol::TelemetrySummary {
+                            ts: *ts,
+                            line: line.clone(),
+                        }
+                    }),
+                ))
             }
         }
     }
@@ -657,7 +664,8 @@ impl ChatServer {
             self.remove_session(session, RemovedKind::Kicked, reason, actor_name);
         }
         self.policy.keys.retain(|_, k| k.user_id != *user_id);
-        self.persist.send(Command::DeleteUserKeys { user_id: *user_id });
+        self.persist
+            .send(Command::DeleteUserKeys { user_id: *user_id });
         let roles: Vec<RoleId> = self
             .policy
             .users
@@ -818,11 +826,7 @@ impl ChatServer {
             self.check_target(actor, &owner)?;
         }
         let now = self.wall_now();
-        let added_at = self
-            .policy
-            .keys
-            .get(key_hash)
-            .map_or(now, |k| k.added_at);
+        let added_at = self.policy.keys.get(key_hash).map_or(now, |k| k.added_at);
         self.policy.keys.insert(
             *key_hash,
             KeyRecord {
@@ -902,7 +906,11 @@ impl ChatServer {
             b.client_id
                 .is_some()
                 .cmp(&a.client_id.is_some())
-                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                .then_with(|| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                })
         });
         users
     }

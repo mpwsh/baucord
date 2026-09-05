@@ -15,11 +15,11 @@ use std::{
     net::IpAddr,
 };
 
+pub use protocol::RestrictionKind;
 use protocol::{
     permissions::{self, Rank, RoleId, BUILTIN_ROLES, RANK_GUEST, ROLE_GUEST},
     InviteInvalidReason, UserId,
 };
-pub use protocol::RestrictionKind;
 
 use crate::clock::WallMs;
 
@@ -243,10 +243,7 @@ impl Policy {
         code: &str,
         now: WallMs,
     ) -> Result<&InviteRecord, InviteInvalidReason> {
-        let invite = self
-            .invites
-            .get(code)
-            .ok_or(InviteInvalidReason::Unknown)?;
+        let invite = self.invites.get(code).ok_or(InviteInvalidReason::Unknown)?;
         if invite.revoked_at.is_some() {
             return Err(InviteInvalidReason::Revoked);
         }
@@ -403,7 +400,9 @@ pub fn generate_invite_code() -> String {
         // Rejection sampling keeps every symbol equally likely.
         let byte: u8 = rand::random();
         if usize::from(byte) < 8 * INVITE_ALPHABET.len() {
-            code.push(char::from(INVITE_ALPHABET[usize::from(byte) % INVITE_ALPHABET.len()]));
+            code.push(char::from(
+                INVITE_ALPHABET[usize::from(byte) % INVITE_ALPHABET.len()],
+            ));
         }
     }
     code
@@ -447,7 +446,10 @@ mod tests {
         p.grant_role(&id(1), ROLE_GUEST);
         assert_eq!(p.permissions_of(&id(1)), permissions::GUEST_PERMISSIONS);
         p.grant_role(&id(1), ROLE_ADMIN);
-        assert!(permissions::has(p.permissions_of(&id(1)), permissions::ADMIN));
+        assert!(permissions::has(
+            p.permissions_of(&id(1)),
+            permissions::ADMIN
+        ));
         assert!(p.has_admin());
         assert_eq!(p.rank_of(&id(1)), protocol::permissions::RANK_ADMIN);
     }
@@ -539,7 +541,10 @@ mod tests {
         p.grant_role(&id(2), ROLE_GUEST);
         assert!(p.name_held_by_member("alice", &id(3)), "case-insensitive");
         assert!(!p.name_held_by_member("alice", &id(1)), "your own name");
-        assert!(!p.name_held_by_member("bob", &id(3)), "guests reserve nothing");
+        assert!(
+            !p.name_held_by_member("bob", &id(3)),
+            "guests reserve nothing"
+        );
     }
 
     #[test]
@@ -552,7 +557,11 @@ mod tests {
             normalize_invite_code("k7fq-2mx9 abcd").as_deref(),
             Some("K7FQ2MX9ABCD")
         );
-        assert_eq!(normalize_invite_code("K7FQ2MX9ABC0"), None, "0 is not in the alphabet");
+        assert_eq!(
+            normalize_invite_code("K7FQ2MX9ABC0"),
+            None,
+            "0 is not in the alphabet"
+        );
         assert_eq!(normalize_invite_code("K7FQ2MX9ABC"), None, "too short");
         assert_ne!(generate_invite_code(), generate_invite_code());
     }

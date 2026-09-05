@@ -35,6 +35,10 @@ pub enum VoiceControl {
     },
     Stop,
     SetMuted(bool),
+    /// Transmit only while the key is held (the gate still applies).
+    SetPushToTalk(bool),
+    /// The push-to-talk key went down / came up.
+    PushToTalkHeld(bool),
     SetDeafened(bool),
     SetLoopback(bool),
     SetGateThreshold(f32),
@@ -183,6 +187,9 @@ struct VoiceLoopState {
     was_speaking: bool,
     /// Explicit mute set by the user (independent of deafen).
     user_muted: bool,
+    /// Push-to-talk mode: the mic is closed unless `ptt_held`.
+    ptt_mode: bool,
+    ptt_held: bool,
     running: bool,
     last_stats_log: Instant,
 }
@@ -194,6 +201,8 @@ impl VoiceLoopState {
             our_client_id: None,
             was_speaking: false,
             user_muted: false,
+            ptt_mode: false,
+            ptt_held: false,
             running: true,
             last_stats_log: Instant::now(),
         }
@@ -248,12 +257,14 @@ impl VoiceLoopState {
         let _ = network_tx.try_send(NetworkControl::TelemetryAudio(sample));
     }
 
-    /// Whether the mic should be muted — true if either user-muted or deafened.
+    /// Whether the mic should be muted: user-muted, deafened, or in
+    /// push-to-talk mode with the key up.
     fn effective_mute(&self) -> bool {
+        let ptt_closed = self.ptt_mode && !self.ptt_held;
         if let Some(v) = &self.vc {
-            self.user_muted || v.is_deafened()
+            self.user_muted || ptt_closed || v.is_deafened()
         } else {
-            self.user_muted
+            self.user_muted || ptt_closed
         }
     }
 
@@ -277,6 +288,12 @@ impl VoiceLoopState {
                         self.vc = Some(voice);
                         self.was_speaking = false;
                         self.user_muted = false;
+                        self.ptt_held = false;
+                        // A fresh engine starts open; push-to-talk
+                        // closes it until the key is held.
+                        if let Some(v) = &self.vc {
+                            v.set_muted(self.effective_mute());
+                        }
                         event_tx.send(VoiceEvent::Started).ok();
                         wake();
                         info!("Voice started for client {id:?}");
@@ -298,6 +315,19 @@ impl VoiceLoopState {
             }
             VoiceControl::SetMuted(muted) => {
                 self.user_muted = muted;
+                if let Some(v) = &self.vc {
+                    v.set_muted(self.effective_mute());
+                }
+            }
+            VoiceControl::SetPushToTalk(on) => {
+                self.ptt_mode = on;
+                self.ptt_held = false;
+                if let Some(v) = &self.vc {
+                    v.set_muted(self.effective_mute());
+                }
+            }
+            VoiceControl::PushToTalkHeld(held) => {
+                self.ptt_held = held;
                 if let Some(v) = &self.vc {
                     v.set_muted(self.effective_mute());
                 }

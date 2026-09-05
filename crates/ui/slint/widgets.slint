@@ -5,7 +5,7 @@
 // plain Rectangles with width bindings — the custom-draw code the FLTK
 // build needed is gone.
 
-import { Icon, IconDisplay } from "@lucide";
+import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 
 // ── Buttons ─────────────────────────────────────────────────────────────
@@ -56,6 +56,10 @@ export component Btn inherits Rectangle {
 export component IconBtn inherits Rectangle {
     in property <Icon> icon;
     in property <string> tooltip;
+    /// Show the tip under the button, ending at its right edge (for
+    /// buttons in a top-right corner, where above and centered would
+    /// leave the window).
+    in property <bool> tooltip-below: false;
     in property <bool> active: false;
     in property <bool> active-danger: false;
     in property <length> size: 40px;
@@ -85,8 +89,8 @@ export component IconBtn inherits Rectangle {
     }
 
     if touch.has-hover && tooltip != "" : Rectangle {
-        y: -28px;
-        x: (root.width - self.width) / 2;
+        y: root.tooltip-below ? root.height + 6px : -28px;
+        x: root.tooltip-below ? root.width - self.width : (root.width - self.width) / 2;
         height: 22px;
         width: tip.preferred-width + 16px;
         border-radius: Theme.radius-sm;
@@ -296,6 +300,69 @@ export component GateMeter inherits Rectangle {
         width: 2px;
         height: root.height - 2px;
         background: Theme.danger;
+    }
+}
+
+// ── Check row ───────────────────────────────────────────────────────────
+
+/// A labelled checkbox: the whole row toggles, the box shows the
+/// state, an optional hint sits under the label.
+export component CheckRow inherits Rectangle {
+    in-out property <bool> checked: false;
+    in property <string> text;
+    in property <string> hint;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    height: body.preferred-height + 2 * Theme.gap-xs;
+    // Concentric with the box: 4px box radius + 4px padding.
+    border-radius: 8px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: 150ms; }
+
+    body := HorizontalLayout {
+        padding: Theme.gap-xs;
+        spacing: Theme.gap-sm;
+        Rectangle {
+            width: 18px;
+            box := Rectangle {
+                y: 2px;
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                background: root.checked ? Theme.accent : Theme.surface;
+                border-width: 1px;
+                border-color: root.checked ? Theme.accent : Theme.border;
+                animate background, border-color { duration: 150ms; }
+                if root.checked : IconDisplay {
+                    icon: IconSet.Check;
+                    size: 14px;
+                    stroke: Theme.on-accent;
+                }
+            }
+        }
+        VerticalLayout {
+            spacing: 2px;
+            Text {
+                text: root.text;
+                color: Theme.text-primary;
+                font-size: Theme.font-body;
+            }
+            if root.hint != "" : Text {
+                text: root.hint;
+                color: Theme.text-muted;
+                font-size: Theme.font-xs;
+                wrap: word-wrap;
+            }
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
     }
 }
 

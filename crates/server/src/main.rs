@@ -429,7 +429,10 @@ fn db_check(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     println!("{} — {:.1} MB", db.display(), megabytes(report.file_bytes));
     match report.schema_version {
         Some(v) if v <= report.supported_version => {
-            println!("schema version {v} (this build: {})", report.supported_version);
+            println!(
+                "schema version {v} (this build: {})",
+                report.supported_version
+            );
         }
         Some(v) => println!(
             "schema version {v} — NEWER than this build ({}); this server will refuse to open it",
@@ -666,10 +669,17 @@ fn telemetry_command(
     let from = persistence_wall_now().saturating_sub(window);
     let lines = persistence::cli_telemetry(&db, &user, from, last)?;
     if lines.is_empty() {
-        println!("no telemetry from {} in that window", policy.users[&user].name);
+        println!(
+            "no telemetry from {} in that window",
+            policy.users[&user].name
+        );
         return Ok(());
     }
-    println!("{} — {} sample(s), oldest first:", policy.users[&user].name, lines.len());
+    println!(
+        "{} — {} sample(s), oldest first:",
+        policy.users[&user].name,
+        lines.len()
+    );
     for l in lines {
         println!(
             "{}  rtt {:>4} ms  loss {:>5.1}%  voice {}  behind {}  rung {}  in '{}'  out '{}'",
@@ -678,7 +688,8 @@ fn telemetry_command(
             l.path_loss,
             l.voice_loss
                 .map_or_else(|| "  -  ".to_string(), |v| format!("{v:>5.1}%")),
-            l.groups_behind.map_or_else(|| "-".to_string(), |g| g.to_string()),
+            l.groups_behind
+                .map_or_else(|| "-".to_string(), |g| g.to_string()),
             l.rung.map_or_else(|| "-".to_string(), |r| format!("{r}%")),
             l.input_device.as_deref().unwrap_or("?"),
             l.output_device.as_deref().unwrap_or("?"),
@@ -701,18 +712,15 @@ fn restriction_command(
                 return Ok(());
             }
             for r in &policy.restrictions {
-                let who = r
-                    .user_id
-                    .and_then(|u| policy.users.get(&u))
-                    .map_or_else(
-                        || {
-                            r.key_hash.map_or_else(
-                                || r.ip.map_or("?".to_string(), |ip| ip.to_string()),
-                                |k| format!("key {}", persistence::hex(&k[..8])),
-                            )
-                        },
-                        |u| u.name.clone(),
-                    );
+                let who = r.user_id.and_then(|u| policy.users.get(&u)).map_or_else(
+                    || {
+                        r.key_hash.map_or_else(
+                            || r.ip.map_or("?".to_string(), |ip| ip.to_string()),
+                            |k| format!("key {}", persistence::hex(&k[..8])),
+                        )
+                    },
+                    |u| u.name.clone(),
+                );
                 println!(
                     "{:<4} {:<8} {:<24} {:<18} {}",
                     r.id,

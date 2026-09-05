@@ -116,7 +116,9 @@ pub enum AdminCommand {
     },
     /// Remove a restriction by id (needs `RESTRICT`, or `MUTE` for a
     /// `voice` one).
-    Lift { restriction_id: u64 },
+    Lift {
+        restriction_id: u64,
+    },
     /// Remove every restriction of `kind` on a user (`/unmute`). Same
     /// permission as `Restrict`.
     Unmute {
@@ -124,11 +126,17 @@ pub enum AdminCommand {
         kind: RestrictionKind,
     },
     /// Close the session; access unchanged (needs `DISCONNECT`).
-    Disconnect { target: AdminTarget, reason: String },
+    Disconnect {
+        target: AdminTarget,
+        reason: String,
+    },
     /// Close the session and forget the person's device keys and
     /// roles: they need a new invite to come back, and start over as
     /// whatever it grants (needs `KICK`). Nothing to lift.
-    Kick { target: AdminTarget, reason: String },
+    Kick {
+        target: AdminTarget,
+        reason: String,
+    },
     /// Close the session and block the user, their key and their
     /// address until `duration_secs` runs out or `Unban` (needs `BAN`).
     Ban {
@@ -137,25 +145,43 @@ pub enum AdminCommand {
         reason: String,
     },
     /// Remove every `server` restriction on a user (needs `BAN`).
-    Unban { target: AdminTarget },
+    Unban {
+        target: AdminTarget,
+    },
     /// Put a user in another voice channel (needs `MANAGE_CHANNELS`).
-    MoveUser { target: AdminTarget, channel_id: u16 },
+    MoveUser {
+        target: AdminTarget,
+        channel_id: u16,
+    },
     /// Stop a code from admitting anyone else (needs `MANAGE_INVITES`).
-    RevokeInvite { code: String },
+    RevokeInvite {
+        code: String,
+    },
     /// Attach a device key to a user — a retired key, or one seen in the
     /// log (needs `MANAGE_USERS`).
-    LinkKey { target: AdminTarget, key_hash: UserId },
+    LinkKey {
+        target: AdminTarget,
+        key_hash: UserId,
+    },
     /// Retire a device key: that device is refused until re-linked
     /// (needs `MANAGE_USERS`).
-    UnlinkKey { key_hash: UserId },
+    UnlinkKey {
+        key_hash: UserId,
+    },
     /// Remove anyone's message (needs `RESTRICT`).
-    DeleteMessage { msg_id: u64 },
+    DeleteMessage {
+        msg_id: u64,
+    },
     /// Delete a person: their row, keys, roles, restrictions, progress
     /// and messages. The audit keeps a line (needs `MANAGE_USERS`).
-    PurgeUser { target: AdminTarget },
+    PurgeUser {
+        target: AdminTarget,
+    },
     /// The last telemetry sample a user sent, summarized (needs
     /// `MANAGE_USERS`): what the roster tooltip shows.
-    LastTelemetry { target: AdminTarget },
+    LastTelemetry {
+        target: AdminTarget,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -31,10 +31,34 @@ export global Tr {
     in property <string> disconnect: "Disconnect";
     in property <string> live: "LIVE";
 
-    // Per-user popover
+    // Per-user popover and roster menu
     in property <string> user-volume: "User volume";
     in property <string> watch-stream: "Watch stream";
     in property <string> reset-audio: "Reset audio";
+    in property <string> menu-volume: "Volume…";
+    in property <string> menu-mute-for-me: "Mute for me";
+    in property <string> menu-unmute-for-me: "Unmute for me";
+    in property <string> menu-role: "Role";
+    in property <string> menu-move-to: "Move to";
+    in property <string> menu-channel-kick: "Send to the default channel";
+    in property <string> menu-mute: "Mute";
+    in property <string> menu-mute-voice: "Voice…";
+    in property <string> menu-mute-chat: "Chat…";
+    in property <string> menu-unmute-voice: "Unmute voice";
+    in property <string> menu-unmute-chat: "Unmute chat";
+    in property <string> menu-disconnect: "Disconnect…";
+    in property <string> menu-kick: "Kick…";
+    in property <string> menu-ban: "Ban…";
+    in property <string> role-guest: "Guest";
+    in property <string> role-member: "Member";
+    in property <string> role-organizer: "Organizer";
+    in property <string> role-admin: "Admin";
+
+    // Moderation dialog
+    in property <string> moderation-duration: "Duration";
+    in property <string> moderation-reason: "Reason";
+    in property <string> moderation-reason-placeholder: "Optional — shown to them and kept in the log";
+    in property <string> server-not-persistent-note: "This server does not save changes. Roles, bans and invites last until it restarts.";
 
     // Chat
     in property <string> send: "Send";
@@ -42,6 +66,25 @@ export global Tr {
 
     // Voice channels
     in property <string> channel-password-title: "Channel password";
+    in property <string> channel-join: "Join channel";
+    in property <string> channel-new: "New channel";
+    in property <string> channel-name: "Name";
+    in property <string> channel-name-placeholder: "Up to 40 characters";
+    in property <string> channel-password-placeholder: "Optional";
+    in property <string> channel-limit: "User limit";
+    in property <string> channel-limit-placeholder: "No limit";
+    in property <string> channel-afk: "AFK after (minutes)";
+    in property <string> channel-afk-placeholder: "Server default";
+    in property <string> channel-keep: "Keep this channel";
+    in property <string> channel-keep-hint: "Otherwise it is removed after standing empty for a while.";
+    in property <string> channel-members-only: "Members only";
+    in property <string> channel-members-only-hint: "Guests do not see it and cannot join.";
+    in property <string> channel-create: "Create channel";
+    in property <string> channel-save: "Save changes";
+    in property <string> channel-not-persistent-note: "This server does not save channels: it lasts until the server restarts.";
+    in property <string> menu-channel-edit: "Edit channel…";
+    in property <string> menu-channel-delete: "Delete channel…";
+    in property <string> menu-channel-config-owned: "Set in the server's config file";
     in property <string> share-visibility: "Visible to";
     in property <string> share-channel-only: "My channel";
     in property <string> share-everyone: "Everyone";
@@ -53,10 +96,20 @@ export global Tr {
     in property <string> menu-copy: "Copy";
     in property <string> menu-paste: "Paste";
     in property <string> menu-copy-message: "Copy message";
+    in property <string> menu-select-text: "Select text";
+    in property <string> menu-show-formatting: "Show formatting";
     in property <string> menu-copy-link: "Copy link";
     in property <string> menu-open-link: "Open link";
     in property <string> menu-save-image: "Save image…";
     in property <string> menu-open-image: "Open image";
+    in property <string> chat-edited-mark: "(edited)";
+    in property <string> chat-deleted-placeholder: "Message deleted";
+    in property <string> menu-edit-message: "Edit message";
+    in property <string> menu-delete-message: "Delete message";
+    in property <string> chat-editing: "Editing your message — Enter saves, Esc cancels";
+    in property <string> chat-load-earlier: "Load earlier messages";
+    in property <string> chat-loading: "Loading…";
+    in property <string> banner-not-persistent: "This server keeps nothing between restarts: roles, invites and bans last until it stops.";
 
     // Screen share dialog
     in property <string> monitor: "Monitor";
@@ -68,6 +121,7 @@ export global Tr {
 
     // Settings
     in property <string> settings-title: "Settings";
+    in property <string> tab-profile: "Profile";
     in property <string> tab-general: "General";
     in property <string> tab-audio: "Audio";
     in property <string> tab-keyboard: "Keyboard";
@@ -95,6 +149,51 @@ export global Tr {
     in property <string> identity-export: "Export";
     in property <string> identity-import: "Import";
     in property <string> identity-regenerate: "Regenerate";
+    in property <string> identity-regenerate-confirm: "Regenerate — new user, are you sure?";
+    in property <string> profile-lead: "How you appear to others.";
+    in property <string> profile-no-name: "No nickname yet";
+    in property <string> profile-nickname-hint: "Used from your next connection on.";
+    in property <string> profile-name-color: "Name color";
+    in property <string> profile-name-color-hint: "Every color here reads on the chat background. Gold is reserved for admins.";
+    in property <string> profile-name-style: "Name style";
+    in property <string> profile-avatar: "Avatar";
+    in property <string> profile-avatar-hint: "PNG, JPEG or WebP; cropped square and scaled to 128 × 128.";
+    in property <string> profile-avatar-choose: "Choose image…";
+    in property <string> profile-avatar-remove: "Remove";
+    in property <string> profile-note: "Kept on this device. Servers with profile support (1.1.2) will show it to everyone.";
+    in property <string> general-lead: "Language, text size, sounds and files.";
+    in property <string> text-size: "Text size";
+    in property <string> text-size-hint: "Applies everywhere, right away.";
+    in property <string> sounds-header: "Sounds";
+    in property <string> sounds-enabled: "Play sounds";
+    in property <string> sounds-enabled-hint: "Off silences everything below.";
+    in property <string> sounds-join-leave: "Someone joins or leaves your channel";
+    in property <string> sounds-mention: "A message names you";
+    in property <string> sounds-mention-hint: "Your nickname as a word, or @nickname. Off by default: the general chat can be busy. Ordinary messages never make a sound.";
+    in property <string> startup-header: "Startup";
+    in property <string> startup-auto-connect: "Connect to the default server on launch";
+    in property <string> startup-auto-connect-hint: "Needs a nickname; the connect screen is skipped.";
+    in property <string> startup-minimized: "Start in the tray";
+    in property <string> startup-minimized-hint: "The window stays hidden until you open it from the tray icon.";
+    in property <string> startup-check-updates: "Check for a new version at launch";
+    in property <string> startup-check-updates-hint: "Off, the app goes straight to the connect screen.";
+    in property <string> chat-header: "Chat";
+    in property <string> chat-show-timestamps: "Show the time on each message";
+    in property <string> chat-compact-rows: "Compact rows";
+    in property <string> chat-image-size: "Images you send";
+    in property <string> chat-image-size-hint: "Larger pictures are shrunk to fit. Servers cap uploads at 10 MB.";
+    in property <string> privacy-header: "Privacy";
+    in property <string> privacy-note: "While connected, a server sees your nickname, your key's id, your roles and level, which channel you are in, and every 10 seconds a telemetry line: round-trip time, packet loss, the names of your audio and video devices, your app version and operating system. Admins on that server can read the last line in the roster. Nothing goes anywhere else.";
+    in property <string> audio-transmission: "Transmission";
+    in property <string> audio-vad-hint: "Your voice is sent whenever it crosses the sensitivity below.";
+    in property <string> audio-ptt-hint: "Hold to talk:";
+    in property <string> audio-ptt-unbound: "No key bound yet — set one on the Keyboard tab.";
+    in property <string> ptt-tooltip: "Push to talk — hold";
+    in property <string> files-header: "Files";
+    in property <string> about-config-file: "Config file:";
+    in property <string> files-note: "Settings, the identity key and the avatar live in this folder.";
+    in property <string> servers-lead: "Saved servers; the default is the one the connect screen starts on.";
+    in property <string> audio-lead: "Devices, input gate and output level — every change applies live.";
     in property <string> identity-note: "This device's key is who you are on every server. Export it to be the same user on another machine; Import replaces this device's key; Regenerate makes a new one (a new user, invite needed).";
     in property <string> audio-devices-header: "Devices";
     in property <string> audio-input-device: "Input device";

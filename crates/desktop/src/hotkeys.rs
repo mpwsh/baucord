@@ -1,7 +1,7 @@
 // hotkeys.rs — Global hotkey registration and dispatch.
 //
-// Only Pressed events are forwarded — Released events are ignored so
-// the hotkeys act as toggles, not push-to-talk.
+// Both edges are forwarded with a `pressed` flag: the toggles act on
+// the press only, push-to-talk on both.
 //
 // Hotkeys are strictly optional: if the OS refuses to create a global
 // hotkey manager (common on Wayland, some remote sessions, etc.) the
@@ -90,16 +90,15 @@ impl HotkeyManager {
         self.register_all(settings);
     }
 
-    /// Poll for hotkey press events. Ignores releases.
+    /// Poll for a hotkey edge: `(action, pressed)`.
     ///
     /// Reads our own channel (see [`event_channel`]) — with an event
     /// handler installed, the crate's built-in receiver never fires.
-    pub fn poll(&self) -> Option<BindableAction> {
+    pub fn poll(&self) -> Option<(BindableAction, bool)> {
         if let Ok(event) = event_channel().1.try_recv()
-            && event.state() == HotKeyState::Pressed
             && let Some(&action) = self.bindings.get(&event.id())
         {
-            return Some(action);
+            return Some((action, event.state() == HotKeyState::Pressed));
         }
         None
     }

@@ -52,7 +52,11 @@ mod tests {
             normalize_code("k7fq-2mx9 abcd").as_deref(),
             Some("K7FQ2MX9ABCD")
         );
-        assert_eq!(normalize_code("K7FQ2MX9ABC0"), None, "0 is not in the alphabet");
+        assert_eq!(
+            normalize_code("K7FQ2MX9ABC0"),
+            None,
+            "0 is not in the alphabet"
+        );
         assert_eq!(normalize_code("K7FQ2MX9ABC"), None, "too short");
         assert_eq!(normalize_code(""), None);
     }
@@ -60,7 +64,10 @@ mod tests {
     #[test]
     fn display_form_groups_by_four_and_normalizes_back() {
         assert_eq!(display_code("K7FQ2MX9ABCD"), "K7FQ-2MX9-ABCD");
-        assert_eq!(normalize_code("K7FQ-2MX9-ABCD").as_deref(), Some("K7FQ2MX9ABCD"));
+        assert_eq!(
+            normalize_code("K7FQ-2MX9-ABCD").as_deref(),
+            Some("K7FQ2MX9ABCD")
+        );
         assert_eq!(display_code(""), "");
     }
 }

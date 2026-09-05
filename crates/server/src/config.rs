@@ -601,7 +601,9 @@ mod tests {
 
     #[test]
     fn defaults_pass_policy_validation() {
-        Config::default().validate_policy().expect("defaults are valid");
+        Config::default()
+            .validate_policy()
+            .expect("defaults are valid");
     }
 
     #[test]
@@ -634,7 +636,10 @@ mod tests {
         config.user_channels.max_per_user = 3;
         config.limits.chat.burst = 9;
         let yaml = serde_yaml::to_string(&config).expect("serialize");
-        assert!(!yaml.contains("write_queue"), "tuning knob must stay out of the file");
+        assert!(
+            !yaml.contains("write_queue"),
+            "tuning knob must stay out of the file"
+        );
         let back: Config = serde_yaml::from_str(&yaml).expect("parse");
         assert!(!back.persistence.enabled);
         assert_eq!(back.persistence.history.replay, 25);

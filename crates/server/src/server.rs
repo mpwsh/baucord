@@ -481,7 +481,9 @@ impl ChatServer {
             created_by,
             "invite.create",
             Some(code.clone()),
-            Some(format!("role {role}, max_uses {max_uses:?}, ttl_ms {ttl_ms:?}")),
+            Some(format!(
+                "role {role}, max_uses {max_uses:?}, ttl_ms {ttl_ms:?}"
+            )),
         );
         Ok((code, invite))
     }
@@ -491,7 +493,8 @@ impl ChatServer {
     /// removes it at once. Returns the stored restriction (with id).
     pub fn restrict(&mut self, restriction: Restriction, by_name: &str) -> Restriction {
         let stored = self.policy.add_restriction(restriction);
-        self.persist.send(Command::InsertRestriction(stored.clone()));
+        self.persist
+            .send(Command::InsertRestriction(stored.clone()));
         self.audit(
             stored.by,
             "restrict",
@@ -499,7 +502,10 @@ impl ChatServer {
                 .user_id
                 .map(|u| hex(&u[..8]))
                 .or_else(|| stored.key_hash.map(|k| hex(&k[..8]))),
-            Some(format!("{:?} until {:?}: {}", stored.kind, stored.until, stored.reason)),
+            Some(format!(
+                "{:?} until {:?}: {}",
+                stored.kind, stored.until, stored.reason
+            )),
         );
         if stored.kind == RestrictionKind::Server {
             // An address or key match can reach people the actor never
@@ -594,7 +600,13 @@ impl ChatServer {
 
     /// Lift a restriction by id. A live session it applied to is told.
     pub fn lift_restriction(&mut self, id: u64, by: Option<UserId>) -> bool {
-        let Some(gone) = self.policy.restrictions.iter().find(|r| r.id == id).cloned() else {
+        let Some(gone) = self
+            .policy
+            .restrictions
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+        else {
             return false;
         };
         self.policy.remove_restriction(id);
@@ -894,7 +906,10 @@ impl ChatServer {
         };
 
         // Bans before anything else (spec §3.2): by user, key or address.
-        if let Some(ban) = self.policy.server_ban(known_user.as_ref(), &key_hash, ip, now) {
+        if let Some(ban) = self
+            .policy
+            .server_ban(known_user.as_ref(), &key_hash, ip, now)
+        {
             let reason = RefusedReason::Banned {
                 until: ban.until,
                 reason: ban.reason.clone(),
@@ -1020,7 +1035,8 @@ impl ChatServer {
                 .invites
                 .get(code)
                 .map_or(policy::default_invite_role(), |i| i.grants_role);
-            self.policy.create_user(user_id, &username, now, Some(code.clone()));
+            self.policy
+                .create_user(user_id, &username, now, Some(code.clone()));
             self.policy.link_key(key_hash, user_id, now);
             self.policy.grant_role(&user_id, role);
             self.policy.use_invite(code);
@@ -1150,7 +1166,8 @@ impl ChatServer {
                 },
             );
         }
-        self.driver.close_after(self.now, client, REFUSED_CLOSE_DELAY);
+        self.driver
+            .close_after(self.now, client, REFUSED_CLOSE_DELAY);
         self.handle_client_disconnected(client, &DisconnectReason::LocallyClosed);
     }
 
@@ -1969,13 +1986,14 @@ impl ChatServer {
                     && let Some(key_hash) = self.key_of.get(&client_id).copied()
                     && let Some(encoded) = protocol::encode_telemetry_event(&event)
                 {
-                    self.persist.send(Command::TelemetryEvent(TelemetryEventRow {
-                        ts: self.clock.wall_ms(self.now),
-                        user_id,
-                        key_hash,
-                        kind: event_kind(&event).to_string(),
-                        event: encoded,
-                    }));
+                    self.persist
+                        .send(Command::TelemetryEvent(TelemetryEventRow {
+                            ts: self.clock.wall_ms(self.now),
+                            user_id,
+                            key_hash,
+                            kind: event_kind(&event).to_string(),
+                            event: encoded,
+                        }));
                 }
             }
             ClientMessage::LogUploadChunk {

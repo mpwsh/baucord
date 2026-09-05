@@ -32,28 +32,53 @@ import { IconBtn } from "widgets.slint";
 
 component MessageRow inherits Rectangle {
     in property <ChatRow> data;
-    height: cell.height + 8px;
+    /// StyledText cannot be selected with the mouse, so a styled row
+    /// can be switched to its selectable plain view (menu, or a
+    /// double-click on the text) and back.
+    in property <bool> select-mode: false;
+    callback select-requested(bool);
+    height: cell.height + (State.compact-rows ? 3px : 8px);
+
+    // Which view is up: the selectable input for plain rows and for
+    // styled rows in select mode, the StyledText otherwise.
+    property <bool> plain-view: !data.styled || root.select-mode;
 
     ContextMenuArea {
+        enabled: !data.deleted;
         Menu {
             MenuItem {
                 title: Tr.menu-copy-message;
                 activated => { Logic.copy-text(data.body); }
             }
+            if data.styled : MenuItem {
+                title: root.select-mode ? Tr.menu-show-formatting : Tr.menu-select-text;
+                activated => { root.select-requested(!root.select-mode); }
+            }
+            // Only the author edits; the author or a moderator deletes
+            // (the server checks both; this only mirrors it).
+            if data.own || State.perm-delete-any : MenuSeparator { }
+            if data.own : MenuItem {
+                title: Tr.menu-edit-message;
+                activated => { Logic.row-edit(data.msg-id-lo, data.msg-id-hi); }
+            }
+            if data.own || State.perm-delete-any : MenuItem {
+                title: Tr.menu-delete-message;
+                activated => { Logic.row-delete(data.msg-id-lo, data.msg-id-hi); }
+            }
         }
         HorizontalLayout {
             padding-left: Theme.gap-sm;
             padding-right: Theme.gap-sm;
-            padding-top: 4px;
+            padding-top: State.compact-rows ? 1px : 4px;
             spacing: Theme.gap-sm;
-            Text {
+            if State.show-timestamps : Text {
                 text: "[\{data.ts}]";
                 color: Theme.text-muted;
                 font-size: Theme.font-sm;
             }
             Text {
                 text: data.user;
-                color: Theme.accent;
+                color: Theme.accent-text;
                 font-size: Theme.font-body;
                 font-weight: 700;
             }
@@ -62,16 +87,24 @@ component MessageRow inherits Rectangle {
             // (inline bold/italic/code — not selectable, but the
             // right-click Copy still grabs the raw text). Both live in
             // one stretch cell; `visible` picks the active one and the
-            // cell tracks its height.
+            // cell tracks its height. A deleted message keeps its
+            // header and shows a muted placeholder instead.
             cell := Rectangle {
                 horizontal-stretch: 1;
-                height: data.styled ? styled-body.preferred-height : body.preferred-height;
+                height: data.deleted ? gone.preferred-height
+                    : root.plain-view ? body.preferred-height
+                    : styled-body.preferred-height;
+                // Under the StyledText: a double-click on the text
+                // (off a link) switches to the selectable view.
+                if data.styled && !root.select-mode : TouchArea {
+                    double-clicked => { root.select-requested(true); }
+                }
                 body := TextInput {
                     x: 0;
                     y: 0;
                     width: 100%;
-                    visible: !data.styled;
-                    text: data.body;
+                    visible: root.plain-view && !data.deleted;
+                    text: data.edited ? "\{data.body} \{Tr.chat-edited-mark}" : data.body;
                     read-only: true;
                     single-line: false;
                     color: Theme.text-secondary;
@@ -79,18 +112,46 @@ component MessageRow inherits Rectangle {
                     wrap: word-wrap;
                     selection-background-color: Theme.accent;
                     selection-foreground-color: Theme.on-accent;
+                    // A key on a read-only row: printable characters go
+                    // to the composer (see Logic.type-through); the
+                    // rest (⌘C, arrows) stays here for the selection.
+                    key-pressed(ev) => {
+                        if (!ev.modifiers.control && !ev.modifiers.meta && !ev.modifiers.alt
+                            && ev.text != "") {
+                            Logic.type-through(ev.text);
+                            return accept;
+                        }
+                        reject
+                    }
                 }
                 styled-body := StyledText {
                     x: 0;
                     y: 0;
                     width: 100%;
-                    visible: data.styled;
+                    visible: !root.plain-view && !data.deleted;
                     text: data.body-styled;
                     default-color: Theme.text-secondary;
                     default-font-size: Theme.font-body;
-                    link-color: Theme.accent;
+                    link-color: Theme.accent-text;
                     link-clicked(url) => { Logic.link-clicked(url); }
                 }
+                gone := Text {
+                    x: 0;
+                    y: 0;
+                    width: 100%;
+                    visible: data.deleted;
+                    text: Tr.chat-deleted-placeholder;
+                    color: Theme.text-muted;
+                    font-size: Theme.font-body;
+                    font-italic: true;
+                }
+            }
+            // The mark for a styled body: StyledText is pre-parsed,
+            // so it is appended as a sibling rather than into the text.
+            if data.edited && !root.plain-view && !data.deleted : Text {
+                text: Tr.chat-edited-mark;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
             }
         }
     }
@@ -99,16 +160,33 @@ component MessageRow inherits Rectangle {
 component SystemRow inherits Rectangle {
     in property <ChatRow> data;
     height: body.preferred-height + 6px;
+    // Read-only input rather than Text: an invite code or a server
+    // notice is something people select and copy.
     HorizontalLayout {
         padding-left: Theme.gap-sm;
         padding-right: Theme.gap-sm;
         padding-top: 3px;
-        body := Text {
+        body := TextInput {
             text: data.body;
+            read-only: true;
+            single-line: false;
             color: Theme.text-muted;
             font-size: Theme.font-sm;
             font-italic: true;
             wrap: word-wrap;
+            selection-background-color: Theme.accent;
+            selection-foreground-color: Theme.on-accent;
+            // A key on a read-only row: printable characters go
+            // to the composer (see Logic.type-through); the
+            // rest (⌘C, arrows) stays here for the selection.
+            key-pressed(ev) => {
+                if (!ev.modifiers.control && !ev.modifiers.meta && !ev.modifiers.alt
+                    && ev.text != "") {
+                    Logic.type-through(ev.text);
+                    return accept;
+                }
+                reject
+            }
         }
     }
 }
@@ -122,6 +200,15 @@ component CodeRow inherits Rectangle {
                 title: Tr.menu-copy;
                 activated => { Logic.copy-text(data.body); }
             }
+            if data.own || State.perm-delete-any : MenuSeparator { }
+            if data.own : MenuItem {
+                title: Tr.menu-edit-message;
+                activated => { Logic.row-edit(data.msg-id-lo, data.msg-id-hi); }
+            }
+            if data.own || State.perm-delete-any : MenuItem {
+                title: Tr.menu-delete-message;
+                activated => { Logic.row-delete(data.msg-id-lo, data.msg-id-hi); }
+            }
         }
         VerticalLayout {
             padding-left: Theme.gap-sm;
@@ -131,8 +218,8 @@ component CodeRow inherits Rectangle {
             // Same sender header the image rows carry.
             HorizontalLayout {
                 spacing: Theme.gap-sm;
-                Text { text: "[\{data.ts}]"; color: Theme.text-muted; font-size: Theme.font-sm; }
-                Text { text: data.user; color: Theme.accent; font-size: Theme.font-body; font-weight: 700; }
+                if State.show-timestamps : Text { text: "[\{data.ts}]"; color: Theme.text-muted; font-size: Theme.font-sm; }
+                Text { text: data.user; color: Theme.accent-text; font-size: Theme.font-body; font-weight: 700; }
                 Rectangle { }
             }
             panel := Rectangle {
@@ -157,6 +244,17 @@ component CodeRow inherits Rectangle {
                     font-size: Theme.font-sm;
                     selection-background-color: Theme.accent;
                     selection-foreground-color: Theme.on-accent;
+                    // A key on a read-only row: printable characters go
+                    // to the composer (see Logic.type-through); the
+                    // rest (⌘C, arrows) stays here for the selection.
+                    key-pressed(ev) => {
+                        if (!ev.modifiers.control && !ev.modifiers.meta && !ev.modifiers.alt
+                            && ev.text != "") {
+                            Logic.type-through(ev.text);
+                            return accept;
+                        }
+                        reject
+                    }
                 }
             }
         }
@@ -195,8 +293,8 @@ component ImageRow inherits Rectangle {
             spacing: 4px;
             HorizontalLayout {
                 spacing: Theme.gap-sm;
-                Text { text: "[\{data.ts}]"; color: Theme.text-muted; font-size: Theme.font-sm; }
-                Text { text: data.user; color: Theme.accent; font-size: Theme.font-body; font-weight: 700; }
+                if State.show-timestamps : Text { text: "[\{data.ts}]"; color: Theme.text-muted; font-size: Theme.font-sm; }
+                Text { text: data.user; color: Theme.accent-text; font-size: Theme.font-body; font-weight: 700; }
                 Rectangle { }
             }
             HorizontalLayout {
@@ -237,6 +335,7 @@ component ComposerField inherits Rectangle {
     callback edited;
     public function focus-input() { input.focus(); }
     public function set-cursor(pos: int) { input.set-selection-offsets(pos, pos); }
+    public function select-all() { input.select-all(); }
     public function do-cut() { input.cut(); }
     public function do-copy() { input.copy(); }
     public function do-paste() { input.paste(); }
@@ -304,10 +403,75 @@ export component ChatPane inherits Rectangle {
     // Maintained by the ListView's changed-handlers below; also drives
     // the jump-to-latest button.
     private property <bool> stick-to-bottom: true;
+    /// The one styled row currently shown as selectable plain text.
+    private property <int> selecting-row: -1;
 
     col := VerticalLayout {
         padding: Theme.gap-md;
         spacing: Theme.gap-sm;
+
+        // Standing notice on a memory-mode server (spec §1.1): what
+        // is decided here lasts until the server restarts.
+        if !State.server-persistent : Rectangle {
+            height: banner.preferred-height + 2 * Theme.gap-sm;
+            border-radius: Theme.radius-sm;
+            background: Theme.warning.with-alpha(0.12);
+            border-width: 1px;
+            border-color: Theme.warning.with-alpha(0.5);
+            HorizontalLayout {
+                padding-left: Theme.gap-md;
+                padding-right: Theme.gap-md;
+                spacing: Theme.gap-sm;
+                Rectangle {
+                    width: 14px;
+                    IconDisplay {
+                        icon: IconSet.TriangleAlert;
+                        size: 14px;
+                        stroke: Theme.warning;
+                    }
+                }
+                banner := Text {
+                    text: Tr.banner-not-persistent;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        // "Load earlier": appears once the reader reaches the top and
+        // the server said older pages exist; the page is put in front.
+        if State.history-more && list.viewport-y >= -2px : Rectangle {
+            height: 28px;
+            border-radius: Theme.radius-sm;
+            background: le.has-hover && !State.history-loading ? Theme.hover : transparent;
+            animate background { duration: 150ms; }
+            HorizontalLayout {
+                alignment: center;
+                spacing: Theme.gap-xs;
+                Rectangle {
+                    width: 14px;
+                    IconDisplay {
+                        icon: State.history-loading ? IconSet.LoaderCircle : IconSet.History;
+                        size: 14px;
+                        stroke: Theme.text-secondary;
+                    }
+                }
+                Text {
+                    text: State.history-loading ? Tr.chat-loading : Tr.chat-load-earlier;
+                    color: State.history-loading ? Theme.text-muted : Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    vertical-alignment: center;
+                }
+            }
+            le := TouchArea {
+                enabled: !State.history-loading;
+                mouse-cursor: pointer;
+                clicked => { Logic.load-earlier(); }
+            }
+        }
 
         list := ListView {
             vertical-stretch: 1;
@@ -354,10 +518,50 @@ export component ChatPane inherits Rectangle {
                     : row.kind == 1 ? sys.height
                     : row.kind == 2 ? img.height
                     : cod.height;
-                msg := MessageRow { data: row; visible: row.kind == 0; }
+                msg := MessageRow {
+                    data: row;
+                    visible: row.kind == 0;
+                    select-mode: root.selecting-row == row.row-id;
+                    select-requested(on) => { root.selecting-row = on ? row.row-id : -1; }
+                }
                 sys := SystemRow  { data: row; visible: row.kind == 1; }
                 img := ImageRow   { data: row; visible: row.kind == 2; }
                 cod := CodeRow    { data: row; visible: row.kind == 3; }
+            }
+        }
+
+        // Editing one of our messages: say so, and give Escape a
+        // visible way out.
+        if State.editing : Rectangle {
+            height: 26px;
+            border-radius: Theme.radius-sm;
+            background: Theme.bg-secondary;
+            HorizontalLayout {
+                padding-left: Theme.gap-sm;
+                padding-right: 2px;
+                spacing: Theme.gap-xs;
+                Rectangle {
+                    width: 14px;
+                    IconDisplay {
+                        icon: IconSet.Pencil;
+                        size: 14px;
+                        stroke: Theme.accent;
+                    }
+                }
+                Text {
+                    text: Tr.chat-editing;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                IconBtn {
+                    size: 22px;
+                    icon-size: 14px;
+                    icon: IconSet.X;
+                    clicked => { Logic.edit-cancel(); }
+                }
             }
         }
 
@@ -398,6 +602,10 @@ export component ChatPane inherits Rectangle {
                         Logic.send-message();
                         return accept;
                     }
+                    if (ev.text == Key.Escape && State.editing) {
+                        Logic.edit-cancel();
+                        return accept;
+                    }
                     // Deterministic Shift+Enter: splice the newline
                     // ourselves (platforms disagree on whether a
                     // shifted Return reaches the TextInput's insert
@@ -406,25 +614,53 @@ export component ChatPane inherits Rectangle {
                         Logic.composer-newline(input.cursor-offset, input.anchor-offset);
                         return accept;
                     }
+                    // Select all, explicitly: ⌘A on macOS (Slint reports
+                    // ⌘ as `control` there) and Ctrl+A elsewhere. Handled
+                    // here rather than left to the input so it cannot
+                    // depend on which shortcut table the input consults.
+                    if (ev.modifiers.control && !ev.modifiers.meta && !ev.modifiers.alt
+                        && (ev.text == "a" || ev.text == "A")) {
+                        input.select-all();
+                        return accept;
+                    }
                     // macOS line navigation (Ctrl+A / Ctrl+E, like
                     // every NSTextView). Slint swaps Apple modifiers —
                     // Cmd arrives as `control`, the physical Ctrl key
                     // as `meta` — so the physical-Ctrl test is `meta`.
-                    // Cmd+A stays untouched and falls through to the
-                    // TextInput's built-in select-all. Elsewhere
-                    // Ctrl+A must remain select-all, hence the OS
-                    // gate.
+                    // The key's text under Ctrl may be the control
+                    // character rather than the letter, hence both.
                     if (Platform.os == OperatingSystemType.macos
                         && ev.modifiers.meta && !ev.modifiers.control
-                        && (ev.text == "a" || ev.text == "A")) {
+                        && (ev.text == "a" || ev.text == "A" || ev.text == "\u{1}")) {
                         Logic.composer-line-edge(input.cursor-offset, false);
                         return accept;
                     }
                     if (Platform.os == OperatingSystemType.macos
                         && ev.modifiers.meta && !ev.modifiers.control
-                        && (ev.text == "e" || ev.text == "E")) {
+                        && (ev.text == "e" || ev.text == "E" || ev.text == "\u{5}")) {
                         Logic.composer-line-edge(input.cursor-offset, true);
                         return accept;
+                    }
+                    // ⌘← / ⌘→ to the line edges, ⌘↑ / ⌘↓ to the start
+                    // and end of the draft, as in every macOS text view.
+                    if (Platform.os == OperatingSystemType.macos
+                        && ev.modifiers.control && !ev.modifiers.meta) {
+                        if (ev.text == Key.LeftArrow) {
+                            Logic.composer-line-edge(input.cursor-offset, false);
+                            return accept;
+                        }
+                        if (ev.text == Key.RightArrow) {
+                            Logic.composer-line-edge(input.cursor-offset, true);
+                            return accept;
+                        }
+                        if (ev.text == Key.UpArrow) {
+                            input.set-cursor(0);
+                            return accept;
+                        }
+                        if (ev.text == Key.DownArrow) {
+                            Logic.composer-doc-end();
+                            return accept;
+                        }
                     }
                     if ((ev.modifiers.control || ev.modifiers.meta) && (ev.text == "v" || ev.text == "V")) {
                         Logic.paste-rich();
