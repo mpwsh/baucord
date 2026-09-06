@@ -567,3 +567,4 @@ chat-dm-with-offline = { $name } no está conectado; el mensaje espera en el ser
 chat-command-usage-dm = Uso: /dm <nombre> <mensaje>
 chat-dm-unknown = Acá nadie se llama { $name }.
 chat-dm-no-images = Las imágenes en mensajes directos llegan con la actualización de archivos.
+dm-close = Cerrar conversación

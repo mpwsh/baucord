@@ -161,7 +161,7 @@ pub enum Event {
         peer: PeerId,
         reason: DisconnectReason,
     },
-    /// The datagram send buffer overflowed and the oldest queued packet
+    /// The datagram send buffer overflowed and the packet being sent
     /// was dropped. Emitted once per episode; the count is in
     /// [`LinkStats::datagram_send_drops`].
     DatagramsBlocked { peer: PeerId },
@@ -1317,24 +1317,27 @@ fn send_datagram(
         return Err(SendError::TooLarge(lane, bytes.len()));
     }
     // Time bound (§6.1): the send buffer is ~200 ms of voice; when it is
-    // full, the *oldest* packet makes room — the newest audio is the
-    // one worth delivering.
-    let dropping = datagrams.send_buffer_space() < d.len();
-    match datagrams.send(d, true) {
+    // full the packet is dropped and counted. `drop = false` on purpose:
+    // quinn-proto 0.11.17's drop-oldest path (`send(_, true)`) decrements
+    // its `payload_bytes` accounting twice per evicted datagram, the
+    // counter wraps, and the next eviction panics with
+    // "datagrams.outgoing.payload_bytes desynchronized" — which killed
+    // the client's network thread the first time a link stalled. Until
+    // the fix (quinn's `make_space_for`) is released, the newest packet
+    // is the one that goes; the buffer is short enough that the
+    // difference is a few frames of audio during a stall either way.
+    match datagrams.send(d, false) {
         Ok(()) => {
-            if dropping {
-                p.counters.datagram_send_drops += 1;
-                if !p.counters.blocked_episode {
-                    p.counters.blocked_episode = true;
-                    p.counters.datagrams_blocked += 1;
-                    events.push_back(Event::DatagramsBlocked { peer: p.id });
-                }
-            }
+            p.counters.blocked_episode = false;
             Ok(())
         }
         Err(SendDatagramError::Blocked(_)) => {
-            // Cannot happen with `drop = true`; treat as a drop anyway.
             p.counters.datagram_send_drops += 1;
+            if !p.counters.blocked_episode {
+                p.counters.blocked_episode = true;
+                p.counters.datagrams_blocked += 1;
+                events.push_back(Event::DatagramsBlocked { peer: p.id });
+            }
             Ok(())
         }
         Err(SendDatagramError::TooLarge) => Err(SendError::TooLarge(lane, bytes.len())),

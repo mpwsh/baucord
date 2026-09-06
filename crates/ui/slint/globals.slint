@@ -340,6 +340,7 @@ export global Logic {
     callback user-dm(int);
     // 1.1.1 — the Messages section
     callback dm-clicked(int);                  // index into State.dms
+    callback dm-closed(int);                   // hide the conversation (nothing is deleted)
     callback general-clicked();                // back to the general chat
     callback moderation-confirm();             // reads State.moderation-*
     callback moderation-cancel();

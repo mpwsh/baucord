@@ -136,6 +136,7 @@ pub fn refresh_avatar(app: &mut AppState) {
     // One decode, shared by the settings preview and the rows.
     app.reload_own_avatar();
     app.update_user_list();
+    app.refresh_own_rows();
     let Some(win) = &app.settings_win else { return };
     let s = win.global::<SettingsState>();
     s.set_has_avatar(app.own_avatar.is_some());
@@ -504,6 +505,7 @@ fn wire(win: &SettingsWindow) {
                 .and_then(|i| palette.get(i).copied());
             app.profile_dirty = true;
             app.update_user_list();
+            app.refresh_own_rows();
         });
     });
     logic.on_name_style_selected(|index| {
@@ -515,6 +517,7 @@ fn wire(win: &SettingsWindow) {
             };
             app.profile_dirty = true;
             app.update_user_list();
+            app.refresh_own_rows();
         });
     });
     logic.on_avatar_pick(|| {

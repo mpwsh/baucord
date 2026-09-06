@@ -504,10 +504,32 @@ export component Sidebar inherits Rectangle {
                             horizontal-alignment: center;
                         }
                     }
+                    // Close: hides the conversation from the list; the
+                    // messages stay on the server and it comes back on
+                    // the next message. General cannot be closed.
+                    if dm-t.has-hover || close-t.has-hover : Rectangle {
+                        width: 20px;
+                        IconBtn {
+                            y: (parent.height - self.height) / 2;
+                            size: 20px;
+                            icon-size: 12px;
+                            icon: IconSet.X;
+                            tooltip: Tr.dm-close;
+                            tooltip-below: true;
+                            clicked => { Logic.dm-closed(i); }
+                        }
+                    }
                 }
                 dm-t := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { Logic.dm-clicked(i); }
+                }
+                // Keeps the ✕ shown while the pointer is on it (the row's
+                // own hover ends under the button).
+                close-t := TouchArea {
+                    x: parent.width - 28px;
+                    width: 28px;
+                    enabled: false;
                 }
             }
             }

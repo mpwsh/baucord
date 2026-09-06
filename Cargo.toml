@@ -8,12 +8,18 @@ resolver = "2"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 crossbeam-channel = "0.5.15"
+# `accessibility` (AccessKit) is off for now: with it, any accessibility
+# client on the OS (a screen reader, or on Windows any UI Automation
+# client) can drive a focus change while Slint's accesskit adapter is
+# already borrowed, and the app panics with "RefCell already borrowed"
+# in the winit adapter's handle_focus_change (slint-ui/slint#6922).
+# Users hit it opening the volume popover. Re-enable once that is fixed
+# upstream.
 slint = { version = "1.17", default-features = false, features = [
   "std",
   "backend-winit",
   "renderer-skia",
   "renderer-software",
-  "accessibility",
   "compat-1-2",
 ] }
 bytes = "1.12"

@@ -771,6 +771,17 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, |app| app.switch_conversation(None));
     });
     let w = Rc::downgrade(state);
+    logic.on_dm_closed(move |index| {
+        with_app(&w, |app| {
+            if let Some(user) = usize::try_from(index)
+                .ok()
+                .and_then(|i| app.dm_order.get(i).copied())
+            {
+                app.close_dm(user);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
     logic.on_user_channel_kick(move |index| {
         with_app(&w, |app| {
             let Some(client_id) = app.user_id_at(index) else {
@@ -4574,6 +4585,18 @@ impl AppState {
         self.main.invoke_focus_composer();
     }
 
+    /// Hide a DM from the list. Nothing is deleted: the server keeps
+    /// the conversation, and the next message brings it back.
+    fn close_dm(&mut self, user: client::UserId) {
+        if self.active_dm == Some(user) {
+            self.switch_conversation(None);
+        }
+        self.parked.remove(&Some(user));
+        self.dm_meta.remove(&user);
+        self.dm_order.retain(|u| *u != user);
+        self.rebuild_dms_model();
+    }
+
     /// Open (or start) the DM with `user`, named `name`.
     pub fn open_dm(&mut self, user: client::UserId, name: &str) {
         let meta = self.dm_meta.entry(user).or_insert_with(|| DmMeta {
@@ -5407,10 +5430,45 @@ impl AppState {
             .ok();
     }
 
+    /// A profile changed: every chat row by that author, in every
+    /// conversation, takes the new look (the roster rebuilds anyway).
+    fn refresh_author_look(&mut self, name: &str) {
+        let keys: Vec<Option<client::UserId>> = std::iter::once(self.active_dm)
+            .chain(self.parked.keys().copied())
+            .collect();
+        for key in keys {
+            self.with_conversation(key, |app| {
+                for i in 0..app.chat_model.row_count() {
+                    let Some(mut row) = app.chat_model.row_data(i) else {
+                        continue;
+                    };
+                    if row.kind == 1 || row.kind == 4 || row.user != name {
+                        continue;
+                    }
+                    // Reset before re-applying: a removed picture or
+                    // color must clear too.
+                    row.has_avatar = false;
+                    row.avatar = slint::Image::default();
+                    row.has_name_color = false;
+                    row.name_style = 0;
+                    let own = row.own;
+                    app.apply_profile_look(name, own, &mut row);
+                    app.chat_model.set_row_data(i, row);
+                }
+            });
+        }
+    }
+
     /// The picture changed locally: the server's hash for it no longer
     /// applies (the next `send_own_profile` uploads the new one).
     pub fn forget_avatar_blob(&mut self) {
         self.own_avatar_blob = None;
+    }
+
+    /// Our own look changed in Settings: our rows follow at once.
+    pub fn refresh_own_rows(&mut self) {
+        let name = self.settings.user.nickname.clone();
+        self.refresh_author_look(&name);
     }
 
     /// Ask the server to rename this session (spec §7.1).
@@ -5440,6 +5498,8 @@ impl AppState {
         self.profiles.insert(client_id, profile);
         self.update_user_list();
         self.rebuild_dms_model();
+        let name = self.username_of(client_id);
+        self.refresh_author_look(&name);
     }
 
     /// Decode a picture into the image map (and onto the disk cache
@@ -5458,6 +5518,17 @@ impl AppState {
             }
         }
         self.update_user_list();
+        self.rebuild_dms_model();
+        // Whoever's picture this is, their rows can show it now.
+        let authors: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.avatar == Some(blob))
+            .filter_map(|(c, _)| self.users.get(c).map(|u| u.username.clone()))
+            .collect();
+        for name in authors {
+            self.refresh_author_look(&name);
+        }
     }
 
     /// The pointer entered or left an author's picture in chat: the
@@ -6368,6 +6439,7 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_dm_back(t!("dm-back").into());
     tr.set_chat_placeholder_dm(t!("chat-placeholder-dm").into());
     tr.set_menu_message(t!("menu-message").into());
+    tr.set_dm_close(t!("dm-close").into());
     tr.set_monitor(t!("monitor").into());
     tr.set_quality(t!("quality").into());
     tr.set_start_sharing(t!("start-sharing").into());
