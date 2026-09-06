@@ -1105,6 +1105,19 @@ pub enum ServerMessage {
     Conversations {
         dms: Vec<DmSummary>,
     },
+
+    // ── 1.1: progress, everyone's (feature bit `PROGRESS`) ──────────
+    /// How far a session's user is (spec §9.1), for the profile card's
+    /// bar: the whole roster to a newcomer after `Init`, the newcomer
+    /// to everyone, and once a minute for whoever gained xp.
+    /// `UserDetails` carries the level alone; this is the xp behind
+    /// it, and `progress::xp_for_level` / `cost_of_level` turn the
+    /// pair into a fraction.
+    UserProgress {
+        client_id: ClientId,
+        xp: u64,
+        level: u16,
+    },
 }
 
 /// Why a DM was not sent (spec §6).
@@ -1979,6 +1992,11 @@ mod tests {
             user_id: [1u8; 32],
             roles: vec![1, 2],
             level: 3,
+        }));
+        assert!(server_roundtrips(&ServerMessage::UserProgress {
+            client_id: 9,
+            xp: 4_242,
+            level: 7,
         }));
         let bytes = encode_server_message(&ServerMessage::Restricted {
             kind: RestrictionKind::GeneralText,

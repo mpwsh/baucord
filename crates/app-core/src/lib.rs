@@ -25,6 +25,7 @@ pub mod fps;
 pub mod gif;
 pub mod images;
 pub mod markdown;
+pub mod menu;
 pub mod roster;
 pub mod stats;
 pub mod update;

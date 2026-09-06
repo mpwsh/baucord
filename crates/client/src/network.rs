@@ -279,6 +279,12 @@ pub enum NetworkMessage {
         xp: u64,
         level: u16,
     },
+    /// Where a session's user stands (spec §9.1), for the card's bar.
+    UserProgress {
+        client_id: u64,
+        xp: u64,
+        level: u16,
+    },
     /// Per-channel facts `ChannelInfo` cannot carry (spec §5).
     ChannelDetails {
         channel_id: u16,
@@ -1450,6 +1456,17 @@ impl NetworkClient {
                 info!("Progress: {xp} xp, level {level}");
                 self.message_queue
                     .push(NetworkMessage::ProgressUpdate { xp, level });
+            }
+            ServerMessage::UserProgress {
+                client_id,
+                xp,
+                level,
+            } => {
+                self.message_queue.push(NetworkMessage::UserProgress {
+                    client_id,
+                    xp,
+                    level,
+                });
             }
             ServerMessage::ChannelDetails {
                 channel_id,

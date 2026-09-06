@@ -350,7 +350,7 @@ channel-owner-server = servidor
 chat-admin-no-telemetry = No llegó telemetría de esa persona en esta sesión.
 
 # ── 1.1 menú del roster, insignias, diálogo de moderación ───────────────
-menu-volume = Volumen…
+menu-volume = Volumen
 menu-mute-for-me = Silenciar para mí
 menu-unmute-for-me = Dejar de silenciar para mí
 menu-role = Rol
@@ -369,6 +369,7 @@ role-member = Miembro
 role-organizer = Organizador
 role-admin = Admin
 tooltip-level = Nivel { $level }
+card-xp-line = { $have } / { $need } xp para el nivel { $next }
 tooltip-telemetry-age = Telemetría { $ago }
 tooltip-no-telemetry = Todavía no llegó telemetría de esta persona.
 moderation-duration = Duración
@@ -556,6 +557,10 @@ dm-failed-no-such-user = No existe ese usuario.
 dm-failed-store = El servidor no pudo guardar el mensaje. Probá de nuevo.
 
 messages-header = Mensajes
+voice-header = Voz
+messages-collapse = Contraer mensajes
+messages-expand = Expandir mensajes
+invite-button = Invitar usuarios
 dm-general = General
 dm-direct-message = Mensaje directo
 dm-note-memory = Le llega solo mientras esté conectado; este servidor no guarda nada.

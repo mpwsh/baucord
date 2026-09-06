@@ -348,7 +348,7 @@ channel-owner-server = servidor
 chat-admin-no-telemetry = Nada recebido dessa pessoa nesta execução.
 
 # ── 1.1 menu da lista, insígnias, diálogo de moderação ──────────────────
-menu-volume = Volume…
+menu-volume = Volume
 menu-mute-for-me = Silenciar para mim
 menu-unmute-for-me = Reativar som para mim
 menu-role = Papel
@@ -367,6 +367,7 @@ role-member = Membro
 role-organizer = Organizador
 role-admin = Admin
 tooltip-level = Nível { $level }
+card-xp-line = { $have } / { $need } xp para o nível { $next }
 tooltip-telemetry-age = Telemetria { $ago }
 tooltip-no-telemetry = Ainda não chegou telemetria dessa pessoa.
 moderation-duration = Duração
@@ -554,6 +555,10 @@ dm-failed-no-such-user = Esse usuário não existe.
 dm-failed-store = O servidor não conseguiu guardar a mensagem. Tente de novo.
 
 messages-header = Mensagens
+voice-header = Voz
+messages-collapse = Recolher mensagens
+messages-expand = Expandir mensagens
+invite-button = Convidar usuários
 dm-general = Geral
 dm-direct-message = Mensagem direta
 dm-note-memory = Chega só enquanto a pessoa está online; este servidor não guarda nada.

@@ -7,6 +7,7 @@
 
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
+import { MenuEntry, MenuAction } from "globals.slint";
 
 // ── Buttons ─────────────────────────────────────────────────────────────
 
@@ -459,6 +460,142 @@ export component SectionHeader inherits Text {
     color: Theme.text-primary;
     font-size: Theme.font-md;
     font-weight: 700;
+}
+
+// ── Context menu column ─────────────────────────────────────────────────
+
+/// One column of a context menu: a raised panel of `MenuEntry` rows.
+/// The overlay in main.slint places it, opens a second column beside
+/// an entry with a submenu when the pointer rests on it, and forwards
+/// picks to the host. Drawn in the app's own skin because the
+/// toolkit's context menu is native (and unstylable) on macOS and
+/// Windows.
+export component MenuPanel inherits Rectangle {
+    in property <[MenuEntry]> entries;
+    /// The entry whose submenu is open: stays highlighted while the
+    /// pointer is in the child column.
+    in property <int> open-entry: -1;
+    /// A `MenuAction.volume` entry draws as a slider bound here
+    /// instead of a text row.
+    in-out property <float> volume: 1.0;
+    callback activated(action: MenuAction, arg: int);
+    /// The pointer rests on `entry`; `model` is its submenu (-1 for
+    /// none) and `y` where the row starts, relative to this panel.
+    callback submenu-hovered(entry: int, model: int, y: length);
+    callback volume-changed(float);
+    callback volume-released(float);
+
+    width: Math.clamp(body.preferred-width, 180px, 320px);
+    height: body.preferred-height;
+    // Concentric with the rows: radius-sm + 4px padding.
+    border-radius: Theme.radius-sm + 4px;
+    background: Theme.bg-tertiary;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-color: #00000066;
+    drop-shadow-blur: 12px;
+    drop-shadow-offset-y: 4px;
+
+    body := VerticalLayout {
+        padding: 4px;
+        for e[i] in root.entries : VerticalLayout {
+            if e.separator : Rectangle {
+                height: 9px;
+                Rectangle {
+                    x: Theme.gap-sm;
+                    y: 4px;
+                    width: parent.width - 2 * Theme.gap-sm;
+                    height: 1px;
+                    background: Theme.border;
+                }
+            }
+            // The volume slider, inline: one drag instead of a dialog.
+            if e.action == MenuAction.volume : Rectangle {
+                height: 52px;
+                // Under the slider (declared first): a pointer resting
+                // on the label line is no submenu hover.
+                TouchArea {
+                    changed has-hover => {
+                        if (self.has-hover) { root.submenu-hovered(i, -1, 0px); }
+                    }
+                }
+                VerticalLayout {
+                    padding-left: Theme.gap-sm;
+                    padding-right: Theme.gap-sm;
+                    padding-top: 4px;
+                    spacing: 2px;
+                    HorizontalLayout {
+                        Text {
+                            text: e.label;
+                            color: Theme.text-primary;
+                            font-size: Theme.font-body;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: "\{Math.round(root.volume * 100)}%";
+                            color: Theme.text-muted;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+                    HSlider {
+                        minimum: 0.0;
+                        maximum: 2.0;
+                        value <=> root.volume;
+                        live-changed(v) => { root.volume-changed(v); }
+                        released(v) => { root.volume-released(v); }
+                    }
+                }
+            }
+            if e.action != MenuAction.volume : row := Rectangle {
+                height: 30px;
+                border-radius: Theme.radius-sm;
+                background: e.enabled && (it.has-hover || root.open-entry == i)
+                    ? Theme.hover : transparent;
+                animate background { duration: 100ms; }
+                HorizontalLayout {
+                    padding-left: Theme.gap-sm;
+                    padding-right: Theme.gap-sm;
+                    spacing: Theme.gap-sm;
+                    Text {
+                        text: e.label;
+                        color: !e.enabled ? Theme.text-muted
+                            : e.danger ? Theme.danger-text
+                            : Theme.text-primary;
+                        font-size: Theme.font-body;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    if e.submenu >= 0 : Rectangle {
+                        width: 14px;
+                        IconDisplay {
+                            icon: IconSet.ChevronRight;
+                            size: 14px;
+                            stroke: Theme.text-muted;
+                        }
+                    }
+                }
+                it := TouchArea {
+                    enabled: e.enabled;
+                    mouse-cursor: e.enabled ? MouseCursor.pointer : MouseCursor.default;
+                    changed has-hover => {
+                        if (self.has-hover) {
+                            root.submenu-hovered(i, e.submenu, row.absolute-position.y - root.absolute-position.y);
+                        }
+                    }
+                    clicked => {
+                        if (e.submenu >= 0) {
+                            root.submenu-hovered(i, e.submenu, row.absolute-position.y - root.absolute-position.y);
+                        } else {
+                            root.activated(e.action, e.arg);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Dropdown ────────────────────────────────────────────────────────────

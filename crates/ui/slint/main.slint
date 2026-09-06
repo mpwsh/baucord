@@ -1,26 +1,26 @@
 // main.slint — the application window.
 //
 // One Window hosting all phases (splash/update → connect → main), plus
-// the in-window overlays: image send preview, screen-share dialog, and
-// the per-user audio popover. Every FLTK floating helper window becomes
+// the in-window overlays: image send preview, screen-share dialog, the
+// dialogs and the context menu. Every FLTK floating helper window becomes
 // an overlay here — which retires the orphaned-popup / focus-churn
 // machinery wholesale (there is nothing to strand on the desktop).
 
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind } from "globals.slint";
+import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind, MenuAction, MenuEntry } from "globals.slint";
 import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
-import { Btn, IconBtn, Card, HSlider, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile } from "widgets.slint";
+import { Btn, IconBtn, Card, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel } from "widgets.slint";
 import { SettingsWindow, SettingsState, SettingsLogic } from "settings.slint";
 import { StreamViewerWindow } from "viewer.slint";
 
 import { BaucordTray } from "tray.slint";
 
-export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind }
+export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind, MenuAction, MenuEntry }
 
 export component MainWindow inherits Window {
     title: "baucord";
@@ -40,8 +40,12 @@ export component MainWindow inherits Window {
     public function chat-at-bottom() -> bool { return chat-pane.at-bottom(); }
     public function chat-scroll-to-end() { chat-pane.scroll-to-end(); }
     public function chat-pin-bottom() { chat-pane.pin-to-bottom(); }
+    public function chat-follow-appended() { chat-pane.follow-appended(); }
     public function focus-composer() { chat-pane.focus-composer(); }
     public function composer-set-cursor(pos: int) { chat-pane.composer-set-cursor(pos); }
+    // The composer's menu entries (the host dispatches the pick).
+    public function composer-cut() { chat-pane.composer-cut(); }
+    public function composer-copy() { chat-pane.composer-copy(); }
 
     // Flipped by the shell after a minimize→restore on Windows: the OS
     // repaints the uncovered window white, but the renderer's damage
@@ -151,6 +155,30 @@ export component MainWindow inherits Window {
                         font-size: Theme.font-sm;
                         overflow: elide;
                     }
+                    // How far into the level (spec §9.1): a bar and
+                    // the numbers, once the server has said.
+                    if card.who.xp-pct >= 0 : VerticalLayout {
+                        spacing: 3px;
+                        Rectangle {
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.subtle;
+                            Rectangle {
+                                x: 0;
+                                width: parent.width * Math.clamp(card.who.xp-pct, 0, 100) / 100;
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: Theme.accent-text;
+                                animate width { duration: 200ms; }
+                            }
+                        }
+                        Text {
+                            text: card.who.xp-line;
+                            color: Theme.text-muted;
+                            font-size: Theme.font-xs;
+                            overflow: elide;
+                        }
+                    }
                     if card.who.role == 1 || card.who.role == 3 || card.who.role == 4 : HorizontalLayout {
                         spacing: Theme.gap-xs;
                         Rectangle {
@@ -183,6 +211,54 @@ export component MainWindow inherits Window {
                 font-family: "monospace";
                 wrap: word-wrap;
             }
+        }
+    }
+
+    // ── Context menu ───────────────────────────────────────────────
+    // The host fills `State.menu-*` and opens it; a click anywhere
+    // outside the columns (consumed, as a native menu would) or
+    // Escape closes it. A second column opens beside an entry with a
+    // submenu while the pointer rests on it, to the right when there
+    // is room, else to the left; both columns stay inside the window.
+    if State.menu-open : menu-layer := Rectangle {
+        property <int> open-entry: -1;
+        property <int> open-model: -1;
+        property <length> open-y;
+        TouchArea {
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down) { Logic.menu-closed(); }
+            }
+        }
+        menu-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { Logic.menu-closed(); return accept; }
+                reject
+            }
+        }
+        main-column := MenuPanel {
+            entries: State.menu-entries;
+            open-entry: menu-layer.open-entry;
+            volume <=> State.menu-volume;
+            volume-changed(v) => { Logic.menu-volume-changed(v); }
+            volume-released(v) => { Logic.menu-volume-released(v); }
+            x: Math.max(Theme.gap-sm, Math.min(State.menu-x, root.width - self.width - Theme.gap-sm));
+            y: Math.max(Theme.gap-sm, Math.min(State.menu-y, root.height - self.height - Theme.gap-sm));
+            submenu-hovered(entry, model, y) => {
+                menu-layer.open-entry = model >= 0 ? entry : -1;
+                menu-layer.open-model = model;
+                menu-layer.open-y = y;
+            }
+            activated(action, arg) => { Logic.menu-activated(action, arg); }
+        }
+        if menu-layer.open-model >= 0 && menu-layer.open-model < State.menu-submenus.length : MenuPanel {
+            entries: State.menu-submenus[menu-layer.open-model];
+            x: main-column.x + main-column.width - 4px + self.width <= root.width - Theme.gap-sm
+                ? main-column.x + main-column.width - 4px
+                : Math.max(Theme.gap-sm, main-column.x - self.width + 4px);
+            y: Math.max(Theme.gap-sm, Math.min(main-column.y + menu-layer.open-y - 4px,
+                root.height - self.height - Theme.gap-sm));
+            activated(action, arg) => { Logic.menu-activated(action, arg); }
         }
     }
 
@@ -733,60 +809,4 @@ export component MainWindow inherits Window {
         }
     }
 
-    // ── Per-user audio popover ─────────────────────────────────────
-    if State.user-popup-open && State.popup-user-index >= 0
-        && State.popup-user-index < State.users.length : Rectangle {
-        background: #00000055;
-        TouchArea { clicked => { Logic.popup-closed(); } }
-        popup-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape) { Logic.popup-closed(); return accept; }
-                reject
-            }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: 260px;
-                height: up.preferred-height;
-                background: Theme.bg-tertiary;
-                border-width: 1px;
-                border-color: Theme.border;
-                TouchArea { }
-                up := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    // Only the slider lives here now; mute, reset and
-                    // watch moved to the row's menu with the rest.
-                    Text {
-                        text: State.users[State.popup-user-index].name;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 700;
-                        horizontal-alignment: center;
-                    }
-                    FieldLabel { text: Tr.user-volume; }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        HSlider {
-                            horizontal-stretch: 1;
-                            minimum: 0.0; maximum: 2.0;
-                            value <=> State.popup-volume;
-                            released(v) => {
-                                Logic.popup-set-volume(State.popup-user-index, v);
-                            }
-                        }
-                        Text {
-                            width: 44px;
-                            text: "\{Math.round(State.popup-volume * 100)}%";
-                            color: Theme.text-secondary;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
-                            horizontal-alignment: right;
-                        }
-                    }
-                }
-            }
-        }
-    }
 }

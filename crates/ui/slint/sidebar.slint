@@ -5,10 +5,12 @@
 //    muted), role badge (guest ring / organizer wrench / admin shield),
 //    volume badge, remote mute/deafen icon, LIVE chip;
 //  - the row's menu (right-click, left-click, or the "…" affordance)
-//    is a ContextMenuArea: audio items for everyone, and the
-//    moderation items only when `Session.permissions` and the rank
-//    rule allow them — the server would refuse anything else, so it is
-//    never advertised (spec §8);
+//    is the window's own overlay (main.slint), filled by the host from
+//    app-core's `menu`: audio items for everyone, and the moderation
+//    items only when `Session.permissions` and the rank rule allow
+//    them — the server would refuse anything else, so it is never
+//    advertised (spec §8). Not a ContextMenuArea: that one is native
+//    on macOS/Windows, and a row's TouchArea swallowed its right-click;
 //  - a hover tooltip with the level and role, plus the last telemetry
 //    for admins (spec §8 "connection info");
 //  - row tint for locally-muted / volume-adjusted users;
@@ -24,7 +26,7 @@ import { ListView, ScrollView } from "std-widgets.slint";
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, UserRow, ModAction } from "globals.slint";
+import { State, Logic, UserRow } from "globals.slint";
 import { IconBtn, Btn, AvatarTile } from "widgets.slint";
 
 component UserRowView inherits Rectangle {
@@ -42,217 +44,108 @@ component UserRowView inherits Rectangle {
         : transparent;
     animate background { duration: 150ms; }
 
-    // Any moderation entry at all? Decides the separator.
-    property <bool> moderates: !user.is-channel && !user.is-us && (
-        (State.perm-roles && user.role-editable)
-        || State.perm-move
-        || user.channel-kickable
-        || (user.outranked && (State.perm-mute || State.perm-disconnect
-            || State.perm-kick || State.perm-ban)));
-
-    pure function role-name(r: int) -> string {
-        return r == 1 ? Tr.role-guest
-            : r == 2 ? Tr.role-member
-            : r == 3 ? Tr.role-organizer
-            : r == 4 ? Tr.role-admin
-            : "";
+    // The row's menu (app-core `menu::user_menu` / `channel_menu`):
+    // the host builds the entries from what the session may do and
+    // opens the window overlay at the click. Right-click on any row;
+    // user rows also open it on a left click, since the whole row is
+    // the target (a hover-gated button was impossible to hit).
+    function open-menu() {
+        Logic.user-context(root.index,
+            touch.absolute-position.x + touch.mouse-x,
+            touch.absolute-position.y + touch.mouse-y);
     }
 
-    // A channel header we may manage (the server's `may_manage`): our
-    // own with MANAGE_OWN_CHANNELS, or any user channel with
-    // MANAGE_CHANNELS. Config channels get a one-line explanation
-    // instead of actions.
-    property <bool> channel-manageable: user.is-channel && !user.from-config
-        && ((user.owned && State.perm-manage-own) || State.perm-move);
-
-    menu := ContextMenuArea {
-        // Our own row has nothing to offer; a channel header only when
-        // there is something to say about it.
-        enabled: user.is-channel
-            ? (root.channel-manageable || (user.from-config && (State.perm-move || State.perm-create-channels)))
-            : !user.is-us;
-        Menu {
-            // ── Channel header ─────────────────────────────────────
-            if user.is-channel && user.from-config : MenuItem {
-                title: Tr.menu-channel-config-owned;
-                enabled: false;
-            }
-            if root.channel-manageable : MenuItem {
-                title: Tr.menu-channel-edit;
-                activated => { Logic.channel-edit(user.channel-id); }
-            }
-            if root.channel-manageable : MenuItem {
-                title: Tr.menu-channel-delete;
-                activated => { Logic.channel-delete(user.channel-id); }
-            }
-
-            // ── Audio, for every user row ──────────────────────────
-            if !user.is-channel : MenuItem {
-                title: Tr.menu-volume;
-                activated => { Logic.user-menu(root.index); }
-            }
-            if !user.is-channel : MenuItem {
-                title: user.local-muted ? Tr.menu-unmute-for-me : Tr.menu-mute-for-me;
-                activated => { Logic.popup-toggle-mute(root.index); }
-            }
-            if !user.is-channel : MenuItem {
-                title: Tr.reset-audio;
-                activated => { Logic.popup-reset-audio(root.index); }
-            }
-            if !user.is-channel && user.sharing : MenuItem {
-                title: Tr.watch-stream;
-                activated => { Logic.popup-watch(root.index); }
-            }
-
-            // ── Direct message (members to members) ───────────────
-            if !user.is-channel && State.perm-dm && user.role != 1 : MenuSeparator { }
-            if !user.is-channel && State.perm-dm && user.role != 1 : MenuItem {
-                title: Tr.menu-message;
-                activated => { Logic.user-dm(root.index); }
-            }
-
-            // ── Moderation, permission- and rank-gated ─────────────
-            if root.moderates : MenuSeparator { }
-            if State.perm-roles && user.role-editable : Menu {
-                title: Tr.menu-role;
-                // Roles up to our own; the one they hold is greyed.
-                for r in 4 : MenuItem {
-                    title: root.role-name(r + 1);
-                    enabled: r + 1 <= State.our-role && user.role != r + 1;
-                    activated => { Logic.user-set-role(root.index, r + 1); }
-                }
-            }
-            if State.perm-move : Menu {
-                title: Tr.menu-move-to;
-                for ch in State.channel-options : MenuItem {
-                    title: ch.name;
-                    enabled: ch.id != user.channel-id;
-                    activated => { Logic.user-move(root.index, ch.id); }
-                }
-            }
-            if user.channel-kickable : MenuItem {
-                title: Tr.menu-channel-kick;
-                activated => { Logic.user-channel-kick(root.index); }
-            }
-            if user.outranked && State.perm-mute : Menu {
-                title: Tr.menu-mute;
-                MenuItem {
-                    title: Tr.menu-mute-voice;
-                    activated => { Logic.user-moderate(root.index, ModAction.mute-voice); }
-                }
-                MenuItem {
-                    title: Tr.menu-mute-chat;
-                    activated => { Logic.user-moderate(root.index, ModAction.mute-chat); }
-                }
-                MenuSeparator { }
-                MenuItem {
-                    title: Tr.menu-unmute-voice;
-                    activated => { Logic.user-moderate(root.index, ModAction.unmute-voice); }
-                }
-                MenuItem {
-                    title: Tr.menu-unmute-chat;
-                    activated => { Logic.user-moderate(root.index, ModAction.unmute-chat); }
-                }
-            }
-            if user.outranked && State.perm-disconnect : MenuItem {
-                title: Tr.menu-disconnect;
-                activated => { Logic.user-moderate(root.index, ModAction.disconnect); }
-            }
-            if user.outranked && State.perm-kick : MenuItem {
-                title: Tr.menu-kick;
-                activated => { Logic.user-moderate(root.index, ModAction.kick); }
-            }
-            if user.outranked && State.perm-ban : MenuItem {
-                title: Tr.menu-ban;
-                activated => { Logic.user-moderate(root.index, ModAction.ban); }
+    touch := TouchArea {
+        mouse-cursor: (user.is-channel && !user.is-our-channel) || (!user.is-channel && !user.is-us)
+            ? MouseCursor.pointer : MouseCursor.default;
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                root.open-menu();
             }
         }
-
-        // The whole row is the click target — a hover-gated button was
-        // impossible to hit (its own TouchArea stole the hover that made
-        // it visible). Channel headers join on click; user rows open
-        // the menu on left click (right-click is the area's own).
-        touch := TouchArea {
-            mouse-cursor: (user.is-channel && !user.is-our-channel) || (!user.is-channel && !user.is-us)
-                ? MouseCursor.pointer : MouseCursor.default;
-            clicked => {
-                if (user.is-channel) {
-                    if (!user.is-our-channel) { Logic.channel-clicked(user.channel-id); }
-                } else if (!user.is-us) {
-                    menu.show({ x: self.mouse-x, y: self.mouse-y });
-                }
+        clicked => {
+            if (user.is-channel) {
+                if (!user.is-our-channel) { Logic.channel-clicked(user.channel-id); }
+            } else if (!user.is-us) {
+                root.open-menu();
             }
-            changed has-hover => {
-                if (!user.is-channel) {
-                    if (self.has-hover) {
-                        State.card-x = root.absolute-position.x;
-                        State.card-y = root.absolute-position.y;
-                        State.card-anchor-h = root.height;
-                        State.card-index = root.index;
-                        Logic.user-hovered(root.index, true);
-                    } else if (State.card-index == root.index) {
-                        State.card-index = -1;
-                        Logic.user-hovered(root.index, false);
-                    }
+        }
+        changed has-hover => {
+            if (!user.is-channel) {
+                if (self.has-hover) {
+                    State.card-x = root.absolute-position.x;
+                    State.card-y = root.absolute-position.y;
+                    State.card-anchor-h = root.height;
+                    State.card-index = root.index;
+                    Logic.user-hovered(root.index, true);
+                } else if (State.card-index == root.index) {
+                    State.card-index = -1;
+                    Logic.user-hovered(root.index, false);
                 }
             }
         }
+    }
 
-        // ── Channel header row ──────────────────────────────────────
-        if user.is-channel : HorizontalLayout {
-            padding-left: Theme.gap-xs;
-            padding-right: Theme.gap-xs;
-            spacing: Theme.gap-xs;
+    // ── Channel header row ──────────────────────────────────────
+    if user.is-channel : HorizontalLayout {
+        padding-left: Theme.gap-xs;
+        padding-right: Theme.gap-xs;
+        spacing: Theme.gap-xs;
 
-            Text {
-                text: user.name;
-                color: user.is-our-channel ? Theme.accent-text : Theme.text-secondary;
-                font-size: Theme.font-body;
-                font-weight: 700;
-                vertical-alignment: center;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
-            if user.temporary : Rectangle {
-                width: 12px;
-                IconDisplay {
-                    icon: IconSet.Hourglass;
-                    size: 12px;
-                    stroke: Theme.text-muted;
-                }
-            }
-            if user.members-only : Rectangle {
-                width: 12px;
-                IconDisplay {
-                    icon: IconSet.Users;
-                    size: 12px;
-                    stroke: Theme.text-muted;
-                }
-            }
-            if user.locked : Rectangle {
-                width: 12px;
-                IconDisplay {
-                    icon: IconSet.Lock;
-                    size: 12px;
-                    stroke: Theme.text-muted;
-                }
-            }
-            Text {
-                text: user.member-label;
-                color: Theme.text-muted;
-                font-size: Theme.font-xs;
-                vertical-alignment: center;
+        Text {
+            text: user.name;
+            color: user.is-our-channel ? Theme.accent-text : Theme.text-secondary;
+            font-size: Theme.font-body;
+            font-weight: 700;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if user.temporary : Rectangle {
+            width: 12px;
+            IconDisplay {
+                icon: IconSet.Hourglass;
+                size: 12px;
+                stroke: Theme.text-muted;
             }
         }
+        if user.members-only : Rectangle {
+            width: 12px;
+            IconDisplay {
+                icon: IconSet.Users;
+                size: 12px;
+                stroke: Theme.text-muted;
+            }
+        }
+        if user.locked : Rectangle {
+            width: 12px;
+            IconDisplay {
+                icon: IconSet.Lock;
+                size: 12px;
+                stroke: Theme.text-muted;
+            }
+        }
+        Text {
+            text: user.member-label;
+            color: Theme.text-muted;
+            font-size: Theme.font-xs;
+            vertical-alignment: center;
+        }
+    }
 
-        // ── User row ────────────────────────────────────────────────
-        if !user.is-channel : HorizontalLayout {
-            padding-left: Theme.gap-sm;   // indent members under their channel
-            padding-right: Theme.gap-xs;
-            spacing: Theme.gap-xs;
+    // ── User row ────────────────────────────────────────────────
+    if !user.is-channel : HorizontalLayout {
+        padding-left: Theme.gap-sm;   // indent members under their channel
+        padding-right: Theme.gap-xs;
+        spacing: Theme.gap-xs;
 
-            // The avatar tile; its ring is the speaking indicator.
-            AvatarTile {
+        // The avatar tile; its ring is the speaking indicator. A
+        // fixed-height child sits at the top of a HorizontalLayout,
+        // so it is centered by hand in a wrapper that takes the row.
+        Rectangle {
+            width: tile.width;
+            tile := AvatarTile {
+                y: (parent.height - self.height) / 2;
                 source: user.avatar;
                 has-image: user.has-avatar;
                 initial: user.initial;
@@ -260,85 +153,85 @@ component UserRowView inherits Rectangle {
                 ring: user.speaking && !user.local-muted;
                 struck: user.local-muted;
             }
+        }
 
-            // The name in the profile's color and style (spec §7.1);
-            // ours keeps the accent when no color is set so it stays
-            // findable, a local mute greys it.
-            name := Text {
-                text: user.name;
-                color: user.local-muted ? Theme.text-muted
-                    : user.has-name-color ? user.name-color
-                    : user.is-us ? Theme.accent-text
-                    : Theme.text-primary;
-                font-size: Theme.font-body;
-                font-weight: user.name-style == 1 || (user.is-us && user.name-style == 0) ? 600 : 400;
-                font-italic: user.name-style == 2;
-                vertical-alignment: center;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
+        // The name in the profile's color and style (spec §7.1);
+        // ours keeps the accent when no color is set so it stays
+        // findable, a local mute greys it.
+        name := Text {
+            text: user.name;
+            color: user.local-muted ? Theme.text-muted
+                : user.has-name-color ? user.name-color
+                : user.is-us ? Theme.accent-text
+                : Theme.text-primary;
+            font-size: Theme.font-body;
+            font-weight: user.name-style == 1 || (user.is-us && user.name-style == 0) ? 600 : 400;
+            font-italic: user.name-style == 2;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
 
-            // Role badge (spec §4, §8): the server's roster says who
-            // is what; the name string itself is never altered.
-            if user.role == 1 || user.role == 3 || user.role == 4 : Rectangle {
-                width: 14px;
-                IconDisplay {
-                    icon: user.role == 4 ? IconSet.Shield
-                        : user.role == 3 ? IconSet.Wrench
-                        : IconSet.CircleDashed;
-                    size: 14px;
-                    stroke: user.role == 4 ? Theme.gold
-                        : user.role == 3 ? Theme.text-secondary
-                        : Theme.text-muted;
-                }
+        // Role badge (spec §4, §8): the server's roster says who
+        // is what; the name string itself is never altered.
+        if user.role == 1 || user.role == 3 || user.role == 4 : Rectangle {
+            width: 14px;
+            IconDisplay {
+                icon: user.role == 4 ? IconSet.Shield
+                    : user.role == 3 ? IconSet.Wrench
+                    : IconSet.CircleDashed;
+                size: 14px;
+                stroke: user.role == 4 ? Theme.gold
+                    : user.role == 3 ? Theme.text-secondary
+                    : Theme.text-muted;
             }
+        }
 
-            // Volume badge for non-default remote volume.
-            if !user.is-us && user.volume-pct != 100 : Rectangle {
-                width: badge.preferred-width + 10px;
-                height: 18px;
-                y: (parent.height - self.height) / 2;
-                border-radius: 9px;
-                background: Theme.bg-tertiary;
-                badge := Text {
-                    text: "\{user.volume-pct}%";
-                    color: Theme.text-secondary;
-                    font-size: Theme.font-xs;
-                }
+        // Volume badge for non-default remote volume.
+        if !user.is-us && user.volume-pct != 100 : Rectangle {
+            width: badge.preferred-width + 10px;
+            height: 18px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 9px;
+            background: Theme.bg-tertiary;
+            badge := Text {
+                text: "\{user.volume-pct}%";
+                color: Theme.text-secondary;
+                font-size: Theme.font-xs;
             }
+        }
 
-            // Remote (or own) self-mute / deafen status icon.
-            if user.self-deafened || user.self-muted : Rectangle {
-                width: 15px;
-                IconDisplay {
-                    icon: user.self-deafened ? IconSet.HeadphoneOff : IconSet.MicOff;
-                    size: 15px;
-                    stroke: Theme.text-muted;
-                }
+        // Remote (or own) self-mute / deafen status icon.
+        if user.self-deafened || user.self-muted : Rectangle {
+            width: 15px;
+            IconDisplay {
+                icon: user.self-deafened ? IconSet.HeadphoneOff : IconSet.MicOff;
+                size: 15px;
+                stroke: Theme.text-muted;
             }
+        }
 
-            // LIVE chip / hover "…" menu.
-            if user.sharing : Rectangle {
-                width: live.preferred-width + 14px;
-                height: 20px;
-                y: (parent.height - self.height) / 2;
-                border-radius: 10px;
-                background: Theme.danger;
-                live := Text {
-                    text: Tr.live;
-                    color: Theme.on-accent;
-                    font-size: Theme.font-xs;
-                    font-weight: 700;
-                }
+        // LIVE chip / hover "…" menu.
+        if user.sharing : Rectangle {
+            width: live.preferred-width + 14px;
+            height: 20px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 10px;
+            background: Theme.danger;
+            live := Text {
+                text: Tr.live;
+                color: Theme.on-accent;
+                font-size: Theme.font-xs;
+                font-weight: 700;
             }
-            // Pure affordance — clicks land on the row's own TouchArea.
-            if !user.sharing && !user.is-us && touch.has-hover : Rectangle {
-                width: 14px;
-                IconDisplay {
-                    icon: IconSet.Ellipsis;
-                    size: 14px;
-                    stroke: Theme.text-muted;
-                }
+        }
+        // Pure affordance — clicks land on the row's own TouchArea.
+        if !user.sharing && !user.is-us && touch.has-hover : Rectangle {
+            width: 14px;
+            IconDisplay {
+                icon: IconSet.Ellipsis;
+                size: 14px;
+                stroke: Theme.text-muted;
             }
         }
     }
@@ -351,25 +244,73 @@ export component Sidebar inherits Rectangle {
         padding: Theme.gap-md;
         spacing: Theme.gap-md;
 
-        HorizontalLayout {
+        // ── The server, and what this session may add to it ───────
+        // Its name is the title (the greeting in chat no longer
+        // repeats it); the two chips below are gated by what the
+        // server said we may (spec §3.1, §5).
+        Text {
+            text: State.server-name != "" ? State.server-name : Tr.voice-header;
+            color: Theme.text-secondary;
+            font-size: Theme.font-body;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if State.perm-create-channels || State.perm-create-invites : HorizontalLayout {
             spacing: Theme.gap-sm;
-            Text {
-                text: State.users-count-label;
-                color: Theme.text-secondary;
-                font-size: Theme.font-body;
-                font-weight: 600;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
+            if State.perm-create-channels : Rectangle {
+                width: new-lbl.preferred-width + 14px + 2 * Theme.gap-sm + Theme.gap-xs;
+                height: 26px;
+                border-radius: Theme.radius-sm;
+                background: new-t.has-hover ? Theme.hover : Theme.bg-tertiary;
+                animate background { duration: 150ms; }
+                HorizontalLayout {
+                    padding-left: Theme.gap-sm;
+                    padding-right: Theme.gap-sm;
+                    spacing: Theme.gap-xs;
+                    new-lbl := Text {
+                        text: Tr.channel-new;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-sm;
+                        font-weight: 500;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        width: 14px;
+                        IconDisplay {
+                            icon: IconSet.Plus;
+                            size: 14px;
+                            stroke: Theme.text-secondary;
+                        }
+                    }
+                }
+                new-t := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Logic.channel-create(); }
+                }
             }
-            // `+`: only when the server said we may (spec §5).
-            if State.perm-create-channels : IconBtn {
-                size: 28px;
-                icon-size: 16px;
-                icon: IconSet.Plus;
-                tooltip: Tr.channel-new;
-                tooltip-below: true;
-                clicked => { Logic.channel-create(); }
+            // Invite: a code with the defaults; it lands in chat and
+            // on the clipboard.
+            if State.perm-create-invites : Rectangle {
+                width: invite-lbl.preferred-width + 2 * Theme.gap-sm;
+                height: 26px;
+                border-radius: Theme.radius-sm;
+                background: invite-t.has-hover ? Theme.hover : Theme.bg-tertiary;
+                animate background { duration: 150ms; }
+                invite-lbl := Text {
+                    text: Tr.invite-button;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-sm;
+                    font-weight: 500;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+                invite-t := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Logic.invite-create(); }
+                }
             }
+            Rectangle { }   // keep the chips at their natural width
         }
 
         list := ListView {
@@ -384,19 +325,65 @@ export component Sidebar inherits Rectangle {
         // General first, then one row per DM partner, newest first,
         // with an unread badge; the open conversation is highlighted.
         // Only when the session may DM at all, or has conversations
-        // to read.
+        // to read. The header folds the list away (a setting) so the
+        // voice channels get the room; while folded, the unread total
+        // moves up onto the header.
         if State.perm-dm || State.dms.length > 0 : Rectangle {
             height: 1px;
             background: Theme.border;
         }
-        if State.perm-dm || State.dms.length > 0 : Text {
-            text: Tr.messages-header;
-            color: Theme.text-secondary;
-            font-size: Theme.font-body;
-            font-weight: 600;
-            vertical-alignment: center;
+        if State.perm-dm || State.dms.length > 0 : fold := Rectangle {
+            property <int> hidden-unread: State.dm-unread-total
+                + (State.active-dm >= 0 ? State.general-unread : 0);
+            height: 28px;
+            border-radius: Theme.radius-sm;
+            background: fold-t.has-hover ? Theme.hover : transparent;
+            animate background { duration: 150ms; }
+            fold-t := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { Logic.messages-toggle(); }
+            }
+            HorizontalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: 2px;
+                spacing: Theme.gap-sm;
+                Text {
+                    text: Tr.messages-header;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-body;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                if State.messages-collapsed && fold.hidden-unread > 0 : Rectangle {
+                    width: fold-badge.preferred-width + 12px;
+                    height: 18px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 9px;
+                    background: Theme.accent;
+                    fold-badge := Text {
+                        text: fold.hidden-unread;
+                        color: Theme.on-accent;
+                        font-size: Theme.font-xs;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 24px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 24px;
+                        icon-size: 16px;
+                        icon: State.messages-collapsed ? IconSet.ChevronUp : IconSet.ChevronDown;
+                        tooltip: State.messages-collapsed ? Tr.messages-expand : Tr.messages-collapse;
+                        clicked => { Logic.messages-toggle(); }
+                    }
+                }
+            }
         }
-        if State.perm-dm || State.dms.length > 0 : dm-list := ScrollView {
+        if (State.perm-dm || State.dms.length > 0) && !State.messages-collapsed : dm-list := ScrollView {
             // A short list: the roster keeps the room.
             height: Math.min(200px, 34px + 34px * State.dms.length);
             vertical-stretch: 0;
@@ -411,7 +398,7 @@ export component Sidebar inherits Rectangle {
                 animate background { duration: 150ms; }
                 HorizontalLayout {
                     padding-left: Theme.gap-sm;
-                    padding-right: Theme.gap-xs;
+                    padding-right: 16px;
                     spacing: Theme.gap-sm;
                     Rectangle {
                         width: 16px;
@@ -452,15 +439,33 @@ export component Sidebar inherits Rectangle {
                     clicked => { Logic.general-clicked(); }
                 }
             }
-            for dm[i] in State.dms : Rectangle {
+            for dm[i] in State.dms : dm-row := Rectangle {
                 height: 32px;
                 border-radius: Theme.radius-md;
                 background: dm.active ? Theme.row-volume-tint
                     : dm-t.has-hover ? Theme.hover : transparent;
                 animate background { duration: 150ms; }
+                // The rightmost 28 px of the row are the ✕: one
+                // TouchArea decides by position, so the hover that
+                // reveals the button never ends under it and the
+                // click reaches the right handler (a button on top
+                // of the row's area got neither).
+                property <bool> on-close: dm-t.has-hover && dm-t.mouse-x > dm-t.width - 28px - 16px;
+                dm-t := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if (self.mouse-x > self.width - 28px - 16px) {
+                            Logic.dm-closed(i);
+                        } else {
+                            Logic.dm-clicked(i);
+                        }
+                    }
+                }
                 HorizontalLayout {
                     padding-left: Theme.gap-sm;
-                    padding-right: Theme.gap-xs;
+                    // Clear of the ScrollView's scrollbar (14 px at
+                    // the right edge, over the content).
+                    padding-right: 16px;
                     spacing: Theme.gap-sm;
                     // The picture at the `#`'s size; the ring means
                     // "online".
@@ -506,30 +511,24 @@ export component Sidebar inherits Rectangle {
                     }
                     // Close: hides the conversation from the list; the
                     // messages stay on the server and it comes back on
-                    // the next message. General cannot be closed.
-                    if dm-t.has-hover || close-t.has-hover : Rectangle {
+                    // the next message. General cannot be closed. Pure
+                    // affordance: the row's TouchArea handles the click.
+                    if dm-t.has-hover : Rectangle {
                         width: 20px;
-                        IconBtn {
+                        Rectangle {
                             y: (parent.height - self.height) / 2;
-                            size: 20px;
-                            icon-size: 12px;
-                            icon: IconSet.X;
-                            tooltip: Tr.dm-close;
-                            tooltip-below: true;
-                            clicked => { Logic.dm-closed(i); }
+                            width: 20px;
+                            height: 20px;
+                            border-radius: Theme.radius-sm;
+                            background: dm-row.on-close ? Theme.subtle : transparent;
+                            animate background { duration: 100ms; }
+                            IconDisplay {
+                                icon: IconSet.X;
+                                size: 12px;
+                                stroke: Theme.text-secondary;
+                            }
                         }
                     }
-                }
-                dm-t := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { Logic.dm-clicked(i); }
-                }
-                // Keeps the ✕ shown while the pointer is on it (the row's
-                // own hover ends under the button).
-                close-t := TouchArea {
-                    x: parent.width - 28px;
-                    width: 28px;
-                    enabled: false;
                 }
             }
             }

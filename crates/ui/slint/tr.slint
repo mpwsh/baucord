@@ -22,6 +22,10 @@ export global Tr {
     in property <string> quit: "Quit";
 
     // Sidebar
+    in property <string> voice-header: "Voice";
+    in property <string> messages-collapse: "Collapse messages";
+    in property <string> messages-expand: "Expand messages";
+    in property <string> invite-button: "Invite users";
     in property <string> mute: "Mute";
     in property <string> unmute: "Unmute";
     in property <string> deafen: "Deafen";
@@ -31,24 +35,8 @@ export global Tr {
     in property <string> disconnect: "Disconnect";
     in property <string> live: "LIVE";
 
-    // Per-user popover and roster menu
-    in property <string> user-volume: "User volume";
-    in property <string> watch-stream: "Watch stream";
-    in property <string> reset-audio: "Reset audio";
-    in property <string> menu-volume: "Volume…";
-    in property <string> menu-mute-for-me: "Mute for me";
-    in property <string> menu-unmute-for-me: "Unmute for me";
-    in property <string> menu-role: "Role";
-    in property <string> menu-move-to: "Move to";
-    in property <string> menu-channel-kick: "Send to the default channel";
-    in property <string> menu-mute: "Mute";
-    in property <string> menu-mute-voice: "Voice…";
-    in property <string> menu-mute-chat: "Chat…";
-    in property <string> menu-unmute-voice: "Unmute voice";
-    in property <string> menu-unmute-chat: "Unmute chat";
-    in property <string> menu-disconnect: "Disconnect…";
-    in property <string> menu-kick: "Kick…";
-    in property <string> menu-ban: "Ban…";
+    // Per-user popover (the menu strings live in the host: app-core's
+    // `menu` names them, `menu_label` localizes)
     in property <string> role-guest: "Guest";
     in property <string> role-member: "Member";
     in property <string> role-organizer: "Organizer";
@@ -82,9 +70,6 @@ export global Tr {
     in property <string> channel-create: "Create channel";
     in property <string> channel-save: "Save changes";
     in property <string> channel-not-persistent-note: "This server does not save channels: it lasts until the server restarts.";
-    in property <string> menu-channel-edit: "Edit channel…";
-    in property <string> menu-channel-delete: "Delete channel…";
-    in property <string> menu-channel-config-owned: "Set in the server's config file";
     in property <string> share-visibility: "Visible to";
     in property <string> share-channel-only: "My channel";
     in property <string> share-everyone: "Everyone";
@@ -92,20 +77,9 @@ export global Tr {
     in property <string> chat-attach-tooltip: "Attach image";
     in property <string> chat-clear-tooltip: "Clear chat (just for you)";
     in property <string> image-preview-title: "Send image?";
-    in property <string> menu-cut: "Cut";
-    in property <string> menu-copy: "Copy";
-    in property <string> menu-paste: "Paste";
-    in property <string> menu-copy-message: "Copy message";
-    in property <string> menu-select-text: "Select text";
-    in property <string> menu-show-formatting: "Show formatting";
-    in property <string> menu-copy-link: "Copy link";
-    in property <string> menu-open-link: "Open link";
     in property <string> menu-save-image: "Save image…";
-    in property <string> menu-open-image: "Open image";
     in property <string> chat-edited-mark: "(edited)";
     in property <string> chat-deleted-placeholder: "Message deleted";
-    in property <string> menu-edit-message: "Edit message";
-    in property <string> menu-delete-message: "Delete message";
     in property <string> chat-editing: "Editing your message — Enter saves, Esc cancels";
     in property <string> chat-load-earlier: "Load earlier messages";
     in property <string> chat-loading: "Loading…";
@@ -117,8 +91,6 @@ export global Tr {
     in property <string> dm-note-memory: "Reaches them only while they are online; this server keeps nothing.";
     in property <string> dm-back: "Back to General";
     in property <string> chat-placeholder-dm: "Message";
-    in property <string> menu-message: "Message…";
-    in property <string> dm-close: "Close conversation";
 
     // Screen share dialog
     in property <string> monitor: "Monitor";

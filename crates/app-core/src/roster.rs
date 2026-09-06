@@ -96,6 +96,19 @@ impl Role {
             Role::Admin => 4,
         }
     }
+
+    /// The inverse of [`Role::as_int`] for the four real roles; `None`
+    /// for anything else (a pick the UI could not have made).
+    #[must_use]
+    pub fn from_int(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Role::Guest),
+            2 => Some(Role::Member),
+            3 => Some(Role::Organizer),
+            4 => Some(Role::Admin),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +125,8 @@ pub struct UserState {
     pub role: Role,
     /// From `UserDetails`; 0 until it arrives.
     pub level: u16,
+    /// From `UserProgress` (spec §9.1); `None` until it arrives.
+    pub xp: Option<u64>,
 }
 
 impl UserState {
@@ -125,6 +140,7 @@ impl UserState {
             channel_id,
             role: Role::Unknown,
             level: 0,
+            xp: None,
         }
     }
 }
@@ -173,6 +189,8 @@ pub struct RosterRow {
     pub sharing: bool,
     pub role: Role,
     pub level: u16,
+    /// Total xp, when the server said (the card's bar).
+    pub xp: Option<u64>,
     /// The channel they are in (the "Move to" menu greys it out).
     pub channel_id: u16,
 }
@@ -248,6 +266,7 @@ pub fn grouped_rows(
             sharing: sharers.contains(&id),
             role: st.role,
             level: st.level,
+            xp: st.xp,
             channel_id: st.channel_id,
         }
     };

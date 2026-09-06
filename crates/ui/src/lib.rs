@@ -20,10 +20,131 @@ pub mod convert {
 
     use app_core::{
         chat::{ChatItem, Meta},
+        menu,
         roster::{split_id, ChannelRow, RosterItem, RosterRow},
     };
 
-    use super::{ChatRow, UserRow};
+    use super::{ChatRow, MenuAction, MenuEntry, UserRow};
+
+    /// Menu entries → the overlay's rows: the main column and, in
+    /// order of appearance, one column per submenu (`MenuEntry.submenu`
+    /// indexes it). `label` localizes; the shell owns the catalog.
+    #[must_use]
+    pub fn menu_entries(
+        entries: &[menu::Entry],
+        label: &dyn Fn(&menu::Label) -> slint::SharedString,
+    ) -> (Vec<MenuEntry>, Vec<Vec<MenuEntry>>) {
+        let mut submenus: Vec<Vec<MenuEntry>> = Vec::new();
+        let main = entries
+            .iter()
+            .map(|e| {
+                let submenu = if e.submenu.is_empty() {
+                    -1
+                } else {
+                    submenus.push(
+                        e.submenu
+                            .iter()
+                            .map(|sub| menu_entry(sub, -1, label))
+                            .collect(),
+                    );
+                    i32::try_from(submenus.len() - 1).unwrap_or(-1)
+                };
+                menu_entry(e, submenu, label)
+            })
+            .collect();
+        (main, submenus)
+    }
+
+    fn menu_entry(
+        e: &menu::Entry,
+        submenu: i32,
+        label: &dyn Fn(&menu::Label) -> slint::SharedString,
+    ) -> MenuEntry {
+        let (action, arg) = menu_action(e.action);
+        MenuEntry {
+            label: label(&e.label),
+            action,
+            arg,
+            enabled: e.enabled,
+            separator: e.separator,
+            danger: e.danger,
+            submenu,
+        }
+    }
+
+    /// An action and its parameter, as the Slint enum + `arg` carry
+    /// them; [`menu_action_back`] is the inverse.
+    #[must_use]
+    pub fn menu_action(action: menu::Action) -> (MenuAction, i32) {
+        use menu::Action as A;
+        match action {
+            A::None => (MenuAction::None, 0),
+            A::ChannelEdit(id) => (MenuAction::ChannelEdit, i32::from(id)),
+            A::ChannelDelete(id) => (MenuAction::ChannelDelete, i32::from(id)),
+            A::Volume => (MenuAction::Volume, 0),
+            A::MuteForMe => (MenuAction::MuteForMe, 0),
+            A::ResetAudio => (MenuAction::ResetAudio, 0),
+            A::Watch => (MenuAction::Watch, 0),
+            A::Message => (MenuAction::Message, 0),
+            A::SetRole(role) => (MenuAction::SetRole, role.as_int()),
+            A::MoveTo(id) => (MenuAction::MoveTo, i32::from(id)),
+            A::ChannelKick => (MenuAction::ChannelKick, 0),
+            A::MuteVoice => (MenuAction::MuteVoice, 0),
+            A::MuteChat => (MenuAction::MuteChat, 0),
+            A::UnmuteVoice => (MenuAction::UnmuteVoice, 0),
+            A::UnmuteChat => (MenuAction::UnmuteChat, 0),
+            A::Disconnect => (MenuAction::Disconnect, 0),
+            A::Kick => (MenuAction::Kick, 0),
+            A::Ban => (MenuAction::Ban, 0),
+            A::CopyText => (MenuAction::CopyText, 0),
+            A::SelectText(on) => (MenuAction::SelectText, i32::from(on)),
+            A::EditMessage => (MenuAction::EditMessage, 0),
+            A::DeleteMessage => (MenuAction::DeleteMessage, 0),
+            A::OpenImage => (MenuAction::OpenImage, 0),
+            A::SaveImage => (MenuAction::SaveImage, 0),
+            A::Cut => (MenuAction::Cut, 0),
+            A::Copy => (MenuAction::Copy, 0),
+            A::Paste => (MenuAction::Paste, 0),
+        }
+    }
+
+    /// The pick back into app-core's action. A parameter the UI could
+    /// not have produced (a role outside 1…4, a channel above `u16`)
+    /// yields `None`.
+    #[must_use]
+    pub fn menu_action_back(action: MenuAction, arg: i32) -> Option<menu::Action> {
+        use menu::Action as A;
+        let channel = || u16::try_from(arg).ok();
+        Some(match action {
+            MenuAction::None => A::None,
+            MenuAction::ChannelEdit => A::ChannelEdit(channel()?),
+            MenuAction::ChannelDelete => A::ChannelDelete(channel()?),
+            MenuAction::Volume => A::Volume,
+            MenuAction::MuteForMe => A::MuteForMe,
+            MenuAction::ResetAudio => A::ResetAudio,
+            MenuAction::Watch => A::Watch,
+            MenuAction::Message => A::Message,
+            MenuAction::SetRole => A::SetRole(app_core::roster::Role::from_int(arg)?),
+            MenuAction::MoveTo => A::MoveTo(channel()?),
+            MenuAction::ChannelKick => A::ChannelKick,
+            MenuAction::MuteVoice => A::MuteVoice,
+            MenuAction::MuteChat => A::MuteChat,
+            MenuAction::UnmuteVoice => A::UnmuteVoice,
+            MenuAction::UnmuteChat => A::UnmuteChat,
+            MenuAction::Disconnect => A::Disconnect,
+            MenuAction::Kick => A::Kick,
+            MenuAction::Ban => A::Ban,
+            MenuAction::CopyText => A::CopyText,
+            MenuAction::SelectText => A::SelectText(arg != 0),
+            MenuAction::EditMessage => A::EditMessage,
+            MenuAction::DeleteMessage => A::DeleteMessage,
+            MenuAction::OpenImage => A::OpenImage,
+            MenuAction::SaveImage => A::SaveImage,
+            MenuAction::Cut => A::Cut,
+            MenuAction::Copy => A::Copy,
+            MenuAction::Paste => A::Paste,
+        })
+    }
 
     /// Roster row → sidebar model row.
     #[must_use]
@@ -50,6 +171,8 @@ pub mod convert {
             // The shell fills these from what the session may do and
             // from the profiles it knows.
             level_line: "".into(),
+            xp_pct: -1,
+            xp_line: "".into(),
             telemetry: "".into(),
             avatar: slint::Image::default(),
             has_avatar: false,
@@ -95,6 +218,8 @@ pub mod convert {
             role: 0,
             level: 0,
             level_line: "".into(),
+            xp_pct: -1,
+            xp_line: "".into(),
             telemetry: "".into(),
             avatar: slint::Image::default(),
             has_avatar: false,

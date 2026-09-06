@@ -12,9 +12,13 @@
 //                inline in message rows: the markdown translator
 //                linkifies them for StyledText)
 //
-// Context menus use the builtin ContextMenuArea (keyboard + a11y for
-// free — the hand-rolled FLTK menus had neither). Copy for messages,
-// copy/open for links, save/open for images.
+// Context menus are the window's own overlay (main.slint), filled by
+// the host from app-core's `menu`: copy / select / edit / delete for
+// messages, open / save for images, cut / copy / paste in the
+// composer. A right-click reaches a row's TouchArea because the
+// read-only TextInputs ignore every button but the left one; a
+// StyledText accepts them all, so on a formatted body the menu opens
+// from the header, the gutter or the margin.
 //
 // The composer: emoji + attach icon buttons, the input, live counter
 // (amber past 380), send. The emoji palette is an in-window popover —
@@ -42,6 +46,9 @@ import { IconBtn, AvatarTile } from "widgets.slint";
 component Gutter inherits Rectangle {
     in property <ChatRow> data;
     in property <bool> head;
+    /// A right-click on the picture: the row opens its menu there
+    /// (the tile's own TouchArea would otherwise swallow it).
+    callback context(x: length, y: length);
     width: Theme.chat-gutter;
     if head : tile := Rectangle {
         x: Theme.gap-sm;
@@ -58,6 +65,12 @@ component Gutter inherits Rectangle {
             ring-room: false;
         }
         TouchArea {
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                    root.context(self.absolute-position.x + self.mouse-x,
+                        self.absolute-position.y + self.mouse-y);
+                }
+            }
             changed has-hover => {
                 if (self.has-hover) {
                     State.card-x = tile.absolute-position.x;
@@ -109,37 +122,25 @@ component MessageRow inherits Rectangle {
     property <length> header-h: root.cozy && root.head ? Theme.chat-header : 0px;
     height: root.top + root.header-h + cell.height + (root.cozy ? 4px : 3px);
 
-    ContextMenuArea {
-        enabled: !data.deleted;
-        Menu {
-            MenuItem {
-                title: Tr.menu-copy-message;
-                activated => { Logic.copy-text(data.body); }
-            }
-            if data.styled : MenuItem {
-                title: root.select-mode ? Tr.menu-show-formatting : Tr.menu-select-text;
-                activated => { root.select-requested(!root.select-mode); }
-            }
-            // Only the author edits; the author or a moderator deletes
-            // (the server checks both; this only mirrors it). DMs are
-            // immutable in 1.1.1.
-            if State.active-dm < 0 && (data.own || State.perm-delete-any) : MenuSeparator { }
-            if State.active-dm < 0 && data.own : MenuItem {
-                title: Tr.menu-edit-message;
-                activated => { Logic.row-edit(data.msg-id-lo, data.msg-id-hi); }
-            }
-            if State.active-dm < 0 && (data.own || State.perm-delete-any) : MenuItem {
-                title: Tr.menu-delete-message;
-                activated => { Logic.row-delete(data.msg-id-lo, data.msg-id-hi); }
+    // Under everything: the read-only body ignores right-clicks, so
+    // they land here and open the row's menu.
+    ctx := TouchArea {
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                Logic.row-context(data, root.select-mode,
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y);
             }
         }
-
+    }
+    Rectangle {
         if root.cozy : Gutter {
             x: 0px;
             y: root.top;
             height: 36px;
             data: data;
             head: root.head;
+            context(x, y) => { Logic.row-context(data, root.select-mode, x, y); }
         }
         if root.cozy && root.head : RowHeader {
             x: Theme.chat-gutter;
@@ -302,7 +303,10 @@ component DayMarkerRow inherits Rectangle {
             horizontal-stretch: 1;
         }
         Rectangle {
-            width: label.preferred-width + 2 * Theme.gap-md;
+            // Never wider than the row: an unwrapped label's width is
+            // a *minimum* the ListView adopts as its viewport width,
+            // and that is a horizontal scrollbar.
+            width: Math.min(label.preferred-width + 2 * Theme.gap-md, root.width * 0.8);
             height: 24px;
             y: (parent.height - self.height) / 2;
             border-radius: 12px;
@@ -310,12 +314,14 @@ component DayMarkerRow inherits Rectangle {
             border-width: 1px;
             border-color: Theme.border;
             label := Text {
+                width: parent.width - 2 * Theme.gap-sm;
                 text: data.body;
                 color: Theme.text-secondary;
                 font-size: Theme.font-sm;
                 font-weight: 600;
                 vertical-alignment: center;
                 horizontal-alignment: center;
+                overflow: elide;
             }
         }
         Rectangle {
@@ -335,28 +341,23 @@ component CodeRow inherits Rectangle {
     property <length> header-h: root.head ? Theme.chat-header : 0px;
     property <length> left: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
     height: root.top + root.header-h + panel.height + 6px;
-    ContextMenuArea {
-        Menu {
-            MenuItem {
-                title: Tr.menu-copy;
-                activated => { Logic.copy-text(data.body); }
-            }
-            if State.active-dm < 0 && (data.own || State.perm-delete-any) : MenuSeparator { }
-            if State.active-dm < 0 && data.own : MenuItem {
-                title: Tr.menu-edit-message;
-                activated => { Logic.row-edit(data.msg-id-lo, data.msg-id-hi); }
-            }
-            if State.active-dm < 0 && (data.own || State.perm-delete-any) : MenuItem {
-                title: Tr.menu-delete-message;
-                activated => { Logic.row-delete(data.msg-id-lo, data.msg-id-hi); }
+    ctx := TouchArea {
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                Logic.row-context(data, false,
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y);
             }
         }
+    }
+    Rectangle {
         if root.cozy : Gutter {
             x: 0px;
             y: root.top;
             height: 36px;
             data: data;
             head: root.head;
+            context(x, y) => { Logic.row-context(data, false, x, y); }
         }
         if root.head : RowHeader {
             x: root.left;
@@ -426,23 +427,23 @@ component ImageRow inherits Rectangle {
     property <length> left: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
     height: root.top + root.header-h + disp-h + 6px;
 
-    ContextMenuArea {
-        Menu {
-            MenuItem {
-                title: Tr.menu-open-image;
-                activated => { Logic.row-open-image(data.row-id); }
-            }
-            MenuItem {
-                title: Tr.menu-save-image;
-                activated => { Logic.row-save-image(data.row-id); }
+    ctx := TouchArea {
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                Logic.row-context(data, false,
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y);
             }
         }
+    }
+    Rectangle {
         if root.cozy : Gutter {
             x: 0px;
             y: root.top;
             height: 36px;
             data: data;
             head: root.head;
+            context(x, y) => { Logic.row-context(data, false, x, y); }
         }
         if root.head : RowHeader {
             x: root.left;
@@ -470,6 +471,13 @@ component ImageRow inherits Rectangle {
                     it := TouchArea {
                         mouse-cursor: pointer;
                         clicked => { Logic.row-open-image(data.row-id); }
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                                Logic.row-context(data, false,
+                                    self.absolute-position.x + self.mouse-x,
+                                    self.absolute-position.y + self.mouse-y);
+                            }
+                        }
                         changed has-hover => {
                             if (data.is-gif) { Logic.gif-hover(data.row-id, self.has-hover); }
                         }
@@ -485,6 +493,9 @@ component ImageRow inherits Rectangle {
 
 component ComposerField inherits Rectangle {
     in-out property <string> text <=> input.text;
+    /// A right-click anywhere on the field (the input ignores the
+    /// button; the Flickable only intercepts the left one).
+    callback context(x: length, y: length);
     // UTF-8 byte offsets, the unit set-selection-offsets consumes —
     // forwarded to the host for cursor-relative edits.
     out property <int> cursor-offset <=> input.cursor-position-byte-offset;
@@ -512,6 +523,14 @@ component ComposerField inherits Rectangle {
     animate border-color { duration: 150ms; }
 
     in property <string> placeholder;
+    TouchArea {
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                root.context(self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y);
+            }
+        }
+    }
     // The hint for an empty draft: the room, or the person.
     if root.placeholder != "" && input.text == "" : Text {
         x: Theme.gap-md;
@@ -564,6 +583,7 @@ export component ChatPane inherits Rectangle {
     /// conversation switch.
     public function pin-to-bottom() {
         root.stick-to-bottom = true;
+        root.follow-pending = true;
         root.scroll-to-end();
     }
     /// True when the user is at (or within ~40px of) the bottom — the
@@ -574,20 +594,69 @@ export component ChatPane inherits Rectangle {
     }
     public function focus-composer() { input.focus-input(); }
     public function composer-set-cursor(pos: int) { input.set-cursor(pos); }
+    public function composer-cut() { input.do-cut(); }
+    public function composer-copy() { input.do-copy(); }
+    /// The host appended rows: if the reader was at the bottom, follow
+    /// them — on the layout pass that measures them, not now (a
+    /// scroll-to-end right after a push reads the old height).
+    public function follow-appended() {
+        if (root.stick-to-bottom) { root.follow-pending = true; }
+    }
 
     // Maintained by the ListView's changed-handlers below; also drives
     // the jump-to-latest button.
     private property <bool> stick-to-bottom: true;
-    /// The one styled row currently shown as selectable plain text.
-    private property <int> selecting-row: -1;
+    // A follow is owed: appended rows (or a pin) are waiting for the
+    // ListView to measure them. Cleared once the exact bottom is
+    // reached, or the moment the reader scrolls up.
+    private property <bool> follow-pending: false;
 
     col := VerticalLayout {
         padding: Theme.gap-md;
         spacing: Theme.gap-sm;
 
-        // ── Conversation header (spec §6): who this is with, a way
-        // back, and on a memory-mode server the fact that nothing is
-        // kept. General shows no header: the room is the default.
+        // ── Conversation header (spec §6): where you are. General
+        // says so too (the `#`, and how many are here); a DM has the
+        // person, a way back, and on a memory-mode server the fact
+        // that nothing is kept.
+        if State.active-dm < 0 : Rectangle {
+            height: general-head.preferred-height + 2 * Theme.gap-sm;
+            border-radius: Theme.radius-sm;
+            background: Theme.bg-secondary;
+            general-head := HorizontalLayout {
+                padding-left: Theme.gap-sm;
+                padding-right: Theme.gap-sm;
+                spacing: Theme.gap-sm;
+                // The same slot the DM header's back button takes, so
+                // the title sits at one x in both.
+                Rectangle {
+                    width: 28px;
+                    IconDisplay {
+                        icon: IconSet.Hash;
+                        size: 18px;
+                        stroke: Theme.accent-text;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: Tr.dm-general;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-body;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: State.users-count-label;
+                        color: Theme.text-muted;
+                        font-size: Theme.font-xs;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
         if State.active-dm >= 0 : Rectangle {
             height: dm-head.preferred-height + 2 * Theme.gap-sm;
             border-radius: Theme.radius-sm;
@@ -718,6 +787,12 @@ export component ChatPane inherits Rectangle {
             //      person just asked for.
             //   4. Anything else keeps the current state, so mid-layout
             //      geometry never unpins spuriously.
+            //   5. A follow — appended rows, a pin — is owed only until
+            //      the exact bottom is reached, and never against a
+            //      reader who scrolls up. Following on *every* height
+            //      change fought a scrollbar drag: dragging near the
+            //      bottom instantiates rows, the estimate refines, and
+            //      the snap-back held the thumb there.
             private property <length> last-viewport-y;
             pure function at-exact-bottom() -> bool {
                 self.viewport-y <= -(self.viewport-height - self.visible-height) + 2px
@@ -728,34 +803,37 @@ export component ChatPane inherits Rectangle {
             changed viewport-y => {
                 if (self.at-exact-bottom()) {
                     root.stick-to-bottom = true;
+                    root.follow-pending = false;
                 } else if (self.viewport-y > self.last-viewport-y + 0.25px) {
                     root.stick-to-bottom = false;
+                    root.follow-pending = false;
                 } else if (self.viewport-y < self.last-viewport-y - 0.25px && self.near-bottom()) {
                     root.stick-to-bottom = true;
                 }
                 self.last-viewport-y = self.viewport-y;
             }
-            changed viewport-height => { if (root.stick-to-bottom) { root.scroll-to-end(); } }
+            changed viewport-height => { if (root.follow-pending) { root.scroll-to-end(); } }
+            // A resize cannot coincide with a drag: keep the tail in view.
             changed visible-height => { if (root.stick-to-bottom) { root.scroll-to-end(); } }
             for row[i] in State.chat : Rectangle {
-                // One delegate hosting all four kinds; only the matching
-                // one is visible and the wrapper takes its height.
-                // ListView virtualizes, so only on-screen rows exist.
-                height: row.kind == 0 ? msg.height
-                    : row.kind == 1 ? sys.height
-                    : row.kind == 2 ? img.height
-                    : row.kind == 4 ? day.height
-                    : cod.height;
-                msg := MessageRow {
-                    data: row;
-                    visible: row.kind == 0;
-                    select-mode: root.selecting-row == row.row-id;
-                    select-requested(on) => { root.selecting-row = on ? row.row-id : -1; }
+                // One delegate per row, hosting only the matching kind.
+                // `if`, not `visible`: an invisible instance still
+                // hands the ListView its minimum width, and a day
+                // marker's pill sized to a message body was a
+                // horizontal scrollbar. ListView virtualizes, so only
+                // on-screen rows exist.
+                height: cell.preferred-height;
+                cell := VerticalLayout {
+                    if row.kind == 0 : MessageRow {
+                        data: row;
+                        select-mode: State.selecting-row == row.row-id;
+                        select-requested(on) => { State.selecting-row = on ? row.row-id : -1; }
+                    }
+                    if row.kind == 1 : SystemRow { data: row; }
+                    if row.kind == 2 : ImageRow { data: row; }
+                    if row.kind == 3 : CodeRow { data: row; }
+                    if row.kind == 4 : DayMarkerRow { data: row; }
                 }
-                sys := SystemRow  { data: row; visible: row.kind == 1; }
-                img := ImageRow   { data: row; visible: row.kind == 2; }
-                cod := CodeRow    { data: row; visible: row.kind == 3; }
-                day := DayMarkerRow { data: row; visible: row.kind == 4; }
             }
         }
 
@@ -794,8 +872,10 @@ export component ChatPane inherits Rectangle {
             }
         }
 
-        // Composer
+        // Composer. The extra top padding keeps the newest message
+        // clear of the field.
         HorizontalLayout {
+            padding-top: Theme.gap-sm;
             spacing: Theme.gap-sm;
             emoji-btn := IconBtn {
                 icon: IconSet.Smile;
@@ -820,8 +900,8 @@ export component ChatPane inherits Rectangle {
             // text-only default. Everything else falls through.
             paste-scope := FocusScope {
                 horizontal-stretch: 1;
-                // FocusScope/ContextMenuArea are not layouts, so they
-                // don't report the field's grown height to the row —
+                // A FocusScope is not a layout, so it doesn't report
+                // the field's grown height to the row —
                 // without this the row stays 40px and the field spills
                 // past the window bottom. With it, the row grows and
                 // the history shrinks: the composer expands upward.
@@ -897,19 +977,13 @@ export component ChatPane inherits Rectangle {
                     }
                     reject
                 }
-                ContextMenuArea {
-                    Menu {
-                        MenuItem { title: Tr.menu-cut;   activated => { input.do-cut(); } }
-                        MenuItem { title: Tr.menu-copy;  activated => { input.do-copy(); } }
-                        MenuItem { title: Tr.menu-paste; activated => { Logic.paste-rich(); } }
-                    }
-                    input := ComposerField {
-                        placeholder: State.active-dm >= 0
-                            ? Tr.chat-placeholder-dm + " " + State.conv-name
-                            : "";
-                        text <=> State.draft;
-                        edited => { Logic.draft-edited(); }
-                    }
+                input := ComposerField {
+                    placeholder: State.active-dm >= 0
+                        ? Tr.chat-placeholder-dm + " " + State.conv-name
+                        : "";
+                    text <=> State.draft;
+                    edited => { Logic.draft-edited(); }
+                    context(x, y) => { Logic.composer-context(x, y); }
                 }
             }
             counter := Text {

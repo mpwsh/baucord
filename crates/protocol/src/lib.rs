@@ -52,7 +52,7 @@ pub use messages::{
     MAX_LOG_UPLOAD_BYTES, MAX_LOG_UPLOAD_CHUNKS, MEDIA_UPLOAD_PACE,
 };
 pub use permissions::{Rank, RoleId};
-pub use progress::level_for_xp;
+pub use progress::{cost_of_level, level_for_xp, xp_for_level};
 pub use relayed::{split_sender, wrap_sender, RELAY_SENDER_BYTES};
 pub use system_audio::{
     pack_system_audio, parse_system_audio, SystemAudioHeader, SYSTEM_AUDIO_HEADER_SIZE,

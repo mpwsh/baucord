@@ -1647,6 +1647,16 @@ impl ChatServer {
         for msg in profiles {
             self.send_if_profiles(client_id, &msg);
         }
+        // Everyone's progress, ours included (the newcomer's own bar
+        // needs its xp too), for sessions that render it.
+        let progress: Vec<ServerMessage> = self
+            .user_of
+            .iter()
+            .map(|(c, u)| self.user_progress(*c, u))
+            .collect();
+        for msg in progress {
+            self.send_if(client_id, features::PROGRESS, &msg);
+        }
 
         self.broadcast_msg_except(
             client_id,
@@ -1664,6 +1674,10 @@ impl ChatServer {
             let msg = self.user_profile(client_id, &user_id);
             for peer in self.clients() {
                 self.send_if_profiles(peer, &msg);
+            }
+            let msg = self.user_progress(client_id, &user_id);
+            for peer in self.clients() {
+                self.send_if(peer, features::PROGRESS, &msg);
             }
         }
         self.refresh_enforcement();

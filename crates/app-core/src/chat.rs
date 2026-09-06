@@ -385,7 +385,9 @@ mod tests {
         Meta {
             id,
             ts: "12:00".into(),
-            ts_ms: 1_000 * id,
+            // Placeholder ids sit near `u64::MAX`; a plain multiply
+            // overflows there under debug assertions.
+            ts_ms: id.saturating_mul(1_000),
             day: 20_000,
             user: "a".into(),
             own: false,

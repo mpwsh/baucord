@@ -1970,6 +1970,46 @@ fn progress_accrues_by_the_minute_and_levels_up() {
 }
 
 #[test]
+fn everyone_sees_everyones_progress() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect("alice");
+    let mut bob = w.connect("bob");
+    let alice_id = alice.id;
+    let bob_id = bob.id;
+    // The newcomer gets the roster's standing (level 1, nothing yet),
+    // itself included; the room gets the newcomer's.
+    bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::UserProgress {
+            client_id,
+            xp,
+            level,
+        } if *client_id == alice_id => (*xp == 0 && *level == 1).then_some(()),
+        _ => None,
+    });
+    bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::UserProgress { client_id, .. } if *client_id == bob_id => Some(()),
+        _ => None,
+    });
+    alice.wait_for(&mut w, &mut [&mut bob], |m| match m {
+        ServerMessage::UserProgress { client_id, .. } if *client_id == bob_id => Some(()),
+        _ => None,
+    });
+    // A minute of alice talking with bob there: 6 xp, and bob sees it
+    // move (no level-up involved).
+    alice.send(&mut w, &ClientMessage::Speaking(true));
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(61));
+    let (xp, level) = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::UserProgress {
+            client_id,
+            xp,
+            level,
+        } if *client_id == alice_id && *xp > 0 => Some((*xp, *level)),
+        _ => None,
+    });
+    assert_eq!((xp, level), (6, 1));
+}
+
+#[test]
 fn a_purge_removes_the_person_and_their_messages() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
     let boot = w.bootstrap_code();

@@ -128,6 +128,10 @@ pub struct UiSettings {
     /// cap (`protocol::MAX_CHAT_IMAGE_BYTES`) is the ceiling.
     #[serde(default = "default_image_max_kb")]
     pub image_max_kb: u32,
+    /// The sidebar's Messages section is folded to its header, giving
+    /// the voice channels the room.
+    #[serde(default)]
+    pub messages_collapsed: bool,
 }
 
 impl Default for UiSettings {
@@ -137,6 +141,7 @@ impl Default for UiSettings {
             show_timestamps: true,
             compact_rows: false,
             image_max_kb: default_image_max_kb(),
+            messages_collapsed: false,
         }
     }
 }

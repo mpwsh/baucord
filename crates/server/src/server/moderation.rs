@@ -220,6 +220,16 @@ impl ChatServer {
     }
 
     /// Send only to a session that negotiated `ROLES`.
+    /// Where a session's user stands (spec §9.1): the xp behind the
+    /// level `UserDetails` carries, for sessions that render the bar.
+    pub(super) fn user_progress(&self, client: ClientId, user: &UserId) -> ServerMessage {
+        ServerMessage::UserProgress {
+            client_id: client,
+            xp: self.policy.xp.get(user).copied().unwrap_or(0),
+            level: self.policy.level_of(user),
+        }
+    }
+
     pub(super) fn send_if_roles(&mut self, client: ClientId, msg: &ServerMessage) {
         if self
             .features_of

@@ -383,6 +383,14 @@ impl ChatServer {
             *self.policy.xp.entry(user).or_insert(0) += delta.xp;
             let after = self.policy.level_of(&user);
             self.persist.send(Command::AddProgress(delta));
+            // Everyone's bar moves once a minute: each of this user's
+            // sessions, to every peer that renders it.
+            for session in self.sessions_of(&user) {
+                let msg = self.user_progress(session, &user);
+                for peer in self.clients() {
+                    self.send_if(peer, features::PROGRESS, &msg);
+                }
+            }
             if after > before {
                 let xp = self.policy.xp.get(&user).copied().unwrap_or(0);
                 info!("{} reached level {after}", hex(&user[..8]));

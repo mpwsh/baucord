@@ -1,15 +1,17 @@
 Threads on messages, or being able to reply under messages in general chat 
 reactions to messages
+a feedback tab in settings with a button to 'attach logs' that should send the last 200 lines from baucord.log + a textbox for the user to fill up with details. Clicking send should attach the file and send it via the file uploading protocol and the server should persist it there. Admins should be able to pull this via their admin panel on a feedback tab or something.
+
+
+the right click context menu right now its "native", we probably want a nice slint UI for that instead using a modal or similar pop up menu
 horizontal scroll is broken in the general chat. We should not allow to scroll horizontally, onlky vertically. for responsiveness we wrap text
 we need a button to generate invite links next to the create channel + sign, button label should be "invite". When an invite code is generated it should be printed in chat.
 right clicking a channel should display the channel edit features
 display an XP BAR on the User Card when hovering, so others (and we) can see how close we are to level up 
 usernames are not centered with their profile picture on the sidebar
-sidebar should have a title for "Voice" because the one below on dms has the "Messages" title
+sidebar should have a title for "Voice" because the one below on dms has the "Messages" title but Voice channels are just floating there under Users: <count>. We Also might want to put a header on the General Chat main textbox like the one we have for the DMs? At least so we know we are in general
 text chat is still pretty rough, like the scrollbar gets stuck in the bottom and is not releasing the cursor, also the "last message" is too close to the bottom (it should have some margin so it doesnt collide with the text input) 
 the Close DM X button doesnt work, and its also colliding with the sidebar scrollbar on hover. move the X away from the sidebar
 we also need a right click for channels or 3 dots or similar so we edit/delete channels easily without the /channel command
-sound when a user starts sharing in our channel
-soft sound to sharer when a user joins the stream
-a feedback tab in settings with a button to 'attach logs' that should send the last 200 lines from baucord.log + a textbox for the user to fill up with details
+sound when a user starts sharing in our channel  and softer sound to sharer when a user joins the stream -- all sounds need to be switchable to off on the settings page (Maybe move the sounds section to its own tab so its not in general)
 

@@ -348,7 +348,7 @@ channel-owner-server = server
 chat-admin-no-telemetry = Nothing received from them this run.
 
 # ── 1.1 roster menu, badges, moderation dialog ─────────────────────────
-menu-volume = Volume…
+menu-volume = Volume
 menu-mute-for-me = Mute for me
 menu-unmute-for-me = Unmute for me
 menu-role = Role
@@ -367,6 +367,7 @@ role-member = Member
 role-organizer = Organizer
 role-admin = Admin
 tooltip-level = Level { $level }
+card-xp-line = { $have } / { $need } xp to level { $next }
 tooltip-telemetry-age = Telemetry { $ago }
 tooltip-no-telemetry = No telemetry received from them yet.
 moderation-duration = Duration
@@ -554,6 +555,10 @@ dm-failed-no-such-user = No such user.
 dm-failed-store = The server couldn't store the message. Try again.
 
 messages-header = Messages
+voice-header = Voice
+messages-collapse = Collapse messages
+messages-expand = Expand messages
+invite-button = Invite users
 dm-general = General
 dm-direct-message = Direct message
 dm-note-memory = Reaches them only while they are online; this server keeps nothing.
