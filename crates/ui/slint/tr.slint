@@ -110,6 +110,14 @@ export global Tr {
     in property <string> chat-load-earlier: "Load earlier messages";
     in property <string> chat-loading: "Loading…";
     in property <string> banner-not-persistent: "This server keeps nothing between restarts: roles, invites and bans last until it stops.";
+    // Direct messages
+    in property <string> messages-header: "Messages";
+    in property <string> dm-general: "General";
+    in property <string> dm-direct-message: "Direct message";
+    in property <string> dm-note-memory: "Reaches them only while they are online; this server keeps nothing.";
+    in property <string> dm-back: "Back to General";
+    in property <string> chat-placeholder-dm: "Message";
+    in property <string> menu-message: "Message…";
 
     // Screen share dialog
     in property <string> monitor: "Monitor";
@@ -118,6 +126,8 @@ export global Tr {
 
     // Stream viewer
     in property <string> stop-watching: "Stop watching";
+    in property <string> viewer-fullscreen: "Full screen (F)";
+    in property <string> viewer-exit-fullscreen: "Exit full screen (Esc)";
 
     // Settings
     in property <string> settings-title: "Settings";
@@ -152,15 +162,11 @@ export global Tr {
     in property <string> identity-regenerate-confirm: "Regenerate — new user, are you sure?";
     in property <string> profile-lead: "How you appear to others.";
     in property <string> profile-no-name: "No nickname yet";
-    in property <string> profile-nickname-hint: "Used from your next connection on.";
+    in property <string> profile-nickname-hint: "Renames you for everyone while connected.";
     in property <string> profile-name-color: "Name color";
-    in property <string> profile-name-color-hint: "Every color here reads on the chat background. Gold is reserved for admins.";
     in property <string> profile-name-style: "Name style";
-    in property <string> profile-avatar: "Avatar";
-    in property <string> profile-avatar-hint: "PNG, JPEG or WebP; cropped square and scaled to 128 × 128.";
     in property <string> profile-avatar-choose: "Choose image…";
     in property <string> profile-avatar-remove: "Remove";
-    in property <string> profile-note: "Kept on this device. Servers with profile support (1.1.2) will show it to everyone.";
     in property <string> general-lead: "Language, text size, sounds and files.";
     in property <string> text-size: "Text size";
     in property <string> text-size-hint: "Applies everywhere, right away.";
@@ -170,6 +176,7 @@ export global Tr {
     in property <string> sounds-join-leave: "Someone joins or leaves your channel";
     in property <string> sounds-mention: "A message names you";
     in property <string> sounds-mention-hint: "Your nickname as a word, or @nickname. Off by default: the general chat can be busy. Ordinary messages never make a sound.";
+    in property <string> sounds-dm: "A direct message arrives";
     in property <string> startup-header: "Startup";
     in property <string> startup-auto-connect: "Connect to the default server on launch";
     in property <string> startup-auto-connect-hint: "Needs a nickname; the connect screen is skipped.";

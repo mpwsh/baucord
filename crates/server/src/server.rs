@@ -40,8 +40,10 @@ use transport::{
 };
 
 mod channels;
+mod dms;
 mod history;
 mod moderation;
+mod profiles;
 
 use crate::{
     clock::{Clock, WallMs},
@@ -55,6 +57,7 @@ use crate::{
         DEFAULT_INVITE_TTL_MS,
     },
     relay::{ShareInfo, VideoRelay, VoiceRelay},
+    server::{dms::PendingDm, profiles::AnnouncedUpload},
 };
 
 /// Announced share dimensions must fall in this range (per-chunk
@@ -218,6 +221,20 @@ pub struct ChatServer {
     /// In-progress image uploads, at most one per client — a chunk
     /// with a fresh `upload_id` abandons the old partial.
     uploads: HashMap<ClientId, IncomingUpload>,
+    /// Blob uploads in flight (spec §7), announced first.
+    blob_uploads: HashMap<ClientId, IncomingUpload>,
+    announced_uploads: HashMap<ClientId, AnnouncedUpload>,
+    /// Blob bytes by hash: the only copy without persistence, a cache
+    /// of the disk with it.
+    blob_bytes: HashMap<protocol::BlobId, std::sync::Arc<Vec<u8>>>,
+    /// Disk reads in flight: who asked for which blob.
+    pending_blobs: HashMap<protocol::BlobId, (AskId, Vec<ClientId>)>,
+    /// Profile and rename rate limits (spec §7.1).
+    profile_changed_at: HashMap<UserId, Instant>,
+    renamed_at: HashMap<ClientId, Instant>,
+    /// DMs waiting for the store, and conversation-list reads (spec §6).
+    pending_dms: HashMap<AskId, PendingDm>,
+    pending_convs: HashMap<AskId, ClientId>,
     /// In-progress log uploads, same shape.
     log_uploads: HashMap<ClientId, IncomingUpload>,
     /// When each client last completed a log upload.
@@ -352,6 +369,14 @@ impl ChatServer {
             last_config_check: now,
             image_bytes: HashMap::new(),
             uploads: HashMap::new(),
+            blob_uploads: HashMap::new(),
+            announced_uploads: HashMap::new(),
+            blob_bytes: HashMap::new(),
+            pending_blobs: HashMap::new(),
+            profile_changed_at: HashMap::new(),
+            renamed_at: HashMap::new(),
+            pending_dms: HashMap::new(),
+            pending_convs: HashMap::new(),
             log_uploads: HashMap::new(),
             last_log_upload: HashMap::new(),
             image_bytes_global: Vec::new(),
@@ -1248,7 +1273,15 @@ impl ChatServer {
     fn poll_persistence(&mut self) {
         let polled = self.persist.poll(self.now);
         for (id, outcome) in polled.answers {
-            self.resolve_history_answer(id, outcome);
+            if self.is_blob_ask(id) {
+                self.resolve_blob_answer(id, outcome);
+            } else if self.is_dm_ask(id) {
+                self.resolve_dm_answer(id, outcome);
+            } else if self.is_conversations_ask(id) {
+                self.resolve_conversations_answer(id, outcome);
+            } else {
+                self.resolve_history_answer(id, outcome);
+            }
         }
         for notice in polled.notices {
             match notice {
@@ -1591,6 +1624,7 @@ impl ChatServer {
         self.last_activity.insert(client_id, self.now);
         self.send_channel_details(client_id);
         self.replay_history(client_id);
+        self.send_conversations(client_id);
 
         // Who everyone is, for clients that render roles (spec §8):
         // the whole roster to the newcomer, the newcomer to everyone.
@@ -1602,6 +1636,16 @@ impl ChatServer {
             .collect();
         for msg in details {
             self.send_if_roles(client_id, &msg);
+        }
+        // Everyone's look, ours included (the server's copy is the
+        // one that follows the key), for sessions that render it.
+        let profiles: Vec<ServerMessage> = self
+            .user_of
+            .iter()
+            .map(|(c, u)| self.user_profile(*c, u))
+            .collect();
+        for msg in profiles {
+            self.send_if_profiles(client_id, &msg);
         }
 
         self.broadcast_msg_except(
@@ -1617,6 +1661,10 @@ impl ChatServer {
             for peer in self.clients() {
                 self.send_if_roles(peer, &msg);
             }
+            let msg = self.user_profile(client_id, &user_id);
+            for peer in self.clients() {
+                self.send_if_profiles(peer, &msg);
+            }
         }
         self.refresh_enforcement();
     }
@@ -1630,6 +1678,9 @@ impl ChatServer {
         self.chat_tokens.remove(&client_id);
         self.last_activity.remove(&client_id);
         self.spoke.remove(&client_id);
+        self.blob_uploads.remove(&client_id);
+        self.announced_uploads.remove(&client_id);
+        self.renamed_at.remove(&client_id);
         if let Some(user_id) = self.user_of.remove(&client_id) {
             let key_hash = self.key_of.remove(&client_id);
             let now = self.wall_now();
@@ -1779,6 +1830,30 @@ impl ChatServer {
                 channel_id,
                 user_id,
             } => self.handle_channel_kick(client_id, channel_id, user_id),
+            ClientMessage::SetProfile(profile) => self.handle_set_profile(client_id, profile),
+            ClientMessage::SetNickname { name } => self.handle_set_nickname(client_id, &name),
+            ClientMessage::UploadBegin {
+                upload_id,
+                name,
+                mime,
+                size,
+                sha256,
+            } => self.handle_upload_begin(client_id, upload_id, name, mime, size, sha256),
+            ClientMessage::UploadChunk {
+                upload_id,
+                index,
+                count,
+                data,
+            } => self.handle_upload_chunk(client_id, upload_id, index, count, data),
+            ClientMessage::FetchBlob { blob_id } => self.handle_fetch_blob(client_id, blob_id),
+            ClientMessage::DirectMessage {
+                to,
+                text,
+                client_ref,
+            } => self.handle_direct_message(client_id, to, text, client_ref),
+            ClientMessage::MarkRead { conv, msg_id } => {
+                self.handle_mark_read(client_id, conv, msg_id);
+            }
             ClientMessage::ChatImageChunk {
                 upload_id,
                 index,

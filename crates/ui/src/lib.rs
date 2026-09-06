@@ -47,8 +47,17 @@ pub mod convert {
             is_our_channel: false,
             role: r.role.as_int(),
             level: i32::from(r.level),
-            // The shell fills these from what the session may do.
-            tooltip: "".into(),
+            // The shell fills these from what the session may do and
+            // from the profiles it knows.
+            level_line: "".into(),
+            telemetry: "".into(),
+            avatar: slint::Image::default(),
+            has_avatar: false,
+            initial: app_core::roster::initial_of(&r.name).into(),
+            tile_tint: tint(&r.name),
+            name_color: slint::Color::default(),
+            has_name_color: false,
+            name_style: 0,
             outranked: false,
             role_editable: false,
             channel_kickable: false,
@@ -85,7 +94,15 @@ pub mod convert {
             is_our_channel: c.is_ours,
             role: 0,
             level: 0,
-            tooltip: "".into(),
+            level_line: "".into(),
+            telemetry: "".into(),
+            avatar: slint::Image::default(),
+            has_avatar: false,
+            initial: "".into(),
+            tile_tint: slint::Color::default(),
+            name_color: slint::Color::default(),
+            has_name_color: false,
+            name_style: 0,
             outranked: false,
             role_editable: false,
             channel_kickable: false,
@@ -131,6 +148,18 @@ pub mod convert {
                 own: meta.is_some_and(|m| m.own),
                 edited: false,
                 deleted: false,
+                pending: meta.is_some_and(|m| m.pending),
+                continuation: false,
+                avatar: slint::Image::default(),
+                has_avatar: false,
+                initial: meta.map_or_else(
+                    || "".into(),
+                    |m| app_core::roster::initial_of(&m.user).into(),
+                ),
+                tile_tint: meta.map_or(slint::Color::default(), |m| tint(&m.user)),
+                name_color: slint::Color::default(),
+                has_name_color: false,
+                name_style: 0,
             }
         };
         match item {
@@ -149,6 +178,10 @@ pub mod convert {
                 body: body.as_str().into(),
                 ..base(1, None)
             },
+            ChatItem::DayMarker { label, .. } => ChatRow {
+                body: label.as_str().into(),
+                ..base(4, None)
+            },
             ChatItem::Code { meta, code } => ChatRow {
                 body: code.as_str().into(),
                 ..base(3, Some(meta))
@@ -166,6 +199,13 @@ pub mod convert {
                 ..base(2, Some(meta))
             },
         }
+    }
+
+    /// The fallback tile's color for a name.
+    #[must_use]
+    pub fn tint(name: &str) -> slint::Color {
+        let [r, g, b] = app_core::roster::tile_tint(name);
+        slint::Color::from_rgb_u8(r, g, b)
     }
 
     /// Packed RGBA bytes → `slint::Image` (shared-buffer copy).

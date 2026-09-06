@@ -51,7 +51,8 @@ use i18n::t;
 use log::{info, warn};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use ui::{
-    ChannelOption, ChatRow, Logic, MainWindow, ModAction, Phase, State, ToastKind, Tr, UserRow,
+    ChannelOption, ChatRow, DmRow, Logic, MainWindow, ModAction, Phase, State, ToastKind, Tr,
+    UserRow,
 };
 
 use crate::{
@@ -149,9 +150,32 @@ pub struct AppState {
     /// The oldest history id shown, for paging ("load earlier",
     /// `/history`).
     oldest_history_id: Option<u64>,
-    /// A `FetchHistory` we asked for is in flight: its page goes in
-    /// front of the list; the replay after `Init` is appended.
-    history_page_pending: bool,
+    /// The conversation whose `FetchHistory` page is in flight: its
+    /// page goes in front of that list; the general replay after
+    /// `Init` is appended.
+    history_page_pending: Option<Option<client::UserId>>,
+    /// Which conversation the chat pane shows: `None` = General, else
+    /// the DM partner (spec §6). `history` / `chat_model` /
+    /// `oldest_history_id` are that conversation's; the others are
+    /// parked with theirs.
+    active_dm: Option<client::UserId>,
+    parked: HashMap<Option<client::UserId>, Conversation>,
+    /// DM partners as the Messages section lists them, newest first,
+    /// and what the list knows about each.
+    dm_order: Vec<client::UserId>,
+    dm_meta: HashMap<client::UserId, DmMeta>,
+    dms_model: Rc<VecModel<DmRow>>,
+    /// Row ids are unique across conversations (images and GIFs are
+    /// keyed by them), so the counter lives here, not per history.
+    next_row_id: u64,
+    /// Our DMs waiting for the server: `client_ref` → (conversation,
+    /// placeholder message id).
+    next_client_ref: u32,
+    pending_dm_sends: HashMap<u32, (Option<client::UserId>, u64)>,
+    /// The active conversation's "older pages exist" (swapped with it).
+    history_more: bool,
+    /// General messages that arrived while a DM was open.
+    general_unread: u32,
     /// The full text of our own messages by id (rows hold segments):
     /// what the composer starts from on "Edit message".
     own_texts: HashMap<u64, String>,
@@ -169,6 +193,19 @@ pub struct AppState {
     /// The connect screen has been reached once: auto-connect and
     /// start-in-tray apply only then, not after a disconnect.
     startup_done: bool,
+    /// Our own avatar, decoded once for the rows (spec §7.1).
+    pub own_avatar: Option<slint::Image>,
+    /// The hash of our own avatar as uploaded, once the server has it.
+    own_avatar_blob: Option<client::protocol::BlobId>,
+    /// The look changed in Settings since the server last got it;
+    /// sent as one `SetProfile` on Save & close.
+    pub profile_dirty: bool,
+    /// Everyone's look, from the server (spec §7.1).
+    profiles: HashMap<u64, client::protocol::Profile>,
+    /// Decoded pictures by hash: the on-disk cache, warmed on demand.
+    avatar_images: HashMap<client::protocol::BlobId, slint::Image>,
+    /// Blobs asked for and not yet here (no double fetches).
+    avatar_fetches: HashSet<client::protocol::BlobId>,
     /// Per-channel facts from `ChannelDetails`, keyed by wire id.
     channel_details: HashMap<u16, ChannelFacts>,
     is_muted: bool,
@@ -355,6 +392,9 @@ pub fn run() {
     let chat_model = Rc::new(VecModel::<ChatRow>::default());
     let users_model = Rc::new(VecModel::<UserRow>::default());
     let channel_options = Rc::new(VecModel::<ChannelOption>::default());
+    let dms_model = Rc::new(VecModel::<DmRow>::default());
+    main.global::<State>()
+        .set_dms(ModelRc::from(dms_model.clone()));
     main.global::<State>()
         .set_chat(ModelRc::from(chat_model.clone()));
     main.global::<State>()
@@ -398,7 +438,17 @@ pub fn run() {
         server_muted: None,
         text_muted: None,
         oldest_history_id: None,
-        history_page_pending: false,
+        history_page_pending: None,
+        active_dm: None,
+        parked: HashMap::new(),
+        dm_order: Vec::new(),
+        dm_meta: HashMap::new(),
+        dms_model,
+        next_row_id: 0,
+        next_client_ref: 1,
+        pending_dm_sends: HashMap::new(),
+        history_more: false,
+        general_unread: 0,
         own_texts: HashMap::new(),
         editing: None,
         pending_edit: None,
@@ -406,6 +456,12 @@ pub fn run() {
         pending_confirm: None,
         channel_dialog: None,
         startup_done: false,
+        own_avatar: None,
+        own_avatar_blob: None,
+        profile_dirty: false,
+        profiles: HashMap::new(),
+        avatar_images: HashMap::new(),
+        avatar_fetches: HashSet::new(),
         channel_details: HashMap::new(),
         settings,
         is_muted: false,
@@ -493,7 +549,8 @@ pub fn run() {
         });
     }
     {
-        let st = state.borrow();
+        let mut st = state.borrow_mut();
+        st.reload_own_avatar();
         st.push_ui_prefs();
         st.apply_push_to_talk();
     }
@@ -659,6 +716,10 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         }
     });
     let w = Rc::downgrade(state);
+    logic.on_author_hovered(move |name, hovering| {
+        with_app(&w, |app| app.author_hovered(name.as_str(), hovering));
+    });
+    let w = Rc::downgrade(state);
     logic.on_user_moderate(move |index, action| {
         with_app(&w, |app| app.moderate(index, action));
     });
@@ -689,6 +750,25 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 );
             }
         });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_user_dm(move |index| {
+        with_app(&w, |app| app.dm_from_roster(index));
+    });
+    let w = Rc::downgrade(state);
+    logic.on_dm_clicked(move |index| {
+        with_app(&w, |app| {
+            if let Some(user) = usize::try_from(index)
+                .ok()
+                .and_then(|i| app.dm_order.get(i).copied())
+            {
+                app.switch_conversation(Some(user));
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_general_clicked(move || {
+        with_app(&w, |app| app.switch_conversation(None));
     });
     let w = Rc::downgrade(state);
     logic.on_user_channel_kick(move |index| {
@@ -891,6 +971,9 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                             "reason" => ""
                         ),
                     );
+                } else if app.active_dm.is_some() {
+                    // Images in DMs ride the blob path later (1.1.2).
+                    app.show_toast(ToastKind::Warning, &t!("chat-dm-no-images"));
                 } else {
                     // Same broadcast semantics as SendMessage: the server
                     // relays ImageMessage back to everyone (sender
@@ -1056,13 +1139,24 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 ///   flipping at the `show()` call itself fires before the OS maps
 ///   and clears the real surface. The first paint of the fresh
 ///   surface is the exact right moment.
+/// * Move, resize (maximize and restore-from-maximized included) and
+///   scale change — the OS repaints the exposed or reshaped surface
+///   with the background brush while damage tracking still trusts the
+///   back buffer, so an already-focused window shows white bands after
+///   a drag or a maximize until something forces a full frame. A
+///   full-window flip per such event is cheap next to the frame it
+///   already costs.
 pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl Fn() + 'static) {
     use i_slint_backend_winit::WinitWindowAccessor;
     win.on_winit_window_event(move |_w, ev| {
         use i_slint_backend_winit::winit::event::WindowEvent;
         let reveal = matches!(
             ev,
-            WindowEvent::Focused(true) | WindowEvent::Occluded(false)
+            WindowEvent::Focused(true)
+                | WindowEvent::Occluded(false)
+                | WindowEvent::Moved(_)
+                | WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
         ) || (matches!(ev, WindowEvent::RedrawRequested) && armed.take());
         if reveal {
             flip();
@@ -1344,6 +1438,7 @@ impl AppState {
                     short_id(&user_id)
                 );
                 self.push_permissions();
+                self.send_own_profile();
             }
             NetworkMessage::NeedInvite { why } => {
                 let s = self.main.global::<State>();
@@ -1417,63 +1512,25 @@ impl AppState {
                 }));
             }
             NetworkMessage::History {
-                conv: _,
+                conv,
                 messages,
                 more,
             } => {
-                // Oldest first. A page we asked for goes in front of
-                // the list; the replay right after the roster is
-                // appended (nothing live precedes it).
-                if let Some(first) = messages.first() {
-                    self.oldest_history_id = Some(first.id);
+                // A page lands in its own conversation, active or
+                // parked; a DM's is always one we asked for.
+                let key = match conv {
+                    client::ConvRef::General => None,
+                    client::ConvRef::Dm(user) => Some(user),
+                };
+                if let Some(user) = key
+                    && let Some(meta) = self.dm_meta.get_mut(&user)
+                {
+                    meta.fetched = true;
                 }
-                for m in &messages {
-                    if Some(m.user_id) == self.our_user_id {
-                        self.own_texts.insert(m.id, m.text.clone());
-                    }
-                }
-                let prepared: Vec<(Meta, String, bool)> = messages
-                    .iter()
-                    .map(|m| {
-                        let meta = Meta {
-                            id: m.id,
-                            ts: format_wall_time(m.ts),
-                            user: m.name.clone(),
-                            own: Some(m.user_id) == self.our_user_id,
-                        };
-                        (meta, app_core::emoji::replace_shortcodes(&m.text), m.edited)
-                    })
-                    .collect();
-                let s = self.main.global::<State>();
-                s.set_history_more(more);
-                s.set_history_loading(false);
-                if self.history_page_pending {
-                    self.history_page_pending = false;
-                    if prepared.is_empty() {
-                        self.push_chat_system(&t!("chat-no-earlier"));
-                    } else {
-                        let page = prepared
-                            .iter()
-                            .map(|(meta, body, edited)| (meta, body.as_str(), *edited));
-                        let inserted = self.history.prepend_messages(page);
-                        self.sync_prepend(inserted);
-                    }
-                } else {
-                    for (meta, body, edited) in &prepared {
-                        self.push_chat_message(meta, body, *edited);
-                    }
-                    if !prepared.is_empty() {
-                        let line = t!(
-                            "chat-history-loaded",
-                            "count" => prepared.len(),
-                            "more" => if more { "yes" } else { "no" }
-                        );
-                        self.push_chat_system(&line);
-                    }
-                }
+                self.with_conversation(key, |app| app.take_history_page(key, &messages, more));
             }
             NetworkMessage::HistoryUnavailable { retry_secs, .. } => {
-                self.history_page_pending = false;
+                self.history_page_pending = None;
                 self.main.global::<State>().set_history_loading(false);
                 self.push_chat_system(&t!("chat-history-unavailable", "secs" => retry_secs));
             }
@@ -1487,13 +1544,21 @@ impl AppState {
                 let text = app_core::emoji::replace_shortcodes(&text);
                 // In place when the message is on screen; a notice
                 // when it scrolled out of the window (or predates it).
-                match self.history.edit_message(msg_id, &text) {
-                    Some(delta) => self.sync_range(&delta),
-                    None => self.push_chat_system(&t!(
+                let edited = self.with_conversation(None, |app| {
+                    match app.history.edit_message(msg_id, &text) {
+                        Some(delta) => {
+                            app.sync_range(&delta);
+                            true
+                        }
+                        None => false,
+                    }
+                });
+                if !edited {
+                    self.push_chat_system(&t!(
                         "chat-message-edited",
                         "id" => msg_id,
                         "text" => text.as_str()
-                    )),
+                    ));
                 }
             }
             NetworkMessage::MessageDeleted { msg_id } => {
@@ -1504,9 +1569,16 @@ impl AppState {
                 if self.editing.as_ref().is_some_and(|e| e.msg_id == msg_id) {
                     self.edit_cancel();
                 }
-                match self.history.delete_message(msg_id) {
-                    Some(delta) => self.sync_range(&delta),
-                    None => self.push_chat_system(&t!("chat-message-deleted", "id" => msg_id)),
+                let deleted =
+                    self.with_conversation(None, |app| match app.history.delete_message(msg_id) {
+                        Some(delta) => {
+                            app.sync_range(&delta);
+                            true
+                        }
+                        None => false,
+                    });
+                if !deleted {
+                    self.push_chat_system(&t!("chat-message-deleted", "id" => msg_id));
                 }
             }
             NetworkMessage::ChatRateLimited { retry_ms } => {
@@ -1573,6 +1645,9 @@ impl AppState {
                 if let Some(user) = self.users.get_mut(&client_id) {
                     user.role = role_of(&roles);
                     user.level = level;
+                }
+                if self.dm_meta.contains_key(&user_id) {
+                    self.rebuild_dms_model();
                 }
                 if Some(client_id) == self.our_client_id {
                     // Our own rank decides which gated channels we see
@@ -1863,8 +1938,11 @@ impl AppState {
                 let meta = Meta {
                     id,
                     ts: format_wall_time(ts),
+                    ts_ms: ts,
+                    day: local_day(ts),
                     user: username,
                     own: Some(client_id) == self.our_client_id,
+                    pending: false,
                 };
                 if meta.own {
                     self.own_texts.insert(id, text.clone());
@@ -1899,10 +1977,15 @@ impl AppState {
                 let meta = Meta {
                     id,
                     ts: format_wall_time(ts),
+                    ts_ms: ts,
+                    day: local_day(ts),
                     user: username.clone(),
                     own: Some(client_id) == self.our_client_id,
+                    pending: false,
                 };
-                if !media::push_image_row(self, &meta, data) {
+                let shown =
+                    self.with_conversation(None, |app| media::push_image_row(app, &meta, data));
+                if !shown {
                     self.push_chat_system(
                         &t!("chat-image-undisplayable", "name" => username.as_str()),
                     );
@@ -1973,6 +2056,142 @@ impl AppState {
                 self.active_sharers.remove(&client_id);
                 self.sharer_ids = self.active_sharers.keys().copied().collect();
                 self.update_user_list();
+            }
+            // ── 1.1.2: profiles and blobs (spec §7, §7.1) ────────────
+            NetworkMessage::UserProfile { client_id, profile } => {
+                self.take_profile(client_id, profile);
+            }
+            NetworkMessage::ProfileUpdated { user_id, profile } => {
+                let client = self
+                    .details
+                    .iter()
+                    .find(|(_, (u, _))| *u == user_id)
+                    .map(|(c, _)| *c);
+                if let Some(client_id) = client {
+                    self.take_profile(client_id, profile);
+                }
+            }
+            NetworkMessage::ProfileDenied { reason } => {
+                self.show_toast(ToastKind::Warning, &t!(profile_denied_key(reason)));
+            }
+            NetworkMessage::UserRenamed { client_id, name } => {
+                let old = self.username_of(client_id);
+                if let Some(user) = self.users.get_mut(&client_id) {
+                    user.username.clone_from(&name);
+                }
+                // The Messages list and an open DM header follow a
+                // partner's rename.
+                let renamed_partner = self
+                    .details
+                    .get(&client_id)
+                    .map(|(u, _)| *u)
+                    .filter(|u| self.dm_meta.contains_key(u));
+                if let Some(user_id) = renamed_partner {
+                    if let Some(meta) = self.dm_meta.get_mut(&user_id) {
+                        meta.name.clone_from(&name);
+                    }
+                    self.rebuild_dms_model();
+                    if self.active_dm == Some(user_id) {
+                        self.main
+                            .global::<State>()
+                            .set_conv_name(name.as_str().into());
+                    }
+                }
+                self.push_chat_system(&t!(
+                    "chat-user-renamed",
+                    "old" => old.as_str(),
+                    "new" => name.as_str()
+                ));
+                self.update_user_list();
+            }
+            NetworkMessage::RenameDenied { reason } => {
+                self.show_toast(ToastKind::Warning, &t!(rename_denied_key(reason)));
+            }
+            NetworkMessage::UploadDone { upload_id, blob_id } => {
+                if upload_id == AVATAR_UPLOAD_ID {
+                    // The picture is on the server: now the profile
+                    // can point at it.
+                    self.own_avatar_blob = Some(blob_id);
+                    self.avatar_images
+                        .entry(blob_id)
+                        .or_insert_with(|| self.own_avatar.clone().unwrap_or_default());
+                    self.send_own_profile();
+                }
+            }
+            NetworkMessage::UploadRejected { upload_id, reason } => {
+                if upload_id == AVATAR_UPLOAD_ID {
+                    self.show_toast(
+                        ToastKind::Warning,
+                        &t!("profile-avatar-refused", "why" => reason.describe()),
+                    );
+                    // The rest of the look still goes out.
+                    self.own_avatar_blob = None;
+                    self.send_own_profile();
+                }
+            }
+            NetworkMessage::Blob { blob_id, data } => {
+                self.avatar_fetches.remove(&blob_id);
+                self.take_avatar_bytes(blob_id, &data, true);
+            }
+            NetworkMessage::BlobMissing { blob_id } => {
+                self.avatar_fetches.remove(&blob_id);
+            }
+            // ── 1.1.1: direct messages — the conversation UI is the
+            // next drop; until then a DM lands in the general view
+            // marked as such, and a refusal is a toast. ───────────
+            NetworkMessage::Direct {
+                from,
+                username,
+                id,
+                ts,
+                text,
+            } => {
+                self.take_direct(from, &username, id, ts, &text);
+            }
+            NetworkMessage::MessageAck { client_ref, msg_id } => {
+                if let Some((key, placeholder)) = self.pending_dm_sends.remove(&client_ref) {
+                    self.with_conversation(key, |app| {
+                        if let Some(delta) = app.history.confirm_message(placeholder, msg_id) {
+                            app.sync_range(&delta);
+                        }
+                        app.oldest_history_id.get_or_insert(msg_id);
+                    });
+                    if let Some(user) = key
+                        && let Some(meta) = self.dm_meta.get_mut(&user)
+                    {
+                        meta.last_msg_id = meta.last_msg_id.max(msg_id);
+                    }
+                }
+            }
+            NetworkMessage::MessageFailed { client_ref, reason } => {
+                if let Some((key, placeholder)) = self.pending_dm_sends.remove(&client_ref) {
+                    self.with_conversation(key, |app| {
+                        if let Some(delta) = app.history.discard_message(placeholder) {
+                            app.sync_range(&delta);
+                        }
+                    });
+                }
+                self.show_toast(ToastKind::Warning, &t!(dm_failed_key(reason)));
+            }
+            NetworkMessage::Conversations { dms } => {
+                // The list from the store: names, unread counts, the
+                // newest id per partner. Histories load when opened.
+                self.dm_order.clear();
+                for dm in dms {
+                    let meta = self.dm_meta.entry(dm.user_id).or_insert_with(|| DmMeta {
+                        name: dm.name.clone(),
+                        unread: 0,
+                        last_ts: 0,
+                        last_msg_id: 0,
+                        fetched: false,
+                    });
+                    meta.name = dm.name;
+                    meta.unread = dm.unread;
+                    meta.last_ts = dm.last_ts;
+                    meta.last_msg_id = dm.last_msg_id;
+                    self.dm_order.push(dm.user_id);
+                }
+                self.rebuild_dms_model();
             }
             // Hot-path variants routed straight to the voice/screen
             // threads by the network loop. They should never arrive
@@ -2075,6 +2294,29 @@ impl AppState {
             "history" => {
                 let limit = args.trim().parse::<u16>().unwrap_or(20).clamp(1, 200);
                 self.load_earlier(limit);
+            }
+            "dm" | "msg" => {
+                let (name, text) = match args.trim().split_once(char::is_whitespace) {
+                    Some((n, t)) if !t.trim().is_empty() => (n.trim(), t.trim().to_string()),
+                    _ => {
+                        self.push_chat_system(&t!("chat-command-usage-dm"));
+                        return;
+                    }
+                };
+                let found = self
+                    .users
+                    .iter()
+                    .find(|(_, u)| u.username.eq_ignore_ascii_case(name))
+                    .map(|(c, u)| (*c, u.username.clone()));
+                let Some((client_id, shown)) = found else {
+                    self.push_chat_system(&t!("chat-dm-unknown", "name" => name));
+                    return;
+                };
+                let Some(user_id) = self.details.get(&client_id).map(|(u, _)| *u) else {
+                    return;
+                };
+                self.open_dm(user_id, &shown);
+                self.send_dm(user_id, text);
             }
             "channel" => self.handle_channel_command(args),
             "kick" | "ban" | "unban" | "disconnect" | "mute" | "unmute" | "grant" | "revoke"
@@ -2831,6 +3073,7 @@ impl AppState {
             .ok();
 
         self.push_chat_system(&t!("chat-user-joined", "name" => username.as_str()));
+        self.rebuild_dms_model();
         let mut user = UserState::new(username, peer_audio_from(&saved), channel_id);
         // `UserDetails` normally follows `UserJoined`; if it got here
         // first (a replaced session's details), honor it.
@@ -2849,6 +3092,8 @@ impl AppState {
     fn handle_user_left(&mut self, client_id: u64, username: &str) {
         self.details.remove(&client_id);
         self.telemetry_notes.remove(&client_id);
+        self.profiles.remove(&client_id);
+        self.rebuild_dms_model();
         self.voice.tx.send(VoiceControl::RemovePeer(client_id)).ok();
         let was_in_our_channel = self
             .users
@@ -3022,6 +3267,7 @@ impl AppState {
         s.set_perm_create_channels(has(p::CREATE_CHANNELS));
         s.set_perm_manage_own(has(p::MANAGE_OWN_CHANNELS));
         s.set_perm_delete_any(has(p::RESTRICT));
+        s.set_perm_dm(has(p::DM));
         s.set_our_role(
             self.our_client_id
                 .and_then(|id| self.details.get(&id))
@@ -3083,6 +3329,16 @@ impl AppState {
         if self.settings.sounds.join_leave_on() {
             self.voice.tx.send(VoiceControl::PlaySound(sound)).ok();
         }
+    }
+
+    /// The name the server knows this session by, while connected.
+    pub fn session_name(&self) -> Option<&str> {
+        if !self.connected {
+            return None;
+        }
+        self.our_client_id
+            .and_then(|id| self.users.get(&id))
+            .map(|u| u.username.as_str())
     }
 
     /// Our role badge and level as the roster knows them (for the
@@ -3257,6 +3513,9 @@ impl AppState {
         self.channel_details.clear();
         self.telemetry_notes.clear();
         self.moderation = None;
+        self.profiles.clear();
+        self.avatar_fetches.clear();
+        self.own_avatar_blob = None;
         self.reset_chat_flow();
         self.is_testing_mic = false;
         self.channels.clear();
@@ -3565,6 +3824,9 @@ impl AppState {
             && let Some((command, args)) = split_command(rest)
         {
             self.handle_slash_command(command, args);
+        } else if let Some(to) = self.active_dm {
+            self.send_dm(to, text);
+            self.main.invoke_chat_pin_bottom();
         } else if let Some(until) = self.text_muted {
             // The server would drop it anyway; say so here instead.
             let until = format!(" {}", describe_until(until));
@@ -3575,6 +3837,7 @@ impl AppState {
             return;
         } else {
             self.network.tx.send(NetworkControl::SendMessage(text)).ok();
+            self.main.invoke_chat_pin_bottom();
         }
         self.main.global::<State>().set_draft("".into());
         self.main.invoke_focus_composer();
@@ -4035,6 +4298,8 @@ impl AppState {
     pub fn apply_reset_defaults(&mut self) {
         self.settings.reset();
         let _ = std::fs::remove_file(client::config::avatar_path());
+        self.forget_avatar_blob();
+        self.profile_dirty = true;
         self.apply_text_scale();
         self.push_ui_prefs();
         self.apply_push_to_talk();
@@ -4109,11 +4374,380 @@ impl AppState {
                 self.evict_row(0);
             }
         }
+        if delta.dropped_front > 0 {
+            self.refresh_grouping(0);
+        }
         let len = self.history.rows().len();
         for i in (len - delta.appended)..len {
             let row = self.chat_row_at(i);
             self.chat_model.push(row);
         }
+    }
+
+    /// A history page for conversation `key`; the active fields hold
+    /// that conversation while this runs. Oldest first. A page we
+    /// asked for goes in front of the list; the general replay right
+    /// after the roster is appended (nothing live precedes it).
+    fn take_history_page(
+        &mut self,
+        key: Option<client::UserId>,
+        messages: &[client::HistoryMessage],
+        more: bool,
+    ) {
+        if let Some(first) = messages.first() {
+            self.oldest_history_id = Some(first.id);
+        }
+        if key.is_none() {
+            for m in messages {
+                if Some(m.user_id) == self.our_user_id {
+                    self.own_texts.insert(m.id, m.text.clone());
+                }
+            }
+        }
+        let prepared: Vec<(Meta, String, bool)> = messages
+            .iter()
+            .map(|m| {
+                let meta = Meta {
+                    id: m.id,
+                    ts: format_wall_time(m.ts),
+                    ts_ms: m.ts,
+                    day: local_day(m.ts),
+                    user: m.name.clone(),
+                    own: Some(m.user_id) == self.our_user_id,
+                    pending: false,
+                };
+                (meta, app_core::emoji::replace_shortcodes(&m.text), m.edited)
+            })
+            .collect();
+        if key == self.active_dm {
+            let s = self.main.global::<State>();
+            s.set_history_more(more);
+            s.set_history_loading(false);
+        }
+        self.history_more = more;
+        // DM pages are always asked for; the general replay after
+        // `Init` is the one page that is appended.
+        let page = self.history_page_pending == Some(key) || key.is_some();
+        if page {
+            if self.history_page_pending == Some(key) {
+                self.history_page_pending = None;
+            }
+            if prepared.is_empty() {
+                if key.is_none() {
+                    self.push_system_here(&t!("chat-no-earlier"));
+                }
+                return;
+            }
+            // Dividers where the day changes within the page, and one
+            // before its first message.
+            let mut rows = Vec::new();
+            let mut day = None;
+            for (meta, body, edited) in &prepared {
+                if day != Some(meta.day) {
+                    rows.push(app_core::chat::ChatItem::DayMarker {
+                        label: day_label(meta.day),
+                        day: meta.day,
+                    });
+                    day = Some(meta.day);
+                }
+                rows.extend(ChatHistory::rows_for(meta, body, *edited));
+            }
+            let inserted = self.history.prepend_rows(rows);
+            self.sync_prepend(inserted);
+            // The divider that used to open the list is redundant when
+            // the page ends on the same day.
+            let redundant = matches!(
+                self.history.rows().get(inserted),
+                Some(app_core::chat::ChatItem::DayMarker { day: d, .. }) if Some(*d) == day
+            );
+            if redundant && let Some(delta) = self.history.remove_row(inserted) {
+                self.sync_range(&delta);
+            }
+        } else {
+            for (meta, body, edited) in &prepared {
+                self.push_message_here(meta, body, *edited);
+            }
+            if !prepared.is_empty() {
+                let line = t!(
+                    "chat-history-loaded",
+                    "count" => prepared.len(),
+                    "more" => if more { "yes" } else { "no" }
+                );
+                self.push_system_here(&line);
+            }
+        }
+    }
+
+    // ── Conversations (spec §6) ─────────────────────────────────────
+
+    /// Run `f` with conversation `key` in the active fields, swapping
+    /// a parked one in and back out around it. The pane keeps showing
+    /// the real active conversation: only `switch_conversation` moves
+    /// `State.chat`.
+    fn with_conversation<R>(
+        &mut self,
+        key: Option<client::UserId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if key == self.active_dm {
+            return f(self);
+        }
+        let active = self.active_dm;
+        self.swap_in(key);
+        let out = f(self);
+        self.swap_in(active);
+        out
+    }
+
+    /// Exchange the active fields with the parked conversation `key`
+    /// (created empty if new), parking the current one under its key.
+    fn swap_in(&mut self, key: Option<client::UserId>) {
+        if key == self.active_dm {
+            return;
+        }
+        let mut target = self.parked.remove(&key).unwrap_or_else(|| Conversation {
+            history: ChatHistory::new(),
+            model: Rc::new(VecModel::default()),
+            oldest_history_id: None,
+            more: false,
+        });
+        std::mem::swap(&mut self.history, &mut target.history);
+        std::mem::swap(&mut self.chat_model, &mut target.model);
+        std::mem::swap(&mut self.oldest_history_id, &mut target.oldest_history_id);
+        std::mem::swap(&mut self.history_more, &mut target.more);
+        let old_key = self.active_dm;
+        self.parked.insert(old_key, target);
+        self.active_dm = key;
+    }
+
+    /// Show a conversation in the chat pane: General (`None`) or the
+    /// DM with `user`. A DM opens with its history fetched once and
+    /// its unread cleared (`MarkRead`).
+    fn switch_conversation(&mut self, key: Option<client::UserId>) {
+        if key != self.active_dm {
+            self.freeze_chat_gifs();
+            self.swap_in(key);
+            let s = self.main.global::<State>();
+            s.set_chat(ModelRc::from(self.chat_model.clone()));
+            s.set_history_more(self.history_more);
+            s.set_history_loading(false);
+            self.history_page_pending = None;
+        }
+        let s = self.main.global::<State>();
+        match key {
+            None => {
+                s.set_active_dm(-1);
+                s.set_conv_name("".into());
+                self.general_unread = 0;
+                s.set_general_unread(0);
+            }
+            Some(user) => {
+                let index = self.dm_order.iter().position(|u| *u == user);
+                s.set_active_dm(index.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1));
+                let name = self
+                    .dm_meta
+                    .get(&user)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                s.set_conv_name(name.into());
+                let (fetch, mark) = self.dm_meta.get_mut(&user).map_or((false, None), |meta| {
+                    let mark = (meta.unread > 0).then_some(meta.last_msg_id);
+                    meta.unread = 0;
+                    (!meta.fetched && self.server_persistent, mark)
+                });
+                if fetch {
+                    self.load_earlier(50);
+                }
+                if let Some(msg_id) = mark {
+                    self.network
+                        .tx
+                        .send(NetworkControl::MarkRead {
+                            conv: client::ConvRef::Dm(user),
+                            msg_id,
+                        })
+                        .ok();
+                }
+            }
+        }
+        self.rebuild_dms_model();
+        self.main.invoke_chat_pin_bottom();
+        self.main.invoke_focus_composer();
+    }
+
+    /// Open (or start) the DM with `user`, named `name`.
+    pub fn open_dm(&mut self, user: client::UserId, name: &str) {
+        let meta = self.dm_meta.entry(user).or_insert_with(|| DmMeta {
+            name: name.to_string(),
+            unread: 0,
+            last_ts: 0,
+            last_msg_id: 0,
+            // Nothing to fetch without a store.
+            fetched: false,
+        });
+        if meta.name.is_empty() {
+            meta.name = name.to_string();
+        }
+        if !self.dm_order.contains(&user) {
+            self.dm_order.insert(0, user);
+        }
+        self.switch_conversation(Some(user));
+    }
+
+    /// The Messages section's rows: newest conversation first, with
+    /// unread counts, online rings and the partner's look.
+    fn rebuild_dms_model(&mut self) {
+        let mut total = 0;
+        let rows: Vec<DmRow> = self
+            .dm_order
+            .iter()
+            .filter_map(|user| {
+                let meta = self.dm_meta.get(user)?;
+                total += meta.unread;
+                let client = self
+                    .details
+                    .iter()
+                    .find(|(_, (u, _))| u == user)
+                    .map(|(c, _)| *c);
+                let name = client
+                    .and_then(|c| self.users.get(&c))
+                    .map_or(meta.name.clone(), |u| u.username.clone());
+                let mut row = DmRow {
+                    name: name.as_str().into(),
+                    unread: i32::try_from(meta.unread).unwrap_or(i32::MAX),
+                    active: self.active_dm == Some(*user),
+                    online: client.is_some(),
+                    avatar: slint::Image::default(),
+                    has_avatar: false,
+                    initial: app_core::roster::initial_of(&name).into(),
+                    tile_tint: ui::convert::tint(&name),
+                };
+                if let Some(image) = client
+                    .and_then(|c| self.profiles.get(&c))
+                    .and_then(|p| p.avatar)
+                    .and_then(|blob| self.avatar_images.get(&blob))
+                {
+                    row.avatar = image.clone();
+                    row.has_avatar = true;
+                }
+                Some(row)
+            })
+            .collect();
+        self.dms_model.set_vec(rows);
+        let s = self.main.global::<State>();
+        s.set_dm_unread_total(i32::try_from(total).unwrap_or(i32::MAX));
+        if let Some(user) = self.active_dm {
+            let index = self.dm_order.iter().position(|u| *u == user);
+            s.set_active_dm(index.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1));
+        }
+    }
+
+    /// A live DM arrived (spec §6): into its conversation — shown at
+    /// once if open (and marked read), counted as unread otherwise —
+    /// the list moves it to the top, the chime plays.
+    fn take_direct(&mut self, from: client::UserId, username: &str, id: u64, ts: u64, text: &str) {
+        let is_open = self.active_dm == Some(from);
+        let meta = self.dm_meta.entry(from).or_insert_with(|| DmMeta {
+            name: username.to_string(),
+            unread: 0,
+            last_ts: 0,
+            last_msg_id: 0,
+            // Never opened: with a store the page will bring this one
+            // too, so it is not pushed twice.
+            fetched: false,
+        });
+        meta.name = username.to_string();
+        meta.last_ts = ts;
+        meta.last_msg_id = meta.last_msg_id.max(id);
+        let show_now = is_open || meta.fetched || !self.server_persistent;
+        if !self.server_persistent {
+            meta.fetched = true;
+        }
+        if !is_open {
+            meta.unread += 1;
+        }
+        self.dm_order.retain(|u| *u != from);
+        self.dm_order.insert(0, from);
+        if show_now {
+            let meta = Meta {
+                id,
+                ts: format_wall_time(ts),
+                ts_ms: ts,
+                day: local_day(ts),
+                user: username.to_string(),
+                own: false,
+                pending: false,
+            };
+            let body = app_core::emoji::replace_shortcodes(text);
+            self.with_conversation(Some(from), |app| {
+                app.push_message_here(&meta, &body, false);
+                app.oldest_history_id.get_or_insert(id);
+            });
+        }
+        if is_open {
+            self.network
+                .tx
+                .send(NetworkControl::MarkRead {
+                    conv: client::ConvRef::Dm(from),
+                    msg_id: id,
+                })
+                .ok();
+        }
+        if self.settings.sounds.direct_message_on() {
+            self.voice
+                .tx
+                .send(VoiceControl::PlaySound(SoundType::DirectMessage))
+                .ok();
+        }
+        self.rebuild_dms_model();
+    }
+
+    /// Send a DM from the composer: the row appears at once, muted,
+    /// under a placeholder id; `MessageAck` confirms it, `MessageFailed`
+    /// removes it.
+    fn send_dm(&mut self, to: client::UserId, text: String) {
+        let client_ref = self.next_client_ref;
+        self.next_client_ref = self.next_client_ref.wrapping_add(1).max(1);
+        let placeholder = u64::MAX - u64::from(client_ref);
+        let now = u64::try_from(chrono::Local::now().timestamp_millis()).unwrap_or(0);
+        let meta = Meta {
+            id: placeholder,
+            ts: format_wall_time(now),
+            ts_ms: now,
+            day: local_day(now),
+            user: self.settings.user.nickname.clone(),
+            own: true,
+            pending: true,
+        };
+        let body = app_core::emoji::replace_shortcodes(&text);
+        self.push_message_here(&meta, &body, false);
+        self.pending_dm_sends
+            .insert(client_ref, (Some(to), placeholder));
+        if let Some(m) = self.dm_meta.get_mut(&to) {
+            m.last_ts = now;
+        }
+        self.dm_order.retain(|u| *u != to);
+        self.dm_order.insert(0, to);
+        self.rebuild_dms_model();
+        self.network
+            .tx
+            .send(NetworkControl::SendDm {
+                to,
+                text,
+                client_ref,
+            })
+            .ok();
+    }
+
+    /// The user behind roster row `index`, for "Message …".
+    fn dm_from_roster(&mut self, index: i32) {
+        let Some(client_id) = self.user_id_at(index) else {
+            return;
+        };
+        let Some(user_id) = self.details.get(&client_id).map(|(u, _)| *u) else {
+            return;
+        };
+        let name = self.username_of(client_id);
+        self.open_dm(user_id, &name);
     }
 
     /// Mirror a splice (an edit or a deletion) into the model: the
@@ -4129,6 +4763,20 @@ impl AppState {
             let index = delta.start + offset;
             let row = self.chat_row_at(index);
             self.chat_model.insert(index, row);
+        }
+        self.refresh_grouping(delta.start + delta.inserted);
+    }
+
+    /// Re-derive one row's continuation flag after its neighbourhood
+    /// changed (a splice, a prepend, a front drop). Only the flag is
+    /// touched: GIF/image state keyed by the row id stays intact.
+    fn refresh_grouping(&self, index: usize) {
+        if let Some(mut row) = self.chat_model.row_data(index) {
+            let flag = self.history.is_continuation(index);
+            if row.continuation != flag {
+                row.continuation = flag;
+                self.chat_model.set_row_data(index, row);
+            }
         }
     }
 
@@ -4147,9 +4795,16 @@ impl AppState {
         // Truncating u64→i32 is deliberate: ids only need uniqueness
         // within the 500-row window, and 2^31 messages per session is
         // out of scope by ~six orders of magnitude.
+        self.next_row_id += 1;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let row_id = self.history.next_id() as i32;
+        let row_id = self.next_row_id as i32;
         let mut row = ui::convert::chat_row(&self.history.rows()[index], row_id);
+        row.continuation = self.history.is_continuation(index);
+        if row.kind != 1 && row.kind != 4 {
+            let own = row.own;
+            let name = row.user.to_string();
+            self.apply_profile_look(&name, own, &mut row);
+        }
         // Message rows carrying WhatsApp-style markup (*bold*,
         // _italic_, `code`) get a pre-parsed StyledText; plain
         // ones skip it and stay mouse-selectable. to_commonmark
@@ -4172,14 +4827,44 @@ impl AppState {
         self.sync_history_tail(delta);
     }
 
+    /// A system line into the general chat, whichever conversation
+    /// is open (notices are about the room).
     pub fn push_chat_system(&mut self, text: &str) {
+        self.with_conversation(None, |app| app.push_system_here(text));
+    }
+
+    /// A message into the general chat, whichever conversation is
+    /// open: a DM being read must not swallow the room's traffic.
+    pub fn push_chat_message(&mut self, meta: &Meta, body: &str, edited: bool) {
+        self.with_conversation(None, |app| app.push_message_here(meta, body, edited));
+        if self.active_dm.is_some() && !meta.own && !meta.pending {
+            self.general_unread += 1;
+            self.main
+                .global::<State>()
+                .set_general_unread(i32::try_from(self.general_unread).unwrap_or(i32::MAX));
+        }
+    }
+
+    /// Into whatever conversation the active fields hold right now —
+    /// the DM paths, and pages already routed by `with_conversation`.
+    fn push_system_here(&mut self, text: &str) {
         let delta = self.history.push_system(text);
         self.sync_history_tail(&delta);
     }
 
-    pub fn push_chat_message(&mut self, meta: &Meta, body: &str, edited: bool) {
+    fn push_message_here(&mut self, meta: &Meta, body: &str, edited: bool) {
+        self.mark_day(meta.day);
         let delta = self.history.push_message(meta, body, edited);
         self.sync_history_tail(&delta);
+    }
+
+    /// A divider before the next message when its day differs from
+    /// the last one shown.
+    pub fn mark_day(&mut self, day: i64) {
+        if self.history.last_day() != Some(day) {
+            let delta = self.history.push_day_marker(&day_label(day), day);
+            self.sync_history_tail(&delta);
+        }
     }
 
     /// Mirror `inserted` rows put at the front of the history.
@@ -4188,19 +4873,22 @@ impl AppState {
             let row = self.chat_row_at(i);
             self.chat_model.insert(i, row);
         }
+        self.refresh_grouping(inserted);
     }
 
     /// Ask the server for the page before the oldest message shown.
     fn load_earlier(&mut self, limit: u16) {
-        if self.history_page_pending {
+        if self.history_page_pending.is_some() {
             return;
         }
-        self.history_page_pending = true;
+        self.history_page_pending = Some(self.active_dm);
         self.main.global::<State>().set_history_loading(true);
         self.network
             .tx
             .send(NetworkControl::FetchHistory {
-                conv: client::ConvRef::General,
+                conv: self
+                    .active_dm
+                    .map_or(client::ConvRef::General, client::ConvRef::Dm),
                 before: self.oldest_history_id,
                 limit,
             })
@@ -4341,7 +5029,20 @@ impl AppState {
         self.pending_delete = None;
         self.pending_confirm = None;
         self.channel_dialog = None;
-        self.history_page_pending = false;
+        self.history_page_pending = None;
+        self.pending_dm_sends.clear();
+        self.parked.clear();
+        self.dm_order.clear();
+        self.dm_meta.clear();
+        self.dms_model.set_vec(Vec::new());
+        self.active_dm = None;
+        self.history_more = false;
+        self.general_unread = 0;
+        let s = self.main.global::<State>();
+        s.set_general_unread(0);
+        s.set_active_dm(-1);
+        s.set_conv_name("".into());
+        s.set_dm_unread_total(0);
         let s = self.main.global::<State>();
         s.set_editing(false);
         s.set_confirm_open(false);
@@ -4512,7 +5213,7 @@ impl AppState {
     //  ROSTER / STATUS
     // ════════════════════════════════════════════════════════════════
 
-    fn update_user_list(&mut self) {
+    pub fn update_user_list(&mut self) {
         let items = roster::grouped_rows(
             &self.channels,
             &self.users,
@@ -4555,8 +5256,9 @@ impl AppState {
     /// powers, plus the tooltip text.
     fn decorate_user_row(&self, row: &mut UserRow, user: &roster::RosterRow) {
         use client::permissions as p;
+        self.apply_profile_look(&user.name, user.is_us, row);
+        row.level_line = self.user_level_line(user).into();
         if user.is_us {
-            row.tooltip = self.user_tooltip(user).into();
             return;
         }
         let ours = self.our_rank();
@@ -4569,13 +5271,11 @@ impl AppState {
             .any(|c| c.id == user.channel_id && c.owned);
         row.channel_kickable = p::has(self.permissions, p::MANAGE_CHANNELS)
             || (owns_their_channel && p::has(self.permissions, p::MANAGE_OWN_CHANNELS));
-        row.tooltip = self.user_tooltip(user).into();
+        row.telemetry = self.user_telemetry(user).into();
     }
 
-    /// "Level 3 · Member", plus the last telemetry for sessions that
-    /// may see it — or a note that none arrived yet.
-    fn user_tooltip(&self, user: &roster::RosterRow) -> String {
-        let mut lines: Vec<String> = Vec::new();
+    /// "Level 3 · Member" for the hover card.
+    fn user_level_line(&self, user: &roster::RosterRow) -> String {
         let role = match user.role {
             Role::Guest => Some(t!("role-guest")),
             Role::Member => Some(t!("role-member")),
@@ -4585,20 +5285,205 @@ impl AppState {
         };
         let level = (user.level > 0).then(|| t!("tooltip-level", "level" => u32::from(user.level)));
         match (level, role) {
-            (Some(l), Some(r)) => lines.push(format!("{l} · {r}")),
-            (Some(l), None) => lines.push(l),
-            (None, Some(r)) => lines.push(r),
-            (None, None) => {}
+            (Some(l), Some(r)) => format!("{l} · {r}"),
+            (Some(l), None) => l,
+            (None, Some(r)) => r,
+            (None, None) => String::new(),
         }
-        if client::permissions::has(self.permissions, client::permissions::MANAGE_USERS)
-            && !user.is_us
+    }
+
+    /// The last telemetry for sessions that may see it — or a note
+    /// that none arrived yet; empty for everyone else.
+    fn user_telemetry(&self, user: &roster::RosterRow) -> String {
+        if !client::permissions::has(self.permissions, client::permissions::MANAGE_USERS)
+            || user.is_us
         {
-            match self.telemetry_notes.get(&user.client_id) {
-                Some(note) => lines.push(note.text.clone()),
-                None => lines.push(t!("tooltip-no-telemetry")),
+            return String::new();
+        }
+        match self.telemetry_notes.get(&user.client_id) {
+            Some(note) => note.text.clone(),
+            None => t!("tooltip-no-telemetry"),
+        }
+    }
+
+    /// Decode `avatar.png` (if the profile has one) for the rows.
+    pub fn reload_own_avatar(&mut self) {
+        self.own_avatar = self
+            .settings
+            .profile
+            .avatar
+            .then(|| std::fs::read(client::config::avatar_path()).ok())
+            .flatten()
+            .and_then(|bytes| app_core::images::decode_bounded(&bytes).ok())
+            .map(|img| {
+                let rgba = img.to_rgba8();
+                ui::convert::rgba_image(rgba.as_raw(), rgba.width(), rgba.height())
+            });
+    }
+
+    /// The profile look for a name: ours from the settings, everyone
+    /// else's the defaults until the profile wire (1.1.2) fills them.
+    /// `UserRow` and `ChatRow` carry the same fields (`ProfileLook`).
+    fn apply_profile_look(&self, name: &str, is_us: bool, row: &mut dyn ProfileLook) {
+        // The server's copy when it has one (that is what everyone
+        // else sees); our settings before the server answered, or
+        // when it does not carry profiles.
+        let from_server = self
+            .users
+            .iter()
+            .find(|(id, u)| (is_us && Some(**id) == self.our_client_id) || u.username == name)
+            .and_then(|(id, _)| self.profiles.get(id));
+        let ours = is_us || name == self.settings.user.nickname;
+        let (color, style, avatar) = match from_server {
+            Some(p) => (
+                p.name_color,
+                match p.name_style {
+                    client::protocol::NameStyle::Normal => client::config::NameStyle::Normal,
+                    client::protocol::NameStyle::Bold => client::config::NameStyle::Bold,
+                    client::protocol::NameStyle::Italic => client::config::NameStyle::Italic,
+                },
+                p.avatar
+                    .and_then(|blob| self.avatar_images.get(&blob).cloned())
+                    .or_else(|| ours.then(|| self.own_avatar.clone()).flatten()),
+            ),
+            None if ours => (
+                self.settings.profile.name_color,
+                self.settings.profile.name_style,
+                self.own_avatar.clone(),
+            ),
+            None => (None, client::config::NameStyle::Normal, None),
+        };
+        if let Some(rgb) = color {
+            let [_, r, g, b] = rgb.to_be_bytes();
+            row.set_name_color(slint::Color::from_rgb_u8(r, g, b));
+        }
+        row.set_name_style(match style {
+            client::config::NameStyle::Normal => 0,
+            client::config::NameStyle::Bold => 1,
+            client::config::NameStyle::Italic => 2,
+        });
+        if let Some(image) = avatar {
+            row.set_avatar(image);
+        }
+    }
+
+    /// Our look as the server should have it (spec §7.1): sent right
+    /// after `Session` and on every change. With a picture the blob
+    /// goes first; `UploadDone` calls back here with its hash.
+    pub fn send_own_profile(&mut self) {
+        if !self.connected {
+            return;
+        }
+        if self.settings.profile.avatar && self.own_avatar_blob.is_none() {
+            if let Ok(bytes) = std::fs::read(client::config::avatar_path()) {
+                self.network
+                    .tx
+                    .send(NetworkControl::UploadBlob {
+                        upload_id: AVATAR_UPLOAD_ID,
+                        name: "avatar.png".to_string(),
+                        mime: "image/png".to_string(),
+                        data: bytes,
+                    })
+                    .ok();
+                return;
             }
         }
-        lines.join("\n")
+        let profile = client::protocol::Profile {
+            name_color: self.settings.profile.name_color,
+            name_style: match self.settings.profile.name_style {
+                client::config::NameStyle::Normal => client::protocol::NameStyle::Normal,
+                client::config::NameStyle::Bold => client::protocol::NameStyle::Bold,
+                client::config::NameStyle::Italic => client::protocol::NameStyle::Italic,
+            },
+            avatar: if self.settings.profile.avatar {
+                self.own_avatar_blob
+            } else {
+                None
+            },
+        };
+        self.network
+            .tx
+            .send(NetworkControl::SetProfile(profile))
+            .ok();
+    }
+
+    /// The picture changed locally: the server's hash for it no longer
+    /// applies (the next `send_own_profile` uploads the new one).
+    pub fn forget_avatar_blob(&mut self) {
+        self.own_avatar_blob = None;
+    }
+
+    /// Ask the server to rename this session (spec §7.1).
+    pub fn request_rename(&mut self, name: String) {
+        self.network.tx.send(NetworkControl::SetNickname(name)).ok();
+    }
+
+    /// A session's look arrived: keep it, fetch a picture we do not
+    /// have (disk cache first), redraw.
+    fn take_profile(&mut self, client_id: u64, profile: client::protocol::Profile) {
+        if let Some(blob) = profile.avatar
+            && !self.avatar_images.contains_key(&blob)
+        {
+            let cached = client::config::avatar_cache_dir().join(hex(&blob));
+            match std::fs::read(&cached) {
+                Ok(bytes) => self.take_avatar_bytes(blob, &bytes, false),
+                Err(_) => {
+                    if self.avatar_fetches.insert(blob) {
+                        self.network
+                            .tx
+                            .send(NetworkControl::FetchBlob { blob_id: blob })
+                            .ok();
+                    }
+                }
+            }
+        }
+        self.profiles.insert(client_id, profile);
+        self.update_user_list();
+        self.rebuild_dms_model();
+    }
+
+    /// Decode a picture into the image map (and onto the disk cache
+    /// when it just arrived from the wire).
+    fn take_avatar_bytes(&mut self, blob: client::protocol::BlobId, bytes: &[u8], cache: bool) {
+        let Ok(decoded) = app_core::images::decode_bounded(bytes) else {
+            return;
+        };
+        let rgba = decoded.to_rgba8();
+        let image = ui::convert::rgba_image(rgba.as_raw(), rgba.width(), rgba.height());
+        self.avatar_images.insert(blob, image);
+        if cache {
+            let dir = client::config::avatar_cache_dir();
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let _ = std::fs::write(dir.join(hex(&blob)), bytes);
+            }
+        }
+        self.update_user_list();
+    }
+
+    /// The pointer entered or left an author's picture in chat: the
+    /// card wants a roster row, so the name is looked up among the
+    /// people online (someone who left gets no card).
+    fn author_hovered(&mut self, name: &str, hovering: bool) {
+        let found = (0..self.users_model.row_count()).find(|&i| {
+            self.users_model
+                .row_data(i)
+                .is_some_and(|row| !row.is_channel && row.name == name)
+        });
+        let s = self.main.global::<State>();
+        match (hovering, found) {
+            (true, Some(index)) => {
+                let index = i32::try_from(index).unwrap_or(-1);
+                s.set_card_index(index);
+                self.user_hovered(index);
+            }
+            (true, None) => s.set_card_index(-1),
+            (false, _) => {
+                let shown = usize::try_from(s.get_card_index()).ok();
+                if shown == found {
+                    s.set_card_index(-1);
+                }
+            }
+        }
     }
 
     /// The pointer rests on a user row: fetch their last telemetry
@@ -4992,6 +5877,26 @@ fn channel_denied_key(reason: client::ChannelUiDenyReason) -> &'static str {
     }
 }
 
+/// A conversation not currently shown: its rows, its model (kept, so
+/// decoded images survive a switch), and its paging cursor.
+struct Conversation {
+    history: ChatHistory,
+    model: Rc<VecModel<ChatRow>>,
+    oldest_history_id: Option<u64>,
+    more: bool,
+}
+
+/// What the Messages section knows about a DM partner.
+struct DmMeta {
+    name: String,
+    unread: u32,
+    last_ts: u64,
+    last_msg_id: u64,
+    /// Its history page has been fetched (or there is no store to
+    /// fetch from); until then live messages wait for the page.
+    fetched: bool,
+}
+
 /// The last telemetry line for a session, formatted for the tooltip.
 struct TelemetryNote {
     fetched: Instant,
@@ -5018,6 +5923,81 @@ pub fn short_id(id: &[u8]) -> String {
 }
 
 /// Milliseconds since the epoch as the chat's local `HH:MM`.
+/// The local calendar day of a server timestamp (days since the epoch
+/// in the viewer's zone): what the day dividers compare.
+fn local_day(ms: u64) -> i64 {
+    use chrono::Datelike;
+    let secs = i64::try_from(ms / 1000).unwrap_or(0);
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|utc| utc.with_timezone(&chrono::Local).date_naive())
+        .map_or(0, |d| i64::from(d.num_days_from_ce()))
+}
+
+/// "Today", "Yesterday", or a spelled-out date in the current
+/// language ("Thursday, August 27th"; "jueves, 27 de agosto"; the
+/// year appended when it is not this one).
+fn day_label(day: i64) -> String {
+    use chrono::Datelike;
+    let today = local_day(u64::try_from(chrono::Local::now().timestamp_millis()).unwrap_or(0));
+    if day == today {
+        return t!("chat-day-today");
+    }
+    if day == today - 1 {
+        return t!("chat-day-yesterday");
+    }
+    let Some(date) = i32::try_from(day)
+        .ok()
+        .and_then(chrono::NaiveDate::from_num_days_from_ce_opt)
+    else {
+        return String::new();
+    };
+    let weekday = t!(match date.weekday() {
+        chrono::Weekday::Mon => "weekday-mon",
+        chrono::Weekday::Tue => "weekday-tue",
+        chrono::Weekday::Wed => "weekday-wed",
+        chrono::Weekday::Thu => "weekday-thu",
+        chrono::Weekday::Fri => "weekday-fri",
+        chrono::Weekday::Sat => "weekday-sat",
+        chrono::Weekday::Sun => "weekday-sun",
+    });
+    let month = t!(match date.month() {
+        1 => "month-1",
+        2 => "month-2",
+        3 => "month-3",
+        4 => "month-4",
+        5 => "month-5",
+        6 => "month-6",
+        7 => "month-7",
+        8 => "month-8",
+        9 => "month-9",
+        10 => "month-10",
+        11 => "month-11",
+        _ => "month-12",
+    });
+    let n = date.day();
+    // English ordinals; the other locales' patterns ignore `$suffix`.
+    let suffix = match (n % 10, n % 100) {
+        (1, x) if x != 11 => "st",
+        (2, x) if x != 12 => "nd",
+        (3, x) if x != 13 => "rd",
+        _ => "th",
+    };
+    let this_year = chrono::Local::now().year();
+    let key = if date.year() == this_year {
+        "chat-day-label"
+    } else {
+        "chat-day-label-year"
+    };
+    t!(
+        key,
+        "weekday" => weekday.as_str(),
+        "month" => month.as_str(),
+        "day" => n,
+        "suffix" => suffix,
+        "year" => date.year()
+    )
+}
+
 fn format_wall_time(ms: u64) -> String {
     let secs = i64::try_from(ms / 1000).unwrap_or(0);
     chrono::DateTime::from_timestamp(secs, 0)
@@ -5103,6 +6083,80 @@ fn describe_ago(ts: u64) -> String {
 }
 
 /// The built-in role's name, or `role <id>` for a custom one.
+/// The five look fields `UserRow` and `ChatRow` share, so one writer
+/// serves both.
+trait ProfileLook {
+    fn set_name_color(&mut self, color: slint::Color);
+    fn set_name_style(&mut self, style: i32);
+    fn set_avatar(&mut self, image: slint::Image);
+}
+
+impl ProfileLook for UserRow {
+    fn set_name_color(&mut self, color: slint::Color) {
+        self.name_color = color;
+        self.has_name_color = true;
+    }
+    fn set_name_style(&mut self, style: i32) {
+        self.name_style = style;
+    }
+    fn set_avatar(&mut self, image: slint::Image) {
+        self.avatar = image;
+        self.has_avatar = true;
+    }
+}
+
+impl ProfileLook for ChatRow {
+    fn set_name_color(&mut self, color: slint::Color) {
+        self.name_color = color;
+        self.has_name_color = true;
+    }
+    fn set_name_style(&mut self, style: i32) {
+        self.name_style = style;
+    }
+    fn set_avatar(&mut self, image: slint::Image) {
+        self.avatar = image;
+        self.has_avatar = true;
+    }
+}
+
+/// The upload id our avatar always travels under (one at a time).
+const AVATAR_UPLOAD_ID: u32 = 1;
+
+/// Lowercase hex of a hash, the cache file name.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn profile_denied_key(reason: client::protocol::ProfileDenyReason) -> &'static str {
+    use client::protocol::ProfileDenyReason as R;
+    match reason {
+        R::ReservedColor => "profile-denied-reserved-color",
+        R::LowContrast => "profile-denied-low-contrast",
+        R::RateLimited => "profile-denied-rate-limited",
+        R::Locked => "profile-denied-locked",
+        R::BadAvatar => "profile-denied-bad-avatar",
+    }
+}
+
+fn dm_failed_key(reason: client::DmFailReason) -> &'static str {
+    use client::DmFailReason as R;
+    match reason {
+        R::Offline => "dm-failed-offline",
+        R::NoPermission => "dm-failed-no-permission",
+        R::NoSuchUser => "dm-failed-no-such-user",
+        R::Store => "dm-failed-store",
+    }
+}
+
+fn rename_denied_key(reason: client::protocol::RenameDenyReason) -> &'static str {
+    use client::protocol::RenameDenyReason as R;
+    match reason {
+        R::Taken => "rename-denied-taken",
+        R::Invalid => "rename-denied-invalid",
+        R::RateLimited => "rename-denied-rate-limited",
+    }
+}
+
 /// The roster's badge for a role set: the highest built-in role.
 /// Custom roles (`server role`, later) are invisible here until they
 /// carry a badge of their own.
@@ -5307,10 +6361,19 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_chat_load_earlier(t!("chat-load-earlier").into());
     tr.set_chat_loading(t!("chat-loading").into());
     tr.set_banner_not_persistent(t!("chat-server-not-persistent").into());
+    tr.set_messages_header(t!("messages-header").into());
+    tr.set_dm_general(t!("dm-general").into());
+    tr.set_dm_direct_message(t!("dm-direct-message").into());
+    tr.set_dm_note_memory(t!("dm-note-memory").into());
+    tr.set_dm_back(t!("dm-back").into());
+    tr.set_chat_placeholder_dm(t!("chat-placeholder-dm").into());
+    tr.set_menu_message(t!("menu-message").into());
     tr.set_monitor(t!("monitor").into());
     tr.set_quality(t!("quality").into());
     tr.set_start_sharing(t!("start-sharing").into());
     tr.set_stop_watching(t!("stop-watching").into());
+    tr.set_viewer_fullscreen(t!("viewer-fullscreen").into());
+    tr.set_viewer_exit_fullscreen(t!("viewer-exit-fullscreen").into());
     tr.set_settings_title(t!("settings-title").into());
     tr.set_tab_profile(t!("tab-profile").into());
     tr.set_tab_general(t!("tab-general").into());
@@ -5346,13 +6409,9 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_profile_no_name(t!("profile-no-name").into());
     tr.set_profile_nickname_hint(t!("profile-nickname-hint").into());
     tr.set_profile_name_color(t!("profile-name-color").into());
-    tr.set_profile_name_color_hint(t!("profile-name-color-hint").into());
     tr.set_profile_name_style(t!("profile-name-style").into());
-    tr.set_profile_avatar(t!("profile-avatar").into());
-    tr.set_profile_avatar_hint(t!("profile-avatar-hint").into());
     tr.set_profile_avatar_choose(t!("profile-avatar-choose").into());
     tr.set_profile_avatar_remove(t!("profile-avatar-remove").into());
-    tr.set_profile_note(t!("profile-note").into());
     tr.set_general_lead(t!("general-lead").into());
     tr.set_text_size(t!("text-size").into());
     tr.set_text_size_hint(t!("text-size-hint").into());
@@ -5362,6 +6421,7 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_sounds_join_leave(t!("sounds-join-leave").into());
     tr.set_sounds_mention(t!("sounds-mention").into());
     tr.set_sounds_mention_hint(t!("sounds-mention-hint").into());
+    tr.set_sounds_dm(t!("sounds-dm").into());
     tr.set_startup_header(t!("startup-header").into());
     tr.set_startup_auto_connect(t!("startup-auto-connect").into());
     tr.set_startup_auto_connect_hint(t!("startup-auto-connect-hint").into());

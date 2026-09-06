@@ -30,6 +30,8 @@ pub enum SoundType {
     UserLeft,
     /// A message named us.
     Mention,
+    /// A direct message arrived.
+    DirectMessage,
 }
 
 // ── Sound bank ──────────────────────────────────────────────────────────
@@ -39,6 +41,7 @@ pub struct SoundBank {
     join: Vec<f32>,
     leave: Vec<f32>,
     mention: Vec<f32>,
+    direct: Vec<f32>,
 }
 impl Default for SoundBank {
     fn default() -> Self {
@@ -55,6 +58,7 @@ impl SoundBank {
             // short envelope, quieter than the join/leave chimes. Built
             // once here, next to the WAV decodes — ~10k samples, 40 KB.
             mention: synth_notes(&[(660.0, 0.09), (880.0, 0.12)], 0.30),
+            direct: synth_notes(&[(523.0, 0.08), (659.0, 0.08), (784.0, 0.12)], 0.28),
         }
     }
 
@@ -64,6 +68,7 @@ impl SoundBank {
             SoundType::UserJoined => &self.join,
             SoundType::UserLeft => &self.leave,
             SoundType::Mention => &self.mention,
+            SoundType::DirectMessage => &self.direct,
         }
     }
 }

@@ -41,6 +41,19 @@ pub const NAME_COLORS: [u32; 16] = [
     0x00F5_F5F5, // white
 ];
 
+/// The theme's gold: on the palette only for admins, since the server
+/// refuses the band to anyone else (spec §7.1).
+pub const GOLD: u32 = 0x00E5_C158;
+
+/// The palette this session may pick from.
+fn palette(app: &AppState) -> Vec<u32> {
+    let mut colors = NAME_COLORS.to_vec();
+    if app.our_role_and_level().0 == app_core::roster::Role::Admin {
+        colors.push(GOLD);
+    }
+    colors
+}
+
 /// The "Images you send" choices: label and budget in KB; the last
 /// entry is the wire cap.
 pub const IMAGE_SIZES: [(&str, u32); 5] = [
@@ -118,32 +131,15 @@ fn set_identity_status(app: &AppState, text: &str) {
     }
 }
 
-/// The first letter of a name, upper-cased, for the avatar fallback.
-fn initial_of(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
-        .map(|c| c.to_uppercase().collect())
-        .unwrap_or_else(|| "?".to_string())
-}
-
 /// Load `avatar.png` into the preview, or clear it.
-pub fn refresh_avatar(app: &AppState) {
+pub fn refresh_avatar(app: &mut AppState) {
+    // One decode, shared by the settings preview and the rows.
+    app.reload_own_avatar();
+    app.update_user_list();
     let Some(win) = &app.settings_win else { return };
     let s = win.global::<SettingsState>();
-    let image = app
-        .settings
-        .profile
-        .avatar
-        .then(|| std::fs::read(client::config::avatar_path()).ok())
-        .flatten()
-        .and_then(|bytes| app_core::images::decode_bounded(&bytes).ok())
-        .map(|img| {
-            let rgba = img.to_rgba8();
-            ui::convert::rgba_image(rgba.as_raw(), rgba.width(), rgba.height())
-        });
-    s.set_has_avatar(image.is_some());
-    s.set_avatar(image.unwrap_or_default());
+    s.set_has_avatar(app.own_avatar.is_some());
+    s.set_avatar(app.own_avatar.clone().unwrap_or_default());
 }
 
 /// "On <server>: Member · Level 3", from what the session knows.
@@ -335,6 +331,7 @@ pub fn populate(app: &mut AppState) {
     s.set_sounds_enabled(settings.sounds.enabled);
     s.set_join_leave_sounds(settings.sounds.join_leave);
     s.set_mention_sound(settings.sounds.mention);
+    s.set_dm_sound(settings.sounds.direct_message);
     s.set_show_timestamps(settings.ui.show_timestamps);
     s.set_compact_rows(settings.ui.compact_rows);
     let sizes: Vec<slint::SharedString> = IMAGE_SIZES
@@ -361,8 +358,10 @@ pub fn populate(app: &mut AppState) {
 
     // Profile (spec §7.1): what this device keeps.
     s.set_nickname(settings.user.nickname.as_str().into());
-    s.set_initial(initial_of(&settings.user.nickname).into());
-    let colors: Vec<slint::Color> = NAME_COLORS
+    s.set_initial(app_core::roster::initial_of(&settings.user.nickname).into());
+    let palette = palette(app);
+    s.set_is_admin(palette.len() > NAME_COLORS.len());
+    let colors: Vec<slint::Color> = palette
         .iter()
         .map(|rgb| {
             let [_, r, g, b] = rgb.to_be_bytes();
@@ -374,7 +373,7 @@ pub fn populate(app: &mut AppState) {
         settings
             .profile
             .name_color
-            .and_then(|c| NAME_COLORS.iter().position(|p| *p == c))
+            .and_then(|c| palette.iter().position(|p| *p == c))
             .and_then(|i| i32::try_from(i).ok())
             .unwrap_or(-1),
     );
@@ -389,7 +388,9 @@ pub fn populate(app: &mut AppState) {
         client::config::NameStyle::Bold => 1,
         client::config::NameStyle::Italic => 2,
     });
-    refresh_avatar(app);
+    // The picture was decoded at startup (and on every change).
+    s.set_has_avatar(app.own_avatar.is_some());
+    s.set_avatar(app.own_avatar.clone().unwrap_or_default());
     refresh_role_line(app);
 
     // Servers tab: rows + editor, selection starting on the default.
@@ -484,7 +485,7 @@ fn wire(win: &SettingsWindow) {
             app.settings.user.nickname = text.to_string();
             if let Some(win) = &app.settings_win {
                 win.global::<SettingsState>()
-                    .set_initial(initial_of(&text).into());
+                    .set_initial(app_core::roster::initial_of(&text).into());
             }
             // The connect screen shows the same name.
             app.main
@@ -492,11 +493,17 @@ fn wire(win: &SettingsWindow) {
                 .set_nickname(text.as_str().into());
         });
     });
+    // Look edits apply locally at once and reach the server together
+    // on Save & close (one `SetProfile`, not one per click: the
+    // server allows one change per 30 s).
     logic.on_name_color_selected(|index| {
         app::with_current(move |app| {
+            let palette = palette(app);
             app.settings.profile.name_color = usize::try_from(index)
                 .ok()
-                .and_then(|i| NAME_COLORS.get(i).copied());
+                .and_then(|i| palette.get(i).copied());
+            app.profile_dirty = true;
+            app.update_user_list();
         });
     });
     logic.on_name_style_selected(|index| {
@@ -506,6 +513,8 @@ fn wire(win: &SettingsWindow) {
                 2 => client::config::NameStyle::Italic,
                 _ => client::config::NameStyle::Normal,
             };
+            app.profile_dirty = true;
+            app.update_user_list();
         });
     });
     logic.on_avatar_pick(|| {
@@ -530,6 +539,10 @@ fn wire(win: &SettingsWindow) {
                     Ok(()) => {
                         app.settings.profile.avatar = true;
                         refresh_avatar(app);
+                        // A new picture is a new hash: uploaded on
+                        // Save & close, then the profile points at it.
+                        app.forget_avatar_blob();
+                        app.profile_dirty = true;
                     }
                     Err(e) => app.show_error(&t!("profile-avatar-error", "error" => e.as_str())),
                 });
@@ -541,6 +554,8 @@ fn wire(win: &SettingsWindow) {
             app.settings.profile.avatar = false;
             let _ = std::fs::remove_file(client::config::avatar_path());
             refresh_avatar(app);
+            app.forget_avatar_blob();
+            app.profile_dirty = true;
         });
     });
 
@@ -563,6 +578,9 @@ fn wire(win: &SettingsWindow) {
     });
     logic.on_mention_sound_changed(|on| {
         app::with_current(move |app| app.settings.sounds.mention = on);
+    });
+    logic.on_dm_sound_changed(|on| {
+        app::with_current(move |app| app.settings.sounds.direct_message = on);
     });
     logic.on_auto_connect_changed(|on| {
         app::with_current(move |app| app.settings.startup.auto_connect = on);
@@ -1128,6 +1146,17 @@ fn close(app: &mut AppState) {
     app.settings.normalize_servers();
     app.settings.save();
     app.push_connect_servers();
+    // A new nickname while connected goes to the server, which renames
+    // us for everyone or says why not (spec §7.1); the look goes out
+    // as one change.
+    let wanted = app.settings.user.nickname.trim().to_string();
+    if !wanted.is_empty() && app.session_name().is_some_and(|current| current != wanted) {
+        app.request_rename(wanted);
+    }
+    if app.profile_dirty {
+        app.profile_dirty = false;
+        app.send_own_profile();
+    }
     if let Some(win) = &app.settings_win {
         let _ = win.hide();
     }

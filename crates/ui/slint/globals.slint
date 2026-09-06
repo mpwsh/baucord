@@ -45,7 +45,17 @@ export struct UserRow {
     // For user rows `channel-id` is the channel they are in.
     role: int,              // users: 0 unknown, 1 guest, 2 member, 3 organizer, 4 admin
     level: int,             // users: progress level, 0 = unknown
-    tooltip: string,        // users: level, role, and (for admins) last telemetry
+    level-line: string,     // users: "Level 3 · Member" for the hover card
+    telemetry: string,      // users: the last telemetry (admins only), "" otherwise
+    // Profile look (spec §7.1): the picture, or a tinted tile with the
+    // initial; the name's color and style.
+    avatar: image,
+    has-avatar: bool,
+    initial: string,
+    tile-tint: color,
+    name-color: color,
+    has-name-color: bool,   // false = the theme's default name color
+    name-style: int,        // 0 normal, 1 bold, 2 italic
     outranked: bool,        // users: rank strictly below ours — mute/disconnect/kick/ban apply
     role-editable: bool,    // users: rank at or below ours — the role submenu applies
     channel-kickable: bool, // users: we own their channel (or manage all) — send to default
@@ -59,6 +69,18 @@ export struct UserRow {
 /// A channel as the "Move to" submenu lists it (visible ones only).
 export struct ChannelOption { id: int, name: string }
 
+/// One direct-message conversation in the sidebar's Messages section.
+export struct DmRow {
+    name: string,
+    unread: int,
+    active: bool,        // the conversation open in the chat pane
+    online: bool,        // the other person has a session
+    avatar: image,
+    has-avatar: bool,
+    initial: string,
+    tile-tint: color,
+}
+
 /// The toast's register: what color and glyph it carries.
 export enum ToastKind { info, success, warning, error }
 
@@ -67,7 +89,7 @@ export enum ModAction { mute-voice, mute-chat, unmute-voice, unmute-chat, discon
 
 /// One chat row. `kind`: 0 = message, 1 = system, 2 = image, 3 = code
 /// (a ```-fenced block; links stay inline in kind-0 rows via
-/// StyledText).
+/// StyledText), 4 = day divider (`body` is its label).
 export struct ChatRow {
     kind: int,
     ts: string,
@@ -87,6 +109,18 @@ export struct ChatRow {
     own: bool,           // authored by this session: edit/delete in the menu
     edited: bool,        // "(edited)" mark after the body
     deleted: bool,       // body gone: muted placeholder, no menu
+    pending: bool,       // sent, not acknowledged yet: drawn muted
+    /// Continues the run above (same author within five minutes, no
+    /// system line or divider between): no picture, no header.
+    continuation: bool,
+    // The author's look (see UserRow).
+    avatar: image,
+    has-avatar: bool,
+    initial: string,
+    tile-tint: color,
+    name-color: color,
+    has-name-color: bool,
+    name-style: int,
 }
 
 export struct EmojiRow  { glyph: string, code: string, section: string }
@@ -225,6 +259,26 @@ export global State {
     /// Channels this session can see, for the "Move to" submenu.
     in property <[ChannelOption]> channel-options;
 
+    // ── 1.1.1: direct messages (spec §6) ────────────────────────────
+    /// The Messages section: DM conversations, newest first.
+    in property <[DmRow]> dms;
+    /// Which DM is open in the chat pane; -1 = General.
+    in property <int> active-dm: -1;
+    in property <string> conv-name;         // the partner's name when a DM is open
+    in property <bool> perm-dm: false;      // we may send DMs (members and up)
+    /// Sum of unread DMs, for the Messages header.
+    in property <int> dm-unread-total: 0;
+    /// Messages that landed in General while a DM was open.
+    in property <int> general-unread: 0;
+
+    // Profile card (roster rows and chat pictures summon it): which
+    // roster row it shows, and where the hovered element sits in
+    // window coordinates. -1 = none.
+    in-out property <int> card-index: -1;
+    in-out property <length> card-x;
+    in-out property <length> card-y;
+    in-out property <length> card-anchor-h;
+
     // Moderation dialog (kick / ban / disconnect / mute with a reason)
     in property <bool> moderation-open: false;
     in property <ModAction> moderation-action: ModAction.kick;
@@ -271,14 +325,22 @@ export global Logic {
     callback popup-closed();
     // 1.1 — roster moderation (row index → the host resolves the user)
     /// The pointer entered/left a user row: the host fetches the last
-    /// telemetry for the tooltip when it may.
+    /// telemetry for the card when it may.
     callback user-hovered(int, bool);
+    /// The pointer entered/left an author's picture in chat: the host
+    /// resolves the name to a roster row and sets `State.card-index`.
+    callback author-hovered(string, bool);
     /// Open the dialog for an action with a reason (kick/ban/…), or
     /// send it right away (the unmutes).
     callback user-moderate(int, ModAction);
     callback user-move(int, int);              // row index, channel id
     callback user-set-role(int, int);          // row index, role (1 guest … 4 admin)
     callback user-channel-kick(int);           // send back to the default channel
+    /// "Message …" on a roster row: open (or start) the DM with them.
+    callback user-dm(int);
+    // 1.1.1 — the Messages section
+    callback dm-clicked(int);                  // index into State.dms
+    callback general-clicked();                // back to the general chat
     callback moderation-confirm();             // reads State.moderation-*
     callback moderation-cancel();
 

@@ -562,6 +562,13 @@ impl ChatServer {
                     }),
                 ))
             }
+            AdminCommand::ResetProfile { target, lock } => {
+                need(permissions::RESTRICT)?;
+                let user_id = self.resolve_target(&target)?;
+                self.check_target(actor, &user_id)?;
+                self.reset_profile(actor, &user_id, lock, &actor_name);
+                Ok(AdminOutcome::Done)
+            }
         }
     }
 

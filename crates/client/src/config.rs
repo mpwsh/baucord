@@ -167,6 +167,10 @@ pub struct SoundSettings {
     /// Off by default.
     #[serde(default)]
     pub mention: bool,
+    /// A direct message arrives (spec §6). On by default: it is for
+    /// us, and only us.
+    #[serde(default = "default_true")]
+    pub direct_message: bool,
 }
 
 impl Default for SoundSettings {
@@ -175,6 +179,7 @@ impl Default for SoundSettings {
             enabled: true,
             join_leave: true,
             mention: false,
+            direct_message: true,
         }
     }
 }
@@ -189,6 +194,11 @@ impl SoundSettings {
     #[must_use]
     pub fn mention_on(&self) -> bool {
         self.enabled && self.mention
+    }
+
+    #[must_use]
+    pub fn direct_message_on(&self) -> bool {
+        self.enabled && self.direct_message
     }
 }
 
@@ -891,6 +901,13 @@ pub fn client_key_path() -> PathBuf {
 #[must_use]
 pub fn avatar_path() -> PathBuf {
     config_base_dir().join("avatar.png")
+}
+
+/// Where other people's avatars are cached by hash (spec §7.1: one
+/// transfer per client per change): `avatars/<hex>` next to settings.
+#[must_use]
+pub fn avatar_cache_dir() -> PathBuf {
+    config_base_dir().join("avatars")
 }
 
 /// Whether settings live next to the executable (a portable install),

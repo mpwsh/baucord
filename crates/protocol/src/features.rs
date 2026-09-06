@@ -43,11 +43,20 @@ pub const SERVER_1_0: u64 = TELEMETRY;
 /// What a 1.1 client can do: it logs in by key, presents invites,
 /// renders roles and restrictions, replays history, shows progress,
 /// and makes channels.
-pub const CLIENT_1_1: u64 = CLIENT_1_0 | INVITES | ROLES | HISTORY | PROGRESS | CHANNELS_UI;
+pub const CLIENT_1_1: u64 =
+    CLIENT_1_0 | INVITES | ROLES | HISTORY | PROGRESS | CHANNELS_UI | PROFILES | BLOBS | DM;
 /// What a 1.1 server offers: keys are the login, invites the door,
 /// roles decide what a session may do, and it keeps history.
-pub const SERVER_1_1: u64 =
-    TELEMETRY | IDENTITY | INVITES | ROLES | HISTORY | PROGRESS | CHANNELS_UI;
+pub const SERVER_1_1: u64 = TELEMETRY
+    | IDENTITY
+    | INVITES
+    | ROLES
+    | HISTORY
+    | PROGRESS
+    | CHANNELS_UI
+    | PROFILES
+    | BLOBS
+    | DM;
 
 /// Bits both sides announced.
 #[must_use]

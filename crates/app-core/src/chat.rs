@@ -17,6 +17,10 @@ pub const MAX_ROWS: usize = 500;
 /// Character cap for an outgoing message (matches the wire check).
 pub const MAX_MESSAGE_CHARS: usize = 400;
 
+/// Messages from one author closer than this are one run: the first
+/// carries the picture and the name, the rest only their body.
+pub const GROUP_WINDOW_MS: u64 = 5 * 60 * 1000;
+
 /// Who sent a message and when, as the rows need it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Meta {
@@ -24,9 +28,17 @@ pub struct Meta {
     pub id: u64,
     /// Local `HH:MM`, already formatted.
     pub ts: String,
+    /// The server wall clock, ms since the Unix epoch.
+    pub ts_ms: u64,
+    /// The local calendar day of `ts_ms` (days since the epoch, in the
+    /// viewer's zone): where the day dividers go.
+    pub day: i64,
     pub user: String,
     /// Authored by this session's user: the edit/delete menu appears.
     pub own: bool,
+    /// Sent, not yet acknowledged (a DM waiting for the store): drawn
+    /// muted; `id` is a placeholder until then.
+    pub pending: bool,
 }
 
 /// One row of chat history.
@@ -55,17 +67,38 @@ pub enum ChatItem {
         height: u32,
         is_gif: bool,
     },
+    /// "Thursday, August 27th": the day changed between the rows
+    /// around it.
+    DayMarker {
+        label: String,
+        day: i64,
+    },
 }
 
 impl ChatItem {
-    /// The message id of a user-authored row; `None` for system rows.
+    /// The author's metadata of a user-authored row.
     #[must_use]
-    pub fn message_id(&self) -> Option<u64> {
+    pub fn meta(&self) -> Option<&Meta> {
         match self {
             ChatItem::Message { meta, .. }
             | ChatItem::Code { meta, .. }
-            | ChatItem::Image { meta, .. } => Some(meta.id),
-            ChatItem::System { .. } => None,
+            | ChatItem::Image { meta, .. } => Some(meta),
+            ChatItem::System { .. } | ChatItem::DayMarker { .. } => None,
+        }
+    }
+
+    /// The message id of a user-authored row; `None` otherwise.
+    #[must_use]
+    pub fn message_id(&self) -> Option<u64> {
+        self.meta().map(|m| m.id)
+    }
+
+    /// The calendar day a row belongs to; `None` for system rows.
+    #[must_use]
+    pub fn day(&self) -> Option<i64> {
+        match self {
+            ChatItem::DayMarker { day, .. } => Some(*day),
+            other => other.meta().map(|m| m.day),
         }
     }
 }
@@ -124,26 +157,71 @@ impl ChatHistory {
         self.cap(appended)
     }
 
-    /// A page of older messages, oldest first, put in front of what is
-    /// shown ("load earlier"). Returns how many rows went in. Not
-    /// capped here: the reader asked for these; the next append trims
-    /// from the front as usual.
-    pub fn prepend_messages<'a>(
-        &mut self,
-        messages: impl IntoIterator<Item = (&'a Meta, &'a str, bool)>,
-    ) -> usize {
-        let rows: Vec<ChatItem> = messages
-            .into_iter()
-            .flat_map(|(meta, body, edited)| Self::segments(meta, body, edited))
-            .collect();
+    pub fn push_system(&mut self, body: &str) -> HistoryDelta {
+        self.rows.push(ChatItem::System { body: body.into() });
+        self.cap(1)
+    }
+
+    /// A day divider. Callers add one before a message whose day
+    /// differs from [`ChatHistory::last_day`].
+    pub fn push_day_marker(&mut self, label: &str, day: i64) -> HistoryDelta {
+        self.rows.push(ChatItem::DayMarker {
+            label: label.into(),
+            day,
+        });
+        self.cap(1)
+    }
+
+    /// The day of the last row that has one (a message or a divider).
+    #[must_use]
+    pub fn last_day(&self) -> Option<i64> {
+        self.rows.iter().rev().find_map(ChatItem::day)
+    }
+
+    /// Rows for one message, fences split out — for callers that
+    /// assemble a page with dividers before prepending it.
+    #[must_use]
+    pub fn rows_for(meta: &Meta, body: &str, edited: bool) -> Vec<ChatItem> {
+        Self::segments(meta, body, edited)
+    }
+
+    /// Put assembled rows (oldest first) in front of what is shown
+    /// ("load earlier"). Returns how many went in. Not capped here:
+    /// the reader asked for these; the next append trims from the
+    /// front as usual.
+    pub fn prepend_rows(&mut self, rows: Vec<ChatItem>) -> usize {
         let inserted = rows.len();
         self.rows.splice(0..0, rows);
         inserted
     }
 
-    pub fn push_system(&mut self, body: &str) -> HistoryDelta {
-        self.rows.push(ChatItem::System { body: body.into() });
-        self.cap(1)
+    /// Drop one row (a divider made redundant by a prepended page).
+    pub fn remove_row(&mut self, index: usize) -> Option<RangeDelta> {
+        if index >= self.rows.len() {
+            return None;
+        }
+        self.rows.remove(index);
+        Some(RangeDelta {
+            start: index,
+            removed: 1,
+            inserted: 0,
+        })
+    }
+
+    /// Whether row `index` continues the run of the row before it:
+    /// same author, the previous row a message (a system line or a
+    /// divider breaks a run), within [`GROUP_WINDOW_MS`]. A run's first
+    /// row carries the picture and the name; the rest only the body.
+    #[must_use]
+    pub fn is_continuation(&self, index: usize) -> bool {
+        let Some(prev) = index.checked_sub(1).and_then(|i| self.rows.get(i)) else {
+            return false;
+        };
+        let (Some(this), Some(prev)) = (self.rows.get(index).and_then(ChatItem::meta), prev.meta())
+        else {
+            return false;
+        };
+        this.user == prev.user && this.ts_ms.saturating_sub(prev.ts_ms) <= GROUP_WINDOW_MS
     }
 
     /// Note: the compressed bytes deliberately do **not** live here.
@@ -186,6 +264,38 @@ impl ChatHistory {
             start,
             removed: end - start,
             inserted,
+        })
+    }
+
+    /// The server acknowledged a pending message: its rows take the
+    /// real id and lose the muted look.
+    pub fn confirm_message(&mut self, placeholder: u64, id: u64) -> Option<RangeDelta> {
+        let (start, end) = self.span_of(placeholder)?;
+        for row in &mut self.rows[start..end] {
+            if let ChatItem::Message { meta, .. }
+            | ChatItem::Code { meta, .. }
+            | ChatItem::Image { meta, .. } = row
+            {
+                meta.id = id;
+                meta.pending = false;
+            }
+        }
+        // Replaced in place: the mirror re-renders exactly these rows.
+        Some(RangeDelta {
+            start,
+            removed: end - start,
+            inserted: end - start,
+        })
+    }
+
+    /// Drop every row of a message the server refused.
+    pub fn discard_message(&mut self, id: u64) -> Option<RangeDelta> {
+        let (start, end) = self.span_of(id)?;
+        self.rows.drain(start..end);
+        Some(RangeDelta {
+            start,
+            removed: end - start,
+            inserted: 0,
         })
     }
 
@@ -275,8 +385,11 @@ mod tests {
         Meta {
             id,
             ts: "12:00".into(),
+            ts_ms: 1_000 * id,
+            day: 20_000,
             user: "a".into(),
             own: false,
+            pending: false,
         }
     }
 
@@ -380,13 +493,70 @@ mod tests {
     fn prepended_pages_go_in_front_in_order() {
         let mut h = ChatHistory::new();
         h.push_message(&meta(10), "newest", false);
-        let older = [(meta(3), "three"), (meta(4), "four\n```\nx\n```")];
-        let n = h.prepend_messages(older.iter().map(|(m, b)| (m, *b, false)));
+        let mut page = ChatHistory::rows_for(&meta(3), "three", false);
+        page.extend(ChatHistory::rows_for(&meta(4), "four\n```\nx\n```", false));
+        let n = h.prepend_rows(page);
         assert_eq!(n, 3);
         assert_eq!(h.rows().len(), 4);
         assert!(matches!(&h.rows()[0], ChatItem::Message { body, .. } if body == "three"));
         assert!(matches!(&h.rows()[2], ChatItem::Code { .. }));
         assert!(matches!(&h.rows()[3], ChatItem::Message { body, .. } if body == "newest"));
+        let d = h.remove_row(2).expect("in range");
+        assert_eq!(
+            d,
+            RangeDelta {
+                start: 2,
+                removed: 1,
+                inserted: 0
+            }
+        );
+        assert_eq!(h.rows().len(), 3);
+    }
+
+    #[test]
+    fn runs_group_by_author_and_time_and_days_are_tracked() {
+        let mut h = ChatHistory::new();
+        assert_eq!(h.last_day(), None);
+        h.push_day_marker("Monday", 20_000);
+        h.push_message(&meta(1), "hi", false);
+        h.push_message(&meta(2), "again", false);
+        let mut other = meta(3);
+        other.user = "b".into();
+        h.push_message(&other, "hello", false);
+        h.push_system("notice");
+        h.push_message(&meta(5), "back", false);
+        let mut late = meta(6);
+        late.ts_ms = meta(5).ts_ms + GROUP_WINDOW_MS + 1;
+        h.push_message(&late, "much later", false);
+        let flags: Vec<bool> = (0..h.rows().len()).map(|i| h.is_continuation(i)).collect();
+        //           marker hi     again  b:hello system back   later
+        assert_eq!(flags, [false, false, true, false, false, false, false]);
+        assert_eq!(h.last_day(), Some(20_000));
+    }
+
+    #[test]
+    fn pending_messages_are_confirmed_or_discarded() {
+        let mut h = ChatHistory::new();
+        let mut m = meta(u64::MAX - 1);
+        m.pending = true;
+        h.push_message(&m, "sending", false);
+        let d = h
+            .confirm_message(u64::MAX - 1, 42)
+            .expect("known placeholder");
+        assert_eq!(
+            d,
+            RangeDelta {
+                start: 0,
+                removed: 1,
+                inserted: 1
+            }
+        );
+        assert!(matches!(
+            &h.rows()[0],
+            ChatItem::Message { meta, .. } if meta.id == 42 && !meta.pending
+        ));
+        assert!(h.discard_message(42).is_some());
+        assert!(h.rows().is_empty());
     }
 
     #[test]

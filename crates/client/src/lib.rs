@@ -28,10 +28,10 @@ pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
 /// Wire budget for a chat image/GIF payload, re-exported so the UI
 /// layer enforces the same cap the codec does — the numbers can't
 /// drift because they are the same constant.
-pub use protocol::MAX_CHAT_IMAGE_BYTES;
+pub use protocol;
 pub use protocol::{
     admin, invite, permissions, AdminCommand, AdminError, AdminOutcome, AdminTarget,
-    ChannelDenyReason, ChannelInfo, ChannelSpec, ChannelUiDenyReason, ConvRef, HistoryMessage,
-    InviteDenyReason, InviteInvalidReason, NeedInviteReason, RefusedReason, RemovedKind,
-    RestrictionKind, RoleId, ShareScope, UserId,
+    ChannelDenyReason, ChannelInfo, ChannelSpec, ChannelUiDenyReason, ConvRef, DmFailReason,
+    DmSummary, HistoryMessage, InviteDenyReason, InviteInvalidReason, NeedInviteReason,
+    RefusedReason, RemovedKind, RestrictionKind, RoleId, ShareScope, UserId, MAX_CHAT_IMAGE_BYTES,
 };

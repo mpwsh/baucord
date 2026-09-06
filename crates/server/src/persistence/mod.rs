@@ -212,6 +212,21 @@ pub struct AuditRow {
     pub detail: Option<String>,
 }
 
+/// A blob to store: what the uploader said, what the server sniffed,
+/// and the bytes (spec §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRecord {
+    pub blob_id: protocol::BlobId,
+    /// Sniffed.
+    pub mime: String,
+    pub declared_mime: Option<String>,
+    pub size: u32,
+    pub name: String,
+    pub created_by: Option<UserId>,
+    pub created_at: WallMs,
+    pub bytes: Vec<u8>,
+}
+
 // ── Commands, queries, answers ──────────────────────────────────────────
 
 /// A fire-and-forget write.
@@ -279,6 +294,25 @@ pub enum Command {
         id: u64,
     },
     Audit(AuditRow),
+    /// A user's profile columns (spec §7.1).
+    SetProfile {
+        user_id: UserId,
+        profile: protocol::Profile,
+        ts: WallMs,
+    },
+    /// Bytes to `blobs/<hex>` and a row in `blobs` (spec §7).
+    StoreBlob(Box<BlobRecord>),
+    /// How many profiles point at a blob.
+    BlobRefs {
+        blob_id: protocol::BlobId,
+        refs: u32,
+    },
+    /// Everything up to `msg_id` in a conversation has been read.
+    MarkRead {
+        conv: ConvKey,
+        user_id: UserId,
+        msg_id: u64,
+    },
 }
 
 impl Command {
@@ -300,18 +334,43 @@ enum Envelope {
 /// A read with a reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
+    /// A stored blob's bytes, from disk (spec §7).
+    Blob { blob_id: protocol::BlobId },
+    /// Store a DM before anyone sees it (spec §6): the conversation is
+    /// created on the first message between the two; the reply is the
+    /// sender's ack.
+    StoreDm {
+        row: MessageRow,
+        a: UserId,
+        b: UserId,
+    },
+    /// This user's DM conversations with unread counts (spec §6).
+    Conversations { user_id: UserId },
     /// The last `limit` messages of a conversation before `before`
     /// (exclusive; `None` = newest), oldest first.
     MessagesBefore {
-        conv_id: u64,
+        conv: ConvKey,
         before: Option<u64>,
         limit: u16,
     },
 }
 
+/// Which conversation a read or a mark is about (spec §6): the general
+/// chat, or the DM between two users (order-free).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvKey {
+    General,
+    Dm(UserId, UserId),
+}
+
 #[derive(Debug)]
 pub enum Answer {
     Messages(Vec<MessageRow>),
+    /// `None` when the file is missing or does not match its hash.
+    Blob(Option<Vec<u8>>),
+    /// A DM is on disk.
+    Stored,
+    Conversations(Vec<protocol::DmSummary>),
     /// Persistence is off: there is nothing to read.
     Unavailable,
     Failed(String),
@@ -464,7 +523,7 @@ impl Persist {
             let path = PathBuf::from(settings.path.trim());
             let (db, next) = Sqlite::open(&path)?;
             let policy = db.load_policy()?;
-            let recent = db.messages_before(GENERAL_CONV, None, RECENT_RING)?;
+            let recent = db.messages_before(ConvKey::General, None, RECENT_RING)?;
             info!(
                 "Policy loaded: {} users, {} keys, {} roles, {} invites, {} restrictions",
                 policy.users.len(),
@@ -765,12 +824,21 @@ impl Worker {
         let Store::Sqlite(db) = &self.store else {
             return Answer::Unavailable;
         };
-        match *query {
+        match query {
+            Query::Blob { blob_id } => Answer::Blob(db.read_blob(blob_id)),
+            Query::StoreDm { row, a, b } => match db.store_dm(row, a, b) {
+                Ok(()) => Answer::Stored,
+                Err(e) => Answer::Failed(e.to_string()),
+            },
+            Query::Conversations { user_id } => match db.conversations_of(user_id) {
+                Ok(list) => Answer::Conversations(list),
+                Err(e) => Answer::Failed(e.to_string()),
+            },
             Query::MessagesBefore {
-                conv_id,
+                conv,
                 before,
                 limit,
-            } => match db.messages_before(conv_id, before, limit) {
+            } => match db.messages_before(*conv, *before, *limit) {
                 Ok(rows) => Answer::Messages(rows),
                 Err(e) => Answer::Failed(e.to_string()),
             },
@@ -786,6 +854,25 @@ impl Worker {
             Command::Telemetry(rows) => db.insert_telemetry(rows),
             Command::TelemetryEvent(row) => db.insert_telemetry_event(row),
             Command::UpsertUser { user_id, user } => db.upsert_user(user_id, user),
+            Command::SetProfile {
+                user_id,
+                profile,
+                ts,
+            } => db.set_profile(user_id, profile, *ts),
+            Command::StoreBlob(blob) => match db.store_blob(blob) {
+                Ok(()) => Ok(()),
+                Err(PersistError::Sqlite(e)) => Err(e),
+                Err(e) => {
+                    warn!("blob {} not stored: {e}", store::hex(&blob.blob_id));
+                    Ok(())
+                }
+            },
+            Command::BlobRefs { blob_id, refs } => db.set_blob_refs(blob_id, *refs),
+            Command::MarkRead {
+                conv,
+                user_id,
+                msg_id,
+            } => db.mark_read(*conv, user_id, *msg_id),
             Command::UpsertKey { key_hash, key } => db.upsert_key(key_hash, key),
             Command::GrantRole {
                 user_id,
@@ -959,7 +1046,7 @@ mod tests {
         let start = Instant::now();
         let id = p.ask(
             Query::MessagesBefore {
-                conv_id: GENERAL_CONV,
+                conv: ConvKey::General,
                 before: None,
                 limit: 10,
             },
@@ -986,7 +1073,7 @@ mod tests {
         wait_until(|| p.stats().written == 2);
         let id = p.ask(
             Query::MessagesBefore {
-                conv_id: GENERAL_CONV,
+                conv: ConvKey::General,
                 before: None,
                 limit: 10,
             },
@@ -1018,7 +1105,7 @@ mod tests {
         let now = Instant::now();
         let id = p.ask(
             Query::MessagesBefore {
-                conv_id: GENERAL_CONV,
+                conv: ConvKey::General,
                 before: None,
                 limit: 10,
             },

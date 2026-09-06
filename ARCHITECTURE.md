@@ -328,6 +328,31 @@ members to the default, share visibility is re-derived with
 exactly-once `ScreenShareStarted/Stopped` corrections. Validation
 (`validate_channel_list`) rejects a bad list before anything changes.
 
+### Profiles and blobs (`server/profiles.rs`)
+
+A profile (spec §7.1: name color, name style, avatar hash) lives on
+the user row and follows the key. The server is the gate: 3:1
+contrast against the chat background, the gold band (HSV hue
+38°–65°, saturation ≥ 0.35) refused without `ADMIN`, one change per
+30 s, the `profile` restriction as an admin lock (`ResetProfile {
+lock }`). `UserProfile` rides after each `UserDetails` (a batch after
+`Init`), `ProfileUpdated` on change, both only to sessions that
+negotiated `PROFILES`. `SetNickname` renames a live session under the
+`Hello` name rules and broadcasts `UserRenamed`.
+
+Blobs (spec §7) are the `UploadBegin/Accept/Chunk/Done/Rejected` and
+`FetchBlob/BlobChunk/BlobMissing` messages, currently admitting only
+avatar-sized images (`persistence.avatars.max_kb`). An announced
+hash the server already holds is acknowledged without transfer;
+otherwise chunks fold through the same `fold_upload` as images, the
+bytes are hashed, sniffed (PNG/JPEG/WebP) and stored: metadata in
+`policy.blobs`, bytes in `blob_bytes` (the only copy without
+persistence) and, with it, at `blobs/<sha256>` next to the database
+plus a `blobs` row. Fetches are served from memory or read from disk
+through `Query::Blob`, with concurrent fetchers of one hash
+coalesced. Reference counts follow profiles; an unreferenced blob
+leaves memory.
+
 ### Reports and logs
 
 Every 2 s each client gets `VoiceReceiverReport { received, expected,
@@ -438,6 +463,11 @@ the transport's wording and goes to the log only.
 - Images: `send_media` on one paced stream; progress from
   `upload_progress`. Inbound chunks are reassembled per (sender,
   upload) and hash-checked.
+- Blobs: `UploadBlob` announces (`UploadBegin`), sends the chunks only
+  on `UploadAccept { needed: true }`, and synthesizes `UploadDone`
+  itself on `needed: false`. `FetchBlob` answers arrive as `BlobChunk`
+  and are reassembled per hash (`accept_blob_chunk`), the hash being
+  the blob's id and the only thing trusted.
 
 ### Link feedback
 
@@ -463,7 +493,26 @@ address, password, fingerprint, channel_passwords }`;
 are dropped on load rather than trusted. `load_client_key()` creates
 `identity.key` beside the settings file on first use.
 
+Beside `settings.json` also live `avatar.png` (our own picture,
+128×128, `ProfileSettings.avatar` says whether it exists) and
+`avatars/<sha256>`, the cache of other people's pictures — one
+transfer per hash per client. `Settings` sections added in 1.1:
+`ui` (text scale, chat prefs, image budget), `profile`, `startup`,
+`sounds`, `audio.push_to_talk`; every field has a serde default so
+older files load unchanged.
+
 ## 7. Desktop (`crates/desktop`)
+
+Profile flow: `send_own_profile` runs after `Session` and on Save &
+close of Settings when the look changed (`profile_dirty`); with a
+picture the blob goes first under `AVATAR_UPLOAD_ID` and `UploadDone`
+calls back with the hash. Everyone's look is `profiles: ClientId →
+Profile`; pictures are `avatar_images: hash → slint::Image`, warmed
+from the disk cache before any `FetchBlob`. `apply_profile_look`
+prefers the server's copy and falls back to our settings for
+ourselves. Moderation, channel and message actions in the UI send
+the same `NetworkControl`s the slash commands do — one authorization
+path, two front ends.
 
 `app.rs` is the `AppState`: one `Rc<RefCell<_>>` reached through
 `with_current` from Slint callbacks and timers. It drains

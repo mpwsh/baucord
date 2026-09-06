@@ -20,19 +20,12 @@
 // The list virtualizes via ListView; updates are in-place row writes
 // from the shell, so scroll position survives (same contract as before).
 
-import { ListView } from "std-widgets.slint";
+import { ListView, ScrollView } from "std-widgets.slint";
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, UserRow, ModAction } from "globals.slint";
-import { IconBtn, Btn } from "widgets.slint";
-
-/// Which row the pointer is on, for the tooltip the sidebar draws
-/// outside the (clipping) list. Window-relative `y` of the row.
-global RosterTip {
-    in-out property <int> index: -1;
-    in-out property <length> y;
-}
+import { IconBtn, Btn, AvatarTile } from "widgets.slint";
 
 component UserRowView inherits Rectangle {
     in property <UserRow> user;
@@ -111,6 +104,13 @@ component UserRowView inherits Rectangle {
                 activated => { Logic.popup-watch(root.index); }
             }
 
+            // ── Direct message (members to members) ───────────────
+            if !user.is-channel && State.perm-dm && user.role != 1 : MenuSeparator { }
+            if !user.is-channel && State.perm-dm && user.role != 1 : MenuItem {
+                title: Tr.menu-message;
+                activated => { Logic.user-dm(root.index); }
+            }
+
             // ── Moderation, permission- and rank-gated ─────────────
             if root.moderates : MenuSeparator { }
             if State.perm-roles && user.role-editable : Menu {
@@ -185,11 +185,13 @@ component UserRowView inherits Rectangle {
             changed has-hover => {
                 if (!user.is-channel) {
                     if (self.has-hover) {
-                        RosterTip.index = root.index;
-                        RosterTip.y = root.absolute-position.y;
+                        State.card-x = root.absolute-position.x;
+                        State.card-y = root.absolute-position.y;
+                        State.card-anchor-h = root.height;
+                        State.card-index = root.index;
                         Logic.user-hovered(root.index, true);
-                    } else if (RosterTip.index == root.index) {
-                        RosterTip.index = -1;
+                    } else if (State.card-index == root.index) {
+                        State.card-index = -1;
                         Logic.user-hovered(root.index, false);
                     }
                 }
@@ -245,37 +247,32 @@ component UserRowView inherits Rectangle {
 
         // ── User row ────────────────────────────────────────────────
         if !user.is-channel : HorizontalLayout {
-            padding-left: Theme.gap-md;   // indent members under their channel
+            padding-left: Theme.gap-sm;   // indent members under their channel
             padding-right: Theme.gap-xs;
-            spacing: Theme.gap-sm;
+            spacing: Theme.gap-xs;
 
-            // Speaking indicator: filled green dot while speaking, ring
-            // otherwise, crossed grey when locally muted.
-            Rectangle {
-                width: 14px;
-                dot := Rectangle {
-                    width: 10px; height: 10px;
-                    border-radius: 5px;
-                    background: user.speaking && !user.local-muted ? Theme.success : transparent;
-                    border-width: user.speaking && !user.local-muted ? 0px : 2px;
-                    border-color: Theme.text-muted;
-                    animate background { duration: 100ms; }
-                }
-                if user.local-muted : Rectangle {
-                    width: 14px; height: 2px;
-                    background: Theme.text-muted;
-                    // diagonal strike
-                    transform-rotation: -45deg;
-                }
+            // The avatar tile; its ring is the speaking indicator.
+            AvatarTile {
+                source: user.avatar;
+                has-image: user.has-avatar;
+                initial: user.initial;
+                tint: user.tile-tint;
+                ring: user.speaking && !user.local-muted;
+                struck: user.local-muted;
             }
 
+            // The name in the profile's color and style (spec §7.1);
+            // ours keeps the accent when no color is set so it stays
+            // findable, a local mute greys it.
             name := Text {
                 text: user.name;
-                color: user.is-us ? Theme.accent-text
-                    : user.local-muted ? Theme.text-muted
+                color: user.local-muted ? Theme.text-muted
+                    : user.has-name-color ? user.name-color
+                    : user.is-us ? Theme.accent-text
                     : Theme.text-primary;
                 font-size: Theme.font-body;
-                font-weight: user.is-us ? 600 : 400;
+                font-weight: user.name-style == 1 || (user.is-us && user.name-style == 0) ? 600 : 400;
+                font-italic: user.name-style == 2;
                 vertical-alignment: center;
                 overflow: elide;
                 horizontal-stretch: 1;
@@ -383,6 +380,139 @@ export component Sidebar inherits Rectangle {
             }
         }
 
+        // ── Messages (spec §6): the lower half of the sidebar ──────
+        // General first, then one row per DM partner, newest first,
+        // with an unread badge; the open conversation is highlighted.
+        // Only when the session may DM at all, or has conversations
+        // to read.
+        if State.perm-dm || State.dms.length > 0 : Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        if State.perm-dm || State.dms.length > 0 : Text {
+            text: Tr.messages-header;
+            color: Theme.text-secondary;
+            font-size: Theme.font-body;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        if State.perm-dm || State.dms.length > 0 : dm-list := ScrollView {
+            // A short list: the roster keeps the room.
+            height: Math.min(200px, 34px + 34px * State.dms.length);
+            vertical-stretch: 0;
+            VerticalLayout {
+            spacing: 2px;
+            // General
+            Rectangle {
+                height: 32px;
+                border-radius: Theme.radius-md;
+                background: State.active-dm < 0 ? Theme.row-volume-tint
+                    : general-t.has-hover ? Theme.hover : transparent;
+                animate background { duration: 150ms; }
+                HorizontalLayout {
+                    padding-left: Theme.gap-sm;
+                    padding-right: Theme.gap-xs;
+                    spacing: Theme.gap-sm;
+                    Rectangle {
+                        width: 16px;
+                        IconDisplay {
+                            icon: IconSet.Hash;
+                            size: 16px;
+                            stroke: State.active-dm < 0 ? Theme.accent-text : Theme.text-muted;
+                        }
+                    }
+                    Text {
+                        text: Tr.dm-general;
+                        color: State.active-dm < 0 ? Theme.accent-text
+                            : State.general-unread > 0 ? Theme.text-primary
+                            : Theme.text-secondary;
+                        font-size: Theme.font-body;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    if State.general-unread > 0 && State.active-dm >= 0 : Rectangle {
+                        width: general-badge.preferred-width + 12px;
+                        height: 18px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 9px;
+                        background: Theme.accent;
+                        general-badge := Text {
+                            text: State.general-unread;
+                            color: Theme.on-accent;
+                            font-size: Theme.font-xs;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+                general-t := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Logic.general-clicked(); }
+                }
+            }
+            for dm[i] in State.dms : Rectangle {
+                height: 32px;
+                border-radius: Theme.radius-md;
+                background: dm.active ? Theme.row-volume-tint
+                    : dm-t.has-hover ? Theme.hover : transparent;
+                animate background { duration: 150ms; }
+                HorizontalLayout {
+                    padding-left: Theme.gap-sm;
+                    padding-right: Theme.gap-xs;
+                    spacing: Theme.gap-sm;
+                    // The picture at the `#`'s size; the ring means
+                    // "online".
+                    Rectangle {
+                        width: 16px;
+                        AvatarTile {
+                            y: (parent.height - self.height) / 2;
+                            source: dm.avatar;
+                            has-image: dm.has-avatar;
+                            initial: dm.initial;
+                            tint: dm.tile-tint;
+                            side: 16px;
+                            corner: 4px;
+                            ring: dm.online;
+                            ring-color: Theme.text-muted;
+                        }
+                    }
+                    Text {
+                        text: dm.name;
+                        color: dm.active ? Theme.accent-text
+                            : dm.unread > 0 ? Theme.text-primary
+                            : Theme.text-secondary;
+                        font-size: Theme.font-body;
+                        font-weight: dm.unread > 0 || dm.active ? 600 : 400;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    if dm.unread > 0 : Rectangle {
+                        width: badge.preferred-width + 12px;
+                        height: 18px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 9px;
+                        background: Theme.accent;
+                        badge := Text {
+                            text: dm.unread;
+                            color: Theme.on-accent;
+                            font-size: Theme.font-xs;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+                dm-t := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Logic.dm-clicked(i); }
+                }
+            }
+            }
+        }
+
         // Stream stats — visible while sharing, amber when the sender
         // is shedding fps for lossy viewers.
         if State.stream-stats != "" : Rectangle {
@@ -475,37 +605,4 @@ export component Sidebar inherits Rectangle {
         }
     }
 
-    // ── Hover tooltip (level, role, and the last telemetry for admins) ──
-    // Drawn here, outside the list's clip, anchored to the hovered
-    // row's window position; shown after a short dwell like a native
-    // tooltip. The text binds to the row, so telemetry that arrives
-    // while the pointer rests updates it live.
-    property <int> tip-shown-for: -1;
-    Timer {
-        interval: 450ms;
-        running: RosterTip.index >= 0 && root.tip-shown-for != RosterTip.index;
-        triggered => { root.tip-shown-for = RosterTip.index; }
-    }
-    if RosterTip.index >= 0 && RosterTip.index < State.users.length
-        && root.tip-shown-for == RosterTip.index
-        && State.users[RosterTip.index].tooltip != "" : Rectangle {
-        property <length> anchor-y: RosterTip.y - root.absolute-position.y + 40px;
-        x: Theme.gap-md;
-        y: Math.min(self.anchor-y, root.height - self.height - Theme.gap-sm);
-        width: root.width - 2 * Theme.gap-md;
-        height: tip-text.preferred-height + 2 * Theme.gap-sm;
-        border-radius: Theme.radius-sm;
-        background: Theme.surface;
-        border-width: 1px;
-        border-color: Theme.border;
-        tip-text := Text {
-            x: Theme.gap-sm;
-            y: Theme.gap-sm;
-            width: parent.width - 2 * Theme.gap-sm;
-            text: State.users[RosterTip.index].tooltip;
-            color: Theme.text-secondary;
-            font-size: Theme.font-sm;
-            wrap: word-wrap;
-        }
-    }
 }

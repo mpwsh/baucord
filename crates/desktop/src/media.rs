@@ -60,6 +60,7 @@ pub fn push_image_row(app: &mut AppState, meta: &app_core::chat::Meta, data: Vec
     };
     let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);
 
+    app.mark_day(meta.day);
     let delta = app.history_mut().push_image(meta, w, h, is_gif);
     // sync_history_tail equivalent: history rows were appended; mirror
     // them (push_image appends exactly one row and may drop from front).

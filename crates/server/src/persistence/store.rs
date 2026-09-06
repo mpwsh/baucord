@@ -13,14 +13,18 @@ use std::{
 };
 
 use log::{info, warn};
-use protocol::permissions::BUILTIN_ROLES;
+use protocol::{permissions::BUILTIN_ROLES, UserId};
 use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
+use sha2::Digest;
 
-use super::{AuditRow, MessageRow, PersistError, ProgressDelta, TelemetryEventRow, TelemetryRow};
+use super::{
+    AuditRow, BlobRecord, ConvKey, MessageRow, PersistError, ProgressDelta, TelemetryEventRow,
+    TelemetryRow,
+};
 use crate::{
     clock::WallMs,
     policy::{
-        InviteRecord, KeyRecord, Policy, Restriction, RestrictionKind, RoleRecord,
+        BlobMeta, InviteRecord, KeyRecord, Policy, Restriction, RestrictionKind, RoleRecord,
         UserChannelRecord, UserRecord,
     },
 };
@@ -78,6 +82,9 @@ pub enum Store {
 pub struct Sqlite {
     conn: Connection,
     data_version: i64,
+    /// Where blob bytes live: `blobs/` next to the database (spec §2),
+    /// a per-process temp dir for an in-memory database.
+    blobs: PathBuf,
 }
 
 impl Sqlite {
@@ -116,7 +123,131 @@ impl Sqlite {
             "Database {} open (schema {SCHEMA_VERSION}, next message id {next_message_id})",
             path.display()
         );
-        Ok((Self { conn, data_version }, next_message_id))
+        let blobs = if is_memory_path(path) {
+            std::env::temp_dir().join(format!("baucord-blobs-{}", std::process::id()))
+        } else {
+            blobs_dir(path)
+        };
+        Ok((
+            Self {
+                conn,
+                data_version,
+                blobs,
+            },
+            next_message_id,
+        ))
+    }
+
+    // ── Profiles and blobs (spec §7) ─────────────────────────────────
+
+    /// Write a user's profile columns.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn set_profile(
+        &self,
+        user_id: &[u8; 32],
+        profile: &protocol::Profile,
+        ts: WallMs,
+    ) -> Result<(), rusqlite::Error> {
+        let style: i64 = match profile.name_style {
+            protocol::NameStyle::Normal => 0,
+            protocol::NameStyle::Bold => 1,
+            protocol::NameStyle::Italic => 2,
+        };
+        self.conn.execute(
+            "UPDATE users SET name_color = ?2, name_style = ?3, avatar_blob = ?4,
+                              profile_updated_at = ?5
+             WHERE user_id = ?1",
+            params![
+                user_id,
+                profile.name_color.map(i64::from),
+                style,
+                profile.avatar,
+                ordered(ts)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Store a blob: bytes under `blobs/<hex>`, a row in `blobs`. A
+    /// known hash only refreshes the row.
+    ///
+    /// # Errors
+    /// I/O on the blob file, or `SQLite` failure.
+    pub fn store_blob(&self, blob: &BlobRecord) -> Result<(), PersistError> {
+        fs::create_dir_all(&self.blobs).map_err(|e| PersistError::Io(self.blobs.clone(), e))?;
+        let path = self.blobs.join(hex(&blob.blob_id));
+        if !path.exists() {
+            let tmp = path.with_extension("part");
+            fs::write(&tmp, &blob.bytes).map_err(|e| PersistError::Io(tmp.clone(), e))?;
+            fs::rename(&tmp, &path).map_err(|e| PersistError::Io(path.clone(), e))?;
+        }
+        self.conn.execute(
+            "INSERT INTO blobs
+                 (blob_id, mime, declared_mime, size, name, created_by, created_at, refs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+             ON CONFLICT(blob_id) DO NOTHING",
+            params![
+                blob.blob_id,
+                blob.mime,
+                blob.declared_mime,
+                i64::from(blob.size),
+                blob.name,
+                blob.created_by,
+                ordered(blob.created_at)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Adjust a blob's reference count (profiles pointing at it).
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn set_blob_refs(&self, blob_id: &[u8; 32], refs: u32) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE blobs SET refs = ?2 WHERE blob_id = ?1",
+            params![blob_id, i64::from(refs)],
+        )?;
+        Ok(())
+    }
+
+    /// A blob's bytes from disk, verified against its hash; `None`
+    /// when the file is missing or corrupt.
+    #[must_use]
+    pub fn read_blob(&self, blob_id: &[u8; 32]) -> Option<Vec<u8>> {
+        let path = self.blobs.join(hex(blob_id));
+        let bytes = fs::read(&path).ok()?;
+        let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        if digest != *blob_id {
+            warn!("blob {} on disk does not match its hash", path.display());
+            return None;
+        }
+        Some(bytes)
+    }
+
+    fn load_blobs(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT blob_id, mime, size, name, created_by, created_at, refs FROM blobs")?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, [u8; 32]>(0)?,
+                BlobMeta {
+                    mime: r.get(1)?,
+                    size: u32::try_from(r.get::<_, i64>(2)?).unwrap_or(u32::MAX),
+                    name: r.get(3)?,
+                    created_by: r.get(4)?,
+                    created_at: unordered(r.get(5)?),
+                    refs: u32::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
+                },
+            ))
+        })? {
+            let (id, meta) = row?;
+            policy.blobs.insert(id, meta);
+        }
+        Ok(())
     }
 
     /// Insert one general-chat (or DM) message. A duplicate id is
@@ -191,10 +322,13 @@ impl Sqlite {
     /// `SQLite` failure.
     pub fn messages_before(
         &self,
-        conv_id: u64,
+        conv: ConvKey,
         before: Option<u64>,
         limit: u16,
     ) -> Result<Vec<MessageRow>, rusqlite::Error> {
+        let Some(conv_id) = self.conv_id(conv, false)? else {
+            return Ok(Vec::new());
+        };
         let mut stmt = self.conn.prepare(
             "SELECT m.msg_id, m.conv_id, m.ts, m.user_id, m.body, m.edited_at,
                     COALESCE(u.name, '')
@@ -219,6 +353,116 @@ impl Sqlite {
         let mut out: Vec<MessageRow> = rows.collect::<Result<_, _>>()?;
         out.reverse();
         Ok(out)
+    }
+
+    // ── Direct messages (spec §6) ──────────────────────────────────────
+
+    /// The `conv_id` of a conversation; a DM's is created on demand
+    /// when `create` is set (the first message between the two).
+    fn conv_id(&self, conv: ConvKey, create: bool) -> Result<Option<u64>, rusqlite::Error> {
+        let ConvKey::Dm(x, y) = conv else {
+            return Ok(Some(GENERAL_CONV));
+        };
+        let (a, b) = if x <= y { (x, y) } else { (y, x) };
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT conv_id FROM conversations WHERE kind = 1 AND user_a = ?1 AND user_b = ?2",
+                params![a, b],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = found {
+            return Ok(Some(unordered(id)));
+        }
+        if !create {
+            return Ok(None);
+        }
+        self.conn.execute(
+            "INSERT INTO conversations (kind, user_a, user_b) VALUES (1, ?1, ?2)",
+            params![a, b],
+        )?;
+        Ok(Some(unordered(self.conn.last_insert_rowid())))
+    }
+
+    /// Store a DM: find or create the conversation, then the row. The
+    /// row's `conv_id` is ignored; the pair decides.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn store_dm(
+        &self,
+        row: &MessageRow,
+        a: &UserId,
+        b: &UserId,
+    ) -> Result<(), rusqlite::Error> {
+        let conv_id = self
+            .conv_id(ConvKey::Dm(*a, *b), true)?
+            .unwrap_or(GENERAL_CONV);
+        let mut stored = row.clone();
+        stored.conv_id = conv_id;
+        self.insert_message(&stored)
+    }
+
+    /// Everything up to `msg_id` has been read by `user_id`; marks
+    /// only move forward.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn mark_read(
+        &self,
+        conv: ConvKey,
+        user_id: &UserId,
+        msg_id: u64,
+    ) -> Result<(), rusqlite::Error> {
+        let Some(conv_id) = self.conv_id(conv, false)? else {
+            return Ok(());
+        };
+        self.conn.execute(
+            "INSERT INTO message_reads (conv_id, user_id, last_read_msg_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(conv_id, user_id) DO UPDATE SET
+                 last_read_msg_id = MAX(last_read_msg_id, excluded.last_read_msg_id)",
+            params![ordered(conv_id), user_id, ordered(msg_id)],
+        )?;
+        Ok(())
+    }
+
+    /// This user's DM conversations: the other party, how many of
+    /// their messages are past the read mark, the newest message.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn conversations_of(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<protocol::DmSummary>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT CASE WHEN c.user_a = ?1 THEN c.user_b ELSE c.user_a END AS other,
+                    COALESCE((SELECT u.name FROM users u
+                              WHERE u.user_id = CASE WHEN c.user_a = ?1 THEN c.user_b ELSE c.user_a END), ''),
+                    (SELECT COUNT(*) FROM messages m
+                     WHERE m.conv_id = c.conv_id AND m.deleted_at IS NULL AND m.user_id != ?1
+                       AND m.msg_id > COALESCE((SELECT r.last_read_msg_id FROM message_reads r
+                                                WHERE r.conv_id = c.conv_id AND r.user_id = ?1), 0)),
+                    COALESCE((SELECT m.ts FROM messages m
+                              WHERE m.conv_id = c.conv_id AND m.deleted_at IS NULL
+                              ORDER BY m.msg_id DESC LIMIT 1), 0),
+                    COALESCE((SELECT MAX(m.msg_id) FROM messages m
+                              WHERE m.conv_id = c.conv_id AND m.deleted_at IS NULL), 0)
+             FROM conversations c
+             WHERE c.kind = 1 AND (c.user_a = ?1 OR c.user_b = ?1)
+             ORDER BY 4 DESC",
+        )?;
+        let rows = stmt.query_map(params![user_id], |row| {
+            Ok(protocol::DmSummary {
+                user_id: row.get(0)?,
+                name: row.get(1)?,
+                unread: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(u32::MAX),
+                last_ts: unordered(row.get(3)?),
+                last_msg_id: unordered(row.get(4)?),
+            })
+        })?;
+        rows.collect()
     }
 
     /// Fold the WAL back into the main file without blocking writers.
@@ -283,6 +527,7 @@ impl Sqlite {
         self.load_restrictions(&mut policy)?;
         self.load_channels(&mut policy)?;
         self.load_progress(&mut policy)?;
+        self.load_blobs(&mut policy)?;
         Ok(policy)
     }
 
@@ -344,9 +589,11 @@ impl Sqlite {
     }
 
     fn load_users(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT user_id, name, created_at, last_seen, invited_with FROM users")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT user_id, name, created_at, last_seen, invited_with,
+                        name_color, name_style, avatar_blob
+                 FROM users",
+        )?;
         for row in stmt.query_map([], |r| {
             Ok((
                 r.get::<_, [u8; 32]>(0)?,
@@ -356,6 +603,17 @@ impl Sqlite {
                     last_seen: unordered(r.get(3)?),
                     invited_with: r.get(4)?,
                     roles: BTreeSet::new(),
+                    profile: protocol::Profile {
+                        name_color: r
+                            .get::<_, Option<i64>>(5)?
+                            .and_then(|c| u32::try_from(c).ok()),
+                        name_style: match r.get::<_, i64>(6)? {
+                            1 => protocol::NameStyle::Bold,
+                            2 => protocol::NameStyle::Italic,
+                            _ => protocol::NameStyle::Normal,
+                        },
+                        avatar: r.get::<_, Option<[u8; 32]>>(7)?,
+                    },
                 },
             ))
         })? {
@@ -1526,12 +1784,14 @@ mod tests {
         for id in 1..=5 {
             db.insert_message(&row(id, "x")).expect("insert");
         }
-        let page = db.messages_before(GENERAL_CONV, None, 2).expect("read");
+        let page = db.messages_before(ConvKey::General, None, 2).expect("read");
         assert_eq!(
             page.iter().map(|m| m.msg_id).collect::<Vec<_>>(),
             vec![4, 5]
         );
-        let older = db.messages_before(GENERAL_CONV, Some(4), 10).expect("read");
+        let older = db
+            .messages_before(ConvKey::General, Some(4), 10)
+            .expect("read");
         assert_eq!(
             older.iter().map(|m| m.msg_id).collect::<Vec<_>>(),
             vec![1, 2, 3]
@@ -1543,7 +1803,9 @@ mod tests {
         let db = memory();
         db.insert_message(&row(1, "first")).expect("insert");
         db.insert_message(&row(1, "again")).expect("dup insert");
-        let page = db.messages_before(GENERAL_CONV, None, 10).expect("read");
+        let page = db
+            .messages_before(ConvKey::General, None, 10)
+            .expect("read");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].body, "first");
     }
@@ -1572,7 +1834,9 @@ mod tests {
             )
             .expect("prune");
         assert_eq!(removed, 1);
-        let left = db.messages_before(GENERAL_CONV, None, 10).expect("read");
+        let left = db
+            .messages_before(ConvKey::General, None, 10)
+            .expect("read");
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].body, "new");
     }
@@ -1662,6 +1926,7 @@ mod tests {
             last_seen: 10,
             invited_with: Some("K7FQ2MX9ABCD".into()),
             roles: BTreeSet::new(),
+            profile: protocol::Profile::default(),
         };
         db.upsert_user(&alice, &user).expect("user");
         db.upsert_key(

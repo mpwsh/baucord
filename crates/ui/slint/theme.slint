@@ -66,6 +66,12 @@ export global Theme {
     out property <length> gap-lg: 16px;
     out property <length> gap-xl: 24px;
 
+    // ── Chat grid ──────────────────────────────────────────────────
+    // The gutter holds a 36 px picture with gap-sm each side; header
+    // lines are one text line tall.
+    out property <length> chat-gutter: 52px;
+    out property <length> chat-header: 20px;
+
     // ── Type scale ─────────────────────────────────────────────────
     // 11 px is the floor: counts, timestamps and hints sit there, body
     // one step up. (10/11 read as noise at typical desktop DPI.)

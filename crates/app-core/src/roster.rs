@@ -23,6 +23,53 @@ impl Default for PeerAudio {
     }
 }
 
+/// The first letter of a name, upper-cased, for the avatar tile when
+/// there is no picture; `?` for an empty name.
+#[must_use]
+pub fn initial_of(name: &str) -> String {
+    name.trim()
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// A muted, deterministic tint for a name's fallback tile: the same
+/// person gets the same square everywhere, and none of the tints is
+/// loud enough to compete with a real name color. Hue from a hash of
+/// the name, fixed saturation and lightness (HSL 45% / 32%).
+#[must_use]
+pub fn tile_tint(name: &str) -> [u8; 3] {
+    let mut h: u32 = 2_166_136_261;
+    for b in name.to_lowercase().bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(16_777_619);
+    }
+    let hue = f64::from(h % 360);
+    hsl_to_rgb(hue, 0.45, 0.32)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    [
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    ]
+}
+
 /// The highest built-in role a user holds, as the roster marks it.
 /// The server's tables decide it (`UserDetails`); the client only
 /// draws it. `Unknown` until the details arrive, or on a server that
@@ -347,6 +394,19 @@ mod tests {
             panic!("expected header")
         };
         assert_eq!(afk.members, 0);
+    }
+
+    #[test]
+    fn tiles_are_stable_and_muted() {
+        assert_eq!(tile_tint("Alice"), tile_tint("alice"));
+        assert_ne!(tile_tint("alice"), tile_tint("bob"));
+        for name in ["a", "bob", "carol", "zed"] {
+            let [r, g, b] = tile_tint(name);
+            let max = r.max(g).max(b);
+            assert!(max < 150, "{name}: {r},{g},{b} is louder than a tint");
+        }
+        assert_eq!(initial_of("  émile"), "É");
+        assert_eq!(initial_of(""), "?");
     }
 
     #[test]

@@ -656,6 +656,55 @@ pub enum ClientMessage {
     DeleteChannel { channel_id: u16 },
     /// Send a member of your channel back to the default channel.
     ChannelKick { channel_id: u16, user_id: UserId },
+
+    // ── 1.1.2: profiles (feature bit `PROFILES`, spec §7.1) ─────────
+    /// How this user's name looks; sent right after `Session` on every
+    /// connect and on every change. The server validates (contrast,
+    /// the gold band, the avatar's size) and answers by broadcasting
+    /// [`ServerMessage::ProfileUpdated`] or with
+    /// [`ServerMessage::ProfileDenied`].
+    SetProfile(Profile),
+    /// A new name while connected. Checked like the name at `Hello`;
+    /// answered by [`ServerMessage::UserRenamed`] to everyone, or
+    /// [`ServerMessage::RenameDenied`].
+    SetNickname { name: String },
+
+    // ── 1.1.2: blobs (feature bit `BLOBS`, spec §7) ─────────────────
+    /// Announce an upload. `sha256` lets a known blob be acknowledged
+    /// without transfer. Until files land, only avatar-sized images
+    /// (`avatars.max_kb`) are accepted.
+    UploadBegin {
+        upload_id: u32,
+        name: String,
+        mime: String,
+        size: u32,
+        sha256: BlobId,
+    },
+    /// One slice of the announced upload; same pacing and bounds as
+    /// [`ClientMessage::ChatImageChunk`].
+    UploadChunk {
+        upload_id: u32,
+        index: u32,
+        count: u32,
+        data: Vec<u8>,
+    },
+    /// Ask for a blob's bytes; they arrive as
+    /// [`ServerMessage::BlobChunk`] on a Media stream, or
+    /// [`ServerMessage::BlobMissing`].
+    FetchBlob { blob_id: BlobId },
+
+    // ── 1.1.1: direct messages (feature bit `DM`, spec §6) ──────────
+    /// A message to one user. `client_ref` is the sender's own handle
+    /// for the reply: [`ServerMessage::MessageAck`] once stored (and
+    /// delivered if they are online) or [`ServerMessage::MessageFailed`].
+    DirectMessage {
+        to: UserId,
+        text: String,
+        client_ref: u32,
+    },
+    /// Everything up to `msg_id` in `conv` has been seen; the unread
+    /// count in [`ServerMessage::Conversations`] starts after it.
+    MarkRead { conv: ConvRef, msg_id: u64 },
 }
 
 impl ClientMessage {
@@ -669,9 +718,10 @@ impl ClientMessage {
             | ClientMessage::UnsubscribeScreen { .. }
             | ClientMessage::JoinChannel { .. } => Lane::Signal,
             // Bulk rides its own stream per upload.
-            ClientMessage::ChatImageChunk { .. } | ClientMessage::LogUploadChunk { .. } => {
-                Lane::Media
-            }
+            ClientMessage::ChatImageChunk { .. }
+            | ClientMessage::LogUploadChunk { .. }
+            | ClientMessage::UploadChunk { .. } => Lane::Media,
+            ClientMessage::UploadBegin { .. } | ClientMessage::FetchBlob { .. } => Lane::Signal,
             _ => Lane::Control,
         }
     }
@@ -682,7 +732,9 @@ impl ClientMessage {
     pub fn is_upload_chunk(&self) -> bool {
         matches!(
             self,
-            ClientMessage::ChatImageChunk { .. } | ClientMessage::LogUploadChunk { .. }
+            ClientMessage::ChatImageChunk { .. }
+                | ClientMessage::LogUploadChunk { .. }
+                | ClientMessage::UploadChunk { .. }
         )
     }
 }
@@ -978,6 +1030,224 @@ pub enum ServerMessage {
     MovedIdle {
         after_min: u16,
     },
+
+    // ── 1.1.2: profiles (feature bit `PROFILES`, spec §7.1) ─────────
+    /// A session's profile, sent right after each `UserDetails` and as
+    /// a batch after `Init` to sessions that negotiated `PROFILES`.
+    UserProfile {
+        client_id: ClientId,
+        profile: Profile,
+    },
+    /// A profile changed (or was reset by an admin); everyone renders
+    /// from it.
+    ProfileUpdated {
+        user_id: UserId,
+        profile: Profile,
+    },
+    ProfileDenied {
+        reason: ProfileDenyReason,
+    },
+    /// A session changed its name; every roster renames it.
+    UserRenamed {
+        client_id: ClientId,
+        name: String,
+    },
+    RenameDenied {
+        reason: RenameDenyReason,
+    },
+
+    // ── 1.1.2: blobs (feature bit `BLOBS`, spec §7) ─────────────────
+    /// `needed: false` = the server already has this hash; reference
+    /// it, send nothing.
+    UploadAccept {
+        upload_id: u32,
+        needed: bool,
+    },
+    UploadDone {
+        upload_id: u32,
+        blob_id: BlobId,
+    },
+    UploadRejected {
+        upload_id: u32,
+        reason: UploadRejectReason,
+    },
+    /// One slice of a fetched blob, on a Media stream paced like an
+    /// image relay; the client verifies the hash once whole.
+    BlobChunk {
+        blob_id: BlobId,
+        index: u32,
+        count: u32,
+        data: Vec<u8>,
+    },
+    BlobMissing {
+        blob_id: BlobId,
+    },
+
+    // ── 1.1.1: direct messages (feature bit `DM`, spec §6) ──────────
+    /// A live DM from `from`; `msg.client_id` is their session.
+    Direct {
+        from: UserId,
+        msg: ChatMessage,
+    },
+    /// The sender's DM has its id: stored (with persistence) and
+    /// delivered to every session of the recipient that is online.
+    MessageAck {
+        client_ref: u32,
+        msg_id: u64,
+    },
+    MessageFailed {
+        client_ref: u32,
+        reason: DmFailReason,
+    },
+    /// The DM conversations this user has, with unread counts; sent
+    /// after the general replay on join and after a change (a DM
+    /// arrived while away, a mark moved).
+    Conversations {
+        dms: Vec<DmSummary>,
+    },
+}
+
+/// Why a DM was not sent (spec §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DmFailReason {
+    /// No store, and the recipient is not online to take it live.
+    Offline,
+    /// A guest on either end, or a `dm` restriction on the sender.
+    NoPermission,
+    /// No such user.
+    NoSuchUser,
+    /// The store did not confirm within the deadline; nothing was
+    /// delivered.
+    Store,
+}
+
+impl DmFailReason {
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Offline => "they are offline and this server does not keep messages",
+            Self::NoPermission => "direct messages are for members",
+            Self::NoSuchUser => "no such user",
+            Self::Store => "the server could not store the message; try again",
+        }
+    }
+}
+
+/// One DM conversation as the list shows it (spec §6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmSummary {
+    pub user_id: UserId,
+    /// Their name of record.
+    pub name: String,
+    pub unread: u32,
+    /// The newest message's `ts`, milliseconds since the Unix epoch.
+    pub last_ts: u64,
+    /// The newest message's id (the client's paging cursor).
+    pub last_msg_id: u64,
+}
+
+/// The SHA-256 of a blob's bytes: its identity everywhere (spec §7).
+pub type BlobId = [u8; 32];
+
+/// How a name is drawn (spec §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NameStyle {
+    #[default]
+    Normal,
+    Bold,
+    Italic,
+}
+
+/// How a user's name looks, and their picture (spec §7.1). Kept on
+/// the user row, so it follows the key across visits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Profile {
+    /// `0xRRGGBB`; `None` = the client's default name color.
+    pub name_color: Option<u32>,
+    pub name_style: NameStyle,
+    /// A 128×128 PNG/JPEG/WebP blob the client uploaded.
+    pub avatar: Option<BlobId>,
+}
+
+/// Why `SetProfile` was refused (spec §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfileDenyReason {
+    /// The gold band (hue 38°–65°, saturation ≥ 0.35) without `ADMIN`.
+    ReservedColor,
+    /// Under 3:1 against the chat background.
+    LowContrast,
+    /// One change per 30 s.
+    RateLimited,
+    /// An admin reset it with `lock`; a `profile` restriction stands.
+    Locked,
+    /// The avatar is not a blob the server holds, or not an image of
+    /// the allowed size.
+    BadAvatar,
+}
+
+impl ProfileDenyReason {
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::ReservedColor => "gold is reserved for admins",
+            Self::LowContrast => "that color does not read on the chat background",
+            Self::RateLimited => "one profile change every 30 seconds",
+            Self::Locked => "an admin locked your profile",
+            Self::BadAvatar => "the server does not have that picture",
+        }
+    }
+}
+
+/// Why `SetNickname` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenameDenyReason {
+    /// Someone online has it, or a guest asked for an offline
+    /// member's name.
+    Taken,
+    /// Empty after sanitizing.
+    Invalid,
+    /// One rename per 30 s.
+    RateLimited,
+}
+
+impl RenameDenyReason {
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Taken => "that name is in use",
+            Self::Invalid => "that name is empty",
+            Self::RateLimited => "one rename every 30 seconds",
+        }
+    }
+}
+
+/// Why `UploadBegin` or the finished upload was refused (spec §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UploadRejectReason {
+    TooLarge,
+    /// Not PNG/JPEG/WebP (declared or sniffed).
+    BadType,
+    /// The bytes do not hash to what `UploadBegin` said.
+    HashMismatch,
+    /// A second upload before the first finished, or chunks for an
+    /// upload never announced.
+    NotAnnounced,
+    /// The server is not storing blobs at the moment (its blob store
+    /// is full, or the upload kind is not enabled yet).
+    Refused,
+}
+
+impl UploadRejectReason {
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::TooLarge => "the file is larger than this server allows",
+            Self::BadType => "only PNG, JPEG and WebP images are accepted",
+            Self::HashMismatch => "the upload did not match its announced hash",
+            Self::NotAnnounced => "the upload was not announced first",
+            Self::Refused => "the server refused the upload",
+        }
+    }
 }
 
 /// Why a session was ended (spec §4.1).
@@ -1012,7 +1282,11 @@ impl ServerMessage {
             ServerMessage::KeyframeRequested { .. } | ServerMessage::StreamHealth { .. } => {
                 Lane::Signal
             }
-            ServerMessage::ChatImageChunk { .. } => Lane::Media,
+            ServerMessage::ChatImageChunk { .. } | ServerMessage::BlobChunk { .. } => Lane::Media,
+            ServerMessage::UploadAccept { .. }
+            | ServerMessage::UploadDone { .. }
+            | ServerMessage::UploadRejected { .. }
+            | ServerMessage::BlobMissing { .. } => Lane::Signal,
             _ => Lane::Control,
         }
     }
@@ -1021,7 +1295,10 @@ impl ServerMessage {
     /// stream that the relay opens and finishes per image).
     #[must_use]
     pub fn is_upload_chunk(&self) -> bool {
-        matches!(self, ServerMessage::ChatImageChunk { .. })
+        matches!(
+            self,
+            ServerMessage::ChatImageChunk { .. } | ServerMessage::BlobChunk { .. }
+        )
     }
 }
 

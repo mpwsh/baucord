@@ -303,6 +303,67 @@ export component GateMeter inherits Rectangle {
     }
 }
 
+// ── Avatar tile ─────────────────────────────────────────────────────────
+
+/// The avatar tile: the picture, or the initial on a tinted square.
+/// Rounded square rather than a circle — it sits better in rows and
+/// gives the ring something to follow. `ring` lights for voice.
+export component AvatarTile inherits Rectangle {
+    in property <image> source;
+    in property <bool> has-image: false;
+    in property <string> initial;
+    in property <color> tint;
+    in property <length> side: 22px;
+    in property <length> corner: 6px;
+    /// Voice-activity ring, 2px outside the tile (concentric radius).
+    in property <bool> ring: false;
+    in property <color> ring-color: Theme.success;
+    /// Reserve the ring's room in the box (roster rows); off for
+    /// places that never ring (chat, the card).
+    in property <bool> ring-room: true;
+    /// Dimmed with a strike: locally muted.
+    in property <bool> struck: false;
+
+    width: side + (ring-room ? 8px : 0px);
+    height: side + (ring-room ? 8px : 0px);
+
+    if ring : Rectangle {
+        width: root.side + 4px;
+        height: root.side + 4px;
+        border-radius: root.corner + 2px;
+        border-width: 2px;
+        border-color: root.ring-color;
+    }
+    tile := Rectangle {
+        width: root.side;
+        height: root.side;
+        border-radius: root.corner;
+        background: root.has-image ? transparent : root.tint;
+        clip: true;
+        opacity: root.struck ? 0.45 : 1.0;
+        if root.has-image : Image {
+            width: 100%;
+            height: 100%;
+            source: root.source;
+            image-fit: cover;
+        }
+        if !root.has-image : Text {
+            text: root.initial;
+            color: Theme.text-primary;
+            font-size: root.side * 0.5;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    if struck : Rectangle {
+        width: root.side + 6px;
+        height: 2px;
+        background: Theme.text-muted;
+        transform-rotation: -45deg;
+    }
+}
+
 // ── Check row ───────────────────────────────────────────────────────────
 
 /// A labelled checkbox: the whole row toggles, the box shows the

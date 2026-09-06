@@ -18,7 +18,7 @@ use protocol::{
 
 use super::{hex, ChatServer};
 use crate::persistence::{
-    Answer, AskId, Command, MessageRow, Outcome, ProgressDelta, Query, GENERAL_CONV, RECENT_RING,
+    Answer, AskId, Command, ConvKey, MessageRow, Outcome, ProgressDelta, Query, RECENT_RING,
 };
 
 /// A history page stays under this many bytes of text (spec §10:
@@ -107,16 +107,30 @@ impl ChatServer {
             return;
         }
         let limit = limit.clamp(1, HISTORY_MAX_LIMIT);
-        if conv != ConvRef::General {
-            // DMs are 1.1.1: nothing to page yet.
-            self.send_msg(
-                client,
-                &ServerMessage::History {
-                    conv,
-                    messages: Vec::new(),
-                    more: false,
+        if let ConvRef::Dm(other) = conv {
+            // DMs live only in the store (no ring); without one there
+            // is nothing to page.
+            let key = self.dm_conv_key(client, other);
+            let (Some(key), true) = (key, self.persist.is_persistent()) else {
+                self.send_msg(
+                    client,
+                    &ServerMessage::History {
+                        conv,
+                        messages: Vec::new(),
+                        more: false,
+                    },
+                );
+                return;
+            };
+            let ask = self.persist.ask(
+                Query::MessagesBefore {
+                    conv: key,
+                    before,
+                    limit,
                 },
+                self.now + HISTORY_DEADLINE,
             );
+            self.pending_history.insert(ask, (client, conv, limit));
             return;
         }
         let oldest_in_ring = self.recent.front().map(|m| m.msg_id);
@@ -154,7 +168,7 @@ impl ChatServer {
         }
         let ask = self.persist.ask(
             Query::MessagesBefore {
-                conv_id: GENERAL_CONV,
+                conv: ConvKey::General,
                 before,
                 limit,
             },
@@ -184,6 +198,11 @@ impl ChatServer {
                         more: false,
                     },
                 );
+            }
+            // Routed by `poll_persistence`; these never land on a
+            // history ask.
+            Outcome::Answered(Answer::Blob(_) | Answer::Stored | Answer::Conversations(_)) => {
+                log::warn!("unexpected answer on a history ask; ignored");
             }
             Outcome::Answered(Answer::Failed(e)) => {
                 log::warn!("history read failed: {e}");

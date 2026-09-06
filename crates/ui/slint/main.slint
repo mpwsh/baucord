@@ -14,7 +14,7 @@ import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
-import { Btn, IconBtn, Card, HSlider, Field, FieldLabel, Hint, Dropdown, CheckRow } from "widgets.slint";
+import { Btn, IconBtn, Card, HSlider, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile } from "widgets.slint";
 import { SettingsWindow, SettingsState, SettingsLogic } from "settings.slint";
 import { StreamViewerWindow } from "viewer.slint";
 
@@ -39,6 +39,7 @@ export component MainWindow inherits Window {
 
     public function chat-at-bottom() -> bool { return chat-pane.at-bottom(); }
     public function chat-scroll-to-end() { chat-pane.scroll-to-end(); }
+    public function chat-pin-bottom() { chat-pane.pin-to-bottom(); }
     public function focus-composer() { chat-pane.focus-composer(); }
     public function composer-set-cursor(pos: int) { chat-pane.composer-set-cursor(pos); }
 
@@ -79,6 +80,109 @@ export component MainWindow inherits Window {
         }
         chat-pane := ChatPane {
             horizontal-stretch: 1;
+        }
+    }
+
+    // ── Profile card (spec §7.1, §8) ───────────────────────────────
+    // Summoned by a roster row or an author's picture in chat, which
+    // set `State.card-*` (window coordinates of the hovered element).
+    // Shown after a short dwell like a native tooltip; the fields bind
+    // to the roster row, so telemetry arriving while the pointer
+    // rests updates it live.
+    property <int> card-shown-for: -1;
+    Timer {
+        interval: 450ms;
+        running: State.card-index >= 0 && root.card-shown-for != State.card-index;
+        triggered => { root.card-shown-for = State.card-index; }
+    }
+    if State.card-index >= 0 && State.card-index < State.users.length
+        && root.card-shown-for == State.card-index
+        && !State.users[State.card-index].is-channel : card := Rectangle {
+        property <UserRow> who: State.users[State.card-index];
+        x: Math.max(Theme.gap-md, Math.min(State.card-x, root.width - self.width - Theme.gap-md));
+        y: Math.min(State.card-y + State.card-anchor-h + 4px, root.height - self.height - Theme.gap-md);
+        width: 272px;
+        height: card-body.preferred-height;
+        border-radius: Theme.radius-md;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-color: #00000066;
+        drop-shadow-blur: 12px;
+        drop-shadow-offset-y: 4px;
+
+        pure function role-name(r: int) -> string {
+            return r == 1 ? Tr.role-guest
+                : r == 2 ? Tr.role-member
+                : r == 3 ? Tr.role-organizer
+                : r == 4 ? Tr.role-admin
+                : "";
+        }
+
+        card-body := VerticalLayout {
+            padding: Theme.gap-md;
+            spacing: Theme.gap-sm;
+            HorizontalLayout {
+                spacing: Theme.gap-md;
+                AvatarTile {
+                    source: card.who.avatar;
+                    has-image: card.who.has-avatar;
+                    initial: card.who.initial;
+                    tint: card.who.tile-tint;
+                    side: 64px;
+                    corner: 8px;
+                    ring-room: false;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 3px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: card.who.name;
+                        color: card.who.has-name-color ? card.who.name-color : Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: card.who.name-style == 1 ? 700 : 600;
+                        font-italic: card.who.name-style == 2;
+                        overflow: elide;
+                    }
+                    if card.who.level-line != "" : Text {
+                        text: card.who.level-line;
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-sm;
+                        overflow: elide;
+                    }
+                    if card.who.role == 1 || card.who.role == 3 || card.who.role == 4 : HorizontalLayout {
+                        spacing: Theme.gap-xs;
+                        Rectangle {
+                            width: 13px;
+                            IconDisplay {
+                                icon: card.who.role == 4 ? IconSet.Shield
+                                    : card.who.role == 3 ? IconSet.Wrench
+                                    : IconSet.CircleDashed;
+                                size: 13px;
+                                stroke: card.who.role == 4 ? Theme.gold : Theme.text-muted;
+                            }
+                        }
+                        Text {
+                            text: card.role-name(card.who.role);
+                            color: card.who.role == 4 ? Theme.gold : Theme.text-muted;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+            if card.who.telemetry != "" : Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+            if card.who.telemetry != "" : Text {
+                text: card.who.telemetry;
+                color: Theme.text-secondary;
+                font-size: Theme.font-xs;
+                font-family: "monospace";
+                wrap: word-wrap;
+            }
         }
     }
 

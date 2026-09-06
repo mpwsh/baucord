@@ -18,7 +18,7 @@ use std::{
 pub use protocol::RestrictionKind;
 use protocol::{
     permissions::{self, Rank, RoleId, BUILTIN_ROLES, RANK_GUEST, ROLE_GUEST},
-    InviteInvalidReason, UserId,
+    BlobId, InviteInvalidReason, Profile, UserId,
 };
 
 use crate::clock::WallMs;
@@ -47,6 +47,23 @@ pub struct UserRecord {
     /// bootstrap.
     pub invited_with: Option<String>,
     pub roles: BTreeSet<RoleId>,
+    /// How the name looks (spec §7.1); on the user row so it follows
+    /// the key.
+    pub profile: Profile,
+}
+
+/// What the server knows about a stored blob besides its bytes (spec
+/// §7). Bytes live on disk (persistent) or in the server's memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobMeta {
+    /// What the server sniffed.
+    pub mime: String,
+    pub size: u32,
+    pub name: String,
+    pub created_by: Option<UserId>,
+    pub created_at: WallMs,
+    /// Profiles pointing at it; zero means evictable.
+    pub refs: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +160,8 @@ pub struct Policy {
     pub next_channel_id: u64,
     /// Total xp per user (spec §9.1); the level is derived.
     pub xp: HashMap<UserId, u64>,
+    /// Stored blobs by hash (spec §7).
+    pub blobs: HashMap<BlobId, BlobMeta>,
 }
 
 impl Default for Policy {
@@ -179,6 +198,7 @@ impl Policy {
             channels: Vec::new(),
             next_channel_id: 1,
             xp: HashMap::new(),
+            blobs: HashMap::new(),
         }
     }
 
@@ -315,6 +335,7 @@ impl Policy {
                 last_seen: now,
                 invited_with,
                 roles: BTreeSet::new(),
+                profile: Profile::default(),
             },
         );
     }

@@ -182,6 +182,12 @@ pub enum AdminCommand {
     LastTelemetry {
         target: AdminTarget,
     },
+    /// Clear a user's profile (spec §7.1; needs `RESTRICT`); with
+    /// `lock`, a `profile` restriction keeps it cleared until lifted.
+    ResetProfile {
+        target: AdminTarget,
+        lock: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

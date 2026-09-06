@@ -453,6 +453,70 @@ pub enum NetworkMessage {
         worst_rtt_ms: f32,
         viewers: u16,
     },
+
+    // ── 1.1.2: profiles and blobs (spec §7, §7.1) ────────────────────
+    /// A session's look, with the roster (after its `UserDetails`).
+    UserProfile {
+        client_id: ClientId,
+        profile: protocol::Profile,
+    },
+    /// A profile changed (ours included, as the server's echo).
+    ProfileUpdated {
+        user_id: UserId,
+        profile: protocol::Profile,
+    },
+    ProfileDenied {
+        reason: protocol::ProfileDenyReason,
+    },
+    UserRenamed {
+        client_id: ClientId,
+        name: String,
+    },
+    RenameDenied {
+        reason: protocol::RenameDenyReason,
+    },
+    /// The server has the announced bytes already, or took them:
+    /// either way the hash is usable now.
+    UploadDone {
+        upload_id: u32,
+        blob_id: protocol::BlobId,
+    },
+    UploadRejected {
+        upload_id: u32,
+        reason: protocol::UploadRejectReason,
+    },
+    /// A fetched blob, whole and hash-verified.
+    Blob {
+        blob_id: protocol::BlobId,
+        data: Vec<u8>,
+    },
+    BlobMissing {
+        blob_id: protocol::BlobId,
+    },
+
+    // ── 1.1.1: direct messages (spec §6) ─────────────────────────────
+    /// A live DM; `username` is the sender's session name.
+    Direct {
+        from: UserId,
+        username: String,
+        id: u64,
+        ts: u64,
+        text: String,
+    },
+    /// Our DM `client_ref` has its id.
+    MessageAck {
+        client_ref: u32,
+        msg_id: u64,
+    },
+    MessageFailed {
+        client_ref: u32,
+        reason: protocol::DmFailReason,
+    },
+    /// Our DM conversations with unread counts (after the general
+    /// replay on join).
+    Conversations {
+        dms: Vec<protocol::DmSummary>,
+    },
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -467,6 +531,13 @@ struct IncomingImage {
     hash: [u8; 32],
     chunks: Vec<Option<Vec<u8>>>,
     started: Instant,
+}
+
+/// An announced blob upload waiting for the server's `UploadAccept`.
+struct PendingBlob {
+    upload_id: u32,
+    blob_id: [u8; 32],
+    data: Vec<u8>,
 }
 
 /// What we say once the transport is up.
@@ -523,6 +594,10 @@ pub(crate) struct NetworkClient {
     upload_last_pct: u8,
     /// Reassembly of relayed images, keyed by (sender, upload id).
     incoming_images: HashMap<(u64, u32), IncomingImage>,
+    /// Blobs being fetched, keyed by hash (spec §7).
+    incoming_blobs: HashMap<[u8; 32], IncomingImage>,
+    /// The blob we announced and may still have to send.
+    pending_blob: Option<PendingBlob>,
     last_stats_check: Instant,
     /// Transport counters at the last stats sample.
     stats_baseline: Option<LinkStats>,
@@ -617,6 +692,8 @@ impl NetworkClient {
             upload: None,
             upload_last_pct: 255,
             incoming_images: HashMap::new(),
+            incoming_blobs: HashMap::new(),
+            pending_blob: None,
             last_stats_check: now,
             stats_baseline: None,
             telemetry_baseline: None,
@@ -1402,6 +1479,81 @@ impl NetworkClient {
                 info!("Moved to the AFK channel after {after_min} idle minutes");
                 self.message_queue
                     .push(NetworkMessage::MovedIdle { after_min });
+            }
+            ServerMessage::UserProfile { client_id, profile } => {
+                self.message_queue
+                    .push(NetworkMessage::UserProfile { client_id, profile });
+            }
+            ServerMessage::ProfileUpdated { user_id, profile } => {
+                self.message_queue
+                    .push(NetworkMessage::ProfileUpdated { user_id, profile });
+            }
+            ServerMessage::ProfileDenied { reason } => {
+                info!("Profile refused: {}", reason.describe());
+                self.message_queue
+                    .push(NetworkMessage::ProfileDenied { reason });
+            }
+            ServerMessage::UserRenamed { client_id, name } => {
+                self.usernames.insert(client_id, name.clone());
+                self.message_queue
+                    .push(NetworkMessage::UserRenamed { client_id, name });
+            }
+            ServerMessage::RenameDenied { reason } => {
+                info!("Rename refused: {}", reason.describe());
+                self.message_queue
+                    .push(NetworkMessage::RenameDenied { reason });
+            }
+            ServerMessage::UploadAccept { upload_id, needed } => {
+                self.continue_blob_upload(now, upload_id, needed);
+            }
+            ServerMessage::UploadDone { upload_id, blob_id } => {
+                self.message_queue
+                    .push(NetworkMessage::UploadDone { upload_id, blob_id });
+            }
+            ServerMessage::UploadRejected { upload_id, reason } => {
+                info!("Upload {upload_id} rejected: {}", reason.describe());
+                self.pending_blob.take_if(|p| p.upload_id == upload_id);
+                self.message_queue
+                    .push(NetworkMessage::UploadRejected { upload_id, reason });
+            }
+            ServerMessage::BlobChunk {
+                blob_id,
+                index,
+                count,
+                data,
+            } => {
+                if let Some(data) = self.accept_blob_chunk(now, blob_id, index, count, data) {
+                    self.message_queue
+                        .push(NetworkMessage::Blob { blob_id, data });
+                }
+            }
+            ServerMessage::BlobMissing { blob_id } => {
+                self.incoming_blobs.remove(&blob_id);
+                self.message_queue
+                    .push(NetworkMessage::BlobMissing { blob_id });
+            }
+            ServerMessage::Direct { from, msg } => {
+                let username = self.username_of(msg.client_id);
+                self.message_queue.push(NetworkMessage::Direct {
+                    from,
+                    username,
+                    id: msg.id,
+                    ts: msg.ts,
+                    text: msg.text,
+                });
+            }
+            ServerMessage::MessageAck { client_ref, msg_id } => {
+                self.message_queue
+                    .push(NetworkMessage::MessageAck { client_ref, msg_id });
+            }
+            ServerMessage::MessageFailed { client_ref, reason } => {
+                info!("DM {client_ref} failed: {}", reason.describe());
+                self.message_queue
+                    .push(NetworkMessage::MessageFailed { client_ref, reason });
+            }
+            ServerMessage::Conversations { dms } => {
+                self.message_queue
+                    .push(NetworkMessage::Conversations { dms });
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.
@@ -1680,6 +1832,122 @@ impl NetworkClient {
         Some(image)
     }
 
+    /// Fold one fetched chunk into its blob; `Some(bytes)` when whole
+    /// and the hash checks out. Same bounds as images; the hash is the
+    /// blob's id, so nothing else is trusted.
+    fn accept_blob_chunk(
+        &mut self,
+        now: Instant,
+        blob_id: [u8; 32],
+        index: u32,
+        count: u32,
+        data: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        if count == 0 || count > protocol::MAX_IMAGE_CHUNKS || index >= count {
+            return None;
+        }
+        self.incoming_blobs
+            .retain(|_, blob| now.duration_since(blob.started) < IMAGE_PARTIAL_TTL);
+        let entry = self
+            .incoming_blobs
+            .entry(blob_id)
+            .or_insert_with(|| IncomingImage {
+                count,
+                received: 0,
+                bytes: 0,
+                hash: blob_id,
+                chunks: vec![None; count as usize],
+                started: now,
+            });
+        if entry.count != count || entry.chunks[index as usize].is_some() {
+            return None;
+        }
+        entry.bytes += data.len();
+        if entry.bytes > protocol::MAX_CHAT_IMAGE_BYTES {
+            self.incoming_blobs.remove(&blob_id);
+            return None;
+        }
+        entry.chunks[index as usize] = Some(data);
+        entry.received += 1;
+        if entry.received < entry.count {
+            return None;
+        }
+        let entry = self.incoming_blobs.remove(&blob_id)?;
+        let mut bytes = Vec::with_capacity(entry.bytes);
+        for chunk in entry.chunks {
+            bytes.extend_from_slice(&chunk?);
+        }
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if digest != blob_id {
+            warn!("Fetched blob failed its hash; dropped");
+            return None;
+        }
+        Some(bytes)
+    }
+
+    /// Announce a blob (spec §7): the server answers whether it needs
+    /// the bytes, and `continue_blob_upload` sends them on one paced
+    /// Media stream.
+    fn begin_blob_upload(
+        &mut self,
+        now: Instant,
+        upload_id: u32,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) {
+        let blob_id: [u8; 32] = Sha256::digest(&data).into();
+        let Ok(size) = u32::try_from(data.len()) else {
+            return;
+        };
+        self.send_control(
+            now,
+            &ClientMessage::UploadBegin {
+                upload_id,
+                name,
+                mime,
+                size,
+                sha256: blob_id,
+            },
+        );
+        self.pending_blob = Some(PendingBlob {
+            upload_id,
+            blob_id,
+            data,
+        });
+    }
+
+    fn continue_blob_upload(&mut self, now: Instant, upload_id: u32, needed: bool) {
+        let Some(pending) = self.pending_blob.take_if(|p| p.upload_id == upload_id) else {
+            return;
+        };
+        if !needed {
+            // Known hash: the server's `UploadDone` will not come; the
+            // announcement was the whole exchange.
+            self.message_queue.push(NetworkMessage::UploadDone {
+                upload_id,
+                blob_id: pending.blob_id,
+            });
+            return;
+        }
+        let frames = chunk_upload(
+            &pending.data,
+            upload_id,
+            |upload_id, index, count, chunk| ClientMessage::UploadChunk {
+                upload_id,
+                index,
+                count,
+                data: chunk,
+            },
+        );
+        let Some(frames) = frames else {
+            return;
+        };
+        if let Err(e) = self.driver.send_media(now, self.server, frames) {
+            warn!("Blob upload could not start: {e}");
+        }
+    }
+
     pub fn send_speaking_status(&mut self, now: Instant, is_speaking: bool) {
         // Edge-triggered by the voice thread; dedupe defensively in case
         // the same state is ever delivered twice.
@@ -1954,6 +2222,30 @@ pub enum NetworkControl {
     ChannelKick {
         channel_id: u16,
         user_id: UserId,
+    },
+    // ── 1.1.2: profiles and blobs ────────────────────────────────────
+    SetProfile(protocol::Profile),
+    SetNickname(String),
+    /// Announce and, if the server wants it, send a blob. Ends in
+    /// `NetworkMessage::UploadDone` / `UploadRejected`.
+    UploadBlob {
+        upload_id: u32,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    },
+    FetchBlob {
+        blob_id: protocol::BlobId,
+    },
+    // ── 1.1.1: direct messages ───────────────────────────────────────
+    SendDm {
+        to: UserId,
+        text: String,
+        client_ref: u32,
+    },
+    MarkRead {
+        conv: protocol::ConvRef,
+        msg_id: u64,
     },
     Disconnect,
     SendMessage(String),
@@ -2240,6 +2532,52 @@ fn handle_control(
         NetworkControl::SendImage(data) => {
             if let Some(c) = client {
                 c.send_image(now, &data);
+            }
+        }
+        NetworkControl::SetProfile(profile) => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::SetProfile(profile));
+            }
+        }
+        NetworkControl::SetNickname(name) => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::SetNickname { name });
+            }
+        }
+        NetworkControl::UploadBlob {
+            upload_id,
+            name,
+            mime,
+            data,
+        } => {
+            if let Some(c) = client {
+                c.begin_blob_upload(now, upload_id, name, mime, data);
+            }
+        }
+        NetworkControl::FetchBlob { blob_id } => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::FetchBlob { blob_id });
+            }
+        }
+        NetworkControl::SendDm {
+            to,
+            text,
+            client_ref,
+        } => {
+            if let Some(c) = client {
+                c.send_control(
+                    now,
+                    &ClientMessage::DirectMessage {
+                        to,
+                        text,
+                        client_ref,
+                    },
+                );
+            }
+        }
+        NetworkControl::MarkRead { conv, msg_id } => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::MarkRead { conv, msg_id });
             }
         }
         NetworkControl::SendLog(data) => {
