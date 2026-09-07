@@ -648,6 +648,14 @@ export component ChatPane inherits Rectangle {
                         font-weight: 600;
                         overflow: elide;
                     }
+                    // The server's greeting (it used to be a chat line
+                    // on every login), then who is here.
+                    if State.greeting != "" : Text {
+                        text: State.greeting;
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-sm;
+                        overflow: elide;
+                    }
                     Text {
                         text: State.users-count-label;
                         color: Theme.text-muted;

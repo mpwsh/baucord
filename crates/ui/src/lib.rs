@@ -170,7 +170,8 @@ pub mod convert {
             level: i32::from(r.level),
             // The shell fills these from what the session may do and
             // from the profiles it knows.
-            level_line: "".into(),
+            level_label: "".into(),
+            role_label: "".into(),
             xp_pct: -1,
             xp_line: "".into(),
             telemetry: "".into(),
@@ -217,7 +218,8 @@ pub mod convert {
             is_our_channel: c.is_ours,
             role: 0,
             level: 0,
-            level_line: "".into(),
+            level_label: "".into(),
+            role_label: "".into(),
             xp_pct: -1,
             xp_line: "".into(),
             telemetry: "".into(),

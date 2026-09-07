@@ -392,6 +392,7 @@ export component CheckRow inherits Rectangle {
                 width: 18px;
                 height: 18px;
                 border-radius: 4px;
+                opacity: root.enabled ? 1.0 : 0.4;
                 background: root.checked ? Theme.accent : Theme.surface;
                 border-width: 1px;
                 border-color: root.checked ? Theme.accent : Theme.border;
@@ -407,12 +408,13 @@ export component CheckRow inherits Rectangle {
             spacing: 2px;
             Text {
                 text: root.text;
-                color: Theme.text-primary;
+                color: root.enabled ? Theme.text-primary : Theme.text-muted;
                 font-size: Theme.font-body;
             }
             if root.hint != "" : Text {
                 text: root.hint;
                 color: Theme.text-muted;
+                opacity: root.enabled ? 1.0 : 0.6;
                 font-size: Theme.font-xs;
                 wrap: word-wrap;
             }

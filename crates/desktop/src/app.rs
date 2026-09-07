@@ -976,7 +976,17 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, AppState::channel_password_cancel);
     });
     let w = Rc::downgrade(state);
-    logic.on_invite_create(move || with_app(&w, |app| app.handle_invite_command("")));
+    logic.on_invite_create(move || with_app(&w, AppState::open_invite_dialog));
+    let w = Rc::downgrade(state);
+    logic.on_invite_dialog_create(move || with_app(&w, AppState::invite_dialog_create));
+    let w = Rc::downgrade(state);
+    logic.on_invite_dialog_copy(move || with_app(&w, AppState::invite_dialog_copy));
+    let w = Rc::downgrade(state);
+    logic.on_invite_dialog_cancel(move || {
+        with_app(&w, |app| {
+            app.main.global::<State>().set_invite_dialog_open(false)
+        });
+    });
     let w = Rc::downgrade(state);
     logic.on_channel_create(move || with_app(&w, AppState::channel_create));
     let w = Rc::downgrade(state);
@@ -1415,19 +1425,33 @@ impl AppState {
                     Some(n) => t!("invite-uses", "count" => n),
                     None => t!("invite-uses-unlimited"),
                 };
-                self.push_chat_system(&t!(
-                    "chat-invite-created",
-                    "code" => shown.as_str(),
-                    "role" => role.as_str(),
-                    "expiry" => expiry.as_str(),
-                    "uses" => uses.as_str()
-                ));
+                let s = self.main.global::<State>();
+                if s.get_invite_dialog_open() {
+                    // Minted from the dialog: it shows there, to copy.
+                    s.set_invite_dialog_code(shown.into());
+                    s.set_invite_dialog_summary(format!("{role} · {expiry} · {uses}").into());
+                    s.set_invite_dialog_error("".into());
+                } else {
+                    self.push_chat_system(&t!(
+                        "chat-invite-created",
+                        "code" => shown.as_str(),
+                        "role" => role.as_str(),
+                        "expiry" => expiry.as_str(),
+                        "uses" => uses.as_str()
+                    ));
+                }
             }
             NetworkMessage::InviteDenied { reason } => {
-                self.push_chat_system(&t!(match reason {
+                let line = t!(match reason {
                     client::InviteDenyReason::NoPermission => "chat-invite-no-permission",
                     client::InviteDenyReason::RoleNotAllowed => "chat-invite-role-not-allowed",
-                }));
+                });
+                let s = self.main.global::<State>();
+                if s.get_invite_dialog_open() {
+                    s.set_invite_dialog_error(line.into());
+                } else {
+                    self.push_chat_system(&line);
+                }
             }
             NetworkMessage::History {
                 conv,
@@ -2045,6 +2069,10 @@ impl AppState {
                             .set_conv_name(name.as_str().into());
                     }
                 }
+                // Every row they authored, in every conversation, takes
+                // the new name (their look follows: profiles are keyed
+                // by session, and the roster row now carries the name).
+                self.rename_author(&old, &name);
                 self.push_chat_system(&t!(
                     "chat-user-renamed",
                     "old" => old.as_str(),
@@ -2907,6 +2935,84 @@ impl AppState {
     /// `/invite [guest|member|organizer] [<n>m|h|d] [<uses>]` from the
     /// composer: ask the server for a code. The answer lands in chat as
     /// a link (and on the clipboard).
+    // ── Invite dialog (spec §3.1) ───────────────────────────────────
+    // The picks are indices into option lists the dialog shows; the
+    // wire carries what the slash command would send for the same
+    // words, so the server applies the same rules (a member's expiry
+    // is capped at the default, roles at or above admin refused).
+
+    /// "Invite users": open the dialog with the defaults (`/invite`'s:
+    /// guest, a day, unlimited).
+    fn open_invite_dialog(&mut self) {
+        let s = self.main.global::<State>();
+        let strings = |keys: &[&str]| -> ModelRc<slint::SharedString> {
+            let items: Vec<slint::SharedString> = keys.iter().map(|k| t!(k).into()).collect();
+            ModelRc::new(VecModel::from(items))
+        };
+        s.set_invite_role_options(strings(&["role-guest", "role-member", "role-organizer"]));
+        s.set_invite_expiry_options(strings(&[
+            "invite-expiry-1h",
+            "invite-expiry-1d",
+            "invite-expiry-7d",
+            "invite-expiry-30d",
+        ]));
+        s.set_invite_uses_options(strings(&[
+            "invite-uses-1",
+            "invite-uses-5",
+            "invite-uses-10",
+            "invite-uses-unlimited-option",
+        ]));
+        s.set_invite_dialog_role(0);
+        s.set_invite_dialog_expiry(1);
+        s.set_invite_dialog_uses(3);
+        s.set_invite_dialog_code("".into());
+        s.set_invite_dialog_summary("".into());
+        s.set_invite_dialog_error("".into());
+        s.set_invite_dialog_open(true);
+    }
+
+    /// "Create invite": mint with the picks. The answer lands in the
+    /// dialog (`InviteCreated` / `InviteDenied`).
+    fn invite_dialog_create(&mut self) {
+        let s = self.main.global::<State>();
+        let grants_role = match s.get_invite_dialog_role() {
+            1 => Some(client::permissions::ROLE_MEMBER),
+            2 => Some(client::permissions::ROLE_ORGANIZER),
+            _ => None,
+        };
+        let expires_secs = match s.get_invite_dialog_expiry() {
+            0 => Some(3_600),
+            2 => Some(7 * 86_400),
+            3 => Some(30 * 86_400),
+            _ => Some(86_400),
+        };
+        let max_uses = match s.get_invite_dialog_uses() {
+            0 => Some(1),
+            1 => Some(5),
+            2 => Some(10),
+            _ => None,
+        };
+        s.set_invite_dialog_error("".into());
+        self.network
+            .tx
+            .send(NetworkControl::CreateInvite {
+                grants_role,
+                expires_secs,
+                max_uses,
+            })
+            .ok();
+    }
+
+    /// The code, again, onto the clipboard (it went there when minted).
+    fn invite_dialog_copy(&mut self) {
+        let code = self.main.global::<State>().get_invite_dialog_code();
+        if code.is_empty() {
+            return;
+        }
+        crate::clipboard::set_clipboard_text(&code);
+        self.show_toast(ToastKind::Success, &t!("invite-copied"));
+    }
+
     fn handle_invite_command(&mut self, args: &str) {
         let mut grants_role = None;
         let mut expires_secs = None;
@@ -3001,11 +3107,11 @@ impl AppState {
         let s = self.main.global::<State>();
         s.set_status_text(format!("●  {}", t!("status-connected")).into());
         s.set_status_color(slint::Color::from_rgb_u8(0x2B, 0xAC, 0x76));
-        // The name is the sidebar's title now; the greeting stands alone.
-        self.main
-            .global::<State>()
-            .set_server_name(server_name.into());
-        self.push_chat_system(greeting);
+        // The name is the sidebar's title and the greeting the General
+        // header's second line: neither repeats in chat on every login.
+        let s = self.main.global::<State>();
+        s.set_server_name(server_name.into());
+        s.set_greeting(greeting.into());
         self.update_user_list();
         self.show_main();
     }
@@ -3218,6 +3324,7 @@ impl AppState {
         s.set_perm_users(has(p::MANAGE_USERS));
         s.set_perm_create_channels(has(p::CREATE_CHANNELS));
         s.set_perm_create_invites(has(p::CREATE_INVITES));
+        s.set_perm_manage_invites(has(p::MANAGE_INVITES));
         s.set_perm_manage_own(has(p::MANAGE_OWN_CHANNELS));
         s.set_perm_delete_any(has(p::RESTRICT));
         s.set_perm_dm(has(p::DM));
@@ -4584,10 +4691,17 @@ impl AppState {
 
     /// Show the main window, arming the reveal hook so the full
     /// repaint lands on the first OS paint of the (possibly fresh)
-    /// surface — see [`repaint_on_reveal`].
+    /// surface — see [`repaint_on_reveal`]. Also for a window that is
+    /// merely behind others or minimized (the tray's "Show", a second
+    /// launch of the binary): `show()` alone would leave it there.
     pub fn show_main(&self) {
+        use i_slint_backend_winit::WinitWindowAccessor;
         self.main_repaint_arm.set(true);
         let _ = self.main.show();
+        self.main.window().with_winit_window(|w| {
+            w.set_minimized(false);
+            w.focus_window();
+        });
     }
 
     // NOTE: there is deliberately no scroll-after-append here. The
@@ -5505,7 +5619,10 @@ impl AppState {
     fn decorate_user_row(&self, row: &mut UserRow, user: &roster::RosterRow) {
         use client::permissions as p;
         self.apply_profile_look(&user.name, user.is_us, row);
-        row.level_line = self.user_level_line(user).into();
+        if user.level > 0 {
+            row.level_label = t!("tooltip-level", "level" => u32::from(user.level)).into();
+        }
+        row.role_label = role_name(user.role).into();
         if let Some((pct, line)) = xp_progress(user.level, user.xp) {
             row.xp_pct = pct;
             row.xp_line = line.into();
@@ -5527,16 +5644,6 @@ impl AppState {
     }
 
     /// "Level 3 · Member" for the hover card.
-    fn user_level_line(&self, user: &roster::RosterRow) -> String {
-        let role = Some(role_name(user.role)).filter(|r| !r.is_empty());
-        let level = (user.level > 0).then(|| t!("tooltip-level", "level" => u32::from(user.level)));
-        match (level, role) {
-            (Some(l), Some(r)) => format!("{l} · {r}"),
-            (Some(l), None) => l,
-            (None, Some(r)) => r,
-            (None, None) => String::new(),
-        }
-    }
 
     /// The last telemetry for sessions that may see it — or a note
     /// that none arrived yet; empty for everyone else.
@@ -5653,6 +5760,25 @@ impl AppState {
             .ok();
     }
 
+    /// Someone changed their nickname: every row they authored, in
+    /// every conversation, is rebuilt under the new name.
+    fn rename_author(&mut self, old: &str, new: &str) {
+        if old == new || old.is_empty() {
+            return;
+        }
+        let keys: Vec<Option<client::UserId>> = std::iter::once(self.active_dm)
+            .chain(self.parked.keys().copied())
+            .collect();
+        for key in keys {
+            self.with_conversation(key, |app| {
+                for i in app.history.rename_author(old, new) {
+                    let row = app.chat_row_at(i);
+                    app.chat_model.set_row_data(i, row);
+                }
+            });
+        }
+    }
+
     /// A profile changed: every chat row by that author, in every
     /// conversation, takes the new look (the roster rebuilds anyway).
     fn refresh_author_look(&mut self, name: &str) {
@@ -5767,17 +5893,47 @@ impl AppState {
         match (hovering, found) {
             (true, Some(index)) => {
                 let index = i32::try_from(index).unwrap_or(-1);
+                s.set_card_guest_open(false);
                 s.set_card_index(index);
                 self.user_hovered(index);
             }
-            (true, None) => s.set_card_index(-1),
+            // Gone since they wrote: a card from what we still know.
+            (true, None) => {
+                s.set_card_index(-1);
+                let guest = self.guest_card_row(name);
+                let s = self.main.global::<State>();
+                s.set_card_guest(guest);
+                s.set_card_guest_open(true);
+            }
             (false, _) => {
                 let shown = usize::try_from(s.get_card_index()).ok();
                 if shown == found {
                     s.set_card_index(-1);
                 }
+                s.set_card_guest_open(false);
             }
         }
+    }
+
+    /// The card for a chat author who is no longer connected: name
+    /// and look from the profile cache, "Offline" where the level
+    /// would go, nothing the roster alone could tell.
+    fn guest_card_row(&self, name: &str) -> UserRow {
+        let initial: String = name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().collect())
+            .unwrap_or_default();
+        let mut row = UserRow {
+            name: name.into(),
+            initial: initial.into(),
+            tile_tint: ui::convert::tint(name),
+            level_label: t!("card-offline").into(),
+            xp_pct: -1,
+            ..UserRow::default()
+        };
+        self.apply_profile_look(name, false, &mut row);
+        row
     }
 
     /// The pointer rests on a user row: fetch their last telemetry
@@ -6727,6 +6883,16 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_messages_collapse(t!("messages-collapse").into());
     tr.set_messages_expand(t!("messages-expand").into());
     tr.set_invite_button(t!("invite-button").into());
+    tr.set_card_offline(t!("card-offline").into());
+    tr.set_invite_dialog_title(t!("invite-dialog-title").into());
+    tr.set_invite_role(t!("invite-role").into());
+    tr.set_invite_expiry(t!("invite-expiry").into());
+    tr.set_invite_uses_label(t!("invite-uses-label").into());
+    tr.set_invite_create(t!("invite-create").into());
+    tr.set_invite_copy(t!("invite-copy").into());
+    tr.set_invite_close(t!("invite-close").into());
+    tr.set_invite_share_hint(t!("invite-share-hint").into());
+    tr.set_invite_expiry_note(t!("invite-expiry-note").into());
     tr.set_dm_general(t!("dm-general").into());
     tr.set_dm_direct_message(t!("dm-direct-message").into());
     tr.set_dm_note_memory(t!("dm-note-memory").into());

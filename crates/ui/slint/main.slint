@@ -93,16 +93,21 @@ export component MainWindow inherits Window {
     // Shown after a short dwell like a native tooltip; the fields bind
     // to the roster row, so telemetry arriving while the pointer
     // rests updates it live.
+    // Which card is asked for: a roster row (its index), a chat author
+    // no longer in the roster (-2, `State.card-guest`), or none (-1).
+    property <int> card-key: State.card-index >= 0 ? State.card-index
+        : State.card-guest-open ? -2 : -1;
     property <int> card-shown-for: -1;
     Timer {
         interval: 450ms;
-        running: State.card-index >= 0 && root.card-shown-for != State.card-index;
-        triggered => { root.card-shown-for = State.card-index; }
+        running: root.card-key != -1 && root.card-shown-for != root.card-key;
+        triggered => { root.card-shown-for = root.card-key; }
     }
-    if State.card-index >= 0 && State.card-index < State.users.length
-        && root.card-shown-for == State.card-index
-        && !State.users[State.card-index].is-channel : card := Rectangle {
-        property <UserRow> who: State.users[State.card-index];
+    if root.card-key != -1 && root.card-shown-for == root.card-key
+        && (root.card-key == -2
+            || (State.card-index < State.users.length
+                && !State.users[State.card-index].is-channel)) : card := Rectangle {
+        property <UserRow> who: root.card-key == -2 ? State.card-guest : State.users[State.card-index];
         x: Math.max(Theme.gap-md, Math.min(State.card-x, root.width - self.width - Theme.gap-md));
         y: Math.min(State.card-y + State.card-anchor-h + 4px, root.height - self.height - Theme.gap-md);
         width: 272px;
@@ -114,14 +119,6 @@ export component MainWindow inherits Window {
         drop-shadow-color: #00000066;
         drop-shadow-blur: 12px;
         drop-shadow-offset-y: 4px;
-
-        pure function role-name(r: int) -> string {
-            return r == 1 ? Tr.role-guest
-                : r == 2 ? Tr.role-member
-                : r == 3 ? Tr.role-organizer
-                : r == 4 ? Tr.role-admin
-                : "";
-        }
 
         card-body := VerticalLayout {
             padding: Theme.gap-md;
@@ -149,11 +146,47 @@ export component MainWindow inherits Window {
                         font-italic: card.who.name-style == 2;
                         overflow: elide;
                     }
-                    if card.who.level-line != "" : Text {
-                        text: card.who.level-line;
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-sm;
-                        overflow: elide;
+                    // "Level 5 · 🔧 Organizer": the role in its own
+                    // color (gold for admins), or "Offline" for a
+                    // guest card.
+                    if card.who.level-label != "" || card.who.role-label != "" : HorizontalLayout {
+                        spacing: Theme.gap-xs;
+                        if card.who.level-label != "" : Text {
+                            text: card.who.level-label;
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                        if card.who.level-label != "" && card.who.role-label != "" : Text {
+                            text: "·";
+                            color: Theme.text-muted;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                        if card.who.role == 1 || card.who.role == 3 || card.who.role == 4 : Rectangle {
+                            width: 13px;
+                            IconDisplay {
+                                icon: card.who.role == 4 ? IconSet.Shield
+                                    : card.who.role == 3 ? IconSet.Wrench
+                                    : IconSet.CircleDashed;
+                                size: 13px;
+                                stroke: card.who.role == 4 ? Theme.gold
+                                    : card.who.role == 3 ? Theme.accent-text
+                                    : Theme.text-muted;
+                            }
+                        }
+                        if card.who.role-label != "" : Text {
+                            text: card.who.role-label;
+                            color: card.who.role == 4 ? Theme.gold
+                                : card.who.role == 3 ? Theme.accent-text
+                                : card.who.role == 1 ? Theme.text-muted
+                                : Theme.text-secondary;
+                            font-size: Theme.font-sm;
+                            font-weight: card.who.role >= 3 ? 600 : 400;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
                     }
                     // How far into the level (spec §9.1): a bar and
                     // the numbers, once the server has said.
@@ -177,25 +210,6 @@ export component MainWindow inherits Window {
                             color: Theme.text-muted;
                             font-size: Theme.font-xs;
                             overflow: elide;
-                        }
-                    }
-                    if card.who.role == 1 || card.who.role == 3 || card.who.role == 4 : HorizontalLayout {
-                        spacing: Theme.gap-xs;
-                        Rectangle {
-                            width: 13px;
-                            IconDisplay {
-                                icon: card.who.role == 4 ? IconSet.Shield
-                                    : card.who.role == 3 ? IconSet.Wrench
-                                    : IconSet.CircleDashed;
-                                size: 13px;
-                                stroke: card.who.role == 4 ? Theme.gold : Theme.text-muted;
-                            }
-                        }
-                        Text {
-                            text: card.role-name(card.who.role);
-                            color: card.who.role == 4 ? Theme.gold : Theme.text-muted;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
                         }
                     }
                 }
@@ -585,6 +599,144 @@ export component MainWindow inherits Window {
                             text: Tr.channel-join;
                             accent: true;
                             clicked => { Logic.channel-password-ok(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Invite dialog (spec §3.1) ──────────────────────────────────
+    // Pick who the code admits, for how long and how many times; the
+    // code appears in the same dialog once the server minted it (and
+    // is on the clipboard already). Escape closes.
+    if State.invite-dialog-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { Logic.invite-dialog-cancel(); } }
+        inv-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { Logic.invite-dialog-cancel(); return accept; }
+                if (ev.text == Key.Return && State.invite-dialog-code == "") {
+                    Logic.invite-dialog-create();
+                    return accept;
+                }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: Math.min(400px, root.width - 48px);
+                height: invd.preferred-height;
+                TouchArea { }
+                invd := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: Tr.invite-dialog-title;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                    }
+                    if State.invite-dialog-code == "" : VerticalLayout {
+                        spacing: Theme.gap-md;
+                        VerticalLayout {
+                            spacing: Theme.gap-xs;
+                            FieldLabel { text: Tr.invite-role; }
+                            Dropdown {
+                                options: State.invite-role-options;
+                                current <=> State.invite-dialog-role;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.gap-md;
+                            VerticalLayout {
+                                spacing: Theme.gap-xs;
+                                FieldLabel { text: Tr.invite-expiry; }
+                                Dropdown {
+                                    options: State.invite-expiry-options;
+                                    current <=> State.invite-dialog-expiry;
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: Theme.gap-xs;
+                                FieldLabel { text: Tr.invite-uses-label; }
+                                Dropdown {
+                                    options: State.invite-uses-options;
+                                    current <=> State.invite-dialog-uses;
+                                }
+                            }
+                        }
+                        if State.invite-dialog-expiry > 1 && !State.perm-manage-invites : Hint {
+                            text: Tr.invite-expiry-note;
+                        }
+                    }
+                    // The minted code: big, monospace, one click to copy.
+                    if State.invite-dialog-code != "" : VerticalLayout {
+                        spacing: Theme.gap-sm;
+                        Rectangle {
+                            height: 56px;
+                            border-radius: Theme.radius-md;
+                            background: code-t.has-hover ? Theme.hover : Theme.bg-primary;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            animate background { duration: 150ms; }
+                            HorizontalLayout {
+                                padding-left: Theme.gap-md;
+                                padding-right: Theme.gap-md;
+                                spacing: Theme.gap-sm;
+                                Text {
+                                    text: State.invite-dialog-code;
+                                    color: Theme.text-primary;
+                                    font-family: "monospace";
+                                    font-size: Theme.font-lg;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Rectangle {
+                                    width: 18px;
+                                    IconDisplay {
+                                        icon: IconSet.Copy;
+                                        size: 18px;
+                                        stroke: Theme.text-secondary;
+                                    }
+                                }
+                            }
+                            code-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { Logic.invite-dialog-copy(); }
+                            }
+                        }
+                        Text {
+                            text: State.invite-dialog-summary;
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-sm;
+                            wrap: word-wrap;
+                        }
+                        Hint { text: Tr.invite-share-hint; }
+                    }
+                    if State.invite-dialog-error != "" : Text {
+                        text: State.invite-dialog-error;
+                        color: Theme.danger-text;
+                        font-size: Theme.font-sm;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn {
+                            text: State.invite-dialog-code == "" ? Tr.cancel : Tr.invite-close;
+                            clicked => { Logic.invite-dialog-cancel(); }
+                        }
+                        if State.invite-dialog-code == "" : Btn {
+                            text: Tr.invite-create;
+                            accent: true;
+                            clicked => { Logic.invite-dialog-create(); }
+                        }
+                        if State.invite-dialog-code != "" : Btn {
+                            text: Tr.invite-copy;
+                            accent: true;
+                            clicked => { Logic.invite-dialog-copy(); }
                         }
                     }
                 }

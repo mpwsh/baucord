@@ -267,6 +267,26 @@ impl ChatHistory {
         })
     }
 
+    /// Someone changed their nickname: every row they authored under
+    /// `old` now says `new`. Returns the indices that changed so the
+    /// mirror can refresh just those rows.
+    pub fn rename_author(&mut self, old: &str, new: &str) -> Vec<usize> {
+        let mut changed = Vec::new();
+        for (i, row) in self.rows.iter_mut().enumerate() {
+            let meta = match row {
+                ChatItem::Message { meta, .. }
+                | ChatItem::Code { meta, .. }
+                | ChatItem::Image { meta, .. } => meta,
+                ChatItem::System { .. } | ChatItem::DayMarker { .. } => continue,
+            };
+            if meta.user == old {
+                new.clone_into(&mut meta.user);
+                changed.push(i);
+            }
+        }
+        changed
+    }
+
     /// The server acknowledged a pending message: its rows take the
     /// real id and lose the muted look.
     pub fn confirm_message(&mut self, placeholder: u64, id: u64) -> Option<RangeDelta> {
@@ -534,6 +554,26 @@ mod tests {
         //           marker hi     again  b:hello system back   later
         assert_eq!(flags, [false, false, true, false, false, false, false]);
         assert_eq!(h.last_day(), Some(20_000));
+    }
+
+    #[test]
+    fn a_rename_follows_the_author_through_the_history() {
+        let mut h = ChatHistory::new();
+        h.push_message(&meta(1), "hi", false);
+        h.push_system("bob joined");
+        let mut other = meta(2);
+        other.user = "carol".into();
+        h.push_message(&other, "hey", false);
+        h.push_message(&meta(3), "again", false);
+        let changed = h.rename_author("a", "alicia");
+        assert_eq!(changed, vec![0, 3]);
+        assert!(h
+            .rows()
+            .iter()
+            .filter_map(ChatItem::meta)
+            .all(|m| m.user != "a"));
+        assert_eq!(h.rows()[2].meta().map(|m| m.user.as_str()), Some("carol"));
+        assert!(h.rename_author("nobody", "x").is_empty());
     }
 
     #[test]

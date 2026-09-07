@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
 
 [lints]
@@ -44,6 +44,10 @@ chrono = "0.4.45"
 ureq = "3.4"
 open = "5.4"
 global-hotkey = "0.8"
+# One instance per config directory: a second launch knocks on the
+# first one's local socket (named pipe / abstract socket / /tmp file)
+# and the first raises its window. See instance.rs.
+interprocess = "2.4"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 zip = "8.6"
 self-replace = "1.5"

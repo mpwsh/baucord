@@ -40,15 +40,15 @@ logging:
   telemetry: true
   file: server.log
 channels:
-  - name: Faceit
-    password: null
-    user_limit: null
   - name: Lobby
     default: true
+    password: null
+    user_limit: null
+  - name: AFK
     password: null
     user_limit: null
 user_channels:
   max_per_user: 2
   temporary_after_min: 30
-  afk_channel: null
+  afk_channel: AFK
   afk_after_min: 30

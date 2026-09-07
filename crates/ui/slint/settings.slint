@@ -723,52 +723,48 @@ component SoundsPanel inherits VerticalLayout {
     alignment: start;
     PanelHeader { title: Tr.sounds-header; lead: Tr.sounds-lead; }
 
+    // The global switch on its own, then every sound at one level,
+    // greyed and inert while the switch is off.
+    CheckRow {
+        text: Tr.sounds-enabled;
+        hint: Tr.sounds-enabled-hint;
+        checked <=> SettingsState.sounds-enabled;
+        toggled(on) => { SettingsLogic.sounds-enabled-changed(on); }
+    }
+    Sep { }
     VerticalLayout {
         spacing: 2px;
         CheckRow {
-            text: Tr.sounds-enabled;
-            hint: Tr.sounds-enabled-hint;
-            checked <=> SettingsState.sounds-enabled;
-            toggled(on) => { SettingsLogic.sounds-enabled-changed(on); }
+            text: Tr.sounds-join-leave;
+            enabled: SettingsState.sounds-enabled;
+            checked <=> SettingsState.join-leave-sounds;
+            toggled(on) => { SettingsLogic.join-leave-sounds-changed(on); }
         }
-        HorizontalLayout {
-            padding-left: Theme.gap-lg;
-            VerticalLayout {
-                spacing: 2px;
-                opacity: SettingsState.sounds-enabled ? 1.0 : 0.45;
-                CheckRow {
-                    text: Tr.sounds-join-leave;
-                    enabled: SettingsState.sounds-enabled;
-                    checked <=> SettingsState.join-leave-sounds;
-                    toggled(on) => { SettingsLogic.join-leave-sounds-changed(on); }
-                }
-                CheckRow {
-                    text: Tr.sounds-share-started;
-                    enabled: SettingsState.sounds-enabled;
-                    checked <=> SettingsState.share-started-sound;
-                    toggled(on) => { SettingsLogic.share-started-sound-changed(on); }
-                }
-                CheckRow {
-                    text: Tr.sounds-viewer-joined;
-                    hint: Tr.sounds-viewer-joined-hint;
-                    enabled: SettingsState.sounds-enabled;
-                    checked <=> SettingsState.viewer-joined-sound;
-                    toggled(on) => { SettingsLogic.viewer-joined-sound-changed(on); }
-                }
-                CheckRow {
-                    text: Tr.sounds-dm;
-                    enabled: SettingsState.sounds-enabled;
-                    checked <=> SettingsState.dm-sound;
-                    toggled(on) => { SettingsLogic.dm-sound-changed(on); }
-                }
-                CheckRow {
-                    text: Tr.sounds-mention;
-                    hint: Tr.sounds-mention-hint;
-                    enabled: SettingsState.sounds-enabled;
-                    checked <=> SettingsState.mention-sound;
-                    toggled(on) => { SettingsLogic.mention-sound-changed(on); }
-                }
-            }
+        CheckRow {
+            text: Tr.sounds-share-started;
+            enabled: SettingsState.sounds-enabled;
+            checked <=> SettingsState.share-started-sound;
+            toggled(on) => { SettingsLogic.share-started-sound-changed(on); }
+        }
+        CheckRow {
+            text: Tr.sounds-viewer-joined;
+            hint: Tr.sounds-viewer-joined-hint;
+            enabled: SettingsState.sounds-enabled;
+            checked <=> SettingsState.viewer-joined-sound;
+            toggled(on) => { SettingsLogic.viewer-joined-sound-changed(on); }
+        }
+        CheckRow {
+            text: Tr.sounds-dm;
+            enabled: SettingsState.sounds-enabled;
+            checked <=> SettingsState.dm-sound;
+            toggled(on) => { SettingsLogic.dm-sound-changed(on); }
+        }
+        CheckRow {
+            text: Tr.sounds-mention;
+            hint: Tr.sounds-mention-hint;
+            enabled: SettingsState.sounds-enabled;
+            checked <=> SettingsState.mention-sound;
+            toggled(on) => { SettingsLogic.mention-sound-changed(on); }
         }
     }
 }

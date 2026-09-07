@@ -45,7 +45,8 @@ export struct UserRow {
     // For user rows `channel-id` is the channel they are in.
     role: int,              // users: 0 unknown, 1 guest, 2 member, 3 organizer, 4 admin
     level: int,             // users: progress level, 0 = unknown
-    level-line: string,     // users: "Level 3 · Member" for the hover card
+    level-label: string,    // users: "Level 3" for the hover card ("" = unknown)
+    role-label: string,     // users: "Member" for the hover card ("" = none)
     xp-pct: int,            // users: 0…100 into the current level; -1 = unknown
     xp-line: string,        // users: "128 / 250 xp to level 4"
     telemetry: string,      // users: the last telemetry (admins only), "" otherwise
@@ -187,6 +188,8 @@ export global State {
     in property <[UserRow]> users;
     /// The server's display name (`Init`): the sidebar's title.
     in property <string> server-name;
+    /// The server's greeting (`Init`): the General header's second line.
+    in property <string> greeting;
     in property <string> users-count-label;
     /// The Messages section is folded to its header (a setting).
     in property <bool> messages-collapsed: false;
@@ -224,6 +227,20 @@ export global State {
     /// The one styled chat row shown as selectable plain text (its
     /// row id; -1 = none). The row's menu and a double-click toggle it.
     in-out property <int> selecting-row: -1;
+
+    // ── Invite dialog (spec §3.1) ───────────────────────────────────
+    // Options are indices into the lists the host fills; the created
+    // code shows in the same dialog, with a copy button.
+    in property <bool> invite-dialog-open: false;
+    in property <[string]> invite-role-options;
+    in property <[string]> invite-expiry-options;
+    in property <[string]> invite-uses-options;
+    in-out property <int> invite-dialog-role: 0;
+    in-out property <int> invite-dialog-expiry: 1;
+    in-out property <int> invite-dialog-uses: 3;
+    in property <string> invite-dialog-code;      // "" until created
+    in property <string> invite-dialog-summary;   // "member, expires in 23 h, unlimited uses"
+    in property <string> invite-dialog-error;     // "" when none
 
     // ── Context menu (main.slint draws it; the host fills it) ──────
     // Window coordinates of the click that opened it; the overlay
@@ -295,6 +312,7 @@ export global State {
     in property <bool> perm-users: false;       // MANAGE_USERS (telemetry tooltip)
     in property <bool> perm-create-channels: false;
     in property <bool> perm-create-invites: false;
+    in property <bool> perm-manage-invites: false;  // longer expiries
     in property <bool> perm-manage-own: false;  // MANAGE_OWN_CHANNELS
     /// Our highest built-in role (same scale as UserRow.role): the
     /// role submenu offers roles up to it.
@@ -321,6 +339,11 @@ export global State {
     // roster row it shows, and where the hovered element sits in
     // window coordinates. -1 = none.
     in-out property <int> card-index: -1;
+    /// A chat author who is no longer in the roster: the host builds a
+    /// row from what it still knows (name, look, "Offline") and opens
+    /// the same card with it.
+    in property <UserRow> card-guest;
+    in property <bool> card-guest-open: false;
     in-out property <length> card-x;
     in-out property <length> card-y;
     in-out property <length> card-anchor-h;
@@ -437,9 +460,12 @@ export global Logic {
     callback channel-clicked(int);        // channel id (header row tapped)
     callback channel-password-ok();       // reads State.channel-password
     callback channel-password-cancel();
-    /// The Invite button: a code with the defaults, printed in chat
-    /// and copied (the same path as `/invite`).
+    /// The Invite button: open the dialog.
     callback invite-create();
+    /// The dialog: mint with the picked options; copy the code; close.
+    callback invite-dialog-create();
+    callback invite-dialog-copy();
+    callback invite-dialog-cancel();
     // 1.1 — channels from the UI (spec §5)
     callback channel-create();            // the `+`: open the dialog empty
     callback channel-dialog-save();       // reads State.channel-dialog-*

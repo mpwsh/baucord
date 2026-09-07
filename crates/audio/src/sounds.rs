@@ -66,9 +66,10 @@ impl SoundBank {
             // once here, next to the WAV decodes — ~10k samples, 40 KB.
             mention: synth_notes(&[(660.0, 0.09), (880.0, 0.12)], 0.30),
             direct: synth_notes(&[(523.0, 0.08), (659.0, 0.08), (784.0, 0.12)], 0.28),
-            // A rising A-major figure for a stream going up in the
-            // room; a short, quieter pair for a viewer arriving.
-            share_started: synth_notes(&[(440.0, 0.08), (554.0, 0.08), (659.0, 0.16)], 0.30),
+            // A stream going up in the room: two low notes a fifth
+            // apart, held — nothing like the DM chime's quick high
+            // arpeggio. A short, quieter pair for a viewer arriving.
+            share_started: synth_notes(&[(392.0, 0.12), (587.0, 0.22)], 0.30),
             viewer_joined: synth_notes(&[(784.0, 0.06), (988.0, 0.10)], 0.16),
         }
     }

@@ -4,6 +4,7 @@
 mod app;
 mod clipboard;
 mod hotkeys;
+mod instance;
 mod media;
 mod present;
 mod resources;
@@ -66,12 +67,21 @@ fn main() {
         }
     }
 
-    log::info!(
-        "Config directory: {}",
-        client::config::settings_file_path()
-            .parent()
-            .map_or_else(|| "?".to_string(), |d| d.display().to_string())
-    );
+    let config_dir = client::config::settings_file_path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    log::info!("Config directory: {}", config_dir.display());
+
+    // One instance per config directory: if another baucord already
+    // runs on this profile, ask it to show its window and stop here
+    // — the same as clicking the tray icon.
+    let claim = instance::claim(&config_dir, || {
+        let _ = slint::invoke_from_event_loop(|| app::with_current(|app| app.show_main()));
+    });
+    if matches!(claim, instance::Claim::AlreadyRunning) {
+        return;
+    }
 
     // A release build aborts on panic and a GUI process has no stderr,
     // so without this a crash on any thread leaves nothing behind but a
