@@ -32,6 +32,11 @@ pub enum SoundType {
     Mention,
     /// A direct message arrived.
     DirectMessage,
+    /// Someone in our channel started sharing their screen.
+    ShareStarted,
+    /// Someone started watching the stream we share (softer: it is
+    /// for the sharer alone, and viewers come and go).
+    ViewerJoined,
 }
 
 // ── Sound bank ──────────────────────────────────────────────────────────
@@ -42,6 +47,8 @@ pub struct SoundBank {
     leave: Vec<f32>,
     mention: Vec<f32>,
     direct: Vec<f32>,
+    share_started: Vec<f32>,
+    viewer_joined: Vec<f32>,
 }
 impl Default for SoundBank {
     fn default() -> Self {
@@ -59,6 +66,10 @@ impl SoundBank {
             // once here, next to the WAV decodes — ~10k samples, 40 KB.
             mention: synth_notes(&[(660.0, 0.09), (880.0, 0.12)], 0.30),
             direct: synth_notes(&[(523.0, 0.08), (659.0, 0.08), (784.0, 0.12)], 0.28),
+            // A rising A-major figure for a stream going up in the
+            // room; a short, quieter pair for a viewer arriving.
+            share_started: synth_notes(&[(440.0, 0.08), (554.0, 0.08), (659.0, 0.16)], 0.30),
+            viewer_joined: synth_notes(&[(784.0, 0.06), (988.0, 0.10)], 0.16),
         }
     }
 
@@ -69,6 +80,8 @@ impl SoundBank {
             SoundType::UserLeft => &self.leave,
             SoundType::Mention => &self.mention,
             SoundType::DirectMessage => &self.direct,
+            SoundType::ShareStarted => &self.share_started,
+            SoundType::ViewerJoined => &self.viewer_joined,
         }
     }
 }

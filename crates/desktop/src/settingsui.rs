@@ -14,9 +14,9 @@ use ui::{KeybindRow, ServerRow, SettingsLogic, SettingsState, SettingsWindow};
 use crate::app::{self, AppState};
 
 /// Nav index of the Servers tab (Profile 0, General 1, Audio 2,
-/// Keyboard 3, Servers 4, About 5) — the connect view's pencil jumps
-/// here.
-pub const TAB_SERVERS: i32 = 4;
+/// Sounds 3, Keyboard 4, Servers 5, Credits 6, About 7) — the connect
+/// view's pencil jumps here. Mirrors the `NavItem`s in settings.slint.
+pub const TAB_SERVERS: i32 = 5;
 
 /// The name-color palette (spec §7.1): sixteen colors that all pass
 /// 3:1 on the chat background (#1A1D21, measured 4.9–15.5) and none
@@ -333,6 +333,8 @@ pub fn populate(app: &mut AppState) {
     s.set_join_leave_sounds(settings.sounds.join_leave);
     s.set_mention_sound(settings.sounds.mention);
     s.set_dm_sound(settings.sounds.direct_message);
+    s.set_share_started_sound(settings.sounds.share_started);
+    s.set_viewer_joined_sound(settings.sounds.viewer_joined);
     s.set_show_timestamps(settings.ui.show_timestamps);
     s.set_compact_rows(settings.ui.compact_rows);
     let sizes: Vec<slint::SharedString> = IMAGE_SIZES
@@ -584,6 +586,12 @@ fn wire(win: &SettingsWindow) {
     });
     logic.on_dm_sound_changed(|on| {
         app::with_current(move |app| app.settings.sounds.direct_message = on);
+    });
+    logic.on_share_started_sound_changed(|on| {
+        app::with_current(move |app| app.settings.sounds.share_started = on);
+    });
+    logic.on_viewer_joined_sound_changed(|on| {
+        app::with_current(move |app| app.settings.sounds.viewer_joined = on);
     });
     logic.on_auto_connect_changed(|on| {
         app::with_current(move |app| app.settings.startup.auto_connect = on);

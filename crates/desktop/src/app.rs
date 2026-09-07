@@ -219,6 +219,10 @@ pub struct AppState {
 
     /// Active screen sharers: `client_id` → (width, height).
     active_sharers: HashMap<u64, (u32, u32)>,
+    /// How many were watching our stream at the last stats tick: a
+    /// rise plays the viewer-joined sound (`StreamHealth` is the only
+    /// word the sharer gets, and it goes to the screen thread).
+    stream_viewers_seen: u32,
     /// Sharer display order for the roster projection.
     sharer_ids: HashSet<u64>,
 
@@ -474,6 +478,7 @@ pub fn run() {
         is_testing_mic: false,
         is_testing_mic_shared,
         active_sharers: HashMap::new(),
+        stream_viewers_seen: 0,
         sharer_ids: HashSet::new(),
         history: ChatHistory::new(),
         chat_model,
@@ -1980,6 +1985,20 @@ impl AppState {
                 self.active_sharers.insert(client_id, (width, height));
                 self.sharer_ids = self.active_sharers.keys().copied().collect();
                 self.update_user_list();
+                // A stream going up in our channel, by someone else.
+                let in_our_channel = self
+                    .users
+                    .get(&client_id)
+                    .is_some_and(|u| Some(u.channel_id) == self.our_channel());
+                if in_our_channel
+                    && Some(client_id) != self.our_client_id
+                    && self.settings.sounds.share_started_on()
+                {
+                    self.voice
+                        .tx
+                        .send(VoiceControl::PlaySound(SoundType::ShareStarted))
+                        .ok();
+                }
             }
             NetworkMessage::ScreenShareStopped { client_id } => {
                 self.active_sharers.remove(&client_id);
@@ -5823,12 +5842,22 @@ impl AppState {
     #[allow(clippy::cast_precision_loss)]
     fn update_stream_stats(&mut self) {
         if !self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+            self.stream_viewers_seen = 0;
             return;
         }
         let sh = &self.screen.shared;
         let frame_bytes = sh.last_frame_bytes.load(Ordering::Relaxed);
         let encode_us = sh.last_encode_us.load(Ordering::Relaxed);
         let viewers = sh.stream_viewers.load(Ordering::Relaxed);
+        // Someone new is watching (the count only reaches us through
+        // the screen thread's health sample, once a second).
+        if viewers > self.stream_viewers_seen && self.settings.sounds.viewer_joined_on() {
+            self.voice
+                .tx
+                .send(VoiceControl::PlaySound(SoundType::ViewerJoined))
+                .ok();
+        }
+        self.stream_viewers_seen = viewers;
         let fps_scale_pct = sh.fps_scale_pct.load(Ordering::Relaxed);
         let loss_pct = f32::from_bits(sh.stream_loss_pct.load(Ordering::Relaxed));
         let quality_str = sh
@@ -6757,6 +6786,10 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_sounds_mention(t!("sounds-mention").into());
     tr.set_sounds_mention_hint(t!("sounds-mention-hint").into());
     tr.set_sounds_dm(t!("sounds-dm").into());
+    tr.set_sounds_lead(t!("sounds-lead").into());
+    tr.set_sounds_share_started(t!("sounds-share-started").into());
+    tr.set_sounds_viewer_joined(t!("sounds-viewer-joined").into());
+    tr.set_sounds_viewer_joined_hint(t!("sounds-viewer-joined-hint").into());
     tr.set_startup_header(t!("startup-header").into());
     tr.set_startup_auto_connect(t!("startup-auto-connect").into());
     tr.set_startup_auto_connect_hint(t!("startup-auto-connect-hint").into());

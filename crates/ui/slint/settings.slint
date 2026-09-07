@@ -58,12 +58,14 @@ export global SettingsState {
     in-out property <bool> start-minimized: false;
     in property <bool> tray-available: false; // start-minimized needs the tray
     in-out property <bool> check-updates: true;
-    // Sounds: a master switch, then the two that exist. Ordinary chat
-    // messages never make a sound.
+    // Sounds (their own tab): a master switch, then each one. Ordinary
+    // chat messages never make a sound.
     in-out property <bool> sounds-enabled: true;
     in-out property <bool> join-leave-sounds: true;
     in-out property <bool> mention-sound: false;
     in-out property <bool> dm-sound: true;
+    in-out property <bool> share-started-sound: true;
+    in-out property <bool> viewer-joined-sound: true;
     // Chat
     in-out property <bool> show-timestamps: true;
     in-out property <bool> compact-rows: false;
@@ -137,6 +139,8 @@ export global SettingsLogic {
     callback join-leave-sounds-changed(bool);
     callback mention-sound-changed(bool);
     callback dm-sound-changed(bool);
+    callback share-started-sound-changed(bool);
+    callback viewer-joined-sound-changed(bool);
     callback show-timestamps-changed(bool);
     callback compact-rows-changed(bool);
     callback image-size-selected(int);
@@ -513,46 +517,6 @@ component GeneralPanel inherits VerticalLayout {
     }
 
     Sep { }
-    SectionHeader { text: Tr.sounds-header; }
-    VerticalLayout {
-        spacing: 2px;
-        CheckRow {
-            text: Tr.sounds-enabled;
-            hint: Tr.sounds-enabled-hint;
-            checked <=> SettingsState.sounds-enabled;
-            toggled(on) => { SettingsLogic.sounds-enabled-changed(on); }
-        }
-        // The individual picks, indented under the master switch and
-        // greyed while it is off.
-        HorizontalLayout {
-            padding-left: Theme.gap-lg;
-            VerticalLayout {
-                spacing: 2px;
-                opacity: SettingsState.sounds-enabled ? 1.0 : 0.45;
-                CheckRow {
-                    text: Tr.sounds-join-leave;
-                    enabled: SettingsState.sounds-enabled;
-                    checked <=> SettingsState.join-leave-sounds;
-                    toggled(on) => { SettingsLogic.join-leave-sounds-changed(on); }
-                }
-                CheckRow {
-                    text: Tr.sounds-dm;
-                    enabled: SettingsState.sounds-enabled;
-                    checked <=> SettingsState.dm-sound;
-                    toggled(on) => { SettingsLogic.dm-sound-changed(on); }
-                }
-                CheckRow {
-                    text: Tr.sounds-mention;
-                    hint: Tr.sounds-mention-hint;
-                    enabled: SettingsState.sounds-enabled;
-                    checked <=> SettingsState.mention-sound;
-                    toggled(on) => { SettingsLogic.mention-sound-changed(on); }
-                }
-            }
-        }
-    }
-
-    Sep { }
     SectionHeader { text: Tr.chat-header; }
     VerticalLayout {
         spacing: 2px;
@@ -747,6 +711,66 @@ component ServersPanel inherits VerticalLayout {
         }
     }
     Rectangle { }
+}
+
+// ── Sounds ─────────────────────────────────────────────────────────────
+// A master switch, then each sound: the picks are indented under it
+// and greyed while it is off. Ordinary chat messages never sound.
+component SoundsPanel inherits VerticalLayout {
+    spacing: Theme.gap-lg;
+    // Short panel: stack at the top instead of spreading over the
+    // column's full height.
+    alignment: start;
+    PanelHeader { title: Tr.sounds-header; lead: Tr.sounds-lead; }
+
+    VerticalLayout {
+        spacing: 2px;
+        CheckRow {
+            text: Tr.sounds-enabled;
+            hint: Tr.sounds-enabled-hint;
+            checked <=> SettingsState.sounds-enabled;
+            toggled(on) => { SettingsLogic.sounds-enabled-changed(on); }
+        }
+        HorizontalLayout {
+            padding-left: Theme.gap-lg;
+            VerticalLayout {
+                spacing: 2px;
+                opacity: SettingsState.sounds-enabled ? 1.0 : 0.45;
+                CheckRow {
+                    text: Tr.sounds-join-leave;
+                    enabled: SettingsState.sounds-enabled;
+                    checked <=> SettingsState.join-leave-sounds;
+                    toggled(on) => { SettingsLogic.join-leave-sounds-changed(on); }
+                }
+                CheckRow {
+                    text: Tr.sounds-share-started;
+                    enabled: SettingsState.sounds-enabled;
+                    checked <=> SettingsState.share-started-sound;
+                    toggled(on) => { SettingsLogic.share-started-sound-changed(on); }
+                }
+                CheckRow {
+                    text: Tr.sounds-viewer-joined;
+                    hint: Tr.sounds-viewer-joined-hint;
+                    enabled: SettingsState.sounds-enabled;
+                    checked <=> SettingsState.viewer-joined-sound;
+                    toggled(on) => { SettingsLogic.viewer-joined-sound-changed(on); }
+                }
+                CheckRow {
+                    text: Tr.sounds-dm;
+                    enabled: SettingsState.sounds-enabled;
+                    checked <=> SettingsState.dm-sound;
+                    toggled(on) => { SettingsLogic.dm-sound-changed(on); }
+                }
+                CheckRow {
+                    text: Tr.sounds-mention;
+                    hint: Tr.sounds-mention-hint;
+                    enabled: SettingsState.sounds-enabled;
+                    checked <=> SettingsState.mention-sound;
+                    toggled(on) => { SettingsLogic.mention-sound-changed(on); }
+                }
+            }
+        }
+    }
 }
 
 component AudioPanel inherits VerticalLayout {
@@ -985,14 +1009,16 @@ export component SettingsWindow inherits Window {
                 VerticalLayout {
                     padding: Theme.gap-md;
                     spacing: Theme.gap-xs;
-                    NavItem { text: Tr.tab-profile;  icon: IconSet.UserRound;         active: root.tab == 0; clicked => { root.tab = 0; } }
-                    NavItem { text: Tr.tab-general;  icon: IconSet.SlidersHorizontal; active: root.tab == 1; clicked => { root.tab = 1; } }
-                    NavItem { text: Tr.tab-audio;    icon: IconSet.Volume2;           active: root.tab == 2; clicked => { root.tab = 2; } }
-                    NavItem { text: Tr.tab-keyboard; icon: IconSet.Keyboard;          active: root.tab == 3; clicked => { root.tab = 3; } }
-                    NavItem { text: Tr.tab-servers;  icon: IconSet.Server;            active: root.tab == 4; clicked => { root.tab = 4; } }
+                    // Indices are mirrored by `settingsui::TAB_*`.
+                    NavItem { text: Tr.tab-profile;   icon: IconSet.UserRound;         active: root.tab == 0; clicked => { root.tab = 0; } }
+                    NavItem { text: Tr.tab-general;   icon: IconSet.SlidersHorizontal; active: root.tab == 1; clicked => { root.tab = 1; } }
+                    NavItem { text: Tr.tab-audio;     icon: IconSet.Volume2;           active: root.tab == 2; clicked => { root.tab = 2; } }
+                    NavItem { text: Tr.sounds-header; icon: IconSet.Bell;              active: root.tab == 3; clicked => { root.tab = 3; } }
+                    NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard;          active: root.tab == 4; clicked => { root.tab = 4; } }
+                    NavItem { text: Tr.tab-servers;   icon: IconSet.Server;            active: root.tab == 5; clicked => { root.tab = 5; } }
                     Rectangle { }
-                    NavItem { text: Tr.tab-credits;  icon: IconSet.Heart;             active: root.tab == 5; clicked => { root.tab = 5; } }
-                    NavItem { text: Tr.tab-about;    icon: IconSet.Info;              active: root.tab == 6; clicked => { root.tab = 6; } }
+                    NavItem { text: Tr.tab-credits;   icon: IconSet.Heart;             active: root.tab == 6; clicked => { root.tab = 6; } }
+                    NavItem { text: Tr.tab-about;     icon: IconSet.Info;              active: root.tab == 7; clicked => { root.tab = 7; } }
                 }
             }
             // Content + button row
@@ -1010,10 +1036,11 @@ export component SettingsWindow inherits Window {
                                 if root.tab == 0 : ProfilePanel { }
                                 if root.tab == 1 : GeneralPanel { }
                                 if root.tab == 2 : AudioPanel { }
-                                if root.tab == 3 : KeyboardPanel { }
-                                if root.tab == 4 : ServersPanel { }
-                                if root.tab == 5 : CreditsPanel { }
-                                if root.tab == 6 : AboutPanel { }
+                                if root.tab == 3 : SoundsPanel { }
+                                if root.tab == 4 : KeyboardPanel { }
+                                if root.tab == 5 : ServersPanel { }
+                                if root.tab == 6 : CreditsPanel { }
+                                if root.tab == 7 : AboutPanel { }
                             }
                             Rectangle { horizontal-stretch: 1; }
                         }

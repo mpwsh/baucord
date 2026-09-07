@@ -176,6 +176,13 @@ pub struct SoundSettings {
     /// us, and only us.
     #[serde(default = "default_true")]
     pub direct_message: bool,
+    /// Someone in our channel starts sharing their screen.
+    #[serde(default = "default_true")]
+    pub share_started: bool,
+    /// Someone starts watching the stream we share (a softer sound,
+    /// to the sharer alone).
+    #[serde(default = "default_true")]
+    pub viewer_joined: bool,
 }
 
 impl Default for SoundSettings {
@@ -185,6 +192,8 @@ impl Default for SoundSettings {
             join_leave: true,
             mention: false,
             direct_message: true,
+            share_started: true,
+            viewer_joined: true,
         }
     }
 }
@@ -204,6 +213,16 @@ impl SoundSettings {
     #[must_use]
     pub fn direct_message_on(&self) -> bool {
         self.enabled && self.direct_message
+    }
+
+    #[must_use]
+    pub fn share_started_on(&self) -> bool {
+        self.enabled && self.share_started
+    }
+
+    #[must_use]
+    pub fn viewer_joined_on(&self) -> bool {
+        self.enabled && self.viewer_joined
     }
 }
 
