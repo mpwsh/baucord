@@ -233,5 +233,9 @@ pub fn step_gallery(app: &mut AppState, dir: i32) {
 pub fn close_gallery(app: &mut AppState) {
     app.gallery_row = None;
     app.gallery_gif = None;
-    app.main.global::<State>().set_viewer_open(false);
+    let s = app.main.global::<State>();
+    s.set_viewer_open(false);
+    // The full-resolution decode goes with the overlay; the row keeps
+    // only its preview-sized texture.
+    s.set_viewer_image(slint::Image::default());
 }

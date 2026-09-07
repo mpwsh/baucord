@@ -55,7 +55,8 @@ pub fn push_image_row(app: &mut AppState, meta: &app_core::chat::Meta, data: Vec
     // Preview-sized texture for the row (the layout box still comes
     // from the original dimensions); the gallery viewer decodes the
     // full resolution from `app.images` on demand.
-    let Ok((frame, w, h)) = ui::convert::decode_to_preview(&data) else {
+    let max_edge = ui::convert::preview_max_edge(app.main.window().scale_factor());
+    let Ok((frame, w, h)) = ui::convert::decode_to_preview(&data, max_edge) else {
         return false;
     };
     let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);

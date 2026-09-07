@@ -369,27 +369,37 @@ pub mod convert {
         Ok((rgba_image(rgba.as_raw(), w, h), w, h))
     }
 
-    /// Longest edge of a chat-row preview texture. Chat displays
-    /// images in at most a 360×280 box (chat.slint), so 720 px covers
-    /// a 2× hidpi scale exactly; the full-resolution decode happens
-    /// only when the gallery viewer opens.
-    pub const PREVIEW_MAX_EDGE: u32 = 720;
+    /// The chat-row image box's longest side, in logical pixels
+    /// (chat.slint draws images in at most 360×280).
+    pub const PREVIEW_BOX_EDGE: u32 = 360;
+
+    /// Longest edge of a chat-row preview texture for a window at
+    /// `scale_factor`: the box at that scale, so a 1× display keeps
+    /// 360² per picture (0.5 MB) and a 2× display 720² (2 MB) — the
+    /// old fixed 720 paid the hidpi price everywhere. Capped at 2×.
+    #[must_use]
+    pub fn preview_max_edge(scale_factor: f32) -> u32 {
+        let scale = scale_factor.clamp(1.0, 2.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let edge = (PREVIEW_BOX_EDGE as f32 * scale).ceil() as u32;
+        edge
+    }
 
     /// Decode for a chat row: the returned dimensions are the
     /// *original* image's (the row's layout box is computed from
-    /// them), but the texture is downscaled to
-    /// [`PREVIEW_MAX_EDGE`] — a 1280² PNG is 6.5 MB of RGBA that
+    /// them), but the texture is downscaled to `max_edge` (see
+    /// [`preview_max_edge`]) — a 1280² PNG is 6.5 MB of RGBA that
     /// would otherwise stay resident for the row's whole life just to
-    /// be drawn at 360 px.
+    /// be drawn at 360 px. The full-resolution decode happens only
+    /// while the gallery viewer is open.
     pub fn decode_to_preview(
         bytes: &[u8],
+        max_edge: u32,
     ) -> Result<(slint::Image, u32, u32), app_core::images::ImageError> {
         let decoded = app_core::images::decode_bounded(bytes)?;
         let (w, h) = (decoded.width(), decoded.height());
-        let rgba = if w.max(h) > PREVIEW_MAX_EDGE {
-            decoded
-                .thumbnail(PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE)
-                .to_rgba8()
+        let rgba = if w.max(h) > max_edge {
+            decoded.thumbnail(max_edge, max_edge).to_rgba8()
         } else {
             decoded.to_rgba8()
         };

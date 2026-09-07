@@ -914,7 +914,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 }
             }
             app.preview_gif = None;
-            app.main.global::<State>().set_preview_open(false);
+            app.close_preview();
         });
     });
     let w = Rc::downgrade(state);
@@ -922,7 +922,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, |app| {
             app.pending_preview = None;
             app.preview_gif = None;
-            app.main.global::<State>().set_preview_open(false);
+            app.close_preview();
         });
     });
 
@@ -2271,6 +2271,11 @@ impl AppState {
                 let limit = args.trim().parse::<u16>().unwrap_or(20).clamp(1, 200);
                 self.load_earlier(limit);
             }
+            "mem" => {
+                let report = self.memory_report();
+                info!("memory report:\n{report}");
+                self.push_chat_system(&report);
+            }
             "dm" | "msg" => {
                 let (name, text) = match args.trim().split_once(char::is_whitespace) {
                     Some((n, t)) if !t.trim().is_empty() => (n.trim(), t.trim().to_string()),
@@ -2424,7 +2429,14 @@ impl AppState {
     fn commands_available(&self) -> String {
         use client::permissions as p;
         let has = |bit: u64| p::has(self.permissions, bit);
-        let mut out: Vec<&str> = vec!["/help", "/history [n]", "/channel list", "/leave", "/quit"];
+        let mut out: Vec<&str> = vec![
+            "/help",
+            "/history [n]",
+            "/channel list",
+            "/mem",
+            "/leave",
+            "/quit",
+        ];
         if has(p::CREATE_INVITES) {
             out.push("/invite [role] [24h] [uses]");
         }
@@ -5431,6 +5443,16 @@ impl AppState {
         self.pending_preview = Some(png);
     }
 
+    /// Close the send preview and let go of its full-resolution
+    /// texture: a property keeps its last image, and a 4K screenshot
+    /// previewed once is 32 MB that would otherwise stay until the
+    /// next one.
+    pub fn close_preview(&mut self) {
+        let s = self.main.global::<State>();
+        s.set_preview_open(false);
+        s.set_preview_image(slint::Image::default());
+    }
+
     fn gif_hover(&mut self, row_id: i32, entering: bool) {
         let needs_ticker = self
             .gifs
@@ -5857,7 +5879,15 @@ impl AppState {
         let Ok(decoded) = app_core::images::decode_bounded(bytes) else {
             return;
         };
-        let rgba = decoded.to_rgba8();
+        // Ours are 128² at pick time; a picture from another client is
+        // whatever the server's KB cap let through, and it is drawn at
+        // 64 px at most. Never keep more than 128² of it resident.
+        let side = app_core::images::AVATAR_SIDE;
+        let rgba = if decoded.width().max(decoded.height()) > side {
+            decoded.thumbnail(side, side).to_rgba8()
+        } else {
+            decoded.to_rgba8()
+        };
         let image = ui::convert::rgba_image(rgba.as_raw(), rgba.width(), rgba.height());
         self.avatar_images.insert(blob, image);
         if cache {
@@ -6056,6 +6086,83 @@ impl AppState {
         self.main.global::<State>().get_phase() == Phase::Main
             && self.main.window().is_visible()
             && !self.main.window().is_minimized()
+    }
+
+    /// `/mem`: where the client's memory goes, from what it holds. The
+    /// process figure the task monitor shows, beside every pixel
+    /// buffer and row the app retains — so a "the RAM tripled" report
+    /// becomes a number per bucket instead of a guess. Texture bytes
+    /// are `width × height × 4` of each `slint::Image` held; the
+    /// renderer's own caches (Skia's glyphs and surfaces) and the
+    /// allocator's slack are the remainder.
+    #[allow(clippy::cast_precision_loss)]
+    fn memory_report(&mut self) -> String {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        let texture = |img: &slint::Image| {
+            let size = img.size();
+            size.width as usize * size.height as usize * 4
+        };
+        let rss = self.pid.and_then(|pid| {
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                false,
+                ProcessRefreshKind::nothing().with_memory(),
+            );
+            self.sys.process(pid).map(sysinfo::Process::memory)
+        });
+        let rss = crate::resources::native_monitor_memory()
+            .or(rss)
+            .map_or_else(|| "?".to_string(), |b| format!("{:.0} MB", mb(b as usize)));
+
+        // Chat rows and their pictures, over every conversation.
+        let mut rows = self.chat_model.row_count();
+        let mut preview_bytes = 0usize;
+        let mut preview_count = 0usize;
+        for i in 0..self.chat_model.row_count() {
+            if let Some(row) = self.chat_model.row_data(i)
+                && row.kind == 2
+            {
+                preview_count += 1;
+                preview_bytes += texture(&row.image);
+            }
+        }
+        let mut parked_rows = 0usize;
+        for conv in self.parked.values() {
+            parked_rows += conv.model.row_count();
+            for i in 0..conv.model.row_count() {
+                if let Some(row) = conv.model.row_data(i)
+                    && row.kind == 2
+                {
+                    preview_count += 1;
+                    preview_bytes += texture(&row.image);
+                }
+            }
+        }
+        rows += parked_rows;
+        let compressed: usize = self.images.values().map(|e| e.bytes.len()).sum();
+        let gifs_playing = self.gifs.values().filter(|g| g.playing()).count();
+        let avatars: usize = self.avatar_images.values().map(texture).sum();
+        let own_avatar = self.own_avatar.as_ref().map_or(0, texture);
+        let viewers = self.viewers.len();
+
+        format!(
+            "Memory — process {rss}\n\
+             chat: {rows} rows ({parked_rows} parked in {} conversations), \
+             {preview_count} pictures: {:.1} MB of previews, {:.1} MB compressed, \
+             {} GIF players ({gifs_playing} playing)\n\
+             avatars: {} decoded, {:.1} MB (+{:.1} MB ours)\n\
+             roster: {} users, {} profiles; {viewers} stream viewers open",
+            self.parked.len(),
+            mb(preview_bytes),
+            mb(compressed),
+            self.gifs.len(),
+            self.avatar_images.len(),
+            mb(avatars),
+            mb(own_avatar),
+            self.users.len(),
+            self.profiles.len(),
+        )
     }
 
     #[allow(clippy::cast_precision_loss)]
