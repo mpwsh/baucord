@@ -464,6 +464,37 @@ export component SectionHeader inherits Text {
     font-weight: 700;
 }
 
+// ── Role glyph ──────────────────────────────────────────────────────────
+
+/// A role's badge by its wire name (`permissions::ROLE_ICONS`); the
+/// list is closed, so the mapping lives here.
+export component RoleGlyph inherits Rectangle {
+    in property <string> name;
+    in property <length> size: 14px;
+    in property <color> stroke: Theme.text-secondary;
+    width: root.size;
+    IconDisplay {
+        size: root.size;
+        stroke: root.stroke;
+        icon: root.name == "star" ? IconSet.Star
+            : root.name == "crown" ? IconSet.Crown
+            : root.name == "shield" ? IconSet.Shield
+            : root.name == "wrench" ? IconSet.Wrench
+            : root.name == "zap" ? IconSet.Zap
+            : root.name == "flame" ? IconSet.Flame
+            : root.name == "heart" ? IconSet.Heart
+            : root.name == "gem" ? IconSet.Gem
+            : root.name == "trophy" ? IconSet.Trophy
+            : root.name == "sword" ? IconSet.Sword
+            : root.name == "music" ? IconSet.Music
+            : root.name == "gamepad" ? IconSet.Gamepad2
+            : root.name == "video" ? IconSet.Video
+            : root.name == "mic" ? IconSet.Mic
+            : root.name == "eye" ? IconSet.Eye
+            : IconSet.Bot;
+    }
+}
+
 // ── Context menu column ─────────────────────────────────────────────────
 
 /// One column of a context menu: a raised panel of `MenuEntry` rows.
@@ -607,6 +638,8 @@ export component MenuPanel inherits Rectangle {
 export component Dropdown inherits Rectangle {
     in property <[string]> options;
     in-out property <int> current: 0;
+    /// Shown while nothing is picked (`current` out of range).
+    in property <string> placeholder;
     callback selected(int);
 
     height: 36px;
@@ -622,7 +655,7 @@ export component Dropdown inherits Rectangle {
         spacing: Theme.gap-sm;
         Text {
             text: root.current >= 0 && root.current < root.options.length
-                ? root.options[root.current] : "";
+                ? root.options[root.current] : root.placeholder;
             color: Theme.text-primary;
             font-size: Theme.font-body;
             vertical-alignment: center;

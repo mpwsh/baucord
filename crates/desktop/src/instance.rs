@@ -10,9 +10,10 @@
 //! directory, so `--profile bob` still runs beside the default.
 //!
 //! The socket is a named pipe on Windows, an abstract-namespace socket
-//! on Linux and a file under `/tmp` elsewhere; only the last can leave
-//! a corpse behind after a crash, and that case is told apart from a
-//! live instance by knocking first.
+//! on Linux and a file under `/tmp` elsewhere. The newcomer always
+//! knocks before binding: a live instance answers the same way
+//! everywhere, while a refused bind means different things per OS
+//! (a corpse file on macOS, a held pipe name on Windows).
 
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
@@ -45,33 +46,42 @@ pub fn claim(config_dir: &Path, on_show: impl Fn() + Send + 'static) -> Claim {
             return Claim::First;
         }
     };
+    // Knock first, on every platform. A live instance answers; what a
+    // second listener would get otherwise differs per OS — AddrInUse
+    // on Unix, but on Windows a pipe name held with
+    // FIRST_PIPE_INSTANCE refuses with ERROR_ACCESS_DENIED, i.e.
+    // PermissionDenied — and reading the bind error alone let a second
+    // copy through there.
+    if knock(name.clone()).is_ok() {
+        info!("baucord is already running; asked it to show its window");
+        return Claim::AlreadyRunning;
+    }
     match ListenerOptions::new().name(name.clone()).create_sync() {
         Ok(listener) => {
             serve(listener, on_show);
             Claim::First
         }
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            // Alive, or a corpse socket from a crash: a knock tells.
-            match knock(name.clone()) {
-                Ok(()) => {
-                    info!("baucord is already running; asked it to show its window");
-                    Claim::AlreadyRunning
-                }
-                Err(e) => {
-                    debug!("nobody answers the instance socket ({e}); reclaiming it");
-                    match ListenerOptions::new()
-                        .name(name)
-                        .try_overwrite(true)
-                        .create_sync()
-                    {
-                        Ok(listener) => serve(listener, on_show),
-                        Err(e) => warn!("single-instance guard unavailable: {e}"),
-                    }
-                    Claim::First
-                }
+            // Nobody answered the knock, yet the name is taken: a corpse
+            // socket file from a crash (macOS). Reclaim it.
+            debug!("reclaiming a stale instance socket ({e})");
+            match ListenerOptions::new()
+                .name(name)
+                .try_overwrite(true)
+                .create_sync()
+            {
+                Ok(listener) => serve(listener, on_show),
+                Err(e) => warn!("single-instance guard unavailable: {e}"),
             }
+            Claim::First
         }
         Err(e) => {
+            // Lost a race with a copy that bound between our knock and
+            // our bind (Windows says PermissionDenied): knock again.
+            if knock(name).is_ok() {
+                info!("baucord is already running; asked it to show its window");
+                return Claim::AlreadyRunning;
+            }
             warn!("single-instance guard unavailable: {e}");
             Claim::First
         }

@@ -41,12 +41,7 @@ pub mod convert {
                 let submenu = if e.submenu.is_empty() {
                     -1
                 } else {
-                    submenus.push(
-                        e.submenu
-                            .iter()
-                            .map(|sub| menu_entry(sub, -1, label))
-                            .collect(),
-                    );
+                    submenus.push(e.submenu.iter().map(|sub| menu_entry(sub, -1, label)).collect());
                     i32::try_from(submenus.len() - 1).unwrap_or(-1)
                 };
                 menu_entry(e, submenu, label)
@@ -86,7 +81,7 @@ pub mod convert {
             A::ResetAudio => (MenuAction::ResetAudio, 0),
             A::Watch => (MenuAction::Watch, 0),
             A::Message => (MenuAction::Message, 0),
-            A::SetRole(role) => (MenuAction::SetRole, role.as_int()),
+            A::SetRole(id) => (MenuAction::SetRole, i32::try_from(id).unwrap_or(-1)),
             A::MoveTo(id) => (MenuAction::MoveTo, i32::from(id)),
             A::ChannelKick => (MenuAction::ChannelKick, 0),
             A::MuteVoice => (MenuAction::MuteVoice, 0),
@@ -102,6 +97,7 @@ pub mod convert {
             A::DeleteMessage => (MenuAction::DeleteMessage, 0),
             A::OpenImage => (MenuAction::OpenImage, 0),
             A::SaveImage => (MenuAction::SaveImage, 0),
+            A::SaveFile => (MenuAction::SaveFile, 0),
             A::Cut => (MenuAction::Cut, 0),
             A::Copy => (MenuAction::Copy, 0),
             A::Paste => (MenuAction::Paste, 0),
@@ -124,7 +120,7 @@ pub mod convert {
             MenuAction::ResetAudio => A::ResetAudio,
             MenuAction::Watch => A::Watch,
             MenuAction::Message => A::Message,
-            MenuAction::SetRole => A::SetRole(app_core::roster::Role::from_int(arg)?),
+            MenuAction::SetRole => A::SetRole(u32::try_from(arg).ok()?),
             MenuAction::MoveTo => A::MoveTo(channel()?),
             MenuAction::ChannelKick => A::ChannelKick,
             MenuAction::MuteVoice => A::MuteVoice,
@@ -140,6 +136,7 @@ pub mod convert {
             MenuAction::DeleteMessage => A::DeleteMessage,
             MenuAction::OpenImage => A::OpenImage,
             MenuAction::SaveImage => A::SaveImage,
+            MenuAction::SaveFile => A::SaveFile,
             MenuAction::Cut => A::Cut,
             MenuAction::Copy => A::Copy,
             MenuAction::Paste => A::Paste,
@@ -172,6 +169,9 @@ pub mod convert {
             // from the profiles it knows.
             level_label: "".into(),
             role_label: "".into(),
+            role_icon: "".into(),
+            role_color: slint::Color::default(),
+            has_role_color: false,
             xp_pct: -1,
             xp_line: "".into(),
             telemetry: "".into(),
@@ -220,6 +220,9 @@ pub mod convert {
             level: 0,
             level_label: "".into(),
             role_label: "".into(),
+            role_icon: "".into(),
+            role_color: slint::Color::default(),
+            has_role_color: false,
             xp_pct: -1,
             xp_line: "".into(),
             telemetry: "".into(),
@@ -287,6 +290,10 @@ pub mod convert {
                 name_color: slint::Color::default(),
                 has_name_color: false,
                 name_style: 0,
+                file_kind: "".into(),
+                file_meta: "".into(),
+                transfer_kind: 0,
+                transfer_pct: 0,
             }
         };
         match item {
@@ -324,6 +331,12 @@ pub mod convert {
                 img_h: *height as f32,
                 is_gif: *is_gif,
                 ..base(2, Some(meta))
+            },
+            ChatItem::File { meta, file } => ChatRow {
+                body: file.name.as_str().into(),
+                file_kind: file.kind_text().into(),
+                file_meta: file.size_text().into(),
+                ..base(5, Some(meta))
             },
         }
     }

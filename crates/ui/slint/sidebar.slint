@@ -27,7 +27,7 @@ import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, UserRow } from "globals.slint";
-import { IconBtn, Btn, AvatarTile } from "widgets.slint";
+import { IconBtn, Btn, AvatarTile, RoleGlyph } from "widgets.slint";
 
 component UserRowView inherits Rectangle {
     in property <UserRow> user;
@@ -173,8 +173,14 @@ component UserRowView inherits Rectangle {
         }
 
         // Role badge (spec §4, §8): the server's roster says who
-        // is what; the name string itself is never altered.
-        if user.role == 1 || user.role == 3 || user.role == 4 : Rectangle {
+        // is what; the name string itself is never altered. A custom
+        // role's own glyph and color come first.
+        if user.role-icon != "" : RoleGlyph {
+            name: user.role-icon;
+            size: 14px;
+            stroke: user.has-role-color ? user.role-color : Theme.text-secondary;
+        }
+        if user.role-icon == "" && (user.role == 1 || user.role == 3 || user.role == 4) : Rectangle {
             width: 14px;
             IconDisplay {
                 icon: user.role == 4 ? IconSet.Shield
@@ -248,13 +254,37 @@ export component Sidebar inherits Rectangle {
         // Its name is the title (the greeting in chat no longer
         // repeats it); the two chips below are gated by what the
         // server said we may (spec §3.1, §5).
-        Text {
-            text: State.server-name != "" ? State.server-name : Tr.voice-header;
-            color: Theme.text-secondary;
-            font-size: Theme.font-body;
-            font-weight: 600;
-            vertical-alignment: center;
-            overflow: elide;
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Text {
+                text: State.server-name != "" ? State.server-name : Tr.voice-header;
+                color: Theme.text-secondary;
+                font-size: Theme.font-body;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            // Admin: the panel (spec §8), for whoever holds `panel`.
+            if State.perm-panel : Rectangle {
+                width: admin-lbl.preferred-width + 2 * Theme.gap-sm;
+                height: 24px;
+                border-radius: Theme.radius-sm;
+                background: admin-t.has-hover ? Theme.hover : Theme.bg-tertiary;
+                animate background { duration: 150ms; }
+                admin-lbl := Text {
+                    text: Tr.admin-button;
+                    color: Theme.gold;
+                    font-size: Theme.font-sm;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+                admin-t := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Logic.admin-open(); }
+                }
+            }
         }
         if State.perm-create-channels || State.perm-create-invites : HorizontalLayout {
             spacing: Theme.gap-sm;

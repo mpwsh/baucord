@@ -8,6 +8,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File},
+    io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -37,6 +38,7 @@ pub const GENERAL_CONV: u64 = 1;
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_foundation.sql"),
     include_str!("migrations/0002_message_edits.sql"),
+    include_str!("migrations/0003_role_style.sql"),
 ];
 
 /// The schema version this build produces.
@@ -203,6 +205,24 @@ impl Sqlite {
 
     /// Adjust a blob's reference count (profiles pointing at it).
     ///
+    /// Remove a blob: its row and its bytes (a missing file is fine).
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn delete_blob(&self, blob_id: &[u8; 32]) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM blobs WHERE blob_id = ?1",
+            params![blob_id],
+        )?;
+        let path = self.blobs.join(hex(blob_id));
+        if let Err(e) = fs::remove_file(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            warn!("blob file {} not removed: {e}", path.display());
+        }
+        Ok(())
+    }
+
     /// # Errors
     /// `SQLite` failure.
     pub fn set_blob_refs(&self, blob_id: &[u8; 32], refs: u32) -> Result<(), rusqlite::Error> {
@@ -257,14 +277,15 @@ impl Sqlite {
     /// `SQLite` failure.
     pub fn insert_message(&self, m: &MessageRow) -> Result<(), rusqlite::Error> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO messages (msg_id, conv_id, ts, user_id, body)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO messages (msg_id, conv_id, ts, user_id, body, blob_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 ordered(m.msg_id),
                 ordered(m.conv_id),
                 ordered(m.ts),
                 m.user_id,
-                m.body
+                m.body,
+                m.blob_id
             ],
         )?;
         Ok(())
@@ -331,7 +352,7 @@ impl Sqlite {
         };
         let mut stmt = self.conn.prepare(
             "SELECT m.msg_id, m.conv_id, m.ts, m.user_id, m.body, m.edited_at,
-                    COALESCE(u.name, '')
+                    COALESCE(u.name, ''), m.blob_id
              FROM messages m LEFT JOIN users u ON u.user_id = m.user_id
              WHERE m.conv_id = ?1 AND m.deleted_at IS NULL AND (?2 IS NULL OR m.msg_id < ?2)
              ORDER BY m.msg_id DESC LIMIT ?3",
@@ -347,6 +368,7 @@ impl Sqlite {
                     body: row.get(4)?,
                     edited: row.get::<_, Option<i64>>(5)?.is_some(),
                     name: row.get(6)?,
+                    blob_id: row.get(7)?,
                 })
             },
         )?;
@@ -570,7 +592,7 @@ impl Sqlite {
     fn load_roles(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT role_id, name, permissions, rank, builtin FROM roles")?;
+            .prepare("SELECT role_id, name, permissions, rank, builtin, icon, color FROM roles")?;
         for row in stmt.query_map([], |r| {
             Ok((
                 r.get::<_, u32>(0)?,
@@ -579,6 +601,8 @@ impl Sqlite {
                     permissions: bits_from_sql(r.get(2)?),
                     rank: r.get(3)?,
                     builtin: r.get::<_, i64>(4)? != 0,
+                    icon: r.get(5)?,
+                    color: u32::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
                 },
             ))
         })? {
@@ -789,6 +813,84 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Add a custom role (spec §4). The id is `SQLite`'s next.
+    ///
+    /// # Errors
+    /// `SQLite` failure (a duplicate name is the UNIQUE constraint).
+    pub fn create_role(
+        &self,
+        name: &str,
+        permissions: u64,
+        rank: u16,
+        icon: &str,
+        color: u32,
+    ) -> Result<u32, rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO roles (name, permissions, rank, builtin, icon, color)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            params![name, bits_to_sql(permissions), rank, icon, i64::from(color)],
+        )?;
+        u32::try_from(self.conn.last_insert_rowid()).map_err(|_| {
+            rusqlite::Error::IntegralValueOutOfRange(0, self.conn.last_insert_rowid())
+        })
+    }
+
+    /// A custom role with the id the tick picked (`role_id` is a plain
+    /// INTEGER PRIMARY KEY, so explicit ids are fine).
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_role(
+        &self,
+        role_id: u32,
+        name: &str,
+        permissions: u64,
+        rank: u16,
+        icon: &str,
+        color: u32,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO roles (role_id, name, permissions, rank, builtin, icon, color)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+            params![role_id, name, bits_to_sql(permissions), rank, icon, i64::from(color)],
+        )?;
+        Ok(())
+    }
+
+    /// Rewrite a custom role's name, permissions and rank.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn update_role(
+        &self,
+        role_id: u32,
+        name: &str,
+        permissions: u64,
+        rank: u16,
+        icon: &str,
+        color: u32,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE roles SET name = ?2, permissions = ?3, rank = ?4, icon = ?5, color = ?6
+             WHERE role_id = ?1 AND builtin = 0",
+            params![role_id, name, bits_to_sql(permissions), rank, icon, i64::from(color)],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a custom role; `user_roles` rows cascade, so whoever
+    /// held it simply loses it.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn delete_role(&self, role_id: u32) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM roles WHERE role_id = ?1 AND builtin = 0",
+            params![role_id],
+        )?;
+        Ok(())
+    }
+
     /// # Errors
     /// `SQLite` failure.
     pub fn revoke_role(&self, user_id: &[u8; 32], role_id: u32) -> Result<(), rusqlite::Error> {
@@ -893,6 +995,37 @@ impl Sqlite {
             params![ordered(a.ts), a.actor, a.action, a.target, a.detail],
         )?;
         Ok(())
+    }
+
+    /// The audit log, newest first, `limit` entries before id `before`.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn audit_before(
+        &self,
+        before: Option<u64>,
+        limit: u16,
+    ) -> Result<Vec<(u64, AuditRow)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, actor_user_id, action, target, detail FROM audit
+             WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![before.map(ordered), i64::from(limit)],
+            |row| {
+                Ok((
+                    unordered(row.get(0)?),
+                    AuditRow {
+                        ts: unordered(row.get(1)?),
+                        actor: row.get(2)?,
+                        action: row.get(3)?,
+                        target: row.get(4)?,
+                        detail: row.get(5)?,
+                    },
+                ))
+            },
+        )?;
+        rows.collect()
     }
 
     /// # Errors
@@ -1395,6 +1528,154 @@ pub fn cli_set_roles(
     Ok(())
 }
 
+/// What `server role edit` changes; `None` keeps the current value.
+/// The rank is never given: it follows the permissions
+/// (`permissions::derived_rank`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RoleEdit {
+    pub name: Option<String>,
+    pub permissions: Option<u64>,
+    pub icon: Option<String>,
+    pub color: Option<u32>,
+}
+
+/// The rules a custom role obeys (spec §4): a strict name that is not
+/// a built-in's, no `ADMIN` bit, a glyph from the list.
+fn check_custom_role(name: &str, permissions: u64, icon: &str) -> Result<(), PersistError> {
+    use protocol::permissions as p;
+    if !p::valid_custom_role_name(name) {
+        return Err(PersistError::BadRoleName(name.to_string()));
+    }
+    if p::has(permissions, p::ADMIN) {
+        return Err(PersistError::AdminBit);
+    }
+    if !p::valid_role_icon(icon) {
+        return Err(PersistError::BadIcon(icon.to_string()));
+    }
+    Ok(())
+}
+
+/// A role named on the command line: a name (case-insensitive) or an
+/// id.
+fn find_role(policy: &Policy, who: &str) -> Result<u32, PersistError> {
+    let lower = who.trim().to_ascii_lowercase();
+    if let Some((id, _)) = policy.roles.iter().find(|(_, r)| r.name == lower) {
+        return Ok(*id);
+    }
+    lower
+        .parse::<u32>()
+        .ok()
+        .filter(|id| policy.roles.contains_key(id))
+        .ok_or_else(|| PersistError::NoSuchRole(who.trim().to_string()))
+}
+
+/// `server role create`: a custom role with a permission set; its rank
+/// follows from the set. A running server picks it up within 2 s and
+/// tells every client the new table.
+///
+/// # Errors
+/// No database, a bad name or permission set, a name in use, or a
+/// `SQLite` failure.
+pub fn cli_role_create(
+    db_path: &Path,
+    name: &str,
+    permissions: u64,
+    icon: &str,
+    color: u32,
+) -> Result<u32, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    check_custom_role(name, permissions, icon)?;
+    let rank = protocol::permissions::derived_rank(permissions);
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    if policy.roles.values().any(|r| r.name == name) {
+        db.close();
+        return Err(PersistError::RoleNameTaken(name.to_string()));
+    }
+    let id = db.create_role(name, permissions, rank, icon, color)?;
+    db.insert_audit(&AuditRow {
+        ts: super::wall_now(),
+        actor: None,
+        action: "role.create".to_string(),
+        target: Some(id.to_string()),
+        detail: Some(format!("cli: {name} rank {rank} permissions {permissions:#x}")),
+    })?;
+    db.close();
+    Ok(id)
+}
+
+/// `server role edit`: change a custom role's name or permissions (the
+/// rank follows). Built-ins are refused: their sets come from the
+/// binary and are rewritten at every start.
+///
+/// # Errors
+/// No database or role, a built-in, a bad value, or a `SQLite` failure.
+pub fn cli_role_edit(db_path: &Path, who: &str, edit: &RoleEdit) -> Result<u32, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    let id = find_role(&policy, who)?;
+    let current = &policy.roles[&id];
+    if current.builtin {
+        db.close();
+        return Err(PersistError::BuiltinRole(current.name.clone()));
+    }
+    let name = edit.name.clone().unwrap_or_else(|| current.name.clone());
+    let permissions = edit.permissions.unwrap_or(current.permissions);
+    let icon = edit.icon.clone().unwrap_or_else(|| current.icon.clone());
+    let color = edit.color.unwrap_or(current.color);
+    check_custom_role(&name, permissions, &icon)?;
+    let rank = protocol::permissions::derived_rank(permissions);
+    if name != current.name && policy.roles.values().any(|r| r.name == name) {
+        db.close();
+        return Err(PersistError::RoleNameTaken(name));
+    }
+    db.update_role(id, &name, permissions, rank, &icon, color)?;
+    db.insert_audit(&AuditRow {
+        ts: super::wall_now(),
+        actor: None,
+        action: "role.edit".to_string(),
+        target: Some(id.to_string()),
+        detail: Some(format!("cli: {name} rank {rank} permissions {permissions:#x}")),
+    })?;
+    db.close();
+    Ok(id)
+}
+
+/// `server role delete`: remove a custom role; whoever held it loses
+/// it (their session's permissions refresh within 2 s).
+///
+/// # Errors
+/// No database or role, a built-in, or a `SQLite` failure.
+pub fn cli_role_delete(db_path: &Path, who: &str) -> Result<(u32, String), PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let policy = db.load_policy()?;
+    let id = find_role(&policy, who)?;
+    let role = &policy.roles[&id];
+    if role.builtin {
+        db.close();
+        return Err(PersistError::BuiltinRole(role.name.clone()));
+    }
+    let name = role.name.clone();
+    db.delete_role(id)?;
+    db.insert_audit(&AuditRow {
+        ts: super::wall_now(),
+        actor: None,
+        action: "role.delete".to_string(),
+        target: Some(id.to_string()),
+        detail: Some(format!("cli: {name}")),
+    })?;
+    db.close();
+    Ok((id, name))
+}
+
 /// `server user kick`: forget a user's device keys and roles, so they
 /// need a new invite. A running server closes the session within 2 s.
 ///
@@ -1735,6 +2016,7 @@ mod tests {
             body: body.to_string(),
             name: String::new(),
             edited: false,
+            blob_id: None,
         }
     }
 

@@ -87,11 +87,38 @@ impl ChatServer {
         }
         let replay = usize::from(self.config.persistence.history.replay);
         let start = self.recent.len().saturating_sub(replay);
-        let page: Vec<HistoryMessage> = self.recent.iter().skip(start).map(to_wire).collect();
+        let rows: Vec<MessageRow> = self.recent.iter().skip(start).cloned().collect();
         // "More" only when the store can answer; the ring is all there
         // is otherwise.
-        let more = self.persist.is_persistent() && !page.is_empty();
-        self.send_history_pages(client, ConvRef::General, page, more);
+        let more = self.persist.is_persistent() && !rows.is_empty();
+        self.send_rows_as_history(client, ConvRef::General, &rows, more);
+    }
+
+    /// Rows → a page for `client`, wherever they came from (the ring
+    /// or the store): a file row is named in its text for a session
+    /// without `FILES`, and its card follows the page with it.
+    fn send_rows_as_history(
+        &mut self,
+        client: protocol::ClientId,
+        conv: ConvRef,
+        rows: &[MessageRow],
+        more: bool,
+    ) {
+        let rich = self.has_feature(client, features::FILES);
+        let page: Vec<HistoryMessage> = rows
+            .iter()
+            .map(|r| {
+                let mut m = to_wire(r);
+                if !rich && let Some(text) = self.plain_history_text(r) {
+                    m.text = text;
+                }
+                m
+            })
+            .collect();
+        self.send_history_pages(client, conv, page, more);
+        if rich && let Some(attachments) = self.history_attachments(conv, rows) {
+            self.send_msg(client, &attachments);
+        }
     }
 
     /// `FetchHistory`: from the ring when it covers the range, else a
@@ -140,19 +167,19 @@ impl ChatServer {
             _ => false,
         };
         if ring_covers {
-            let page: Vec<HistoryMessage> = self
+            let rows: Vec<MessageRow> = self
                 .recent
                 .iter()
                 .rev()
                 .filter(|m| before.is_none_or(|b| m.msg_id < b))
                 .take(usize::from(limit))
-                .map(to_wire)
+                .cloned()
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
                 .collect();
-            let more = self.persist.is_persistent() && !page.is_empty();
-            self.send_history_pages(client, conv, page, more);
+            let more = self.persist.is_persistent() && !rows.is_empty();
+            self.send_rows_as_history(client, conv, &rows, more);
             return;
         }
         if !self.persist.is_persistent() {
@@ -185,9 +212,8 @@ impl ChatServer {
         };
         match outcome {
             Outcome::Answered(Answer::Messages(rows)) => {
-                let page: Vec<HistoryMessage> = rows.iter().map(to_wire).collect();
                 let more = rows.len() >= usize::from(limit);
-                self.send_history_pages(client, conv, page, more);
+                self.send_rows_as_history(client, conv, &rows, more);
             }
             Outcome::Answered(Answer::Unavailable) => {
                 self.send_msg(
@@ -201,7 +227,9 @@ impl ChatServer {
             }
             // Routed by `poll_persistence`; these never land on a
             // history ask.
-            Outcome::Answered(Answer::Blob(_) | Answer::Stored | Answer::Conversations(_)) => {
+            Outcome::Answered(
+                Answer::Blob(_) | Answer::Stored | Answer::Conversations(_) | Answer::Audit(_),
+            ) => {
                 log::warn!("unexpected answer on a history ask; ignored");
             }
             Outcome::Answered(Answer::Failed(e)) => {
@@ -321,6 +349,9 @@ impl ChatServer {
         if !by_admin && self.recent[pos].user_id != user {
             return false;
         }
+        if let Some(blob_id) = self.recent[pos].blob_id {
+            self.blob_ref(&blob_id, -1);
+        }
         self.recent.remove(pos);
         let ts = self.wall_now();
         self.persist.send(Command::DeleteMessage { msg_id, ts });
@@ -388,7 +419,7 @@ impl ChatServer {
             for session in self.sessions_of(&user) {
                 let msg = self.user_progress(session, &user);
                 for peer in self.clients() {
-                    self.send_if(peer, features::PROGRESS, &msg);
+                    self.send_if(peer, features::PROGRESS_ALL, &msg);
                 }
             }
             if after > before {

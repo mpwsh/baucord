@@ -45,6 +45,7 @@ pub enum Label {
     DeleteMessage,
     OpenImage,
     SaveImage,
+    SaveFile,
     Cut,
     Paste,
 }
@@ -64,7 +65,9 @@ pub enum Action {
     ResetAudio,
     Watch,
     Message,
-    SetRole(Role),
+    /// Make this the user's one role (the built-ins nest; a custom
+    /// role is a whole set), by the server's role id.
+    SetRole(u32),
     MoveTo(u16),
     ChannelKick,
     MuteVoice,
@@ -82,6 +85,8 @@ pub enum Action {
     DeleteMessage,
     OpenImage,
     SaveImage,
+    /// Fetch a file card's blob into the Downloads folder.
+    SaveFile,
     Cut,
     Copy,
     Paste,
@@ -158,8 +163,9 @@ pub struct Session {
     pub dm: bool,
     pub manage_own_channels: bool,
     pub create_channels: bool,
-    /// Our highest built-in role; the role submenu offers up to it.
-    pub our_role: Role,
+    /// Our highest rank across our roles; the role submenu offers
+    /// roles up to it.
+    pub our_rank: u16,
 }
 
 /// A roster user row, as the menu sees it (the decorated row: the
@@ -199,9 +205,28 @@ pub struct ChannelChoice {
     pub name: String,
 }
 
+/// A role the "Role" submenu can offer: the server's table, in rank
+/// order, with whether the user already holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleChoice {
+    pub id: u32,
+    /// The table's name; shown as-is for a custom role.
+    pub name: String,
+    pub rank: u16,
+    /// The built-in this is, for a localized label; `None` for a
+    /// custom role.
+    pub builtin: Option<Role>,
+    pub held: bool,
+}
+
 /// The menu for a user row. Empty for our own row.
 #[must_use]
-pub fn user_menu(session: &Session, user: &UserFacts, channels: &[ChannelChoice]) -> Vec<Entry> {
+pub fn user_menu(
+    session: &Session,
+    user: &UserFacts,
+    channels: &[ChannelChoice],
+    roles: &[RoleChoice],
+) -> Vec<Entry> {
     if user.is_us {
         return Vec::new();
     }
@@ -227,16 +252,19 @@ pub fn user_menu(session: &Session, user: &UserFacts, channels: &[ChannelChoice]
 
     // Moderation, permission- and rank-gated (spec §4.1, §8).
     let mut moderation = Vec::new();
-    if session.roles && user.role_editable {
-        let roles = [Role::Guest, Role::Member, Role::Organizer, Role::Admin];
+    if session.roles && user.role_editable && !roles.is_empty() {
         moderation.push(Entry::submenu(
             Label::Role,
             roles
-                .into_iter()
+                .iter()
                 .map(|r| Entry {
-                    // Roles up to our own; the one they hold is greyed.
-                    enabled: r <= session.our_role && user.role != r,
-                    ..Entry::new(Label::RoleName(r), Action::SetRole(r))
+                    // Roles up to our rank; the one they hold is greyed.
+                    enabled: r.rank <= session.our_rank && !r.held,
+                    ..Entry::new(
+                        r.builtin
+                            .map_or_else(|| Label::Text(r.name.clone()), Label::RoleName),
+                        Action::SetRole(r.id),
+                    )
                 })
                 .collect(),
         ));
@@ -314,6 +342,8 @@ pub enum MessageKind {
     Text,
     Code,
     Image,
+    /// A file card (spec §7).
+    File,
 }
 
 /// A chat row, as the menu sees it.
@@ -349,12 +379,11 @@ pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
     if m.deleted {
         return Vec::new();
     }
-    let copy = if m.kind == MessageKind::Code {
-        Label::Copy
-    } else {
-        Label::CopyMessage
+    let mut entries = match m.kind {
+        MessageKind::File => vec![Entry::new(Label::SaveFile, Action::SaveFile)],
+        MessageKind::Code => vec![Entry::new(Label::Copy, Action::CopyText)],
+        _ => vec![Entry::new(Label::CopyMessage, Action::CopyText)],
     };
-    let mut entries = vec![Entry::new(copy, Action::CopyText)];
     if m.kind == MessageKind::Text && m.styled {
         entries.push(if m.selecting {
             Entry::new(Label::ShowFormatting, Action::SelectText(false))
@@ -366,7 +395,7 @@ pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
     // server checks both; this mirrors it).
     if !m.in_dm {
         let mut editing = Vec::new();
-        if m.own {
+        if m.own && m.kind != MessageKind::File {
             editing.push(Entry::new(Label::EditMessage, Action::EditMessage));
         }
         if m.own || m.delete_any {
@@ -411,18 +440,37 @@ mod tests {
         }
     }
 
+    /// The four built-ins as a table, `held` for `member`.
+    fn builtin_roles() -> Vec<RoleChoice> {
+        [
+            (1, "guest", 0, Role::Guest),
+            (2, "member", 10, Role::Member),
+            (3, "organizer", 20, Role::Organizer),
+            (4, "admin", 30, Role::Admin),
+        ]
+        .into_iter()
+        .map(|(id, name, rank, builtin)| RoleChoice {
+            id,
+            name: name.into(),
+            rank,
+            builtin: Some(builtin),
+            held: builtin == Role::Member,
+        })
+        .collect()
+    }
+
     #[test]
     fn own_row_has_no_menu() {
         let me = UserFacts {
             is_us: true,
             ..member()
         };
-        assert!(user_menu(&Session::default(), &me, &[]).is_empty());
+        assert!(user_menu(&Session::default(), &me, &[], &[]).is_empty());
     }
 
     #[test]
     fn plain_member_sees_only_audio_items() {
-        let entries = user_menu(&Session::default(), &member(), &[]);
+        let entries = user_menu(&Session::default(), &member(), &[], &[]);
         assert_eq!(
             labels(&entries),
             [Label::Volume, Label::MuteForMe, Label::ResetAudio]
@@ -435,7 +483,7 @@ mod tests {
             local_muted: true,
             ..member()
         };
-        let entries = user_menu(&Session::default(), &muted, &[]);
+        let entries = user_menu(&Session::default(), &muted, &[], &[]);
         assert_eq!(entries[1].label, Label::UnmuteForMe);
     }
 
@@ -445,7 +493,7 @@ mod tests {
             sharing: true,
             ..member()
         };
-        let entries = user_menu(&Session::default(), &sharing, &[]);
+        let entries = user_menu(&Session::default(), &sharing, &[], &[]);
         assert!(labels(&entries).contains(&Label::WatchStream));
     }
 
@@ -459,9 +507,10 @@ mod tests {
             role: Role::Guest,
             ..member()
         };
-        assert!(!labels(&user_menu(&Session::default(), &member(), &[])).contains(&Label::Message));
-        assert!(!labels(&user_menu(&dm, &guest, &[])).contains(&Label::Message));
-        let entries = user_menu(&dm, &member(), &[]);
+        let plain = user_menu(&Session::default(), &member(), &[], &[]);
+        assert!(!labels(&plain).contains(&Label::Message));
+        assert!(!labels(&user_menu(&dm, &guest, &[], &[])).contains(&Label::Message));
+        let entries = user_menu(&dm, &member(), &[], &[]);
         let message = entries
             .iter()
             .find(|e| e.label == Label::Message)
@@ -479,15 +528,15 @@ mod tests {
             ..Session::default()
         };
         // Permission without rank: nothing.
-        assert_eq!(user_menu(&admin, &member(), &[]).len(), 3);
+        assert_eq!(user_menu(&admin, &member(), &[], &[]).len(), 3);
         // Rank without permission: nothing.
         let outranked = UserFacts {
             outranked: true,
             ..member()
         };
-        assert_eq!(user_menu(&Session::default(), &outranked, &[]).len(), 3);
+        assert_eq!(user_menu(&Session::default(), &outranked, &[], &[]).len(), 3);
         // Both: the four entries, the first with a rule above.
-        let entries = user_menu(&admin, &outranked, &[]);
+        let entries = user_menu(&admin, &outranked, &[], &[]);
         assert_eq!(
             labels(&entries[3..]),
             [Label::Mute, Label::Disconnect, Label::Kick, Label::Ban]
@@ -501,14 +550,14 @@ mod tests {
     fn role_submenu_offers_roles_up_to_ours() {
         let organizer = Session {
             roles: true,
-            our_role: Role::Organizer,
+            our_rank: 20,
             ..Session::default()
         };
         let editable = UserFacts {
             role_editable: true,
             ..member()
         };
-        let entries = user_menu(&organizer, &editable, &[]);
+        let entries = user_menu(&organizer, &editable, &[], &builtin_roles());
         let role = entries
             .iter()
             .find(|e| e.label == Label::Role)
@@ -516,7 +565,44 @@ mod tests {
         let enabled: Vec<bool> = role.submenu.iter().map(|e| e.enabled).collect();
         // Guest yes, Member no (held), Organizer yes, Admin no (above us).
         assert_eq!(enabled, [true, false, true, false]);
-        assert_eq!(role.submenu[2].action, Action::SetRole(Role::Organizer));
+        assert_eq!(role.submenu[2].action, Action::SetRole(3));
+        assert_eq!(role.submenu[2].label, Label::RoleName(Role::Organizer));
+    }
+
+    #[test]
+    fn custom_roles_appear_by_name_at_their_rank() {
+        let admin = Session {
+            roles: true,
+            our_rank: 30,
+            ..Session::default()
+        };
+        let editable = UserFacts {
+            role_editable: true,
+            ..member()
+        };
+        let mut roles = builtin_roles();
+        roles.insert(
+            2,
+            RoleChoice {
+                id: 7,
+                name: "streamer".into(),
+                rank: 15,
+                builtin: None,
+                held: false,
+            },
+        );
+        let entries = user_menu(&admin, &editable, &[], &roles);
+        let role = entries
+            .iter()
+            .find(|e| e.label == Label::Role)
+            .expect("role submenu");
+        assert_eq!(role.submenu[2].label, Label::Text("streamer".into()));
+        assert_eq!(role.submenu[2].action, Action::SetRole(7));
+        assert!(role.submenu[2].enabled);
+        // No table at all (an older server): no submenu.
+        assert!(!user_menu(&admin, &editable, &[], &[])
+            .iter()
+            .any(|e| e.label == Label::Role));
     }
 
     #[test]
@@ -535,7 +621,7 @@ mod tests {
                 name: "Games".into(),
             },
         ];
-        let entries = user_menu(&mover, &member(), &channels);
+        let entries = user_menu(&mover, &member(), &channels, &[]);
         let move_to = entries
             .iter()
             .find(|e| e.label == Label::MoveTo)
@@ -644,7 +730,10 @@ mod tests {
             [Label::CopyMessage, Label::EditMessage, Label::DeleteMessage]
         );
         assert!(entries[1].separator && entries[2].danger);
-        let in_dm = MessageFacts { in_dm: true, ..own };
+        let in_dm = MessageFacts {
+            in_dm: true,
+            ..own
+        };
         assert_eq!(message_menu(&in_dm).len(), 1);
     }
 
@@ -658,6 +747,20 @@ mod tests {
             labels(&message_menu(&mod_view)),
             [Label::CopyMessage, Label::DeleteMessage]
         );
+    }
+
+    #[test]
+    fn a_file_card_saves_and_deletes() {
+        let own = MessageFacts {
+            kind: MessageKind::File,
+            own: true,
+            ..text_row()
+        };
+        assert_eq!(
+            labels(&message_menu(&own)),
+            [Label::SaveFile, Label::DeleteMessage]
+        );
+        assert_eq!(message_menu(&own)[0].action, Action::SaveFile);
     }
 
     #[test]

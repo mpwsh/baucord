@@ -44,6 +44,26 @@ pub(super) struct AnnouncedUpload {
     pub size: u32,
     pub name: String,
     pub mime: String,
+    /// A file (spec §7) rather than an avatar-sized image: the file
+    /// cap applies, any type goes, the bytes stay on disk only.
+    pub is_file: bool,
+}
+
+/// A display name for an upload: no control characters, never a path
+/// (the last component only), length-capped, never empty.
+pub(super) fn sanitize_file_name(name: &str) -> String {
+    let last = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    let trimmed = last.trim();
+    if trimmed.is_empty() {
+        return "file".to_string();
+    }
+    protocol::truncate_on_char_boundary(trimmed, 120).to_string()
 }
 
 impl ChatServer {
@@ -109,7 +129,7 @@ impl ChatServer {
                 self.deny_profile(client, ProfileDenyReason::LowContrast);
                 return;
             }
-            if is_gold(color) && !self.has_permission(client, permissions::ADMIN) {
+            if is_gold(color) && !self.has_permission(client, permissions::GOLD_NAME) {
                 self.deny_profile(client, ProfileDenyReason::ReservedColor);
                 return;
             }
@@ -288,14 +308,30 @@ impl ChatServer {
             );
             return;
         }
-        let cap = self.avatar_cap();
-        if size == 0 || usize::try_from(size).is_ok_and(|s| s > cap) {
-            self.reject_upload(client, upload_id, UploadRejectReason::TooLarge);
-            return;
-        }
-        if !is_avatar_mime(&mime) {
-            self.reject_upload(client, upload_id, UploadRejectReason::BadType);
-            return;
+        // Avatar-sized images are everyone's (spec §7.1); anything else
+        // is a file and goes through the file rules (spec §7).
+        let avatar_sized = is_avatar_mime(&mime)
+            && size != 0
+            && usize::try_from(size).is_ok_and(|s| s <= self.avatar_cap());
+        if !avatar_sized {
+            // Where files are not a thing — an older client, or a
+            // memory-mode server — the avatar rules are the only rules,
+            // and an oversized picture is simply too large.
+            let files_here =
+                self.has_feature(client, features::FILES) && self.persist.is_persistent();
+            if !files_here {
+                let reason = if is_avatar_mime(&mime) {
+                    UploadRejectReason::TooLarge
+                } else {
+                    UploadRejectReason::BadType
+                };
+                self.reject_upload(client, upload_id, reason);
+                return;
+            }
+            if let Err(reason) = self.admit_file_upload(client, size) {
+                self.reject_upload(client, upload_id, reason);
+                return;
+            }
         }
         self.blob_uploads.remove(&client);
         self.announced_uploads.insert(
@@ -304,11 +340,9 @@ impl ChatServer {
                 upload_id,
                 sha256,
                 size,
-                name: protocol::truncate_on_char_boundary(
-                    &name.chars().filter(|c| !c.is_control()).collect::<String>(),
-                    120,
-                ),
+                name: sanitize_file_name(&name),
                 mime,
+                is_file: !avatar_sized,
             },
         );
         self.send_msg(
@@ -338,8 +372,12 @@ impl ChatServer {
             self.reject_upload(client, upload_id, UploadRejectReason::NotAnnounced);
             return;
         }
-        let cap = self.avatar_cap();
-        #[allow(clippy::cast_possible_truncation)] // small: cap / chunk
+        let cap = if announced.is_file {
+            self.file_cap()
+        } else {
+            self.avatar_cap()
+        };
+        #[allow(clippy::cast_possible_truncation)] // cap / chunk fits
         let max_chunks = cap.div_ceil(protocol::IMAGE_CHUNK_BYTES) as u32;
         let Some(folded) = fold_upload(
             &mut self.blob_uploads,
@@ -375,9 +413,15 @@ impl ChatServer {
             self.reject_upload(client, upload_id, UploadRejectReason::HashMismatch);
             return;
         }
-        let Some(sniffed) = sniff_image_mime(&bytes) else {
-            self.reject_upload(client, upload_id, UploadRejectReason::BadType);
-            return;
+        // An image is what it sniffs as; any other file keeps a sane
+        // declared type or becomes an octet stream.
+        let sniffed = match sniff_image_mime(&bytes) {
+            Some(image) => image.to_string(),
+            None if announced.is_file => Self::sanitize_mime_impl(&announced.mime),
+            None => {
+                self.reject_upload(client, upload_id, UploadRejectReason::BadType);
+                return;
+            }
         };
         let created_by = self.user_of.get(&client).copied();
         info!(
@@ -386,10 +430,15 @@ impl ChatServer {
             sniffed,
             bytes.len() / 1024
         );
+        if announced.is_file
+            && let Some(user) = created_by
+        {
+            self.note_upload(user, announced.size);
+        }
         self.store_blob(
             digest,
             BlobMeta {
-                mime: sniffed.to_string(),
+                mime: sniffed,
                 size: announced.size,
                 name: announced.name,
                 created_by,
@@ -398,6 +447,7 @@ impl ChatServer {
             },
             Some(announced.mime),
             bytes,
+            announced.is_file,
         );
         self.send_msg(
             client,
@@ -417,16 +467,19 @@ impl ChatServer {
         self.send_msg(client, &ServerMessage::UploadRejected { upload_id, reason });
     }
 
-    /// Keep a blob: metadata in the policy, bytes in memory (the only
-    /// copy without persistence) and, with it, on disk.
+    /// Keep a blob: metadata in the policy, on disk with persistence,
+    /// and in memory for avatars (the only copy without persistence,
+    /// a cache with it). A file's bytes live on disk only — a 50 MB
+    /// download is read back through `Query::Blob`, not held.
     fn store_blob(
         &mut self,
         blob_id: BlobId,
         meta: BlobMeta,
         declared_mime: Option<String>,
         bytes: Vec<u8>,
+        is_file: bool,
     ) {
-        self.persist.send(Command::StoreBlob(Box::new(BlobRecord {
+        let record = BlobRecord {
             blob_id,
             mime: meta.mime.clone(),
             declared_mime,
@@ -434,15 +487,44 @@ impl ChatServer {
             name: meta.name.clone(),
             created_by: meta.created_by,
             created_at: meta.created_at,
-            bytes: bytes.clone(),
-        })));
+            bytes: if is_file { bytes } else { bytes.clone() },
+        };
+        let cached = if is_file {
+            None
+        } else {
+            Some(Arc::new(record.bytes.clone()))
+        };
+        self.persist.send(Command::StoreBlob(Box::new(record)));
         self.policy.blobs.insert(blob_id, meta);
-        self.blob_bytes.insert(blob_id, Arc::new(bytes));
+        if let Some(bytes) = cached {
+            self.blob_bytes.insert(blob_id, bytes);
+        }
     }
 
-    /// Adjust how many profiles point at a blob; an unreferenced blob
-    /// leaves memory (and, without persistence, existence).
-    fn blob_ref(&mut self, blob_id: &BlobId, delta: i32) {
+    /// A declared MIME type worth keeping: `type/subtype` in printable
+    /// ASCII, short; anything else is an octet stream.
+    fn sanitize_mime_impl(mime: &str) -> String {
+        let m = mime.trim().to_ascii_lowercase();
+        let ok = m.len() <= 80
+            && m.split_once('/').is_some_and(|(t, st)| {
+                !t.is_empty()
+                    && !st.is_empty()
+                    && m.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'+')
+                    })
+            });
+        if ok {
+            m
+        } else {
+            "application/octet-stream".to_string()
+        }
+    }
+
+    /// Adjust how many profiles and messages point at a blob; an
+    /// unreferenced blob leaves memory (and, without persistence,
+    /// existence) — on disk it stays until the cap or the retention
+    /// window evicts it.
+    pub(super) fn blob_ref(&mut self, blob_id: &BlobId, delta: i32) {
         let Some(meta) = self.policy.blobs.get_mut(blob_id) else {
             return;
         };
@@ -525,7 +607,11 @@ impl ChatServer {
         let bytes = match outcome {
             Outcome::Answered(Answer::Blob(Some(bytes))) => {
                 let bytes = Arc::new(bytes);
-                self.blob_bytes.insert(blob_id, bytes.clone());
+                // Avatars are fetched by everyone and stay cached; a
+                // file is read for one download and not kept.
+                if bytes.len() <= self.avatar_cap() {
+                    self.blob_bytes.insert(blob_id, bytes.clone());
+                }
                 Some(bytes)
             }
             Outcome::Answered(Answer::Failed(e)) => {
@@ -597,7 +683,7 @@ pub(super) fn contrast_on_chat_bg(color: u32) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// The gold band the server reserves for admins: hue 38°–65°,
+/// The gold band the server reserves for `GOLD_NAME`: hue 38°–65°,
 /// saturation ≥ 0.35 (HSV).
 pub(super) fn is_gold(color: u32) -> bool {
     let [r, g, b] = rgb_of(color).map(|c| f64::from(c) / 255.0);

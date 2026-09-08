@@ -132,6 +132,13 @@ pub struct UiSettings {
     /// the voice channels the room.
     #[serde(default)]
     pub messages_collapsed: bool,
+    /// The sidebar's width in logical pixels (dragged at its edge).
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: u16,
+}
+
+fn default_sidebar_width() -> u16 {
+    260
 }
 
 impl Default for UiSettings {
@@ -142,6 +149,7 @@ impl Default for UiSettings {
             compact_rows: false,
             image_max_kb: default_image_max_kb(),
             messages_collapsed: false,
+            sidebar_width: default_sidebar_width(),
         }
     }
 }

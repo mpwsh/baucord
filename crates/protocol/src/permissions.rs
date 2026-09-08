@@ -47,9 +47,16 @@ pub const MANAGE_USERS: u64 = 1 << 16;
 pub const MANAGE_INVITES: u64 = 1 << 17;
 /// Ignore the sharer/viewer caps and file quotas.
 pub const BYPASS_LIMITS: u64 = 1 << 18;
-/// "Is an administrator": the gold name band, the admin channel, the
-/// last-admin guard. Granted only by the built-in `admin` role.
+/// "Is an administrator": the admin channel, the last-admin guard.
+/// Granted only by the built-in `admin` role.
 pub const ADMIN: u64 = 1 << 19;
+/// Wear the gold name band (spec §7.1). In the admin set, and a
+/// custom role may hold or lack it — "everything but gold" is a role.
+pub const GOLD_NAME: u64 = 1 << 20;
+/// Open the admin panel (spec §8): the chip, the audit log, the
+/// server's counters. Each tab's data still needs its own
+/// permission; this is the door, not the rooms.
+pub const PANEL: u64 = 1 << 21;
 
 /// What a guest may do.
 pub const GUEST_PERMISSIONS: u64 = JOIN_CHANNELS | SPEAK | TEXT_GENERAL;
@@ -69,6 +76,8 @@ pub const ADMIN_PERMISSIONS: u64 = ORGANIZER_PERMISSIONS
     | MANAGE_USERS
     | MANAGE_INVITES
     | BYPASS_LIMITS
+    | GOLD_NAME
+    | PANEL
     | ADMIN;
 
 /// Identifies a role on the wire and in the database.
@@ -132,6 +141,102 @@ pub const fn has(permissions: u64, bit: u64) -> bool {
     permissions & bit != 0
 }
 
+/// Every permission with the name the CLI and the panel use for it,
+/// in bit order. [`ADMIN`] is listed so it can be *printed*; a custom
+/// role can never hold it ([`CUSTOM_ROLE_PERMISSIONS`]).
+pub const PERMISSION_NAMES: [(&str, u64); 22] = [
+    ("join", JOIN_CHANNELS),
+    ("speak", SPEAK),
+    ("text", TEXT_GENERAL),
+    ("dm", DM),
+    ("share", SHARE),
+    ("upload", UPLOAD),
+    ("invite", CREATE_INVITES),
+    ("create-channels", CREATE_CHANNELS),
+    ("manage-own-channels", MANAGE_OWN_CHANNELS),
+    ("manage-channels", MANAGE_CHANNELS),
+    ("disconnect", DISCONNECT),
+    ("kick", KICK),
+    ("ban", BAN),
+    ("mute", MUTE),
+    ("restrict", RESTRICT),
+    ("manage-roles", MANAGE_ROLES),
+    ("manage-users", MANAGE_USERS),
+    ("manage-invites", MANAGE_INVITES),
+    ("bypass-limits", BYPASS_LIMITS),
+    ("gold", GOLD_NAME),
+    ("panel", PANEL),
+    ("admin", ADMIN),
+];
+
+/// The glyphs a role may wear (spec §4), by lucide name; `""` is
+/// none. Clients map the name to the icon, so the list is closed.
+pub const ROLE_ICONS: [&str; 16] = [
+    "star", "crown", "shield", "wrench", "zap", "flame", "heart", "gem", "trophy", "sword",
+    "music", "gamepad", "video", "mic", "eye", "bot",
+];
+
+/// Whether `icon` is one of [`ROLE_ICONS`] or none.
+#[must_use]
+pub fn valid_role_icon(icon: &str) -> bool {
+    icon.is_empty() || ROLE_ICONS.contains(&icon)
+}
+
+/// What a custom role may be given: everything but [`ADMIN`], which
+/// only the built-in `admin` role grants (the gold band, the
+/// last-admin guard).
+pub const CUSTOM_ROLE_PERMISSIONS: u64 = ADMIN_PERMISSIONS & !ADMIN;
+
+/// A custom role's rank follows from its permissions: the tier of the
+/// highest built-in whose whole set it contains, placed just above
+/// that tier — everything a member has sits above members and below
+/// organizers; everything an organizer has (an administrator without
+/// the `admin` bit) sits above organizers and below admins. Nothing
+/// custom reaches the admin rank, and the operator never picks a
+/// number: what a role can do decides where it stands for the
+/// moderation rank rule and the channel gates.
+#[must_use]
+pub fn derived_rank(permissions: u64) -> Rank {
+    BUILTIN_ROLES
+        .iter()
+        .filter(|r| r.rank < RANK_ADMIN && permissions & r.permissions == r.permissions)
+        .map(|r| r.rank + 5)
+        .max()
+        .unwrap_or(RANK_GUEST + 5)
+}
+
+/// The bit for a permission name (`"share"`), or `None`.
+#[must_use]
+pub fn permission_by_name(name: &str) -> Option<u64> {
+    let lower = name.trim().to_ascii_lowercase();
+    PERMISSION_NAMES
+        .iter()
+        .find(|(n, _)| *n == lower)
+        .map(|(_, bit)| *bit)
+}
+
+/// The names in `permissions`, in bit order: `"join, speak, text"`.
+#[must_use]
+pub fn permission_names(permissions: u64) -> Vec<&'static str> {
+    PERMISSION_NAMES
+        .iter()
+        .filter(|(_, bit)| has(permissions, *bit))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Whether `name` may name a custom role: 1–32 characters of
+/// lowercase ASCII letters, digits and hyphens, not a built-in's.
+#[must_use]
+pub fn valid_custom_role_name(name: &str) -> bool {
+    let ok_chars = !name.is_empty()
+        && name.len() <= 32
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    ok_chars && !BUILTIN_ROLES.iter().any(|r| r.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +264,8 @@ mod tests {
             MANAGE_INVITES,
             BYPASS_LIMITS,
             ADMIN,
+            GOLD_NAME,
+            PANEL,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);
@@ -166,6 +273,45 @@ mod tests {
                 assert_eq!(a & b, 0);
             }
         }
+    }
+
+    #[test]
+    fn permission_names_round_trip() {
+        for (name, bit) in PERMISSION_NAMES {
+            assert_eq!(permission_by_name(name), Some(bit));
+            assert_eq!(permission_names(bit), vec![name]);
+        }
+        assert_eq!(permission_by_name("fly"), None);
+        assert_eq!(permission_names(GUEST_PERMISSIONS), vec!["join", "speak", "text"]);
+        assert!(!has(CUSTOM_ROLE_PERMISSIONS, ADMIN));
+        assert!(has(CUSTOM_ROLE_PERMISSIONS, GOLD_NAME));
+        assert_eq!(CUSTOM_ROLE_PERMISSIONS | ADMIN, ADMIN_PERMISSIONS);
+    }
+
+    #[test]
+    fn custom_role_names_are_strict() {
+        assert!(valid_custom_role_name("streamer"));
+        assert!(valid_custom_role_name("mod-2"));
+        assert!(!valid_custom_role_name(""));
+        assert!(!valid_custom_role_name("Streamer"));
+        assert!(!valid_custom_role_name("-mod"));
+        assert!(!valid_custom_role_name("member"));
+        assert!(!valid_custom_role_name(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn a_custom_roles_rank_follows_its_permissions() {
+        // Less than a guest: just above guests all the same.
+        assert_eq!(derived_rank(0), RANK_GUEST + 5);
+        assert_eq!(derived_rank(GUEST_PERMISSIONS | KICK), RANK_GUEST + 5);
+        assert_eq!(derived_rank(MEMBER_PERMISSIONS | SHARE), RANK_MEMBER + 5);
+        assert_eq!(derived_rank(ORGANIZER_PERMISSIONS), RANK_ORGANIZER + 5);
+        // Everything but gold: above organizers, below admins.
+        let steward = CUSTOM_ROLE_PERMISSIONS & !GOLD_NAME;
+        assert!(derived_rank(steward) > RANK_ORGANIZER);
+        assert!(derived_rank(steward) < RANK_ADMIN);
+        // Even the full custom set never reaches the admin rank.
+        assert!(derived_rank(CUSTOM_ROLE_PERMISSIONS) < RANK_ADMIN);
     }
 
     #[test]

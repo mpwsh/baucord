@@ -1,0 +1,754 @@
+// The admin panel (spec §8): a settings-shaped window — tabs on the
+// left, one list per tab on the right — over the admin commands the
+// slash commands already send. Every row action goes through the
+// host (`AdminLogic`), which sends the same `AdminCommand` the
+// command line would: one authorization path, three front ends.
+// Lists are filled by the host from the matching `AdminOutcome`;
+// `AdminState.busy` is the tab's refresh in flight.
+
+import { ScrollView } from "std-widgets.slint";
+import { Icon, IconSet, IconDisplay } from "@lucide";
+import { Theme } from "theme.slint";
+import { Tr } from "tr.slint";
+import { Btn, IconBtn, Field, FieldLabel, Hint, Sep, Dropdown, CheckRow, RoleGlyph } from "widgets.slint";
+import { NavItem, PanelHeader } from "settings.slint";
+
+export struct AdminUserRow {
+    user-id: string,        // hex, the target for actions
+    name: string,
+    roles: string,          // "member, streamer"
+    online: bool,
+    last-seen: string,
+    keys: int,
+}
+
+export struct AdminRoleRow {
+    id: int,
+    name: string,
+    standing: string,       // "above members"
+    builtin: bool,
+    permissions: string,    // "join, speak, text, …"
+    holders: int,
+    icon: string,           // "" = none
+    color: color,
+    has-color: bool,
+}
+
+export struct AdminRestrictionRow {
+    id: int,
+    kind: string,
+    who: string,
+    until: string,
+    reason: string,
+    by: string,
+}
+
+export struct AdminInviteRow {
+    code: string,
+    role: string,
+    expiry: string,
+    uses: string,
+    revoked: bool,
+}
+
+export struct AdminChannelRow {
+    id: int,
+    name: string,
+    members: int,
+    owner: string,
+    config-owned: bool,
+}
+
+export struct AdminBlobRow {
+    blob-hex: string,
+    name: string,
+    kind: string,
+    size: string,
+    by: string,
+    when: string,
+    refs: int,
+}
+
+export struct AdminAuditRow {
+    when: string,
+    actor: string,
+    action: string,
+    target: string,
+    detail: string,
+}
+
+export global AdminState {
+    in property <bool> busy: false;
+    /// One line under the header: the last error, or empty.
+    in property <string> notice;
+    // Users
+    in property <[AdminUserRow]> users;
+    in property <[string]> role-names;      // the Role dropdown, table order
+    in-out property <string> reason;
+    /// A destructive action asked once: the row awaiting its second
+    /// click (a user id, a role id as text, a blob hex).
+    in-out property <string> confirming;
+    // Roles
+    in property <[AdminRoleRow]> roles;
+    in-out property <int> role-edit-id: -1;   // -1 = new
+    in-out property <string> role-edit-name;
+    in property <[string]> perm-names;
+    in property <[bool]> perm-on;
+    in property <bool> role-edit-open: false;
+    /// The badge: one of `role-icons` (or "") and one of `role-colors`
+    /// (-1 = none).
+    in property <[string]> role-icons;
+    in property <[color]> role-colors;
+    in-out property <string> role-edit-icon;
+    in-out property <int> role-edit-color: -1;
+    // Restrictions · Invites · Channels · Files · Audit
+    in property <[AdminRestrictionRow]> restrictions;
+    in property <[AdminInviteRow]> invites;
+    in property <[AdminChannelRow]> channels;
+    in property <[AdminBlobRow]> blobs;
+    in property <string> storage-line;      // "1.2 GB of 20 GB"
+    in property <float> storage-frac;
+    in property <[AdminAuditRow]> audit;
+    in property <bool> audit-more: false;
+    // Server
+    in property <string> stat-version;
+    in property <string> stat-uptime;
+    in property <string> stat-online;
+    in property <string> stat-users;
+    in property <string> stat-messages;
+    in property <string> stat-blobs;
+    in property <string> stat-persistence;
+    in property <string> stat-queue;
+    in property <string> stat-dropped;
+    in property <string> stat-errors;
+}
+
+export global AdminLogic {
+    /// The tab came into view, or its refresh was clicked.
+    callback refresh(tab: int);
+    // Users: 1 disconnect, 2 kick, 3 ban, 4 purge, 5 reset profile,
+    // 6 reset and lock.
+    callback user-action(user-id: string, action: int);
+    callback user-set-role(user-id: string, role-index: int);
+    // Roles
+    callback role-select(id: int);
+    callback role-new();
+    callback role-perm-toggled(index: int, on: bool);
+    callback role-save();
+    callback role-delete(id: int);
+    callback role-edit-cancel();
+    // The rest
+    callback restriction-lift(id: int);
+    callback invite-revoke(code: string);
+    callback invite-new();
+    callback channel-edit(id: int);
+    callback channel-delete(id: int);
+    callback blob-delete(blob-hex: string);
+    callback audit-more();
+    callback close();
+}
+
+// ── Small pieces ────────────────────────────────────────────────────────
+
+/// A compact text chip that acts: the panel's row buttons.
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> danger;
+    in property <bool> enabled: true;
+    callback clicked;
+    width: lbl.preferred-width + 2 * Theme.gap-sm;
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: !root.enabled ? transparent
+        : t.has-hover ? Theme.hover : Theme.bg-tertiary;
+    animate background { duration: 150ms; }
+    lbl := Text {
+        text: root.text;
+        color: !root.enabled ? Theme.text-muted
+            : root.danger ? Theme.danger-text : Theme.text-primary;
+        font-size: Theme.font-xs;
+        font-weight: 500;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    t := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// The tab's title row: header, a refresh, the notice line.
+component TabHead inherits VerticalLayout {
+    in property <string> title;
+    in property <string> lead;
+    in property <int> tab;
+    spacing: Theme.gap-xs;
+    HorizontalLayout {
+        spacing: Theme.gap-sm;
+        PanelHeader { title: root.title; lead: root.lead; horizontal-stretch: 1; }
+        Rectangle {
+            width: 28px;
+            IconBtn {
+                y: 4px;
+                size: 28px;
+                icon-size: 16px;
+                icon: IconSet.RefreshCw;
+                tooltip: Tr.admin-refresh;
+                tooltip-below: true;
+                clicked => { AdminLogic.refresh(root.tab); }
+            }
+        }
+    }
+    if AdminState.notice != "" : Text {
+        text: AdminState.notice;
+        color: Theme.danger-text;
+        font-size: Theme.font-sm;
+        wrap: word-wrap;
+    }
+    if AdminState.busy : Text {
+        text: Tr.admin-loading;
+        color: Theme.text-muted;
+        font-size: Theme.font-sm;
+    }
+}
+
+component Empty inherits Text {
+    color: Theme.text-muted;
+    font-size: Theme.font-sm;
+}
+
+/// One list row's frame: a hairline between rows, hover tint.
+component Row inherits Rectangle {
+    in property <length> row-height: 44px;
+    height: root.row-height;
+    background: t.has-hover ? Theme.hover : transparent;
+    animate background { duration: 150ms; }
+    border-radius: Theme.radius-sm;
+    t := TouchArea { }
+    Rectangle { y: parent.height - 1px; height: 1px; width: 100%; background: Theme.border; }
+    @children
+}
+
+component Cell inherits Text {
+    color: Theme.text-primary;
+    font-size: Theme.font-sm;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
+component Muted inherits Text {
+    color: Theme.text-muted;
+    font-size: Theme.font-xs;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
+// ── Tabs ────────────────────────────────────────────────────────────────
+
+component UsersTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-users; lead: Tr.admin-users-lead; tab: 0; }
+    VerticalLayout {
+        spacing: Theme.gap-xs;
+        FieldLabel { text: Tr.admin-reason; }
+        Field { text <=> AdminState.reason; placeholder: Tr.admin-reason-placeholder; }
+    }
+    if AdminState.users.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
+    VerticalLayout {
+        for u in AdminState.users : Row {
+            row-height: 60px;
+            HorizontalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: Theme.gap-xs;
+                spacing: Theme.gap-sm;
+                Rectangle {
+                    width: 10px;
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: u.online ? Theme.success : Theme.subtle;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Cell { text: u.name; font-weight: 600; }
+                    Muted { text: u.roles + " · " + u.last-seen; }
+                    HorizontalLayout {
+                        spacing: Theme.gap-xs;
+                        Chip { text: Tr.admin-disconnect; enabled: u.online;
+                            clicked => { AdminLogic.user-action(u.user-id, 1); } }
+                        Chip { text: Tr.admin-kick; danger: true;
+                            clicked => { AdminLogic.user-action(u.user-id, 2); } }
+                        Chip { text: Tr.admin-ban; danger: true;
+                            clicked => { AdminLogic.user-action(u.user-id, 3); } }
+                        Chip { text: Tr.admin-reset-profile;
+                            clicked => { AdminLogic.user-action(u.user-id, 5); } }
+                        Chip {
+                            text: AdminState.confirming == u.user-id ? Tr.admin-sure : Tr.admin-purge;
+                            danger: true;
+                            clicked => {
+                                if (AdminState.confirming == u.user-id) {
+                                    AdminState.confirming = "";
+                                    AdminLogic.user-action(u.user-id, 4);
+                                } else {
+                                    AdminState.confirming = u.user-id;
+                                }
+                            }
+                        }
+                        Rectangle { }
+                    }
+                }
+                Rectangle {
+                    width: 128px;
+                    Dropdown {
+                        y: (parent.height - self.height) / 2;
+                        options: AdminState.role-names;
+                        current: -1;
+                        placeholder: Tr.admin-set-role;
+                        selected(i) => { AdminLogic.user-set-role(u.user-id, i); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component RolesTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-roles; lead: Tr.admin-roles-lead; tab: 1; }
+    VerticalLayout {
+        for r in AdminState.roles : Row {
+            row-height: 52px;
+            HorizontalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: Theme.gap-xs;
+                spacing: Theme.gap-sm;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: Theme.gap-xs;
+                        if r.icon != "" : RoleGlyph {
+                            name: r.icon;
+                            size: 14px;
+                            stroke: r.has-color ? r.color : Theme.text-secondary;
+                        }
+                        Cell { text: r.name; font-weight: 600;
+                            color: r.has-color ? r.color : Theme.text-primary; }
+                        Muted { text: "· " + r.standing + " · " + r.holders + " " + Tr.admin-holders; }
+                    }
+                    Muted { text: r.permissions; }
+                }
+                if !r.builtin : Chip { text: Tr.admin-edit; clicked => { AdminLogic.role-select(r.id); } }
+                if !r.builtin : Chip {
+                    text: AdminState.confirming == "role:" + r.id ? Tr.admin-sure : Tr.admin-delete;
+                    danger: true;
+                    clicked => {
+                        if (AdminState.confirming == "role:" + r.id) {
+                            AdminState.confirming = "";
+                            AdminLogic.role-delete(r.id);
+                        } else {
+                            AdminState.confirming = "role:" + r.id;
+                        }
+                    }
+                }
+                if r.builtin : Muted { text: Tr.admin-builtin; }
+            }
+        }
+    }
+    if !AdminState.role-edit-open : HorizontalLayout {
+        Btn { text: Tr.admin-role-new; clicked => { AdminLogic.role-new(); } }
+        Rectangle { }
+    }
+    // The editor: a name and every permission as a checkbox. Rank is
+    // derived from the set, so there is nothing else to pick.
+    if AdminState.role-edit-open : Rectangle {
+        border-radius: Theme.radius-md;
+        background: Theme.bg-secondary;
+        border-width: 1px;
+        border-color: Theme.border;
+        VerticalLayout {
+            padding: Theme.gap-md;
+            spacing: Theme.gap-md;
+            Text {
+                text: AdminState.role-edit-id < 0 ? Tr.admin-role-new : Tr.admin-role-editing;
+                color: Theme.text-primary;
+                font-size: Theme.font-body;
+                font-weight: 600;
+            }
+            VerticalLayout {
+                spacing: Theme.gap-xs;
+                FieldLabel { text: Tr.admin-role-name; }
+                Field { text <=> AdminState.role-edit-name; placeholder: "streamer"; }
+                Hint { text: Tr.admin-role-name-hint; }
+            }
+            // The badge: a glyph and a color, both optional.
+            VerticalLayout {
+                spacing: Theme.gap-xs;
+                FieldLabel { text: Tr.admin-role-badge; }
+                HorizontalLayout {
+                    spacing: Theme.gap-xs;
+                    Rectangle {
+                        width: 30px;
+                        height: 30px;
+                        border-radius: Theme.radius-sm;
+                        background: AdminState.role-edit-icon == "" ? Theme.accent : Theme.bg-tertiary;
+                        Text { text: "—"; color: Theme.text-secondary; font-size: Theme.font-sm; }
+                        TouchArea { mouse-cursor: pointer; clicked => { AdminState.role-edit-icon = ""; } }
+                    }
+                    for icon in AdminState.role-icons : Rectangle {
+                        width: 30px;
+                        height: 30px;
+                        border-radius: Theme.radius-sm;
+                        background: AdminState.role-edit-icon == icon ? Theme.accent : Theme.bg-tertiary;
+                        animate background { duration: 100ms; }
+                        RoleGlyph {
+                            name: icon;
+                            size: 16px;
+                            stroke: AdminState.role-edit-icon == icon ? Theme.on-accent : Theme.text-secondary;
+                        }
+                        TouchArea { mouse-cursor: pointer; clicked => { AdminState.role-edit-icon = icon; } }
+                    }
+                    Rectangle { }
+                }
+                HorizontalLayout {
+                    spacing: Theme.gap-xs;
+                    Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        border-radius: 11px;
+                        border-width: AdminState.role-edit-color < 0 ? 2px : 1px;
+                        border-color: AdminState.role-edit-color < 0 ? Theme.text-primary : Theme.border;
+                        background: Theme.bg-tertiary;
+                        Text { text: "—"; color: Theme.text-muted; font-size: Theme.font-xs; }
+                        TouchArea { mouse-cursor: pointer; clicked => { AdminState.role-edit-color = -1; } }
+                    }
+                    for c[i] in AdminState.role-colors : Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        border-radius: 11px;
+                        background: c;
+                        border-width: AdminState.role-edit-color == i ? 2px : 0px;
+                        border-color: Theme.text-primary;
+                        TouchArea { mouse-cursor: pointer; clicked => { AdminState.role-edit-color = i; } }
+                    }
+                    Rectangle { }
+                }
+            }
+            VerticalLayout {
+                spacing: 2px;
+                for name[i] in AdminState.perm-names : CheckRow {
+                    text: name;
+                    checked: AdminState.perm-on[i];
+                    toggled(on) => { AdminLogic.role-perm-toggled(i, on); }
+                }
+            }
+            Hint { text: Tr.admin-role-rank-hint; }
+            HorizontalLayout {
+                spacing: Theme.gap-sm;
+                Btn { text: Tr.cancel; clicked => { AdminLogic.role-edit-cancel(); } }
+                Btn { text: Tr.admin-role-save; accent: true; clicked => { AdminLogic.role-save(); } }
+                Rectangle { }
+            }
+        }
+    }
+}
+
+component RestrictionsTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-restrictions; lead: Tr.admin-restrictions-lead; tab: 2; }
+    if AdminState.restrictions.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
+    VerticalLayout {
+        for r in AdminState.restrictions : Row {
+            row-height: 52px;
+            HorizontalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: Theme.gap-xs;
+                spacing: Theme.gap-sm;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: Theme.gap-xs;
+                        Cell { text: r.kind; font-weight: 600; }
+                        Cell { text: r.who; }
+                        Muted { text: "· " + r.until; }
+                    }
+                    Muted { text: r.reason + " — " + r.by; }
+                }
+                Chip { text: Tr.admin-lift; clicked => { AdminLogic.restriction-lift(r.id); } }
+            }
+        }
+    }
+}
+
+component InvitesTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-invites; lead: Tr.admin-invites-lead; tab: 3; }
+    HorizontalLayout {
+        Btn { text: Tr.invite-create; clicked => { AdminLogic.invite-new(); } }
+        Rectangle { }
+    }
+    if AdminState.invites.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
+    VerticalLayout {
+        for i in AdminState.invites : Row {
+            row-height: 48px;
+            HorizontalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: Theme.gap-xs;
+                spacing: Theme.gap-sm;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Cell { text: i.code; font-family: "monospace"; font-weight: 600;
+                        color: i.revoked ? Theme.text-muted : Theme.text-primary; }
+                    Muted { text: i.role + " · " + i.expiry + " · " + i.uses; }
+                }
+                if i.revoked : Muted { text: Tr.admin-revoked; }
+                if !i.revoked : Chip { text: Tr.admin-revoke; danger: true;
+                    clicked => { AdminLogic.invite-revoke(i.code); } }
+            }
+        }
+    }
+}
+
+component ChannelsTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-channels; lead: Tr.admin-channels-lead; tab: 4; }
+    VerticalLayout {
+        for c in AdminState.channels : Row {
+            row-height: 48px;
+            HorizontalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: Theme.gap-xs;
+                spacing: Theme.gap-sm;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Cell { text: c.name; font-weight: 600; }
+                    Muted { text: c.members + " " + Tr.admin-members + (c.owner != "" ? " · " + c.owner : ""); }
+                }
+                if c.config-owned : Muted { text: Tr.admin-config-owned; }
+                if !c.config-owned : Chip { text: Tr.admin-edit; clicked => { AdminLogic.channel-edit(c.id); } }
+                if !c.config-owned : Chip {
+                    text: AdminState.confirming == "channel:" + c.id ? Tr.admin-sure : Tr.admin-delete;
+                    danger: true;
+                    clicked => {
+                        if (AdminState.confirming == "channel:" + c.id) {
+                            AdminState.confirming = "";
+                            AdminLogic.channel-delete(c.id);
+                        } else {
+                            AdminState.confirming = "channel:" + c.id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component FilesTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-files; lead: Tr.admin-files-lead; tab: 5; }
+    VerticalLayout {
+        spacing: Theme.gap-xs;
+        HorizontalLayout {
+            Cell { text: AdminState.storage-line; horizontal-stretch: 1; }
+        }
+        Rectangle {
+            height: 6px;
+            border-radius: 3px;
+            background: Theme.subtle;
+            Rectangle {
+                x: 0;
+                width: parent.width * Math.clamp(AdminState.storage-frac, 0, 1);
+                height: parent.height;
+                border-radius: 3px;
+                background: AdminState.storage-frac > 0.9 ? Theme.danger : Theme.accent-text;
+            }
+        }
+    }
+    if AdminState.blobs.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
+    VerticalLayout {
+        for b in AdminState.blobs : Row {
+            row-height: 48px;
+            HorizontalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: Theme.gap-xs;
+                spacing: Theme.gap-sm;
+                Rectangle {
+                    width: 40px;
+                    Rectangle {
+                        width: 36px;
+                        height: 24px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.bg-tertiary;
+                        Text { text: b.kind; color: Theme.text-secondary; font-size: Theme.font-xs; font-weight: 700; }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Cell { text: b.name; font-weight: 600; }
+                    Muted { text: b.size + " · " + b.by + " · " + b.when + " · " + b.refs + " " + Tr.admin-refs; }
+                }
+                Chip {
+                    text: AdminState.confirming == b.blob-hex ? Tr.admin-sure : Tr.admin-delete;
+                    danger: true;
+                    clicked => {
+                        if (AdminState.confirming == b.blob-hex) {
+                            AdminState.confirming = "";
+                            AdminLogic.blob-delete(b.blob-hex);
+                        } else {
+                            AdminState.confirming = b.blob-hex;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component AuditTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-audit; lead: Tr.admin-audit-lead; tab: 6; }
+    if AdminState.audit.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
+    VerticalLayout {
+        for e in AdminState.audit : Row {
+            row-height: 44px;
+            HorizontalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: Theme.gap-xs;
+                spacing: Theme.gap-sm;
+                Muted { text: e.when; width: 112px; }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: Theme.gap-xs;
+                        Cell { text: e.actor; font-weight: 600; }
+                        Cell { text: e.action; color: Theme.accent-text; }
+                        Cell { text: e.target; color: Theme.text-secondary; }
+                    }
+                    if e.detail != "" : Muted { text: e.detail; }
+                }
+            }
+        }
+    }
+    if AdminState.audit-more : HorizontalLayout {
+        Btn { text: Tr.admin-audit-more; clicked => { AdminLogic.audit-more(); } }
+        Rectangle { }
+    }
+}
+
+component StatLine inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    spacing: Theme.gap-md;
+    Muted { text: root.label; width: 140px; }
+    Cell { text: root.value; horizontal-stretch: 1; }
+}
+
+component ServerTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-server; lead: Tr.admin-server-lead; tab: 7; }
+    VerticalLayout {
+        spacing: Theme.gap-xs;
+        StatLine { label: Tr.admin-stat-version;     value: AdminState.stat-version; }
+        StatLine { label: Tr.admin-stat-uptime;      value: AdminState.stat-uptime; }
+        StatLine { label: Tr.admin-stat-online;      value: AdminState.stat-online; }
+        StatLine { label: Tr.admin-stat-users;       value: AdminState.stat-users; }
+        StatLine { label: Tr.admin-stat-messages;    value: AdminState.stat-messages; }
+        StatLine { label: Tr.admin-stat-blobs;       value: AdminState.stat-blobs; }
+        Sep { }
+        StatLine { label: Tr.admin-stat-persistence; value: AdminState.stat-persistence; }
+        StatLine { label: Tr.admin-stat-queue;       value: AdminState.stat-queue; }
+        StatLine { label: Tr.admin-stat-dropped;     value: AdminState.stat-dropped; }
+        StatLine { label: Tr.admin-stat-errors;      value: AdminState.stat-errors; }
+    }
+}
+
+// ── The window ──────────────────────────────────────────────────────────
+
+export component AdminWindow inherits Window {
+    title: Tr.admin-title;
+    background: Theme.bg-primary;
+    preferred-width: 820px;
+    preferred-height: 660px;
+    min-width: 680px;
+    min-height: 520px;
+
+    /// 0 users, 1 roles, 2 restrictions, 3 invites, 4 channels,
+    /// 5 files, 6 audit, 7 server.
+    in-out property <int> tab: 0;
+    in property <bool> repaint-flip;
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.repaint-flip ? #FFFFFF01 : transparent;
+    }
+
+    function open-tab(t: int) {
+        root.tab = t;
+        AdminState.confirming = "";
+        AdminLogic.refresh(t);
+    }
+
+    HorizontalLayout {
+        Rectangle {
+            width: 188px;
+            background: Theme.surface;
+            VerticalLayout {
+                padding: Theme.gap-md;
+                spacing: Theme.gap-xs;
+                NavItem { text: Tr.admin-users;        icon: IconSet.Users;        active: root.tab == 0; clicked => { root.open-tab(0); } }
+                NavItem { text: Tr.admin-roles;        icon: IconSet.Shield;       active: root.tab == 1; clicked => { root.open-tab(1); } }
+                NavItem { text: Tr.admin-restrictions; icon: IconSet.Ban;          active: root.tab == 2; clicked => { root.open-tab(2); } }
+                NavItem { text: Tr.admin-invites;      icon: IconSet.Ticket;       active: root.tab == 3; clicked => { root.open-tab(3); } }
+                NavItem { text: Tr.admin-channels;     icon: IconSet.Hash;         active: root.tab == 4; clicked => { root.open-tab(4); } }
+                NavItem { text: Tr.admin-files;        icon: IconSet.Paperclip;    active: root.tab == 5; clicked => { root.open-tab(5); } }
+                NavItem { text: Tr.admin-audit;        icon: IconSet.ScrollText;   active: root.tab == 6; clicked => { root.open-tab(6); } }
+                Rectangle { }
+                NavItem { text: Tr.admin-server;       icon: IconSet.Server;       active: root.tab == 7; clicked => { root.open-tab(7); } }
+            }
+        }
+        VerticalLayout {
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding: Theme.gap-xl;
+                    alignment: start;
+                    if root.tab == 0 : UsersTab { }
+                    if root.tab == 1 : RolesTab { }
+                    if root.tab == 2 : RestrictionsTab { }
+                    if root.tab == 3 : InvitesTab { }
+                    if root.tab == 4 : ChannelsTab { }
+                    if root.tab == 5 : FilesTab { }
+                    if root.tab == 6 : AuditTab { }
+                    if root.tab == 7 : ServerTab { }
+                }
+            }
+            Rectangle {
+                height: 64px;
+                background: Theme.bg-primary;
+                Rectangle { y: 0; height: 1px; width: 100%; background: Theme.border; }
+                HorizontalLayout {
+                    padding: Theme.gap-md;
+                    spacing: Theme.gap-sm;
+                    Rectangle { }
+                    Btn { text: Tr.invite-close; clicked => { AdminLogic.close(); } }
+                }
+            }
+        }
+    }
+}

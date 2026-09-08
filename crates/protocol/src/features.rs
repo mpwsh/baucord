@@ -34,6 +34,18 @@ pub const DM: u64 = 1 << 8;
 pub const CHANNELS_UI: u64 = 1 << 9;
 /// Admin commands over the wire and the admin channel.
 pub const ADMIN: u64 = 1 << 10;
+/// Everyone's xp on the wire (`UserProgress`), for the card's bar.
+/// Its own bit rather than [`PROGRESS`]: a 1.1.0 client negotiated
+/// that one and cannot decode the variant appended in 1.1.2.
+pub const PROGRESS_ALL: u64 = 1 << 11;
+/// The role table on the wire (`RoleList`): custom roles by name.
+pub const ROLE_LIST: u64 = 1 << 12;
+/// Files in conversations (spec §7): `SendFile`, `FileMessage`,
+/// `HistoryAttachments`, and the upload path open to any type.
+pub const FILES: u64 = 1 << 13;
+/// The admin panel's commands (spec §8): `AuditLog`, roles over the
+/// wire, `ListBlobs`/`DeleteBlob`, `ServerStats`.
+pub const ADMIN_PANEL: u64 = 1 << 14;
 
 /// What a 1.0 client can do.
 pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
@@ -43,8 +55,19 @@ pub const SERVER_1_0: u64 = TELEMETRY;
 /// What a 1.1 client can do: it logs in by key, presents invites,
 /// renders roles and restrictions, replays history, shows progress,
 /// and makes channels.
-pub const CLIENT_1_1: u64 =
-    CLIENT_1_0 | INVITES | ROLES | HISTORY | PROGRESS | CHANNELS_UI | PROFILES | BLOBS | DM;
+pub const CLIENT_1_1: u64 = CLIENT_1_0
+    | INVITES
+    | ROLES
+    | HISTORY
+    | PROGRESS
+    | CHANNELS_UI
+    | PROFILES
+    | BLOBS
+    | DM
+    | PROGRESS_ALL
+    | ROLE_LIST
+    | FILES
+    | ADMIN_PANEL;
 /// What a 1.1 server offers: keys are the login, invites the door,
 /// roles decide what a session may do, and it keeps history.
 pub const SERVER_1_1: u64 = TELEMETRY
@@ -56,7 +79,11 @@ pub const SERVER_1_1: u64 = TELEMETRY
     | CHANNELS_UI
     | PROFILES
     | BLOBS
-    | DM;
+    | DM
+    | PROGRESS_ALL
+    | ROLE_LIST
+    | FILES
+    | ADMIN_PANEL;
 
 /// Bits both sides announced.
 #[must_use]

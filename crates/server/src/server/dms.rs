@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use log::{info, warn};
 use protocol::{
-    features, permissions, ChatMessage, ClientId, ConvRef, DmFailReason, RestrictionKind,
-    ServerMessage, UserId,
+    features, permissions, Attachment, ChatMessage, ClientId, ConvRef, DmFailReason,
+    RestrictionKind, ServerMessage, UserId,
 };
 
 use super::ChatServer;
@@ -35,6 +35,8 @@ pub(super) struct PendingDm {
     pub to: UserId,
     pub client_ref: u32,
     pub msg: ChatMessage,
+    /// A file (spec §7): delivered as `FileMessage`, not `Direct`.
+    pub attachment: Option<Attachment>,
 }
 
 impl ChatServer {
@@ -104,6 +106,7 @@ impl ChatServer {
             body: msg.text.clone(),
             name: self.get_username(client),
             edited: false,
+            blob_id: None,
         };
         let ask = self.persist.ask(
             Query::StoreDm {
@@ -121,6 +124,7 @@ impl ChatServer {
                 to,
                 client_ref,
                 msg,
+                attachment: None,
             },
         );
     }
@@ -132,13 +136,31 @@ impl ChatServer {
         };
         match outcome {
             Outcome::Answered(Answer::Stored) => {
-                self.deliver_dm(
-                    pending.sender,
-                    &pending.from,
-                    &pending.to,
-                    pending.client_ref,
-                    &pending.msg,
-                );
+                if let Some(attachment) = pending.attachment.as_ref() {
+                    self.stats.messages_count += 1;
+                    self.send_msg(
+                        pending.sender,
+                        &ServerMessage::MessageAck {
+                            client_ref: pending.client_ref,
+                            msg_id: pending.msg.id,
+                        },
+                    );
+                    self.broadcast_file(
+                        ConvRef::Dm(pending.to),
+                        pending.from,
+                        &pending.msg,
+                        attachment,
+                        Some(&pending.to),
+                    );
+                } else {
+                    self.deliver_dm(
+                        pending.sender,
+                        &pending.from,
+                        &pending.to,
+                        pending.client_ref,
+                        &pending.msg,
+                    );
+                }
             }
             Outcome::Answered(Answer::Failed(e)) => {
                 warn!("DM store failed: {e}");

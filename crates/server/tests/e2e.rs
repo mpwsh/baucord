@@ -15,8 +15,8 @@ use protocol::{
     permissions::{self, RoleId, ROLE_ADMIN, ROLE_GUEST, ROLE_MEMBER},
     AdminCommand, AdminError, AdminOutcome, AdminTarget, Auth, ChannelDenyReason, ChannelSpec,
     ChannelUiDenyReason, ClientId, ClientKeyProof, ClientMessage, ConvRef, DenyReason,
-    InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason, RefusedReason, RemovedKind,
-    RestrictionKind, ServerMessage, ShareScope, UserId,
+    DmFailReason, InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason, RefusedReason,
+    RemovedKind, RestrictionKind, ServerMessage, ShareScope, UploadRejectReason, UserId,
 };
 use server::{
     clock::Clock,
@@ -1970,6 +1970,523 @@ fn progress_accrues_by_the_minute_and_levels_up() {
 }
 
 #[test]
+fn custom_roles_come_from_the_cli_and_reach_the_room() {
+    use server::persistence::{
+        cli_find_user, cli_role_create, cli_role_delete, cli_role_edit, cli_set_roles, RoleEdit,
+    };
+    let dir = temp_dir("custom-roles");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect("alice");
+    let alice_user = alice.key.user_id();
+
+    // The table arrives on join: the built-ins, in rank order.
+    let names = alice.wait_for(&mut w, &mut [], |m| match m {
+        ServerMessage::RoleList { roles } => {
+            Some(roles.iter().map(|r| r.name.clone()).collect::<Vec<_>>())
+        }
+        _ => None,
+    });
+    assert_eq!(names, ["guest", "member", "organizer", "admin"]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "rows never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let db = dir.join("baucord.db");
+
+    // The rules: a strict name, never the admin bit, and built-ins stay
+    // as the binary says. The rank follows the set: everything a
+    // member has sits just above members.
+    let streamer = permissions::MEMBER_PERMISSIONS | permissions::MANAGE_CHANNELS;
+    assert!(cli_role_create(&db, "Streamer", streamer, "", 0).is_err());
+    assert!(cli_role_create(&db, "member", streamer, "", 0).is_err());
+    assert!(cli_role_create(&db, "gods", streamer | permissions::ADMIN, "", 0).is_err());
+    assert!(cli_role_create(&db, "odd", streamer, "unicorn", 0).is_err(), "icon list");
+    assert!(cli_role_edit(&db, "member", &RoleEdit::default()).is_err());
+    let id = cli_role_create(&db, "streamer", streamer, "star", 0x00E0_6C75).expect("create");
+    assert!(id > ROLE_ADMIN);
+    assert!(cli_role_create(&db, "streamer", streamer, "", 0).is_err(), "name taken");
+    let rank = permissions::derived_rank(streamer);
+    assert!(rank > permissions::RANK_MEMBER && rank < permissions::RANK_ORGANIZER);
+
+    // Grant it to alice by name; her session follows within the poll.
+    let (found, _) = cli_find_user(&db, "alice").expect("alice on disk");
+    assert_eq!(found, alice_user);
+    cli_set_roles(&db, &alice_user, &[id]).expect("grant");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        w.pump(&mut [&mut alice]);
+        let followed = alice.inbox.iter().any(|m| {
+            matches!(m, ServerMessage::Session { permissions, .. } if *permissions == streamer)
+        });
+        let listed = alice.inbox.iter().any(|m| {
+            matches!(m, ServerMessage::RoleList { roles }
+                if roles.iter().any(|r| r.id == id && r.name == "streamer" && r.rank == rank
+                    && r.icon == "star" && r.color == 0x00E0_6C75))
+        });
+        if followed && listed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the custom role never reached the session"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(w.server().policy().users[&alice_user].roles.contains(&id));
+
+    // Renamed in place, and the rank follows a bigger set; then
+    // deleted, and she has nothing.
+    let bigger = streamer | permissions::CREATE_CHANNELS | permissions::MANAGE_OWN_CHANNELS;
+    let edit = RoleEdit {
+        name: Some("caster".into()),
+        permissions: Some(bigger),
+        icon: Some("crown".into()),
+        color: None,
+    };
+    assert_eq!(cli_role_edit(&db, "streamer", &edit).expect("edit"), id);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        w.pump(&mut [&mut alice]);
+        let above_organizers = |r: &server::policy::RoleRecord| {
+            r.rank > permissions::RANK_ORGANIZER && r.rank < permissions::RANK_ADMIN
+        };
+        if w.server()
+            .policy()
+            .roles
+            .get(&id)
+            .is_some_and(|r| r.name == "caster" && above_organizers(r))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the edit never reached the server");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (_, name) = cli_role_delete(&db, "caster").expect("delete");
+    assert_eq!(name, "caster");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        w.pump(&mut [&mut alice]);
+        if w.server().policy().users[&alice_user].roles.is_empty()
+            && !w.server().policy().roles.contains_key(&id)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the deletion never reached the server");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Upload `bytes` as a file named `name` and post it into `conv`;
+/// returns the message id the server acked.
+fn post_file(
+    who: &mut TestClient,
+    w: &mut World,
+    peers: &mut [&mut TestClient],
+    upload_id: u32,
+    name: &str,
+    mime: &str,
+    bytes: &[u8],
+    conv: ConvRef,
+) -> Result<(u64, [u8; 32]), DmFailReason> {
+    let sha256: [u8; 32] = sha2::Sha256::digest(bytes).into();
+    who.send(
+        w,
+        &ClientMessage::UploadBegin {
+            upload_id,
+            name: name.into(),
+            mime: mime.into(),
+            size: u32::try_from(bytes.len()).unwrap(),
+            sha256,
+        },
+    );
+    let needed = who.wait_for(w, peers, |m| match m {
+        ServerMessage::UploadAccept {
+            upload_id: id,
+            needed,
+        } if *id == upload_id => Some(*needed),
+        ServerMessage::UploadRejected {
+            upload_id: id,
+            reason,
+        } if *id == upload_id => panic!("upload rejected: {reason:?}"),
+        _ => None,
+    });
+    if needed {
+        who.send_blob_chunks(w, upload_id, bytes);
+        who.wait_for(w, peers, |m| match m {
+            ServerMessage::UploadDone { upload_id: id, .. } if *id == upload_id => Some(()),
+            ServerMessage::UploadRejected {
+                upload_id: id,
+                reason,
+            } if *id == upload_id => panic!("upload rejected: {reason:?}"),
+            _ => None,
+        });
+    }
+    let client_ref = upload_id + 1_000;
+    who.send(
+        w,
+        &ClientMessage::SendFile {
+            conv,
+            blob_id: sha256,
+            client_ref,
+        },
+    );
+    who.wait_for(w, peers, |m| match m {
+        ServerMessage::MessageAck {
+            client_ref: r,
+            msg_id,
+        } if *r == client_ref => Some(Ok((*msg_id, sha256))),
+        ServerMessage::MessageFailed {
+            client_ref: r,
+            reason,
+        } if *r == client_ref => Some(Err(*reason)),
+        _ => None,
+    })
+}
+
+#[test]
+fn files_are_posted_as_cards_and_replayed() {
+    let dir = temp_dir("files");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let alice_id = alice.id;
+    let notes = b"just some notes, not an image".repeat(40);
+
+    // A member posts a text file: everyone gets the card, the poster
+    // an ack, and the blob is theirs to fetch.
+    let (msg_id, blob) = post_file(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob],
+        1,
+        "../../notes.txt",
+        "text/plain",
+        &notes,
+        ConvRef::General,
+    )
+    .expect("posted");
+    let card = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::FileMessage {
+            conv: ConvRef::General,
+            msg,
+            attachment,
+            ..
+        } if msg.id == msg_id => Some(attachment.clone()),
+        _ => None,
+    });
+    assert_eq!(card.blob_id, blob);
+    assert_eq!(card.name, "notes.txt", "sanitized: no path");
+    assert_eq!(card.mime, "text/plain");
+    assert_eq!(card.size, u32::try_from(notes.len()).unwrap());
+    assert!(alice.inbox.iter().any(|m| matches!(m,
+        ServerMessage::FileMessage { msg, .. } if msg.id == msg_id && msg.client_id == alice_id)));
+    // The bytes live on disk only: let the write land before the read.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "the blob never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    bob.send(&mut w, &ClientMessage::FetchBlob { blob_id: blob });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        w.pump(&mut [&mut alice, &mut bob]);
+        if let Some(bytes) = bob.blob_received(&blob) {
+            assert_eq!(bytes, notes);
+            break;
+        }
+        assert!(
+            !bob.inbox.iter().any(|m| matches!(m,
+                ServerMessage::BlobMissing { blob_id } if *blob_id == blob)),
+            "the server says the blob is missing"
+        );
+        assert!(Instant::now() < deadline, "the blob never arrived");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Someone else's blob cannot be posted by hash.
+    bob.send(
+        &mut w,
+        &ClientMessage::SendFile {
+            conv: ConvRef::General,
+            blob_id: blob,
+            client_ref: 77,
+        },
+    );
+    let reason = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::MessageFailed {
+            client_ref: 77,
+            reason,
+        } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, DmFailReason::NoSuchBlob);
+
+    // Guests do not upload files.
+    let mut guest = w.connect("guest");
+    guest.send(
+        &mut w,
+        &ClientMessage::UploadBegin {
+            upload_id: 3,
+            name: "x.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 10,
+            sha256: [1u8; 32],
+        },
+    );
+    let reason = guest.wait_for(&mut w, &mut [&mut alice, &mut bob], |m| match m {
+        ServerMessage::UploadRejected {
+            upload_id: 3,
+            reason,
+        } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, UploadRejectReason::NoPermission);
+
+    // Over the per-file cap: refused at announce.
+    alice.send(
+        &mut w,
+        &ClientMessage::UploadBegin {
+            upload_id: 4,
+            name: "huge.iso".into(),
+            mime: "application/octet-stream".into(),
+            size: u32::MAX,
+            sha256: [2u8; 32],
+        },
+    );
+    let reason = alice.wait_for(&mut w, &mut [&mut bob, &mut guest], |m| match m {
+        ServerMessage::UploadRejected {
+            upload_id: 4,
+            reason,
+        } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, UploadRejectReason::TooLarge);
+
+    // A newcomer's replay carries the card, not an empty line.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "rows never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut carol = w.connect_member("carol");
+    let replayed = carol.wait_for(&mut w, &mut [&mut alice, &mut bob, &mut guest], |m| {
+        match m {
+            ServerMessage::HistoryAttachments {
+                conv: ConvRef::General,
+                items,
+            } => items
+                .iter()
+                .find(|(id, _)| *id == msg_id)
+                .map(|(_, a)| a.clone()),
+            _ => None,
+        }
+    });
+    assert_eq!(replayed.name, "notes.txt");
+    assert!(carol.inbox.iter().any(|m| matches!(m,
+        ServerMessage::History { messages, .. }
+            if messages.iter().any(|h| h.id == msg_id && h.text.is_empty()))));
+
+    // Deleting the message lets go of the blob's reference.
+    alice.send(&mut w, &ClientMessage::DeleteMessage { msg_id });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        w.pump(&mut [&mut alice, &mut bob, &mut guest, &mut carol]);
+        if w.server().policy().blobs.get(&blob).is_some_and(|b| b.refs == 0) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the reference never dropped");
+    }
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_file_goes_into_a_dm_like_a_message() {
+    let dir = temp_dir("dm-files");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let alice_user = alice.key.user_id();
+    let bob_user = bob.key.user_id();
+    let (msg_id, blob) = post_file(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob],
+        9,
+        "photo.raw",
+        "image/x-raw",
+        &[7u8; 5_000],
+        ConvRef::Dm(bob_user),
+    )
+    .expect("posted");
+    let (from, card) = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::FileMessage {
+            conv: ConvRef::Dm(_),
+            from,
+            msg,
+            attachment,
+        } if msg.id == msg_id => Some((*from, attachment.clone())),
+        _ => None,
+    });
+    assert_eq!(from, alice_user);
+    assert_eq!(card.blob_id, blob);
+    // Not an image: the declared type is kept when sane. `image/x-raw`
+    // is a well-formed type that does not sniff as an image.
+    assert_eq!(card.mime, "image/x-raw");
+    // Nobody else saw it.
+    let mut carol = w.connect_member("carol");
+    w.settle(&mut [&mut alice, &mut bob, &mut carol], Duration::from_millis(500));
+    assert!(!carol
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::FileMessage { .. })));
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_panel_manages_roles_and_blobs_and_reads_the_audit() {
+    let dir = temp_dir("panel");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut alice = w.connect_member("alice");
+
+    // A role from the panel: created with the same rules as the CLI,
+    // announced to the room, edited, then deleted.
+    admin.admin(
+        &mut w,
+        1,
+        AdminCommand::CreateRole {
+            name: "Streamer".into(),
+            permissions: permissions::MEMBER_PERMISSIONS,
+            icon: String::new(),
+            color: 0,
+        },
+    );
+    assert!(matches!(
+        admin.admin_result(&mut w, &mut [&mut alice], 1),
+        Err(AdminError::Invalid(_))
+    ));
+    admin.admin(
+        &mut w,
+        2,
+        AdminCommand::CreateRole {
+            name: "streamer".into(),
+            permissions: permissions::MEMBER_PERMISSIONS | permissions::SHARE,
+            icon: "zap".into(),
+            color: 0x007E_D321,
+        },
+    );
+    let Ok(AdminOutcome::RoleCreated(id)) = admin.admin_result(&mut w, &mut [&mut alice], 2)
+    else {
+        panic!("role not created");
+    };
+    alice.wait_for(&mut w, &mut [&mut admin], |m| match m {
+        ServerMessage::RoleList { roles } if roles.iter().any(|r| r.id == id) => Some(()),
+        _ => None,
+    });
+    admin.admin(
+        &mut w,
+        3,
+        AdminCommand::EditRole {
+            role: id,
+            name: Some("caster".into()),
+            permissions: None,
+            icon: None,
+            color: None,
+        },
+    );
+    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 3), Ok(AdminOutcome::Done));
+    assert_eq!(w.server().policy().roles[&id].name, "caster");
+    admin.admin(
+        &mut w,
+        4,
+        AdminCommand::EditRole {
+            role: ROLE_MEMBER,
+            name: Some("members".into()),
+            permissions: None,
+            icon: None,
+            color: None,
+        },
+    );
+    assert!(matches!(
+        admin.admin_result(&mut w, &mut [&mut alice], 4),
+        Err(AdminError::Invalid(_))
+    ), "built-ins stay");
+    admin.admin(&mut w, 5, AdminCommand::DeleteRole { role: id });
+    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 5), Ok(AdminOutcome::Done));
+    assert!(!w.server().policy().roles.contains_key(&id));
+
+    // Stats and the audit are the admin's; a member gets refused.
+    admin.admin(&mut w, 6, AdminCommand::ServerStats);
+    let Ok(AdminOutcome::Stats(stats)) = admin.admin_result(&mut w, &mut [&mut alice], 6) else {
+        panic!("no stats");
+    };
+    assert_eq!(stats.online, 2);
+    assert!(stats.persistent);
+    alice.admin(&mut w, 7, AdminCommand::ServerStats);
+    assert_eq!(
+        alice.admin_result(&mut w, &mut [&mut admin], 7),
+        Err(AdminError::NoPermission)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "rows never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    admin.admin(
+        &mut w,
+        8,
+        AdminCommand::AuditLog {
+            before: None,
+            limit: 50,
+        },
+    );
+    let Ok(AdminOutcome::Audit(entries)) = admin.admin_result(&mut w, &mut [&mut alice], 8)
+    else {
+        panic!("no audit");
+    };
+    assert!(entries.iter().any(|e| e.action == "role.create"
+        && e.actor.as_deref() == Some("mpw")));
+    assert!(entries.iter().any(|e| e.action == "role.delete"));
+    assert!(entries.windows(2).all(|p| p[0].id > p[1].id), "newest first");
+
+    // Blobs: listed with their uploader, deleted from the panel.
+    let (_, blob) = post_file(
+        &mut alice,
+        &mut w,
+        &mut [&mut admin],
+        20,
+        "readme.md",
+        "text/plain",
+        b"hello there",
+        ConvRef::General,
+    )
+    .expect("posted");
+    admin.admin(&mut w, 9, AdminCommand::ListBlobs);
+    let Ok(AdminOutcome::Blobs(blobs)) = admin.admin_result(&mut w, &mut [&mut alice], 9) else {
+        panic!("no blobs");
+    };
+    let listed = blobs.iter().find(|b| b.blob_id == blob).expect("the file is listed");
+    assert_eq!(listed.created_by.as_deref(), Some("alice"));
+    assert_eq!(listed.refs, 1);
+    admin.admin(&mut w, 10, AdminCommand::DeleteBlob { blob_id: blob });
+    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 10), Ok(AdminOutcome::Done));
+    assert!(!w.server().policy().blobs.contains_key(&blob));
+    alice.send(&mut w, &ClientMessage::FetchBlob { blob_id: blob });
+    alice.wait_for(&mut w, &mut [&mut admin], |m| match m {
+        ServerMessage::BlobMissing { blob_id } if *blob_id == blob => Some(()),
+        _ => None,
+    });
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn everyone_sees_everyones_progress() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
     let mut alice = w.connect("alice");
@@ -3359,6 +3876,47 @@ fn the_gold_band_and_low_contrast_are_the_servers_call() {
     set_profile(&mut admin, &mut w, Some(0x00FF_D700), None);
     let gold = profile_verdict(&mut admin, &mut w, &mut [&mut alice]).expect("admin gold");
     assert_eq!(gold.name_color, Some(0x00FF_D700));
+}
+
+#[test]
+fn gold_is_a_permission_of_its_own() {
+    use server::persistence::{cli_role_create, cli_set_roles};
+    let dir = temp_dir("gold-permission");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut alice = w.connect_member("alice");
+    let alice_user = alice.key.user_id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "rows never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let db = dir.join("baucord.db");
+    // "Everything but gold": an administrator's powers without the band.
+    let everything = permissions::CUSTOM_ROLE_PERMISSIONS & !permissions::GOLD_NAME;
+    assert!(permissions::has(everything, permissions::BAN));
+    let id = cli_role_create(&db, "steward", everything, "", 0).expect("create");
+    cli_set_roles(&db, &alice_user, &[id]).expect("grant");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        w.pump(&mut [&mut alice, &mut admin]);
+        if alice.inbox.iter().any(|m| {
+            matches!(m, ServerMessage::Session { permissions, .. } if *permissions == everything)
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the role never reached the session");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // She may ban, but not wear gold.
+    set_profile(&mut alice, &mut w, Some(0x00FF_D700), None);
+    assert_eq!(
+        profile_verdict(&mut alice, &mut w, &mut [&mut admin]),
+        Err(protocol::ProfileDenyReason::ReservedColor)
+    );
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

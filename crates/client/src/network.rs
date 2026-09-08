@@ -285,6 +285,30 @@ pub enum NetworkMessage {
         xp: u64,
         level: u16,
     },
+    /// The server's role table (spec §4), custom roles included.
+    RoleList {
+        roles: Vec<protocol::RoleInfo>,
+    },
+    /// A file in a conversation (spec §7): a card, from `username`.
+    FileMessage {
+        conv: protocol::ConvRef,
+        from: UserId,
+        username: String,
+        id: u64,
+        ts: u64,
+        client_id: u64,
+        attachment: protocol::Attachment,
+    },
+    /// A blob fetch is `pct` of the way in (a Save's download).
+    BlobProgress {
+        blob_id: protocol::BlobId,
+        pct: u8,
+    },
+    /// The cards of a history page, by message id.
+    HistoryAttachments {
+        conv: protocol::ConvRef,
+        items: Vec<(u64, protocol::Attachment)>,
+    },
     /// Per-channel facts `ChannelInfo` cannot carry (spec §5).
     ChannelDetails {
         channel_id: u16,
@@ -537,6 +561,8 @@ struct IncomingImage {
     hash: [u8; 32],
     chunks: Vec<Option<Vec<u8>>>,
     started: Instant,
+    /// The percent last reported (blob fetches only).
+    last_pct: u8,
 }
 
 /// An announced blob upload waiting for the server's `UploadAccept`.
@@ -1468,6 +1494,30 @@ impl NetworkClient {
                     level,
                 });
             }
+            ServerMessage::RoleList { roles } => {
+                self.message_queue.push(NetworkMessage::RoleList { roles });
+            }
+            ServerMessage::FileMessage {
+                conv,
+                from,
+                msg,
+                attachment,
+            } => {
+                let username = self.username_of(msg.client_id);
+                self.message_queue.push(NetworkMessage::FileMessage {
+                    conv,
+                    from,
+                    username,
+                    id: msg.id,
+                    ts: msg.ts,
+                    client_id: msg.client_id,
+                    attachment,
+                });
+            }
+            ServerMessage::HistoryAttachments { conv, items } => {
+                self.message_queue
+                    .push(NetworkMessage::HistoryAttachments { conv, items });
+            }
             ServerMessage::ChannelDetails {
                 channel_id,
                 stable_id,
@@ -1822,6 +1872,7 @@ impl NetworkClient {
                 hash,
                 chunks: vec![None; count as usize],
                 started: now,
+                last_pct: 0,
             });
         if entry.count != count || entry.hash != hash || entry.chunks[index as usize].is_some() {
             return None; // inconsistent or duplicate — drop
@@ -1860,7 +1911,7 @@ impl NetworkClient {
         count: u32,
         data: Vec<u8>,
     ) -> Option<Vec<u8>> {
-        if count == 0 || count > protocol::MAX_IMAGE_CHUNKS || index >= count {
+        if count == 0 || count > protocol::MAX_BLOB_CHUNKS || index >= count {
             return None;
         }
         self.incoming_blobs
@@ -1875,6 +1926,7 @@ impl NetworkClient {
                 hash: blob_id,
                 chunks: vec![None; count as usize],
                 started: now,
+                last_pct: 0,
             });
         if entry.count != count || entry.chunks[index as usize].is_some() {
             return None;
@@ -1887,6 +1939,13 @@ impl NetworkClient {
         entry.chunks[index as usize] = Some(data);
         entry.received += 1;
         if entry.received < entry.count {
+            #[allow(clippy::cast_possible_truncation)] // ≤ 100
+            let pct = (u64::from(entry.received) * 100 / u64::from(entry.count)) as u8;
+            if pct != entry.last_pct {
+                entry.last_pct = pct;
+                self.message_queue
+                    .push(NetworkMessage::BlobProgress { blob_id, pct });
+            }
             return None;
         }
         let entry = self.incoming_blobs.remove(&blob_id)?;
@@ -1960,8 +2019,15 @@ impl NetworkClient {
         let Some(frames) = frames else {
             return;
         };
-        if let Err(e) = self.driver.send_media(now, self.server, frames) {
-            warn!("Blob upload could not start: {e}");
+        match self.driver.send_media(now, self.server, frames) {
+            Ok(id) => {
+                // The same tracker as an image send: one media upload
+                // at a time, its percent to the UI as the bytes go.
+                self.upload = Some(id);
+                self.upload_last_pct = 255;
+                self.report_upload_progress();
+            }
+            Err(e) => warn!("Blob upload could not start: {e}"),
         }
     }
 
@@ -2253,6 +2319,13 @@ pub enum NetworkControl {
     },
     FetchBlob {
         blob_id: protocol::BlobId,
+    },
+    /// Post an uploaded blob into a conversation (spec §7). Ends in
+    /// `NetworkMessage::MessageAck` / `MessageFailed` on `client_ref`.
+    SendFile {
+        conv: protocol::ConvRef,
+        blob_id: protocol::BlobId,
+        client_ref: u32,
     },
     // ── 1.1.1: direct messages ───────────────────────────────────────
     SendDm {
@@ -2569,6 +2642,22 @@ fn handle_control(
         } => {
             if let Some(c) = client {
                 c.begin_blob_upload(now, upload_id, name, mime, data);
+            }
+        }
+        NetworkControl::SendFile {
+            conv,
+            blob_id,
+            client_ref,
+        } => {
+            if let Some(c) = client {
+                c.send_control(
+                    now,
+                    &ClientMessage::SendFile {
+                        conv,
+                        blob_id,
+                        client_ref,
+                    },
+                );
             }
         }
         NetworkControl::FetchBlob { blob_id } => {

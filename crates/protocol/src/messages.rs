@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     admin::{AdminCommand, AdminError, AdminOutcome, RestrictionKind},
     lanes::Lane,
-    permissions::RoleId,
+    permissions::{Rank, RoleId},
 };
 
 /// Transport-assigned identity of a connection, valid for its lifetime.
@@ -76,6 +76,12 @@ pub const IMAGE_CHUNK_BYTES: usize = 16 * 1024;
 /// for the remainder). Reassemblers refuse anything claiming more.
 #[allow(clippy::cast_possible_truncation)] // 641 with current constants
 pub const MAX_IMAGE_CHUNKS: u32 = (MAX_CHAT_IMAGE_BYTES / IMAGE_CHUNK_BYTES + 1) as u32;
+
+/// The largest blob the wire carries (spec §7: `files.max_mb` is capped
+/// here whatever the config says), and the chunks it spans.
+pub const MAX_BLOB_BYTES: usize = 50 * 1024 * 1024;
+#[allow(clippy::cast_possible_truncation)] // 3201 with current constants
+pub const MAX_BLOB_CHUNKS: u32 = (MAX_BLOB_BYTES / IMAGE_CHUNK_BYTES + 1) as u32;
 
 /// Size cap for a "send my log" upload (§9.1) **[default]**.
 pub const MAX_LOG_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
@@ -705,6 +711,18 @@ pub enum ClientMessage {
     /// Everything up to `msg_id` in `conv` has been seen; the unread
     /// count in [`ServerMessage::Conversations`] starts after it.
     MarkRead { conv: ConvRef, msg_id: u64 },
+
+    // ── 1.1.3: files in conversations (feature bit `FILES`, spec §7) ─
+    /// Post an uploaded blob (yours, per [`ClientMessage::UploadBegin`]
+    /// → [`ServerMessage::UploadDone`]) into a conversation. Answered
+    /// with [`ServerMessage::MessageAck`] or
+    /// [`ServerMessage::MessageFailed`] on `client_ref`, then delivered
+    /// to everyone as [`ServerMessage::FileMessage`].
+    SendFile {
+        conv: ConvRef,
+        blob_id: BlobId,
+        client_ref: u32,
+    },
 }
 
 impl ClientMessage {
@@ -1118,6 +1136,32 @@ pub enum ServerMessage {
         xp: u64,
         level: u16,
     },
+
+    // ── 1.1.3: files in conversations (feature bit `FILES`, spec §7) ─
+    /// A file in `conv` — General or a DM — from `from`; `msg.text` is
+    /// empty, the card draws from `attachment`. Sessions without the
+    /// bit get a plain [`ServerMessage::Chat`] naming the file instead.
+    FileMessage {
+        conv: ConvRef,
+        from: UserId,
+        msg: ChatMessage,
+        attachment: Attachment,
+    },
+    /// The attachments of a [`ServerMessage::History`] page, by message
+    /// id, sent right after it (a file row's `text` is empty there).
+    HistoryAttachments {
+        conv: ConvRef,
+        items: Vec<(u64, Attachment)>,
+    },
+
+    // ── 1.1.3: the role table (feature bit `ROLE_LIST`) ──────────────
+    /// Every role the server has, in rank order: after `Session` on
+    /// join, and to everyone when the table changes (a `server role`
+    /// command). Custom roles have no built-in name; this is how a
+    /// client shows "streamer" on the card and offers it in the menu.
+    RoleList {
+        roles: Vec<RoleInfo>,
+    },
 }
 
 /// Why a DM was not sent (spec §6).
@@ -1132,6 +1176,10 @@ pub enum DmFailReason {
     /// The store did not confirm within the deadline; nothing was
     /// delivered.
     Store,
+    // 1.1.3 (only to sessions with `FILES`):
+    /// `SendFile` named a blob the server does not have, or one that
+    /// is not yours.
+    NoSuchBlob,
 }
 
 impl DmFailReason {
@@ -1142,8 +1190,35 @@ impl DmFailReason {
             Self::NoPermission => "direct messages are for members",
             Self::NoSuchUser => "no such user",
             Self::Store => "the server could not store the message; try again",
+            Self::NoSuchBlob => "the file is not on the server",
         }
     }
+}
+
+/// A file posted into a conversation (spec §7): the blob and what the
+/// card shows. `mime` is what the server sniffed; the name is
+/// sanitized for display and never a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub blob_id: BlobId,
+    pub name: String,
+    pub mime: String,
+    pub size: u32,
+}
+
+/// One role as the table has it (spec §4), for clients to name what
+/// `UserDetails.roles` carries by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleInfo {
+    pub id: RoleId,
+    pub name: String,
+    pub rank: Rank,
+    pub permissions: u64,
+    pub builtin: bool,
+    /// A glyph from `permissions::ROLE_ICONS`, or `""`.
+    pub icon: String,
+    /// An RGB name-style color for the badge and the card, 0 = none.
+    pub color: u32,
 }
 
 /// One DM conversation as the list shows it (spec §6).
@@ -1248,6 +1323,13 @@ pub enum UploadRejectReason {
     /// The server is not storing blobs at the moment (its blob store
     /// is full, or the upload kind is not enabled yet).
     Refused,
+    // 1.1.3 (only to sessions with `FILES`):
+    /// Over `files.per_user_daily_mb` for today.
+    Quota,
+    /// The blob store is at `files.total_cap_gb` with nothing to evict.
+    Full,
+    /// No `UPLOAD` permission (guests), or files are not kept here.
+    NoPermission,
 }
 
 impl UploadRejectReason {
@@ -1259,6 +1341,9 @@ impl UploadRejectReason {
             Self::HashMismatch => "the upload did not match its announced hash",
             Self::NotAnnounced => "the upload was not announced first",
             Self::Refused => "the server refused the upload",
+            Self::Quota => "you have uploaded your daily allowance",
+            Self::Full => "the server's file store is full",
+            Self::NoPermission => "you may not upload files here",
         }
     }
 }
@@ -1997,6 +2082,45 @@ mod tests {
             client_id: 9,
             xp: 4_242,
             level: 7,
+        }));
+        assert!(server_roundtrips(&ServerMessage::FileMessage {
+            conv: ConvRef::General,
+            from: [2u8; 32],
+            msg: ChatMessage {
+                id: 5,
+                ts: 6,
+                client_id: 7,
+                text: String::new(),
+            },
+            attachment: Attachment {
+                blob_id: [9u8; 32],
+                name: "notes.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 1_234,
+            },
+        }));
+        assert!(server_roundtrips(&ServerMessage::HistoryAttachments {
+            conv: ConvRef::General,
+            items: vec![(
+                5,
+                Attachment {
+                    blob_id: [9u8; 32],
+                    name: "notes.pdf".into(),
+                    mime: "application/pdf".into(),
+                    size: 1_234,
+                },
+            )],
+        }));
+        assert!(server_roundtrips(&ServerMessage::RoleList {
+            roles: vec![RoleInfo {
+                id: 7,
+                name: "streamer".into(),
+                rank: 15,
+                permissions: 0x1f,
+                builtin: false,
+                icon: "star".into(),
+                color: 0x00E0_6C75,
+            }],
         }));
         let bytes = encode_server_message(&ServerMessage::Restricted {
             kind: RestrictionKind::GeneralText,

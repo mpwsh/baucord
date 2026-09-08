@@ -72,6 +72,15 @@ enum Command {
         #[command(subcommand)]
         command: UserCommand,
     },
+    /// Custom roles: named permission sets (needs persistence on; a
+    /// running server tells every client the new table within 2 s).
+    /// Where a role stands for moderation follows from what it can
+    /// do: everything a member has sits above members, everything an
+    /// organizer has above organizers, never above admins.
+    Role {
+        #[command(subcommand)]
+        command: RoleCommand,
+    },
     /// Kicks, bans and mutes (needs persistence on).
     Restriction {
         #[command(subcommand)]
@@ -130,6 +139,58 @@ enum UserCommand {
         #[arg(long, default_value = "")]
         reason: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum RoleCommand {
+    /// Every role with its rank, permissions and how many hold it.
+    List,
+    /// Add a role. Start from a built-in's permission set (`--like`),
+    /// then add and remove names from `role list`.
+    Create {
+        /// 1–32 lowercase letters, digits and hyphens.
+        name: String,
+        /// The set to start from: guest (default), member, organizer,
+        /// or admin (everything a custom role may hold; `--deny gold`
+        /// for an administrator without the gold name).
+        #[arg(long, default_value = "guest")]
+        like: String,
+        /// Permissions to add, comma-separated, e.g. `share,upload`.
+        #[arg(long, value_delimiter = ',')]
+        grant: Vec<String>,
+        /// Permissions to remove, comma-separated.
+        #[arg(long, value_delimiter = ',')]
+        deny: Vec<String>,
+        /// A glyph for the badge: star, crown, shield, wrench, zap,
+        /// flame, heart, gem, trophy, sword, music, gamepad, video,
+        /// mic, eye, bot.
+        #[arg(long, default_value = "")]
+        icon: String,
+        /// A color for the badge and the card, as `#rrggbb`.
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// Change a custom role. Built-ins cannot be changed.
+    Edit {
+        /// Its current name or id.
+        role: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace the set with a built-in's before `--grant`/`--deny`.
+        #[arg(long)]
+        like: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        grant: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        deny: Vec<String>,
+        #[arg(long)]
+        icon: Option<String>,
+        /// `#rrggbb`, or `none`.
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// Remove a custom role; whoever holds it loses it.
+    Delete { role: String },
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -226,6 +287,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }) => return db_check(&config),
         Some(Command::Invite { command }) => return invite_command(&config, command),
         Some(Command::User { command }) => return user_command(&config, command),
+        Some(Command::Role { command }) => return role_command(&config, command),
         Some(Command::Restriction { command }) => return restriction_command(&config, command),
         Some(Command::Key { command }) => return key_command(&config, command),
         Some(Command::Telemetry { who, since, last }) => {
@@ -472,7 +534,8 @@ fn invite_command(
             expires,
             uses,
         } => {
-            let role = parse_role(&grants)?;
+            let policy = load_policy_for_listing(&db)?;
+            let role = parse_role(&policy, &grants)?;
             let ttl_ms = parse_ttl(&expires)?;
             let (code, invite) = persistence::cli_create_invite(&db, role, ttl_ms, uses)?;
             let identity_dir = PathBuf::from(&config.identity.dir);
@@ -487,7 +550,7 @@ fn invite_command(
             println!("{}", protocol::invite::display_code(&code));
             println!(
                 "  grants {}, {}, {}",
-                role_name(role),
+                role_name_in(&policy, role),
                 describe_expiry(invite.expires_at),
                 match invite.max_uses {
                     Some(n) => format!("{n} use(s)"),
@@ -507,6 +570,7 @@ fn invite_command(
                 println!("no invites");
                 return Ok(());
             }
+            let policy = load_policy_for_listing(&db)?;
             let now = persistence_wall_now();
             for (code, invite) in invites {
                 let state = if invite.revoked_at.is_some() {
@@ -520,7 +584,7 @@ fn invite_command(
                 };
                 println!(
                     "{code}  {:<9} {:<10} uses {}{}  {}",
-                    role_name(invite.grants_role),
+                    role_name_in(&policy, invite.grants_role),
                     state,
                     invite.uses,
                     invite.max_uses.map(|m| format!("/{m}")).unwrap_or_default(),
@@ -555,7 +619,11 @@ fn user_command(config: &Config, command: UserCommand) -> Result<(), Box<dyn std
             let mut users: Vec<_> = policy.users.iter().collect();
             users.sort_by_key(|(_, u)| u.name.to_ascii_lowercase());
             for (id, u) in users {
-                let roles: Vec<String> = u.roles.iter().map(|r| role_name(*r)).collect();
+                let roles: Vec<String> = u
+                    .roles
+                    .iter()
+                    .map(|r| role_name_in(&policy, *r))
+                    .collect();
                 println!(
                     "{}  {:<24} {:<20} last seen {}",
                     persistence::hex(id),
@@ -579,18 +647,22 @@ fn user_command(config: &Config, command: UserCommand) -> Result<(), Box<dyn std
         }
         UserCommand::Grant { who, role } => {
             let (user, policy) = persistence::cli_find_user(&db, &who)?;
-            let role = parse_role(&role)?;
+            let role = parse_role(&policy, &role)?;
             let mut roles: Vec<u32> = policy.users[&user].roles.iter().copied().collect();
             if !roles.contains(&role) {
                 roles.push(role);
             }
             persistence::cli_set_roles(&db, &user, &roles)?;
-            println!("{}: {}", policy.users[&user].name, describe_roles(&roles));
+            println!(
+                "{}: {}",
+                policy.users[&user].name,
+                describe_roles(&policy, &roles)
+            );
             Ok(())
         }
         UserCommand::Revoke { who, role } => {
             let (user, policy) = persistence::cli_find_user(&db, &who)?;
-            let role = parse_role(&role)?;
+            let role = parse_role(&policy, &role)?;
             let roles: Vec<u32> = policy.users[&user]
                 .roles
                 .iter()
@@ -598,7 +670,11 @@ fn user_command(config: &Config, command: UserCommand) -> Result<(), Box<dyn std
                 .filter(|r| *r != role)
                 .collect();
             persistence::cli_set_roles(&db, &user, &roles)?;
-            println!("{}: {}", policy.users[&user].name, describe_roles(&roles));
+            println!(
+                "{}: {}",
+                policy.users[&user].name,
+                describe_roles(&policy, &roles)
+            );
             Ok(())
         }
         UserCommand::Kick { who, reason } => {
@@ -791,13 +867,13 @@ fn restriction_for(
     }
 }
 
-fn describe_roles(roles: &[u32]) -> String {
+fn describe_roles(policy: &server::policy::Policy, roles: &[u32]) -> String {
     if roles.is_empty() {
         return "no roles".to_string();
     }
     roles
         .iter()
-        .map(|r| role_name(*r))
+        .map(|r| role_name_in(policy, *r))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -817,17 +893,158 @@ fn describe_ago(ts: u64) -> String {
     }
 }
 
-fn parse_role(text: &str) -> Result<u32, String> {
+/// A role as typed: any role's name (built-in or custom,
+/// case-insensitive) or its id.
+fn parse_role(policy: &server::policy::Policy, text: &str) -> Result<u32, String> {
     let lower = text.trim().to_ascii_lowercase();
-    if let Some(role) = protocol::permissions::BUILTIN_ROLES
-        .iter()
-        .find(|r| r.name == lower)
-    {
-        return Ok(role.id);
+    if let Some((id, _)) = policy.roles.iter().find(|(_, r)| r.name == lower) {
+        return Ok(*id);
     }
     lower
-        .parse()
-        .map_err(|_| format!("'{text}' is not a role name or id"))
+        .parse::<u32>()
+        .ok()
+        .filter(|id| policy.roles.contains_key(id))
+        .ok_or_else(|| format!("'{text}' is not a role name or id (see `role list`)"))
+}
+
+/// A comma-split permission list as typed, to bits.
+fn parse_permissions(names: &[String]) -> Result<u64, String> {
+    let mut bits = 0;
+    for name in names.iter().flat_map(|n| n.split(',')) {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        bits |= protocol::permissions::permission_by_name(name)
+            .ok_or_else(|| persistence::PersistError::BadPermission(name.to_string()).to_string())?;
+    }
+    Ok(bits)
+}
+
+/// `#rrggbb` (or `none`) to the RGB the wire carries.
+fn parse_color(text: &str) -> Result<u32, String> {
+    let t = text.trim().trim_start_matches('#');
+    if t.eq_ignore_ascii_case("none") || t.is_empty() {
+        return Ok(0);
+    }
+    if t.len() != 6 {
+        return Err(format!("'{text}' is not a color; use #rrggbb"));
+    }
+    u32::from_str_radix(t, 16).map_err(|_| format!("'{text}' is not a color; use #rrggbb"))
+}
+
+/// Where a rank stands, in words: "above organizers".
+fn describe_standing(rank: u16) -> String {
+    use protocol::permissions as p;
+    if rank >= p::RANK_ADMIN {
+        "admin".to_string()
+    } else if rank == p::RANK_ORGANIZER {
+        "organizer".to_string()
+    } else if rank > p::RANK_ORGANIZER {
+        "above organizers".to_string()
+    } else if rank == p::RANK_MEMBER {
+        "member".to_string()
+    } else if rank > p::RANK_MEMBER {
+        "above members".to_string()
+    } else if rank == p::RANK_GUEST {
+        "guest".to_string()
+    } else {
+        "above guests".to_string()
+    }
+}
+
+/// The permission set a `--like` names: a built-in's, less what a
+/// custom role can never hold (`admin`): `--like admin --deny gold`
+/// is the administrator without the gold band.
+fn like_permissions(like: &str) -> Result<u64, String> {
+    let lower = like.trim().to_ascii_lowercase();
+    protocol::permissions::BUILTIN_ROLES
+        .iter()
+        .find(|r| r.name == lower)
+        .map(|r| r.permissions & protocol::permissions::CUSTOM_ROLE_PERMISSIONS)
+        .ok_or_else(|| format!("'{like}': --like takes guest, member, organizer or admin"))
+}
+
+fn role_command(config: &Config, command: RoleCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    match command {
+        RoleCommand::List => {
+            let policy = load_policy_for_listing(&db)?;
+            let mut roles: Vec<_> = policy.roles.iter().collect();
+            roles.sort_by_key(|(id, r)| (r.rank, **id));
+            for (id, r) in roles {
+                let holders = policy.users.values().filter(|u| u.roles.contains(id)).count();
+                println!(
+                    "{id:>3}  {:<16} {:<8} {:<18} {} user(s)\n     {}",
+                    r.name,
+                    if r.builtin { "built-in" } else { "custom" },
+                    describe_standing(r.rank),
+                    holders,
+                    protocol::permissions::permission_names(r.permissions).join(", ")
+                );
+            }
+            Ok(())
+        }
+        RoleCommand::Create {
+            name,
+            like,
+            grant,
+            deny,
+            icon,
+            color,
+        } => {
+            let base = like_permissions(&like)?;
+            let permissions = (base | parse_permissions(&grant)?) & !parse_permissions(&deny)?;
+            let color = color.as_deref().map(parse_color).transpose()?.unwrap_or(0);
+            let id = persistence::cli_role_create(&db, &name, permissions, &icon, color)?;
+            println!(
+                "created {name} (id {id}), {}: {}",
+                describe_standing(protocol::permissions::derived_rank(permissions)),
+                protocol::permissions::permission_names(permissions).join(", ")
+            );
+            Ok(())
+        }
+        RoleCommand::Edit {
+            role,
+            name,
+            like,
+            grant,
+            deny,
+            icon,
+            color,
+        } => {
+            let policy = load_policy_for_listing(&db)?;
+            let id = parse_role(&policy, &role)?;
+            let current = policy.roles[&id].permissions;
+            let base = match like {
+                Some(like) => like_permissions(&like)?,
+                None => current,
+            };
+            let permissions = (base | parse_permissions(&grant)?) & !parse_permissions(&deny)?;
+            let edit = persistence::RoleEdit {
+                name,
+                permissions: (permissions != current || policy.roles[&id].builtin)
+                    .then_some(permissions),
+                icon,
+                color: color.as_deref().map(parse_color).transpose()?,
+            };
+            let id = persistence::cli_role_edit(&db, &role, &edit)?;
+            let policy = load_policy_for_listing(&db)?;
+            let r = &policy.roles[&id];
+            println!(
+                "{} (id {id}), {}: {}",
+                r.name,
+                describe_standing(r.rank),
+                protocol::permissions::permission_names(r.permissions).join(", ")
+            );
+            Ok(())
+        }
+        RoleCommand::Delete { role } => {
+            let (id, name) = persistence::cli_role_delete(&db, &role)?;
+            println!("deleted {name} (id {id}); whoever held it has lost it");
+            Ok(())
+        }
+    }
 }
 
 /// `30m`, `1h`, `24h`, `7d`, `never`.
@@ -850,11 +1067,12 @@ fn parse_ttl(text: &str) -> Result<Option<u64>, String> {
     Ok(Some(n.saturating_mul(per_unit)))
 }
 
-fn role_name(role: u32) -> String {
-    protocol::permissions::BUILTIN_ROLES
-        .iter()
-        .find(|r| r.id == role)
-        .map_or_else(|| format!("role {role}"), |r| r.name.to_string())
+/// A role's name from the table (custom ones included), or `role N`.
+fn role_name_in(policy: &server::policy::Policy, role: u32) -> String {
+    policy
+        .roles
+        .get(&role)
+        .map_or_else(|| format!("role {role}"), |r| r.name.clone())
 }
 
 fn describe_expiry(expires_at: Option<u64>) -> String {

@@ -347,7 +347,20 @@ pub fn paste_into_chat(app: &mut AppState) {
 }
 
 /// Load an image file from disk into the preview.
+/// A picked path: an image previews and goes the image way; anything
+/// else uploads as a blob and posts as a card (spec §7).
 fn attach_path(app: &mut AppState, path: &std::path::Path) {
+    let is_image = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            let lower = e.to_ascii_lowercase();
+            images::IMAGE_EXTENSIONS.contains(&lower.as_str())
+        });
+    if !is_image {
+        start_file_upload(app, path);
+        return;
+    }
     match std::fs::read(path) {
         Ok(raw) => match images::load_image_bytes(raw, app.image_budget()) {
             Ok(bytes) => show_preview(app, bytes),
@@ -357,15 +370,111 @@ fn attach_path(app: &mut AppState, path: &std::path::Path) {
     }
 }
 
+/// Read a file and announce it to the server; `UploadDone` posts it
+/// into the open conversation (`AppState::file_uploaded`).
+fn start_file_upload(app: &mut AppState, path: &std::path::Path) {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let line = t!("file-read-error", "name" => name.as_str(), "error" => e.to_string());
+            app.show_error(&line);
+            return;
+        }
+    };
+    if bytes.is_empty() || bytes.len() > client::protocol::MAX_BLOB_BYTES {
+        app.show_error(&t!(
+            "file-too-large",
+            "name" => name.as_str(),
+            "max" => client::protocol::MAX_BLOB_BYTES / (1024 * 1024)
+        ));
+        return;
+    }
+    let mime = mime_for(&name).to_string();
+    app.begin_file_upload(name, mime, bytes);
+}
+
+/// A MIME type from the extension, for the server to keep when it
+/// cannot sniff one; anything unknown is an octet stream.
+fn mime_for(name: &str) -> &'static str {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "txt" | "log" | "md" | "csv" | "toml" | "yaml" | "yml" | "rs" | "py" | "js" | "ts" => {
+            "text/plain"
+        }
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        "mp4" | "m4v" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Write a fetched file into the Downloads folder (spec §7), never
+/// over an existing one. Returns the path written.
+pub fn save_to_downloads(name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':') { '_' } else { c })
+        .collect();
+    let base = std::path::Path::new(&safe);
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = base
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let mut path = dir.join(&safe);
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
 /// Async native file dialog → attach. rfd's portal backend is async;
-/// run it on a scratch thread and hop back via the event loop.
+/// run it on a scratch thread and hop back via the event loop. Any
+/// file: images preview, the rest upload as cards.
 pub fn attach_image_from_disk() {
     std::thread::spawn(|| {
-        let picked = pollster::block_on(
-            rfd::AsyncFileDialog::new()
-                .add_filter(t!("chat-image-filter"), images::IMAGE_EXTENSIONS)
-                .pick_file(),
-        );
+        let picked = pollster::block_on(rfd::AsyncFileDialog::new().pick_file());
         if let Some(handle) = picked {
             let path = handle.path().to_path_buf();
             let _ = slint::invoke_from_event_loop(move || {

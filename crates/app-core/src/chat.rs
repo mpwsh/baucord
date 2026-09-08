@@ -73,6 +73,69 @@ pub enum ChatItem {
         label: String,
         day: i64,
     },
+    /// A file posted into the conversation (spec §7): a card, fetched
+    /// on demand.
+    File {
+        meta: Meta,
+        file: FileMeta,
+    },
+}
+
+/// What a file card shows and needs (spec §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMeta {
+    pub blob: [u8; 32],
+    pub name: String,
+    /// What the server sniffed.
+    pub mime: String,
+    pub size: u32,
+}
+
+impl FileMeta {
+    /// `1.2 MB`, `640 KB`, `12 B`.
+    #[must_use]
+    pub fn size_text(&self) -> String {
+        human_size(u64::from(self.size))
+    }
+
+    /// A short type word for the card: the subtype in caps (`PDF`,
+    /// `ZIP`), or the name's extension when the type is generic.
+    #[must_use]
+    pub fn kind_text(&self) -> String {
+        let ext = std::path::Path::new(&self.name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| !e.is_empty() && e.len() <= 8);
+        let generic = self.mime == "application/octet-stream" || self.mime.is_empty();
+        match (ext, generic) {
+            (Some(ext), true) => ext.to_ascii_uppercase(),
+            (_, true) => "FILE".to_string(),
+            (_, false) => self
+                .mime
+                .rsplit('/')
+                .next()
+                .unwrap_or("file")
+                .trim_start_matches("x-")
+                .trim_start_matches("vnd.")
+                .to_ascii_uppercase(),
+        }
+    }
+}
+
+/// `1.2 MB`, `640 KB`, `12 B` — the client's twin of the server's.
+#[must_use]
+pub fn human_size(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let b = bytes as f64;
+    if bytes >= 1 << 30 {
+        format!("{:.1} GB", b / f64::from(1u32 << 30))
+    } else if bytes >= 1 << 20 {
+        format!("{:.1} MB", b / f64::from(1u32 << 20))
+    } else if bytes >= 1 << 10 {
+        format!("{:.0} KB", b / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 impl ChatItem {
@@ -82,7 +145,8 @@ impl ChatItem {
         match self {
             ChatItem::Message { meta, .. }
             | ChatItem::Code { meta, .. }
-            | ChatItem::Image { meta, .. } => Some(meta),
+            | ChatItem::Image { meta, .. }
+            | ChatItem::File { meta, .. } => Some(meta),
             ChatItem::System { .. } | ChatItem::DayMarker { .. } => None,
         }
     }
@@ -246,6 +310,53 @@ impl ChatHistory {
         self.cap(1)
     }
 
+    /// A file card (spec §7).
+    pub fn push_file(&mut self, meta: &Meta, file: FileMeta) -> HistoryDelta {
+        self.rows.push(ChatItem::File {
+            meta: meta.clone(),
+            file,
+        });
+        self.cap(1)
+    }
+
+    /// A replayed page named this message's file after the fact (the
+    /// row arrived as an empty message): it becomes the card. The
+    /// index changed, or `None` when the message is not in the window.
+    pub fn attach_file(&mut self, id: u64, file: FileMeta) -> Option<usize> {
+        let (start, end) = self.span_of(id)?;
+        let ChatItem::Message { meta, .. } = &self.rows[start] else {
+            return None;
+        };
+        let card = ChatItem::File {
+            meta: meta.clone(),
+            file,
+        };
+        self.rows.splice(start..end, [card]);
+        Some(start)
+    }
+
+    /// Whether a message with this id is in the window.
+    #[must_use]
+    pub fn has(&self, id: u64) -> bool {
+        self.rows.iter().any(|r| r.message_id() == Some(id))
+    }
+
+    /// Replace a card's file (an upload learned its blob).
+    pub fn set_file(&mut self, index: usize, file: FileMeta) {
+        if let Some(ChatItem::File { file: slot, .. }) = self.rows.get_mut(index) {
+            *slot = file;
+        }
+    }
+
+    /// The file of row `index`, if it is a card.
+    #[must_use]
+    pub fn file_at(&self, index: usize) -> Option<&FileMeta> {
+        match self.rows.get(index)? {
+            ChatItem::File { file, .. } => Some(file),
+            _ => None,
+        }
+    }
+
     /// A message was retexted for everyone: its rows are replaced by
     /// the new text's rows (re-split on fences) at the same place,
     /// flagged edited. `None` when the message is not in the window
@@ -276,7 +387,8 @@ impl ChatHistory {
             let meta = match row {
                 ChatItem::Message { meta, .. }
                 | ChatItem::Code { meta, .. }
-                | ChatItem::Image { meta, .. } => meta,
+                | ChatItem::Image { meta, .. }
+                | ChatItem::File { meta, .. } => meta,
                 ChatItem::System { .. } | ChatItem::DayMarker { .. } => continue,
             };
             if meta.user == old {
@@ -294,7 +406,8 @@ impl ChatHistory {
         for row in &mut self.rows[start..end] {
             if let ChatItem::Message { meta, .. }
             | ChatItem::Code { meta, .. }
-            | ChatItem::Image { meta, .. } = row
+            | ChatItem::Image { meta, .. }
+            | ChatItem::File { meta, .. } = row
             {
                 meta.id = id;
                 meta.pending = false;
@@ -326,7 +439,8 @@ impl ChatHistory {
         let (start, end) = self.span_of(id)?;
         let (ChatItem::Message { meta, .. }
         | ChatItem::Code { meta, .. }
-        | ChatItem::Image { meta, .. }) = &self.rows[start]
+        | ChatItem::Image { meta, .. }
+        | ChatItem::File { meta, .. }) = &self.rows[start]
         else {
             return None;
         };
@@ -557,6 +671,34 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_file_becomes_a_card_and_sizes_read_well() {
+        let mut h = ChatHistory::new();
+        h.push_message(&meta(1), "", false);
+        h.push_message(&meta(2), "text", false);
+        let file = FileMeta {
+            blob: [9u8; 32],
+            name: "notes.pdf".into(),
+            mime: "application/pdf".into(),
+            size: 1_258_291,
+        };
+        assert_eq!(h.attach_file(1, file.clone()), Some(0));
+        assert_eq!(h.file_at(0), Some(&file));
+        assert_eq!(h.attach_file(5, file.clone()), None);
+        assert_eq!(file.size_text(), "1.2 MB");
+        assert_eq!(file.kind_text(), "PDF");
+        let raw = FileMeta {
+            name: "dump.bin".into(),
+            mime: "application/octet-stream".into(),
+            ..file
+        };
+        assert_eq!(raw.kind_text(), "BIN");
+        assert_eq!(human_size(640 * 1024), "640 KB");
+        // A deleted card keeps its header.
+        assert!(h.delete_message(1).is_some());
+        assert!(matches!(h.rows()[0], ChatItem::Message { deleted: true, .. }));
+    }
+
+    #[test]
     fn a_rename_follows_the_author_through_the_history() {
         let mut h = ChatHistory::new();
         h.push_message(&meta(1), "hi", false);
@@ -567,11 +709,7 @@ mod tests {
         h.push_message(&meta(3), "again", false);
         let changed = h.rename_author("a", "alicia");
         assert_eq!(changed, vec![0, 3]);
-        assert!(h
-            .rows()
-            .iter()
-            .filter_map(ChatItem::meta)
-            .all(|m| m.user != "a"));
+        assert!(h.rows().iter().filter_map(ChatItem::meta).all(|m| m.user != "a"));
         assert_eq!(h.rows()[2].meta().map(|m| m.user.as_str()), Some("carol"));
         assert!(h.rename_author("nobody", "x").is_empty());
     }

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    messages::{ClientId, UserId},
+    messages::{BlobId, ClientId, UserId},
     permissions::RoleId,
 };
 
@@ -188,6 +188,90 @@ pub enum AdminCommand {
         target: AdminTarget,
         lock: bool,
     },
+
+    // ── 1.1.3: the panel (feature bit `ADMIN_PANEL`) ──────────────────
+    /// The audit log, newest first, entries before id `before` (needs
+    /// `ADMIN`). Answered with [`AdminOutcome::Audit`]; empty without
+    /// persistence.
+    AuditLog {
+        before: Option<u64>,
+        limit: u16,
+    },
+    /// A custom role (spec §4; needs `MANAGE_ROLES`, and the role's
+    /// derived rank must stay below the actor's). Answered with
+    /// [`AdminOutcome::RoleCreated`].
+    CreateRole {
+        name: String,
+        permissions: u64,
+        /// From `permissions::ROLE_ICONS`, or `""`.
+        icon: String,
+        /// RGB, 0 = none.
+        color: u32,
+    },
+    /// Rename, re-permission or restyle a custom role (`None` keeps).
+    EditRole {
+        role: RoleId,
+        name: Option<String>,
+        permissions: Option<u64>,
+        icon: Option<String>,
+        color: Option<u32>,
+    },
+    /// Remove a custom role; whoever holds it loses it.
+    DeleteRole {
+        role: RoleId,
+    },
+    /// Every stored blob (needs `RESTRICT`).
+    ListBlobs,
+    /// Remove a blob; the messages that referenced it keep their card
+    /// but a fetch says it is gone (needs `RESTRICT`).
+    DeleteBlob {
+        blob_id: BlobId,
+    },
+    /// The server's counters (needs `ADMIN`).
+    ServerStats,
+}
+
+/// One audit line (spec §8), as the panel shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub id: u64,
+    pub ts: u64,
+    /// The actor's name of record; `None` for the server itself.
+    pub actor: Option<String>,
+    pub action: String,
+    pub target: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// One stored blob (spec §7), as the panel's Files tab shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSummary {
+    pub blob_id: BlobId,
+    pub name: String,
+    pub mime: String,
+    pub size: u32,
+    pub created_by: Option<String>,
+    pub created_at: u64,
+    /// Profiles and messages pointing at it; zero is evictable.
+    pub refs: u32,
+}
+
+/// The server's counters, as the panel's Server tab shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatsSummary {
+    pub version: String,
+    pub uptime_secs: u64,
+    pub online: u32,
+    pub users: u32,
+    pub messages: u64,
+    pub blobs: u32,
+    pub blob_bytes: u64,
+    pub blob_cap_bytes: u64,
+    pub persistent: bool,
+    pub queue_depth: u32,
+    pub queue_capacity: u32,
+    pub dropped_writes: u64,
+    pub write_errors: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +330,11 @@ pub enum AdminOutcome {
     Invites(Vec<InviteSummary>),
     /// `None`: nothing received from that user this run.
     Telemetry(Option<TelemetrySummary>),
+    // 1.1.3 (answers to the panel's commands):
+    Audit(Vec<AuditEntry>),
+    Blobs(Vec<BlobSummary>),
+    Stats(StatsSummary),
+    RoleCreated(RoleId),
 }
 
 /// A user's last telemetry, as the server logs it.

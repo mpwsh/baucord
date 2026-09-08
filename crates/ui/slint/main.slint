@@ -14,13 +14,15 @@ import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
-import { Btn, IconBtn, Card, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel } from "widgets.slint";
+import { Btn, IconBtn, Card, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph } from "widgets.slint";
 import { SettingsWindow, SettingsState, SettingsLogic } from "settings.slint";
+import { AdminWindow, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow } from "admin.slint";
 import { StreamViewerWindow } from "viewer.slint";
 
 import { BaucordTray } from "tray.slint";
 
 export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind, MenuAction, MenuEntry }
+export { AdminWindow, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow }
 
 export component MainWindow inherits Window {
     title: "baucord";
@@ -79,8 +81,27 @@ export component MainWindow inherits Window {
     main-screen := HorizontalLayout {
         visible: State.phase == Phase.main;
         Rectangle {
-            width: 260px;
+            width: State.sidebar-width;
             Sidebar { }
+            // The edge: drag to resize, within reason.
+            grip := TouchArea {
+                x: parent.width - 4px;
+                width: 8px;
+                mouse-cursor: MouseCursor.col-resize;
+                property <length> start-width;
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) {
+                        self.start-width = State.sidebar-width;
+                    } else if (ev.kind == PointerEventKind.up) {
+                        Logic.sidebar-resized(State.sidebar-width);
+                    }
+                }
+                moved => {
+                    State.sidebar-width = Math.clamp(
+                        self.start-width + (self.mouse-x - self.pressed-x),
+                        220px, Math.min(480px, root.width - 360px));
+                }
+            }
         }
         chat-pane := ChatPane {
             horizontal-stretch: 1;
@@ -163,7 +184,15 @@ export component MainWindow inherits Window {
                             font-size: Theme.font-sm;
                             vertical-alignment: center;
                         }
-                        if card.who.role == 1 || card.who.role == 3 || card.who.role == 4 : Rectangle {
+                        // A custom role's own glyph and color first; the
+                        // built-ins keep theirs.
+                        if card.who.role-icon != "" : RoleGlyph {
+                            name: card.who.role-icon;
+                            size: 13px;
+                            stroke: card.who.has-role-color ? card.who.role-color : Theme.text-secondary;
+                        }
+                        if card.who.role-icon == ""
+                            && (card.who.role == 1 || card.who.role == 3 || card.who.role == 4) : Rectangle {
                             width: 13px;
                             IconDisplay {
                                 icon: card.who.role == 4 ? IconSet.Shield
@@ -177,7 +206,8 @@ export component MainWindow inherits Window {
                         }
                         if card.who.role-label != "" : Text {
                             text: card.who.role-label;
-                            color: card.who.role == 4 ? Theme.gold
+                            color: card.who.has-role-color ? card.who.role-color
+                                : card.who.role == 4 ? Theme.gold
                                 : card.who.role == 3 ? Theme.accent-text
                                 : card.who.role == 1 ? Theme.text-muted
                                 : Theme.text-secondary;

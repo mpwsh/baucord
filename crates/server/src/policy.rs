@@ -81,6 +81,10 @@ pub struct RoleRecord {
     pub permissions: u64,
     pub rank: Rank,
     pub builtin: bool,
+    /// A glyph from `permissions::ROLE_ICONS`, or `""` (spec §4).
+    pub icon: String,
+    /// RGB for the badge and the card, 0 = none.
+    pub color: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +188,8 @@ impl Policy {
                         permissions: r.permissions,
                         rank: r.rank,
                         builtin: true,
+                        icon: String::new(),
+                        color: 0,
                     },
                 )
             })

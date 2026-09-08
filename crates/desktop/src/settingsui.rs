@@ -48,7 +48,9 @@ pub const GOLD: u32 = 0x00E5_C158;
 /// The palette this session may pick from.
 fn palette(app: &AppState) -> Vec<u32> {
     let mut colors = NAME_COLORS.to_vec();
-    if app.our_role_and_level().0 == app_core::roster::Role::Admin {
+    // The band follows the permission, not the role: a custom role
+    // may hold it, and an "everything but gold" role may not.
+    if client::permissions::has(app.permissions, client::permissions::GOLD_NAME) {
         colors.push(GOLD);
     }
     colors

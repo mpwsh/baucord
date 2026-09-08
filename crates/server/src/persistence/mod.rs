@@ -49,8 +49,9 @@ use protocol::{TelemetrySample, UserId};
 pub use self::store::{
     backup_to_tar, blobs_dir, check, cli_create_invite, cli_find_user, cli_kick,
     cli_lift_restriction, cli_list_invites, cli_load_policy, cli_purge, cli_restrict,
-    cli_revoke_invite, cli_set_key, cli_set_roles, cli_telemetry, hex, parse_hex_id, BackupReport,
-    CheckReport, TelemetryLine, GENERAL_CONV, SCHEMA_VERSION,
+    cli_revoke_invite, cli_role_create, cli_role_delete, cli_role_edit, cli_set_key, cli_set_roles,
+    cli_telemetry, hex, parse_hex_id, BackupReport, CheckReport, RoleEdit, TelemetryLine,
+    GENERAL_CONV, SCHEMA_VERSION,
 };
 use self::store::{Retention, Sqlite, Store};
 use crate::{
@@ -108,6 +109,23 @@ pub enum PersistError {
     Ambiguous(String, Vec<String>),
     #[error("the last admin keeps admin")]
     LastAdmin,
+    #[error("no role named {0}")]
+    NoSuchRole(String),
+    #[error("a role is already named {0}")]
+    RoleNameTaken(String),
+    #[error(
+        "'{0}' cannot name a role: 1–32 lowercase letters, digits and hyphens, and not a \
+         built-in's name"
+    )]
+    BadRoleName(String),
+    #[error("the built-in role {0} cannot be changed (its permissions come from the binary)")]
+    BuiltinRole(String),
+    #[error("'{0}' is not a permission; the names are {list}", list = permission_name_list())]
+    BadPermission(String),
+    #[error("a custom role cannot hold `admin`; only the built-in admin role grants it")]
+    AdminBit,
+    #[error("'{0}' is not a role icon; the choices are {list}", list = role_icon_list())]
+    BadIcon(String),
 }
 
 // ── Rows ────────────────────────────────────────────────────────────────
@@ -124,6 +142,8 @@ pub struct MessageRow {
     /// carries it).
     pub name: String,
     pub edited: bool,
+    /// A file posted with this message (spec §7); the body is empty then.
+    pub blob_id: Option<protocol::BlobId>,
 }
 
 /// A minute's worth of progress for one user (spec §9.1), added to the
@@ -199,6 +219,20 @@ pub struct TelemetryEventRow {
     /// A short stable name (`share_started`, …) for querying.
     pub kind: String,
     pub event: Vec<u8>,
+}
+
+/// `star, crown, …` for the `BadIcon` message.
+fn role_icon_list() -> String {
+    protocol::permissions::ROLE_ICONS.join(", ")
+}
+
+/// `join, speak, text, …` for the `BadPermission` message.
+fn permission_name_list() -> String {
+    protocol::permissions::PERMISSION_NAMES
+        .iter()
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One audit line (spec §8): who did what to whom.
@@ -303,6 +337,31 @@ pub enum Command {
     /// Bytes to `blobs/<hex>` and a row in `blobs` (spec §7).
     StoreBlob(Box<BlobRecord>),
     /// How many profiles point at a blob.
+    /// Remove a blob outright (spec §7: eviction at the cap, an admin's
+    /// delete): the row and the bytes.
+    DeleteBlob {
+        blob_id: protocol::BlobId,
+    },
+    /// A custom role from the panel (spec §4); the tick picked the id.
+    InsertRole {
+        id: u32,
+        name: String,
+        permissions: u64,
+        rank: u16,
+        icon: String,
+        color: u32,
+    },
+    UpdateRole {
+        id: u32,
+        name: String,
+        permissions: u64,
+        rank: u16,
+        icon: String,
+        color: u32,
+    },
+    DeleteRole {
+        id: u32,
+    },
     BlobRefs {
         blob_id: protocol::BlobId,
         refs: u32,
@@ -336,6 +395,8 @@ enum Envelope {
 pub enum Query {
     /// A stored blob's bytes, from disk (spec §7).
     Blob { blob_id: protocol::BlobId },
+    /// The audit log, newest first, before entry `before` (spec §8).
+    Audit { before: Option<u64>, limit: u16 },
     /// Store a DM before anyone sees it (spec §6): the conversation is
     /// created on the first message between the two; the reply is the
     /// sender's ack.
@@ -370,6 +431,8 @@ pub enum Answer {
     Blob(Option<Vec<u8>>),
     /// A DM is on disk.
     Stored,
+    /// Audit entries with their ids, newest first.
+    Audit(Vec<(u64, AuditRow)>),
     Conversations(Vec<protocol::DmSummary>),
     /// Persistence is off: there is nothing to read.
     Unavailable,
@@ -830,6 +893,10 @@ impl Worker {
                 Ok(()) => Answer::Stored,
                 Err(e) => Answer::Failed(e.to_string()),
             },
+            Query::Audit { before, limit } => match db.audit_before(*before, *limit) {
+                Ok(rows) => Answer::Audit(rows),
+                Err(e) => Answer::Failed(e.to_string()),
+            },
             Query::Conversations { user_id } => match db.conversations_of(user_id) {
                 Ok(list) => Answer::Conversations(list),
                 Err(e) => Answer::Failed(e.to_string()),
@@ -868,6 +935,24 @@ impl Worker {
                 }
             },
             Command::BlobRefs { blob_id, refs } => db.set_blob_refs(blob_id, *refs),
+            Command::DeleteBlob { blob_id } => db.delete_blob(blob_id),
+            Command::InsertRole {
+                id,
+                name,
+                permissions,
+                rank,
+                icon,
+                color,
+            } => db.insert_role(*id, name, *permissions, *rank, icon, *color),
+            Command::UpdateRole {
+                id,
+                name,
+                permissions,
+                rank,
+                icon,
+                color,
+            } => db.update_role(*id, name, *permissions, *rank, icon, *color),
+            Command::DeleteRole { id } => db.delete_role(*id),
             Command::MarkRead {
                 conv,
                 user_id,
@@ -999,6 +1084,7 @@ mod tests {
             body: format!("m{msg_id}"),
             name: String::new(),
             edited: false,
+            blob_id: None,
         })
     }
 

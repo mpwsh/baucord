@@ -25,7 +25,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
     rc::{Rc, Weak},
     sync::{
@@ -90,7 +90,7 @@ fn wake() {
 #[allow(clippy::struct_excessive_bools)]
 pub struct AppState {
     // Thread handles (own the threads + their channels)
-    network: NetworkThreadHandle,
+    pub(crate) network: NetworkThreadHandle,
     voice: VoiceThreadHandle,
     screen: ScreenThreadHandle,
     /// Prepared frames + the forward channel from the present-prep
@@ -99,7 +99,7 @@ pub struct AppState {
     ui_screen_rx: crossbeam_channel::Receiver<ScreenEvent>,
 
     // Domain state
-    users: HashMap<u64, UserState>,
+    pub(crate) users: HashMap<u64, UserState>,
     our_client_id: Option<u64>,
     /// Server display name (from Init) — prefixes server-originated
     /// system chat lines, same style as the greeting.
@@ -107,7 +107,7 @@ pub struct AppState {
     /// Voice channels this server defines (from Init), in id order —
     /// derived from `channel_infos` + `channel_details` + our rank by
     /// `rebuild_channels`.
-    channels: Vec<ChannelMeta>,
+    pub(crate) channels: Vec<ChannelMeta>,
     /// The wire list as last received (`Init` / `ChannelListUpdated`).
     channel_infos: Vec<client::ChannelInfo>,
     /// Channel a JoinChannel is in flight for (the password prompt's
@@ -131,7 +131,7 @@ pub struct AppState {
     server_persistent: bool,
     /// Who each session is (`UserDetails`): user id and roles, from
     /// the server's tables. Slash commands resolve names through it.
-    details: HashMap<u64, (client::UserId, Vec<client::RoleId>)>,
+    pub(crate) details: HashMap<u64, (client::UserId, Vec<client::RoleId>)>,
     /// Admin requests in flight: what to do with the answer.
     pending_admin: HashMap<u32, PendingAdmin>,
     next_request_id: u32,
@@ -144,6 +144,25 @@ pub struct AppState {
     /// What the open context menu is about: its entries were built
     /// for this target, and a pick resolves against it.
     menu_target: Option<MenuTarget>,
+    /// The server's role table (`RoleList`, spec §4), the built-ins
+    /// alone until it arrives — custom roles are named by it.
+    pub(crate) roles: BTreeMap<client::RoleId, client::protocol::RoleInfo>,
+    /// File uploads in flight, by upload id (spec §7): where they go
+    /// once the server has the bytes.
+    pending_uploads: HashMap<u32, PendingUpload>,
+    /// Files posted and awaiting the server's ack, by client ref: the
+    /// conversation and the placeholder row.
+    pending_files: HashMap<u32, (Option<client::UserId>, u64)>,
+    /// Blobs fetched for a Save, by hash: the name to write them as,
+    /// and the row (conversation, message id) whose card shows it.
+    pending_downloads: HashMap<client::protocol::BlobId, PendingDownload>,
+    next_file_upload_id: u32,
+    /// Transfers shown on cards, by (conversation, message id): the
+    /// kind (1 up, 2 down) and percent. Rows are rebuilt freely, so
+    /// `chat_row_at` reads this rather than the row carrying it.
+    transfers: HashMap<(Option<client::UserId>, u64), (i32, i32)>,
+    /// The file upload the media lane is busy with, for its percent.
+    uploading: Option<(Option<client::UserId>, u64)>,
     /// The "Move to" submenu's model, rebuilt with the channel list.
     channel_options: Rc<VecModel<ChannelOption>>,
     /// A server voice mute stands (spec §4.2): the mute button is
@@ -244,6 +263,13 @@ pub struct AppState {
     /// main window (tray Show, reconnect paths).
     main_repaint_arm: Rc<Cell<bool>>,
     pub settings_win: Option<ui::SettingsWindow>,
+    /// The admin panel (spec §8), created on first open.
+    pub(crate) admin_win: Option<ui::AdminWindow>,
+    /// The oldest audit id the panel has shown ("Load older" pages
+    /// before it).
+    pub(crate) admin_audit_oldest: Option<u64>,
+    /// The blob cap the server reported, for the Files tab's bar.
+    pub(crate) admin_blob_cap: u64,
     viewers: HashMap<u64, Viewer>,
     /// Image-viewer overlay: the chat row shown, and GIF playback
     /// state while that row is an animated GIF.
@@ -443,6 +469,13 @@ pub fn run() {
         telemetry_notes: HashMap::new(),
         moderation: None,
         menu_target: None,
+        roles: builtin_role_table(),
+        pending_uploads: HashMap::new(),
+        pending_files: HashMap::new(),
+        pending_downloads: HashMap::new(),
+        next_file_upload_id: FILE_UPLOAD_BASE,
+        transfers: HashMap::new(),
+        uploading: None,
         channel_options,
         server_muted: None,
         text_muted: None,
@@ -489,6 +522,9 @@ pub fn run() {
         main,
         main_repaint_arm: Rc::new(Cell::new(false)),
         settings_win: None,
+        admin_win: None,
+        admin_audit_oldest: None,
+        admin_blob_cap: 0,
         viewers: HashMap::new(),
         gallery_row: None,
         gallery_gif: None,
@@ -727,6 +763,8 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_messages_toggle(move || with_app(&w, AppState::toggle_messages));
     let w = Rc::downgrade(state);
+    logic.on_sidebar_resized(move |width| with_app(&w, |app| app.sidebar_resized(width)));
+    let w = Rc::downgrade(state);
     logic.on_dm_closed(move |index| {
         with_app(&w, |app| {
             if let Some(user) = usize::try_from(index)
@@ -847,6 +885,8 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
             warn!("Failed to open link: {e}");
         }
     });
+    let w = Rc::downgrade(state);
+    logic.on_file_save(move |row_id| with_app(&w, |app| app.file_save(row_id)));
     let w = Rc::downgrade(state);
     logic.on_row_open_image(move |row_id| {
         with_app(&w, |app| crate::viewers::open_gallery(app, row_id));
@@ -978,14 +1018,16 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_invite_create(move || with_app(&w, AppState::open_invite_dialog));
     let w = Rc::downgrade(state);
+    logic.on_admin_open(move || {
+        with_app(&w, |app| crate::adminui::open(app, crate::adminui::TAB_USERS));
+    });
+    let w = Rc::downgrade(state);
     logic.on_invite_dialog_create(move || with_app(&w, AppState::invite_dialog_create));
     let w = Rc::downgrade(state);
     logic.on_invite_dialog_copy(move || with_app(&w, AppState::invite_dialog_copy));
     let w = Rc::downgrade(state);
     logic.on_invite_dialog_cancel(move || {
-        with_app(&w, |app| {
-            app.main.global::<State>().set_invite_dialog_open(false)
-        });
+        with_app(&w, |app| app.main.global::<State>().set_invite_dialog_open(false));
     });
     let w = Rc::downgrade(state);
     logic.on_channel_create(move || with_app(&w, AppState::channel_create));
@@ -1419,7 +1461,7 @@ impl AppState {
                 // code, as plain text; the code goes on the clipboard.
                 let shown = client::invite::display_code(&code);
                 crate::clipboard::set_clipboard_text(&shown);
-                let role = role_label(grants_role);
+                let role = self.role_name_of(grants_role);
                 let expiry = describe_expiry(expires_at);
                 let uses = match max_uses {
                     Some(n) => t!("invite-uses", "count" => n),
@@ -1548,6 +1590,69 @@ impl AppState {
                     self.update_user_list();
                 }
             }
+            NetworkMessage::RoleList { roles } => {
+                self.roles = roles.into_iter().map(|r| (r.id, r)).collect();
+                // Custom names on the cards, and in the roster's menu.
+                self.update_user_list();
+            }
+            NetworkMessage::FileMessage {
+                conv,
+                from,
+                username,
+                id,
+                ts,
+                client_id,
+                attachment,
+            } => {
+                let file = app_core::chat::FileMeta {
+                    blob: attachment.blob_id,
+                    name: attachment.name,
+                    mime: attachment.mime,
+                    size: attachment.size,
+                };
+                match conv {
+                    client::ConvRef::General => {
+                        let meta = Meta {
+                            id,
+                            ts: format_wall_time(ts),
+                            ts_ms: ts,
+                            day: local_day(ts),
+                            user: username,
+                            own: Some(client_id) == self.our_client_id,
+                            pending: false,
+                        };
+                        // Our own post came back: the ack already turned
+                        // the placeholder into this message.
+                        let already = self.with_conversation(None, |app| app.history.has(id));
+                        if !already {
+                            self.push_chat_file(&meta, file);
+                        }
+                    }
+                    client::ConvRef::Dm(_) => {
+                        self.take_direct(from, &username, id, ts, Incoming::File(file));
+                    }
+                }
+            }
+            NetworkMessage::HistoryAttachments { conv, items } => {
+                let key = match conv {
+                    client::ConvRef::General => None,
+                    client::ConvRef::Dm(user) => Some(user),
+                };
+                self.with_conversation(key, |app| {
+                    for (msg_id, a) in items {
+                        let file = app_core::chat::FileMeta {
+                            blob: a.blob_id,
+                            name: a.name,
+                            mime: a.mime,
+                            size: a.size,
+                        };
+                        if let Some(i) = app.history.attach_file(msg_id, file) {
+                            let row = app.chat_row_at(i);
+                            app.chat_model.set_row_data(i, row);
+                        }
+                    }
+                });
+            }
             NetworkMessage::ChannelDetails {
                 channel_id,
                 stable_id,
@@ -1618,7 +1723,7 @@ impl AppState {
                     && let Some((_, old)) = before
                     && old != roles
                 {
-                    let names: Vec<String> = roles.iter().map(|r| role_label(*r)).collect();
+                    let names: Vec<String> = roles.iter().map(|r| self.role_name_of(*r)).collect();
                     let now = if names.is_empty() {
                         t!("roles-none")
                     } else {
@@ -1918,11 +2023,18 @@ impl AppState {
                 }
             }
             NetworkMessage::UploadProgress { pct } => {
-                let s = self.main.global::<State>();
-                if pct >= 100 {
-                    s.set_upload_line("".into());
+                if let Some((conv, id)) = self.uploading {
+                    // A file: the card's ring, not the composer's line.
+                    self.set_transfer(conv, id, Some((1, i32::from(pct))));
                 } else {
-                    s.set_upload_line(t!("chat-upload-progress", "pct" => u32::from(pct)).into());
+                    let s = self.main.global::<State>();
+                    if pct >= 100 {
+                        s.set_upload_line("".into());
+                    } else {
+                        s.set_upload_line(
+                            t!("chat-upload-progress", "pct" => u32::from(pct)).into(),
+                        );
+                    }
                 }
             }
             NetworkMessage::ImageMessage {
@@ -2009,15 +2121,13 @@ impl AppState {
                 self.active_sharers.insert(client_id, (width, height));
                 self.sharer_ids = self.active_sharers.keys().copied().collect();
                 self.update_user_list();
-                // A stream going up in our channel, by someone else.
+                // A stream going up in our channel — ours included: the
+                // sharer hears that they are live, the same as the room.
                 let in_our_channel = self
                     .users
                     .get(&client_id)
                     .is_some_and(|u| Some(u.channel_id) == self.our_channel());
-                if in_our_channel
-                    && Some(client_id) != self.our_client_id
-                    && self.settings.sounds.share_started_on()
-                {
+                if in_our_channel && self.settings.sounds.share_started_on() {
                     self.voice
                         .tx
                         .send(VoiceControl::PlaySound(SoundType::ShareStarted))
@@ -2084,7 +2194,9 @@ impl AppState {
                 self.show_toast(ToastKind::Warning, &t!(rename_denied_key(reason)));
             }
             NetworkMessage::UploadDone { upload_id, blob_id } => {
-                if upload_id == AVATAR_UPLOAD_ID {
+                if let Some(upload) = self.pending_uploads.remove(&upload_id) {
+                    self.file_uploaded(upload, blob_id);
+                } else if upload_id == AVATAR_UPLOAD_ID {
                     // The picture is on the server: now the profile
                     // can point at it.
                     self.own_avatar_blob = Some(blob_id);
@@ -2095,7 +2207,21 @@ impl AppState {
                 }
             }
             NetworkMessage::UploadRejected { upload_id, reason } => {
-                if upload_id == AVATAR_UPLOAD_ID {
+                if let Some(upload) = self.pending_uploads.remove(&upload_id) {
+                    self.uploading = None;
+                    self.transfers.remove(&(upload.conv, upload.placeholder));
+                    self.with_conversation(upload.conv, |app| {
+                        if let Some(delta) = app.history.discard_message(upload.placeholder) {
+                            app.sync_range(&delta);
+                        }
+                    });
+                    let line = t!(
+                        "file-upload-failed",
+                        "name" => upload.name.as_str(),
+                        "why" => reason.describe()
+                    );
+                    self.show_toast(ToastKind::Warning, &line);
+                } else if upload_id == AVATAR_UPLOAD_ID {
                     self.show_toast(
                         ToastKind::Warning,
                         &t!("profile-avatar-refused", "why" => reason.describe()),
@@ -2105,12 +2231,45 @@ impl AppState {
                     self.send_own_profile();
                 }
             }
+            NetworkMessage::BlobProgress { blob_id, pct } => {
+                if let Some(d) = self.pending_downloads.get(&blob_id) {
+                    let (conv, msg_id) = (d.conv, d.msg_id);
+                    self.set_transfer(conv, msg_id, Some((2, i32::from(pct))));
+                }
+            }
             NetworkMessage::Blob { blob_id, data } => {
-                self.avatar_fetches.remove(&blob_id);
-                self.take_avatar_bytes(blob_id, &data, true);
+                if let Some(PendingDownload { name, conv, msg_id }) =
+                    self.pending_downloads.remove(&blob_id)
+                {
+                    self.set_transfer(conv, msg_id, None);
+                    match media::save_to_downloads(&name, &data) {
+                        Ok(path) => self.show_toast(
+                            ToastKind::Success,
+                            &t!("file-saved", "path" => path.display().to_string()),
+                        ),
+                        Err(e) => self.show_error(&t!(
+                            "file-save-error",
+                            "name" => name.as_str(),
+                            "error" => e.to_string()
+                        )),
+                    }
+                } else {
+                    self.avatar_fetches.remove(&blob_id);
+                    self.take_avatar_bytes(blob_id, &data, true);
+                }
             }
             NetworkMessage::BlobMissing { blob_id } => {
-                self.avatar_fetches.remove(&blob_id);
+                if let Some(PendingDownload { name, conv, msg_id }) =
+                    self.pending_downloads.remove(&blob_id)
+                {
+                    self.set_transfer(conv, msg_id, None);
+                    self.show_toast(
+                        ToastKind::Warning,
+                        &t!("file-download-failed", "name" => name.as_str()),
+                    );
+                } else {
+                    self.avatar_fetches.remove(&blob_id);
+                }
             }
             // ── 1.1.1: direct messages — the conversation UI is the
             // next drop; until then a DM lands in the general view
@@ -2122,10 +2281,15 @@ impl AppState {
                 ts,
                 text,
             } => {
-                self.take_direct(from, &username, id, ts, &text);
+                self.take_direct(from, &username, id, ts, Incoming::Text(&text));
             }
             NetworkMessage::MessageAck { client_ref, msg_id } => {
-                if let Some((key, placeholder)) = self.pending_dm_sends.remove(&client_ref) {
+                if let Some((key, placeholder)) = self
+                    .pending_dm_sends
+                    .remove(&client_ref)
+                    .or_else(|| self.pending_files.remove(&client_ref))
+                {
+                    self.transfers.remove(&(key, placeholder));
                     self.with_conversation(key, |app| {
                         if let Some(delta) = app.history.confirm_message(placeholder, msg_id) {
                             app.sync_range(&delta);
@@ -2140,7 +2304,11 @@ impl AppState {
                 }
             }
             NetworkMessage::MessageFailed { client_ref, reason } => {
-                if let Some((key, placeholder)) = self.pending_dm_sends.remove(&client_ref) {
+                if let Some((key, placeholder)) = self
+                    .pending_dm_sends
+                    .remove(&client_ref)
+                    .or_else(|| self.pending_files.remove(&client_ref))
+                {
                     self.with_conversation(key, |app| {
                         if let Some(delta) = app.history.discard_message(placeholder) {
                             app.sync_range(&delta);
@@ -2382,7 +2550,7 @@ impl AppState {
             },
             "unmute" => AdminCommand::Unmute { target, kind },
             "grant" | "revoke" => {
-                let Some(role) = rest.first().and_then(|w| parse_role(w)) else {
+                let Some(role) = rest.first().and_then(|w| self.parse_role_name(w)) else {
                     self.push_chat_system(&t!("chat-command-usage", "command" => command));
                     return;
                 };
@@ -2429,14 +2597,8 @@ impl AppState {
     fn commands_available(&self) -> String {
         use client::permissions as p;
         let has = |bit: u64| p::has(self.permissions, bit);
-        let mut out: Vec<&str> = vec![
-            "/help",
-            "/history [n]",
-            "/channel list",
-            "/mem",
-            "/leave",
-            "/quit",
-        ];
+        let mut out: Vec<&str> =
+            vec!["/help", "/history [n]", "/channel list", "/mem", "/leave", "/quit"];
         if has(p::CREATE_INVITES) {
             out.push("/invite [role] [24h] [uses]");
         }
@@ -2684,7 +2846,7 @@ impl AppState {
 
     /// "Edit channel…": the dialog filled with what this client knows
     /// (spec §5; the password only when it was saved here).
-    fn channel_edit(&mut self, channel_id: u16) {
+    pub(crate) fn channel_edit(&mut self, channel_id: u16) {
         let Some(spec) = self.current_spec(channel_id) else {
             return;
         };
@@ -2808,7 +2970,7 @@ impl AppState {
             )
     }
 
-    fn send_admin(&mut self, command: AdminCommand, then: PendingAdmin) {
+    pub(crate) fn send_admin(&mut self, command: AdminCommand, then: PendingAdmin) {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         self.pending_admin.insert(request_id, then);
@@ -2840,10 +3002,25 @@ impl AppState {
                     return;
                 }
                 let why = e.describe();
+                if matches!(then, PendingAdmin::Panel(_) | PendingAdmin::AuditMore) {
+                    crate::adminui::take_error(self, &why);
+                    return;
+                }
                 self.push_chat_system(&t!("chat-admin-refused", "why" => why.as_str()));
                 return;
             }
         };
+        match then {
+            PendingAdmin::Panel(tab) => {
+                crate::adminui::take_outcome(self, tab, outcome);
+                return;
+            }
+            PendingAdmin::AuditMore => {
+                crate::adminui::take_outcome(self, -1, outcome);
+                return;
+            }
+            PendingAdmin::Show | PendingAdmin::Telemetry(_) => {}
+        }
         if let PendingAdmin::Telemetry(client_id) = then {
             if let client::AdminOutcome::Telemetry(sample) = outcome {
                 let text = match sample {
@@ -2873,7 +3050,8 @@ impl AppState {
             client::AdminOutcome::Users(users) => {
                 self.push_chat_system(&t!("chat-admin-users-header", "count" => users.len()));
                 for u in users {
-                    let roles: Vec<String> = u.roles.iter().map(|r| role_label(*r)).collect();
+                    let roles: Vec<String> =
+                        u.roles.iter().map(|r| self.role_name_of(*r)).collect();
                     let line = format!(
                         "{}{} — {} — {} — {}",
                         if u.client_id.is_some() {
@@ -2935,8 +3113,55 @@ impl AppState {
                     let line = format!(
                         "{} — {} — {} — uses {uses}{state}",
                         client::invite::display_code(&i.code),
-                        role_label(i.grants_role),
+                        self.role_name_of(i.grants_role),
                         describe_expiry(i.expires_at)
+                    );
+                    self.push_chat_system(&line);
+                }
+            }
+            // The panel's answers (spec §8): until the window lands they
+            // read as one line each, so `/`-typed commands still answer.
+            client::AdminOutcome::RoleCreated(id) => {
+                self.push_chat_system(&t!("chat-admin-role-created", "id" => id));
+            }
+            client::AdminOutcome::Stats(stats) => {
+                let line = format!(
+                    "baucord {} · up {} · {} online / {} users · {} messages · {} blobs, {} of {}",
+                    stats.version,
+                    describe_duration(stats.uptime_secs),
+                    stats.online,
+                    stats.users,
+                    stats.messages,
+                    stats.blobs,
+                    app_core::chat::human_size(stats.blob_bytes),
+                    app_core::chat::human_size(stats.blob_cap_bytes),
+                );
+                self.push_chat_system(&line);
+            }
+            client::AdminOutcome::Blobs(blobs) => {
+                self.push_chat_system(&t!("chat-admin-blobs-header", "count" => blobs.len()));
+                for b in blobs {
+                    let line = format!(
+                        "{} — {} — {} — {} — refs {}",
+                        b.name,
+                        b.mime,
+                        app_core::chat::human_size(u64::from(b.size)),
+                        b.created_by.as_deref().unwrap_or("?"),
+                        b.refs
+                    );
+                    self.push_chat_system(&line);
+                }
+            }
+            client::AdminOutcome::Audit(entries) => {
+                self.push_chat_system(&t!("chat-admin-audit-header", "count" => entries.len()));
+                for e in entries {
+                    let line = format!(
+                        "{} — {} — {}{}{}",
+                        format_wall_time(e.ts),
+                        e.actor.as_deref().unwrap_or("server"),
+                        e.action,
+                        e.target.as_deref().map(|t| format!(" {t}")).unwrap_or_default(),
+                        e.detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default(),
                     );
                     self.push_chat_system(&line);
                 }
@@ -2955,7 +3180,7 @@ impl AppState {
 
     /// "Invite users": open the dialog with the defaults (`/invite`'s:
     /// guest, a day, unlimited).
-    fn open_invite_dialog(&mut self) {
+    pub(crate) fn open_invite_dialog(&mut self) {
         let s = self.main.global::<State>();
         let strings = |keys: &[&str]| -> ModelRc<slint::SharedString> {
             let items: Vec<slint::SharedString> = keys.iter().map(|k| t!(k).into()).collect();
@@ -3337,6 +3562,7 @@ impl AppState {
         s.set_perm_create_channels(has(p::CREATE_CHANNELS));
         s.set_perm_create_invites(has(p::CREATE_INVITES));
         s.set_perm_manage_invites(has(p::MANAGE_INVITES));
+        s.set_perm_panel(has(p::PANEL));
         s.set_perm_manage_own(has(p::MANAGE_OWN_CHANNELS));
         s.set_perm_delete_any(has(p::RESTRICT));
         s.set_perm_dm(has(p::DM));
@@ -3367,6 +3593,17 @@ impl AppState {
         s.set_show_timestamps(self.settings.ui.show_timestamps);
         s.set_compact_rows(self.settings.ui.compact_rows);
         s.set_messages_collapsed(self.settings.ui.messages_collapsed);
+        s.set_sidebar_width(f32::from(self.settings.ui.sidebar_width.clamp(220, 480)));
+    }
+
+    /// The sidebar's edge was let go: keep the width.
+    fn sidebar_resized(&mut self, width: f32) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let width = width.clamp(220.0, 480.0).round() as u16;
+        if width != self.settings.ui.sidebar_width {
+            self.settings.ui.sidebar_width = width;
+            self.settings.save();
+        }
     }
 
     /// The Messages header's chevron: fold the section or open it,
@@ -3430,6 +3667,84 @@ impl AppState {
             .map_or((Role::Unknown, 0), |u| (u.role, u.level))
     }
 
+    /// The role table's ids in rank order (the panel's lists and the
+    /// Role dropdown share it).
+    pub(crate) fn role_table_in_rank_order(&self) -> Vec<client::RoleId> {
+        let mut ids: Vec<(u16, client::RoleId)> =
+            self.roles.values().map(|r| (r.rank, r.id)).collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// A user's name of record by id: the roster knows the online
+    /// ones; the rest are a short id.
+    pub(crate) fn name_of_user_id(&self, user: &client::UserId) -> String {
+        self.details
+            .iter()
+            .find(|(_, (id, _))| id == user)
+            .and_then(|(client, _)| self.users.get(client))
+            .map_or_else(|| short_id(&user[..8]), |u| u.username.clone())
+    }
+
+    /// A role's name for people: the built-ins localized, a custom one
+    /// as the table has it, `role N` for one we never heard of.
+    pub(crate) fn role_name_of(&self, role: client::RoleId) -> String {
+        match Role::from_int(i32::try_from(role).unwrap_or(0)) {
+            Some(builtin) if builtin != Role::Unknown => role_name(builtin),
+            _ => self
+                .roles
+                .get(&role)
+                .map_or_else(|| format!("role {role}"), |r| r.name.clone()),
+        }
+    }
+
+    /// A role as typed in `/grant`: any name in the table
+    /// (case-insensitive) or an id.
+    fn parse_role_name(&self, text: &str) -> Option<client::RoleId> {
+        let lower = text.trim().to_ascii_lowercase();
+        self.roles
+            .values()
+            .find(|r| r.name == lower)
+            .map(|r| r.id)
+            .or_else(|| lower.parse().ok())
+    }
+
+    /// A client's highest-ranked role, as the table knows it (the
+    /// badge and its color come from it); `None` for a built-in
+    /// without a style, or no entry.
+    fn top_role_info(&self, client_id: u64) -> Option<&client::protocol::RoleInfo> {
+        self.details
+            .get(&client_id)
+            .and_then(|(_, roles)| {
+                roles
+                    .iter()
+                    .filter_map(|r| self.roles.get(r))
+                    .max_by_key(|info| (info.rank, info.id))
+            })
+            .filter(|info| !info.icon.is_empty() || info.color != 0)
+    }
+
+    /// The name of a client's highest-ranked role, for the card.
+    fn top_role_name(&self, client_id: u64) -> String {
+        let top = self
+            .details
+            .get(&client_id)
+            .and_then(|(_, roles)| {
+                roles
+                    .iter()
+                    .filter_map(|r| self.roles.get(r).map(|info| (info.rank, *r)))
+                    .max()
+            })
+            .map(|(_, id)| id);
+        match top {
+            Some(id) => self.role_name_of(id),
+            None => self
+                .users
+                .get(&client_id)
+                .map_or_else(String::new, |u| role_name(u.role)),
+        }
+    }
+
     /// Push the "Text size" setting to every window's Theme (globals
     /// are per window instance).
     pub fn apply_text_scale(&self) {
@@ -3443,7 +3758,9 @@ impl AppState {
         }
     }
 
-    /// A session's highest built-in rank; a guest's until its details
+    /// A session's highest rank across its roles — from the server's
+    /// table, so a custom role counts for the rank rule (a rank-29
+    /// steward outranks organizers); a guest's until its details
     /// arrive.
     fn rank_of_client(&self, client_id: u64) -> client::permissions::Rank {
         self.details
@@ -3451,7 +3768,12 @@ impl AppState {
             .map_or(client::permissions::RANK_GUEST, |(_, roles)| {
                 roles
                     .iter()
-                    .filter_map(|r| builtin_rank(*r))
+                    .filter_map(|r| {
+                        self.roles
+                            .get(r)
+                            .map(|info| info.rank)
+                            .or_else(|| builtin_rank(*r))
+                    })
                     .max()
                     .unwrap_or(client::permissions::RANK_GUEST)
             })
@@ -3650,6 +3972,7 @@ impl AppState {
         self.is_deafened = false;
         // A menu open on a row that is about to vanish.
         self.close_menu();
+        self.roles = builtin_role_table();
 
         let s = self.main.global::<State>();
         s.set_muted(false);
@@ -3975,7 +4298,7 @@ impl AppState {
             dm: has(p::DM),
             manage_own_channels: has(p::MANAGE_OWN_CHANNELS),
             create_channels: has(p::CREATE_CHANNELS),
-            our_role: self.our_role_and_level().0,
+            our_rank: self.our_rank(),
         }
     }
 
@@ -4021,7 +4344,27 @@ impl AppState {
                     name: c.name.clone(),
                 })
                 .collect();
-            let entries = menu::user_menu(&session, &facts, &channels);
+            let held: Vec<client::RoleId> = self
+                .user_id_at(index)
+                .and_then(|id| self.details.get(&id))
+                .map(|(_, roles)| roles.clone())
+                .unwrap_or_default();
+            let mut roles: Vec<menu::RoleChoice> = self
+                .roles
+                .values()
+                .map(|r| menu::RoleChoice {
+                    id: r.id,
+                    name: r.name.clone(),
+                    rank: r.rank,
+                    builtin: r
+                        .builtin
+                        .then(|| Role::from_int(i32::try_from(r.id).unwrap_or(0)))
+                        .flatten(),
+                    held: held.contains(&r.id),
+                })
+                .collect();
+            roles.sort_by_key(|r| (r.rank, r.id));
+            let entries = menu::user_menu(&session, &facts, &channels, &roles);
             // The slider row starts at their current level.
             let volume = self
                 .user_id_at(index)
@@ -4066,6 +4409,7 @@ impl AppState {
             0 => menu::MessageKind::Text,
             2 => menu::MessageKind::Image,
             3 => menu::MessageKind::Code,
+            5 => menu::MessageKind::File,
             // System lines and day dividers have no menu.
             _ => return,
         };
@@ -4148,6 +4492,7 @@ impl AppState {
             (MenuTarget::Message { row_id, .. }, A::SaveImage) => {
                 media::save_image_dialog(self, row_id);
             }
+            (MenuTarget::Message { row_id, .. }, A::SaveFile) => self.file_save(row_id),
             (MenuTarget::Composer, A::Cut) => self.main.invoke_composer_cut(),
             (MenuTarget::Composer, A::Copy) => self.main.invoke_composer_copy(),
             (MenuTarget::Composer, A::Paste) => media::paste_into_chat(self),
@@ -4182,10 +4527,9 @@ impl AppState {
             }
             A::Message => self.dm_from_roster(index),
             A::SetRole(role) => {
-                // The built-ins nest, so one role is the whole set.
-                if let (Some(target), Ok(role)) =
-                    (self.admin_target_at(index), u32::try_from(role.as_int()))
-                {
+                // One role is the whole set: the built-ins nest, and a
+                // custom role is defined as a complete set.
+                if let Some(target) = self.admin_target_at(index) {
                     self.send_admin(
                         AdminCommand::SetRoles {
                             target,
@@ -5018,7 +5362,14 @@ impl AppState {
     /// A live DM arrived (spec §6): into its conversation — shown at
     /// once if open (and marked read), counted as unread otherwise —
     /// the list moves it to the top, the chime plays.
-    fn take_direct(&mut self, from: client::UserId, username: &str, id: u64, ts: u64, text: &str) {
+    fn take_direct(
+        &mut self,
+        from: client::UserId,
+        username: &str,
+        id: u64,
+        ts: u64,
+        body: Incoming<'_>,
+    ) {
         let is_open = self.active_dm == Some(from);
         let meta = self.dm_meta.entry(from).or_insert_with(|| DmMeta {
             name: username.to_string(),
@@ -5051,9 +5402,14 @@ impl AppState {
                 own: false,
                 pending: false,
             };
-            let body = app_core::emoji::replace_shortcodes(text);
             self.with_conversation(Some(from), |app| {
-                app.push_message_here(&meta, &body, false);
+                match &body {
+                    Incoming::Text(text) => {
+                        let text = app_core::emoji::replace_shortcodes(text);
+                        app.push_message_here(&meta, &text, false);
+                    }
+                    Incoming::File(file) => app.push_file_here(&meta, file.clone()),
+                }
                 app.oldest_history_id.get_or_insert(id);
             });
         }
@@ -5174,6 +5530,13 @@ impl AppState {
         let row_id = self.next_row_id as i32;
         let mut row = ui::convert::chat_row(&self.history.rows()[index], row_id);
         row.continuation = self.history.is_continuation(index);
+        if row.kind == 5
+            && let Some(id) = self.history.rows()[index].message_id()
+            && let Some((kind, pct)) = self.transfers.get(&(self.active_dm, id))
+        {
+            row.transfer_kind = *kind;
+            row.transfer_pct = *pct;
+        }
         if row.kind != 1 && row.kind != 4 {
             let own = row.own;
             let name = row.user.to_string();
@@ -5230,6 +5593,182 @@ impl AppState {
         self.mark_day(meta.day);
         let delta = self.history.push_message(meta, body, edited);
         self.sync_history_tail(&delta);
+    }
+
+    /// A file card into the shown conversation (spec §7).
+    fn push_file_here(&mut self, meta: &Meta, file: app_core::chat::FileMeta) {
+        self.mark_day(meta.day);
+        let delta = self.history.push_file(meta, file);
+        self.sync_history_tail(&delta);
+    }
+
+    /// A file card into General, whichever conversation is shown.
+    fn push_chat_file(&mut self, meta: &Meta, file: app_core::chat::FileMeta) {
+        self.with_conversation(None, |app| app.push_file_here(meta, file));
+        if self.active_dm.is_some() && !meta.own {
+            self.general_unread += 1;
+            self.main
+                .global::<State>()
+                .set_general_unread(i32::try_from(self.general_unread).unwrap_or(i32::MAX));
+        }
+    }
+
+    // ── Files (spec §7) ─────────────────────────────────────────────
+
+    /// Announce a picked file to the server; the answer arrives as
+    /// `UploadDone` (→ `file_uploaded`) or `UploadRejected`.
+    pub fn begin_file_upload(&mut self, name: String, mime: String, bytes: Vec<u8>) {
+        let upload_id = self.next_file_upload_id;
+        self.next_file_upload_id = self.next_file_upload_id.wrapping_add(1).max(FILE_UPLOAD_BASE);
+        let size = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        // The card shows at once, at 0 %, and fills as the bytes go;
+        // the same placeholder is confirmed by the post's ack later.
+        let client_ref = self.next_client_ref;
+        self.next_client_ref = self.next_client_ref.wrapping_add(1).max(1);
+        let placeholder = u64::MAX - u64::from(client_ref);
+        let conv = self.active_dm;
+        let now = u64::try_from(chrono::Local::now().timestamp_millis()).unwrap_or(0);
+        let meta = Meta {
+            id: placeholder,
+            ts: format_wall_time(now),
+            ts_ms: now,
+            day: local_day(now),
+            user: self.settings.user.nickname.clone(),
+            own: true,
+            pending: true,
+        };
+        let file = app_core::chat::FileMeta {
+            blob: [0u8; 32],
+            name: name.clone(),
+            mime: mime.clone(),
+            size,
+        };
+        self.transfers.insert((conv, placeholder), (1, 0));
+        self.uploading = Some((conv, placeholder));
+        self.with_conversation(conv, |app| app.push_file_here(&meta, file));
+        self.pending_uploads.insert(
+            upload_id,
+            PendingUpload {
+                conv,
+                name: name.clone(),
+                placeholder,
+            },
+        );
+        self.network
+            .tx
+            .send(NetworkControl::UploadBlob {
+                upload_id,
+                name,
+                mime,
+                data: bytes,
+            })
+            .ok();
+    }
+
+    /// The server has the bytes: post them into the conversation the
+    /// file was picked for, under a placeholder row until the ack.
+    fn file_uploaded(&mut self, upload: PendingUpload, blob_id: client::protocol::BlobId) {
+        let placeholder = upload.placeholder;
+        #[allow(clippy::cast_possible_truncation)] // built from a u32
+        let client_ref = (u64::MAX - placeholder) as u32;
+        // Uploaded: the card knows its blob now (Save works once acked)
+        // and the ring goes; the muted look stays until the ack.
+        self.uploading = None;
+        self.transfers.remove(&(upload.conv, placeholder));
+        self.with_conversation(upload.conv, |app| {
+            let at = app
+                .history
+                .rows()
+                .iter()
+                .position(|r| r.message_id() == Some(placeholder));
+            if let Some(i) = at
+                && let Some(existing) = app.history.file_at(i).cloned()
+            {
+                let file = app_core::chat::FileMeta {
+                    blob: blob_id,
+                    ..existing
+                };
+                app.history.set_file(i, file);
+                let row = app.chat_row_at(i);
+                app.chat_model.set_row_data(i, row);
+            }
+        });
+        self.pending_files
+            .insert(client_ref, (upload.conv, placeholder));
+        let conv = match upload.conv {
+            None => client::ConvRef::General,
+            Some(user) => client::ConvRef::Dm(user),
+        };
+        self.network
+            .tx
+            .send(NetworkControl::SendFile {
+                conv,
+                blob_id,
+                client_ref,
+            })
+            .ok();
+    }
+
+    /// Show, move or clear a card's transfer ring: the state lives in
+    /// `transfers` (rows are rebuilt at will) and the row is rebuilt
+    /// from it.
+    fn set_transfer(
+        &mut self,
+        conv: Option<client::UserId>,
+        msg_id: u64,
+        state: Option<(i32, i32)>,
+    ) {
+        match state {
+            Some(state) => {
+                self.transfers.insert((conv, msg_id), state);
+            }
+            None => {
+                self.transfers.remove(&(conv, msg_id));
+            }
+        }
+        self.with_conversation(conv, |app| {
+            if let Some(i) = app
+                .history
+                .rows()
+                .iter()
+                .position(|r| r.message_id() == Some(msg_id))
+            {
+                let row = app.chat_row_at(i);
+                app.chat_model.set_row_data(i, row);
+            }
+        });
+    }
+
+    /// A card's Save: fetch the blob; `Blob` writes it to Downloads.
+    fn file_save(&mut self, row_id: i32) {
+        let Some(index) = (0..self.chat_model.row_count())
+            .find(|&i| self.chat_model.row_data(i).is_some_and(|r| r.row_id == row_id))
+        else {
+            return;
+        };
+        let Some(file) = self.history.file_at(index).cloned() else {
+            return;
+        };
+        let Some(msg_id) = self.history.rows()[index].message_id() else {
+            return;
+        };
+        if self.pending_downloads.contains_key(&file.blob) {
+            return;
+        }
+        let conv = self.active_dm;
+        self.pending_downloads.insert(
+            file.blob,
+            PendingDownload {
+                name: file.name.clone(),
+                conv,
+                msg_id,
+            },
+        );
+        self.set_transfer(conv, msg_id, Some((2, 0)));
+        self.network
+            .tx
+            .send(NetworkControl::FetchBlob { blob_id: file.blob })
+            .ok();
     }
 
     /// A divider before the next message when its day differs from
@@ -5644,7 +6183,14 @@ impl AppState {
         if user.level > 0 {
             row.level_label = t!("tooltip-level", "level" => u32::from(user.level)).into();
         }
-        row.role_label = role_name(user.role).into();
+        row.role_label = self.top_role_name(user.client_id).into();
+        if let Some(info) = self.top_role_info(user.client_id) {
+            row.role_icon = info.icon.as_str().into();
+            if info.color != 0 {
+                row.role_color = slint::Color::from_argb_encoded(0xFF00_0000 | info.color);
+                row.has_role_color = true;
+            }
+        }
         if let Some((pct, line)) = xp_progress(user.level, user.xp) {
             row.xp_pct = pct;
             row.xp_line = line.into();
@@ -6399,11 +6945,15 @@ struct ChannelFacts {
 }
 
 /// What to do with an `AdminResult` when it arrives.
-enum PendingAdmin {
+pub(crate) enum PendingAdmin {
     /// Print the outcome.
     Show,
     /// A roster-tooltip fetch for this session: keep it, say nothing.
     Telemetry(u64),
+    /// The admin panel's tab asked: fill its list.
+    Panel(i32),
+    /// The panel's Audit tab asked for an older page: append.
+    AuditMore,
 }
 
 /// The composer is rewriting message `msg_id`; the draft it replaced
@@ -6477,6 +7027,12 @@ struct Moderation {
     /// The seconds behind each entry of `State.moderation-durations`;
     /// `None` = until lifted.
     duration_secs: Vec<Option<u64>>,
+}
+
+/// What a DM brought: text, or a file card (spec §7).
+enum Incoming<'a> {
+    Text(&'a str),
+    File(app_core::chat::FileMeta),
 }
 
 /// What the open context menu is about (`AppState::show_menu`): the
@@ -6581,7 +7137,7 @@ fn day_label(day: i64) -> String {
     )
 }
 
-fn format_wall_time(ms: u64) -> String {
+pub(crate) fn format_wall_time(ms: u64) -> String {
     let secs = i64::try_from(ms / 1000).unwrap_or(0);
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|utc| {
@@ -6606,17 +7162,9 @@ fn split_command(rest: &str) -> Option<(&str, &str)> {
 }
 
 /// A role by name (`member`) or id.
-fn parse_role(text: &str) -> Option<client::RoleId> {
-    let lower = text.to_ascii_lowercase();
-    client::permissions::BUILTIN_ROLES
-        .iter()
-        .find(|r| r.name == lower)
-        .map(|r| r.id)
-        .or_else(|| lower.parse().ok())
-}
 
 /// A full 64-hex-digit id.
-fn parse_hex_id(text: &str) -> Option<client::UserId> {
+pub(crate) fn parse_hex_id(text: &str) -> Option<client::UserId> {
     let text = text.trim();
     if text.len() != 64 {
         return None;
@@ -6654,7 +7202,21 @@ fn lifted_key(kind: client::RestrictionKind) -> &'static str {
 }
 
 /// "3 min ago", "2 d ago".
-fn describe_ago(ts: u64) -> String {
+/// "3 d 4 h", "12 min", "45 s": an uptime.
+pub(crate) fn describe_duration(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs / 3_600) % 24, (secs / 60) % 60);
+    if d > 0 {
+        format!("{d} d {h} h")
+    } else if h > 0 {
+        format!("{h} h {m} min")
+    } else if m > 0 {
+        format!("{m} min")
+    } else {
+        format!("{secs} s")
+    }
+}
+
+pub(crate) fn describe_ago(ts: u64) -> String {
     let ago = wall_now_ms().saturating_sub(ts) / 1000;
     if ago >= 86_400 {
         format!("{} d ago", ago / 86_400)
@@ -6704,9 +7266,28 @@ impl ProfileLook for ChatRow {
 
 /// The upload id our avatar always travels under (one at a time).
 const AVATAR_UPLOAD_ID: u32 = 1;
+/// File uploads take ids from here up (spec §7); the avatar keeps 1.
+const FILE_UPLOAD_BASE: u32 = 1_000;
+
+/// A file on its way to the server (spec §7); the card already
+/// carries its type and size.
+struct PendingUpload {
+    /// The conversation open when it was picked.
+    conv: Option<client::UserId>,
+    name: String,
+    /// The pending card's placeholder message id.
+    placeholder: u64,
+}
+
+/// A card's Save in flight.
+struct PendingDownload {
+    name: String,
+    conv: Option<client::UserId>,
+    msg_id: u64,
+}
 
 /// Lowercase hex of a hash, the cache file name.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -6728,6 +7309,7 @@ fn dm_failed_key(reason: client::DmFailReason) -> &'static str {
         R::NoPermission => "dm-failed-no-permission",
         R::NoSuchUser => "dm-failed-no-such-user",
         R::Store => "dm-failed-store",
+        R::NoSuchBlob => "dm-failed-no-such-blob",
     }
 }
 
@@ -6786,6 +7368,26 @@ fn xp_progress(level: u16, xp: Option<u64>) -> Option<(i32, String)> {
     Some((pct, line))
 }
 
+/// Where a rank stands, in words (the panel's Roles tab).
+pub(crate) fn describe_standing(rank: u16) -> String {
+    use client::permissions as p;
+    t!(if rank >= p::RANK_ADMIN {
+        "admin-standing-admin"
+    } else if rank == p::RANK_ORGANIZER {
+        "role-organizer"
+    } else if rank > p::RANK_ORGANIZER {
+        "admin-standing-above-organizers"
+    } else if rank == p::RANK_MEMBER {
+        "role-member"
+    } else if rank > p::RANK_MEMBER {
+        "admin-standing-above-members"
+    } else if rank == p::RANK_GUEST {
+        "role-guest"
+    } else {
+        "admin-standing-above-guests"
+    })
+}
+
 /// A built-in role's name, for the card and the menus.
 fn role_name(role: Role) -> String {
     match role {
@@ -6832,17 +7434,33 @@ fn menu_label(label: &menu::Label) -> slint::SharedString {
         L::DeleteMessage => "menu-delete-message",
         L::OpenImage => "menu-open-image",
         L::SaveImage => "menu-save-image",
+        L::SaveFile => "menu-save-file",
         L::Cut => "menu-cut",
         L::Paste => "menu-paste",
     };
     t!(key).into()
 }
 
-fn role_label(role: client::RoleId) -> String {
+/// The four built-ins as a role table, for before a server sends
+/// its own (or a server too old to).
+fn builtin_role_table() -> BTreeMap<client::RoleId, client::protocol::RoleInfo> {
     client::permissions::BUILTIN_ROLES
         .iter()
-        .find(|r| r.id == role)
-        .map_or_else(|| format!("role {role}"), |r| r.name.to_string())
+        .map(|r| {
+            (
+                r.id,
+                client::protocol::RoleInfo {
+                    id: r.id,
+                    name: r.name.to_string(),
+                    rank: r.rank,
+                    permissions: r.permissions,
+                    builtin: true,
+                    icon: String::new(),
+                    color: 0,
+                },
+            )
+        })
+        .collect()
 }
 
 /// A dialog field that is either empty (`Ok(None)`) or a whole number
@@ -6879,7 +7497,7 @@ fn wall_now_ms() -> u64 {
 }
 
 /// "expires in 3 h" / "never expires", from a wall-clock deadline.
-fn describe_expiry(expires_at: Option<u64>) -> String {
+pub(crate) fn describe_expiry(expires_at: Option<u64>) -> String {
     match expires_at {
         None => t!("invite-never-expires"),
         Some(at) => {
@@ -6890,7 +7508,7 @@ fn describe_expiry(expires_at: Option<u64>) -> String {
 }
 
 /// "for 2 d" / "indefinitely", for a ban deadline.
-fn describe_until(until: Option<u64>) -> String {
+pub(crate) fn describe_until(until: Option<u64>) -> String {
     match until {
         None => t!("ban-indefinite"),
         Some(at) => {
@@ -6998,6 +7616,66 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_invite_create(t!("invite-create").into());
     tr.set_invite_copy(t!("invite-copy").into());
     tr.set_invite_close(t!("invite-close").into());
+    tr.set_file_save(t!("file-save").into());
+    tr.set_admin_title(t!("admin-title").into());
+    tr.set_admin_button(t!("admin-button").into());
+    tr.set_admin_refresh(t!("admin-refresh").into());
+    tr.set_admin_loading(t!("admin-loading").into());
+    tr.set_admin_none(t!("admin-none").into());
+    tr.set_admin_sure(t!("admin-sure").into());
+    tr.set_admin_users(t!("admin-users").into());
+    tr.set_admin_users_lead(t!("admin-users-lead").into());
+    tr.set_admin_reason(t!("admin-reason").into());
+    tr.set_admin_reason_placeholder(t!("admin-reason-placeholder").into());
+    tr.set_admin_disconnect(t!("admin-disconnect").into());
+    tr.set_admin_kick(t!("admin-kick").into());
+    tr.set_admin_ban(t!("admin-ban").into());
+    tr.set_admin_reset_profile(t!("admin-reset-profile").into());
+    tr.set_admin_purge(t!("admin-purge").into());
+    tr.set_admin_set_role(t!("admin-set-role").into());
+    tr.set_admin_roles(t!("admin-roles").into());
+    tr.set_admin_roles_lead(t!("admin-roles-lead").into());
+    tr.set_admin_holders(t!("admin-holders").into());
+    tr.set_admin_builtin(t!("admin-builtin").into());
+    tr.set_admin_edit(t!("admin-edit").into());
+    tr.set_admin_delete(t!("admin-delete").into());
+    tr.set_admin_role_new(t!("admin-role-new").into());
+    tr.set_admin_role_editing(t!("admin-role-editing").into());
+    tr.set_admin_role_name(t!("admin-role-name").into());
+    tr.set_admin_role_name_hint(t!("admin-role-name-hint").into());
+    tr.set_admin_role_rank_hint(t!("admin-role-rank-hint").into());
+    tr.set_admin_role_save(t!("admin-role-save").into());
+    tr.set_admin_restrictions(t!("admin-restrictions").into());
+    tr.set_admin_restrictions_lead(t!("admin-restrictions-lead").into());
+    tr.set_admin_lift(t!("admin-lift").into());
+    tr.set_admin_invites(t!("admin-invites").into());
+    tr.set_admin_invites_lead(t!("admin-invites-lead").into());
+    tr.set_admin_revoke(t!("admin-revoke").into());
+    tr.set_admin_revoked(t!("admin-revoked").into());
+    tr.set_admin_channels(t!("admin-channels").into());
+    tr.set_admin_channels_lead(t!("admin-channels-lead").into());
+    tr.set_admin_members(t!("admin-members").into());
+    tr.set_admin_config_owned(t!("admin-config-owned").into());
+    tr.set_admin_files(t!("admin-files").into());
+    tr.set_admin_files_lead(t!("admin-files-lead").into());
+    tr.set_admin_refs(t!("admin-refs").into());
+    tr.set_admin_audit(t!("admin-audit").into());
+    tr.set_admin_audit_lead(t!("admin-audit-lead").into());
+    tr.set_admin_audit_more(t!("admin-audit-more").into());
+    tr.set_admin_server(t!("admin-server").into());
+    tr.set_admin_server_lead(t!("admin-server-lead").into());
+    tr.set_admin_stat_version(t!("admin-stat-version").into());
+    tr.set_admin_stat_uptime(t!("admin-stat-uptime").into());
+    tr.set_admin_stat_online(t!("admin-stat-online").into());
+    tr.set_admin_stat_users(t!("admin-stat-users").into());
+    tr.set_admin_stat_messages(t!("admin-stat-messages").into());
+    tr.set_admin_stat_blobs(t!("admin-stat-blobs").into());
+    tr.set_admin_stat_persistence(t!("admin-stat-persistence").into());
+    tr.set_admin_stat_queue(t!("admin-stat-queue").into());
+    tr.set_admin_stat_dropped(t!("admin-stat-dropped").into());
+    tr.set_admin_stat_errors(t!("admin-stat-errors").into());
+    tr.set_admin_yours(t!("admin-yours").into());
+    tr.set_admin_role_badge(t!("admin-role-badge").into());
     tr.set_invite_share_hint(t!("invite-share-hint").into());
     tr.set_invite_expiry_note(t!("invite-expiry-note").into());
     tr.set_dm_general(t!("dm-general").into());
