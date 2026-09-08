@@ -1080,6 +1080,22 @@ impl Driver {
     /// progress; `None` once it is fully written and finished (or
     /// dropped).
     #[must_use]
+    /// Abort a media upload: the stream is reset (the peer's reader sees
+    /// it end short and drops the partial) and the queue is freed. `true`
+    /// when there was one.
+    pub fn cancel_media(&mut self, peer: PeerId, upload: UploadId) -> bool {
+        let Some(p) = self.peer_mut(peer) else {
+            return false;
+        };
+        let Some(i) = p.uploads.iter().position(|u| u.id == upload) else {
+            return false;
+        };
+        let u = p.uploads.remove(i);
+        let _ = p.conn.send_stream(u.stream).reset(GROUP_RESET_CODE);
+        p.counters.uploads_dropped += 1;
+        true
+    }
+
     pub fn upload_progress(&self, peer: PeerId, upload: UploadId) -> Option<(usize, usize)> {
         let p = self.peer(peer)?;
         let u = p.uploads.iter().find(|u| u.id == upload)?;

@@ -28,10 +28,10 @@ use log::{debug, info, warn};
 use protocol::{
     features,
     permissions::{self, RoleId, RANK_ADMIN, RANK_GUEST, ROLE_ADMIN},
-    AdminCommand, Auth, ChannelDenyReason, ChannelInfo, ChatMessage, ClientId, ClientKeyProof, ClientMessage,
-    DenyReason, InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason, RefusedReason,
-    RemovedKind, RestrictionKind, ServerMessage, ShareScope, TelemetryEvent, TelemetrySample,
-    UserId,
+    AdminCommand, Auth, ChannelDenyReason, ChannelInfo, ChatMessage, ClientId, ClientKeyProof,
+    ClientMessage, DenyReason, InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason,
+    RefusedReason, RemovedKind, RestrictionKind, ServerMessage, ShareScope, TelemetryEvent,
+    TelemetrySample, UserId,
 };
 use sha2::{Digest, Sha256};
 use transport::{
@@ -514,12 +514,23 @@ impl ChatServer {
             code: code.clone(),
             invite: invite.clone(),
         });
+        let uses = max_uses.map_or_else(|| "unlimited uses".to_string(), |n| format!("{n} uses"));
+        let ttl = ttl_ms.map_or_else(
+            || "never expires".to_string(),
+            |ms| {
+                format!(
+                    "expires in {}",
+                    crate::server::files::human_duration(ms / 1000)
+                )
+            },
+        );
         self.audit(
             created_by,
             "invite.create",
             Some(code.clone()),
             Some(format!(
-                "role {role}, max_uses {max_uses:?}, ttl_ms {ttl_ms:?}"
+                "as {}, {uses}, {ttl}",
+                self.role_name_for_audit(role)
             )),
         );
         Ok((code, invite))
@@ -540,8 +551,17 @@ impl ChatServer {
                 .map(|u| hex(&u[..8]))
                 .or_else(|| stored.key_hash.map(|k| hex(&k[..8]))),
             Some(format!(
-                "{:?} until {:?}: {}",
-                stored.kind, stored.until, stored.reason
+                "{} {}{}",
+                stored.kind.name(),
+                stored.until.map_or_else(
+                    || "indefinitely".to_string(),
+                    |until| format!("until {}", wall_stamp(until))
+                ),
+                if stored.reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stored.reason)
+                }
             )),
         );
         if stored.kind == RestrictionKind::Server {
@@ -1090,7 +1110,10 @@ impl ChatServer {
                 Some(user_id),
                 "user.join",
                 Some(hex(&user_id[..8])),
-                Some(format!("invite {code}, role {role}")),
+                Some(format!(
+                    "with invite {code} as {}",
+                    self.role_name_for_audit(role)
+                )),
             );
             let role_name = self
                 .policy
@@ -3041,6 +3064,14 @@ fn mint_bootstrap_invite(
         protocol::invite::display_code(&code)
     );
     Some(code)
+}
+
+/// A wall-clock millisecond stamp as `2026-09-08 14:06`, for audit lines.
+fn wall_stamp(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap_or(0)).map_or_else(
+        || ms.to_string(),
+        |t| t.format("%Y-%m-%d %H:%M UTC").to_string(),
+    )
 }
 
 fn hex(bytes: &[u8]) -> String {

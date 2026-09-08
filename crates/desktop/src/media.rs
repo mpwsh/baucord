@@ -350,13 +350,10 @@ pub fn paste_into_chat(app: &mut AppState) {
 /// A picked path: an image previews and goes the image way; anything
 /// else uploads as a blob and posts as a card (spec §7).
 fn attach_path(app: &mut AppState, path: &std::path::Path) {
-    let is_image = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| {
-            let lower = e.to_ascii_lowercase();
-            images::IMAGE_EXTENSIONS.contains(&lower.as_str())
-        });
+    let is_image = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        let lower = e.to_ascii_lowercase();
+        images::IMAGE_EXTENSIONS.contains(&lower.as_str())
+    });
     if !is_image {
         start_file_upload(app, path);
         return;
@@ -446,7 +443,13 @@ pub fn save_to_downloads(name: &str, bytes: &[u8]) -> std::io::Result<std::path:
     std::fs::create_dir_all(&dir)?;
     let safe: String = name
         .chars()
-        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':') { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let base = std::path::Path::new(&safe);
     let stem = base
@@ -484,28 +487,22 @@ pub fn attach_image_from_disk() {
     });
 }
 
-/// Fetch a pasted image URL off-thread, then preview it. The status
-/// line under the composer shows "Downloading image…" while the fetch
-/// runs (same slot the upload progress uses).
+/// Fetch a pasted image URL off-thread, then preview it; a toast says
+/// the fetch is running.
 fn fetch_image_url(app: &mut AppState, url: &str) {
-    app.main
-        .global::<State>()
-        .set_upload_line(t!("chat-downloading-image").into());
+    app.show_toast(ui::ToastKind::Info, &t!("chat-downloading-image"));
     let url = url.to_string();
     info!("Fetching pasted image URL: {url}");
     std::thread::spawn(move || {
         let result = fetch_bytes(&url);
         let _ = slint::invoke_from_event_loop(move || {
-            crate::app::with_current(move |app| {
-                app.main.global::<State>().set_upload_line("".into());
-                match result {
-                    Ok(raw) => match images::load_image_bytes(raw, app.image_budget()) {
-                        Ok(bytes) => show_preview(app, bytes),
-                        Err(e) => app.show_error(&describe(&e)),
-                    },
-                    Err(e) => {
-                        app.show_error(&t!("chat-image-load-error", "error" => e.as_str()));
-                    }
+            crate::app::with_current(move |app| match result {
+                Ok(raw) => match images::load_image_bytes(raw, app.image_budget()) {
+                    Ok(bytes) => show_preview(app, bytes),
+                    Err(e) => app.show_error(&describe(&e)),
+                },
+                Err(e) => {
+                    app.show_error(&t!("chat-image-load-error", "error" => e.as_str()));
                 }
             });
         });

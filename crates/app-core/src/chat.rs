@@ -695,7 +695,10 @@ mod tests {
         assert_eq!(human_size(640 * 1024), "640 KB");
         // A deleted card keeps its header.
         assert!(h.delete_message(1).is_some());
-        assert!(matches!(h.rows()[0], ChatItem::Message { deleted: true, .. }));
+        assert!(matches!(
+            h.rows()[0],
+            ChatItem::Message { deleted: true, .. }
+        ));
     }
 
     #[test]
@@ -709,7 +712,11 @@ mod tests {
         h.push_message(&meta(3), "again", false);
         let changed = h.rename_author("a", "alicia");
         assert_eq!(changed, vec![0, 3]);
-        assert!(h.rows().iter().filter_map(ChatItem::meta).all(|m| m.user != "a"));
+        assert!(h
+            .rows()
+            .iter()
+            .filter_map(ChatItem::meta)
+            .all(|m| m.user != "a"));
         assert_eq!(h.rows()[2].meta().map(|m| m.user.as_str()), Some("carol"));
         assert!(h.rename_author("nobody", "x").is_empty());
     }

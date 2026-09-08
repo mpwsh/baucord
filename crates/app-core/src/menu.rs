@@ -534,7 +534,10 @@ mod tests {
             outranked: true,
             ..member()
         };
-        assert_eq!(user_menu(&Session::default(), &outranked, &[], &[]).len(), 3);
+        assert_eq!(
+            user_menu(&Session::default(), &outranked, &[], &[]).len(),
+            3
+        );
         // Both: the four entries, the first with a rule above.
         let entries = user_menu(&admin, &outranked, &[], &[]);
         assert_eq!(
@@ -730,10 +733,7 @@ mod tests {
             [Label::CopyMessage, Label::EditMessage, Label::DeleteMessage]
         );
         assert!(entries[1].separator && entries[2].danger);
-        let in_dm = MessageFacts {
-            in_dm: true,
-            ..own
-        };
+        let in_dm = MessageFacts { in_dm: true, ..own };
         assert_eq!(message_menu(&in_dm).len(), 1);
     }
 

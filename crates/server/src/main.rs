@@ -619,11 +619,8 @@ fn user_command(config: &Config, command: UserCommand) -> Result<(), Box<dyn std
             let mut users: Vec<_> = policy.users.iter().collect();
             users.sort_by_key(|(_, u)| u.name.to_ascii_lowercase());
             for (id, u) in users {
-                let roles: Vec<String> = u
-                    .roles
-                    .iter()
-                    .map(|r| role_name_in(&policy, *r))
-                    .collect();
+                let roles: Vec<String> =
+                    u.roles.iter().map(|r| role_name_in(&policy, *r)).collect();
                 println!(
                     "{}  {:<24} {:<20} last seen {}",
                     persistence::hex(id),
@@ -915,8 +912,9 @@ fn parse_permissions(names: &[String]) -> Result<u64, String> {
         if name.is_empty() {
             continue;
         }
-        bits |= protocol::permissions::permission_by_name(name)
-            .ok_or_else(|| persistence::PersistError::BadPermission(name.to_string()).to_string())?;
+        bits |= protocol::permissions::permission_by_name(name).ok_or_else(|| {
+            persistence::PersistError::BadPermission(name.to_string()).to_string()
+        })?;
     }
     Ok(bits)
 }
@@ -973,7 +971,11 @@ fn role_command(config: &Config, command: RoleCommand) -> Result<(), Box<dyn std
             let mut roles: Vec<_> = policy.roles.iter().collect();
             roles.sort_by_key(|(id, r)| (r.rank, **id));
             for (id, r) in roles {
-                let holders = policy.users.values().filter(|u| u.roles.contains(id)).count();
+                let holders = policy
+                    .users
+                    .values()
+                    .filter(|u| u.roles.contains(id))
+                    .count();
                 println!(
                     "{id:>3}  {:<16} {:<8} {:<18} {} user(s)\n     {}",
                     r.name,

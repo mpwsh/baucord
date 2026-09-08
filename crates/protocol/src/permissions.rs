@@ -231,7 +231,9 @@ pub fn permission_names(permissions: u64) -> Vec<&'static str> {
 pub fn valid_custom_role_name(name: &str) -> bool {
     let ok_chars = !name.is_empty()
         && name.len() <= 32
-        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !name.starts_with('-')
         && !name.ends_with('-');
     ok_chars && !BUILTIN_ROLES.iter().any(|r| r.name == name)
@@ -282,7 +284,10 @@ mod tests {
             assert_eq!(permission_names(bit), vec![name]);
         }
         assert_eq!(permission_by_name("fly"), None);
-        assert_eq!(permission_names(GUEST_PERMISSIONS), vec!["join", "speak", "text"]);
+        assert_eq!(
+            permission_names(GUEST_PERMISSIONS),
+            vec!["join", "speak", "text"]
+        );
         assert!(!has(CUSTOM_ROLE_PERMISSIONS, ADMIN));
         assert!(has(CUSTOM_ROLE_PERMISSIONS, GOLD_NAME));
         assert_eq!(CUSTOM_ROLE_PERMISSIONS | ADMIN, ADMIN_PERMISSIONS);

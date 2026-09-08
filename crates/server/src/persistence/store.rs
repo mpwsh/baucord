@@ -210,10 +210,8 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn delete_blob(&self, blob_id: &[u8; 32]) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "DELETE FROM blobs WHERE blob_id = ?1",
-            params![blob_id],
-        )?;
+        self.conn
+            .execute("DELETE FROM blobs WHERE blob_id = ?1", params![blob_id])?;
         let path = self.blobs.join(hex(blob_id));
         if let Err(e) = fs::remove_file(&path)
             && e.kind() != io::ErrorKind::NotFound
@@ -830,9 +828,8 @@ impl Sqlite {
              VALUES (?1, ?2, ?3, 0, ?4, ?5)",
             params![name, bits_to_sql(permissions), rank, icon, i64::from(color)],
         )?;
-        u32::try_from(self.conn.last_insert_rowid()).map_err(|_| {
-            rusqlite::Error::IntegralValueOutOfRange(0, self.conn.last_insert_rowid())
-        })
+        u32::try_from(self.conn.last_insert_rowid())
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, self.conn.last_insert_rowid()))
     }
 
     /// A custom role with the id the tick picked (`role_id` is a plain
@@ -852,7 +849,14 @@ impl Sqlite {
         self.conn.execute(
             "INSERT OR IGNORE INTO roles (role_id, name, permissions, rank, builtin, icon, color)
              VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
-            params![role_id, name, bits_to_sql(permissions), rank, icon, i64::from(color)],
+            params![
+                role_id,
+                name,
+                bits_to_sql(permissions),
+                rank,
+                icon,
+                i64::from(color)
+            ],
         )?;
         Ok(())
     }
@@ -873,7 +877,14 @@ impl Sqlite {
         self.conn.execute(
             "UPDATE roles SET name = ?2, permissions = ?3, rank = ?4, icon = ?5, color = ?6
              WHERE role_id = ?1 AND builtin = 0",
-            params![role_id, name, bits_to_sql(permissions), rank, icon, i64::from(color)],
+            params![
+                role_id,
+                name,
+                bits_to_sql(permissions),
+                rank,
+                icon,
+                i64::from(color)
+            ],
         )?;
         Ok(())
     }
@@ -1010,21 +1021,18 @@ impl Sqlite {
             "SELECT id, ts, actor_user_id, action, target, detail FROM audit
              WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(
-            params![before.map(ordered), i64::from(limit)],
-            |row| {
-                Ok((
-                    unordered(row.get(0)?),
-                    AuditRow {
-                        ts: unordered(row.get(1)?),
-                        actor: row.get(2)?,
-                        action: row.get(3)?,
-                        target: row.get(4)?,
-                        detail: row.get(5)?,
-                    },
-                ))
-            },
-        )?;
+        let rows = stmt.query_map(params![before.map(ordered), i64::from(limit)], |row| {
+            Ok((
+                unordered(row.get(0)?),
+                AuditRow {
+                    ts: unordered(row.get(1)?),
+                    actor: row.get(2)?,
+                    action: row.get(3)?,
+                    target: row.get(4)?,
+                    detail: row.get(5)?,
+                },
+            ))
+        })?;
         rows.collect()
     }
 
@@ -1600,7 +1608,9 @@ pub fn cli_role_create(
         actor: None,
         action: "role.create".to_string(),
         target: Some(id.to_string()),
-        detail: Some(format!("cli: {name} rank {rank} permissions {permissions:#x}")),
+        detail: Some(format!(
+            "cli: {name} rank {rank} permissions {permissions:#x}"
+        )),
     })?;
     db.close();
     Ok(id)
@@ -1640,7 +1650,9 @@ pub fn cli_role_edit(db_path: &Path, who: &str, edit: &RoleEdit) -> Result<u32, 
         actor: None,
         action: "role.edit".to_string(),
         target: Some(id.to_string()),
-        detail: Some(format!("cli: {name} rank {rank} permissions {permissions:#x}")),
+        detail: Some(format!(
+            "cli: {name} rank {rank} permissions {permissions:#x}"
+        )),
     })?;
     db.close();
     Ok(id)

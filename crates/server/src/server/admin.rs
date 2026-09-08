@@ -82,16 +82,58 @@ impl ChatServer {
                         id,
                         ts: row.ts,
                         actor: row.actor.map(|a| self.name_of_user(&a)),
+                        target: row
+                            .target
+                            .as_deref()
+                            .map(|t| self.audit_target_name(&row.action, t)),
                         action: row.action,
-                        target: row.target,
                         detail: row.detail,
                     })
                     .collect(),
             )),
             Outcome::Answered(Answer::Failed(e)) => Err(AdminError::Invalid(e)),
-            _ => Err(AdminError::Invalid("the audit log did not answer in time".into())),
+            _ => Err(AdminError::Invalid(
+                "the audit log did not answer in time".into(),
+            )),
         };
         self.send_msg(client, &ServerMessage::AdminResult { request_id, result });
+    }
+
+    /// An audit target as the panel should read it: a user's short id
+    /// becomes their name, a role or channel id its name, a
+    /// restriction or message id gets a `#`. Codes and hashes stay.
+    fn audit_target_name(&self, action: &str, target: &str) -> String {
+        let user_named = || {
+            self.policy
+                .users
+                .iter()
+                .find(|(id, _)| hex(&id[..8]) == target)
+                .map(|(_, u)| u.name.clone())
+        };
+        match action {
+            a if a.starts_with("user.") || a == "restrict" || a == "profile.reset" => {
+                user_named().unwrap_or_else(|| target.to_string())
+            }
+            a if a.starts_with("role.") => target
+                .parse::<u32>()
+                .ok()
+                .and_then(|id| self.policy.roles.get(&id))
+                .map_or_else(|| format!("role {target}"), |r| r.name.clone()),
+            a if a.starts_with("channel.") => target
+                .parse::<u64>()
+                .ok()
+                .and_then(|stable| {
+                    self.policy
+                        .channels
+                        .iter()
+                        .find(|c| c.stable_id == stable)
+                        .map(|c| c.name.clone())
+                })
+                .unwrap_or_else(|| format!("channel {target}")),
+            "restriction.lift" => format!("restriction #{target}"),
+            "message.delete" => format!("message #{target}"),
+            _ => target.to_string(),
+        }
     }
 
     /// A user's name of record, or a short id.
@@ -163,7 +205,11 @@ impl ChatServer {
                         Some(actor),
                         "blob.delete",
                         Some(hex(&blob_id[..8])),
-                        Some(format!("{} ({} B)", gone.name, gone.size)),
+                        Some(format!(
+                            "{} ({})",
+                            gone.name,
+                            super::files::human_size(u64::from(gone.size))
+                        )),
                     );
                 }
                 AdminOutcome::Done
@@ -270,7 +316,10 @@ impl ChatServer {
             Some(actor),
             "role.create",
             Some(id.to_string()),
-            Some(format!("{name} rank {rank} permissions {perms:#x}")),
+            Some(format!(
+                "{name}: {}",
+                permissions::permission_names(perms).join(", ")
+            )),
         );
         info!("role {name} ({id}) created from the panel");
         self.broadcast_roles();
@@ -329,7 +378,10 @@ impl ChatServer {
             Some(actor),
             "role.edit",
             Some(id.to_string()),
-            Some(format!("{name} rank {rank} permissions {perms:#x}")),
+            Some(format!(
+                "{name}: {}",
+                permissions::permission_names(perms).join(", ")
+            )),
         );
         self.broadcast_roles();
         for user in self.holders_of(id) {

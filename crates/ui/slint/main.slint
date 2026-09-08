@@ -78,34 +78,49 @@ export component MainWindow inherits Window {
     // build's fresh-chat-per-session semantics.
     if State.phase != Phase.connect && State.phase != Phase.main : StartupView { }
     if State.phase == Phase.connect : ConnectView { }
+    // While the sidebar's edge is dragged, only a line moves: the
+    // width lands on release. Re-laying out the chat (every message
+    // re-wraps) on every pointer move flickered the whole window.
+    property <length> sidebar-preview: -1px;
     main-screen := HorizontalLayout {
         visible: State.phase == Phase.main;
         Rectangle {
             width: State.sidebar-width;
+            // Above the chat pane, so a tooltip at the edge is not
+            // painted over by it.
+            z: 1;
             Sidebar { }
-            // The edge: drag to resize, within reason.
             grip := TouchArea {
                 x: parent.width - 4px;
                 width: 8px;
                 mouse-cursor: MouseCursor.col-resize;
-                property <length> start-width;
-                pointer-event(ev) => {
-                    if (ev.kind == PointerEventKind.down) {
-                        self.start-width = State.sidebar-width;
-                    } else if (ev.kind == PointerEventKind.up) {
-                        Logic.sidebar-resized(State.sidebar-width);
-                    }
-                }
-                moved => {
-                    State.sidebar-width = Math.clamp(
-                        self.start-width + (self.mouse-x - self.pressed-x),
+                pure function target() -> length {
+                    return Math.clamp(State.sidebar-width + (self.mouse-x - self.pressed-x),
                         220px, Math.min(480px, root.width - 360px));
                 }
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) {
+                        root.sidebar-preview = State.sidebar-width;
+                    } else if (ev.kind == PointerEventKind.up && root.sidebar-preview >= 0px) {
+                        State.sidebar-width = self.target();
+                        root.sidebar-preview = -1px;
+                        Logic.sidebar-resized(State.sidebar-width);
+                    } else if (ev.kind == PointerEventKind.cancel) {
+                        root.sidebar-preview = -1px;
+                    }
+                }
+                moved => { if (self.pressed) { root.sidebar-preview = self.target(); } }
             }
         }
         chat-pane := ChatPane {
             horizontal-stretch: 1;
         }
+    }
+    if root.sidebar-preview >= 0px : Rectangle {
+        x: root.sidebar-preview - 1px;
+        width: 2px;
+        height: 100%;
+        background: Theme.accent-text;
     }
 
     // ── Profile card (spec §7.1, §8) ───────────────────────────────

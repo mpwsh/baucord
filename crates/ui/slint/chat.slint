@@ -121,6 +121,11 @@ component MessageRow inherits Rectangle {
     property <length> top: root.cozy ? (root.head ? Theme.gap-sm : 2px) : (root.head ? 4px : 1px);
     property <length> header-h: root.cozy && root.head ? Theme.chat-header : 0px;
     height: root.top + root.header-h + cell.height + (root.cozy ? 4px : 3px);
+    // The roster's hover, here too: the TouchArea wraps the content,
+    // so its hover holds over the text bodies as well.
+    border-radius: Theme.radius-sm;
+    background: ctx.has-hover ? Theme.hover : transparent;
+    animate background { duration: 100ms; }
 
     // Under everything: the read-only body ignores right-clicks, so
     // they land here and open the row's menu.
@@ -132,8 +137,7 @@ component MessageRow inherits Rectangle {
                     self.absolute-position.y + self.mouse-y);
             }
         }
-    }
-    Rectangle {
+        Rectangle {
         if root.cozy : Gutter {
             x: 0px;
             y: root.top;
@@ -251,6 +255,7 @@ component MessageRow inherits Rectangle {
             color: Theme.text-muted;
             font-size: Theme.font-sm;
         }
+        }
     }
 }
 
@@ -299,7 +304,11 @@ component FileRow inherits Rectangle {
     in property <bool> head: !data.continuation;
     in property <length> top: root.cozy && root.head ? Theme.gap-xs : 2px;
     height: root.top + (root.cozy && root.head ? 20px : 0px) + 60px + Theme.gap-xs;
-    background: transparent;
+    // The roster's hover, here too: the TouchArea wraps the content,
+    // so its hover holds over the text bodies as well.
+    border-radius: Theme.radius-sm;
+    background: ctx.has-hover ? Theme.hover : transparent;
+    animate background { duration: 100ms; }
 
     ctx := TouchArea {
         pointer-event(ev) => {
@@ -309,8 +318,7 @@ component FileRow inherits Rectangle {
                     self.absolute-position.y + self.mouse-y);
             }
         }
-    }
-    Rectangle {
+        Rectangle {
         if root.cozy : Gutter {
             x: 0px;
             y: root.top;
@@ -375,10 +383,58 @@ component FileRow inherits Rectangle {
                         overflow: elide;
                     }
                 }
+                // Already saved: a check and Open, with a small
+                // re-download beside them.
+                if data.transfer-kind == 0 && data.file-saved : HorizontalLayout {
+                    spacing: Theme.gap-xs;
+                    Rectangle {
+                        width: 16px;
+                        IconDisplay {
+                            icon: IconSet.Check;
+                            size: 16px;
+                            stroke: Theme.success;
+                        }
+                    }
+                    Rectangle {
+                        width: open-lbl.preferred-width + 2 * Theme.gap-sm;
+                        Rectangle {
+                            y: (parent.height - self.height) / 2;
+                            height: 28px;
+                            border-radius: Theme.radius-sm;
+                            background: open-t.has-hover ? Theme.hover : Theme.bg-tertiary;
+                            animate background { duration: 150ms; }
+                            open-lbl := Text {
+                                text: Tr.file-open;
+                                color: Theme.text-primary;
+                                font-size: Theme.font-sm;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+                            open-t := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { Logic.file-open(data.row-id); }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        width: 28px;
+                        IconBtn {
+                            y: (parent.height - self.height) / 2;
+                            size: 28px;
+                            icon-size: 14px;
+                            icon: IconSet.Download;
+                            tooltip: Tr.file-save-again;
+                            clicked => { Logic.file-save(data.row-id); }
+                        }
+                    }
+                }
                 Rectangle {
-                    width: save-lbl.preferred-width + 2 * Theme.gap-sm;
+                    width: data.file-saved && data.transfer-kind == 0 ? 0px
+                        : data.transfer-kind != 0 ? 28px + Theme.gap-xs + 28px
+                        : save-lbl.preferred-width + 2 * Theme.gap-sm;
                     // Save — or a turning ring while a transfer runs.
-                    if data.transfer-kind == 0 : Rectangle {
+                    if data.transfer-kind == 0 && !data.file-saved : Rectangle {
                         y: (parent.height - self.height) / 2;
                         height: 28px;
                         border-radius: Theme.radius-sm;
@@ -400,6 +456,7 @@ component FileRow inherits Rectangle {
                     }
                     // A ring that fills with the percent: determinate,
                     // so it says how far, not just that something moves.
+                    // The ✕ beside it stops the transfer.
                     if data.transfer-kind != 0 : Rectangle {
                         y: (parent.height - self.height) / 2;
                         width: 28px;
@@ -434,6 +491,15 @@ component FileRow inherits Rectangle {
                             stroke-line-cap: round;
                         }
                     }
+                    if data.transfer-kind != 0 : IconBtn {
+                        x: 28px + Theme.gap-xs;
+                        y: (parent.height - self.height) / 2;
+                        size: 28px;
+                        icon-size: 14px;
+                        icon: IconSet.X;
+                        tooltip: Tr.file-cancel;
+                        clicked => { Logic.file-cancel(data.row-id); }
+                    }
                     // Measured off-screen so the slot keeps its width
                     // whichever face shows.
                     save-lbl := Text {
@@ -453,6 +519,7 @@ component FileRow inherits Rectangle {
                 background: Theme.accent-text;
                 animate width { duration: 150ms; }
             }
+        }
         }
     }
 }
@@ -509,6 +576,11 @@ component CodeRow inherits Rectangle {
     property <length> header-h: root.head ? Theme.chat-header : 0px;
     property <length> left: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
     height: root.top + root.header-h + panel.height + 6px;
+    // The roster's hover, here too: the TouchArea wraps the content,
+    // so its hover holds over the text bodies as well.
+    border-radius: Theme.radius-sm;
+    background: ctx.has-hover ? Theme.hover : transparent;
+    animate background { duration: 100ms; }
     ctx := TouchArea {
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
@@ -517,8 +589,7 @@ component CodeRow inherits Rectangle {
                     self.absolute-position.y + self.mouse-y);
             }
         }
-    }
-    Rectangle {
+        Rectangle {
         if root.cozy : Gutter {
             x: 0px;
             y: root.top;
@@ -573,6 +644,7 @@ component CodeRow inherits Rectangle {
                 }
             }
         }
+        }
     }
 }
 
@@ -594,6 +666,11 @@ component ImageRow inherits Rectangle {
     property <length> header-h: root.head ? Theme.chat-header : 0px;
     property <length> left: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
     height: root.top + root.header-h + disp-h + 6px;
+    // The roster's hover, here too: the TouchArea wraps the content,
+    // so its hover holds over the text bodies as well.
+    border-radius: Theme.radius-sm;
+    background: ctx.has-hover ? Theme.hover : transparent;
+    animate background { duration: 100ms; }
 
     ctx := TouchArea {
         pointer-event(ev) => {
@@ -603,8 +680,7 @@ component ImageRow inherits Rectangle {
                     self.absolute-position.y + self.mouse-y);
             }
         }
-    }
-    Rectangle {
+        Rectangle {
         if root.cozy : Gutter {
             x: 0px;
             y: root.top;
@@ -636,7 +712,63 @@ component ImageRow inherits Rectangle {
                         source: data.image;
                         image-fit: contain;
                     }
+                    // On its way up: muted, with the ring, the percent
+                    // and a ✕ over the picture (the file card's look).
+                    if data.transfer-kind != 0 : Rectangle {
+                        background: #00000088;
+                        border-radius: Theme.radius-md;
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: Theme.gap-sm;
+                            VerticalLayout {
+                                alignment: center;
+                                HorizontalLayout {
+                                    spacing: Theme.gap-sm;
+                                    Rectangle {
+                                        width: 28px;
+                                        height: 28px;
+                                        property <float> frac: Math.clamp(data.transfer-pct, 0, 100) / 100;
+                                        property <angle> sweep: frac * 360deg;
+                                        property <float> ex: 9 + 8 * Math.sin(sweep);
+                                        property <float> ey: 9 - 8 * Math.cos(sweep);
+                                        Path {
+                                            x: 5px; y: 5px; width: 18px; height: 18px;
+                                            viewbox-width: 18; viewbox-height: 18;
+                                            commands: "M 9 1 A 8 8 0 1 1 8.99 1";
+                                            stroke: #FFFFFF55;
+                                            stroke-width: 2px;
+                                        }
+                                        Path {
+                                            x: 5px; y: 5px; width: 18px; height: 18px;
+                                            viewbox-width: 18; viewbox-height: 18;
+                                            commands: parent.frac >= 0.999
+                                                ? "M 9 1 A 8 8 0 1 1 8.99 1"
+                                                : "M 9 1 A 8 8 0 \{parent.frac > 0.5 ? 1 : 0} 1 \{parent.ex} \{parent.ey}";
+                                            stroke: white;
+                                            stroke-width: 2px;
+                                            stroke-line-cap: round;
+                                        }
+                                    }
+                                    Text {
+                                        text: Tr.file-uploading-pct + " " + data.transfer-pct + "%";
+                                        color: white;
+                                        font-size: Theme.font-sm;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                    }
+                                    IconBtn {
+                                        size: 28px;
+                                        icon-size: 14px;
+                                        icon: IconSet.X;
+                                        tooltip: Tr.file-cancel;
+                                        clicked => { Logic.file-cancel(data.row-id); }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     it := TouchArea {
+                        enabled: data.transfer-kind == 0;
                         mouse-cursor: pointer;
                         clicked => { Logic.row-open-image(data.row-id); }
                         pointer-event(ev) => {
@@ -653,6 +785,7 @@ component ImageRow inherits Rectangle {
                 }
                 Rectangle { }   // left-align the image
             }
+        }
         }
     }
 }

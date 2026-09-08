@@ -276,6 +276,22 @@ impl ChatServer {
         }
     }
 
+    /// A role's name for an audit line (custom ones included).
+    pub(super) fn role_name_for_audit(&self, role: RoleId) -> String {
+        self.policy
+            .roles
+            .get(&role)
+            .map_or_else(|| format!("role {role}"), |r| r.name.clone())
+    }
+
+    /// A channel's name for an audit line, or its id.
+    pub(super) fn channel_name_for_audit(&self, channel_id: u16) -> String {
+        self.channel_infos
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map_or_else(|| format!("channel {channel_id}"), |c| c.name.clone())
+    }
+
     pub(super) fn send_if_roles(&mut self, client: ClientId, msg: &ServerMessage) {
         if self
             .features_of
@@ -555,7 +571,7 @@ impl ChatServer {
                     Some(actor),
                     "user.move",
                     Some(hex(&user_id[..8])),
-                    Some(format!("channel {channel_id}")),
+                    Some(format!("to {}", self.channel_name_for_audit(channel_id))),
                 );
                 Ok(AdminOutcome::Done)
             }
@@ -873,7 +889,15 @@ impl ChatServer {
             Some(actor),
             "user.roles",
             Some(hex(&user_id[..8])),
-            Some(format!("{roles:?}")),
+            Some(if roles.is_empty() {
+                "no roles".to_string()
+            } else {
+                roles
+                    .iter()
+                    .map(|r| self.role_name_for_audit(*r))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }),
         );
         self.roles_changed(user_id);
         Ok(())

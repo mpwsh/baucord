@@ -29,6 +29,9 @@ export component Btn inherits Rectangle {
         : touch.has-hover ? Theme.hover : Theme.bg-tertiary;
 
     height: 36px;
+    // Room around the label: without it a layout gives the button the
+    // text's own width, and the edges cut right where the letters end.
+    min-width: lbl.preferred-width + 2 * Theme.gap-lg;
     border-radius: Theme.radius-md;
     background: fill;
     opacity: enabled ? (touch.pressed ? 0.85 : 1.0) : 0.4;

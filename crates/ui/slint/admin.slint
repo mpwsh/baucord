@@ -20,6 +20,7 @@ export struct AdminUserRow {
     online: bool,
     last-seen: string,
     keys: int,
+    role-index: int,        // their highest role's index in role-names; -1 = none
 }
 
 export struct AdminRoleRow {
@@ -70,9 +71,9 @@ export struct AdminBlobRow {
 }
 
 export struct AdminAuditRow {
-    when: string,
+    when: string,           // "14:06", or "Sep 6 14:06" on another day
     actor: string,
-    action: string,
+    action: string,         // humanized: "kicked", "created an invite"
     target: string,
     detail: string,
 }
@@ -84,10 +85,15 @@ export global AdminState {
     // Users
     in property <[AdminUserRow]> users;
     in property <[string]> role-names;      // the Role dropdown, table order
-    in-out property <string> reason;
-    /// A destructive action asked once: the row awaiting its second
-    /// click (a user id, a role id as text, a blob hex).
-    in-out property <string> confirming;
+    // The confirmation the host asks before anything that bites: what
+    // it is about, what it does, whether it takes a reason.
+    in property <bool> confirm-open: false;
+    in property <string> confirm-title;
+    in property <string> confirm-text;
+    in property <string> confirm-label;     // the accepting button
+    in property <bool> confirm-danger: true;
+    in property <bool> confirm-asks-reason: false;
+    in-out property <string> confirm-reason;
     // Roles
     in property <[AdminRoleRow]> roles;
     in-out property <int> role-edit-id: -1;   // -1 = new
@@ -145,6 +151,8 @@ export global AdminLogic {
     callback channel-delete(id: int);
     callback blob-delete(blob-hex: string);
     callback audit-more();
+    callback confirm-accept();
+    callback confirm-cancel();
     callback close();
 }
 
@@ -187,9 +195,12 @@ component TabHead inherits VerticalLayout {
     HorizontalLayout {
         spacing: Theme.gap-sm;
         PanelHeader { title: root.title; lead: root.lead; horizontal-stretch: 1; }
+        // The refresh, or "loading" in its place: the list below never
+        // moves while a fetch is out.
         Rectangle {
-            width: 28px;
-            IconBtn {
+            width: 80px;
+            if !AdminState.busy : IconBtn {
+                x: parent.width - self.width;
                 y: 4px;
                 size: 28px;
                 icon-size: 16px;
@@ -198,6 +209,13 @@ component TabHead inherits VerticalLayout {
                 tooltip-below: true;
                 clicked => { AdminLogic.refresh(root.tab); }
             }
+            if AdminState.busy : Text {
+                x: parent.width - self.width;
+                y: 10px;
+                text: Tr.admin-loading;
+                color: Theme.text-muted;
+                font-size: Theme.font-xs;
+            }
         }
     }
     if AdminState.notice != "" : Text {
@@ -205,11 +223,6 @@ component TabHead inherits VerticalLayout {
         color: Theme.danger-text;
         font-size: Theme.font-sm;
         wrap: word-wrap;
-    }
-    if AdminState.busy : Text {
-        text: Tr.admin-loading;
-        color: Theme.text-muted;
-        font-size: Theme.font-sm;
     }
 }
 
@@ -249,11 +262,6 @@ component Muted inherits Text {
 component UsersTab inherits VerticalLayout {
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-users; lead: Tr.admin-users-lead; tab: 0; }
-    VerticalLayout {
-        spacing: Theme.gap-xs;
-        FieldLabel { text: Tr.admin-reason; }
-        Field { text <=> AdminState.reason; placeholder: Tr.admin-reason-placeholder; }
-    }
     if AdminState.users.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
     VerticalLayout {
         for u in AdminState.users : Row {
@@ -287,29 +295,22 @@ component UsersTab inherits VerticalLayout {
                             clicked => { AdminLogic.user-action(u.user-id, 3); } }
                         Chip { text: Tr.admin-reset-profile;
                             clicked => { AdminLogic.user-action(u.user-id, 5); } }
-                        Chip {
-                            text: AdminState.confirming == u.user-id ? Tr.admin-sure : Tr.admin-purge;
-                            danger: true;
-                            clicked => {
-                                if (AdminState.confirming == u.user-id) {
-                                    AdminState.confirming = "";
-                                    AdminLogic.user-action(u.user-id, 4);
-                                } else {
-                                    AdminState.confirming = u.user-id;
-                                }
-                            }
-                        }
+                        Chip { text: Tr.admin-purge; danger: true;
+                            clicked => { AdminLogic.user-action(u.user-id, 4); } }
                         Rectangle { }
                     }
                 }
+                // Their highest role; picking another one sets it.
                 Rectangle {
-                    width: 128px;
+                    width: 136px;
                     Dropdown {
                         y: (parent.height - self.height) / 2;
                         options: AdminState.role-names;
-                        current: -1;
+                        current: u.role-index;
                         placeholder: Tr.admin-set-role;
-                        selected(i) => { AdminLogic.user-set-role(u.user-id, i); }
+                        selected(i) => {
+                            if (i != u.role-index) { AdminLogic.user-set-role(u.user-id, i); }
+                        }
                     }
                 }
             }
@@ -345,18 +346,8 @@ component RolesTab inherits VerticalLayout {
                     Muted { text: r.permissions; }
                 }
                 if !r.builtin : Chip { text: Tr.admin-edit; clicked => { AdminLogic.role-select(r.id); } }
-                if !r.builtin : Chip {
-                    text: AdminState.confirming == "role:" + r.id ? Tr.admin-sure : Tr.admin-delete;
-                    danger: true;
-                    clicked => {
-                        if (AdminState.confirming == "role:" + r.id) {
-                            AdminState.confirming = "";
-                            AdminLogic.role-delete(r.id);
-                        } else {
-                            AdminState.confirming = "role:" + r.id;
-                        }
-                    }
-                }
+                if !r.builtin : Chip { text: Tr.admin-delete; danger: true;
+                    clicked => { AdminLogic.role-delete(r.id); } }
                 if r.builtin : Muted { text: Tr.admin-builtin; }
             }
         }
@@ -538,18 +529,8 @@ component ChannelsTab inherits VerticalLayout {
                 }
                 if c.config-owned : Muted { text: Tr.admin-config-owned; }
                 if !c.config-owned : Chip { text: Tr.admin-edit; clicked => { AdminLogic.channel-edit(c.id); } }
-                if !c.config-owned : Chip {
-                    text: AdminState.confirming == "channel:" + c.id ? Tr.admin-sure : Tr.admin-delete;
-                    danger: true;
-                    clicked => {
-                        if (AdminState.confirming == "channel:" + c.id) {
-                            AdminState.confirming = "";
-                            AdminLogic.channel-delete(c.id);
-                        } else {
-                            AdminState.confirming = "channel:" + c.id;
-                        }
-                    }
-                }
+                if !c.config-owned : Chip { text: Tr.admin-delete; danger: true;
+                    clicked => { AdminLogic.channel-delete(c.id); } }
             }
         }
     }
@@ -601,46 +582,61 @@ component FilesTab inherits VerticalLayout {
                     Cell { text: b.name; font-weight: 600; }
                     Muted { text: b.size + " · " + b.by + " · " + b.when + " · " + b.refs + " " + Tr.admin-refs; }
                 }
-                Chip {
-                    text: AdminState.confirming == b.blob-hex ? Tr.admin-sure : Tr.admin-delete;
-                    danger: true;
-                    clicked => {
-                        if (AdminState.confirming == b.blob-hex) {
-                            AdminState.confirming = "";
-                            AdminLogic.blob-delete(b.blob-hex);
-                        } else {
-                            AdminState.confirming = b.blob-hex;
-                        }
-                    }
-                }
+                Chip { text: Tr.admin-delete; danger: true;
+                    clicked => { AdminLogic.blob-delete(b.blob-hex); } }
             }
         }
     }
+}
+
+/// A column header cell for the audit table.
+component ColHead inherits Text {
+    color: Theme.text-muted;
+    font-size: Theme.font-xs;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    vertical-alignment: center;
+    overflow: elide;
 }
 
 component AuditTab inherits VerticalLayout {
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-audit; lead: Tr.admin-audit-lead; tab: 6; }
     if AdminState.audit.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
-    VerticalLayout {
+    // A table: fixed columns for when, who and what; the target and
+    // the details share the rest. Headers say what each is.
+    if AdminState.audit.length > 0 : VerticalLayout {
+        HorizontalLayout {
+            height: 28px;
+            padding-left: Theme.gap-xs;
+            padding-right: Theme.gap-xs;
+            spacing: Theme.gap-sm;
+            ColHead { text: Tr.admin-col-when; width: 84px; }
+            ColHead { text: Tr.admin-col-who; width: 96px; }
+            ColHead { text: Tr.admin-col-what; width: 132px; }
+            ColHead { text: Tr.admin-col-target; width: 116px; }
+            ColHead { text: Tr.admin-col-detail; horizontal-stretch: 1; }
+        }
+        Rectangle { height: 1px; background: Theme.border; }
         for e in AdminState.audit : Row {
             row-height: 44px;
             HorizontalLayout {
                 padding-left: Theme.gap-xs;
                 padding-right: Theme.gap-xs;
                 spacing: Theme.gap-sm;
-                Muted { text: e.when; width: 112px; }
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 2px;
+                Muted { text: e.when; width: 84px; }
+                Cell { text: e.actor; font-weight: 600; width: 96px; }
+                Cell { text: e.action; color: Theme.accent-text; width: 132px; }
+                Cell { text: e.target; color: Theme.text-secondary; width: 116px; }
+                // Two lines when it needs them, elided past that.
+                Text {
+                    text: e.detail;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-xs;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    overflow: elide;
                     horizontal-stretch: 1;
-                    HorizontalLayout {
-                        spacing: Theme.gap-xs;
-                        Cell { text: e.actor; font-weight: 600; }
-                        Cell { text: e.action; color: Theme.accent-text; }
-                        Cell { text: e.target; color: Theme.text-secondary; }
-                    }
-                    if e.detail != "" : Muted { text: e.detail; }
                 }
             }
         }
@@ -700,7 +696,6 @@ export component AdminWindow inherits Window {
 
     function open-tab(t: int) {
         root.tab = t;
-        AdminState.confirming = "";
         AdminLogic.refresh(t);
     }
 
@@ -747,6 +742,73 @@ export component AdminWindow inherits Window {
                     spacing: Theme.gap-sm;
                     Rectangle { }
                     Btn { text: Tr.invite-close; clicked => { AdminLogic.close(); } }
+                }
+            }
+        }
+    }
+
+    // ── Confirmation (every action that bites goes through it) ─────
+    // What it is about, what it does, a reason when the action takes
+    // one (kept in the audit and shown to the person), Escape or
+    // Cancel to back out.
+    if AdminState.confirm-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { AdminLogic.confirm-cancel(); } }
+        confirm-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) { AdminLogic.confirm-cancel(); return accept; }
+                reject
+            }
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: Math.min(420px, root.width - 48px);
+                height: confirm-col.preferred-height;
+                border-radius: Theme.radius-md;
+                background: Theme.bg-secondary;
+                border-width: 1px;
+                border-color: Theme.border;
+                drop-shadow-color: #00000088;
+                drop-shadow-blur: 16px;
+                drop-shadow-offset-y: 6px;
+                TouchArea { }
+                confirm-col := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: AdminState.confirm-title;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: AdminState.confirm-text;
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-sm;
+                        wrap: word-wrap;
+                    }
+                    if AdminState.confirm-asks-reason : VerticalLayout {
+                        spacing: Theme.gap-xs;
+                        FieldLabel { text: Tr.admin-reason; }
+                        Field {
+                            text <=> AdminState.confirm-reason;
+                            placeholder: Tr.admin-reason-placeholder;
+                            accepted => { AdminLogic.confirm-accept(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Rectangle { }
+                        Btn { text: Tr.cancel; clicked => { AdminLogic.confirm-cancel(); } }
+                        Btn {
+                            text: AdminState.confirm-label;
+                            danger: AdminState.confirm-danger;
+                            accent: !AdminState.confirm-danger;
+                            clicked => { AdminLogic.confirm-accept(); }
+                        }
+                    }
                 }
             }
         }

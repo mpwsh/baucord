@@ -244,6 +244,8 @@ component UserRowView inherits Rectangle {
 }
 
 export component Sidebar inherits Rectangle {
+    /// The Messages height the divider is being dragged to (-1 = no drag).
+    property <length> divider-preview: -1px;
     background: Theme.bg-secondary;
 
     VerticalLayout {
@@ -267,7 +269,7 @@ export component Sidebar inherits Rectangle {
             }
             // Admin: the panel (spec §8), for whoever holds `panel`.
             if State.perm-panel : Rectangle {
-                width: admin-lbl.preferred-width + 2 * Theme.gap-sm;
+                width: admin-lbl.preferred-width + 2 * Theme.gap-md;
                 height: 24px;
                 border-radius: Theme.radius-sm;
                 background: admin-t.has-hover ? Theme.hover : Theme.bg-tertiary;
@@ -289,14 +291,14 @@ export component Sidebar inherits Rectangle {
         if State.perm-create-channels || State.perm-create-invites : HorizontalLayout {
             spacing: Theme.gap-sm;
             if State.perm-create-channels : Rectangle {
-                width: new-lbl.preferred-width + 14px + 2 * Theme.gap-sm + Theme.gap-xs;
+                width: new-lbl.preferred-width + 14px + 2 * Theme.gap-md + Theme.gap-xs;
                 height: 26px;
                 border-radius: Theme.radius-sm;
                 background: new-t.has-hover ? Theme.hover : Theme.bg-tertiary;
                 animate background { duration: 150ms; }
                 HorizontalLayout {
-                    padding-left: Theme.gap-sm;
-                    padding-right: Theme.gap-sm;
+                    padding-left: Theme.gap-md;
+                    padding-right: Theme.gap-md;
                     spacing: Theme.gap-xs;
                     new-lbl := Text {
                         text: Tr.channel-new;
@@ -322,7 +324,7 @@ export component Sidebar inherits Rectangle {
             // Invite: a code with the defaults; it lands in chat and
             // on the clipboard.
             if State.perm-create-invites : Rectangle {
-                width: invite-lbl.preferred-width + 2 * Theme.gap-sm;
+                width: invite-lbl.preferred-width + 2 * Theme.gap-md;
                 height: 26px;
                 border-radius: Theme.radius-sm;
                 background: invite-t.has-hover ? Theme.hover : Theme.bg-tertiary;
@@ -358,9 +360,45 @@ export component Sidebar inherits Rectangle {
         // to read. The header folds the list away (a setting) so the
         // voice channels get the room; while folded, the unread total
         // moves up onto the header.
+        // The divider, and the grip on it: drag to give Messages more
+        // or less of the sidebar (the section's own height; the voice
+        // list takes the rest).
         if State.perm-dm || State.dms.length > 0 : Rectangle {
             height: 1px;
             background: Theme.border;
+            divider-grip := TouchArea {
+                y: -4px;
+                height: 9px;
+                enabled: !State.messages-collapsed;
+                mouse-cursor: MouseCursor.row-resize;
+                // Dragging the divider up grows Messages. Only a line
+                // moves during the drag; the height lands on release
+                // (re-laying out both lists per move flickered).
+                pure function target() -> length {
+                    return Math.clamp(State.messages-height - (self.mouse-y - self.pressed-y),
+                        100px, 480px);
+                }
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) {
+                        root.divider-preview = State.messages-height;
+                    } else if (ev.kind == PointerEventKind.up && root.divider-preview >= 0px) {
+                        State.messages-height = self.target();
+                        root.divider-preview = -1px;
+                        Logic.messages-resized(State.messages-height);
+                    } else if (ev.kind == PointerEventKind.cancel) {
+                        root.divider-preview = -1px;
+                    }
+                }
+                moved => { if (self.pressed) { root.divider-preview = self.target(); } }
+            }
+            // Where the divider will land: offset by how much the
+            // height changes (up for taller).
+            if root.divider-preview >= 0px : Rectangle {
+                y: -(root.divider-preview - State.messages-height) - 1px;
+                width: 100%;
+                height: 2px;
+                background: Theme.accent-text;
+            }
         }
         if State.perm-dm || State.dms.length > 0 : fold := Rectangle {
             property <int> hidden-unread: State.dm-unread-total
@@ -415,7 +453,7 @@ export component Sidebar inherits Rectangle {
         }
         if (State.perm-dm || State.dms.length > 0) && !State.messages-collapsed : dm-list := ScrollView {
             // A short list: the roster keeps the room.
-            height: Math.min(200px, 34px + 34px * State.dms.length);
+            height: State.messages-height;
             vertical-stretch: 0;
             VerticalLayout {
             spacing: 2px;
@@ -600,11 +638,6 @@ export component Sidebar inherits Rectangle {
                 color: Theme.text-muted;
                 font-size: Theme.font-xs;
                 overflow: elide;
-            }
-            if State.upload-line != "" : Text {
-                text: State.upload-line;
-                color: Theme.accent-text;
-                font-size: Theme.font-xs;
             }
         }
 

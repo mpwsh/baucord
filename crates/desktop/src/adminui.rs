@@ -28,6 +28,22 @@ pub const TAB_SERVER: i32 = 7;
 /// Audit entries per page.
 const AUDIT_PAGE: u16 = 50;
 
+/// An action the panel asked about; it runs on "confirm" with the
+/// reason typed into the dialog, when it takes one.
+#[derive(Debug, Clone)]
+pub enum PanelAction {
+    Disconnect(AdminTarget),
+    Kick(AdminTarget),
+    Ban(AdminTarget),
+    Purge(AdminTarget),
+    ResetProfile(AdminTarget),
+    DeleteRole(u32),
+    DeleteBlob(client::protocol::BlobId),
+    DeleteChannel(u16),
+    RevokeInvite(String),
+    Lift(u64),
+}
+
 /// Open the panel (creating it on first use) on `tab`.
 pub fn open(app: &mut AppState, tab: i32) {
     if app.admin_win.is_none() {
@@ -54,7 +70,7 @@ pub fn open(app: &mut AppState, tab: i32) {
     if let Some(win) = &app.admin_win {
         let s = win.global::<AdminState>();
         s.set_notice("".into());
-        s.set_confirming("".into());
+        s.set_confirm_open(false);
         s.set_perm_names(ModelRc::new(VecModel::from(
             client::permissions::PERMISSION_NAMES
                 .iter()
@@ -93,7 +109,10 @@ fn wire(win: &AdminWindow) {
             };
             // The dropdown lists the table in rank order.
             let ids = app.role_table_in_rank_order();
-            let Some(role) = usize::try_from(index).ok().and_then(|i| ids.get(i).copied()) else {
+            let Some(role) = usize::try_from(index)
+                .ok()
+                .and_then(|i| ids.get(i).copied())
+            else {
                 return;
             };
             app.send_admin(
@@ -126,7 +145,15 @@ fn wire(win: &AdminWindow) {
     logic.on_role_delete(|id| {
         app::with_current(move |app| {
             if let Ok(role) = u32::try_from(id) {
-                app.send_admin(AdminCommand::DeleteRole { role }, PendingAdmin::Panel(TAB_ROLES));
+                let name = app.role_name_of(role);
+                ask(
+                    app,
+                    PanelAction::DeleteRole(role),
+                    t!("admin-confirm-delete-role", "name" => name.as_str()),
+                    t!("admin-confirm-delete-role-text"),
+                    t!("admin-delete"),
+                    false,
+                );
             }
         });
     });
@@ -140,20 +167,26 @@ fn wire(win: &AdminWindow) {
     logic.on_restriction_lift(|id| {
         app::with_current(move |app| {
             if let Ok(restriction_id) = u64::try_from(id) {
-                app.send_admin(
-                    AdminCommand::Lift { restriction_id },
-                    PendingAdmin::Panel(TAB_RESTRICTIONS),
+                ask(
+                    app,
+                    PanelAction::Lift(restriction_id),
+                    t!("admin-confirm-lift"),
+                    t!("admin-confirm-lift-text"),
+                    t!("admin-lift"),
+                    false,
                 );
             }
         });
     });
     logic.on_invite_revoke(|code| {
         app::with_current(move |app| {
-            app.send_admin(
-                AdminCommand::RevokeInvite {
-                    code: code.to_string(),
-                },
-                PendingAdmin::Panel(TAB_INVITES),
+            ask(
+                app,
+                PanelAction::RevokeInvite(code.to_string()),
+                t!("admin-confirm-revoke", "code" => code.as_str()),
+                t!("admin-confirm-revoke-text"),
+                t!("admin-revoke"),
+                false,
             );
         });
     });
@@ -174,20 +207,42 @@ fn wire(win: &AdminWindow) {
     logic.on_channel_delete(|id| {
         app::with_current(move |app| {
             if let Ok(id) = u16::try_from(id) {
-                app.network
-                    .tx
-                    .send(NetworkControl::DeleteChannel { channel_id: id })
-                    .ok();
+                let name = app
+                    .channels
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map_or_else(String::new, |c| c.name.clone());
+                ask(
+                    app,
+                    PanelAction::DeleteChannel(id),
+                    t!("admin-confirm-delete-channel", "name" => name.as_str()),
+                    t!("admin-confirm-delete-channel-text"),
+                    t!("admin-delete"),
+                    false,
+                );
             }
         });
     });
     logic.on_blob_delete(|hex| {
         app::with_current(move |app| {
             if let Some(blob_id) = app::parse_hex_id(&hex) {
-                app.send_admin(
-                    AdminCommand::DeleteBlob { blob_id },
-                    PendingAdmin::Panel(TAB_FILES),
+                ask(
+                    app,
+                    PanelAction::DeleteBlob(blob_id),
+                    t!("admin-confirm-delete-file"),
+                    t!("admin-confirm-delete-file-text"),
+                    t!("admin-delete"),
+                    false,
                 );
+            }
+        });
+    });
+    logic.on_confirm_accept(|| app::with_current(confirm_accept));
+    logic.on_confirm_cancel(|| {
+        app::with_current(|app| {
+            app.admin_pending = None;
+            if let Some(win) = &app.admin_win {
+                win.global::<AdminState>().set_confirm_open(false);
             }
         });
     });
@@ -292,6 +347,7 @@ pub fn take_outcome(app: &mut AppState, tab: i32, outcome: AdminOutcome) {
                         app::describe_ago(u.last_seen).into()
                     },
                     keys: i32::try_from(u.keys.len()).unwrap_or(0),
+                    role_index: top_role_index(app, &u.roles),
                 })
                 .collect();
             s.set_users(ModelRc::new(VecModel::from(rows)));
@@ -370,9 +426,13 @@ pub fn take_outcome(app: &mut AppState, tab: i32, outcome: AdminOutcome) {
             let fresh: Vec<AdminAuditRow> = entries
                 .iter()
                 .map(|e| AdminAuditRow {
-                    when: app::format_wall_time(e.ts).into(),
-                    actor: e.actor.clone().unwrap_or_else(|| "server".into()).into(),
-                    action: e.action.as_str().into(),
+                    when: app::format_wall_stamp(e.ts).into(),
+                    actor: e
+                        .actor
+                        .clone()
+                        .unwrap_or_else(|| t!("admin-actor-server"))
+                        .into(),
+                    action: audit_action_text(&e.action).into(),
                     target: e.target.clone().unwrap_or_default().into(),
                     detail: e.detail.clone().unwrap_or_default().into(),
                 })
@@ -488,7 +548,11 @@ fn fill_channels(app: &mut AppState) {
             name: c.name.as_str().into(),
             members: i32::try_from(app.users.values().filter(|u| u.channel_id == c.id).count())
                 .unwrap_or(0),
-            owner: if c.owned { t!("admin-yours").into() } else { "".into() },
+            owner: if c.owned {
+                t!("admin-yours").into()
+            } else {
+                "".into()
+            },
             config_owned: c.from_config,
         })
         .collect();
@@ -562,32 +626,198 @@ fn role_save(app: &mut AppState) {
     app.send_admin(command, PendingAdmin::Panel(TAB_ROLES));
 }
 
+/// A row button on the Users tab: every one of them asks first. The
+/// dialog says what the action does; the ones that carry a reason to
+/// the person ask for it there.
 fn user_action(app: &mut AppState, user_id: &str, action: i32) {
     let Some(target) = target_of(user_id) else {
+        return;
+    };
+    let name = app
+        .admin_win
+        .as_ref()
+        .and_then(|w| {
+            let users = w.global::<AdminState>().get_users();
+            (0..users.row_count())
+                .filter_map(|i| users.row_data(i))
+                .find(|u| u.user_id.as_str() == user_id)
+                .map(|u| u.name.to_string())
+        })
+        .unwrap_or_default();
+    let n = name.as_str();
+    let (pending, title, text, label, reason) = match action {
+        1 => (
+            PanelAction::Disconnect(target),
+            t!("admin-confirm-disconnect", "name" => n),
+            t!("admin-confirm-disconnect-text"),
+            t!("admin-disconnect"),
+            true,
+        ),
+        2 => (
+            PanelAction::Kick(target),
+            t!("admin-confirm-kick", "name" => n),
+            t!("admin-confirm-kick-text"),
+            t!("admin-kick"),
+            true,
+        ),
+        3 => (
+            PanelAction::Ban(target),
+            t!("admin-confirm-ban", "name" => n),
+            t!("admin-confirm-ban-text"),
+            t!("admin-ban"),
+            true,
+        ),
+        4 => (
+            PanelAction::Purge(target),
+            t!("admin-confirm-purge", "name" => n),
+            t!("admin-confirm-purge-text"),
+            t!("admin-purge"),
+            false,
+        ),
+        5 => (
+            PanelAction::ResetProfile(target),
+            t!("admin-confirm-reset-profile", "name" => n),
+            t!("admin-confirm-reset-profile-text"),
+            t!("admin-reset-profile"),
+            false,
+        ),
+        _ => return,
+    };
+    ask(app, pending, title, text, label, reason);
+}
+
+/// Open the confirmation for `action`.
+fn ask(
+    app: &mut AppState,
+    action: PanelAction,
+    title: String,
+    text: String,
+    label: String,
+    asks_reason: bool,
+) {
+    let Some(win) = &app.admin_win else {
+        return;
+    };
+    let s = win.global::<AdminState>();
+    s.set_confirm_title(title.into());
+    s.set_confirm_text(text.into());
+    s.set_confirm_label(label.into());
+    s.set_confirm_asks_reason(asks_reason);
+    s.set_confirm_reason("".into());
+    s.set_confirm_danger(!matches!(action, PanelAction::Lift(_)));
+    s.set_confirm_open(true);
+    app.admin_pending = Some(action);
+}
+
+/// "Confirm": run the pending action with the reason typed.
+fn confirm_accept(app: &mut AppState) {
+    let Some(action) = app.admin_pending.take() else {
         return;
     };
     let reason = app
         .admin_win
         .as_ref()
-        .map(|w| w.global::<AdminState>().get_reason().to_string())
+        .map(|w| {
+            let s = w.global::<AdminState>();
+            s.set_confirm_open(false);
+            s.get_confirm_reason().trim().to_string()
+        })
         .unwrap_or_default();
-    let command = match action {
-        1 => AdminCommand::Disconnect { target, reason },
-        2 => AdminCommand::Kick { target, reason },
-        3 => AdminCommand::Ban {
-            target,
-            duration_secs: None,
-            reason,
-        },
-        4 => AdminCommand::PurgeUser { target },
-        5 => AdminCommand::ResetProfile {
-            target,
-            lock: false,
-        },
-        6 => AdminCommand::ResetProfile { target, lock: true },
-        _ => return,
+    match action {
+        PanelAction::Disconnect(target) => app.send_admin(
+            AdminCommand::Disconnect { target, reason },
+            PendingAdmin::Panel(TAB_USERS),
+        ),
+        PanelAction::Kick(target) => app.send_admin(
+            AdminCommand::Kick { target, reason },
+            PendingAdmin::Panel(TAB_USERS),
+        ),
+        PanelAction::Ban(target) => app.send_admin(
+            AdminCommand::Ban {
+                target,
+                duration_secs: None,
+                reason,
+            },
+            PendingAdmin::Panel(TAB_USERS),
+        ),
+        PanelAction::Purge(target) => {
+            app.send_admin(
+                AdminCommand::PurgeUser { target },
+                PendingAdmin::Panel(TAB_USERS),
+            );
+        }
+        PanelAction::ResetProfile(target) => app.send_admin(
+            AdminCommand::ResetProfile {
+                target,
+                lock: false,
+            },
+            PendingAdmin::Panel(TAB_USERS),
+        ),
+        PanelAction::DeleteRole(role) => {
+            app.send_admin(
+                AdminCommand::DeleteRole { role },
+                PendingAdmin::Panel(TAB_ROLES),
+            );
+        }
+        PanelAction::DeleteBlob(blob_id) => app.send_admin(
+            AdminCommand::DeleteBlob { blob_id },
+            PendingAdmin::Panel(TAB_FILES),
+        ),
+        PanelAction::DeleteChannel(channel_id) => {
+            app.network
+                .tx
+                .send(NetworkControl::DeleteChannel { channel_id })
+                .ok();
+        }
+        PanelAction::RevokeInvite(code) => app.send_admin(
+            AdminCommand::RevokeInvite { code },
+            PendingAdmin::Panel(TAB_INVITES),
+        ),
+        PanelAction::Lift(restriction_id) => app.send_admin(
+            AdminCommand::Lift { restriction_id },
+            PendingAdmin::Panel(TAB_RESTRICTIONS),
+        ),
+    }
+}
+
+/// An audit action as a verb phrase; unknown ones read as stored.
+fn audit_action_text(action: &str) -> String {
+    let key = match action {
+        "user.join" => "admin-act-join",
+        "user.kick" => "admin-act-kick",
+        "user.disconnect" => "admin-act-disconnect",
+        "user.move" => "admin-act-move",
+        "user.roles" => "admin-act-roles",
+        "user.purge" => "admin-act-purge",
+        "restrict" => "admin-act-restrict",
+        "restriction.lift" => "admin-act-lift",
+        "message.delete" => "admin-act-message-delete",
+        "invite.create" => "admin-act-invite-create",
+        "invite.revoke" => "admin-act-invite-revoke",
+        "key.link" => "admin-act-key-link",
+        "key.unlink" => "admin-act-key-unlink",
+        "profile.reset" => "admin-act-profile-reset",
+        "role.create" => "admin-act-role-create",
+        "role.edit" => "admin-act-role-edit",
+        "role.delete" => "admin-act-role-delete",
+        "channel.create" => "admin-act-channel-create",
+        "channel.edit" => "admin-act-channel-edit",
+        "channel.delete" => "admin-act-channel-delete",
+        "blob.delete" => "admin-act-blob-delete",
+        _ => return action.to_string(),
     };
-    app.send_admin(command, PendingAdmin::Panel(TAB_USERS));
+    t!(key)
+}
+
+/// The index, in the rank-ordered table, of the highest role a user
+/// holds; -1 with none (the dropdown's placeholder).
+fn top_role_index(app: &AppState, roles: &[client::RoleId]) -> i32 {
+    let order = app.role_table_in_rank_order();
+    order
+        .iter()
+        .rposition(|id| roles.contains(id))
+        .and_then(|i| i32::try_from(i).ok())
+        .unwrap_or(-1)
 }
 
 fn target_of(user_id: &str) -> Option<AdminTarget> {

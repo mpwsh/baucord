@@ -157,6 +157,7 @@ export struct ChatRow {
     file-meta: string,      // files: "1.2 MB" — the card's second line
     transfer-kind: int,     // files: 0 none, 1 uploading, 2 downloading
     transfer-pct: int,      // files: 0…100 while a transfer runs
+    file-saved: bool,       // files: already in the Downloads folder
 }
 
 export struct EmojiRow  { glyph: string, code: string, section: string }
@@ -203,6 +204,9 @@ export global State {
     in property <bool> messages-collapsed: false;
     /// The sidebar's width: dragged at its edge, kept in settings.
     in-out property <length> sidebar-width: 260px;
+    /// The Messages section's height: dragged at its divider, kept in
+    /// settings.
+    in-out property <length> messages-height: 200px;
     in property <bool> muted;
     in property <bool> deafened;
     /// Push-to-talk: the mic is closed until the key is held.
@@ -224,7 +228,6 @@ export global State {
     in property <[ChatRow]> chat;
     in-out property <string> draft;
     in property <int> max-chars: 400;
-    in property <string> upload-line;      // "" when idle
     /// Older pages exist on the server (History.more): the "load
     /// earlier" control appears at the top of the list.
     in property <bool> history-more: false;
@@ -450,6 +453,12 @@ export global Logic {
     callback attach-image();
     /// A card's Save: fetch the blob into the Downloads folder.
     callback file-save(int);
+    /// A saved card's Open: the file, with what the system uses for it.
+    callback file-open(int);
+    /// Stop the card's transfer, whichever way it goes.
+    callback file-cancel(int);
+    /// The Voice/Messages divider was let go: keep the height.
+    callback messages-resized(length);
     // Wipe the local chat history/images (each user clears their own).
     callback clear-chat();
     callback emoji-picked(string);

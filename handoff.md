@@ -218,7 +218,8 @@ clients unless marked.
   appending rows (`sync_history_tail`), which sets `follow-pending`
   only if the reader was at the bottom; a bounded 16 ms timer nudges
   to the end while that is owed, and the flag clears on reaching the
-  exact bottom or the moment the reader scrolls up. Window resizes still follow while pinned. The
+  exact bottom or the moment the reader scrolls up. Window resizes still
+  follow while pinned. The
   old "scroll on every height change while pinned" fought a
   scrollbar drag (§3). **General has a header** like the DM one (`#`,
   "General", `Tr.general-subtitle`), the composer keeps `gap-sm` of
@@ -438,7 +439,82 @@ clients unless marked.
   the color, picked in the panel's editor and by `server role …
   --icon star --color #e06c75`; `UserRow.role-icon/role-color` from
   the top role (`top_role_info`), drawn on the roster badge and the
-  card ahead of the built-in glyphs.
+  card ahead of the built-in glyphs. **Second pass:** `Btn` had no
+  horizontal padding (a layout gave it the label's width) — it has
+  `min-width: label + 2 × gap-lg` now, and the sidebar chips pad by
+  gap-md; **every biting action in the panel confirms in a dialog**
+  (`AdminState.confirm-*`, `adminui::PanelAction` kept in
+  `AppState.admin_pending`, `ask` → `confirm_accept`), with the reason
+  typed *there* for Disconnect/Kick/Ban and a sentence saying what
+  the action does — Purge is "erase the user and every message, for
+  ghosts and spam", Reset profile is "clear their color, style and
+  picture"; the inline "Sure?" and the top Reason field are gone;
+  the tab head shows "Loading…" in the refresh icon's slot so the
+  list never shifts; the Users tab's role dropdown shows the user's
+  highest role (`role-index`) and only sends on a different pick.
+  **The Audit tab is a table** (WHEN · WHO · WHAT · ON · DETAILS
+  with headers; `format_wall_stamp` dates entries from other days;
+  `audit_action_text` turns `user.kick` into "kicked" and so on,
+  falling back to the stored action). The server's audit *writers*
+  stopped using `{:?}` (`user.roles` names the roles, `invite.create`
+  says "as member, unlimited uses, expires in 1 d", `restrict` says
+  "voice until 2026-09-09 13:50 UTC: reason", `user.move` names the
+  channel, `role.*` list permission names), and the read side
+  (`audit_target_name`) turns short user ids into names, role and
+  channel ids into names, and restriction/message ids into `#N`.
+  Rows written before this keep their old text.
+  `push_tr` and `apply_text_scale` now cover the admin window too
+  (it is created once and kept, so a language change after the
+  first open left it in the old language). What still reads in
+  English there is the server's own text — audit details and the
+  permission names, which are wire names.
+  **A download that "reset" and stuck** was the blob reassembler
+  capping total bytes at `MAX_CHAT_IMAGE_BYTES` (10 MiB): every 10 MiB
+  the partial was dropped, the next chunk began a fresh one at 0 %,
+  and the discarded chunks were gone for good — a counter that reset
+  and never landed. It caps at `MAX_BLOB_BYTES` now, its 120 s window
+  counts idle time (`last_chunk`) instead of age, and both failures
+  (over the cap, hash mismatch) surface as
+  `NetworkMessage::BlobFailed` → the card's ring clears and a toast
+  says to try again. A finished download also writes a gray system
+  line ("Saved to …") into the conversation the card is in.
+  **File cards, third pass:** a saved card shows a green check, Open
+  (`open::that_detached`; gone from disk → back to Save with a toast)
+  and a small Download-again button (`AppState.downloaded` by blob,
+  this session; the gray "Saved to" line is gone). A ✕ sits
+  beside the progress ring: `Logic.file-cancel` — an upload's
+  media stream is reset (`Driver::cancel_media`, new;
+  `NetworkControl::CancelUpload`, the pending card goes), a
+  download's partial is dropped and later chunks of that blob are
+  ignored until it is asked for again (`CancelFetch`,
+  `ignored_blobs`). **Sidebar drags:** the width drag draws only a
+  line and lands on release (re-laying out every chat row per pointer
+  move flickered the window); the Voice/Messages divider drags
+  the same way — a line during the drag, the height on release
+  (`State.messages-height`, `ui.messages_height`, 100–480 px, the
+  section's own height whatever the DM count). The sidebar sits
+  at `z: 1` so a tooltip at its edge is not painted over by the chat.
+  **Images go up as cards too:** `send_image_with_card` pushes the
+  picture itself as a pending image row (`image_upload` holds its
+  placeholder id, `transfers` its ring), the media lane's percent
+  feeds it, and our own `ImageMessage` echo replaces it
+  (`drop_image_card`: the placeholder row, its `images` entry and
+  GIF player go, then the real row is pushed); ✕ over the picture
+  cancels (`NetworkControl::CancelImage` resets the media stream).
+  The sidebar's "Uploading… %" line is gone (`State.upload-line`
+  removed; a pasted URL's fetch toasts instead).
+  **Regression fixed while there:** `chat_row_at` gave every rebuilt
+  image row a *fresh* row id and a placeholder picture — the texture
+  is installed once by `push_image_row`, and `images`/`gifs` are
+  keyed by row id — so anything rebuilding rows through it
+  (`rename_author`, for one) blanked pictures and orphaned GIF
+  players. An image row rebuilt in place now keeps its id and
+  picture. This is the likely cause of "GIFs stopped showing after a
+  rename".
+  **Chat rows highlight on hover** like the roster: the row's
+  TouchArea is now the *parent* of its content (a `TextInput`
+  accepts idle moves, so a sibling underneath never saw hover; a
+  parent's hover is set in the before-children filter).
 - **Repaint workaround** (`repaint_on_reveal`) now also flips on
   `Moved`, `Resized`, `ScaleFactorChanged`, on all three windows —
   the "white parts after moving or maximizing" hypothesis; not yet

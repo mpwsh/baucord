@@ -163,6 +163,11 @@ pub struct AppState {
     transfers: HashMap<(Option<client::UserId>, u64), (i32, i32)>,
     /// The file upload the media lane is busy with, for its percent.
     uploading: Option<(Option<client::UserId>, u64)>,
+    /// An image on its way: the placeholder row's message id, replaced
+    /// by our own echo.
+    image_upload: Option<u64>,
+    /// Files saved this session, by blob: the card offers Open.
+    downloaded: HashMap<client::protocol::BlobId, std::path::PathBuf>,
     /// The "Move to" submenu's model, rebuilt with the channel list.
     channel_options: Rc<VecModel<ChannelOption>>,
     /// A server voice mute stands (spec §4.2): the mute button is
@@ -270,6 +275,8 @@ pub struct AppState {
     pub(crate) admin_audit_oldest: Option<u64>,
     /// The blob cap the server reported, for the Files tab's bar.
     pub(crate) admin_blob_cap: u64,
+    /// The panel's action awaiting its confirmation.
+    pub(crate) admin_pending: Option<crate::adminui::PanelAction>,
     viewers: HashMap<u64, Viewer>,
     /// Image-viewer overlay: the chat row shown, and GIF playback
     /// state while that row is an animated GIF.
@@ -476,6 +483,8 @@ pub fn run() {
         next_file_upload_id: FILE_UPLOAD_BASE,
         transfers: HashMap::new(),
         uploading: None,
+        image_upload: None,
+        downloaded: HashMap::new(),
         channel_options,
         server_muted: None,
         text_muted: None,
@@ -525,6 +534,7 @@ pub fn run() {
         admin_win: None,
         admin_audit_oldest: None,
         admin_blob_cap: 0,
+        admin_pending: None,
         viewers: HashMap::new(),
         gallery_row: None,
         gallery_gif: None,
@@ -765,6 +775,12 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_sidebar_resized(move |width| with_app(&w, |app| app.sidebar_resized(width)));
     let w = Rc::downgrade(state);
+    logic.on_messages_resized(move |h| with_app(&w, |app| app.messages_resized(h)));
+    let w = Rc::downgrade(state);
+    logic.on_file_open(move |row_id| with_app(&w, |app| app.file_open(row_id)));
+    let w = Rc::downgrade(state);
+    logic.on_file_cancel(move |row_id| with_app(&w, |app| app.file_cancel(row_id)));
+    let w = Rc::downgrade(state);
     logic.on_dm_closed(move |index| {
         with_app(&w, |app| {
             if let Some(user) = usize::try_from(index)
@@ -947,10 +963,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                     // Images in DMs ride the blob path later (1.1.2).
                     app.show_toast(ToastKind::Warning, &t!("chat-dm-no-images"));
                 } else {
-                    // Same broadcast semantics as SendMessage: the server
-                    // relays ImageMessage back to everyone (sender
-                    // included), so no local echo is needed here.
-                    app.network.tx.send(NetworkControl::SendImage(png)).ok();
+                    app.send_image_with_card(png);
                 }
             }
             app.preview_gif = None;
@@ -1019,7 +1032,9 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_invite_create(move || with_app(&w, AppState::open_invite_dialog));
     let w = Rc::downgrade(state);
     logic.on_admin_open(move || {
-        with_app(&w, |app| crate::adminui::open(app, crate::adminui::TAB_USERS));
+        with_app(&w, |app| {
+            crate::adminui::open(app, crate::adminui::TAB_USERS)
+        });
     });
     let w = Rc::downgrade(state);
     logic.on_invite_dialog_create(move || with_app(&w, AppState::invite_dialog_create));
@@ -1027,7 +1042,9 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_invite_dialog_copy(move || with_app(&w, AppState::invite_dialog_copy));
     let w = Rc::downgrade(state);
     logic.on_invite_dialog_cancel(move || {
-        with_app(&w, |app| app.main.global::<State>().set_invite_dialog_open(false));
+        with_app(&w, |app| {
+            app.main.global::<State>().set_invite_dialog_open(false)
+        });
     });
     let w = Rc::downgrade(state);
     logic.on_channel_create(move || with_app(&w, AppState::channel_create));
@@ -2023,18 +2040,9 @@ impl AppState {
                 }
             }
             NetworkMessage::UploadProgress { pct } => {
+                // The card's ring — a file's or an image's.
                 if let Some((conv, id)) = self.uploading {
-                    // A file: the card's ring, not the composer's line.
-                    self.set_transfer(conv, id, Some((1, i32::from(pct))));
-                } else {
-                    let s = self.main.global::<State>();
-                    if pct >= 100 {
-                        s.set_upload_line("".into());
-                    } else {
-                        s.set_upload_line(
-                            t!("chat-upload-progress", "pct" => u32::from(pct)).into(),
-                        );
-                    }
+                    self.set_transfer(conv, id, Some((1, i32::from(pct.min(99)))));
                 }
             }
             NetworkMessage::ImageMessage {
@@ -2053,6 +2061,9 @@ impl AppState {
                     own: Some(client_id) == self.our_client_id,
                     pending: false,
                 };
+                if meta.own {
+                    self.drop_image_card();
+                }
                 let shown =
                     self.with_conversation(None, |app| media::push_image_row(app, &meta, data));
                 if !shown {
@@ -2237,16 +2248,31 @@ impl AppState {
                     self.set_transfer(conv, msg_id, Some((2, i32::from(pct))));
                 }
             }
+            NetworkMessage::BlobFailed { blob_id } => {
+                if let Some(PendingDownload { name, conv, msg_id }) =
+                    self.pending_downloads.remove(&blob_id)
+                {
+                    self.set_transfer(conv, msg_id, None);
+                    self.show_toast(
+                        ToastKind::Warning,
+                        &t!("file-download-broken", "name" => name.as_str()),
+                    );
+                }
+            }
             NetworkMessage::Blob { blob_id, data } => {
                 if let Some(PendingDownload { name, conv, msg_id }) =
                     self.pending_downloads.remove(&blob_id)
                 {
                     self.set_transfer(conv, msg_id, None);
                     match media::save_to_downloads(&name, &data) {
-                        Ok(path) => self.show_toast(
-                            ToastKind::Success,
-                            &t!("file-saved", "path" => path.display().to_string()),
-                        ),
+                        Ok(path) => {
+                            // The card turns into Open (a check, a
+                            // re-download beside it); a toast says where.
+                            let line = t!("file-saved", "path" => path.display().to_string());
+                            self.downloaded.insert(blob_id, path);
+                            self.set_transfer(conv, msg_id, None);
+                            self.show_toast(ToastKind::Success, &line);
+                        }
                         Err(e) => self.show_error(&t!(
                             "file-save-error",
                             "name" => name.as_str(),
@@ -2597,8 +2623,14 @@ impl AppState {
     fn commands_available(&self) -> String {
         use client::permissions as p;
         let has = |bit: u64| p::has(self.permissions, bit);
-        let mut out: Vec<&str> =
-            vec!["/help", "/history [n]", "/channel list", "/mem", "/leave", "/quit"];
+        let mut out: Vec<&str> = vec![
+            "/help",
+            "/history [n]",
+            "/channel list",
+            "/mem",
+            "/leave",
+            "/quit",
+        ];
         if has(p::CREATE_INVITES) {
             out.push("/invite [role] [24h] [uses]");
         }
@@ -3160,8 +3192,14 @@ impl AppState {
                         format_wall_time(e.ts),
                         e.actor.as_deref().unwrap_or("server"),
                         e.action,
-                        e.target.as_deref().map(|t| format!(" {t}")).unwrap_or_default(),
-                        e.detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default(),
+                        e.target
+                            .as_deref()
+                            .map(|t| format!(" {t}"))
+                            .unwrap_or_default(),
+                        e.detail
+                            .as_deref()
+                            .map(|d| format!(": {d}"))
+                            .unwrap_or_default(),
                     );
                     self.push_chat_system(&line);
                 }
@@ -3594,6 +3632,17 @@ impl AppState {
         s.set_compact_rows(self.settings.ui.compact_rows);
         s.set_messages_collapsed(self.settings.ui.messages_collapsed);
         s.set_sidebar_width(f32::from(self.settings.ui.sidebar_width.clamp(220, 480)));
+        s.set_messages_height(f32::from(self.settings.ui.messages_height.clamp(100, 480)));
+    }
+
+    /// The Voice/Messages divider was let go: keep the height.
+    fn messages_resized(&mut self, height: f32) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let height = height.clamp(100.0, 480.0).round() as u16;
+        if height != self.settings.ui.messages_height {
+            self.settings.ui.messages_height = height;
+            self.settings.save();
+        }
     }
 
     /// The sidebar's edge was let go: keep the width.
@@ -3751,6 +3800,9 @@ impl AppState {
         let scale = self.settings.ui.text_scale;
         self.main.global::<ui::Theme>().set_scale(scale);
         if let Some(win) = &self.settings_win {
+            win.global::<ui::Theme>().set_scale(scale);
+        }
+        if let Some(win) = &self.admin_win {
             win.global::<ui::Theme>().set_scale(scale);
         }
         for viewer in self.viewers.values() {
@@ -5530,12 +5582,29 @@ impl AppState {
         let row_id = self.next_row_id as i32;
         let mut row = ui::convert::chat_row(&self.history.rows()[index], row_id);
         row.continuation = self.history.is_continuation(index);
-        if row.kind == 5
-            && let Some(id) = self.history.rows()[index].message_id()
-            && let Some((kind, pct)) = self.transfers.get(&(self.active_dm, id))
+        // An image row rebuilt in place keeps its row id and picture:
+        // the texture is installed once by `push_image_row`, and the
+        // `images`/`gifs` maps are keyed by that id. A fresh id here
+        // orphaned the GIF player and blanked the picture.
+        if row.kind == 2
+            && let Some(old) = self.chat_model.row_data(index)
+            && old.kind == 2
+            && old.msg_id_lo == row.msg_id_lo
+            && old.msg_id_hi == row.msg_id_hi
         {
-            row.transfer_kind = *kind;
-            row.transfer_pct = *pct;
+            row.row_id = old.row_id;
+            row.image = old.image;
+        }
+        if row.kind == 5 || row.kind == 2 {
+            if let Some(id) = self.history.rows()[index].message_id()
+                && let Some((kind, pct)) = self.transfers.get(&(self.active_dm, id))
+            {
+                row.transfer_kind = *kind;
+                row.transfer_pct = *pct;
+            }
+            if let Some(file) = self.history.file_at(index) {
+                row.file_saved = self.downloaded.contains_key(&file.blob);
+            }
         }
         if row.kind != 1 && row.kind != 4 {
             let own = row.own;
@@ -5613,13 +5682,73 @@ impl AppState {
         }
     }
 
+    /// Send an image into General with a card that shows it going:
+    /// the picture itself, muted, with the ring and a ✕ (the same
+    /// look as a file on its way). The server relays `ImageMessage`
+    /// back; our own echo replaces the card.
+    fn send_image_with_card(&mut self, png: Vec<u8>) {
+        let client_ref = self.next_client_ref;
+        self.next_client_ref = self.next_client_ref.wrapping_add(1).max(1);
+        let placeholder = u64::MAX - u64::from(client_ref);
+        let now = u64::try_from(chrono::Local::now().timestamp_millis()).unwrap_or(0);
+        let meta = Meta {
+            id: placeholder,
+            ts: format_wall_time(now),
+            ts_ms: now,
+            day: local_day(now),
+            user: self.settings.user.nickname.clone(),
+            own: true,
+            pending: true,
+        };
+        self.transfers.insert((None, placeholder), (1, 0));
+        self.uploading = Some((None, placeholder));
+        self.image_upload = Some(placeholder);
+        let shown =
+            self.with_conversation(None, |app| media::push_image_row(app, &meta, png.clone()));
+        if !shown {
+            self.transfers.remove(&(None, placeholder));
+            self.uploading = None;
+            self.image_upload = None;
+        }
+        self.network.tx.send(NetworkControl::SendImage(png)).ok();
+    }
+
+    /// Our image came back from the server: the card it replaces goes
+    /// (its picture and player with it) before the real row is pushed.
+    fn drop_image_card(&mut self) {
+        let Some(placeholder) = self.image_upload.take() else {
+            return;
+        };
+        self.uploading = None;
+        self.transfers.remove(&(None, placeholder));
+        self.with_conversation(None, |app| {
+            let at = app
+                .history
+                .rows()
+                .iter()
+                .position(|r| r.message_id() == Some(placeholder));
+            if let Some(i) = at
+                && let Some(row) = app.chat_model.row_data(i)
+            {
+                app.images.remove(&row.row_id);
+                app.gifs.remove(&row.row_id);
+            }
+            if let Some(delta) = app.history.discard_message(placeholder) {
+                app.sync_range(&delta);
+            }
+        });
+    }
+
     // ── Files (spec §7) ─────────────────────────────────────────────
 
     /// Announce a picked file to the server; the answer arrives as
     /// `UploadDone` (→ `file_uploaded`) or `UploadRejected`.
     pub fn begin_file_upload(&mut self, name: String, mime: String, bytes: Vec<u8>) {
         let upload_id = self.next_file_upload_id;
-        self.next_file_upload_id = self.next_file_upload_id.wrapping_add(1).max(FILE_UPLOAD_BASE);
+        self.next_file_upload_id = self
+            .next_file_upload_id
+            .wrapping_add(1)
+            .max(FILE_UPLOAD_BASE);
         let size = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
         // The card shows at once, at 0 %, and fills as the bytes go;
         // the same placeholder is confirmed by the post's ack later.
@@ -5739,11 +5868,99 @@ impl AppState {
         });
     }
 
+    /// A saved card's Open: the file, with what the system uses for it.
+    /// Gone from disk since → the card goes back to Save.
+    fn file_open(&mut self, row_id: i32) {
+        let Some(index) = (0..self.chat_model.row_count()).find(|&i| {
+            self.chat_model
+                .row_data(i)
+                .is_some_and(|r| r.row_id == row_id)
+        }) else {
+            return;
+        };
+        let Some(blob) = self.history.file_at(index).map(|f| f.blob) else {
+            return;
+        };
+        let Some(path) = self.downloaded.get(&blob).cloned() else {
+            return;
+        };
+        if !path.exists() {
+            self.downloaded.remove(&blob);
+            let row = self.chat_row_at(index);
+            self.chat_model.set_row_data(index, row);
+            self.show_toast(ToastKind::Warning, &t!("file-gone"));
+            return;
+        }
+        if let Err(e) = open::that_detached(&path) {
+            self.show_error(&t!("file-open-error", "error" => e.to_string()));
+        }
+    }
+
+    /// Stop a card's transfer: an upload's stream is reset and the
+    /// pending card goes; a download's partial is dropped and the ring
+    /// clears.
+    fn file_cancel(&mut self, row_id: i32) {
+        let Some(index) = (0..self.chat_model.row_count()).find(|&i| {
+            self.chat_model
+                .row_data(i)
+                .is_some_and(|r| r.row_id == row_id)
+        }) else {
+            return;
+        };
+        let Some(msg_id) = self.history.rows()[index].message_id() else {
+            return;
+        };
+        let conv = self.active_dm;
+        match self.transfers.get(&(conv, msg_id)).map(|t| t.0) {
+            Some(1) if self.image_upload == Some(msg_id) => {
+                self.network.tx.send(NetworkControl::CancelImage).ok();
+                self.drop_image_card();
+            }
+            Some(1) => {
+                if let Some((upload_id, _)) = self
+                    .pending_uploads
+                    .iter()
+                    .find(|(_, u)| u.placeholder == msg_id)
+                    .map(|(id, u)| (*id, u.conv))
+                {
+                    self.pending_uploads.remove(&upload_id);
+                    self.uploading = None;
+                    self.transfers.remove(&(conv, msg_id));
+                    self.network
+                        .tx
+                        .send(NetworkControl::CancelUpload { upload_id })
+                        .ok();
+                    if let Some(delta) = self.history.discard_message(msg_id) {
+                        self.sync_range(&delta);
+                    }
+                }
+            }
+            Some(2) => {
+                let blob = self
+                    .pending_downloads
+                    .iter()
+                    .find(|(_, d)| d.msg_id == msg_id && d.conv == conv)
+                    .map(|(b, _)| *b);
+                if let Some(blob) = blob {
+                    self.pending_downloads.remove(&blob);
+                    self.network
+                        .tx
+                        .send(NetworkControl::CancelFetch { blob_id: blob })
+                        .ok();
+                }
+                self.set_transfer(conv, msg_id, None);
+            }
+            _ => {}
+        }
+    }
+
     /// A card's Save: fetch the blob; `Blob` writes it to Downloads.
     fn file_save(&mut self, row_id: i32) {
-        let Some(index) = (0..self.chat_model.row_count())
-            .find(|&i| self.chat_model.row_data(i).is_some_and(|r| r.row_id == row_id))
-        else {
+        let Some(index) = (0..self.chat_model.row_count()).find(|&i| {
+            self.chat_model
+                .row_data(i)
+                .is_some_and(|r| r.row_id == row_id)
+        }) else {
             return;
         };
         let Some(file) = self.history.file_at(index).cloned() else {
@@ -6849,6 +7066,11 @@ impl AppState {
         if let Some(win) = &self.settings_win {
             fill_tr(&win.global::<Tr>());
         }
+        // The panel is created once and kept: it follows a language
+        // change like the others.
+        if let Some(win) = &self.admin_win {
+            fill_tr(&win.global::<Tr>());
+        }
     }
 
     fn push_connect_fields(&self) {
@@ -7135,6 +7357,19 @@ fn day_label(day: i64) -> String {
         "suffix" => suffix,
         "year" => date.year()
     )
+}
+
+/// `14:06` today, `Sep 6 14:06` on another day (the audit table).
+pub(crate) fn format_wall_stamp(ms: u64) -> String {
+    let Some(t) = chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap_or(0)) else {
+        return String::new();
+    };
+    let local = t.with_timezone(&chrono::Local);
+    if local.date_naive() == chrono::Local::now().date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%b %-d %H:%M").to_string()
+    }
 }
 
 pub(crate) fn format_wall_time(ms: u64) -> String {
@@ -7617,12 +7852,16 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_invite_copy(t!("invite-copy").into());
     tr.set_invite_close(t!("invite-close").into());
     tr.set_file_save(t!("file-save").into());
+    tr.set_file_open(t!("file-open").into());
+    tr.set_file_save_again(t!("file-save-again").into());
+    tr.set_file_cancel(t!("file-cancel").into());
+    tr.set_file_uploading_pct(t!("file-uploading-pct").into());
+    tr.set_file_downloading_pct(t!("file-downloading-pct").into());
     tr.set_admin_title(t!("admin-title").into());
     tr.set_admin_button(t!("admin-button").into());
     tr.set_admin_refresh(t!("admin-refresh").into());
     tr.set_admin_loading(t!("admin-loading").into());
     tr.set_admin_none(t!("admin-none").into());
-    tr.set_admin_sure(t!("admin-sure").into());
     tr.set_admin_users(t!("admin-users").into());
     tr.set_admin_users_lead(t!("admin-users-lead").into());
     tr.set_admin_reason(t!("admin-reason").into());
@@ -7676,6 +7915,11 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_admin_stat_errors(t!("admin-stat-errors").into());
     tr.set_admin_yours(t!("admin-yours").into());
     tr.set_admin_role_badge(t!("admin-role-badge").into());
+    tr.set_admin_col_when(t!("admin-col-when").into());
+    tr.set_admin_col_who(t!("admin-col-who").into());
+    tr.set_admin_col_what(t!("admin-col-what").into());
+    tr.set_admin_col_target(t!("admin-col-target").into());
+    tr.set_admin_col_detail(t!("admin-col-detail").into());
     tr.set_invite_share_hint(t!("invite-share-hint").into());
     tr.set_invite_expiry_note(t!("invite-expiry-note").into());
     tr.set_dm_general(t!("dm-general").into());

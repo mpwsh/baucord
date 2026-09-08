@@ -10,9 +10,9 @@ limits:
   max_sharers: 8
   max_viewers_per_stream: 16
   max_chat_bytes: 2000
-  max_image_kb_per_minute: 4096
-  max_image_kb_per_minute_global: 16384
-  media_relay_kb_per_sec: 1024
+  max_image_kb_per_minute: 40096
+  max_image_kb_per_minute_global: 40384
+  media_relay_kb_per_sec: 2048
   chat:
     burst: 5
     per_secs: 5
@@ -35,8 +35,8 @@ persistence:
     retain_days: 30
 logging:
   level: info
-  stats_interval_secs: 30
-  link_stats_interval_secs: 30
+  stats_interval_secs: 1800
+  link_stats_interval_secs: 300
   telemetry: true
   file: server.log
 channels:

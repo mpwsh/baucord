@@ -40,6 +40,20 @@ pub(super) fn fallback_text(attachment: &Attachment) -> String {
     )
 }
 
+/// `3 d`, `5 h`, `20 min`, `40 s`: a span, for audit lines.
+#[must_use]
+pub fn human_duration(secs: u64) -> String {
+    if secs >= 86_400 && secs % 86_400 == 0 {
+        format!("{} d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{} h", secs / 3_600)
+    } else if secs >= 60 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
 /// `1.2 MB`, `640 KB`, `12 B`.
 #[must_use]
 pub fn human_size(bytes: u64) -> String {
@@ -96,8 +110,10 @@ impl ChatServer {
             .get(&user)
             .filter(|d| d.day == today)
             .map_or(0, |d| d.bytes);
-        if !permissions::has(self.effective_permissions(&user), permissions::BYPASS_LIMITS)
-            && used + u64::from(size) > allowance
+        if !permissions::has(
+            self.effective_permissions(&user),
+            permissions::BYPASS_LIMITS,
+        ) && used + u64::from(size) > allowance
         {
             return Err(UploadRejectReason::Quota);
         }
@@ -112,7 +128,10 @@ impl ChatServer {
         let today = self.wall_now() / DAY_MS;
         let entry = self.uploads_today.entry(user).or_default();
         if entry.day != today {
-            *entry = DailyUpload { day: today, bytes: 0 };
+            *entry = DailyUpload {
+                day: today,
+                bytes: 0,
+            };
         }
         entry.bytes += u64::from(size);
     }

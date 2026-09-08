@@ -2001,11 +2001,17 @@ fn custom_roles_come_from_the_cli_and_reach_the_room() {
     assert!(cli_role_create(&db, "Streamer", streamer, "", 0).is_err());
     assert!(cli_role_create(&db, "member", streamer, "", 0).is_err());
     assert!(cli_role_create(&db, "gods", streamer | permissions::ADMIN, "", 0).is_err());
-    assert!(cli_role_create(&db, "odd", streamer, "unicorn", 0).is_err(), "icon list");
+    assert!(
+        cli_role_create(&db, "odd", streamer, "unicorn", 0).is_err(),
+        "icon list"
+    );
     assert!(cli_role_edit(&db, "member", &RoleEdit::default()).is_err());
     let id = cli_role_create(&db, "streamer", streamer, "star", 0x00E0_6C75).expect("create");
     assert!(id > ROLE_ADMIN);
-    assert!(cli_role_create(&db, "streamer", streamer, "", 0).is_err(), "name taken");
+    assert!(
+        cli_role_create(&db, "streamer", streamer, "", 0).is_err(),
+        "name taken"
+    );
     let rank = permissions::derived_rank(streamer);
     assert!(rank > permissions::RANK_MEMBER && rank < permissions::RANK_ORGANIZER);
 
@@ -2016,9 +2022,9 @@ fn custom_roles_come_from_the_cli_and_reach_the_room() {
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
         w.pump(&mut [&mut alice]);
-        let followed = alice.inbox.iter().any(|m| {
-            matches!(m, ServerMessage::Session { permissions, .. } if *permissions == streamer)
-        });
+        let followed = alice.inbox.iter().any(
+            |m| matches!(m, ServerMessage::Session { permissions, .. } if *permissions == streamer),
+        );
         let listed = alice.inbox.iter().any(|m| {
             matches!(m, ServerMessage::RoleList { roles }
                 if roles.iter().any(|r| r.id == id && r.name == "streamer" && r.rank == rank
@@ -2059,7 +2065,10 @@ fn custom_roles_come_from_the_cli_and_reach_the_room() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "the edit never reached the server");
+        assert!(
+            Instant::now() < deadline,
+            "the edit never reached the server"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let (_, name) = cli_role_delete(&db, "caster").expect("delete");
@@ -2072,7 +2081,10 @@ fn custom_roles_come_from_the_cli_and_reach_the_room() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "the deletion never reached the server");
+        assert!(
+            Instant::now() < deadline,
+            "the deletion never reached the server"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(w);
@@ -2272,8 +2284,10 @@ fn files_are_posted_as_cards_and_replayed() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut carol = w.connect_member("carol");
-    let replayed = carol.wait_for(&mut w, &mut [&mut alice, &mut bob, &mut guest], |m| {
-        match m {
+    let replayed = carol.wait_for(
+        &mut w,
+        &mut [&mut alice, &mut bob, &mut guest],
+        |m| match m {
             ServerMessage::HistoryAttachments {
                 conv: ConvRef::General,
                 items,
@@ -2282,8 +2296,8 @@ fn files_are_posted_as_cards_and_replayed() {
                 .find(|(id, _)| *id == msg_id)
                 .map(|(_, a)| a.clone()),
             _ => None,
-        }
-    });
+        },
+    );
     assert_eq!(replayed.name, "notes.txt");
     assert!(carol.inbox.iter().any(|m| matches!(m,
         ServerMessage::History { messages, .. }
@@ -2294,7 +2308,12 @@ fn files_are_posted_as_cards_and_replayed() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         w.pump(&mut [&mut alice, &mut bob, &mut guest, &mut carol]);
-        if w.server().policy().blobs.get(&blob).is_some_and(|b| b.refs == 0) {
+        if w.server()
+            .policy()
+            .blobs
+            .get(&blob)
+            .is_some_and(|b| b.refs == 0)
+        {
             break;
         }
         assert!(Instant::now() < deadline, "the reference never dropped");
@@ -2338,7 +2357,10 @@ fn a_file_goes_into_a_dm_like_a_message() {
     assert_eq!(card.mime, "image/x-raw");
     // Nobody else saw it.
     let mut carol = w.connect_member("carol");
-    w.settle(&mut [&mut alice, &mut bob, &mut carol], Duration::from_millis(500));
+    w.settle(
+        &mut [&mut alice, &mut bob, &mut carol],
+        Duration::from_millis(500),
+    );
     assert!(!carol
         .inbox
         .iter()
@@ -2381,8 +2403,7 @@ fn the_panel_manages_roles_and_blobs_and_reads_the_audit() {
             color: 0x007E_D321,
         },
     );
-    let Ok(AdminOutcome::RoleCreated(id)) = admin.admin_result(&mut w, &mut [&mut alice], 2)
-    else {
+    let Ok(AdminOutcome::RoleCreated(id)) = admin.admin_result(&mut w, &mut [&mut alice], 2) else {
         panic!("role not created");
     };
     alice.wait_for(&mut w, &mut [&mut admin], |m| match m {
@@ -2400,7 +2421,10 @@ fn the_panel_manages_roles_and_blobs_and_reads_the_audit() {
             color: None,
         },
     );
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 3), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 3),
+        Ok(AdminOutcome::Done)
+    );
     assert_eq!(w.server().policy().roles[&id].name, "caster");
     admin.admin(
         &mut w,
@@ -2413,12 +2437,18 @@ fn the_panel_manages_roles_and_blobs_and_reads_the_audit() {
             color: None,
         },
     );
-    assert!(matches!(
-        admin.admin_result(&mut w, &mut [&mut alice], 4),
-        Err(AdminError::Invalid(_))
-    ), "built-ins stay");
+    assert!(
+        matches!(
+            admin.admin_result(&mut w, &mut [&mut alice], 4),
+            Err(AdminError::Invalid(_))
+        ),
+        "built-ins stay"
+    );
     admin.admin(&mut w, 5, AdminCommand::DeleteRole { role: id });
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 5), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 5),
+        Ok(AdminOutcome::Done)
+    );
     assert!(!w.server().policy().roles.contains_key(&id));
 
     // Stats and the audit are the admin's; a member gets refused.
@@ -2446,14 +2476,17 @@ fn the_panel_manages_roles_and_blobs_and_reads_the_audit() {
             limit: 50,
         },
     );
-    let Ok(AdminOutcome::Audit(entries)) = admin.admin_result(&mut w, &mut [&mut alice], 8)
-    else {
+    let Ok(AdminOutcome::Audit(entries)) = admin.admin_result(&mut w, &mut [&mut alice], 8) else {
         panic!("no audit");
     };
-    assert!(entries.iter().any(|e| e.action == "role.create"
-        && e.actor.as_deref() == Some("mpw")));
+    assert!(entries
+        .iter()
+        .any(|e| e.action == "role.create" && e.actor.as_deref() == Some("mpw")));
     assert!(entries.iter().any(|e| e.action == "role.delete"));
-    assert!(entries.windows(2).all(|p| p[0].id > p[1].id), "newest first");
+    assert!(
+        entries.windows(2).all(|p| p[0].id > p[1].id),
+        "newest first"
+    );
 
     // Blobs: listed with their uploader, deleted from the panel.
     let (_, blob) = post_file(
@@ -2471,11 +2504,17 @@ fn the_panel_manages_roles_and_blobs_and_reads_the_audit() {
     let Ok(AdminOutcome::Blobs(blobs)) = admin.admin_result(&mut w, &mut [&mut alice], 9) else {
         panic!("no blobs");
     };
-    let listed = blobs.iter().find(|b| b.blob_id == blob).expect("the file is listed");
+    let listed = blobs
+        .iter()
+        .find(|b| b.blob_id == blob)
+        .expect("the file is listed");
     assert_eq!(listed.created_by.as_deref(), Some("alice"));
     assert_eq!(listed.refs, 1);
     admin.admin(&mut w, 10, AdminCommand::DeleteBlob { blob_id: blob });
-    assert_eq!(admin.admin_result(&mut w, &mut [&mut alice], 10), Ok(AdminOutcome::Done));
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice], 10),
+        Ok(AdminOutcome::Done)
+    );
     assert!(!w.server().policy().blobs.contains_key(&blob));
     alice.send(&mut w, &ClientMessage::FetchBlob { blob_id: blob });
     alice.wait_for(&mut w, &mut [&mut admin], |m| match m {
@@ -3906,7 +3945,10 @@ fn gold_is_a_permission_of_its_own() {
         }) {
             break;
         }
-        assert!(Instant::now() < deadline, "the role never reached the session");
+        assert!(
+            Instant::now() < deadline,
+            "the role never reached the session"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     // She may ban, but not wear gold.

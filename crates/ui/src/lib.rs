@@ -41,7 +41,12 @@ pub mod convert {
                 let submenu = if e.submenu.is_empty() {
                     -1
                 } else {
-                    submenus.push(e.submenu.iter().map(|sub| menu_entry(sub, -1, label)).collect());
+                    submenus.push(
+                        e.submenu
+                            .iter()
+                            .map(|sub| menu_entry(sub, -1, label))
+                            .collect(),
+                    );
                     i32::try_from(submenus.len() - 1).unwrap_or(-1)
                 };
                 menu_entry(e, submenu, label)
@@ -294,6 +299,7 @@ pub mod convert {
                 file_meta: "".into(),
                 transfer_kind: 0,
                 transfer_pct: 0,
+                file_saved: false,
             }
         };
         match item {
