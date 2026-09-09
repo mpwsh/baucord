@@ -289,6 +289,10 @@ pub enum NetworkMessage {
     RoleList {
         roles: Vec<protocol::RoleInfo>,
     },
+    /// An audit line as it happens (spec §8), for the admin channel.
+    AuditLine {
+        entry: protocol::AuditEntry,
+    },
     /// A file in a conversation (spec §7): a card, from `username`.
     FileMessage {
         conv: protocol::ConvRef,
@@ -1511,6 +1515,9 @@ impl NetworkClient {
             }
             ServerMessage::RoleList { roles } => {
                 self.message_queue.push(NetworkMessage::RoleList { roles });
+            }
+            ServerMessage::AuditLine { entry } => {
+                self.message_queue.push(NetworkMessage::AuditLine { entry });
             }
             ServerMessage::FileMessage {
                 conv,

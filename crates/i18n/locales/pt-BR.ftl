@@ -609,7 +609,6 @@ sounds-dm = Chega uma mensagem direta
 chat-dm-with-offline = { $name } está offline; a mensagem espera no servidor.
 chat-command-usage-dm = Uso: /dm <nome> <mensagem>
 chat-dm-unknown = Ninguém aqui se chama { $name }.
-chat-dm-no-images = Imagens em mensagens diretas chegam com a atualização de arquivos.
 dm-close = Fechar conversa
 
 # ── Admin panel (spec §8) ──
@@ -733,3 +732,6 @@ file-save-again = Baixar de novo
 file-gone = Esse arquivo não está mais na sua pasta Downloads
 file-open-error = Não foi possível abrir o arquivo: { $error }
 file-cancel = Cancelar
+admin-channel = Canal de administração
+admin-channel-lead = A auditoria, ao vivo. Os comandos funcionam aqui: /kick, /ban, /mute, /grant, /invite…
+admin-channel-commands-only = Este canal só aceita comandos — comece com /

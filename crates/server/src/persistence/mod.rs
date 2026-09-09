@@ -48,12 +48,12 @@ use protocol::{TelemetrySample, UserId};
 
 pub use self::store::{
     backup_to_tar, blobs_dir, check, cli_create_invite, cli_find_user, cli_kick,
-    cli_lift_restriction, cli_list_invites, cli_load_policy, cli_purge, cli_restrict,
+    cli_lift_restriction, cli_list_invites, cli_load_policy, cli_prune, cli_purge, cli_restrict,
     cli_revoke_invite, cli_role_create, cli_role_delete, cli_role_edit, cli_set_key, cli_set_roles,
-    cli_telemetry, hex, parse_hex_id, BackupReport, CheckReport, RoleEdit, TelemetryLine,
-    GENERAL_CONV, SCHEMA_VERSION,
+    cli_telemetry, hex, parse_hex_id, restore_from_tar, BackupReport, CheckReport, RestoreReport,
+    Retention, RoleEdit, TelemetryLine, GENERAL_CONV, SCHEMA_VERSION,
 };
-use self::store::{Retention, Sqlite, Store};
+use self::store::{Sqlite, Store};
 use crate::{
     clock::WallMs,
     config::PersistenceSettings,
@@ -126,6 +126,10 @@ pub enum PersistError {
     AdminBit,
     #[error("'{0}' is not a role icon; the choices are {list}", list = role_icon_list())]
     BadIcon(String),
+    #[error("the server holds {0} (its -wal file exists): stop it first, or pass --force")]
+    Locked(PathBuf),
+    #[error("{0} is not a baucord backup (no baucord.db inside)")]
+    NotABackup(PathBuf),
 }
 
 // ── Rows ────────────────────────────────────────────────────────────────
@@ -619,6 +623,7 @@ impl Persist {
             retention: Retention {
                 history_days: settings.history.retain_days,
                 telemetry_days: settings.telemetry.retain_days,
+                file_days: settings.files.retain_days,
             },
             last_checkpoint: now,
             // First prune right away: a server that restarts often

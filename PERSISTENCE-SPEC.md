@@ -382,6 +382,8 @@ persistence on, for the run without it. Anyone still on 1.0 sees
 | `DISCONNECT`, `KICK`, `BAN`, `MUTE`, `RESTRICT` | – | – | – |  ✔  | moderation (§4.1)                             |
 | `MANAGE_ROLES`, `MANAGE_USERS`, `MANAGE_INVITES` | – | – | – | ✔ | admin commands                       |
 | `BYPASS_LIMITS`   |  –    |  –     |  –        |  ✔    | sharer/viewer caps, file quotas               |
+| `GOLD_NAME`       |  –    |  –     |  –        |  ✔    | `SetProfile`: the gold name band (§7.1); a custom role may hold it or not |
+| `PANEL`           |  –    |  –     |  –        |  ✔    | the admin panel's door (§8): the chip, `AuditLog`, `ServerStats`; each tab's data keeps its own bit |
 
 Four built-in roles (`builtin = 1`, undeletable): `guest` (what a
 code grants by default), `member` (an admin's member code, or
@@ -588,10 +590,14 @@ ServerMessage::ProfileUpdated { user_id, profile: Profile }
   and refuses otherwise — nobody is unreadable or invisible. The client
   offers a palette of ~16 known-good colors and a custom picker that
   greys out failing values.
-- **Gold is reserved for admins**, and the server is the gate, not the
-  picker: a color in the gold band (hue 38°–65°, saturation ≥ 0.35) is
-  refused with `ProfileDenied { ReservedColor }` unless the user has
-  `ADMIN`. The client's picker greys the band out for everyone else,
+- **Gold is a permission of its own** (`GOLD_NAME`, 1.1.3; before
+  that, `ADMIN`), and the server is the gate, not the picker: a color
+  in the gold band (hue 38°–65°, saturation ≥ 0.35) is refused with
+  `ProfileDenied { ReservedColor }` unless the user has it. The
+  built-in admin role holds it; a custom role may hold it or lack it,
+  so "an administrator without the gold band" is `server role create
+  steward --like admin --deny gold`. The client's picker greys the
+  band out for everyone else,
   but that is courtesy; the check that matters runs on the server, and
   a client that skips the picker gets the same refusal. Because it is
   enforced, a gold name *is* trustworthy — the one deliberate
@@ -810,13 +816,30 @@ untouched.
    channel, 1.1.3). Per-user `DM` enforcement and `Conversations` are
    1.1.1.
 2. **1.1.1 — DMs.** Direct messages with offline delivery, unread
-   counts, `FetchHistory` paging, the conversation list.
-3. **1.1.2 — files and profiles.** Blob uploads for any type, cards,
-   caps, dedup, retention; images migrate onto the same path. Then
-   profiles on top of it: name color and style, avatars, the contrast
-   check, admin reset/lock.
-4. **1.1.3 — admin in the client.** The panel, the admin channel with
-   slash commands, audit stream.
+   counts, `FetchHistory` paging, the conversation list. **Done.**
+3. **1.1.2 — profiles.** Name color and style, avatars over the blob
+   path, the contrast check, admin reset/lock, plus the client work
+   that followed (the app's own context menus with the volume slider,
+   the collapsible Messages section, the invite dialog, the XP bar
+   and `UserProgress`, the share sounds, one instance per profile).
+   **Released.**
+4. **1.1.3 — roles, files, the admin panel.** Custom roles with
+   badges (`server role`, derived ranks, `RoleList`), files in
+   General and DMs (the blob path, allowance and cap, cards with a
+   transfer ring and cancel), the admin panel (users, roles,
+   restrictions, invites, channels, files, audit, server; `PANEL`
+   as its door), a resizable sidebar. **Released.**
+5. **1.1.4 — the rest of the spec's lines.** Blob retention in the
+   hourly prune (`files.retain_days`), purge dropping the person's
+   blobs, chat xp (1 per message, at the flush), pictures on the blob
+   path everywhere a server keeps files (a picture is a file with a
+   picture inside; only memory-mode servers still get the live
+   relay), the transfer budget in place of the image one
+   (`limits.max_transfer_kb_per_minute[_global]`, old names read),
+   `server restore` and `server db prune`, the **admin channel**
+   (`ADMIN_CHANNEL` permission; the audit as it happens over
+   `AuditLine`, slash commands at hand, a shield row in Messages),
+   and push-to-talk that watches its key instead of taking it.
 5. Later: role badges for organizer and admin (icons from the key's
    roles), channel topics, reserved names, a manual away toggle shown
    in the roster, animated avatars, anything built on progress (a
@@ -878,6 +901,29 @@ replays 50 with images as references", "persistence thread stalled for
 - **Progress accrues on the tick.** Once a minute over at most 64
   sessions is cheaper than the events it would take to move it to the
   persistence thread, and it works with persistence off.
+- **Disconnect reaches anyone; kick and ban spare administrators
+  (1.1.3, in use).** §4.1's rank rule stays for mutes, restrictions,
+  roles and purges. A disconnect costs the target a reconnect, so
+  anyone holding `DISCONNECT` may drop anyone but themself. A kick or
+  a ban is refused only when the target holds `ADMIN`; equal or
+  higher rank below that is fair game — the built-in admins are the
+  people who can undo it, and they are the ones protected. The
+  roster menu mirrors this (`menu::UserFacts::is_admin`).
+- **A new wire variant gets a new feature bit.** Postcard is
+  positional: a client that negotiated a bit and then meets a variant
+  appended later under the same bit cannot decode it and the
+  connection is lost. `UserProgress` therefore rides `PROGRESS_ALL`,
+  not `PROGRESS` (a 1.1.0 client has the latter), and `RoleList`
+  rides `ROLE_LIST`, not `ROLES`. The rule going forward: append the
+  variant, allocate a bit, gate the send on it.
+- **Everyone's xp is on the wire (1.1.1, in use).** §9.1's
+  `UserDetails.level` alone cannot draw a bar, so `UserProgress {
+  client_id, xp, level }` (behind `PROGRESS`) goes to a newcomer for
+  the whole roster (itself included), to everyone for a newcomer, and
+  to everyone once a minute for each user whose xp moved — at most
+  64² small control messages a minute. The client derives the
+  fraction with `progress::xp_for_level` / `cost_of_level`, so the
+  curve stays a server-side formula.
 - **Chat earns no xp.** Presence, talking with someone there, watching
   and sharing to a viewer do; a message does not, so there is nothing
   to spam for. `user_progress.messages` still counts them.
@@ -904,7 +950,8 @@ replays 50 with images as references", "persistence thread stalled for
   a code only stops new joins.
 - Everyone, guests included, can set a name color, a name style and an
   avatar; colors pass a contrast check. The gold band is reserved for
-  admins and enforced by the server; apart from that, colors never
+  the `GOLD_NAME` permission (the admin role's, grantable to custom
+  roles) and enforced by the server; apart from that, colors never
   signify a role. The guest icon and gold are the role markers in
   1.1.0; other badges come later as icons from the key's roles.
 - Disconnect, kick and ban are three actions: disconnect keeps access

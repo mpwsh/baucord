@@ -46,6 +46,8 @@ pub const FILES: u64 = 1 << 13;
 /// The admin panel's commands (spec §8): `AuditLog`, roles over the
 /// wire, `ListBlobs`/`DeleteBlob`, `ServerStats`.
 pub const ADMIN_PANEL: u64 = 1 << 14;
+/// The audit as it happens (`AuditLine`), for the admin channel.
+pub const ADMIN_FEED: u64 = 1 << 15;
 
 /// What a 1.0 client can do.
 pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
@@ -67,7 +69,8 @@ pub const CLIENT_1_1: u64 = CLIENT_1_0
     | PROGRESS_ALL
     | ROLE_LIST
     | FILES
-    | ADMIN_PANEL;
+    | ADMIN_PANEL
+    | ADMIN_FEED;
 /// What a 1.1 server offers: keys are the login, invites the door,
 /// roles decide what a session may do, and it keeps history.
 pub const SERVER_1_1: u64 = TELEMETRY
@@ -83,7 +86,8 @@ pub const SERVER_1_1: u64 = TELEMETRY
     | PROGRESS_ALL
     | ROLE_LIST
     | FILES
-    | ADMIN_PANEL;
+    | ADMIN_PANEL
+    | ADMIN_FEED;
 
 /// Bits both sides announced.
 #[must_use]

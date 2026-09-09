@@ -341,6 +341,28 @@ impl ChatHistory {
         self.rows.iter().any(|r| r.message_id() == Some(id))
     }
 
+    /// A card whose file is a picture arrived as bytes: the row becomes
+    /// an image (spec §7: pictures in DMs ride the blob path). The
+    /// index changed, or `None` when the message is not in the window.
+    pub fn attach_image(
+        &mut self,
+        id: u64,
+        width: u32,
+        height: u32,
+        is_gif: bool,
+    ) -> Option<usize> {
+        let (start, end) = self.span_of(id)?;
+        let meta = self.rows[start].meta()?.clone();
+        let image = ChatItem::Image {
+            meta,
+            width,
+            height,
+            is_gif,
+        };
+        self.rows.splice(start..end, [image]);
+        Some(start)
+    }
+
     /// Replace a card's file (an upload learned its blob).
     pub fn set_file(&mut self, index: usize, file: FileMeta) {
         if let Some(ChatItem::File { file: slot, .. }) = self.rows.get_mut(index) {

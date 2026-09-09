@@ -469,7 +469,7 @@ impl ChatServer {
             AdminCommand::Disconnect { target, reason } => {
                 need(permissions::DISCONNECT)?;
                 let user_id = self.resolve_target(&target)?;
-                self.check_target(actor, &user_id)?;
+                self.check_reachable(actor, &user_id)?;
                 let sessions = self.sessions_of(&user_id);
                 if sessions.is_empty() {
                     return Err(AdminError::NoSuchUser);
@@ -488,7 +488,7 @@ impl ChatServer {
             AdminCommand::Kick { target, reason } => {
                 need(permissions::KICK)?;
                 let user_id = self.resolve_target(&target)?;
-                self.check_target(actor, &user_id)?;
+                self.check_not_admin(actor, &user_id)?;
                 self.kick_user(actor, &actor_name, &user_id, &reason);
                 Ok(AdminOutcome::Done)
             }
@@ -499,7 +499,7 @@ impl ChatServer {
             } => {
                 need(permissions::BAN)?;
                 let user_id = self.resolve_target(&target)?;
-                self.check_target(actor, &user_id)?;
+                self.check_not_admin(actor, &user_id)?;
                 let now = self.wall_now();
                 // Block what is known about the person: the user, the
                 // key of the live session (or their latest key), and the
@@ -798,13 +798,32 @@ impl ChatServer {
     /// The rank rule (spec §8): the target must exist, must not be the
     /// actor, and must rank below the actor.
     fn check_target(&self, actor: UserId, target: &UserId) -> Result<(), AdminError> {
+        self.check_reachable(actor, target)?;
+        if self.policy.rank_of(target) >= self.policy.rank_of(&actor) {
+            return Err(AdminError::Outranked);
+        }
+        Ok(())
+    }
+
+    /// The target exists and is not the actor: enough for a disconnect
+    /// (spec §12: anyone with the permission may drop anyone; it costs
+    /// a reconnect).
+    fn check_reachable(&self, actor: UserId, target: &UserId) -> Result<(), AdminError> {
         if !self.policy.users.contains_key(target) {
             return Err(AdminError::NoSuchUser);
         }
         if *target == actor {
             return Err(AdminError::Yourself);
         }
-        if self.policy.rank_of(target) >= self.policy.rank_of(&actor) {
+        Ok(())
+    }
+
+    /// For a kick or a ban (spec §12): reachable, and not an
+    /// administrator — the one protection; equal or higher rank
+    /// below that is fair game.
+    fn check_not_admin(&self, actor: UserId, target: &UserId) -> Result<(), AdminError> {
+        self.check_reachable(actor, target)?;
+        if permissions::has(self.effective_permissions(target), permissions::ADMIN) {
             return Err(AdminError::Outranked);
         }
         Ok(())

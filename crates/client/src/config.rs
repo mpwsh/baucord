@@ -138,6 +138,11 @@ pub struct UiSettings {
     /// The Messages section's height (dragged at its divider).
     #[serde(default = "default_messages_height")]
     pub messages_height: u16,
+    /// Conversations closed with their ✕ (user ids, hex): they stay
+    /// out of the Messages list across logins until a new message
+    /// arrives or "Message" is picked on that person again.
+    #[serde(default)]
+    pub hidden_dms: Vec<String>,
 }
 
 fn default_sidebar_width() -> u16 {
@@ -158,6 +163,7 @@ impl Default for UiSettings {
             messages_collapsed: false,
             sidebar_width: default_sidebar_width(),
             messages_height: default_messages_height(),
+            hidden_dms: Vec::new(),
         }
     }
 }

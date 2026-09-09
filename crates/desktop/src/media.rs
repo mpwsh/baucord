@@ -69,31 +69,65 @@ pub fn push_image_row(app: &mut AppState, meta: &app_core::chat::Meta, data: Vec
 
     // The freshly appended row is the last one — install the decoded
     // frame (convert::chat_row only sets a placeholder).
+    let last = app.chat_model().row_count() - 1;
+    install_image(app, last, frame, data, is_gif);
+    true
+}
+
+/// Put a decoded picture on the image row at `index` and register its
+/// bytes (and player, for a GIF) under that row's id.
+fn install_image(
+    app: &mut AppState,
+    index: usize,
+    frame: slint::Image,
+    data: Vec<u8>,
+    is_gif: bool,
+) {
     let model = app.chat_model().clone();
-    let last = model.row_count() - 1;
-    if let Some(mut row) = model.row_data(last) {
-        let preview = frame.clone();
-        row.image = frame;
-        let row_id = row.row_id;
-        model.set_row_data(last, row);
+    let Some(mut row) = model.row_data(index) else {
+        return;
+    };
+    let preview = frame.clone();
+    row.image = frame;
+    let row_id = row.row_id;
+    model.set_row_data(index, row);
 
-        let bytes = Rc::new(data);
-        app.images.insert(
-            row_id,
-            ImageEntry {
-                bytes: bytes.clone(),
-                is_gif,
-            },
-        );
+    let bytes = Rc::new(data);
+    app.images.insert(
+        row_id,
+        ImageEntry {
+            bytes: bytes.clone(),
+            is_gif,
+        },
+    );
 
-        if is_gif {
-            let mut player = GifPlayer::new(bytes, preview);
-            player.start_autoplay();
-            app.gifs_mut().insert(row_id, player);
-            app.ensure_gif_ticker();
-        }
+    if is_gif {
+        let mut player = GifPlayer::new(bytes, preview);
+        player.start_autoplay();
+        app.gifs_mut().insert(row_id, player);
+        app.ensure_gif_ticker();
     }
+}
 
+/// A picture that came as a file (a DM attachment, spec §7): the card
+/// for message `msg_id` in the shown conversation becomes an image row
+/// with `data`. `false` when the bytes are not a picture after all.
+pub fn picture_from_file(app: &mut AppState, msg_id: u64, data: Vec<u8>) -> bool {
+    let max_edge = ui::convert::preview_max_edge(app.main.window().scale_factor());
+    let Ok((frame, w, h)) = ui::convert::decode_to_preview(&data, max_edge) else {
+        return false;
+    };
+    let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);
+    let Some(index) = app.history_mut().attach_image(msg_id, w, h, is_gif) else {
+        return false;
+    };
+    let row = app.chat_row_at(index);
+    app.chat_model().set_row_data(index, row);
+    install_image(app, index, frame, data, is_gif);
+    // A card became a picture: taller. A reader pinned to the bottom
+    // stays there (the follow only ran on appends before, which left
+    // the view a few rows short after a replay's pictures landed).
+    app.main.invoke_chat_follow_appended();
     true
 }
 

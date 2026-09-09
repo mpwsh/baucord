@@ -511,6 +511,20 @@ clients unless marked.
   players. An image row rebuilt in place now keeps its id and
   picture. This is the likely cause of "GIFs stopped showing after a
   rename".
+  **Pictures in DMs (spec §7, done):** a picture sent in a DM goes
+  up as a file (`begin_file_upload("picture.png", "image/png")`,
+  `pending_picture_uploads` → `picture_acks`), and once acked the
+  sender's own card becomes the picture (`media::picture_from_file`
+  → `ChatHistory::attach_image`); on the receiving end — and in a
+  replay — a card whose mime is `image/*` and size within the image
+  limit fetches its blob (`want_picture`, `pending_pictures` by
+  blob) and turns into an image row when the bytes land. General
+  keeps `ImageMessage`. **Moderation rule change (spec §12):**
+  disconnect reaches anyone with the permission (`check_reachable`),
+  kick and ban refuse only administrators (`check_not_admin`); mutes,
+  restrictions, roles and purges keep the rank rule; the roster menu
+  mirrors it (`UserFacts::is_admin`); e2e
+  `disconnect_reaches_anyone_and_kick_spares_admins`.
   **Chat rows highlight on hover** like the roster: the row's
   TouchArea is now the *parent* of its content (a `TextInput`
   accepts idle moves, so a sibling underneath never saw hover; a
@@ -685,8 +699,48 @@ both only visible from a heap profile.
 
 ## 5. Next steps
 
-1.1.2 is released; every crate on the 1.1 line reads `1.1.3` now.
-The 1.1.3 line (spec §11 item 4), in order:
+1.1.3 is released; every crate on the 1.1 line reads `1.1.4` now.
+**1.1.4, all in this drop (untested by cargo here):** blob retention
+(`Sqlite::prune_blobs`, `Retention.file_days`), purge drops the
+person's blobs, chat xp (`XP_MESSAGE` at the flush), pictures as
+files everywhere the server is persistent (`server_persistent` picks
+the path; memory mode keeps `ImageMessage`), `limits.max_transfer_kb_
+per_minute[_global]` (serde aliases for the old names; the same
+sliding-minute budget now gates file uploads in `admit_file_upload`),
+`server restore <tar> [--force]` (staging dir, the old db kept as
+`baucord.db.before-restore`, refuses while `-wal` exists) and `server
+db prune`, the admin channel (`ADMIN_CHANNEL` permission, `AuditLine`
+under the `ADMIN_FEED` bit from the audit writer itself, a reserved
+conversation key `ADMIN_CHANNEL_KEY` in the Messages list with a
+shield, the last page on first open via `PendingAdmin::Channel`,
+commands only), and push-to-talk as a watched key (`PttWatcher` on
+`device_query`; a registered hotkey consumed the key system-wide —
+falls back to registering where the state cannot be read, e.g.
+Wayland or macOS without the accessibility grant).
+
+**After the first 1.1.4 build:** a command's output — and the answer
+to any admin command, a roster-menu pick included — lands in the
+conversation it was asked from (`AppState.command_conv`, set in
+`handle_slash_command` and in `send_admin` for `PendingAdmin::Show`;
+`push_command_output`), so the admin channel answers in the admin
+channel; server notices keep `push_chat_system` (General). Closed
+DMs stay closed: `ui.hidden_dms` (hex user ids) is written by the ✕
+(`set_dm_hidden`), cleared by "Message" on that person or by a new
+message from them, and `Conversations` skips a hidden partner unless
+they have unread.
+
+The chat's follow no longer ends at the first "exact bottom": the
+ListView estimates the height of rows it has not drawn, so a tall
+last row (a picture) lands at the bottom of an estimate and grows
+once measured. The timer holds at the bottom for 8 consecutive
+frames (`follow-settled`) before it lets go, and the viewport-y
+handler no longer clears the follow on reaching the bottom — only a
+scroll *up* does. In-place row replacements that change height
+(`attach_file`, `picture_from_file`) re-follow when pinned. Roster
+rows pad 20 px on the right so the overlaid scrollbar clears the
+badges.
+
+The 1.1.3 line as it was (spec §11 item 4), for reference:
 
 1. **Custom roles** — done (§2). Try by hand: `server role create
    streamer --like member --grant manage-channels`, `server user

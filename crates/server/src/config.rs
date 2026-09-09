@@ -107,26 +107,19 @@ pub struct LimitSettings {
     pub max_viewers_per_stream: usize,
     /// Chat messages longer than this (bytes) are truncated.
     pub max_chat_bytes: usize,
-    /// Per-client image *bandwidth* budget: KiB of accepted chat
-    /// images per sliding minute. Bytes are the resource being
-    /// protected — a burst of tiny stickers is harmless while two
-    /// 1 MiB monsters back-to-back are not, so the budget weighs each
-    /// image by its size instead of counting them. Images that would
-    /// exceed the window are dropped with a warning. `0` disables
-    /// image relay entirely. Note the amplification: every accepted
-    /// KiB is relayed to every connected client, so per-client egress
-    /// pressure ≈ this budget × connected clients. A budget smaller
-    /// than an image rejects that image outright: the wire allows
-    /// images up to 10 MiB (10240 KiB), so the default of 4096 also
-    /// acts as a per-image size ceiling of ~4 MiB — raise it past
-    /// 10240 if you want single full-size images through.
-    pub max_image_kb_per_minute: usize,
-    /// Same budget across the *whole server* (all senders combined,
-    /// same sliding minute). The per-client budget bounds one chatty
-    /// client; this bounds the coordinated case where several clients
-    /// bursting together multiply into `clients × bytes` of relay
-    /// egress. `0` disables image relay entirely.
-    pub max_image_kb_per_minute_global: usize,
+    /// Per-client *transfer* budget: KiB of accepted uploads — files,
+    /// pictures, and the legacy chat-image relay — per sliding minute.
+    /// Bytes are the resource: a 4 MiB picture costs as much as forty
+    /// 100 KiB ones. Uploads that would cross the budget are refused
+    /// outright; `0` disables uploads entirely. (Was
+    /// `max_image_kb_per_minute`; the old name still reads.)
+    #[serde(alias = "max_image_kb_per_minute")]
+    pub max_transfer_kb_per_minute: usize,
+    /// Server-wide transfer budget, KiB per sliding minute, over all
+    /// clients; `0` disables uploads entirely. (Was
+    /// `max_image_kb_per_minute_global`.)
+    #[serde(alias = "max_image_kb_per_minute_global")]
+    pub max_transfer_kb_per_minute_global: usize,
     /// Relay pacing for chat images, KiB per second *per receiver*.
     /// Images are re-chunked and trickled out at this rate so a big
     /// image never floods a receiver's downlink queue — that queue is
@@ -510,8 +503,8 @@ impl Default for LimitSettings {
             // stickers), 16 MiB/min for the room — bursty enough for a
             // meme volley, bounded enough that a handful of spammers
             // can't multiply into hundreds of MB/min of relay egress.
-            max_image_kb_per_minute: 4096,
-            max_image_kb_per_minute_global: 16_384,
+            max_transfer_kb_per_minute: 4096,
+            max_transfer_kb_per_minute_global: 16_384,
             media_relay_kb_per_sec: 1024,
             chat: ChatLimit::default(),
         }

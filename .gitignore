@@ -9,3 +9,6 @@ netcode.key
 fltk-ui
 ./crates/*.tar.gz
 /data
+baucord.db
+baucord.db-shm
+baucord.db-wal

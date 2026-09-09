@@ -85,6 +85,7 @@ export struct DmRow {
     has-avatar: bool,
     initial: string,
     tile-tint: color,
+    admin: bool,         // the admin channel (spec §8): a shield, not a person
 }
 
 /// The toast's register: what color and glyph it carries.
@@ -327,6 +328,7 @@ export global State {
     in property <bool> perm-create-invites: false;
     in property <bool> perm-manage-invites: false;  // longer expiries
     in property <bool> perm-panel: false;           // the Admin chip (PANEL)
+    in property <bool> perm-admin-channel: false;   // the Messages row (ADMIN_CHANNEL)
     in property <bool> perm-manage-own: false;  // MANAGE_OWN_CHANNELS
     /// Our highest built-in role (same scale as UserRow.role): the
     /// role submenu offers roles up to it.
@@ -490,6 +492,8 @@ export global Logic {
     callback invite-create();
     /// The Admin chip: open the panel (spec §8).
     callback admin-open();
+    /// The Messages section's shield row: open the admin channel.
+    callback admin-channel-open();
     /// The dialog: mint with the picked options; copy the code; close.
     callback invite-dialog-create();
     callback invite-dialog-copy();

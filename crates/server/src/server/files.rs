@@ -120,6 +120,15 @@ impl ChatServer {
         if !self.make_room_for(u64::from(size)) {
             return Err(UploadRejectReason::Full);
         }
+        // The same sliding-minute transfer budget the chat-image relay
+        // keeps: per client and server-wide.
+        if !permissions::has(
+            self.effective_permissions(&user),
+            permissions::BYPASS_LIMITS,
+        ) && !self.allow_image(client, usize::try_from(size).unwrap_or(usize::MAX))
+        {
+            return Err(UploadRejectReason::Quota);
+        }
         Ok(())
     }
 

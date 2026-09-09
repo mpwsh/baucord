@@ -33,6 +33,8 @@ const HISTORY_MAX_LIMIT: u16 = 200;
 /// xp per minute (spec §9.1, as decided: presence, voice and sharing
 /// earn it; typing does not, so there is nothing to spam for).
 const XP_ONLINE: u64 = 1;
+/// Per chat message, counted at the minute flush (spec §9.1).
+const XP_MESSAGE: u64 = 1;
 const XP_TALKING: u64 = 5;
 const XP_WATCHING: u64 = 2;
 const XP_SHARING: u64 = 10;
@@ -410,6 +412,8 @@ impl ChatServer {
         for (user, mut delta) in deltas {
             delta.user_id = user;
             delta.ts = ts;
+            // Chat earns a little (the counter is kept anyway).
+            delta.xp += XP_MESSAGE * delta.messages;
             let before = self.policy.level_of(&user);
             *self.policy.xp.entry(user).or_insert(0) += delta.xp;
             let after = self.policy.level_of(&user);
@@ -474,6 +478,20 @@ impl ChatServer {
             .restrictions
             .retain(|r| r.user_id.as_ref() != Some(user_id));
         self.policy.xp.remove(user_id);
+        // Their files go with them (spec §8): the rows referencing them
+        // are being deleted, and nothing else may point at them.
+        let theirs: Vec<protocol::BlobId> = self
+            .policy
+            .blobs
+            .iter()
+            .filter(|(_, b)| b.created_by == Some(*user_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for blob in theirs {
+            self.policy.blobs.remove(&blob);
+            self.blob_bytes.remove(&blob);
+            self.persist.send(Command::DeleteBlob { blob_id: blob });
+        }
         self.recent.retain(|m| m.user_id != *user_id);
         self.last_telemetry.remove(user_id);
         self.persist.send(Command::PurgeUser { user_id: *user_id });

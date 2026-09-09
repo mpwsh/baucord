@@ -2526,6 +2526,104 @@ fn the_panel_manages_roles_and_blobs_and_reads_the_audit() {
 }
 
 #[test]
+fn disconnect_reaches_anyone_and_kick_spares_admins() {
+    use server::persistence::{cli_role_create, cli_set_roles};
+    let dir = temp_dir("mod-rule");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut mod_ = w.connect_member("mod");
+    let mut peer = w.connect_member("peer");
+    let admin_user = admin.key.user_id();
+    let mod_user = mod_.key.user_id();
+    let peer_user = peer.key.user_id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "rows never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A member-level custom role with the two powers.
+    let db = dir.join("baucord.db");
+    let powers = permissions::MEMBER_PERMISSIONS | permissions::DISCONNECT | permissions::KICK;
+    let id = cli_role_create(&db, "bouncer", powers, "", 0).expect("role");
+    cli_set_roles(&db, &mod_user, &[id]).expect("grant");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        w.pump(&mut [&mut admin, &mut mod_, &mut peer]);
+        if mod_.inbox.iter().any(
+            |m| matches!(m, ServerMessage::Session { permissions, .. } if *permissions == powers),
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the role never reached the session"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Kicking an equal (a member, rank 10 vs the bouncer's 15 — and a
+    // second bouncer would be equal): fine. The admin, holding
+    // `ADMIN_CHANNEL`, sees the line as it happens (spec §8).
+    mod_.admin(
+        &mut w,
+        3,
+        AdminCommand::Kick {
+            target: AdminTarget::User(peer_user),
+            reason: "bye".into(),
+        },
+    );
+    assert_eq!(
+        mod_.admin_result(&mut w, &mut [&mut admin], 3),
+        Ok(AdminOutcome::Done)
+    );
+    let entry = admin.wait_for(&mut w, &mut [&mut mod_], |m| match m {
+        ServerMessage::AuditLine { entry } if entry.action == "user.kick" => Some(entry.clone()),
+        _ => None,
+    });
+    assert_eq!(entry.actor.as_deref(), Some("mod"));
+    assert_eq!(
+        entry.target.as_deref(),
+        Some("peer"),
+        "targets come as names"
+    );
+    assert!(
+        !mod_
+            .inbox
+            .iter()
+            .any(|m| matches!(m, ServerMessage::AuditLine { .. })),
+        "the bouncer lacks the channel permission"
+    );
+    // Kicking the admin: the one protection.
+    mod_.admin(
+        &mut w,
+        2,
+        AdminCommand::Kick {
+            target: AdminTarget::User(admin_user),
+            reason: String::new(),
+        },
+    );
+    assert_eq!(
+        mod_.admin_result(&mut w, &mut [&mut admin], 2),
+        Err(AdminError::Outranked)
+    );
+    // Disconnecting the admin: allowed, the rank rule does not apply.
+    mod_.admin(
+        &mut w,
+        1,
+        AdminCommand::Disconnect {
+            target: AdminTarget::User(admin_user),
+            reason: "reconnect please".into(),
+        },
+    );
+    assert_eq!(
+        mod_.admin_result(&mut w, &mut [&mut admin], 1),
+        Ok(AdminOutcome::Done)
+    );
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn everyone_sees_everyones_progress() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
     let mut alice = w.connect("alice");
@@ -3429,8 +3527,8 @@ fn hot_reload_rejects_invalid_lists_and_keeps_state() {
 #[test]
 fn per_client_image_byte_budget_brakes_one_spammer() {
     let mut config = test_config(vec![open_channel("Lobby", true)]);
-    config.limits.max_image_kb_per_minute = 100; // 100 KiB/min per client
-    config.limits.max_image_kb_per_minute_global = 100_000; // loose
+    config.limits.max_transfer_kb_per_minute = 100; // 100 KiB/min per client
+    config.limits.max_transfer_kb_per_minute_global = 100_000; // loose
     let mut w = World::new(config);
     let mut a = w.connect_member("alice");
     let mut b = w.connect_member("bob");
@@ -3464,8 +3562,8 @@ fn per_client_image_byte_budget_brakes_one_spammer() {
 #[test]
 fn global_image_byte_budget_brakes_coordinated_bursts() {
     let mut config = test_config(vec![open_channel("Lobby", true)]);
-    config.limits.max_image_kb_per_minute = 100_000; // loose
-    config.limits.max_image_kb_per_minute_global = 100; // 100 KiB/min room-wide
+    config.limits.max_transfer_kb_per_minute = 100_000; // loose
+    config.limits.max_transfer_kb_per_minute_global = 100; // 100 KiB/min room-wide
     let mut w = World::new(config);
     let mut a = w.connect_member("alice");
     let mut b = w.connect_member("bob");
@@ -3493,8 +3591,8 @@ fn global_image_byte_budget_brakes_coordinated_bursts() {
 #[test]
 fn relay_paces_large_images_instead_of_bursting() {
     let mut config = test_config(vec![open_channel("Lobby", true)]);
-    config.limits.max_image_kb_per_minute = 100_000;
-    config.limits.max_image_kb_per_minute_global = 100_000;
+    config.limits.max_transfer_kb_per_minute = 100_000;
+    config.limits.max_transfer_kb_per_minute_global = 100_000;
     config.limits.media_relay_kb_per_sec = 1024; // 1 MiB/s per receiver
     let mut w = World::new(config);
     let mut a = w.connect_member("alice");

@@ -416,7 +416,7 @@ confirm-delete-message-body-admin = Se elimina para todos; el registro de audito
 confirm-delete-message = Borrar mensaje
 
 # ── 1.1 canales desde la interfaz ─────────────────────────────────────
-channel-new = Crear canal 
+channel-new = Canal nuevo
 channel-name = Nombre
 channel-name-placeholder = Hasta 40 caracteres
 channel-password-placeholder = Opcional
@@ -431,7 +431,7 @@ channel-members-only-hint = Los invitados no lo ven ni pueden entrar.
 channel-create = Crear canal
 channel-save = Guardar cambios
 channel-not-persistent-note = Este servidor no guarda canales: dura hasta que el servidor se reinicie.
-channel-dialog-title-new = Crear canal
+channel-dialog-title-new = Canal nuevo
 channel-dialog-title-edit = Editar { $name }
 channel-password-unknown = Este canal tiene una contraseña que este dispositivo no conoce. Escribila para conservarla, o dejá el campo vacío para quitarla.
 channel-error-name = Dale al canal un nombre de hasta 40 caracteres.
@@ -567,9 +567,9 @@ messages-header = Mensajes
 voice-header = Voz
 messages-collapse = Contraer mensajes
 messages-expand = Expandir mensajes
-invite-button = Invitar
+invite-button = Invitar usuarios
 card-offline = Desconectado
-invite-dialog-title = Invitar
+invite-dialog-title = Invitar usuarios
 invite-role = Entra como
 invite-expiry = Vence
 invite-uses-label = Usos
@@ -611,7 +611,6 @@ sounds-dm = Llega un mensaje directo
 chat-dm-with-offline = { $name } no está conectado; el mensaje espera en el servidor.
 chat-command-usage-dm = Uso: /dm <nombre> <mensaje>
 chat-dm-unknown = Acá nadie se llama { $name }.
-chat-dm-no-images = Las imágenes en mensajes directos llegan con la actualización de archivos.
 dm-close = Cerrar conversación
 
 # ── Admin panel (spec §8) ──
@@ -735,3 +734,6 @@ file-save-again = Descargar de nuevo
 file-gone = Ese archivo ya no está en tu carpeta de Descargas
 file-open-error = No se pudo abrir el archivo: { $error }
 file-cancel = Cancelar
+admin-channel = Canal de administración
+admin-channel-lead = La auditoría, en vivo. Los comandos funcionan acá: /kick, /ban, /mute, /grant, /invite…
+admin-channel-commands-only = Este canal solo acepta comandos — empezá con /

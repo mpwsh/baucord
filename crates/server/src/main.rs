@@ -56,6 +56,16 @@ enum Command {
         /// Output archive, e.g. `baucord-2026-09-04.tar`.
         file: PathBuf,
     },
+    /// Put a `backup` archive back: the database and the blobs, with
+    /// the server stopped. The current database is kept beside as
+    /// `baucord.db.before-restore`.
+    Restore {
+        /// The archive `backup` wrote.
+        file: PathBuf,
+        /// Go ahead even if the server seems to hold the database.
+        #[arg(long)]
+        force: bool,
+    },
     /// Database maintenance.
     Db {
         #[command(subcommand)]
@@ -238,6 +248,10 @@ enum DbCommand {
     /// Run `SQLite`'s integrity check and print the schema version and
     /// row counts. Read-only; safe while the server is up.
     Check,
+    /// Run the retention pass now (messages, telemetry and unreferenced
+    /// files past their windows). The server does this hourly on its
+    /// own; this is for a stopped server.
+    Prune,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -285,6 +299,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Db {
             command: DbCommand::Check,
         }) => return db_check(&config),
+        Some(Command::Db {
+            command: DbCommand::Prune,
+        }) => return db_prune(&config),
+        Some(Command::Restore { file, force }) => return restore(&config, &file, force),
         Some(Command::Invite { command }) => return invite_command(&config, command),
         Some(Command::User { command }) => return user_command(&config, command),
         Some(Command::Role { command }) => return role_command(&config, command),
@@ -485,6 +503,36 @@ fn backup(config: &Config, out: &Path) -> Result<(), Box<dyn std::error::Error>>
 }
 
 /// `server db check`.
+fn db_prune(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    let p = &config.persistence;
+    let removed = persistence::cli_prune(
+        &db,
+        persistence::Retention {
+            history_days: p.history.retain_days,
+            telemetry_days: p.telemetry.retain_days,
+            file_days: p.files.retain_days,
+        },
+    )?;
+    println!("pruned {removed} row(s) and file(s) past their retention windows");
+    Ok(())
+}
+
+fn restore(config: &Config, file: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let db = database_path(config)?;
+    let report = persistence::restore_from_tar(&db, file, force)?;
+    println!(
+        "restored {} and {} file(s) from {}",
+        db.display(),
+        report.blobs,
+        file.display()
+    );
+    if let Some(kept) = report.kept {
+        println!("the previous database is at {}", kept.display());
+    }
+    Ok(())
+}
+
 fn db_check(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let db = database_path(config)?;
     let report = persistence::check(&db)?;

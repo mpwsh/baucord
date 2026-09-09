@@ -220,7 +220,7 @@ pub struct ChatServer {
     last_config_check: Instant,
     /// Per-client (time, bytes) of recently *accepted* chat images,
     /// pruned to the last minute — the sliding window behind
-    /// `limits.max_image_kb_per_minute`.
+    /// `limits.max_transfer_kb_per_minute`.
     image_bytes: HashMap<ClientId, Vec<(Instant, usize)>>,
     /// In-progress image uploads, at most one per client — a chunk
     /// with a fresh `upload_id` abandons the old partial.
@@ -693,13 +693,36 @@ impl ChatServer {
         target: Option<String>,
         detail: Option<String>,
     ) {
+        let ts = self.wall_now();
         self.persist.send(Command::Audit(AuditRow {
-            ts: self.wall_now(),
+            ts,
             actor,
             action: action.to_string(),
-            target,
-            detail,
+            target: target.clone(),
+            detail: detail.clone(),
         }));
+        // The admin channel sees it as it happens (spec §8).
+        let line = ServerMessage::AuditLine {
+            entry: protocol::AuditEntry {
+                id: 0,
+                ts,
+                actor: actor.map(|a| self.name_of_user(&a)),
+                target: target.as_deref().map(|t| self.audit_target_name(action, t)),
+                action: action.to_string(),
+                detail,
+            },
+        };
+        let readers: Vec<ClientId> = self
+            .user_of
+            .iter()
+            .filter(|(_, u)| {
+                permissions::has(self.effective_permissions(u), permissions::ADMIN_CHANNEL)
+            })
+            .map(|(c, _)| *c)
+            .collect();
+        for peer in readers {
+            self.send_if(peer, features::ADMIN_FEED, &line);
+        }
     }
 
     /// Mutable access to the persistence handle (the CLI bridge in a
@@ -1479,9 +1502,9 @@ impl ChatServer {
     /// sender nothing here (their upload already crossed the wire —
     /// that part is physics), but they are never multiplied into
     /// `clients ×` relay egress.
-    fn allow_image(&mut self, client_id: ClientId, len: usize) -> bool {
-        let per_client = self.config.limits.max_image_kb_per_minute * 1024;
-        let global = self.config.limits.max_image_kb_per_minute_global * 1024;
+    pub(crate) fn allow_image(&mut self, client_id: ClientId, len: usize) -> bool {
+        let per_client = self.config.limits.max_transfer_kb_per_minute * 1024;
+        let global = self.config.limits.max_transfer_kb_per_minute_global * 1024;
         if per_client == 0 || global == 0 {
             return false;
         }

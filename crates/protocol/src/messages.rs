@@ -1154,6 +1154,14 @@ pub enum ServerMessage {
         items: Vec<(u64, Attachment)>,
     },
 
+    // ── 1.1.4: the audit as it happens (feature bit `ADMIN_FEED`) ────
+    /// One audit line, the moment it is written, to sessions holding
+    /// `ADMIN_CHANNEL` (spec §8). `entry.id` is 0: the store numbers
+    /// rows later; `AuditLog` is the paged, numbered read.
+    AuditLine {
+        entry: crate::admin::AuditEntry,
+    },
+
     // ── 1.1.3: the role table (feature bit `ROLE_LIST`) ──────────────
     /// Every role the server has, in rank order: after `Session` on
     /// join, and to everyone when the table changes (a `server role`
@@ -2110,6 +2118,16 @@ mod tests {
                     size: 1_234,
                 },
             )],
+        }));
+        assert!(server_roundtrips(&ServerMessage::AuditLine {
+            entry: crate::admin::AuditEntry {
+                id: 0,
+                ts: 5,
+                actor: Some("mpw".into()),
+                action: "user.kick".into(),
+                target: Some("bob".into()),
+                detail: None,
+            },
         }));
         assert!(server_roundtrips(&ServerMessage::RoleList {
             roles: vec![RoleInfo {

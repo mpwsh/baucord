@@ -609,7 +609,6 @@ sounds-dm = A direct message arrives
 chat-dm-with-offline = { $name } is offline; the message waits on the server.
 chat-command-usage-dm = Usage: /dm <name> <message>
 chat-dm-unknown = Nobody here is called { $name }.
-chat-dm-no-images = Pictures in direct messages come with the file sharing update.
 dm-close = Close conversation
 
 # ── Admin panel (spec §8) ──
@@ -733,3 +732,6 @@ file-save-again = Download again
 file-gone = That file is no longer in your Downloads folder
 file-open-error = Unable to open the file: { $error }
 file-cancel = Cancel
+admin-channel = Admin channel
+admin-channel-lead = The audit, as it happens. Slash commands work here: /kick, /ban, /mute, /grant, /invite…
+admin-channel-commands-only = This channel takes commands only — start with /

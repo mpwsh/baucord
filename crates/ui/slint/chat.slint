@@ -916,16 +916,24 @@ export component ChatPane inherits Rectangle {
     // virtualization refinement while scrolling and stacked into the
     // runtime's "long callback/instantiation chain" warning. Bounded,
     // so a follow that can never land does not tick forever.
+    // The ListView estimates the height of rows it has not drawn yet:
+    // a tall last row (a picture) lands "at the bottom" of an estimate
+    // and grows once it is measured. So the follow is not done at the
+    // first exact bottom — it holds there for a few frames and lets
+    // the measurement settle.
     private property <int> follow-ticks: 0;
+    private property <int> follow-settled: 0;
     Timer {
         interval: 16ms;
         running: root.follow-pending;
         triggered => {
             root.scroll-to-end();
             root.follow-ticks += 1;
-            if (list.at-exact-bottom() || root.follow-ticks > 60) {
+            root.follow-settled = list.at-exact-bottom() ? root.follow-settled + 1 : 0;
+            if (root.follow-settled >= 8 || root.follow-ticks > 90) {
                 root.follow-pending = false;
                 root.follow-ticks = 0;
+                root.follow-settled = 0;
             }
         }
     }
@@ -1129,13 +1137,15 @@ export component ChatPane inherits Rectangle {
             }
             changed viewport-y => {
                 if (self.at-exact-bottom()) {
+                    // Pinned; the follow, if owed, decides for itself
+                    // when it has settled.
                     root.stick-to-bottom = true;
-                    root.follow-pending = false;
-                    root.follow-ticks = 0;
                 } else if (self.viewport-y > self.last-viewport-y + 0.25px) {
+                    // The reader scrolled up: nothing follows them down.
                     root.stick-to-bottom = false;
                     root.follow-pending = false;
                     root.follow-ticks = 0;
+                    root.follow-settled = 0;
                 } else if (self.viewport-y < self.last-viewport-y - 0.25px && self.near-bottom()) {
                     root.stick-to-bottom = true;
                 }

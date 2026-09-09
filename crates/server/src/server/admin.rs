@@ -102,7 +102,7 @@ impl ChatServer {
     /// An audit target as the panel should read it: a user's short id
     /// becomes their name, a role or channel id its name, a
     /// restriction or message id gets a `#`. Codes and hashes stay.
-    fn audit_target_name(&self, action: &str, target: &str) -> String {
+    pub(super) fn audit_target_name(&self, action: &str, target: &str) -> String {
         let user_named = || {
             self.policy
                 .users
@@ -137,7 +137,7 @@ impl ChatServer {
     }
 
     /// A user's name of record, or a short id.
-    fn name_of_user(&self, user: &UserId) -> String {
+    pub(super) fn name_of_user(&self, user: &UserId) -> String {
         self.policy
             .users
             .get(user)

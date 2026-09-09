@@ -781,7 +781,7 @@ fn confirm_accept(app: &mut AppState) {
 }
 
 /// An audit action as a verb phrase; unknown ones read as stored.
-fn audit_action_text(action: &str) -> String {
+pub(crate) fn audit_action_text(action: &str) -> String {
     let key = match action {
         "user.join" => "admin-act-join",
         "user.kick" => "admin-act-kick",

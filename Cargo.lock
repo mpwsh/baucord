@@ -1034,7 +1034,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "1.1.3"
+version = "1.1.4"
 dependencies = [
  "audio",
  "bytes",
@@ -1279,7 +1279,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "web-sys",
- "windows",
+ "windows 0.62.2",
  "windows-core",
 ]
 
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "1.1.3"
+version = "1.1.4"
 dependencies = [
  "app-core",
  "arboard",
@@ -1629,6 +1629,7 @@ dependencies = [
  "chrono",
  "client",
  "crossbeam-channel",
+ "device_query",
  "dirs",
  "env_logger",
  "global-hotkey",
@@ -1649,6 +1650,20 @@ dependencies = [
  "video",
  "winresource",
  "zip",
+]
+
+[[package]]
+name = "device_query"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7331225604b9b097b41872d550134933d4be83465d70a2c4a132b929f99aaca"
+dependencies = [
+ "macos-accessibility-client",
+ "pkg-config",
+ "readkey",
+ "readmouse",
+ "windows 0.48.0",
+ "x11",
 ]
 
 [[package]]
@@ -2183,7 +2198,7 @@ dependencies = [
  "read-fonts 0.39.2",
  "roxmltree",
  "smallvec",
- "windows",
+ "windows 0.62.2",
  "windows-core",
  "yeslogic-fontconfig-sys",
 ]
@@ -2822,7 +2837,7 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "webbrowser",
- "windows",
+ "windows 0.62.2",
  "winit",
  "zbus",
 ]
@@ -2927,7 +2942,7 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "web-time",
- "windows",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2974,7 +2989,7 @@ dependencies = [
  "softbuffer",
  "unicode-segmentation",
  "vtable",
- "windows",
+ "windows 0.62.2",
  "write-fonts",
 ]
 
@@ -3876,6 +3891,16 @@ name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
+
+[[package]]
+name = "macos-accessibility-client"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edf7710fbff50c24124331760978fb9086d6de6288dcdb38b25a97f8b1bdebbb"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
+]
 
 [[package]]
 name = "maybe-rayon"
@@ -5154,7 +5179,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "1.1.3"
+version = "1.1.4"
 dependencies = [
  "bytes",
  "log",
@@ -5485,6 +5510,18 @@ dependencies = [
  "font-types 0.12.3",
  "once_cell",
 ]
+
+[[package]]
+name = "readkey"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a36870cefdfcff57edbc0fa62165f42dfd4e5a0d8965117c1ea84c5700e4450"
+
+[[package]]
+name = "readmouse"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be105c72a1e6a5a1198acee3d5b506a15676b74a02ecd78060042a447f408d94"
 
 [[package]]
 name = "realfft"
@@ -5996,7 +6033,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "1.1.3"
+version = "1.1.4"
 dependencies = [
  "bytes",
  "chrono",
@@ -6131,7 +6168,7 @@ checksum = "9f512ac418a64194842dd05566320805dad1c957c521039db2486fd6368865bc"
 dependencies = [
  "bitflags 2.13.1",
  "skia-bindings",
- "windows",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -6533,7 +6570,7 @@ dependencies = [
  "ntapi",
  "objc2-core-foundation",
  "objc2-io-kit",
- "windows",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -6882,7 +6919,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "1.1.3"
+version = "1.1.4"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -7241,7 +7278,7 @@ dependencies = [
  "ffmpeg-next",
  "log",
  "thiserror 2.0.19",
- "windows",
+ "windows 0.62.2",
  "xcap",
 ]
 
@@ -7298,7 +7335,7 @@ dependencies = [
  "log",
  "num-integer",
  "thiserror 2.0.19",
- "windows",
+ "windows 0.62.2",
  "windows-core",
 ]
 
@@ -7617,6 +7654,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90628d739333b7c5d2ee0b70210b97b8cddc38440c682c96fd9e2c24c2db5f3a"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "windows"
+version = "0.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e686886bc078bc1b0b600cac0147aadb815089b6e4da64016cbd754b6342700f"
+dependencies = [
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -8001,6 +8047,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
+name = "x11"
+version = "2.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "502da5464ccd04011667b11c435cb992822c2c0dbde1770c988480d312a0db2e"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "x11-clipboard"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8096,7 +8152,7 @@ dependencies = [
  "thiserror 2.0.19",
  "url",
  "widestring",
- "windows",
+ "windows 0.62.2",
  "xcb",
  "zbus",
 ]

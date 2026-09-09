@@ -180,8 +180,10 @@ pub struct UserFacts {
     pub role: Role,
     pub sharing: bool,
     pub local_muted: bool,
-    /// Rank strictly below ours: mute, disconnect, kick and ban apply.
+    /// Rank strictly below ours: mutes apply.
     pub outranked: bool,
+    /// Holds the admin role: kick and ban never apply (spec §12).
+    pub is_admin: bool,
     /// Rank at or below ours: the role submenu applies.
     pub role_editable: bool,
     /// We own their channel (or manage all): send to the default one.
@@ -284,21 +286,23 @@ pub fn user_menu(
     if user.channel_kickable {
         moderation.push(Entry::new(Label::ChannelKick, Action::ChannelKick));
     }
-    if user.outranked {
-        if session.mute {
-            moderation.push(Entry::submenu(
-                Label::Mute,
-                vec![
-                    Entry::new(Label::MuteVoice, Action::MuteVoice),
-                    Entry::new(Label::MuteChat, Action::MuteChat),
-                    Entry::new(Label::UnmuteVoice, Action::UnmuteVoice).with_separator(),
-                    Entry::new(Label::UnmuteChat, Action::UnmuteChat),
-                ],
-            ));
-        }
-        if session.disconnect {
-            moderation.push(Entry::new(Label::Disconnect, Action::Disconnect));
-        }
+    if user.outranked && session.mute {
+        moderation.push(Entry::submenu(
+            Label::Mute,
+            vec![
+                Entry::new(Label::MuteVoice, Action::MuteVoice),
+                Entry::new(Label::MuteChat, Action::MuteChat),
+                Entry::new(Label::UnmuteVoice, Action::UnmuteVoice).with_separator(),
+                Entry::new(Label::UnmuteChat, Action::UnmuteChat),
+            ],
+        ));
+    }
+    // Disconnect reaches anyone; kick and ban spare administrators
+    // (spec §12) — the server refuses the same.
+    if session.disconnect {
+        moderation.push(Entry::new(Label::Disconnect, Action::Disconnect));
+    }
+    if !user.is_admin {
         if session.kick {
             moderation.push(Entry::new(Label::Kick, Action::Kick).danger());
         }
@@ -434,6 +438,7 @@ mod tests {
             sharing: false,
             local_muted: false,
             outranked: false,
+            is_admin: false,
             role_editable: false,
             channel_kickable: false,
             channel_id: 1,
@@ -519,16 +524,14 @@ mod tests {
     }
 
     #[test]
-    fn moderation_needs_permission_and_rank() {
-        let admin = Session {
+    fn moderation_needs_permission_and_the_right_target() {
+        let mod_ = Session {
             mute: true,
             disconnect: true,
             kick: true,
             ban: true,
             ..Session::default()
         };
-        // Permission without rank: nothing.
-        assert_eq!(user_menu(&admin, &member(), &[], &[]).len(), 3);
         // Rank without permission: nothing.
         let outranked = UserFacts {
             outranked: true,
@@ -538,15 +541,30 @@ mod tests {
             user_menu(&Session::default(), &outranked, &[], &[]).len(),
             3
         );
-        // Both: the four entries, the first with a rule above.
-        let entries = user_menu(&admin, &outranked, &[], &[]);
+        // Permission on an equal: mutes need rank; disconnect, kick and
+        // ban do not.
+        let entries = user_menu(&mod_, &member(), &[], &[]);
+        assert_eq!(
+            labels(&entries[3..]),
+            [Label::Disconnect, Label::Kick, Label::Ban]
+        );
+        assert!(entries[3].separator && !entries[4].separator);
+        // Outranked: the mute submenu joins them.
+        let entries = user_menu(&mod_, &outranked, &[], &[]);
         assert_eq!(
             labels(&entries[3..]),
             [Label::Mute, Label::Disconnect, Label::Kick, Label::Ban]
         );
-        assert!(entries[3].separator);
-        assert!(!entries[4].separator);
         assert!(entries[5].danger && entries[6].danger);
+        // An administrator: disconnect only.
+        let admin = UserFacts {
+            is_admin: true,
+            ..member()
+        };
+        assert_eq!(
+            labels(&user_menu(&mod_, &admin, &[], &[])[3..]),
+            [Label::Disconnect]
+        );
     }
 
     #[test]

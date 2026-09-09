@@ -57,6 +57,9 @@ pub const GOLD_NAME: u64 = 1 << 20;
 /// server's counters. Each tab's data still needs its own
 /// permission; this is the door, not the rooms.
 pub const PANEL: u64 = 1 << 21;
+/// See the admin channel (spec §8): the audit as it happens, in a
+/// conversation, with the slash commands at hand.
+pub const ADMIN_CHANNEL: u64 = 1 << 22;
 
 /// What a guest may do.
 pub const GUEST_PERMISSIONS: u64 = JOIN_CHANNELS | SPEAK | TEXT_GENERAL;
@@ -78,6 +81,7 @@ pub const ADMIN_PERMISSIONS: u64 = ORGANIZER_PERMISSIONS
     | BYPASS_LIMITS
     | GOLD_NAME
     | PANEL
+    | ADMIN_CHANNEL
     | ADMIN;
 
 /// Identifies a role on the wire and in the database.
@@ -144,7 +148,7 @@ pub const fn has(permissions: u64, bit: u64) -> bool {
 /// Every permission with the name the CLI and the panel use for it,
 /// in bit order. [`ADMIN`] is listed so it can be *printed*; a custom
 /// role can never hold it ([`CUSTOM_ROLE_PERMISSIONS`]).
-pub const PERMISSION_NAMES: [(&str, u64); 22] = [
+pub const PERMISSION_NAMES: [(&str, u64); 23] = [
     ("join", JOIN_CHANNELS),
     ("speak", SPEAK),
     ("text", TEXT_GENERAL),
@@ -166,6 +170,7 @@ pub const PERMISSION_NAMES: [(&str, u64); 22] = [
     ("bypass-limits", BYPASS_LIMITS),
     ("gold", GOLD_NAME),
     ("panel", PANEL),
+    ("admin-channel", ADMIN_CHANNEL),
     ("admin", ADMIN),
 ];
 
@@ -268,6 +273,7 @@ mod tests {
             ADMIN,
             GOLD_NAME,
             PANEL,
+            ADMIN_CHANNEL,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);

@@ -87,9 +87,11 @@ component UserRowView inherits Rectangle {
     }
 
     // ── Channel header row ──────────────────────────────────────
+    // The ListView's scrollbar is drawn over the right edge; the
+    // badges and counts sit clear of it.
     if user.is-channel : HorizontalLayout {
         padding-left: Theme.gap-xs;
-        padding-right: Theme.gap-xs;
+        padding-right: 20px;
         spacing: Theme.gap-xs;
 
         Text {
@@ -136,7 +138,7 @@ component UserRowView inherits Rectangle {
     // ── User row ────────────────────────────────────────────────
     if !user.is-channel : HorizontalLayout {
         padding-left: Theme.gap-sm;   // indent members under their channel
-        padding-right: Theme.gap-xs;
+        padding-right: 20px;
         spacing: Theme.gap-xs;
 
         // The avatar tile; its ring is the speaking indicator. A
@@ -539,7 +541,7 @@ export component Sidebar inherits Rectangle {
                     // "online".
                     Rectangle {
                         width: 16px;
-                        AvatarTile {
+                        if !dm.admin : AvatarTile {
                             y: (parent.height - self.height) / 2;
                             source: dm.avatar;
                             has-image: dm.has-avatar;
@@ -549,6 +551,11 @@ export component Sidebar inherits Rectangle {
                             corner: 4px;
                             ring: dm.online;
                             ring-color: Theme.text-muted;
+                        }
+                        if dm.admin : IconDisplay {
+                            icon: IconSet.Shield;
+                            size: 16px;
+                            stroke: Theme.gold;
                         }
                     }
                     Text {

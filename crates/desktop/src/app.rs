@@ -144,6 +144,10 @@ pub struct AppState {
     /// What the open context menu is about: its entries were built
     /// for this target, and a pick resolves against it.
     menu_target: Option<MenuTarget>,
+    /// The conversation a slash command was typed in: its output
+    /// (and the answer to the admin command it sent) lands there —
+    /// the admin channel, a DM, or General.
+    command_conv: Option<client::UserId>,
     /// The server's role table (`RoleList`, spec §4), the built-ins
     /// alone until it arrives — custom roles are named by it.
     pub(crate) roles: BTreeMap<client::RoleId, client::protocol::RoleInfo>,
@@ -166,6 +170,14 @@ pub struct AppState {
     /// An image on its way: the placeholder row's message id, replaced
     /// by our own echo.
     image_upload: Option<u64>,
+    /// Pictures going up as files (DMs), by upload id: the bytes, to
+    /// show our own card as a picture once the post is acked.
+    pending_picture_uploads: HashMap<u32, Vec<u8>>,
+    /// Pictures posted as files by others, by blob: the rows waiting
+    /// for the bytes to become images.
+    pending_pictures: HashMap<client::protocol::BlobId, Vec<(Option<client::UserId>, u64)>>,
+    /// Our own picture posts awaiting their ack, by client ref.
+    picture_acks: HashMap<u32, Vec<u8>>,
     /// Files saved this session, by blob: the card offers Open.
     downloaded: HashMap<client::protocol::BlobId, std::path::PathBuf>,
     /// The "Move to" submenu's model, rebuilt with the channel list.
@@ -476,6 +488,7 @@ pub fn run() {
         telemetry_notes: HashMap::new(),
         moderation: None,
         menu_target: None,
+        command_conv: None,
         roles: builtin_role_table(),
         pending_uploads: HashMap::new(),
         pending_files: HashMap::new(),
@@ -484,6 +497,9 @@ pub fn run() {
         transfers: HashMap::new(),
         uploading: None,
         image_upload: None,
+        pending_picture_uploads: HashMap::new(),
+        pending_pictures: HashMap::new(),
+        picture_acks: HashMap::new(),
         downloaded: HashMap::new(),
         channel_options,
         server_muted: None,
@@ -762,7 +778,11 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 .ok()
                 .and_then(|i| app.dm_order.get(i).copied())
             {
-                app.switch_conversation(Some(user));
+                if user == ADMIN_CHANNEL_KEY {
+                    app.open_admin_channel();
+                } else {
+                    app.switch_conversation(Some(user));
+                }
             }
         });
     });
@@ -959,9 +979,14 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                             "reason" => ""
                         ),
                     );
-                } else if app.active_dm.is_some() {
-                    // Images in DMs ride the blob path later (1.1.2).
-                    app.show_toast(ToastKind::Warning, &t!("chat-dm-no-images"));
+                } else if app.active_dm.is_some() || app.server_persistent {
+                    // A picture is a file with a picture inside (spec §7):
+                    // uploaded on the blob path, shown as a picture on
+                    // both ends once it lands. Only a memory-mode server,
+                    // which keeps no files, still gets the live relay.
+                    app.pending_picture_uploads
+                        .insert(app.next_file_upload_id, png.clone());
+                    app.begin_file_upload("picture.png".into(), "image/png".into(), png);
                 } else {
                     app.send_image_with_card(png);
                 }
@@ -1036,6 +1061,8 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
             crate::adminui::open(app, crate::adminui::TAB_USERS)
         });
     });
+    let w = Rc::downgrade(state);
+    logic.on_admin_channel_open(move || with_app(&w, AppState::open_admin_channel));
     let w = Rc::downgrade(state);
     logic.on_invite_dialog_create(move || with_app(&w, AppState::invite_dialog_create));
     let w = Rc::downgrade(state);
@@ -1491,7 +1518,7 @@ impl AppState {
                     s.set_invite_dialog_summary(format!("{role} · {expiry} · {uses}").into());
                     s.set_invite_dialog_error("".into());
                 } else {
-                    self.push_chat_system(&t!(
+                    self.push_command_output(&t!(
                         "chat-invite-created",
                         "code" => shown.as_str(),
                         "role" => role.as_str(),
@@ -1509,7 +1536,7 @@ impl AppState {
                 if s.get_invite_dialog_open() {
                     s.set_invite_dialog_error(line.into());
                 } else {
-                    self.push_chat_system(&line);
+                    self.push_command_output(&line);
                 }
             }
             NetworkMessage::History {
@@ -1612,6 +1639,18 @@ impl AppState {
                 // Custom names on the cards, and in the roster's menu.
                 self.update_user_list();
             }
+            NetworkMessage::AuditLine { entry } => {
+                self.ensure_admin_channel();
+                let line = audit_line_text(&entry);
+                let open = self.active_dm == Some(ADMIN_CHANNEL_KEY);
+                self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| {
+                    app.push_system_here(&line);
+                });
+                if !open && let Some(meta) = self.dm_meta.get_mut(&ADMIN_CHANNEL_KEY) {
+                    meta.unread += 1;
+                    self.rebuild_dms_model();
+                }
+            }
             NetworkMessage::FileMessage {
                 conv,
                 from,
@@ -1621,10 +1660,14 @@ impl AppState {
                 client_id,
                 attachment,
             } => {
+                let key = match conv {
+                    client::ConvRef::General => None,
+                    client::ConvRef::Dm(_) => Some(from),
+                };
                 let file = app_core::chat::FileMeta {
                     blob: attachment.blob_id,
-                    name: attachment.name,
-                    mime: attachment.mime,
+                    name: attachment.name.clone(),
+                    mime: attachment.mime.clone(),
                     size: attachment.size,
                 };
                 match conv {
@@ -1642,10 +1685,12 @@ impl AppState {
                         // the placeholder into this message.
                         let already = self.with_conversation(None, |app| app.history.has(id));
                         if !already {
+                            self.want_picture(&attachment, key, id);
                             self.push_chat_file(&meta, file);
                         }
                     }
                     client::ConvRef::Dm(_) => {
+                        self.want_picture(&attachment, key, id);
                         self.take_direct(from, &username, id, ts, Incoming::File(file));
                     }
                 }
@@ -1655,6 +1700,9 @@ impl AppState {
                     client::ConvRef::General => None,
                     client::ConvRef::Dm(user) => Some(user),
                 };
+                for (msg_id, a) in &items {
+                    self.want_picture(a, key, *msg_id);
+                }
                 self.with_conversation(key, |app| {
                     for (msg_id, a) in items {
                         let file = app_core::chat::FileMeta {
@@ -1668,6 +1716,8 @@ impl AppState {
                             app.chat_model.set_row_data(i, row);
                         }
                     }
+                    // Cards are taller than the empty rows they replace.
+                    app.main.invoke_chat_follow_appended();
                 });
             }
             NetworkMessage::ChannelDetails {
@@ -2206,7 +2256,7 @@ impl AppState {
             }
             NetworkMessage::UploadDone { upload_id, blob_id } => {
                 if let Some(upload) = self.pending_uploads.remove(&upload_id) {
-                    self.file_uploaded(upload, blob_id);
+                    self.file_uploaded(upload_id, upload, blob_id);
                 } else if upload_id == AVATAR_UPLOAD_ID {
                     // The picture is on the server: now the profile
                     // can point at it.
@@ -2219,6 +2269,7 @@ impl AppState {
             }
             NetworkMessage::UploadRejected { upload_id, reason } => {
                 if let Some(upload) = self.pending_uploads.remove(&upload_id) {
+                    self.pending_picture_uploads.remove(&upload_id);
                     self.uploading = None;
                     self.transfers.remove(&(upload.conv, upload.placeholder));
                     self.with_conversation(upload.conv, |app| {
@@ -2260,6 +2311,14 @@ impl AppState {
                 }
             }
             NetworkMessage::Blob { blob_id, data } => {
+                if let Some(rows) = self.pending_pictures.remove(&blob_id) {
+                    for (conv, msg_id) in rows {
+                        let bytes = data.clone();
+                        self.with_conversation(conv, |app| {
+                            media::picture_from_file(app, msg_id, bytes);
+                        });
+                    }
+                }
                 if let Some(PendingDownload { name, conv, msg_id }) =
                     self.pending_downloads.remove(&blob_id)
                 {
@@ -2285,6 +2344,7 @@ impl AppState {
                 }
             }
             NetworkMessage::BlobMissing { blob_id } => {
+                self.pending_pictures.remove(&blob_id);
                 if let Some(PendingDownload { name, conv, msg_id }) =
                     self.pending_downloads.remove(&blob_id)
                 {
@@ -2316,11 +2376,18 @@ impl AppState {
                     .or_else(|| self.pending_files.remove(&client_ref))
                 {
                     self.transfers.remove(&(key, placeholder));
+                    let picture = self.picture_acks.remove(&client_ref);
                     self.with_conversation(key, |app| {
+                        // Confirm first: the rebuild that follows keeps a
+                        // picture only when the row's id stays the same,
+                        // so the picture goes in under the final id.
                         if let Some(delta) = app.history.confirm_message(placeholder, msg_id) {
                             app.sync_range(&delta);
                         }
                         app.oldest_history_id.get_or_insert(msg_id);
+                        if let Some(png) = picture {
+                            media::picture_from_file(app, msg_id, png);
+                        }
                     });
                     if let Some(user) = key
                         && let Some(meta) = self.dm_meta.get_mut(&user)
@@ -2348,6 +2415,13 @@ impl AppState {
                 // newest id per partner. Histories load when opened.
                 self.dm_order.clear();
                 for dm in dms {
+                    // Closed by its ✕ and nothing new since: stays out.
+                    if dm.unread == 0 && self.dm_hidden(&dm.user_id) {
+                        continue;
+                    }
+                    if dm.unread > 0 {
+                        self.set_dm_hidden(dm.user_id, false);
+                    }
                     let meta = self.dm_meta.entry(dm.user_id).or_insert_with(|| DmMeta {
                         name: dm.name.clone(),
                         unread: 0,
@@ -2360,6 +2434,11 @@ impl AppState {
                     meta.last_ts = dm.last_ts;
                     meta.last_msg_id = dm.last_msg_id;
                     self.dm_order.push(dm.user_id);
+                }
+                // The admin channel is ours, not the store's: it keeps
+                // its place at the top.
+                if self.dm_meta.contains_key(&ADMIN_CHANNEL_KEY) {
+                    self.dm_order.insert(0, ADMIN_CHANNEL_KEY);
                 }
                 self.rebuild_dms_model();
             }
@@ -2441,12 +2520,14 @@ impl AppState {
     /// onto `AdminCommand` (spec §8): the server checks them, the
     /// answer lands in chat.
     fn handle_slash_command(&mut self, command: &str, args: &str) {
+        // Output goes back where the command was typed.
+        self.command_conv = self.active_dm;
         match command {
             "invite" => self.handle_invite_command(args),
             "help" | "commands" => {
                 let commands = self.commands_available();
                 let line = t!("chat-commands-help", "commands" => commands.as_str());
-                self.push_chat_system(&line);
+                self.push_command_output(&line);
             }
             "leave" => self.handle_disconnect(),
             "quit" | "exit" => {
@@ -2468,13 +2549,13 @@ impl AppState {
             "mem" => {
                 let report = self.memory_report();
                 info!("memory report:\n{report}");
-                self.push_chat_system(&report);
+                self.push_command_output(&report);
             }
             "dm" | "msg" => {
                 let (name, text) = match args.trim().split_once(char::is_whitespace) {
                     Some((n, t)) if !t.trim().is_empty() => (n.trim(), t.trim().to_string()),
                     _ => {
-                        self.push_chat_system(&t!("chat-command-usage-dm"));
+                        self.push_command_output(&t!("chat-command-usage-dm"));
                         return;
                     }
                 };
@@ -2484,7 +2565,7 @@ impl AppState {
                     .find(|(_, u)| u.username.eq_ignore_ascii_case(name))
                     .map(|(c, u)| (*c, u.username.clone()));
                 let Some((client_id, shown)) = found else {
-                    self.push_chat_system(&t!("chat-dm-unknown", "name" => name));
+                    self.push_command_output(&t!("chat-dm-unknown", "name" => name));
                     return;
                 };
                 let Some(user_id) = self.details.get(&client_id).map(|(u, _)| *u) else {
@@ -2500,13 +2581,13 @@ impl AppState {
                 Some(code) => {
                     self.send_admin(AdminCommand::RevokeInvite { code }, PendingAdmin::Show);
                 }
-                None => self.push_chat_system(&t!("chat-command-usage-revoke-invite")),
+                None => self.push_command_output(&t!("chat-command-usage-revoke-invite")),
             },
             "unlink" => match parse_hex_id(args.trim()) {
                 Some(key_hash) => {
                     self.send_admin(AdminCommand::UnlinkKey { key_hash }, PendingAdmin::Show);
                 }
-                None => self.push_chat_system(&t!("chat-command-usage-unlink")),
+                None => self.push_command_output(&t!("chat-command-usage-unlink")),
             },
             "link" => {
                 let mut words = args.split_whitespace();
@@ -2518,10 +2599,10 @@ impl AppState {
                             PendingAdmin::Show,
                         );
                     }
-                    _ => self.push_chat_system(&t!("chat-command-usage-link")),
+                    _ => self.push_command_output(&t!("chat-command-usage-link")),
                 }
             }
-            _ => self.push_chat_system(&t!("chat-command-unknown", "command" => command)),
+            _ => self.push_command_output(&t!("chat-command-unknown", "command" => command)),
         }
     }
 
@@ -2546,7 +2627,7 @@ impl AppState {
             words.remove(0);
         }
         if words.is_empty() {
-            self.push_chat_system(&t!("chat-command-usage", "command" => command));
+            self.push_command_output(&t!("chat-command-usage", "command" => command));
             return;
         }
         let name = words.remove(0);
@@ -2577,7 +2658,7 @@ impl AppState {
             "unmute" => AdminCommand::Unmute { target, kind },
             "grant" | "revoke" => {
                 let Some(role) = rest.first().and_then(|w| self.parse_role_name(w)) else {
-                    self.push_chat_system(&t!("chat-command-usage", "command" => command));
+                    self.push_command_output(&t!("chat-command-usage", "command" => command));
                     return;
                 };
                 // Their current roles, known while they are online.
@@ -2607,7 +2688,7 @@ impl AppState {
                     .position(|c| c.name.eq_ignore_ascii_case(wanted.trim()))
                     .and_then(|i| u16::try_from(i).ok())
                 else {
-                    self.push_chat_system(&t!("chat-command-usage", "command" => command));
+                    self.push_command_output(&t!("chat-command-usage", "command" => command));
                     return;
                 };
                 AdminCommand::MoveUser { target, channel_id }
@@ -2683,7 +2764,7 @@ impl AppState {
     fn handle_channel_command(&mut self, args: &str) {
         let mut words = args.split_whitespace();
         let Some(verb) = words.next() else {
-            self.push_chat_system(&t!("chat-command-usage-channel"));
+            self.push_command_output(&t!("chat-command-usage-channel"));
             return;
         };
         match verb {
@@ -2727,12 +2808,12 @@ impl AppState {
                     })
                     .collect();
                 for line in lines {
-                    self.push_chat_system(&line);
+                    self.push_command_output(&line);
                 }
             }
             "create" => {
                 let Some(name) = words.next() else {
-                    self.push_chat_system(&t!("chat-command-usage-channel"));
+                    self.push_command_output(&t!("chat-command-usage-channel"));
                     return;
                 };
                 let password = words.next().map(str::to_string);
@@ -2748,7 +2829,7 @@ impl AppState {
             "keep" | "delete" => {
                 let wanted = words.collect::<Vec<_>>().join(" ");
                 let Some(channel_id) = self.channel_id_named(&wanted) else {
-                    self.push_chat_system(&t!("chat-command-usage-channel"));
+                    self.push_command_output(&t!("chat-command-usage-channel"));
                     return;
                 };
                 if verb == "delete" {
@@ -2763,13 +2844,13 @@ impl AppState {
             }
             "kick" => {
                 let Some(name) = words.next() else {
-                    self.push_chat_system(&t!("chat-command-usage-channel"));
+                    self.push_command_output(&t!("chat-command-usage-channel"));
                     return;
                 };
                 let (Some(channel_id), AdminTarget::User(user_id)) =
                     (self.our_channel(), self.target_for(name))
                 else {
-                    self.push_chat_system(&t!("chat-command-no-such-user", "name" => name));
+                    self.push_command_output(&t!("chat-command-no-such-user", "name" => name));
                     return;
                 };
                 self.network
@@ -2780,7 +2861,7 @@ impl AppState {
                     })
                     .ok();
             }
-            _ => self.push_chat_system(&t!("chat-command-usage-channel")),
+            _ => self.push_command_output(&t!("chat-command-usage-channel")),
         }
     }
 
@@ -3003,6 +3084,11 @@ impl AppState {
     }
 
     pub(crate) fn send_admin(&mut self, command: AdminCommand, then: PendingAdmin) {
+        // A printed answer lands in the conversation shown when it was
+        // asked for — a menu pick as much as a typed command.
+        if matches!(then, PendingAdmin::Show) {
+            self.command_conv = self.active_dm;
+        }
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         self.pending_admin.insert(request_id, then);
@@ -3038,7 +3124,14 @@ impl AppState {
                     crate::adminui::take_error(self, &why);
                     return;
                 }
-                self.push_chat_system(&t!("chat-admin-refused", "why" => why.as_str()));
+                if matches!(then, PendingAdmin::Channel) {
+                    let line = t!("chat-admin-refused", "why" => why.as_str());
+                    self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| {
+                        app.push_system_here(&line);
+                    });
+                    return;
+                }
+                self.push_command_output(&t!("chat-admin-refused", "why" => why.as_str()));
                 return;
             }
         };
@@ -3049,6 +3142,18 @@ impl AppState {
             }
             PendingAdmin::AuditMore => {
                 crate::adminui::take_outcome(self, -1, outcome);
+                return;
+            }
+            PendingAdmin::Channel => {
+                if let client::AdminOutcome::Audit(entries) = outcome {
+                    // Newest first on the wire; oldest first in a chat.
+                    for e in entries.iter().rev() {
+                        let line = audit_line_text(e);
+                        self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| {
+                            app.push_system_here(&line);
+                        });
+                    }
+                }
                 return;
             }
             PendingAdmin::Show | PendingAdmin::Telemetry(_) => {}
@@ -3078,9 +3183,9 @@ impl AppState {
             return;
         }
         match outcome {
-            client::AdminOutcome::Done => self.push_chat_system(&t!("chat-admin-done")),
+            client::AdminOutcome::Done => self.push_command_output(&t!("chat-admin-done")),
             client::AdminOutcome::Users(users) => {
-                self.push_chat_system(&t!("chat-admin-users-header", "count" => users.len()));
+                self.push_command_output(&t!("chat-admin-users-header", "count" => users.len()));
                 for u in users {
                     let roles: Vec<String> =
                         u.roles.iter().map(|r| self.role_name_of(*r)).collect();
@@ -3100,11 +3205,11 @@ impl AppState {
                         short_id(&u.user_id),
                         describe_ago(u.last_seen)
                     );
-                    self.push_chat_system(&line);
+                    self.push_command_output(&line);
                 }
             }
             client::AdminOutcome::Restrictions(list) => {
-                self.push_chat_system(&t!(
+                self.push_command_output(&t!(
                     "chat-admin-restrictions-header",
                     "count" => list.len()
                 ));
@@ -3124,18 +3229,18 @@ impl AppState {
                         r.reason,
                         r.by
                     );
-                    self.push_chat_system(&line);
+                    self.push_command_output(&line);
                 }
             }
             client::AdminOutcome::Telemetry(sample) => match sample {
                 Some(t) => {
                     let line = format!("{} — {}", describe_ago(t.ts), t.line);
-                    self.push_chat_system(&line);
+                    self.push_command_output(&line);
                 }
-                None => self.push_chat_system(&t!("chat-admin-no-telemetry")),
+                None => self.push_command_output(&t!("chat-admin-no-telemetry")),
             },
             client::AdminOutcome::Invites(list) => {
-                self.push_chat_system(&t!("chat-admin-invites-header", "count" => list.len()));
+                self.push_command_output(&t!("chat-admin-invites-header", "count" => list.len()));
                 for i in list {
                     let uses = match i.max_uses {
                         Some(max) => format!("{}/{max}", i.uses),
@@ -3148,13 +3253,13 @@ impl AppState {
                         self.role_name_of(i.grants_role),
                         describe_expiry(i.expires_at)
                     );
-                    self.push_chat_system(&line);
+                    self.push_command_output(&line);
                 }
             }
             // The panel's answers (spec §8): until the window lands they
             // read as one line each, so `/`-typed commands still answer.
             client::AdminOutcome::RoleCreated(id) => {
-                self.push_chat_system(&t!("chat-admin-role-created", "id" => id));
+                self.push_command_output(&t!("chat-admin-role-created", "id" => id));
             }
             client::AdminOutcome::Stats(stats) => {
                 let line = format!(
@@ -3168,10 +3273,10 @@ impl AppState {
                     app_core::chat::human_size(stats.blob_bytes),
                     app_core::chat::human_size(stats.blob_cap_bytes),
                 );
-                self.push_chat_system(&line);
+                self.push_command_output(&line);
             }
             client::AdminOutcome::Blobs(blobs) => {
-                self.push_chat_system(&t!("chat-admin-blobs-header", "count" => blobs.len()));
+                self.push_command_output(&t!("chat-admin-blobs-header", "count" => blobs.len()));
                 for b in blobs {
                     let line = format!(
                         "{} — {} — {} — {} — refs {}",
@@ -3181,11 +3286,11 @@ impl AppState {
                         b.created_by.as_deref().unwrap_or("?"),
                         b.refs
                     );
-                    self.push_chat_system(&line);
+                    self.push_command_output(&line);
                 }
             }
             client::AdminOutcome::Audit(entries) => {
-                self.push_chat_system(&t!("chat-admin-audit-header", "count" => entries.len()));
+                self.push_command_output(&t!("chat-admin-audit-header", "count" => entries.len()));
                 for e in entries {
                     let line = format!(
                         "{} — {} — {}{}{}",
@@ -3201,7 +3306,7 @@ impl AppState {
                             .map(|d| format!(": {d}"))
                             .unwrap_or_default(),
                     );
-                    self.push_chat_system(&line);
+                    self.push_command_output(&line);
                 }
             }
         }
@@ -3304,7 +3409,7 @@ impl AppState {
             } else if let Ok(n) = lower.parse::<u32>() {
                 max_uses = Some(n);
             } else {
-                self.push_chat_system(&t!("chat-invite-usage"));
+                self.push_command_output(&t!("chat-invite-usage"));
                 return;
             }
         }
@@ -3586,7 +3691,7 @@ impl AppState {
 
     /// What this session may do, as the bools the UI draws from
     /// (spec §8: the server decides; the client renders).
-    fn push_permissions(&self) {
+    fn push_permissions(&mut self) {
         use client::permissions as p;
         let has = |bit: u64| p::has(self.permissions, bit);
         let s = self.main.global::<State>();
@@ -3601,6 +3706,7 @@ impl AppState {
         s.set_perm_create_invites(has(p::CREATE_INVITES));
         s.set_perm_manage_invites(has(p::MANAGE_INVITES));
         s.set_perm_panel(has(p::PANEL));
+        s.set_perm_admin_channel(has(p::ADMIN_CHANNEL));
         s.set_perm_manage_own(has(p::MANAGE_OWN_CHANNELS));
         s.set_perm_delete_any(has(p::RESTRICT));
         s.set_perm_dm(has(p::DM));
@@ -3611,6 +3717,12 @@ impl AppState {
         );
         s.set_server_persistent(self.server_persistent);
         crate::settingsui::refresh_role_line(self);
+        // The channel's row, for whoever may read it (the borrow of
+        // the window's globals is over by here).
+        if p::has(self.permissions, p::ADMIN_CHANNEL) {
+            self.ensure_admin_channel();
+            self.rebuild_dms_model();
+        }
     }
 
     /// Does a message name us — the nickname as a whole word, or
@@ -4383,6 +4495,7 @@ impl AppState {
                 sharing: row.sharing,
                 local_muted: row.local_muted,
                 outranked: row.outranked,
+                is_admin: row.role == 4,
                 role_editable: row.role_editable,
                 channel_kickable: row.channel_kickable,
                 channel_id: u16::try_from(row.channel_id).unwrap_or(0),
@@ -5316,7 +5429,9 @@ impl AppState {
                 if fetch {
                     self.load_earlier(50);
                 }
-                if let Some(msg_id) = mark {
+                if let Some(msg_id) = mark
+                    && user != ADMIN_CHANNEL_KEY
+                {
                     self.network
                         .tx
                         .send(NetworkControl::MarkRead {
@@ -5341,11 +5456,37 @@ impl AppState {
         self.parked.remove(&Some(user));
         self.dm_meta.remove(&user);
         self.dm_order.retain(|u| *u != user);
+        self.set_dm_hidden(user, true);
         self.rebuild_dms_model();
+    }
+
+    /// Remember (or forget) that a conversation was closed, so the
+    /// next login's `Conversations` does not bring it back.
+    fn set_dm_hidden(&mut self, user: client::UserId, hidden: bool) {
+        if user == ADMIN_CHANNEL_KEY {
+            return;
+        }
+        let key = hex(&user);
+        let list = &mut self.settings.ui.hidden_dms;
+        let present = list.iter().any(|h| *h == key);
+        if hidden && !present {
+            list.push(key);
+        } else if !hidden && present {
+            list.retain(|h| *h != key);
+        } else {
+            return;
+        }
+        self.settings.save();
+    }
+
+    fn dm_hidden(&self, user: &client::UserId) -> bool {
+        let key = hex(user);
+        self.settings.ui.hidden_dms.iter().any(|h| *h == key)
     }
 
     /// Open (or start) the DM with `user`, named `name`.
     pub fn open_dm(&mut self, user: client::UserId, name: &str) {
+        self.set_dm_hidden(user, false);
         let meta = self.dm_meta.entry(user).or_insert_with(|| DmMeta {
             name: name.to_string(),
             unread: 0,
@@ -5361,6 +5502,44 @@ impl AppState {
             self.dm_order.insert(0, user);
         }
         self.switch_conversation(Some(user));
+    }
+
+    /// The admin channel's row exists (spec §8): a conversation under
+    /// the reserved key, first in the Messages list, never fetched
+    /// from the DM store.
+    fn ensure_admin_channel(&mut self) {
+        self.dm_meta
+            .entry(ADMIN_CHANNEL_KEY)
+            .or_insert_with(|| DmMeta {
+                name: t!("admin-channel"),
+                unread: 0,
+                last_ts: 0,
+                last_msg_id: 0,
+                fetched: true,
+            });
+        if !self.dm_order.contains(&ADMIN_CHANNEL_KEY) {
+            self.dm_order.insert(0, ADMIN_CHANNEL_KEY);
+        }
+    }
+
+    /// The shield row: open the admin channel; the last page of the
+    /// audit becomes its history the first time.
+    fn open_admin_channel(&mut self) {
+        self.ensure_admin_channel();
+        let empty =
+            self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| app.history.rows().is_empty());
+        self.switch_conversation(Some(ADMIN_CHANNEL_KEY));
+        if empty {
+            let lead = t!("admin-channel-lead");
+            self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| app.push_system_here(&lead));
+            self.send_admin(
+                AdminCommand::AuditLog {
+                    before: None,
+                    limit: 50,
+                },
+                PendingAdmin::Channel,
+            );
+        }
     }
 
     /// The Messages section's rows: newest conversation first, with
@@ -5390,6 +5569,7 @@ impl AppState {
                     has_avatar: false,
                     initial: app_core::roster::initial_of(&name).into(),
                     tile_tint: ui::convert::tint(&name),
+                    admin: *user == ADMIN_CHANNEL_KEY,
                 };
                 if let Some(image) = client
                     .and_then(|c| self.profiles.get(&c))
@@ -5422,6 +5602,8 @@ impl AppState {
         ts: u64,
         body: Incoming<'_>,
     ) {
+        // A new message brings a closed conversation back.
+        self.set_dm_hidden(from, false);
         let is_open = self.active_dm == Some(from);
         let meta = self.dm_meta.entry(from).or_insert_with(|| DmMeta {
             name: username.to_string(),
@@ -5487,6 +5669,12 @@ impl AppState {
     /// under a placeholder id; `MessageAck` confirms it, `MessageFailed`
     /// removes it.
     fn send_dm(&mut self, to: client::UserId, text: String) {
+        if to == ADMIN_CHANNEL_KEY {
+            // Commands only here; they are handled before this point.
+            let hint = t!("admin-channel-commands-only");
+            self.with_conversation(Some(to), |app| app.push_system_here(&hint));
+            return;
+        }
         let client_ref = self.next_client_ref;
         self.next_client_ref = self.next_client_ref.wrapping_add(1).max(1);
         let placeholder = u64::MAX - u64::from(client_ref);
@@ -5573,7 +5761,7 @@ impl AppState {
     }
 
     /// The model row for history row `index`, with a fresh row id.
-    fn chat_row_at(&mut self, index: usize) -> ChatRow {
+    pub(crate) fn chat_row_at(&mut self, index: usize) -> ChatRow {
         // Truncating u64→i32 is deliberate: ids only need uniqueness
         // within the 500-row window, and 2^31 messages per session is
         // out of scope by ~six orders of magnitude.
@@ -5671,6 +5859,12 @@ impl AppState {
         self.sync_history_tail(&delta);
     }
 
+    /// A command's output, into the conversation it was typed in.
+    fn push_command_output(&mut self, text: &str) {
+        let conv = self.command_conv;
+        self.with_conversation(conv, |app| app.push_system_here(text));
+    }
+
     /// A file card into General, whichever conversation is shown.
     fn push_chat_file(&mut self, meta: &Meta, file: app_core::chat::FileMeta) {
         self.with_conversation(None, |app| app.push_file_here(meta, file));
@@ -5679,6 +5873,33 @@ impl AppState {
             self.main
                 .global::<State>()
                 .set_general_unread(i32::try_from(self.general_unread).unwrap_or(i32::MAX));
+        }
+    }
+
+    /// A card that is a picture fetches its bytes on arrival (spec §7:
+    /// pictures in DMs ride the blob path) — when it is small enough
+    /// to show inline; bigger ones stay a card with Save.
+    fn want_picture(
+        &mut self,
+        a: &client::protocol::Attachment,
+        conv: Option<client::UserId>,
+        msg_id: u64,
+    ) {
+        let inline = a.mime.starts_with("image/")
+            && usize::try_from(a.size).is_ok_and(|s| s <= client::MAX_CHAT_IMAGE_BYTES);
+        if !inline {
+            return;
+        }
+        let fresh = !self.pending_pictures.contains_key(&a.blob_id);
+        self.pending_pictures
+            .entry(a.blob_id)
+            .or_default()
+            .push((conv, msg_id));
+        if fresh {
+            self.network
+                .tx
+                .send(NetworkControl::FetchBlob { blob_id: a.blob_id })
+                .ok();
         }
     }
 
@@ -5796,7 +6017,12 @@ impl AppState {
 
     /// The server has the bytes: post them into the conversation the
     /// file was picked for, under a placeholder row until the ack.
-    fn file_uploaded(&mut self, upload: PendingUpload, blob_id: client::protocol::BlobId) {
+    fn file_uploaded(
+        &mut self,
+        upload_id: u32,
+        upload: PendingUpload,
+        blob_id: client::protocol::BlobId,
+    ) {
         let placeholder = upload.placeholder;
         #[allow(clippy::cast_possible_truncation)] // built from a u32
         let client_ref = (u64::MAX - placeholder) as u32;
@@ -5824,6 +6050,11 @@ impl AppState {
         });
         self.pending_files
             .insert(client_ref, (upload.conv, placeholder));
+        // A picture: once acked, our own card shows it (no echo comes
+        // back on a DM).
+        if let Some(png) = self.pending_picture_uploads.remove(&upload_id) {
+            self.picture_acks.insert(client_ref, png);
+        }
         let conv = match upload.conv {
             None => client::ConvRef::General,
             Some(user) => client::ConvRef::Dm(user),
@@ -7176,6 +7407,8 @@ pub(crate) enum PendingAdmin {
     Panel(i32),
     /// The panel's Audit tab asked for an older page: append.
     AuditMore,
+    /// The admin channel opened: the last page becomes its history.
+    Channel,
 }
 
 /// The composer is rewriting message `msg_id`; the draft it replaced
@@ -7504,6 +7737,11 @@ const AVATAR_UPLOAD_ID: u32 = 1;
 /// File uploads take ids from here up (spec §7); the avatar keeps 1.
 const FILE_UPLOAD_BASE: u32 = 1_000;
 
+/// The admin channel (spec §8) lives in the Messages section as a
+/// conversation under a reserved key: no user has this id, so it parks
+/// and swaps like a DM while the composer only takes commands there.
+pub(crate) const ADMIN_CHANNEL_KEY: client::UserId = [0xFF; 32];
+
 /// A file on its way to the server (spec §7); the card already
 /// carries its type and size.
 struct PendingUpload {
@@ -7601,6 +7839,25 @@ fn xp_progress(level: u16, xp: Option<u64>) -> Option<(i32, String)> {
         "next" => u32::from(level) + 1
     );
     Some((pct, line))
+}
+
+/// One audit entry as a chat line: "14:06 · mpw kicked bob: spam".
+fn audit_line_text(e: &client::protocol::AuditEntry) -> String {
+    let actor = e.actor.clone().unwrap_or_else(|| t!("admin-actor-server"));
+    let mut line = format!(
+        "{} · {actor} {}",
+        format_wall_time(e.ts),
+        crate::adminui::audit_action_text(&e.action)
+    );
+    if let Some(t) = e.target.as_deref().filter(|t| !t.is_empty()) {
+        line.push(' ');
+        line.push_str(t);
+    }
+    if let Some(d) = e.detail.as_deref().filter(|d| !d.is_empty()) {
+        line.push_str(": ");
+        line.push_str(d);
+    }
+    line
 }
 
 /// Where a rank stands, in words (the panel's Roles tab).

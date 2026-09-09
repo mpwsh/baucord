@@ -70,6 +70,8 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Retention {
     pub history_days: u32,
     pub telemetry_days: u32,
+    /// Unreferenced blobs older than this go (spec §7).
+    pub file_days: u32,
 }
 
 /// Where data goes. `Memory` is persistence off: writes are discarded,
@@ -497,6 +499,24 @@ impl Sqlite {
     ///
     /// # Errors
     /// `SQLite` failure.
+    /// Unreferenced blobs older than the file window (spec §7): the
+    /// rows go here, the bytes with them. Returns the ids removed.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn prune_blobs(&self, cutoff: WallMs) -> Result<Vec<[u8; 32]>, rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT blob_id FROM blobs WHERE refs = 0 AND created_at < ?1")?;
+        let ids: Vec<[u8; 32]> = stmt
+            .query_map(params![ordered(cutoff)], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in &ids {
+            self.delete_blob(id)?;
+        }
+        Ok(ids)
+    }
+
     pub fn prune(&self, now: WallMs, retention: Retention) -> Result<u64, rusqlite::Error> {
         let mut removed = 0u64;
         if let Some(cutoff) = cutoff(now, retention.history_days) {
@@ -514,6 +534,9 @@ impl Sqlite {
                 "DELETE FROM telemetry_events WHERE ts < ?1",
                 params![ordered(cutoff)],
             )?);
+        }
+        if let Some(cut) = cutoff(now, retention.file_days) {
+            removed += self.prune_blobs(cut)?.len() as u64;
         }
         Ok(removed)
     }
@@ -1265,6 +1288,120 @@ fn count(rows: usize) -> u64 {
 ///
 /// # Errors
 /// No database at `db_path`, a `SQLite` failure, or an archive I/O error.
+/// `server restore`: unpack a `server backup` archive over the data
+/// directory — the database and the blobs. Refuses while the server
+/// holds the database (the `-wal` file exists) unless forced. The
+/// current database, if any, is kept beside as `baucord.db.before-restore`.
+///
+/// # Errors
+/// The archive is missing or not a backup, the server is running, or
+/// an I/O failure.
+pub fn restore_from_tar(
+    db_path: &Path,
+    archive: &Path,
+    force: bool,
+) -> Result<RestoreReport, PersistError> {
+    if !archive.is_file() {
+        return Err(PersistError::Missing(archive.to_path_buf()));
+    }
+    let io_err = |e: std::io::Error| PersistError::Io(db_path.to_path_buf(), e);
+    let wal = db_path.with_extension("db-wal");
+    if wal.exists() && !force {
+        return Err(PersistError::Locked(db_path.to_path_buf()));
+    }
+    let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir).map_err(io_err)?;
+    let file = File::open(archive).map_err(|e| PersistError::Io(archive.to_path_buf(), e))?;
+    let mut tar = tar::Archive::new(file);
+    let mut report = RestoreReport::default();
+    // Unpack into a staging directory first: a bad archive must not
+    // leave half a database behind.
+    let staging = dir.join(format!(".restore-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).map_err(io_err)?;
+    let result = (|| -> Result<(), PersistError> {
+        for entry in tar
+            .entries()
+            .map_err(|e| PersistError::Io(archive.to_path_buf(), e))?
+        {
+            let mut entry = entry.map_err(|e| PersistError::Io(archive.to_path_buf(), e))?;
+            let path = entry
+                .path()
+                .map_err(|e| PersistError::Io(archive.to_path_buf(), e))?
+                .into_owned();
+            let name = path.to_string_lossy().to_string();
+            if name == "baucord.db" {
+                entry.unpack(staging.join("baucord.db")).map_err(io_err)?;
+                report.database = true;
+            } else if let Some(rest) = name.strip_prefix("blobs/")
+                && !rest.is_empty()
+                && !rest.contains("..")
+            {
+                let target = staging.join("blobs").join(rest);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(io_err)?;
+                }
+                if entry.header().entry_type().is_file() {
+                    entry.unpack(&target).map_err(io_err)?;
+                    report.blobs += 1;
+                }
+            }
+        }
+        if !report.database {
+            return Err(PersistError::NotABackup(archive.to_path_buf()));
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    // Swap in: the old database is kept beside, blobs replaced whole.
+    if db_path.is_file() {
+        let kept = db_path.with_extension("db.before-restore");
+        fs::rename(db_path, &kept).map_err(io_err)?;
+        report.kept = Some(kept);
+    }
+    for suffix in ["db-wal", "db-shm"] {
+        let _ = fs::remove_file(db_path.with_extension(suffix));
+    }
+    fs::rename(staging.join("baucord.db"), db_path).map_err(io_err)?;
+    let blobs = blobs_dir(db_path);
+    let _ = fs::remove_dir_all(&blobs);
+    if staging.join("blobs").is_dir() {
+        fs::rename(staging.join("blobs"), &blobs).map_err(io_err)?;
+    }
+    let _ = fs::remove_dir_all(&staging);
+    Ok(report)
+}
+
+/// What `server restore` put in place.
+#[derive(Debug, Default)]
+pub struct RestoreReport {
+    pub database: bool,
+    pub blobs: usize,
+    /// Where the previous database went.
+    pub kept: Option<PathBuf>,
+}
+
+/// `server db prune`: the hourly retention pass, now. Refuses while
+/// the server holds the database.
+///
+/// # Errors
+/// No database, the server is running, or a `SQLite` failure.
+pub fn cli_prune(db_path: &Path, retention: Retention) -> Result<u64, PersistError> {
+    if !db_path.is_file() {
+        return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    if db_path.with_extension("db-wal").exists() {
+        return Err(PersistError::Locked(db_path.to_path_buf()));
+    }
+    let (db, _) = Sqlite::open(db_path)?;
+    let removed = db.prune(super::wall_now(), retention)?;
+    db.close();
+    Ok(removed)
+}
+
 pub fn backup_to_tar(db_path: &Path, out: &Path) -> Result<BackupReport, PersistError> {
     if !db_path.is_file() {
         return Err(PersistError::Missing(db_path.to_path_buf()));
@@ -2124,6 +2261,7 @@ mod tests {
                 Retention {
                     history_days: 30,
                     telemetry_days: 0,
+                    file_days: 0,
                 },
             )
             .expect("prune");
@@ -2145,6 +2283,7 @@ mod tests {
                 Retention {
                     history_days: 0,
                     telemetry_days: 0,
+                    file_days: 0,
                 },
             )
             .expect("prune");
