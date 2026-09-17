@@ -279,6 +279,19 @@ pub struct AppState {
     /// One-shot for repaint_on_reveal: set before showing a hidden
     /// main window (tray Show, reconnect paths).
     main_repaint_arm: Rc<Cell<bool>>,
+    /// The main window has been placed once (centred at its first
+    /// show); later shows leave it where the user put it.
+    main_placed: Cell<bool>,
+    /// The server runs its default channel as a lobby (spec §12,
+    /// 1.1.5): that row and whoever is in it stay out of the roster,
+    /// and arrivals read "joined <room>".
+    lobby: bool,
+    /// The lobby's name (ids renumber on a hot reload; names hold).
+    pub(crate) lobby_name: Option<String>,
+    /// The room to go back to after an automatic reconnect: set when
+    /// the connection drops, spent by the next `Init`, cleared by a
+    /// deliberate connect or disconnect.
+    rejoin_channel: Option<String>,
     pub settings_win: Option<ui::SettingsWindow>,
     /// The admin panel (spec §8), created on first open.
     pub(crate) admin_win: Option<ui::AdminWindow>,
@@ -420,27 +433,22 @@ pub fn run() {
         spawn_workers(&is_testing_mic_shared);
 
     let settings = Settings::load();
+    apply_log_level(&settings);
 
     // Localize before any UI is built. None = follow the OS locale.
     i18n::init(settings.language.as_deref());
 
     let main = MainWindow::new().expect("failed to create the main window");
 
-    // Saved geometry (falls back to the window's preferred size,
-    // centered by the WM).
+    // Saved size only; the position is decided at the first show
+    // (centred on the monitor, see `center_on_monitor`).
     // Saved px dimensions; i32→f32 precision is irrelevant at window
     // scale.
     #[allow(clippy::cast_precision_loss)]
-    {
-        main.window().set_size(slint::LogicalSize::new(
-            settings.window.width.max(500) as f32,
-            settings.window.height.max(400) as f32,
-        ));
-        if let (Some(x), Some(y)) = (settings.window.x, settings.window.y) {
-            main.window()
-                .set_position(slint::LogicalPosition::new(x as f32, y as f32));
-        }
-    }
+    main.window().set_size(slint::LogicalSize::new(
+        settings.window.width.max(500) as f32,
+        settings.window.height.max(400) as f32,
+    ));
 
     let chat_model = Rc::new(VecModel::<ChatRow>::default());
     let users_model = Rc::new(VecModel::<UserRow>::default());
@@ -546,6 +554,10 @@ pub fn run() {
         users_model,
         main,
         main_repaint_arm: Rc::new(Cell::new(false)),
+        main_placed: Cell::new(false),
+        lobby: false,
+        lobby_name: None,
+        rejoin_channel: None,
         settings_win: None,
         admin_win: None,
         admin_audit_oldest: None,
@@ -605,11 +617,9 @@ pub fn run() {
         st.settings.startup.start_minimized && cfg!(feature = "tray")
     };
     if !start_hidden {
-        state
-            .borrow()
-            .main
-            .show()
-            .expect("failed to show the main window");
+        let st = state.borrow();
+        st.main.show().expect("failed to show the main window");
+        st.place_main_once();
     }
     {
         let weak = state.borrow().main.as_weak();
@@ -654,6 +664,41 @@ pub fn run() {
 // ── Callback wiring ─────────────────────────────────────────────────────
 
 /// Convenience: run `f` with a `&mut AppState` if the app still exists.
+/// What a dragged user row carries (inside the opaque
+/// `slint::DataTransfer`): the client id, nothing else.
+struct DragUser(u64);
+
+/// The log level from the settings, unless `RUST_LOG` is set (then the
+/// environment decides and the setting is ignored).
+pub(crate) fn apply_log_level(settings: &Settings) {
+    if std::env::var_os("RUST_LOG").is_none() {
+        log::set_max_level(settings.logging.level_filter());
+    }
+}
+
+/// Put a shown window in the middle of the monitor it is on (the
+/// primary one if winit cannot tell). Physical pixels throughout, so
+/// mixed-DPI setups land where they look centred.
+fn center_on_monitor(win: &slint::Window) {
+    use i_slint_backend_winit::{winit::dpi::PhysicalPosition, WinitWindowAccessor};
+    win.with_winit_window(|w| {
+        let Some(monitor) = w.current_monitor().or_else(|| w.primary_monitor()) else {
+            return;
+        };
+        let area = monitor.size();
+        let origin = monitor.position();
+        let size = w.outer_size();
+        let centred = |start: i32, room: u32, extent: u32| {
+            let slack = (i64::from(room) - i64::from(extent)).max(0) / 2;
+            i32::try_from(i64::from(start) + slack).unwrap_or(start)
+        };
+        w.set_outer_position(PhysicalPosition::new(
+            centred(origin.x, area.width, size.width),
+            centred(origin.y, area.height, size.height),
+        ));
+    });
+}
+
 fn with_app(weak: &Weak<RefCell<AppState>>, f: impl FnOnce(&mut AppState)) {
     if let Some(rc) = weak.upgrade() {
         f(&mut rc.borrow_mut());
@@ -681,6 +726,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
             if nickname.trim().is_empty() {
                 app.show_error(&t!("error-nickname-empty"));
             } else {
+                app.rejoin_channel = None; // a deliberate connect lands in the lobby
                 app.handle_connect(&nickname);
             }
         });
@@ -745,6 +791,43 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_user_context(move |index, x, y| {
         with_app(&w, |app| app.open_user_menu(index, x, y));
+    });
+    // Drag a user onto a channel: the payload is our own type inside
+    // the opaque transfer, so nothing is parsed on the way back.
+    let w = Rc::downgrade(state);
+    logic.on_user_drag_data(move |index| {
+        let mut data = slint::DataTransfer::default();
+        if let Some(rc) = w.upgrade()
+            && let Some(id) = rc.borrow().user_id_at(index)
+        {
+            data.set_user_data(Rc::new(DragUser(id)));
+        }
+        data
+    });
+    let w = Rc::downgrade(state);
+    logic.on_can_drop_user(move |data, channel_index| {
+        w.upgrade()
+            .is_some_and(|rc| rc.borrow().drop_target(&data, channel_index).is_some())
+    });
+    let w = Rc::downgrade(state);
+    logic.on_drop_user(move |data, channel_index| {
+        with_app(&w, |app| {
+            if let Some((client_id, channel_id)) = app.drop_target(&data, channel_index) {
+                app.move_user_to(client_id, channel_id);
+            }
+        });
+    });
+    // The LIVE chip: one click opens the sharer's viewer (or brings
+    // it forward), no menu needed.
+    let w = Rc::downgrade(state);
+    logic.on_watch_user(move |index| {
+        with_app(&w, |app| {
+            if let Some(id) = app.user_id_at(index)
+                && Some(id) != app.our_client_id
+            {
+                app.handle_watch_peer(id);
+            }
+        });
     });
     let w = Rc::downgrade(state);
     logic.on_row_context(move |row, selecting, x, y| {
@@ -936,6 +1019,14 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, |app| {
             if let Some(id) = app.gallery_row {
                 media::save_image_dialog(app, id);
+            }
+        });
+    });
+    let w = Rc::downgrade(state);
+    logic.on_viewer_copy(move || {
+        with_app(&w, |app| {
+            if let Some(id) = app.gallery_row {
+                media::copy_image(app, id);
             }
         });
     });
@@ -1425,8 +1516,9 @@ impl AppState {
     #[allow(clippy::too_many_lines)]
     fn handle_network_message(&mut self, msg: NetworkMessage) {
         match msg {
-            NetworkMessage::Connected => {
+            NetworkMessage::Connected { lobby } => {
                 self.connected = true;
+                self.lobby = lobby;
                 self.reconnect_attempts = 0;
                 self.main.global::<State>().set_error_text("".into());
                 self.clear_connect_verdicts();
@@ -1877,6 +1969,12 @@ impl AppState {
                     LossKind::ServerRestart => "error-lost-restart",
                 });
                 self.push_chat_system(&what);
+                // Where to go back to, if the reconnect is automatic.
+                self.rejoin_channel = if self.lobby && !self.in_lobby() {
+                    self.our_channel().map(|c| self.channel_name(c))
+                } else {
+                    None
+                };
                 self.teardown_connection();
                 self.show_connect_phase();
                 const MAX_AUTO_RECONNECTS: u32 = 5;
@@ -3444,6 +3542,15 @@ impl AppState {
 
         self.our_client_id = Some(client_id);
         self.server_name = server_name.to_string();
+        // The lobby is wherever the server put us on arrival.
+        self.lobby_name = if self.lobby {
+            memberships
+                .get(&client_id)
+                .and_then(|ch| channels.iter().find(|c| c.id == *ch))
+                .map(|c| c.name.clone())
+        } else {
+            None
+        };
         // `ChannelDetails` follow, one per channel, and are keyed by
         // these ids — a stale set from an earlier list must not leak.
         self.channel_infos = channels.to_vec();
@@ -3494,6 +3601,14 @@ impl AppState {
         s.set_greeting(greeting.into());
         self.update_user_list();
         self.show_main();
+        // An automatic reconnect lands in the lobby like any connect;
+        // go back to the room the drop took us out of (a saved
+        // password serves, a missing one asks).
+        if let Some(name) = self.rejoin_channel.take()
+            && let Some(id) = self.channels.iter().find(|c| c.name == name).map(|c| c.id)
+        {
+            self.channel_clicked(id);
+        }
     }
 
     fn handle_user_joined(&mut self, client_id: u64, username: String, channel_id: u16) {
@@ -3510,7 +3625,16 @@ impl AppState {
             .send(VoiceControl::SetPeerAudio(client_id, saved.clone()))
             .ok();
 
-        self.push_chat_system(&t!("chat-user-joined", "name" => username.as_str()));
+        if self.lobby {
+            let channel = self.channel_name(channel_id);
+            self.push_chat_system(&t!(
+                "chat-user-joined-channel",
+                "name" => username.as_str(),
+                "channel" => channel.as_str()
+            ));
+        } else {
+            self.push_chat_system(&t!("chat-user-joined", "name" => username.as_str()));
+        }
         self.rebuild_dms_model();
         let mut user = UserState::new(username, peer_audio_from(&saved), channel_id);
         // `UserDetails` normally follows `UserJoined`; if it got here
@@ -3552,6 +3676,15 @@ impl AppState {
         self.update_user_list();
     }
 
+    /// In the lobby: connected, but in no room yet (spec §12, 1.1.5).
+    fn in_lobby(&self) -> bool {
+        self.lobby
+            && self
+                .our_channel()
+                .map(|c| self.channel_name(c))
+                .is_some_and(|name| Some(name) == self.lobby_name)
+    }
+
     /// The channel we are currently in, per server echo.
     fn our_channel(&self) -> Option<u16> {
         self.our_client_id
@@ -3578,18 +3711,35 @@ impl AppState {
 
         if Some(client_id) == self.our_client_id {
             // Our own move confirmed — close the prompt if it drove
-            // this, and ding into the new room.
+            // this, and ding into the new room. Back into the lobby
+            // (an admin's move, a kick) there is no room to ding
+            // into: the banner says where we are.
             self.pending_channel_join = None;
             let state = self.main.global::<State>();
             state.set_channel_prompt_open(false);
             state.set_channel_password("".into());
+            if self.in_lobby() {
+                self.update_user_list();
+                return;
+            }
+            let channel = self.channel_name(channel_id);
+            self.push_chat_system(&t!("chat-you-moved", "channel" => channel.as_str()));
             self.play_chime(SoundType::UserJoined);
-        } else if Some(channel_id) == our_channel_before {
-            // Someone stepped into our room.
-            self.play_chime(SoundType::UserJoined);
-        } else if old.is_some() && old == our_channel_before {
-            // Someone stepped out of our room.
-            self.play_chime(SoundType::UserLeft);
+        } else {
+            let name = self.username_of(client_id);
+            let channel = self.channel_name(channel_id);
+            self.push_chat_system(&t!(
+                "chat-user-moved",
+                "name" => name.as_str(),
+                "channel" => channel.as_str()
+            ));
+            if Some(channel_id) == our_channel_before {
+                // Someone stepped into our room.
+                self.play_chime(SoundType::UserJoined);
+            } else if old.is_some() && old == our_channel_before {
+                // Someone stepped out of our room.
+                self.play_chime(SoundType::UserLeft);
+            }
         }
         self.update_user_list();
     }
@@ -3672,8 +3822,11 @@ impl AppState {
                     from_config: facts.is_none_or(|f| f.stable_id == 0),
                     // A gate we cannot rank (a custom role) is left to
                     // the server: the channel stays visible and
-                    // `JoinChannel` says no.
-                    hidden: !sees_all && gate_rank.is_some_and(|needed| needed > our_rank),
+                    // `JoinChannel` says no. The lobby is nowhere:
+                    // its row and its members (us, until we pick a
+                    // room) stay out entirely.
+                    hidden: (!sees_all && gate_rank.is_some_and(|needed| needed > our_rank))
+                        || self.lobby_name.as_deref() == Some(c.name.as_str()),
                 }
             })
             .collect();
@@ -3708,7 +3861,7 @@ impl AppState {
         s.set_perm_panel(has(p::PANEL));
         s.set_perm_admin_channel(has(p::ADMIN_CHANNEL));
         s.set_perm_manage_own(has(p::MANAGE_OWN_CHANNELS));
-        s.set_perm_delete_any(has(p::RESTRICT));
+        s.set_perm_delete_any(has(p::DELETE_MESSAGES));
         s.set_perm_dm(has(p::DM));
         s.set_our_role(
             self.our_client_id
@@ -4158,6 +4311,7 @@ impl AppState {
     fn handle_disconnect(&mut self) {
         self.reconnect_timer.stop();
         self.reconnect_attempts = 0;
+        self.rejoin_channel = None;
         self.network.tx.send(NetworkControl::Disconnect).ok();
         self.push_chat_system(&t!("chat-disconnected", "reason" => t!("disconnect-reason-user")));
         self.teardown_connection();
@@ -4440,6 +4594,31 @@ impl AppState {
         Some(AdminTarget::User(*user_id))
     }
 
+    /// A drag payload over a channel row: `Some((client, channel))`
+    /// when the payload is one of our users and the row is a channel
+    /// they are not already in. Used both to accept the hover and to
+    /// act on the drop.
+    fn drop_target(&self, data: &slint::DataTransfer, channel_index: i32) -> Option<(u64, u16)> {
+        let client_id = data.user_data()?.downcast::<DragUser>().ok()?.0;
+        let row = self.users_model.row_data(usize::try_from(channel_index).ok()?)?;
+        if !row.is_channel {
+            return None;
+        }
+        let channel_id = u16::try_from(row.channel_id).ok()?;
+        let current = self.users.get(&client_id).map(|u| u.channel_id);
+        (current != Some(channel_id)).then_some((client_id, channel_id))
+    }
+
+    /// The drop: the same `MoveUser` the "Move to" submenu sends,
+    /// the server judging permission and the target's gates.
+    fn move_user_to(&mut self, client_id: u64, channel_id: u16) {
+        let Some((user_id, _)) = self.details.get(&client_id) else {
+            return;
+        };
+        let target = AdminTarget::User(*user_id);
+        self.send_admin(AdminCommand::MoveUser { target, channel_id }, PendingAdmin::Show);
+    }
+
     // ── Context menus ───────────────────────────────────────────────
     // A row asks for its menu at a window position; app-core's `menu`
     // decides the entries from what the session may do (spec §8), the
@@ -4585,7 +4764,10 @@ impl AppState {
             styled: row.styled,
             selecting,
             in_dm: self.active_dm.is_some(),
-            delete_any: client::permissions::has(self.permissions, client::permissions::RESTRICT),
+            delete_any: client::permissions::has(
+                self.permissions,
+                client::permissions::DELETE_MESSAGES,
+            ),
         };
         let target = MenuTarget::Message {
             row_id: row.row_id,
@@ -4656,6 +4838,9 @@ impl AppState {
             }
             (MenuTarget::Message { row_id, .. }, A::SaveImage) => {
                 media::save_image_dialog(self, row_id);
+            }
+            (MenuTarget::Message { row_id, .. }, A::CopyImage) => {
+                media::copy_image(self, row_id);
             }
             (MenuTarget::Message { row_id, .. }, A::SaveFile) => self.file_save(row_id),
             (MenuTarget::Composer, A::Cut) => self.main.invoke_composer_cut(),
@@ -4943,6 +5128,16 @@ impl AppState {
 
     fn handle_watch_peer(&mut self, client_id: u64) {
         if self.viewers.contains_key(&client_id) {
+            // Already watching: bring the viewer forward, on the event
+            // loop like a fresh open (window ordering can dispatch
+            // events synchronously on macOS).
+            let _ = slint::invoke_from_event_loop(move || {
+                with_current(move |app| {
+                    if let Some(viewer) = app.viewers.get(&client_id) {
+                        let _ = viewer.win.show();
+                    }
+                });
+            });
             return;
         }
         let username = self.username_of(client_id);
@@ -5219,10 +5414,22 @@ impl AppState {
         use i_slint_backend_winit::WinitWindowAccessor;
         self.main_repaint_arm.set(true);
         let _ = self.main.show();
+        self.place_main_once();
         self.main.window().with_winit_window(|w| {
             w.set_minimized(false);
             w.focus_window();
         });
+    }
+
+    /// Centre the main window on its monitor the first time it is
+    /// shown (a launch, or the tray's first "Show" after "start in the
+    /// tray"). Never again afterwards: a user who moved it keeps it
+    /// there for the rest of the run.
+    fn place_main_once(&self) {
+        if self.main_placed.replace(true) {
+            return;
+        }
+        center_on_monitor(self.main.window());
     }
 
     // NOTE: there is deliberately no scroll-after-append here. The
@@ -5823,8 +6030,12 @@ impl AppState {
 
     /// A system line into the general chat, whichever conversation
     /// is open (notices are about the room).
+    /// A system line into General, stamped with the local time: who
+    /// came, went or moved, and when.
     pub fn push_chat_system(&mut self, text: &str) {
-        self.with_conversation(None, |app| app.push_system_here(text));
+        let now = u64::try_from(chrono::Local::now().timestamp_millis()).unwrap_or(0);
+        let line = format!("{}  {text}", format_wall_time(now));
+        self.with_conversation(None, |app| app.push_system_here(&line));
     }
 
     /// A message into the general chat, whichever conversation is
@@ -6585,6 +6796,7 @@ impl AppState {
     // ════════════════════════════════════════════════════════════════
 
     pub fn update_user_list(&mut self) {
+        self.main.global::<State>().set_in_lobby(self.in_lobby());
         let items = roster::grouped_rows(
             &self.channels,
             &self.users,
@@ -7280,12 +7492,9 @@ impl AppState {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn save_window_geometry(&mut self) {
         let size = self.main.window().size();
-        let pos = self.main.window().position();
         let scale = self.main.window().scale_factor();
         self.settings.window.width = (size.width as f32 / scale) as i32;
         self.settings.window.height = (size.height as f32 / scale) as i32;
-        self.settings.window.x = Some(pos.x);
-        self.settings.window.y = Some(pos.y);
     }
 
     /// Push every localized static label into the Tr global (called at
@@ -7926,6 +8135,7 @@ fn menu_label(label: &menu::Label) -> slint::SharedString {
         L::DeleteMessage => "menu-delete-message",
         L::OpenImage => "menu-open-image",
         L::SaveImage => "menu-save-image",
+        L::CopyImage => "menu-copy-image",
         L::SaveFile => "menu-save-file",
         L::Cut => "menu-cut",
         L::Paste => "menu-paste",
@@ -8089,6 +8299,9 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_image_preview_title(t!("image-preview-title").into());
     tr.set_channel_join(t!("channel-join").into());
     tr.set_menu_save_image(t!("menu-save-image").into());
+    tr.set_menu_copy_image(t!("menu-copy-image").into());
+    tr.set_lobby_banner(t!("lobby-banner").into());
+    tr.set_lobby_mic_hint(t!("lobby-mic-hint").into());
     tr.set_chat_edited_mark(t!("chat-edited-mark").into());
     tr.set_chat_deleted_placeholder(t!("chat-deleted-placeholder").into());
     tr.set_chat_editing(t!("chat-editing").into());
@@ -8231,6 +8444,8 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_general_lead(t!("general-lead").into());
     tr.set_text_size(t!("text-size").into());
     tr.set_text_size_hint(t!("text-size-hint").into());
+    tr.set_log_level(t!("log-level").into());
+    tr.set_log_level_hint(t!("log-level-hint").into());
     tr.set_sounds_header(t!("sounds-header").into());
     tr.set_sounds_enabled(t!("sounds-enabled").into());
     tr.set_sounds_enabled_hint(t!("sounds-enabled-hint").into());

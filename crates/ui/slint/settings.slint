@@ -52,6 +52,8 @@ export global SettingsState {
     in-out property <int> language-index: 0;
     in property <[string]> text-sizes;        // Small / Default / Large / Larger
     in-out property <int> text-size-index: 1;
+    in property <[string]> log-levels;        // Errors only … Trace
+    in-out property <int> log-level-index: 2;
     in property <string> config-path;
     // Startup
     in-out property <bool> auto-connect: false;
@@ -131,6 +133,7 @@ export global SettingsLogic {
     // General
     callback language-selected(int);
     callback text-size-selected(int);
+    callback log-level-selected(int);
     callback open-config-folder();
     callback auto-connect-changed(bool);
     callback start-minimized-changed(bool);
@@ -489,6 +492,15 @@ component GeneralPanel inherits VerticalLayout {
             options: SettingsState.text-sizes;
             current <=> SettingsState.text-size-index;
             selected(i) => { SettingsLogic.text-size-selected(i); }
+        }
+    }
+    Setting {
+        label: Tr.log-level;
+        hint: Tr.log-level-hint;
+        Dropdown {
+            options: SettingsState.log-levels;
+            current <=> SettingsState.log-level-index;
+            selected(i) => { SettingsLogic.log-level-selected(i); }
         }
     }
 
@@ -964,10 +976,10 @@ component CreditsPanel inherits VerticalLayout {
 export component SettingsWindow inherits Window {
     title: Tr.settings-title;
     background: Theme.bg-primary;
-    preferred-width: 760px;
-    preferred-height: 660px;
-    min-width: 640px;
-    min-height: 520px;
+    preferred-width: 800px;
+    preferred-height: 740px;
+    min-width: 680px;
+    min-height: 580px;
 
     /// 0 profile, 1 general, 2 audio, 3 keyboard, 4 servers,
     /// 5 credits, 6 about.

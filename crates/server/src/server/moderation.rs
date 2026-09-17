@@ -603,7 +603,7 @@ impl ChatServer {
                 }
             }
             AdminCommand::DeleteMessage { msg_id } => {
-                need(permissions::RESTRICT)?;
+                need(permissions::DELETE_MESSAGES)?;
                 if self.handle_delete_message(client, msg_id, true) {
                     self.audit(
                         Some(actor),

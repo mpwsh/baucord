@@ -45,6 +45,7 @@ pub enum Label {
     DeleteMessage,
     OpenImage,
     SaveImage,
+    CopyImage,
     SaveFile,
     Cut,
     Paste,
@@ -85,6 +86,8 @@ pub enum Action {
     DeleteMessage,
     OpenImage,
     SaveImage,
+    /// Put the picture's pixels on the clipboard.
+    CopyImage,
     /// Fetch a file card's blob into the Downloads folder.
     SaveFile,
     Cut,
@@ -374,16 +377,17 @@ pub struct MessageFacts {
 /// The menu for a chat row. Empty for a deleted message.
 #[must_use]
 pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
-    if m.kind == MessageKind::Image {
-        return vec![
-            Entry::new(Label::OpenImage, Action::OpenImage),
-            Entry::new(Label::SaveImage, Action::SaveImage),
-        ];
-    }
     if m.deleted {
         return Vec::new();
     }
+    // A picture is a message with a blob (spec §12, 1.1.5): its own
+    // entries first, then the same delete rule as text below.
     let mut entries = match m.kind {
+        MessageKind::Image => vec![
+            Entry::new(Label::OpenImage, Action::OpenImage),
+            Entry::new(Label::SaveImage, Action::SaveImage),
+            Entry::new(Label::CopyImage, Action::CopyImage),
+        ],
         MessageKind::File => vec![Entry::new(Label::SaveFile, Action::SaveFile)],
         MessageKind::Code => vec![Entry::new(Label::Copy, Action::CopyText)],
         _ => vec![Entry::new(Label::CopyMessage, Action::CopyText)],
@@ -399,7 +403,7 @@ pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
     // server checks both; this mirrors it).
     if !m.in_dm {
         let mut editing = Vec::new();
-        if m.own && m.kind != MessageKind::File {
+        if m.own && !matches!(m.kind, MessageKind::File | MessageKind::Image) {
             editing.push(Entry::new(Label::EditMessage, Action::EditMessage));
         }
         if m.own || m.delete_any {
@@ -794,7 +798,39 @@ mod tests {
         };
         assert_eq!(
             labels(&message_menu(&image)),
-            [Label::OpenImage, Label::SaveImage]
+            [Label::OpenImage, Label::SaveImage, Label::CopyImage]
         );
+    }
+
+    #[test]
+    fn own_picture_deletes_but_never_edits() {
+        let own = MessageFacts {
+            kind: MessageKind::Image,
+            own: true,
+            ..text_row()
+        };
+        assert_eq!(
+            labels(&message_menu(&own)),
+            [
+                Label::OpenImage,
+                Label::SaveImage,
+                Label::CopyImage,
+                Label::DeleteMessage
+            ]
+        );
+        assert!(message_menu(&own)[3].danger);
+        let moderated = MessageFacts {
+            kind: MessageKind::Image,
+            delete_any: true,
+            ..text_row()
+        };
+        assert_eq!(labels(&message_menu(&moderated))[3], Label::DeleteMessage);
+        let in_dm = MessageFacts {
+            kind: MessageKind::Image,
+            own: true,
+            in_dm: true,
+            ..text_row()
+        };
+        assert_eq!(message_menu(&in_dm).len(), 3);
     }
 }

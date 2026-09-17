@@ -184,3 +184,28 @@ pub fn set_clipboard_text(text: &str) {
         log::warn!("Clipboard write failed: {e}");
     }
 }
+
+/// Put a picture on the clipboard as pixels (the "Copy image" menu
+/// action): decoded here from the PNG/JPEG/GIF bytes the row holds
+/// (a GIF's first frame), then handed to the OS as RGBA. Bounded by
+/// the same decoder that renders chat images.
+pub fn set_clipboard_image(bytes: &[u8]) {
+    let decoded = match app_core::images::decode_bounded(bytes) {
+        Ok(img) => img.to_rgba8(),
+        Err(e) => {
+            log::warn!("Copy image: decode failed: {e:?}");
+            return;
+        }
+    };
+    let (width, height) = (decoded.width() as usize, decoded.height() as usize);
+    let data = arboard::ImageData {
+        width,
+        height,
+        bytes: std::borrow::Cow::Owned(decoded.into_raw()),
+    };
+    if let Ok(mut cb) = arboard::Clipboard::new()
+        && let Err(e) = cb.set_image(data)
+    {
+        log::warn!("Clipboard image write failed: {e}");
+    }
+}

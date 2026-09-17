@@ -377,6 +377,11 @@ impl ChatServer {
                 continue;
             };
             let channel = self.channel_of.get(client).copied();
+            // Nothing accrues outside a room: the lobby is nowhere
+            // and AFK is away (spec §12, 1.1.5).
+            if channel.is_none_or(|c| c == self.default_channel || Some(c) == self.afk_channel()) {
+                continue;
+            }
             let others_in_channel = channel.is_some_and(|c| {
                 self.channel_of
                     .iter()

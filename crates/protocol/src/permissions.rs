@@ -60,6 +60,11 @@ pub const PANEL: u64 = 1 << 21;
 /// See the admin channel (spec §8): the audit as it happens, in a
 /// conversation, with the slash commands at hand.
 pub const ADMIN_CHANNEL: u64 = 1 << 22;
+/// Delete other people's messages in General (1.1.5). Its own bit,
+/// on purpose: a chat moderator who may not mute, kick or restrict.
+/// Nothing implies it, `RESTRICT` included; DMs stay undeletable for
+/// everyone.
+pub const DELETE_MESSAGES: u64 = 1 << 23;
 
 /// What a guest may do.
 pub const GUEST_PERMISSIONS: u64 = JOIN_CHANNELS | SPEAK | TEXT_GENERAL;
@@ -75,6 +80,7 @@ pub const ADMIN_PERMISSIONS: u64 = ORGANIZER_PERMISSIONS
     | BAN
     | MUTE
     | RESTRICT
+    | DELETE_MESSAGES
     | MANAGE_ROLES
     | MANAGE_USERS
     | MANAGE_INVITES
@@ -148,7 +154,7 @@ pub const fn has(permissions: u64, bit: u64) -> bool {
 /// Every permission with the name the CLI and the panel use for it,
 /// in bit order. [`ADMIN`] is listed so it can be *printed*; a custom
 /// role can never hold it ([`CUSTOM_ROLE_PERMISSIONS`]).
-pub const PERMISSION_NAMES: [(&str, u64); 23] = [
+pub const PERMISSION_NAMES: [(&str, u64); 24] = [
     ("join", JOIN_CHANNELS),
     ("speak", SPEAK),
     ("text", TEXT_GENERAL),
@@ -164,6 +170,7 @@ pub const PERMISSION_NAMES: [(&str, u64); 23] = [
     ("ban", BAN),
     ("mute", MUTE),
     ("restrict", RESTRICT),
+    ("delete-messages", DELETE_MESSAGES),
     ("manage-roles", MANAGE_ROLES),
     ("manage-users", MANAGE_USERS),
     ("manage-invites", MANAGE_INVITES),
@@ -266,6 +273,7 @@ mod tests {
             BAN,
             MUTE,
             RESTRICT,
+            DELETE_MESSAGES,
             MANAGE_ROLES,
             MANAGE_USERS,
             MANAGE_INVITES,

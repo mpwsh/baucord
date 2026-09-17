@@ -61,11 +61,31 @@ pub const MAX_CHANNELS: usize = 256;
 
 fn default_channels() -> Vec<ChannelSettings> {
     vec![ChannelSettings {
-        name: "Lobby".to_string(),
-        default: true,
+        name: "General".to_string(),
+        default: false,
         password: None,
         user_limit: None,
     }]
+}
+
+/// The lobby's name on the wire. Empty: a config channel cannot be
+/// empty-named, so it never collides, and a client that knows the
+/// lobby (feature bit `LOBBY`) hides the row by this name.
+pub const LOBBY_NAME: &str = "";
+
+/// A channel list with the lobby appended (spec §12, 1.1.5): the
+/// room everyone connects into, announced to nobody, not in the
+/// config. Always last, so config and UI channels keep their ids.
+#[must_use]
+pub fn with_lobby(channels: &[ChannelSettings]) -> Vec<ChannelSettings> {
+    let mut all = channels.to_vec();
+    all.push(ChannelSettings {
+        name: LOBBY_NAME.to_string(),
+        default: false,
+        password: None,
+        user_limit: None,
+    });
+    all
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -353,14 +373,13 @@ impl Config {
         })
     }
 
-    /// Validate the channel list and return the default channel's index.
+    /// Validate the channel list and return the lobby's index (the
+    /// entry [`with_lobby`] appends).
     ///
     /// Enforced here (at startup, loudly) rather than tolerated at join
-    /// time: empty/duplicate names, zero or multiple `default: true`,
-    /// a password or user limit on the default channel, `user_limit: 0`,
-    /// and more than [`MAX_CHANNELS`] channels are all config mistakes
-    /// the operator should fix, not states the server should limp
-    /// through.
+    /// time: empty/duplicate names, `user_limit: 0`, and more than
+    /// [`MAX_CHANNELS`] channels are all config mistakes the operator
+    /// should fix, not states the server should limp through.
     ///
     /// # Errors
     /// A human-readable description of the first problem found.
@@ -368,11 +387,12 @@ impl Config {
         validate_channel_list(&self.channels)
     }
 
-    /// The channel list as announced to clients (passwords reduced to
-    /// a `has_password` flag; they never cross the wire).
+    /// The channel list as announced to clients, lobby included
+    /// (passwords reduced to a `has_password` flag; they never cross
+    /// the wire).
     #[must_use]
     pub fn channel_infos(&self) -> Vec<protocol::ChannelInfo> {
-        channel_infos_of(&self.channels)
+        channel_infos_of(&with_lobby(&self.channels))
     }
 }
 
@@ -392,17 +412,20 @@ pub fn channel_infos_of(channels: &[ChannelSettings]) -> Vec<protocol::ChannelIn
         .collect()
 }
 
-/// Validate a candidate channel list and return the default channel's
-/// index. Shared by startup ([`Config::validate_channels`]) and hot
+/// Validate a candidate channel list (config and UI channels, without
+/// the lobby) and return the lobby's index, i.e. where [`with_lobby`]
+/// puts it. Shared by startup ([`Config::validate_channels`]) and hot
 /// reload, which must vet a new list *before* swapping it in — a bad
 /// edit to a running server is rejected here and never applied.
+/// `default: true` is accepted and ignored (pre-1.1.5 files carry
+/// it): connecting lands in the lobby, whatever the file says.
 ///
 /// # Errors
 /// A human-readable description of the first problem found.
 pub fn validate_channel_list(channels: &[ChannelSettings]) -> Result<u16, String> {
     if channels.is_empty() {
         return Err(
-            "channels: list is empty — omit the key entirely for a single default Lobby"
+            "channels: list is empty — omit the key entirely for a single 'General'"
                 .to_string(),
         );
     }
@@ -413,7 +436,7 @@ pub fn validate_channel_list(channels: &[ChannelSettings]) -> Result<u16, String
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    let mut default_index: Option<usize> = None;
+    let mut flagged_default = false;
     for (i, ch) in channels.iter().enumerate() {
         let name = ch.name.trim();
         if name.is_empty() {
@@ -428,35 +451,16 @@ pub fn validate_channel_list(channels: &[ChannelSettings]) -> Result<u16, String
                      omit the key for unlimited"
             ));
         }
-        if ch.default {
-            if let Some(first) = default_index {
-                return Err(format!(
-                    "channels[{i}] '{name}': 'default: true' is already set on \
-                         channels[{first}] '{}' — exactly one channel may be the default",
-                    channels[first].name
-                ));
-            }
-            if ch.password.is_some() {
-                return Err(format!(
-                    "channels[{i}] '{name}': the default channel cannot have a password — \
-                         every client lands there on connect"
-                ));
-            }
-            if ch.user_limit.is_some() {
-                return Err(format!(
-                    "channels[{i}] '{name}': the default channel cannot have a user_limit — \
-                         a full default channel would block all new connections"
-                ));
-            }
-            default_index = Some(i);
+        if ch.default && !flagged_default {
+            flagged_default = true;
+            log::warn!(
+                "channels[{i}] '{name}': 'default: true' is ignored since 1.1.5 — everyone \
+                 connects into the lobby and picks a channel; drop the key"
+            );
         }
     }
-    let default_index = default_index.ok_or_else(|| {
-        "channels: no channel has 'default: true' — mark exactly one (typically the Lobby)"
-            .to_string()
-    })?;
     #[allow(clippy::cast_possible_truncation)] // len ≤ MAX_CHANNELS ≤ u16::MAX
-    Ok(default_index as u16)
+    Ok(channels.len() as u16)
 }
 
 impl Default for Config {
@@ -480,7 +484,10 @@ impl Default for ServerSettings {
         Self {
             name: "Baucord Server".to_string(),
             host: "0.0.0.0".to_string(),
-            port: 5000,
+            // 51000 since 1.1.5: some ISP gateways classify UDP/5000
+            // into a policed class (the Movistar case in the session
+            // guide); the 50000+ range is where voice apps live.
+            port: 51000,
             public_address: None,
             greeting_message: "Welcome to the server!".to_string(),
         }

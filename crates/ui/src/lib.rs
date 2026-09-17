@@ -106,6 +106,7 @@ pub mod convert {
             A::Cut => (MenuAction::Cut, 0),
             A::Copy => (MenuAction::Copy, 0),
             A::Paste => (MenuAction::Paste, 0),
+            A::CopyImage => (MenuAction::CopyImage, 0),
         }
     }
 
@@ -145,6 +146,7 @@ pub mod convert {
             MenuAction::Cut => A::Cut,
             MenuAction::Copy => A::Copy,
             MenuAction::Paste => A::Paste,
+            MenuAction::CopyImage => A::CopyImage,
         })
     }
 

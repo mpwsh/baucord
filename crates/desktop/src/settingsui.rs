@@ -75,6 +75,16 @@ pub const TEXT_SIZES: [(&str, f32); 4] = [
     ("text-size-larger", 1.3),
 ];
 
+/// The "Log level" choices: label key and the value stored in
+/// `settings.json` (`logging.level`).
+pub const LOG_LEVELS: [(&str, &str); 5] = [
+    ("log-level-error", "error"),
+    ("log-level-warn", "warn"),
+    ("log-level-info", "info"),
+    ("log-level-debug", "debug"),
+    ("log-level-trace", "trace"),
+];
+
 /// `"ip:port"` → (ip, port). Splits on the *last* colon so
 /// `[::1]:5000` keeps its bracketed v6 host; no colon → all ip.
 fn split_address(address: &str) -> (String, String) {
@@ -320,6 +330,13 @@ pub fn populate(app: &mut AppState) {
         .position(|(_, scale)| (scale - settings.ui.text_scale).abs() < 0.01)
         .unwrap_or(1);
     s.set_text_size_index(i32::try_from(size_index).unwrap_or(1));
+    let levels: Vec<slint::SharedString> = LOG_LEVELS.iter().map(|(k, _)| t!(k).into()).collect();
+    s.set_log_levels(ModelRc::new(VecModel::from(levels)));
+    let level_index = LOG_LEVELS
+        .iter()
+        .position(|(_, v)| *v == settings.logging.level)
+        .unwrap_or(2);
+    s.set_log_level_index(i32::try_from(level_index).unwrap_or(2));
     s.set_config_path(
         client::config::settings_file_path()
             .display()
@@ -575,6 +592,17 @@ fn wire(win: &SettingsWindow) {
                 .map_or(1.0, |(_, scale)| *scale);
             app.settings.ui.text_scale = scale;
             app.apply_text_scale();
+        });
+    });
+    logic.on_log_level_selected(|index| {
+        app::with_current(move |app| {
+            let level = usize::try_from(index)
+                .ok()
+                .and_then(|i| LOG_LEVELS.get(i))
+                .map_or("info", |(_, v)| *v);
+            app.settings.logging.level = level.to_string();
+            app::apply_log_level(&app.settings);
+            log::info!("log level set to {level}");
         });
     });
     logic.on_sounds_enabled_changed(|on| {

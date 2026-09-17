@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "1.1.4"
+version = "1.1.5"
 edition = "2024"
 
 [lints]
@@ -63,6 +63,7 @@ self-replace = "1.5"
 # no file-list support).
 arboard = { version = "3", default-features = false, features = [
   "wayland-data-control",
+  "image-data",     # set_image for "Copy image"
 ] }
 # Native open/save dialogs (FLTK's chooser is gone). The portal backend
 # avoids a GTK link dependency; it is async, hence the tiny pollster

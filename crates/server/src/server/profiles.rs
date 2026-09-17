@@ -108,6 +108,19 @@ impl ChatServer {
             return;
         };
         let now = self.wall_now();
+        // The same look again is not a change: a client re-sends its
+        // profile after every `Session`, and a log-out-and-back-in
+        // inside the rate window used to earn a "one change every 30
+        // seconds" refusal for changing nothing. Nothing to apply,
+        // nothing to broadcast, nothing to count.
+        if self
+            .policy
+            .users
+            .get(&user)
+            .is_some_and(|record| record.profile == profile)
+        {
+            return;
+        }
         if self
             .policy
             .restriction_on(&user, RestrictionKind::Profile, now)

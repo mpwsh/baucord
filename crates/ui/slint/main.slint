@@ -214,7 +214,7 @@ export component MainWindow inherits Window {
                                     : card.who.role == 3 ? IconSet.Wrench
                                     : IconSet.CircleDashed;
                                 size: 13px;
-                                stroke: card.who.role == 4 ? Theme.gold
+                                stroke: card.who.role == 4 ? Theme.admin
                                     : card.who.role == 3 ? Theme.accent-text
                                     : Theme.text-muted;
                             }
@@ -222,7 +222,7 @@ export component MainWindow inherits Window {
                         if card.who.role-label != "" : Text {
                             text: card.who.role-label;
                             color: card.who.has-role-color ? card.who.role-color
-                                : card.who.role == 4 ? Theme.gold
+                                : card.who.role == 4 ? Theme.admin
                                 : card.who.role == 3 ? Theme.accent-text
                                 : card.who.role == 1 ? Theme.text-muted
                                 : Theme.text-secondary;
@@ -471,6 +471,11 @@ export component MainWindow inherits Window {
                         font-weight: 600;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
+                    }
+                    IconBtn {
+                        icon: IconSet.Copy;
+                        tooltip: Tr.menu-copy-image;
+                        clicked => { Logic.viewer-copy(); }
                     }
                     IconBtn {
                         icon: IconSet.Download;

@@ -343,7 +343,7 @@ impl ServerEntry {
     pub fn official() -> Self {
         Self {
             name: "baucord".to_string(),
-            address: "216.238.121.18:5000".to_string(),
+            address: OFFICIAL_ADDRESS.to_string(),
             password: None,
             invite_code: None,
             fingerprint: None,
@@ -427,6 +427,13 @@ struct LegacyServer {
 /// Address of the retired official server: a legacy file pointing there
 /// migrates to [`ServerEntry::official`] instead of keeping dead config.
 const LEGACY_OFFICIAL_ADDRESS: &str = "64.176.16.18:5000";
+/// The official server, on the port it moved to in 1.1.5.
+const OFFICIAL_ADDRESS: &str = "216.238.121.18:51000";
+/// The official server's old port: still answered (Docker publishes
+/// both), but a saved entry pointing there is moved on load — the
+/// port is the reason three users on one ISP heard each other at
+/// 16 kbps (the session guide's Movistar case).
+const OFFICIAL_ADDRESS_OLD_PORT: &str = "216.238.121.18:5000";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioInputSettings {
@@ -480,12 +487,14 @@ impl Default for AudioSettings {
     }
 }
 
+/// The main window's size. Its *position* is not kept (1.1.5): a
+/// saved spot on a monitor that is no longer there lost people their
+/// window, so every launch centres it on the monitor it opens on.
+/// Older files still carry `x`/`y`; serde ignores them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowSettings {
     pub width: i32,
     pub height: i32,
-    pub x: Option<i32>,
-    pub y: Option<i32>,
 }
 
 impl Default for WindowSettings {
@@ -493,8 +502,6 @@ impl Default for WindowSettings {
         Self {
             width: 1000,
             height: 700,
-            x: None,
-            y: None,
         }
     }
 }
@@ -577,6 +584,44 @@ pub struct Settings {
     pub startup: StartupSettings,
     #[serde(default)]
     pub sounds: SoundSettings,
+    #[serde(default)]
+    pub logging: LoggingSettings,
+}
+
+/// How much `baucord.log` records (1.1.5). `RUST_LOG` in the
+/// environment still wins when set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingSettings {
+    /// One of `error`, `warn`, `info`, `debug`, `trace`.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+impl Default for LoggingSettings {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+        }
+    }
+}
+
+impl LoggingSettings {
+    /// The level as the `log` crate wants it; anything unknown reads
+    /// as `info`.
+    #[must_use]
+    pub fn level_filter(&self) -> log::LevelFilter {
+        match self.level.as_str() {
+            "error" => log::LevelFilter::Error,
+            "warn" => log::LevelFilter::Warn,
+            "debug" => log::LevelFilter::Debug,
+            "trace" => log::LevelFilter::Trace,
+            _ => log::LevelFilter::Info,
+        }
+    }
 }
 
 /// Deserialization shadow of [`Settings`]: `server` accepts both the
@@ -612,6 +657,8 @@ struct SettingsDe {
     startup: StartupSettings,
     #[serde(default)]
     sounds: SoundSettings,
+    #[serde(default)]
+    logging: LoggingSettings,
 }
 
 #[derive(Deserialize)]
@@ -669,6 +716,7 @@ impl From<SettingsDe> for Settings {
             profile: de.profile,
             startup: de.startup,
             sounds: de.sounds,
+            logging: de.logging,
         };
         settings.normalize_servers();
         settings
@@ -691,6 +739,7 @@ impl Default for Settings {
             profile: ProfileSettings::default(),
             startup: StartupSettings::default(),
             sounds: SoundSettings::default(),
+            logging: LoggingSettings::default(),
         }
     }
 }
@@ -782,6 +831,11 @@ impl Settings {
             self.servers = default_servers();
         }
         for entry in &mut self.servers {
+            // The official server changed port (1.1.5): follow it,
+            // keeping the pin and passwords — same host, same key.
+            if entry.address == OFFICIAL_ADDRESS_OLD_PORT {
+                entry.address = OFFICIAL_ADDRESS.to_string();
+            }
             let blank = |v: &Option<String>| v.as_deref().is_some_and(|s| s.trim().is_empty());
             if blank(&entry.password) {
                 entry.password = None;
@@ -1101,6 +1155,8 @@ mod tests {
         );
         assert_eq!(s.server, "baucord");
         assert_eq!(s.servers[0].password, None);
+        // The official server's old port is followed to the new one.
+        assert_eq!(s.servers[0].address, OFFICIAL_ADDRESS);
 
         let json = serde_json::to_string_pretty(&s).expect("serialize");
         let back: Settings = serde_json::from_str(&json).expect("re-parse");

@@ -48,6 +48,11 @@ pub const FILES: u64 = 1 << 13;
 pub const ADMIN_PANEL: u64 = 1 << 14;
 /// The audit as it happens (`AuditLine`), for the admin channel.
 pub const ADMIN_FEED: u64 = 1 << 15;
+/// The default channel is a lobby (spec §12, 1.1.5): a session there
+/// is announced to nobody until it joins a channel. The server
+/// behaves this way for every session; the bit tells a client that
+/// it may hide the lobby row and render "joined <channel>".
+pub const LOBBY: u64 = 1 << 16;
 
 /// What a 1.0 client can do.
 pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
@@ -70,7 +75,8 @@ pub const CLIENT_1_1: u64 = CLIENT_1_0
     | ROLE_LIST
     | FILES
     | ADMIN_PANEL
-    | ADMIN_FEED;
+    | ADMIN_FEED
+    | LOBBY;
 /// What a 1.1 server offers: keys are the login, invites the door,
 /// roles decide what a session may do, and it keeps history.
 pub const SERVER_1_1: u64 = TELEMETRY
@@ -87,7 +93,8 @@ pub const SERVER_1_1: u64 = TELEMETRY
     | ROLE_LIST
     | FILES
     | ADMIN_PANEL
-    | ADMIN_FEED;
+    | ADMIN_FEED
+    | LOBBY;
 
 /// Bits both sides announced.
 #[must_use]

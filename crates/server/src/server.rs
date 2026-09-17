@@ -310,19 +310,27 @@ impl ChatServer {
             &identity.fingerprint(),
         );
 
+        if config.server.port == 5000 {
+            warn!(
+                "server.port is 5000: some ISP gateways police UDP/5000 (users hear each \
+                 other at 16 kbps). The default is 51000 since 1.1.5; publish both ports \
+                 while clients migrate (README, \"Running the server\")"
+            );
+        }
+
         // ── Voice channels ──────────────────────────────────────────
         let default_channel = config
             .validate_channels()
             .map_err(|e| format!("invalid server.yaml: {e}"))?;
         let channel_infos = config.channel_infos();
         info!(
-            "Voice channels: {} (default: '{}')",
+            "Voice channels: {} (plus the lobby everyone connects into)",
             channel_infos
                 .iter()
+                .filter(|c| c.name != crate::config::LOBBY_NAME)
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            channel_infos[default_channel as usize].name,
         );
 
         // ── Admission ───────────────────────────────────────────────
@@ -338,7 +346,7 @@ impl ChatServer {
         budget.socket_buffer_bytes = send_buffer_target(config.network.max_clients);
         let driver = Driver::new_server(identity, config.network.max_clients, budget)?;
 
-        let config_channels_for_list = config.channels.clone();
+        let config_channels_for_list = crate::config::with_lobby(&config.channels);
         let mut server = Self {
             config,
             driver,
@@ -776,6 +784,7 @@ impl ChatServer {
             &self.deafened,
             &self.muted,
             afk,
+            self.default_channel,
             &self.channel_of,
         );
         self.video.process(&mut self.driver, now, &clients);
@@ -1628,24 +1637,42 @@ impl ChatServer {
     // ── Connection events ───────────────────────────────────────────
 
     fn handle_client_connected(&mut self, client_id: ClientId, username: String) {
-        info!("{username} ({client_id:#x}) connected");
+        info!("{username} ({client_id:#x}) connected (in the lobby)");
         self.usernames.insert(client_id, username.clone());
         // Everyone lands in the default channel (config guarantees it
-        // is open and unlimited).
+        // is open and unlimited) — the lobby (spec §12, 1.1.5): nobody
+        // is told until they join a channel, which is when `announce`
+        // does everything a connect used to.
         self.channel_of.insert(client_id, self.default_channel);
 
         // Full state snapshot for the new client: user list, channel
         // roster and memberships, active shares, and current audio
         // states — so a client joining an in-progress session renders
         // it correctly instead of assuming everyone is unmuted, nobody
-        // is streaming, and the world is one big room.
+        // is streaming, and the world is one big room. Lobby members
+        // other than the newcomer are left out: they are not there.
+        let visible: HashSet<ClientId> = self
+            .clients()
+            .into_iter()
+            .filter(|c| *c == client_id || !self.in_lobby(*c))
+            .collect();
         let init = ServerMessage::Init {
-            usernames: self.usernames.clone(),
+            usernames: self
+                .usernames
+                .iter()
+                .filter(|(c, _)| visible.contains(c))
+                .map(|(c, n)| (*c, n.clone()))
+                .collect(),
             client_id,
             server_name: self.config.server.name.clone(),
             greeting: self.config.server.greeting_message.clone(),
             channels: self.channel_infos.clone(),
-            memberships: self.channel_of.clone(),
+            memberships: self
+                .channel_of
+                .iter()
+                .filter(|(c, _)| visible.contains(c))
+                .map(|(c, ch)| (*c, *ch))
+                .collect(),
         };
         self.send_msg(client_id, &init);
 
@@ -1672,8 +1699,12 @@ impl ChatServer {
             }
         }
 
-        let states: Vec<(ClientId, (bool, bool))> =
-            self.audio_states.iter().map(|(id, s)| (*id, *s)).collect();
+        let states: Vec<(ClientId, (bool, bool))> = self
+            .audio_states
+            .iter()
+            .filter(|(id, _)| !self.in_lobby(**id))
+            .map(|(id, s)| (*id, *s))
+            .collect();
         for (peer_id, (muted, deafened)) in states {
             self.send_msg(
                 client_id,
@@ -1695,7 +1726,7 @@ impl ChatServer {
         let details: Vec<ServerMessage> = self
             .user_of
             .iter()
-            .filter(|(c, _)| **c != client_id)
+            .filter(|(c, _)| **c != client_id && visible.contains(c))
             .map(|(c, u)| self.user_details(*c, u))
             .collect();
         for msg in details {
@@ -1706,6 +1737,7 @@ impl ChatServer {
         let profiles: Vec<ServerMessage> = self
             .user_of
             .iter()
+            .filter(|(c, _)| visible.contains(c))
             .map(|(c, u)| self.user_profile(*c, u))
             .collect();
         for msg in profiles {
@@ -1716,18 +1748,30 @@ impl ChatServer {
         let progress: Vec<ServerMessage> = self
             .user_of
             .iter()
+            .filter(|(c, _)| visible.contains(c))
             .map(|(c, u)| self.user_progress(*c, u))
             .collect();
         for msg in progress {
             self.send_if(client_id, features::PROGRESS_ALL, &msg);
         }
+        self.refresh_enforcement();
+    }
 
+    /// A session became visible: it left the lobby for a room. What a
+    /// connect used to broadcast happens now — the join (carrying the
+    /// room, so clients render "joined <channel>"), who they are,
+    /// their look, their progress, their audio state — and the
+    /// newcomer learns of the streams it may now watch. Its own
+    /// `UserMovedChannel` still goes to it alone: the others have the
+    /// room from the join.
+    fn announce(&mut self, client_id: ClientId, channel_id: u16) {
+        let username = self.get_username(client_id);
         self.broadcast_msg_except(
             client_id,
             &ServerMessage::UserJoined {
                 client_id,
                 username,
-                channel_id: self.default_channel,
+                channel_id,
             },
         );
         if let Some(user_id) = self.user_of.get(&client_id).copied() {
@@ -1744,7 +1788,79 @@ impl ChatServer {
                 self.send_if(peer, features::PROGRESS_ALL, &msg);
             }
         }
-        self.refresh_enforcement();
+        if let Some((muted, deafened)) = self.audio_states.get(&client_id).copied() {
+            self.broadcast_msg_except(
+                client_id,
+                &ServerMessage::AudioState {
+                    client_id,
+                    muted,
+                    deafened,
+                },
+            );
+        }
+        self.send_msg(
+            client_id,
+            &ServerMessage::UserMovedChannel {
+                client_id,
+                channel_id,
+            },
+        );
+        // Streams for everyone appear now; channel-scoped ones in the
+        // new room come from `revalidate_shares_after_move`.
+        let sharers: Vec<(ClientId, ShareInfo)> = self
+            .video
+            .sharers()
+            .iter()
+            .filter(|(id, info)| **id != client_id && info.scope == ShareScope::Everyone)
+            .map(|(id, info)| (*id, *info))
+            .collect();
+        for (sharer_id, info) in sharers {
+            self.send_msg(
+                client_id,
+                &ServerMessage::ScreenShareStarted {
+                    client_id: sharer_id,
+                    width: info.width,
+                    height: info.height,
+                    scope: info.scope,
+                },
+            );
+        }
+    }
+
+    /// A session went back to the lobby (an admin move, a channel
+    /// kick): to everyone else it left. Its own stream stops, it stops
+    /// watching, and every stream disappears from its view.
+    fn withdraw(&mut self, client_id: ClientId) {
+        if self.video.is_sharing(client_id) {
+            self.video
+                .stop_sharing(&mut self.driver, self.now, client_id);
+            self.broadcast_msg(&ServerMessage::ScreenShareStopped { client_id });
+        }
+        let sharers: Vec<ClientId> = self.video.sharers().keys().copied().collect();
+        for sharer in sharers {
+            if self.video.is_subscribed(client_id, sharer) {
+                self.video
+                    .unsubscribe(&mut self.driver, self.now, client_id, sharer);
+            }
+            self.send_msg(
+                client_id,
+                &ServerMessage::ScreenShareStopped { client_id: sharer },
+            );
+        }
+        self.broadcast_msg_except(client_id, &ServerMessage::UserLeft { client_id });
+        self.send_msg(
+            client_id,
+            &ServerMessage::UserMovedChannel {
+                client_id,
+                channel_id: self.default_channel,
+            },
+        );
+    }
+
+    /// In the lobby: the default channel, where a session is not
+    /// there yet (spec §12, 1.1.5).
+    fn in_lobby(&self, client: ClientId) -> bool {
+        self.channel_of.get(&client).copied() == Some(self.default_channel)
     }
 
     fn handle_client_disconnected(&mut self, client_id: ClientId, reason: &DisconnectReason) {
@@ -1775,7 +1891,10 @@ impl ChatServer {
         }
         self.audio_states.remove(&client_id);
         self.deafened.remove(&client_id);
-        self.channel_of.remove(&client_id);
+        let was_visible = self
+            .channel_of
+            .remove(&client_id)
+            .is_some_and(|ch| ch != self.default_channel);
         self.image_bytes.remove(&client_id);
         self.uploads.remove(&client_id);
         self.log_uploads.remove(&client_id);
@@ -1803,7 +1922,10 @@ impl ChatServer {
             self.broadcast_msg(&ServerMessage::ScreenShareStopped { client_id });
         }
 
-        self.broadcast_msg(&ServerMessage::UserLeft { client_id });
+        // A lobby member was never announced, so nobody hears it go.
+        if was_visible {
+            self.broadcast_msg(&ServerMessage::UserLeft { client_id });
+        }
     }
 
     // ── Control-plane messages ──────────────────────────────────────
@@ -2198,7 +2320,9 @@ impl ChatServer {
             return;
         }
 
-        if !self.allowed(client_id, permissions::SHARE, RestrictionKind::Share) {
+        if !self.allowed(client_id, permissions::SHARE, RestrictionKind::Share)
+            || self.in_lobby(client_id)
+        {
             self.send_msg(
                 client_id,
                 &ServerMessage::ShareDenied {
@@ -2251,7 +2375,13 @@ impl ChatServer {
             scope,
         };
         match scope {
-            ShareScope::Everyone => self.broadcast_msg(&started),
+            ShareScope::Everyone => {
+                for peer in self.clients() {
+                    if !self.in_lobby(peer) {
+                        self.send_msg(peer, &started);
+                    }
+                }
+            }
             ShareScope::Channel => {
                 // Only the sharer's channel learns about the stream —
                 // for everyone else it doesn't exist. The sharer is a
@@ -2366,6 +2496,7 @@ impl ChatServer {
         channels: Vec<ChannelSettings>,
     ) -> Result<(), String> {
         let new_default = validate_channel_list(&channels)?;
+        let channels = crate::config::with_lobby(&channels);
 
         #[allow(clippy::cast_possible_truncation)] // validated ≤ MAX_CHANNELS
         let new_id_of: HashMap<String, u16> = channels
@@ -2406,20 +2537,33 @@ impl ChatServer {
         self.channel_of = new_channel_of;
 
         info!(
-            "Channel list updated: {} (default: '{}'); {} member(s) moved to the default",
+            "Channel list updated: {} (plus the lobby); {} member(s) moved to the lobby",
             self.channel_infos
                 .iter()
+                .filter(|c| c.name != crate::config::LOBBY_NAME)
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            self.channel_infos[usize::from(new_default)].name,
             moved_to_default,
         );
 
-        self.broadcast_msg(&ServerMessage::ChannelListUpdated {
-            channels: self.channel_infos.clone(),
-            memberships: self.channel_of.clone(),
-        });
+        // Memberships per recipient: lobby members other than the
+        // recipient itself stay out, as in `Init`.
+        for client in self.clients() {
+            let memberships: HashMap<ClientId, u16> = self
+                .channel_of
+                .iter()
+                .filter(|(c, _)| **c == client || !self.in_lobby(**c))
+                .map(|(c, ch)| (*c, *ch))
+                .collect();
+            self.send_msg(
+                client,
+                &ServerMessage::ChannelListUpdated {
+                    channels: self.channel_infos.clone(),
+                    memberships,
+                },
+            );
+        }
 
         // ── Re-derive channel-scoped share visibility ───────────────
         // For each channel-scoped stream, compare each client's view
@@ -2527,11 +2671,17 @@ impl ChatServer {
                 .get(usize::from(channel_id))
                 .map_or("?", |c| c.name.as_str()),
         );
+        let lobby = self.default_channel;
+        let was_visible = old_channel.is_some_and(|c| c != lobby);
         self.channel_of.insert(client_id, channel_id);
-        self.broadcast_msg(&ServerMessage::UserMovedChannel {
-            client_id,
-            channel_id,
-        });
+        match (was_visible, channel_id != lobby) {
+            (false, true) => self.announce(client_id, channel_id),
+            (true, false) => self.withdraw(client_id),
+            _ => self.broadcast_msg(&ServerMessage::UserMovedChannel {
+                client_id,
+                channel_id,
+            }),
+        }
         self.revalidate_shares_after_move(client_id, old_channel, channel_id);
     }
 
@@ -2560,6 +2710,9 @@ impl ChatServer {
 
     /// Can a client in `viewer_channel` see this stream?
     fn share_visible_from(&self, info: ShareInfo, sharer: ClientId, viewer_channel: u16) -> bool {
+        if viewer_channel == self.default_channel {
+            return false; // the lobby sees no streams
+        }
         match info.scope {
             ShareScope::Everyone => true,
             ShareScope::Channel => self.channel_of.get(&sharer).copied() == Some(viewer_channel),

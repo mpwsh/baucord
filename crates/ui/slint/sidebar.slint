@@ -32,11 +32,14 @@ import { IconBtn, Btn, AvatarTile, RoleGlyph } from "widgets.slint";
 component UserRowView inherits Rectangle {
     in property <UserRow> user;
     in property <int> index;
+    /// A dragged user hovers this channel row and may be dropped.
+    in property <bool> drop-target;
 
     height: user.is-channel ? 32px : 40px;
     border-radius: Theme.radius-md;
     background: user.is-channel
-        ? (user.is-our-channel ? Theme.row-volume-tint
+        ? (drop-target ? Theme.accent.with-alpha(0.35)
+            : user.is-our-channel ? Theme.row-volume-tint
             : touch.has-hover ? Theme.hover : transparent)
         : touch.has-hover ? Theme.hover
         : user.local-muted ? Theme.row-muted-tint
@@ -189,7 +192,7 @@ component UserRowView inherits Rectangle {
                     : user.role == 3 ? IconSet.Wrench
                     : IconSet.CircleDashed;
                 size: 14px;
-                stroke: user.role == 4 ? Theme.gold
+                stroke: user.role == 4 ? Theme.admin
                     : user.role == 3 ? Theme.text-secondary
                     : Theme.text-muted;
             }
@@ -219,18 +222,27 @@ component UserRowView inherits Rectangle {
             }
         }
 
-        // LIVE chip / hover "…" menu.
+        // LIVE chip / hover "…" menu. The chip is a button: one click
+        // opens the viewer (declared inside the layout, so it sits in
+        // front of the row's own TouchArea and takes the click first).
         if user.sharing : Rectangle {
             width: live.preferred-width + 14px;
             height: 20px;
             y: (parent.height - self.height) / 2;
             border-radius: 10px;
-            background: Theme.danger;
+            // Our own chip is a badge, not a button: no hover, no click.
+            background: live-t.has-hover && !user.is-us ? Theme.danger.brighter(0.15) : Theme.danger;
+            animate background { duration: 150ms; }
             live := Text {
                 text: Tr.live;
                 color: Theme.on-accent;
                 font-size: Theme.font-xs;
                 font-weight: 700;
+            }
+            live-t := TouchArea {
+                enabled: !user.is-us;
+                mouse-cursor: MouseCursor.pointer;
+                clicked => { Logic.watch-user(root.index); }
             }
         }
         // Pure affordance — clicks land on the row's own TouchArea.
@@ -278,7 +290,7 @@ export component Sidebar inherits Rectangle {
                 animate background { duration: 150ms; }
                 admin-lbl := Text {
                     text: Tr.admin-button;
-                    color: Theme.gold;
+                    color: Theme.admin;
                     font-size: Theme.font-sm;
                     font-weight: 600;
                     vertical-alignment: center;
@@ -347,11 +359,53 @@ export component Sidebar inherits Rectangle {
             Rectangle { }   // keep the chips at their natural width
         }
 
+        // The lobby (spec §12, 1.1.5): connected, invisible, silent,
+        // until a channel is picked. The row itself is hidden; this
+        // line is what the user sees instead.
+        if State.in-lobby : Rectangle {
+            height: banner.preferred-height + 2 * Theme.gap-sm;
+            border-radius: Theme.radius-md;
+            background: Theme.bg-tertiary;
+            banner := Text {
+                x: Theme.gap-md;
+                y: Theme.gap-sm;
+                width: parent.width - 2 * Theme.gap-md;
+                text: Tr.lobby-banner;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                wrap: word-wrap;
+            }
+        }
+
         list := ListView {
             vertical-stretch: 1;
-            for user[i] in State.users : UserRowView {
-                user: user;
-                index: i;
+            // Each row sits inside a DragArea (users are sources) with
+            // a DropArea in front (channels are targets). The DragArea
+            // must be the row's *parent*: it watches the press through
+            // its children and only takes over past the drag
+            // threshold, so clicks still reach the row's TouchArea. A
+            // DropArea ignores ordinary mouse events, so it can sit in
+            // front without stealing clicks.
+            for user[i] in State.users : DragArea {
+                height: row.height;
+                enabled: State.perm-move && !user.is-channel;
+                allow-move: true;
+                data: Logic.user-drag-data(i);
+                row := UserRowView {
+                    user: user;
+                    index: i;
+                    drop-target: drop.has-drag;
+                }
+                drop := DropArea {
+                    enabled: State.perm-move && user.is-channel;
+                    can-drop(e) => {
+                        Logic.can-drop-user(e.data, i) ? DragAction.move : DragAction.none
+                    }
+                    dropped(e) => {
+                        Logic.drop-user(e.data, i);
+                        e.proposed-action
+                    }
+                }
             }
         }
 
@@ -549,13 +603,16 @@ export component Sidebar inherits Rectangle {
                             tint: dm.tile-tint;
                             side: 16px;
                             corner: 4px;
-                            ring: dm.online;
-                            ring-color: Theme.text-muted;
+                            // No ring here: rings are for speaking in
+                            // voice rows, not for a conversation.
+                            ring: false;
+                            ring-room: false;
                         }
+                        // Admin logs: a channel like General, so a `#`.
                         if dm.admin : IconDisplay {
-                            icon: IconSet.Shield;
+                            icon: IconSet.Hash;
                             size: 16px;
-                            stroke: Theme.gold;
+                            stroke: dm.active ? Theme.accent-text : Theme.text-muted;
                         }
                     }
                     Text {
@@ -663,7 +720,12 @@ export component Sidebar inherits Rectangle {
                     icon: State.muted ? IconSet.MicOff : IconSet.Mic;
                     active: State.muted || (State.ptt-mode && State.ptt-held);
                     active-danger: State.muted;
-                    tooltip: State.muted ? Tr.unmute
+                    // In the lobby the mic goes nowhere: greyed, and
+                    // the tooltip says why (the toggle still sets the
+                    // preference for the room to come).
+                    idle-color: State.in-lobby ? Theme.text-muted : Theme.text-secondary;
+                    tooltip: State.in-lobby ? Tr.lobby-mic-hint
+                        : State.muted ? Tr.unmute
                         : State.ptt-mode ? State.ptt-tooltip : Tr.mute;
                     clicked => { Logic.toggle-mute(); }
                 }

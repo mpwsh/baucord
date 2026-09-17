@@ -462,10 +462,11 @@ impl ChatServer {
             return;
         };
         let default_after = self.config.user_channels.afk_after_min;
+        let lobby = self.default_channel;
         let idle: Vec<(ClientId, u16)> = self
             .channel_of
             .iter()
-            .filter(|(_, ch)| **ch != afk)
+            .filter(|(_, ch)| **ch != afk && **ch != lobby)
             .filter_map(|(client, ch)| {
                 let after_min = self
                     .user_channel_at(*ch)

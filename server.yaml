@@ -41,9 +41,6 @@ logging:
   file: server.log
 channels:
   - name: Lobby
-    default: true
-    password: null
-    user_limit: null
   - name: AFK
     password: null
     user_limit: null

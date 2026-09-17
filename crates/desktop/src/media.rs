@@ -599,6 +599,13 @@ fn show_preview(app: &mut AppState, bytes: Vec<u8>) {
 }
 
 /// Save an image row to disk via the native save dialog.
+/// "Copy image": the row's picture onto the clipboard as pixels.
+pub fn copy_image(app: &AppState, row_id: i32) {
+    if let Some(entry) = app.images.get(&row_id) {
+        crate::clipboard::set_clipboard_image(entry.bytes.as_slice());
+    }
+}
+
 pub fn save_image_dialog(app: &mut AppState, row_id: i32) {
     let Some(entry) = app.images.get(&row_id) else {
         return;

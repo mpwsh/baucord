@@ -23,9 +23,16 @@ fn main() {
         client::config::set_config_dir(dir);
     }
 
+    // The env_logger filter is left wide open and `log::set_max_level`
+    // is the knob (Settings → General → Log level, applied live once
+    // the file is read); until then, info. `RUST_LOG`, when set, is
+    // the operator's word and the setting stays out of it.
     #[cfg(debug_assertions)]
     {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+        if std::env::var_os("RUST_LOG").is_none() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
     }
 
     #[cfg(not(debug_assertions))]
@@ -54,17 +61,20 @@ fn main() {
             .open("baucord.log")
         {
             Ok(log_file) => {
-                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
                     .target(Target::Pipe(Box::new(log_file)))
                     .init();
             }
             Err(e) => {
                 // Read-only install dir etc. — run without file logging
                 // rather than dying before the window exists.
-                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
                     .init();
                 log::warn!("could not open baucord.log ({e}); logging to stderr");
             }
+        }
+        if std::env::var_os("RUST_LOG").is_none() {
+            log::set_max_level(log::LevelFilter::Info);
         }
     }
 

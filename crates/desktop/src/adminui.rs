@@ -84,9 +84,12 @@ pub fn open(app: &mut AppState, tab: i32) {
                 .map(|n| SharedString::from(*n))
                 .collect::<Vec<_>>(),
         )));
+        // Badges may be gold (spec §12, 1.1.5): the *name band* is the
+        // permission, a badge's colour is whatever the admin says.
         s.set_role_colors(ModelRc::new(VecModel::from(
             crate::settingsui::NAME_COLORS
                 .iter()
+                .chain(std::iter::once(&crate::settingsui::GOLD))
                 .map(|c| slint::Color::from_argb_encoded(0xFF00_0000 | c))
                 .collect::<Vec<_>>(),
         )));
@@ -543,6 +546,7 @@ fn fill_channels(app: &mut AppState) {
     let rows: Vec<AdminChannelRow> = app
         .channels
         .iter()
+        .filter(|c| Some(c.name.as_str()) != app.lobby_name.as_deref())
         .map(|c| AdminChannelRow {
             id: i32::from(c.id),
             name: c.name.as_str().into(),

@@ -107,6 +107,7 @@ export enum MenuAction {
     copy-text, select-text, edit-message, delete-message, open-image, save-image,
     cut, copy, paste,
     save-file,
+    copy-image,
 }
 
 /// One row of a context menu, drawn by the overlay in main.slint.
@@ -322,6 +323,9 @@ export global State {
     in property <bool> perm-kick: false;
     in property <bool> perm-ban: false;
     in property <bool> perm-move: false;        // MANAGE_CHANNELS
+    /// Connected but in no room yet: the server's lobby (spec §12,
+    /// 1.1.5). The banner shows, the mic hint says why.
+    in property <bool> in-lobby: false;
     in property <bool> perm-roles: false;       // MANAGE_ROLES
     in property <bool> perm-users: false;       // MANAGE_USERS (telemetry tooltip)
     in property <bool> perm-create-channels: false;
@@ -403,6 +407,17 @@ export global Logic {
     /// The pointer entered/left a user row: the host fetches the last
     /// telemetry for the card when it may.
     callback user-hovered(int, bool);
+    /// The LIVE chip on a user row was clicked: open (or raise) that
+    /// sharer's viewer.
+    callback watch-user(index: int);
+    /// Drag a user onto a channel (spec §12, 1.1.5; holders of
+    /// MANAGE_CHANNELS). The payload is opaque to Slint: the host
+    /// builds it from the row's index and reads it back on the
+    /// channel row. `can-drop-user` says whether this channel takes
+    /// this user (a different channel than the one they are in).
+    pure callback user-drag-data(index: int) -> data-transfer;
+    pure callback can-drop-user(data: data-transfer, channel-index: int) -> bool;
+    callback drop-user(data: data-transfer, channel-index: int);
     /// The pointer entered/left an author's picture in chat: the host
     /// resolves the name to a roster row and sets `State.card-index`.
     callback author-hovered(string, bool);
@@ -474,6 +489,8 @@ export global Logic {
     /// Image viewer overlay: step -1/+1, save current, close.
     callback viewer-step(int);
     callback viewer-save();
+    /// The gallery's copy button: the shown picture to the clipboard.
+    callback viewer-copy();
     callback viewer-close();
     callback gif-hover(int, bool);        // row-id, entering
 
