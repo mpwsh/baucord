@@ -425,8 +425,7 @@ pub fn channel_infos_of(channels: &[ChannelSettings]) -> Vec<protocol::ChannelIn
 pub fn validate_channel_list(channels: &[ChannelSettings]) -> Result<u16, String> {
     if channels.is_empty() {
         return Err(
-            "channels: list is empty — omit the key entirely for a single 'General'"
-                .to_string(),
+            "channels: list is empty — omit the key entirely for a single 'General'".to_string(),
         );
     }
     if channels.len() > MAX_CHANNELS {

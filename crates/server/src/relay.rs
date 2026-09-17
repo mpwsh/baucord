@@ -128,7 +128,9 @@ impl VoiceRelay {
                     if recipient == sender {
                         continue;
                     }
-                    if sender_channel.is_none() || channel_of.get(recipient).copied() != sender_channel {
+                    if sender_channel.is_none()
+                        || channel_of.get(recipient).copied() != sender_channel
+                    {
                         self.stats.sends_skipped_other_channel += 1;
                         continue;
                     }

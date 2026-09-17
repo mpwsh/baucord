@@ -4600,7 +4600,9 @@ impl AppState {
     /// act on the drop.
     fn drop_target(&self, data: &slint::DataTransfer, channel_index: i32) -> Option<(u64, u16)> {
         let client_id = data.user_data()?.downcast::<DragUser>().ok()?.0;
-        let row = self.users_model.row_data(usize::try_from(channel_index).ok()?)?;
+        let row = self
+            .users_model
+            .row_data(usize::try_from(channel_index).ok()?)?;
         if !row.is_channel {
             return None;
         }
@@ -4616,7 +4618,10 @@ impl AppState {
             return;
         };
         let target = AdminTarget::User(*user_id);
-        self.send_admin(AdminCommand::MoveUser { target, channel_id }, PendingAdmin::Show);
+        self.send_admin(
+            AdminCommand::MoveUser { target, channel_id },
+            PendingAdmin::Show,
+        );
     }
 
     // ── Context menus ───────────────────────────────────────────────

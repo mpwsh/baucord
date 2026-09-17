@@ -165,7 +165,9 @@ pub enum NetworkMessage {
     /// Admitted by the server (`Welcome` received).
     /// Admitted. `lobby`: the server runs the default channel as a
     /// lobby (spec §12, 1.1.5) — hide it and render "joined <room>".
-    Connected { lobby: bool },
+    Connected {
+        lobby: bool,
+    },
     /// The server presented `fingerprint`. `first_use` when we had no
     /// pin for this server (trust on first use): the app stores it on
     /// the server entry. Also sent after a signed key rotation, with

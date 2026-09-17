@@ -61,15 +61,19 @@ fn main() {
             .open("baucord.log")
         {
             Ok(log_file) => {
-                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
-                    .target(Target::Pipe(Box::new(log_file)))
-                    .init();
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("trace"),
+                )
+                .target(Target::Pipe(Box::new(log_file)))
+                .init();
             }
             Err(e) => {
                 // Read-only install dir etc. — run without file logging
                 // rather than dying before the window exists.
-                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
-                    .init();
+                env_logger::Builder::from_env(
+                    env_logger::Env::default().default_filter_or("trace"),
+                )
+                .init();
                 log::warn!("could not open baucord.log ({e}); logging to stderr");
             }
         }
