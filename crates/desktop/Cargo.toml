@@ -20,70 +20,13 @@ default = []
 # libappindicator system packages). Closing the window then hides to
 # the tray instead of quitting. Enable it in the release workflow:
 # `--features tray`.
-tray = ["slint/system-tray"]
+tray = ["frontend/tray"]
 [dependencies]
+frontend = { path = "../frontend" }
 client = { path = "../client" }
-# Fingerprint parsing for the settings editor and the identity key type.
-transport = { path = "../transport" }
-i18n = { path = "../i18n" }
-audio = { path = "../audio", features = ["serde"] }
-video = { path = "../video" }
-app-core = { path = "../app-core" }
-ui = { path = "../ui" }
 slint.workspace = true
-# Raw winit window events: the OS invalidates window surfaces on
-# focus/reveal transitions that Slint's damage tracking can't see;
-# app.rs::repaint_on_reveal hooks them. Default features are empty —
-# this only pulls the accessor trait; cargo unifies the version with
-# slint's own internal dependency.
-i-slint-backend-winit = "1.17"
-crossbeam-channel.workspace = true
 log.workspace = true
 env_logger = "0.11"
-chrono = "0.4.45"
-ureq = "3.4"
-open = "5.4"
-global-hotkey = "0.8"
-# One instance per config directory: a second launch knocks on the
-# first one's local socket (named pipe / abstract socket / /tmp file)
-# and the first raises its window. See instance.rs.
-interprocess = "2.4"
-# The Downloads folder, for file cards' Save (spec §7).
-dirs = "6"
-# Push-to-talk watches the key state instead of registering a global
-# hotkey, so the key still types everywhere else. See hotkeys.rs.
-device_query = "4"
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
-zip = "8.6"
-self-replace = "1.5"
-# Plain-text clipboard read/write. Slint exposes no clipboard API;
-# TextInput's internal Ctrl+V only covers text typed into it — the
-# rich-paste chain and "Copy message" need programmatic access.
-# clipboard.rs keeps its per-platform file/PNG readers (arboard has
-# no file-list support).
-arboard = { version = "3", default-features = false, features = [
-  "wayland-data-control",
-  "image-data",     # set_image for "Copy image"
-] }
-# Native open/save dialogs (FLTK's chooser is gone). The portal backend
-# avoids a GTK link dependency; it is async, hence the tiny pollster
-# block_on on the dialog scratch threads. The runtime feature MUST be
-# async-std, not tokio: rfd→ashpd→zbus's `tokio` feature is unified
-# across the whole binary, and the other zbus users (ksni tray,
-# accesskit, xcap) run on async-io with no Tokio runtime — with
-# `tokio` on, the tray panicked at startup ("no reactor running").
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
-pollster = "1.0"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# Native NSPasteboard access for what the toolkit clipboard layer can't
-# see: copied files (paste the file, not its icon) and PNG-only
-# sources like screenshot copies. Only the NSPasteboard header —
-# default features would compile every AppKit binding.
-objc2-app-kit = { version = "0.3.2", default-features = false, features = [
-  "std",
-  "NSPasteboard",
-] }
 
 [build-dependencies]
 winresource = "0.1"

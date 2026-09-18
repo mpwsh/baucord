@@ -415,7 +415,7 @@ export global Logic {
     /// builds it from the row's index and reads it back on the
     /// channel row. `can-drop-user` says whether this channel takes
     /// this user (a different channel than the one they are in).
-    pure callback user-drag-data(index: int) -> data-transfer;
+    pure callback user-drag-data(id-lo: int, id-hi: int) -> data-transfer;
     pure callback can-drop-user(data: data-transfer, channel-index: int) -> bool;
     callback drop-user(data: data-transfer, channel-index: int);
     /// The pointer entered/left an author's picture in chat: the host

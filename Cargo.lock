@@ -1626,33 +1626,12 @@ dependencies = [
 name = "desktop"
 version = "1.1.5"
 dependencies = [
- "app-core",
- "arboard",
- "audio",
- "chrono",
  "client",
- "crossbeam-channel",
- "device_query",
- "dirs",
  "env_logger",
- "global-hotkey",
- "i-slint-backend-winit",
- "i18n",
- "interprocess",
+ "frontend",
  "log",
- "objc2-app-kit 0.3.2",
- "open",
- "pollster 1.0.1",
- "rfd",
- "self-replace",
  "slint",
- "sysinfo",
- "transport",
- "ui",
- "ureq",
- "video",
  "winresource",
- "zip",
 ]
 
 [[package]]
@@ -2240,6 +2219,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "frontend"
+version = "1.1.6"
+dependencies = [
+ "app-core",
+ "arboard",
+ "audio",
+ "chrono",
+ "client",
+ "crossbeam-channel",
+ "device_query",
+ "dirs",
+ "global-hotkey",
+ "i-slint-backend-winit",
+ "i18n",
+ "interprocess",
+ "log",
+ "objc2-app-kit 0.3.2",
+ "open",
+ "pollster 1.0.1",
+ "rfd",
+ "self-replace",
+ "slint",
+ "sysinfo",
+ "transport",
+ "ui",
+ "ureq",
+ "video",
+ "zip",
 ]
 
 [[package]]

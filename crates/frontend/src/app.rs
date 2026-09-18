@@ -795,11 +795,15 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     // Drag a user onto a channel: the payload is our own type inside
     // the opaque transfer, so nothing is parsed on the way back.
     let w = Rc::downgrade(state);
-    logic.on_user_drag_data(move |index| {
+    // The payload is built from the row's own client id, never from
+    // its index: the binding is cached per row, and after the roster
+    // reshuffles (someone moved) an index-keyed payload would carry
+    // whoever sat in that slot before.
+    logic.on_user_drag_data(move |lo, hi| {
+        let _ = &w;
         let mut data = slint::DataTransfer::default();
-        if let Some(rc) = w.upgrade()
-            && let Some(id) = rc.borrow().user_id_at(index)
-        {
+        let id = roster::join_id(lo, hi);
+        if id != 0 {
             data.set_user_data(Rc::new(DragUser(id)));
         }
         data
@@ -6511,13 +6515,20 @@ impl AppState {
     /// through the admin path when we hold `RESTRICT`; both confirm
     /// first.
     fn row_delete(&mut self, msg_id: u64) {
+        // Anything with a `meta` is ours to delete when we wrote it:
+        // text, code, a picture, a file. Only someone else's needs
+        // the permission.
         let own = self.history.rows().iter().any(|r| match r {
             app_core::chat::ChatItem::Message { meta, .. }
-            | app_core::chat::ChatItem::Code { meta, .. } => meta.id == msg_id && meta.own,
+            | app_core::chat::ChatItem::Code { meta, .. }
+            | app_core::chat::ChatItem::Image { meta, .. }
+            | app_core::chat::ChatItem::File { meta, .. } => meta.id == msg_id && meta.own,
             _ => false,
         });
         let by_admin = !own;
-        if by_admin && !client::permissions::has(self.permissions, client::permissions::RESTRICT) {
+        if by_admin
+            && !client::permissions::has(self.permissions, client::permissions::DELETE_MESSAGES)
+        {
             return;
         }
         self.pending_confirm = Some(Confirm::DeleteMessage { msg_id, by_admin });

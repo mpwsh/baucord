@@ -87,9 +87,7 @@ pub fn open(app: &mut AppState, tab: i32) {
         // Badges may be gold (spec §12, 1.1.5): the *name band* is the
         // permission, a badge's colour is whatever the admin says.
         s.set_role_colors(ModelRc::new(VecModel::from(
-            crate::settingsui::NAME_COLORS
-                .iter()
-                .chain(std::iter::once(&crate::settingsui::GOLD))
+            badge_palette()
                 .map(|c| slint::Color::from_argb_encoded(0xFF00_0000 | c))
                 .collect::<Vec<_>>(),
         )));
@@ -539,6 +537,17 @@ fn fill_roles(app: &mut AppState) {
 }
 
 /// The channels tab is the client's own list.
+/// The role-badge palette: the name colours plus gold (spec §12,
+/// 1.1.5). One source for the swatches, the edit form's selection and
+/// the value saved — an index into one that isn't an index into the
+/// others is how gold came out grey.
+fn badge_palette() -> impl Iterator<Item = u32> {
+    crate::settingsui::NAME_COLORS
+        .iter()
+        .copied()
+        .chain(std::iter::once(crate::settingsui::GOLD))
+}
+
 fn fill_channels(app: &mut AppState) {
     let Some(win) = &app.admin_win else {
         return;
@@ -582,9 +591,8 @@ fn role_select(app: &mut AppState, id: i32) {
     s.set_role_edit_icon(current.map_or("", |r| r.icon.as_str()).into());
     let color = current.map_or(0, |r| r.color);
     s.set_role_edit_color(
-        crate::settingsui::NAME_COLORS
-            .iter()
-            .position(|c| *c == color)
+        badge_palette()
+            .position(|c| c == color)
             .and_then(|i| i32::try_from(i).ok())
             .unwrap_or(-1),
     );
@@ -609,7 +617,7 @@ fn role_save(app: &mut AppState) {
     let icon = s.get_role_edit_icon().to_string();
     let color = usize::try_from(s.get_role_edit_color())
         .ok()
-        .and_then(|i| crate::settingsui::NAME_COLORS.get(i).copied())
+        .and_then(|i| badge_palette().nth(i))
         .unwrap_or(0);
     let id = s.get_role_edit_id();
     let command = match u32::try_from(id) {

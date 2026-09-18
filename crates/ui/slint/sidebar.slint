@@ -390,7 +390,7 @@ export component Sidebar inherits Rectangle {
                 height: row.height;
                 enabled: State.perm-move && !user.is-channel;
                 allow-move: true;
-                data: Logic.user-drag-data(i);
+                data: Logic.user-drag-data(user.client-id-lo, user.client-id-hi);
                 row := UserRowView {
                     user: user;
                     index: i;

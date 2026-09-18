@@ -1,17 +1,7 @@
 // main.rs
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod adminui;
-mod app;
-mod clipboard;
-mod hotkeys;
-mod instance;
-mod media;
-mod present;
-mod resources;
-mod settingsui;
-mod updater;
-mod viewers;
+use frontend::{app, instance};
 
 fn main() {
     // `--config-dir <dir>` or `--profile <name>`: a second settings
