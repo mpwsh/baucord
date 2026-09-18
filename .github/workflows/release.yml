@@ -140,7 +140,7 @@ jobs:
           # the 24.04 VM's glibc 2.39 headers — its objects EMBED
           # 2.38+ versioned symbol refs and would re-poison the
           # container build if restored.
-          key: ffmpeg-static-7.1.1-x264-${{ runner.os }}-${{ runner.arch }}-ubuntu2204-container-v2
+          key: ffmpeg-static-7.1.1-x264-${{ runner.os }}-${{ runner.arch }}-ubuntu2204-container-v3
 
       - name: Build static FFmpeg 7.1.1 + x264 (Linux)
         if: runner.os == 'Linux' && steps.ffmpeg-static-linux-cache.outputs.cache-hit != 'true'
@@ -163,10 +163,16 @@ jobs:
           curl -LO https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
           tar xf ffmpeg-7.1.1.tar.xz
           cd ffmpeg-7.1.1
+          # --disable-autodetect: configure would otherwise enable every
+          # optional dependency it finds on the runner (libxcb, xlib,
+          # sdl2, lzma…) and link it *dynamically*, baking a runner-only
+          # path into the shipped binary. Only what is named after it
+          # is compiled in.
           PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static --enable-pic \
             --disable-programs --disable-doc \
+            --disable-autodetect \
             --enable-gpl --enable-libx264
           make -j"$(nproc)"
           make install
@@ -193,7 +199,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/ffmpeg-static
-          key: ffmpeg-static-7.1.1-x264-${{ runner.os }}-${{ runner.arch }}-v1
+          key: ffmpeg-static-7.1.1-x264-${{ runner.os }}-${{ runner.arch }}-v2
 
       - name: Build static FFmpeg 7.1.1 + x264 (macOS)
         if: runner.os == 'macOS' && steps.ffmpeg-static-cache.outputs.cache-hit != 'true'
@@ -215,10 +221,16 @@ jobs:
           curl -LO https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
           tar xf ffmpeg-7.1.1.tar.xz
           cd ffmpeg-7.1.1
+          # --disable-autodetect: the 1.1.5 Intel build linked Homebrew's
+          # libxcb (an X11 library!) because configure found it on the
+          # runner and enabled xcbgrab; users without that formula got
+          # "Library not loaded: /usr/local/opt/libxcb/…" at launch.
+          # Only what is named after it is compiled in.
           PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static \
             --disable-programs --disable-doc \
+            --disable-autodetect \
             --enable-gpl --enable-libx264 --enable-videotoolbox
           make -j"$(sysctl -n hw.ncpu)"
           make install
@@ -292,6 +304,13 @@ jobs:
             echo "::error::baucord still links FFmpeg/x264 shared objects — the static build was not picked up"
             exit 1
           fi
+          # Every shared object must come from the system: a path under
+          # /home, /opt or /usr/local means a runner dependency leaked
+          # into the binary (the macOS libxcb incident, 1.1.5).
+          if ldd "$BIN" | grep -E "=> (/home|/opt|/usr/local)/"; then
+            echo "::error::baucord links a library from outside the system paths — a runner dependency leaked"
+            exit 1
+          fi
           # Release binaries must load on glibc 2.35 (Ubuntu 22.04 /
           # Debian 12 era). This caught us once: a 24.04-built binary
           # demanded GLIBC_2.39 and refused to even start elsewhere.
@@ -310,6 +329,14 @@ jobs:
           otool -L "$BIN"
           if otool -L "$BIN" | grep -E "libav|libsw|libpostproc"; then
             echo "::error::baucord still links FFmpeg dylibs — the static build was not picked up"
+            exit 1
+          fi
+          # A shipped Mac binary may reference system frameworks and
+          # /usr/lib only. A Homebrew path (/usr/local/opt on Intel,
+          # /opt/homebrew on Apple Silicon) is a runner dependency
+          # that users will not have — 1.1.5 shipped with libxcb.
+          if otool -L "$BIN" | grep -E "/usr/local/|/opt/homebrew/"; then
+            echo "::error::baucord links a Homebrew library — the static FFmpeg picked up a runner dependency"
             exit 1
           fi
 
