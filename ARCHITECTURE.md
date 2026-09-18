@@ -10,7 +10,7 @@ does and how it is run.
 ```
  ┌──────────── desktop process ─────────────┐         ┌──── server process ────┐
  │ UI thread (Slint)                        │         │                        │
- │   app.rs ── AppState ── settingsui …     │         │  main.rs: UDP socket,  │
+ │   frontend::app ── AppState ── settingsui│         │  main.rs: UDP socket,  │
  │      ▲ NetworkMessage        │ NetworkControl       │  tick loop, signals    │
  │      │                       ▼                      │           │            │
  │   ┌──────────── network thread ─────────┐  QUIC    │           ▼            │
@@ -284,7 +284,19 @@ in order:
    refreshes the name of record and last-seen;
 10. feature negotiation (`SERVER_1_1`), `Welcome { user_id: Some }`,
     `Session { user_id, permissions, persistent }`, then the `Init`
-    snapshot and `UserJoined` broadcast.
+    snapshot — filtered: lobby members other than the newcomer are
+    left out, because a fresh session sits in the **lobby** (spec
+    §12, 1.1.5) and is announced to nobody. The lobby is the channel
+    the server appends after the config and UI channels (empty name,
+    `config::with_lobby`). The first `JoinChannel` into a room is
+    what a connect used to be: `announce` broadcasts `UserJoined`
+    with the room, the details/profile/progress/audio state, and
+    sends the newcomer the streams it may now watch. The way back
+    (an admin's move, a `ChannelKick`, a hot reload that removed the
+    room) is `withdraw`: its stream stops, it stops watching, the
+    others get `UserLeft`. Voice from the lobby is dropped like AFK's,
+    nothing accrues there, and `ChannelListUpdated` is filtered per
+    recipient like `Init`.
 
 A refusal sends `Refused { reason }` and closes 300 ms later so the
 reason lands. `remove_session` (replacement, bans, kicks) sends
@@ -505,7 +517,18 @@ transfer per hash per client. `Settings` sections added in 1.1:
 `sounds`, `audio.push_to_talk`; every field has a serde default so
 older files load unchanged.
 
-## 7. Desktop (`crates/desktop`)
+## 7. The UI logic (`crates/frontend`) and the hosts
+
+Since 1.1.6 the client's UI logic lives in `frontend`, shared by
+every host; `desktop` is `main.rs` alone (the config directory from
+`--profile`/`--config-dir`, file logging, the single instance, the
+panic hook, `frontend::app::run()`), and the Android host will be a
+cdylib of the same size (`ANDROID-SPEC.md`). Host-only pieces — the
+winit window hooks, the system clipboard, global hotkeys, the single
+instance, the updater, native dialogs and the URL launcher (the
+`host` module) — sit behind `frontend`'s `desktop` feature; without it
+each compiles to a same-API twin under `src/stubs/`, which is what
+`cargo check -p frontend --no-default-features` builds.
 
 Profile flow: `send_own_profile` runs after `Session` and on Save &
 close of Settings when the look changed (`profile_dirty`); with a
@@ -521,9 +544,14 @@ path, two front ends.
 `app.rs` is the `AppState`: one `Rc<RefCell<_>>` reached through
 `with_current` from Slint callbacks and timers. It drains
 `NetworkMessage`/`VoiceEvent`/`ScreenEvent` on every event-loop pass
-(the worker threads wake the loop via `WakeFn`). `handle_network_message`
-is exhaustive over `NetworkMessage`; the compiler will tell you where to
-add an arm.
+(the worker threads wake the loop via `WakeFn`). The methods are filed
+by concern in child modules under `src/app/` — `events` (the drain
+and `handle_network_message`, which is exhaustive over
+`NetworkMessage`; the compiler will tell you where to add an arm),
+`commands`, `presence`, `session`, `menus`, `devices`,
+`conversations`, `chat`, `profiles`, `stats` — each a child of `app`
+so nothing private had to open up; new methods go in the child that
+owns the concern.
 
 `main.rs` sets up file logging (append-mode `baucord.log`) and a panic
 hook that writes thread, location and backtrace into it — release builds

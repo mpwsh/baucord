@@ -5,7 +5,10 @@ this codebase without a Rust toolchain, where things are, the rules
 that were learned the hard way, what is shipped, and what is left.
 The design record is `PERSISTENCE-SPEC.md` (the 1.1 line's contract,
 with §12 holding every decision taken since); `ARCHITECTURE.md`
-describes the runtime. Keep all three in the repo root.
+describes the runtime; `AEC-SPEC.md` is the echo-cancellation design
+(1.1.5); `ANDROID-SPEC.md` is the Android client's plan. Both collect
+later decisions in their last section the same way. Keep all five in
+the repo root.
 
 ## 1. Setting up the assistant's environment
 
@@ -123,6 +126,18 @@ worth re-running.
   (`ChatHistory`, `ChatItem`, `FileMeta`), `roster.rs`, `menu.rs`,
   `markdown.rs`, `images.rs`, `emoji.rs`.
 - `i18n` — Fluent bundles; `audio`, `video` — codecs and devices.
+- `frontend` (1.1.6, versioned with the public crates) — the client's UI logic: `app.rs` (`AppState`,
+  the event pump, the models), `settingsui`, `adminui`, `media`,
+  `viewers`, `present`, and — until the platform trait replaces them
+  (`ANDROID-SPEC.md` §5) — the host-only modules `hotkeys`,
+  `clipboard`, `instance`, `updater`, `resources`, all behind the
+  `desktop` feature (on by default). `desktop` is now `main.rs`
+  alone: logging, the config directory, the single instance, the
+  panic hook, `frontend::app::run()`. Its `tray` feature forwards to
+  `frontend/tray`. Every `crate::` path inside the moved files still
+  resolves: they moved together.
+- Planned, not present: `android` (the cdylib host) and the Gradle
+  project in `android/` beside `crates/`.
 
 Server config keys the user runs with are in the spec §1; the
 CLI is `server user|role|invite|restriction|key|telemetry|backup|
@@ -137,6 +152,7 @@ restore|db check|db prune|purge` (`server role --help` etc.).
 | 1.1.2 | profiles (name color/style, avatars, contrast check), the app's own context menus with the volume slider, collapsible Messages, invite dialog, XP bar (`UserProgress`), share sounds, one instance per profile |
 | 1.1.3 | custom roles with derived ranks, badges (icon + color) and `RoleList`; `panel`, `gold` and `admin-channel` as permissions; files on the blob path in General and DMs (cards, transfer ring, cancel, Open after save); the admin panel (eight tabs, confirm dialogs, humanized audit); resizable sidebar and Messages divider; hover on chat rows |
 | 1.1.4 | blob retention, purge drops files, chat xp, pictures as files wherever the server is persistent, transfer budget (`limits.max_transfer_kb_per_minute[_global]`, old names alias), `server restore` / `db prune`, the admin channel (`AuditLine` feed), keybinds watched not grabbed, command output in the conversation it was typed in, closed DMs stay closed |
+| 1.1.5 | the lobby (connect invisible, `LOBBY` bit 16, implicit channel, "joined <room>" lines, reconnect-rejoin, no xp in lobby or AFK); relay port 51000 by default with the client following the official server's move; drag a user onto a channel; images get Copy/Delete and a gallery copy button; LIVE chip opens the viewer; gold badges, green admin marker; timestamps on system lines and channel-move lines; `delete-messages` permission; log-level setting; window centred instead of remembered; the DM avatar ring gone, "Admin logs" with a `#`; unchanged profiles no longer trip the rate limit |
 
 Memory-mode servers (persistence off) still use the legacy
 `ImageMessage` relay for pictures and refuse files.
@@ -174,10 +190,13 @@ Memory-mode servers (persistence off) still use the legacy
   keeps passwords it created or joined with in `channel_passwords`
   and `current_spec` reads them from there. A password the client
   never saw is cleared by any edit — the dialog says so.
-- Only text chat enters the server's edit/delete ring (200 most
-  recent); images cannot be edited or deleted; the server is
-  *silent* when it refuses an edit or delete — the client's 3 s
-  timer is the only feedback.
+- The server's edit/delete ring (200 most recent) holds text *and*
+  blob messages (a picture on a persistent server is a blob, spec
+  §7); only memory-mode live-relay images (`ChatImageChunk`) never
+  enter it, so they cannot be deleted. Nothing edits an image. The
+  server is *silent* when it refuses an edit or delete — the
+  client's 3 s timer is the only feedback. (Until 1.1.5 the client
+  menu hid Delete on every image; `app-core::menu` returned early.)
 - `UserDetails` shipped with four positional fields, so the profile
   became its own variant (`UserProfile`), not a fifth field (§12).
 - The server type is `ChatServer`; `Config` nests `avatars` under
@@ -241,6 +260,42 @@ Memory-mode servers (persistence off) still use the legacy
   elided label. A wrapping `TextInput`/`Text` reports `min: 0`, so
   bodies never did this; word-wrap also breaks a 180-character token
   at character boundaries.
+- A `pure` callback in a binding is **cached per element** until a
+  Slint property it read changes; reading Rust state by *index*
+  (`user-drag-data(i)`) went stale as soon as the roster reshuffled,
+  so a drag carried whoever sat in that slot before (1.1.5's "can't
+  move them back"). Key such payloads on the row's own data
+  (`user.client-id-lo/hi`), never on its index.
+- **Drag and drop** (Slint 1.17): `DragArea` must be the row's
+  *parent* — it watches the press through `input_event_filter_before_
+  children` and only intercepts past the threshold, so a sibling in
+  front would never see the moves once the row's TouchArea grabbed.
+  `DropArea` ignores ordinary mouse events, so it can sit in front of
+  the row. The payload is an opaque `data-transfer`: built by a
+  **`pure`** host callback (a binding may only call pure callbacks —
+  the compiler says "Call of impure callback") carrying our own type
+  via `set_user_data`, read back with `user_data().downcast`. In a
+  `ListView` the wrapper needs an explicit `height` (bind it to the
+  row's). The drop highlight cannot be rendered by the viewer (it
+  needs a live drag); QA it in the app.
+- Nothing in the app layer knew the negotiated feature set until the
+  lobby; `NetworkMessage::Connected { lobby }` is the pattern for the
+  next bit a client must gate on (add a field, not a new message).
+- A menu action lives in **three** places: `app-core::menu::Action`,
+  the Slint `MenuAction` enum in `globals.slint` (append only — its
+  ordinal crosses the bridge), and both conversions in
+  `ui/src/lib.rs` (`menu_action`, `menu_action_back`). Miss one and
+  only the compile says so, one round later.
+- A render fixture's `image` fields (`avatar`, `viewer-image`) must
+  point at a real file — `""` makes the whole model fail to load
+  ("Failed to load image from path") — a 1×1 PNG written by the
+  fixture script does; `/tmp/fx/main.json` is a full-field roster
+  fixture (admin, sharer, guest, custom badge) worth regenerating.
+- External drag-and-drop reaches the app only through
+  `on_winit_window_event` (`WindowEvent::DroppedFile` and friends);
+  Slint's `DropArea` is for in-app drags on this backend. The hook
+  may be set once per window, so new event kinds join the existing
+  closure in `repaint_on_reveal`.
 - The DM ✕ does nothing because `dm-t` (the whole-row TouchArea) is
   declared after the layout holding the button and sits on top of it;
   the scrollbar collision is the `ScrollView`'s 14 px bar over a row
@@ -278,6 +333,51 @@ allocation per 1080p frame stays. Left to measure: the `StyledText`
 layouts of visible rows and Skia's glyph cache with color emoji,
 both only visible from a heap profile.
 
+### Network diagnosis (the Movistar / port-5000 case, 2026-09-09..15)
+Three users on one ISP (Movistar fibre, 600/600) heard each other at
+16 kbps in evening episodes; reconnecting "fixed" it; sometimes the
+join hung. Others were fine. **Cause: the relay's UDP port.** On 5000
+the ISP's gateway/path dropped ~40 % of the clients' *outbound*
+packets in on/off episodes; on 51000 nothing. Fix in place: the
+server listens on 51000 (`port` + `public_address` in `server.yaml`)
+and Docker publishes both `51000:51000/udp` and `5000:51000/udp` so
+old saved addresses still work — one socket, two doors; the invite
+string already carries 51000. Rules that came out of it:
+
+- **Read both loss counters before anything else.** The client's
+  `link:` line (transport: our unacked packets) and the relay's
+  `VoiceReceiverReport` (`uplink N%` in `audio stats`) are
+  independent; when they agree the loss is real and outbound. The
+  downlink figure (`Recv … Lost`) tells you the direction. Flat RTT +
+  loss = a policer or classifier, not congestion. Bimodal loss
+  (~0 % or ~40 %, nothing between) = a switch somewhere, not a dial.
+- **`server telemetry <user>` is the same data at 10 s cadence** on
+  the server side; the per-minute view shows episode boundaries, and
+  boundaries that do not line up with reconnects mean reconnecting is
+  not the fix.
+- **Split "our packets" from "the path" with an unmarked control:**
+  `ping -t <relay ip>` beside the client during an episode. Clean ping
+  + baucord loss = something about our packets (port, DSCP, ECN,
+  802.1p tag, protocol); ping loss too = the path.
+- **Split "the PC" from "beyond it" with `pktmon`** (built into
+  Windows): `pktmon filter add baucord -t UDP -p <port>`,
+  `pktmon start -c`, then `pktmon counters --drop-reason`. Equal Tx
+  counts at TCPIP, QoS Packet Scheduler, WFP and the NIC with no drop
+  rows = nothing on the machine ate them; a third-party filter driver
+  (Killer, cFosSpeed, AV suites) would show up as a component.
+- Things checked and cleared, so nobody re-chases them: the audio
+  ladder (`adapt.rs` did exactly what its inputs said); the Realtek
+  802.1p tag (disabled, no change); CS7 DSCP from the qWAVE voice flow
+  (still marked on 51000, no loss); ECN (same); upstream capacity;
+  Discord's QoS toggle was off on those PCs, so it was never a
+  like-for-like comparison.
+- The server-side `link:` lines carry the *relay's* view and the
+  source `addr:port`; `voice rx/expected/lost/late` there vs the
+  client's `path loss` is the first cross-check next time.
+
+The clients keep marking CS7 on Windows and ECT(0) everywhere; both
+were exonerated and neither is changed.
+
 
 ## 5. Remaining work
 
@@ -295,6 +395,335 @@ people rather than devices. Plus:
   channel cap.
 - Scroll anchoring on "load earlier".
 - Arrow-key navigation in the context menu.
+
+From the port-5000 investigation (§4), none started:
+
+- **`PreferredAddress`**: an appended `ServerMessage` under a new
+  feature bit, sent after `Welcome` with `public_address`; the client
+  rewrites the saved `ServerEntry.address` and uses it from the next
+  connect (reconnects at once if its uplink shows the loss
+  signature). Lets the `5000:51000/udp` mapping be dropped once the
+  logs show nobody on it.
+- **Default port 5000 → 51000** (done 2026-09-17): `ServerSettings`
+  default, a startup warning for a server still on 5000, README. The
+  client's official entry is `216.238.121.18:51000` and
+  `normalize_servers` moves a saved `:5000` official entry to it on
+  load (pin and passwords kept) — that is how the 5000 door empties.
+  `PreferredAddress` (above) remains the general mechanism for other
+  servers.
+- **Ladder policy under flat-RTT loss** (`audio/src/adapt.rs`):
+  `HEAVY_LOSS`/`SEVERE_LOSS` step down regardless of the RTT verdict,
+  so a lossy-but-uncongested uplink ends at 16 kbps / 40 ms. Hold
+  32 kbps / 20 ms and buy RED ×2 → ×3 instead, probe-guarded (loss
+  rising after a copy is added = a policer, revert). Fixes what
+  listeners hear on *any* lossy uplink.
+- **ACK frequency for share viewers**: a viewer of a share sends ~500
+  ACK packets/s upstream (quinn acks every second packet); quinn
+  0.11's ack-frequency extension would cut it several-fold.
+- **Telemetry**: audio rung, downlink voice loss and the marking
+  state in `telemetry_samples`; `server telemetry` printing several
+  users side by side over a window.
+
+**Release plan (2026-09-15):** 1.1.5 = features on the current
+structure; 1.1.6 = the `frontend` split with no behaviour change
+(`ANDROID-SPEC.md` §5); then Android M0.
+
+**1.1.6 — the split, round 1 (2026-09-18, awaiting its cargo
+round):** the eleven modules moved from `desktop/src` to
+`frontend/src` unchanged, `lib.rs` declares them `pub`, the manifest
+carries desktop's dependencies (minus `env_logger`) and the `tray`
+feature; `desktop/Cargo.toml` keeps `frontend`, `client`, `slint`,
+`log`, `env_logger` and the `winresource` build script (its
+`libx264` link directive still applies to the binary). The
+workspace `Cargo.toml` must list the new member if `members` is
+explicit. Round 2: gate the host-only modules on the `desktop`
+feature so `cargo check -p frontend --no-default-features` passes;
+round 3: split `app.rs` into modules inside the crate; then the
+`Platform` trait as Android needs it.
+
+**Tech-debt cycle, round 1 (2026-09-18):** the only clippy *error*
+(`clone_on_copy` in `audio/src/stream/input.rs`) fixed — it had been
+stopping clippy before `client`, `frontend`, `server`, `transport`,
+`ui`, `desktop`, so their state is still unknown; the `libx264`
+link directive moved from `desktop/build.rs` to `video/build.rs`
+(where the ffmpeg dependency lives — `video`'s examples and tests
+could not link on Windows, LNK2001 `x264_*`, which also aborted
+`cargo build --all-targets` before the dead-code list existed);
+unused dependencies dropped (`bytes` in `client` and `server` —
+both use `protocol::Bytes`; `rustls-pki-types` in `transport` —
+reached through `rustls::pki_types`). Next: the user runs
+`cargo clippy --fix --workspace --all-targets --all-features
+--allow-dirty` for the ~300 mechanical suggestions (290 are
+`must_use_candidate` in `audio`/`video`), then fresh clippy and
+build logs; the judgment items (casts, `match_same_arms`,
+`unchecked_time_subtraction`, `float_cmp`, docs) go by hand. Rule
+from the skill: fix, or `#[expect]` with a reason — never `allow`.
+
+**Tech-debt cycle, round 2 (2026-09-18):** after the user's
+`cargo clippy --fix` pass, 274 diagnostics remained, 4 of them
+errors in `server` (the workspace denies `clippy::all`): a
+`nonminimal_bool` in `channels.rs` (rewritten as `may_manage`), an
+`if_same_then_else` in `profiles.rs::store_blob` (a pointless clone
+in one branch), `large_enum_variant` on `persistence::Request`
+(`#[expect]` with the reason — one channel message, nobody stores
+it), and `too_many_arguments` on `VoiceRelay::process` — now takes a
+`relay::Room<'_>` (Copy, all borrows) instead of nine arguments. Also
+the one build warning (`i18n::init`'s return is now logged as
+"Locale: …") and the five `{:?}`-formatted paths in
+`client/config.rs`. **The tarball does not contain the user's
+`--fix` edits** (must-use attributes and the like): after unpacking,
+re-run `cargo clippy --fix --workspace --all-targets --all-features
+--allow-dirty` — it is idempotent — then clippy again. What is left
+is pedantic and splits into: ~140 numeric casts (proposal: allow the
+`cast_*` lints in `[workspace.lints]` with a comment — DSP, video
+and timing code casts by design), ~33 `needless_pass_by_value`
+(mostly thread-entry arguments moved into closures; case by case),
+23 missing `# Errors`/`# Panics` sections, 8 `too_many_lines`,
+6 `similar_names`, and a handful of singles — one crate per round,
+leaf crates first.
+
+**The split, round 3 (2026-09-18, awaiting its cargo round):**
+`app.rs` (8.6k lines) is now `app.rs` (2.4k: `AppState`, `run`,
+`wire_logic`, the timers, the free helpers, `fill_tr`, `tray`) plus
+ten **child modules** under `src/app/`, cut along method boundaries
+of the one `impl AppState`: `events` (the drain, voice/screen events,
+`handle_network_message`), `commands` (connect, slash commands, the
+channel dialog, admin, invites), `presence` (`Init`, joins/leaves/moves,
+channels, roles, ranks), `session` (join prompts, teardown, mute/
+deafen, share toggles, sending), `menus` (context menus, moderation,
+per-user audio, watching), `devices` (device changes, live settings,
+`show_main`), `conversations` (history paging, General/DM switch,
+DM rows), `chat` (pushing rows, pictures/files, edit/delete, GIFs),
+`profiles` (row decoration, avatars, hover cards), `stats` (latency,
+memory, toasts, update flags, shutdown). Each starts with
+`use super::*;` (allowed `wildcard_imports`, with the reason) and its
+own `impl AppState`; the 137 private methods became `pub(super)`
+because a private item in a child is invisible to the parent and the
+siblings — nothing became `pub`. Rule: **new `AppState` methods go
+in the child that owns the concern; `app.rs` is for the state and
+the loop.** Also: three stray doc lines before `ChannelFacts`
+removed. Check: `cargo build -p desktop` — the likeliest complaint is
+a `pub(super)` method whose signature names a type private to a
+child (none should), or a method the regex missed at another indent.
+
+**The split, round 2 (2026-09-18, awaiting its cargo round):** the
+`desktop` feature now gates real things. Eleven crates are optional
+behind it (`i-slint-backend-winit`, `arboard`, `global-hotkey`,
+`device_query`, `interprocess`, `zip`, `self-replace`, `rfd`,
+`pollster`, `open`, `objc2-app-kit`); `clipboard`, `hotkeys` and
+`updater` have same-API twins under `src/stubs/` selected by
+`#[path]` when the feature is off; `instance` is desktop-only; a new
+`host` module (`pick_file`, `save_file`, `open_url`, `open_target`)
+is the one seam for native dialogs and the system launcher — the
+five `rfd` sites and three `open` sites now go through it — and it
+too has a stub twin. In `app.rs` the winit-only pieces
+(`raise_window`, `center_on_monitor`, `repaint_on_reveal`) have
+no-op twins under `cfg(not(feature = "desktop"))`. `ureq`, `dirs`,
+`sysinfo`, `video` stay unconditional: they build for Android. The
+check that matters now:
+`cargo check -p frontend --no-default-features` on the host (it
+must not pull any of the eleven crates), then `cargo run -p desktop`
+unchanged. Next: round 3 (`app.rs` into modules), then the
+`Platform` trait replacing the stubs where Android needs a real
+implementation (clipboard, open URL, dialogs).
+
+**Tech-debt cycle, round 5 (2026-09-18) — e2e green (76/76), 105
+pedantic warnings, 0 errors.** This round took the small crates and
+`frontend`'s singles: `# Panics` sections on `i18n`'s three
+lock-holding functions, two `StyledText` backticks, `hex()` built
+with `write!` instead of a `format!`-collect, `MAX_AUTO_RECONNECTS`
+hoisted, `arm_apply_timeout` made an associated fn, the `Volume` arm
+folded into the wildcard with its comment, `text_muted` typed as
+`Option<TextMute { until }>` (the other `Option<Option>`,
+`history_page_pending`, `expect`ed: the inner option *is* the
+conversation key used throughout), the updater's non-Unix stubs
+`expect`ed (`?`-compatible signatures), one clone-then-assign
+reordered. Left (~90): `needless_pass_by_value` 37 (`audio`
+input/stream ctors, `client` thread entries, `server` handlers,
+`video` dxgi), `too_many_lines` 25, missing `# Errors`/`# Panics` 29
+(`audio` 13, `video` 7, `frontend` 5, `client` 2, `server` 1) — one
+crate per round, and `audio` is half of it.
+
+**e2e, third pass (2026-09-18):** two left. The harness's join echo
+was still in the inbox (described, not implemented, the pass before
+— now a `retain`). The other was a **real lobby gap**: a hot reload
+that removes a room moved its members to the lobby by renumbering
+`channel_of` directly, so neither their stream stopped nor did the
+others see them leave. `apply_channel_list` now computes who was
+demoted to the lobby and runs `withdraw` for each, before the
+share-visibility re-derivation. The DM test passed alone: the race,
+not a bug; noted, not fixed.
+
+**e2e, second pass (2026-09-18):** five left after the harness fix,
+four of them list-length predicates written for a list without the
+lobby entry (`== 1` → 2, `== 2` → 3) and one stale `ChannelDetails`
+— the lobby entry's id gets reused by a channel created after it, so
+a predicate on `channel_id` alone finds the lobby's old details;
+match `owner: Some(_)` for a user channel. The hot-reload share test
+now asserts the new semantics: a removed room's members go to the
+lobby, where the stream ends for the viewer and the room next door
+never sees it. `a_file_goes_into_a_dm_like_a_message` failed with
+`Store`, which the code returns both for a store error and for the
+2-s simulated deadline passing before the real SQLite thread answers
+— the harness advances simulated time a `TICK` per pump with no real
+sleep, so this test is timing-sensitive; re-run alone with
+`RUST_LOG=warn -- --nocapture` and look for "DM store failed" (a
+bug) vs "did not answer in time" (the race).
+
+**Tech-debt cycle, round 4 (2026-09-18):** with the cast lints
+allowed, `clippy4` reached `frontend` for the first time and found
+three *errors* there — orphaned `///` comments whose functions were
+deleted long ago (`empty_line_after_doc_comments`), removed. 107
+unique warnings remain: `needless_pass_by_value` 37, `too_many_lines`
+23, `missing_errors_doc` 20, `missing_panics_doc` 12, and eleven
+singles (`Option<Option<T>>` ×2, `unused_self`, `format!` in a
+collect, an `unnecessary_wraps` pair, a `large_stack_arrays`, a
+`clone` assignment, an `items_after_statements`, a `match_same_arms`,
+two `doc_markdown`). Next rounds take them per crate.
+
+**The e2e suite and the lobby (2026-09-18):** `cargo test -p server
+--test e2e` had 19 failures, all one cause — the suite was written
+for a world where connecting made you visible in channel 0, and
+nobody ran it when the lobby landed (a rule now: **the server's
+e2e suite runs before any presence change is called done**). Fix in
+the harness: `connect_*` now joins room 0 after `Init` and waits for
+its own `UserMovedChannel`, so the old tests keep meaning what they
+say; `connect_lobby` stays invisible for the tests about the lobby
+itself (one added: unseen until the first join, the join carries
+the room, an admin's move to the lobby reads as `UserLeft`). Five
+expectations updated for the implicit lobby: `validate_channels`
+returns the lobby's index and `default: true` is not a rule
+(`config_validation_rejects_bad_channel_lists`,
+`hot_reload_rejects_invalid_lists`), `Init` carries one extra
+unnamed entry, a renamed channel's members go to the lobby (last),
+a `ChannelKick` sends its target to the lobby and the others see
+`UserLeft`.
+
+**Tech-debt cycle, round 3 (2026-09-18, on the user's post-`--fix`
+tree):** the two remaining errors (both in `server/tests/e2e.rs`: a
+redundant field name; `post_file`'s eight arguments, `#[expect]`ed
+as a one-caller test helper) and the small pedantic items by hand:
+unbalanced backticks in `app-core::chat` docs, `many_single_char_names`
+on the HSL formula (`expect`, named), `match_wildcard` in the message
+menu (the last kind named), `needless_continue`, `needless_for_each`
+(`fill`), four `manual_let_else`, five `match_same_arms` (merged with
+their comments kept; `UploadBegin`/`FetchBlob` joined the Signal-lane
+arm), four `float_cmp` in tests (`expect`, exact by construction), two
+`items_after_statements` (consts hoisted), three `struct_excessive_bools`
+(`expect`, reasons given), the `_device` binding that was in use. Plus
+a **workspace lint decision**: the four `cast_*` pedantic lints and
+`similar_names` are allowed with reasons (`workspace-lints.toml` has
+the exact table for the root `Cargo.toml`, which is not in the
+archive) — that removes ~160 of the 272. Left for round 4, one crate
+per round: 33 `needless_pass_by_value` (thread-entry arguments — `&`
+where the callee only reads, `expect` where the value is moved into a
+closure), 30 missing `# Errors`/`# Panics` sections, 18
+`too_many_lines` (dispatch functions and tests — `expect` with a
+reason, or a split where one is obvious).
+
+**1.1.6 — drop files from the OS (2026-09-18, awaiting its cargo
+round):** Slint 1.17's `DropArea` never sees external drops on the
+winit backend, but the raw-event hook the app already has for
+repaint-on-reveal does: `WindowEvent::HoveredFile` /
+`HoveredFileCancelled` / `DroppedFile` drive `State.drop-hover` (a
+whole-window "Drop to send" overlay with no TouchArea, so a stale
+hover still lets clicks through) and `media::drop_path`, which is
+the paste chain's road: a picture takes the preview, anything else
+uploads as a card. Several files arrive as several drops. Everything
+is deferred with `invoke_from_event_loop` — the hook runs inside
+winit's dispatch. Wayland delivers no file drags in winit 0.30 (the
+overlay simply never shows there).
+
+**1.1.6 bug fixes (2026-09-18):** drag-to-move
+payload keyed on the row's client id (the index-keyed binding went
+stale after a reshuffle); own pictures and files deletable without
+`delete-messages` (`row_delete` only knew text/code rows, and its
+moderator check still read `RESTRICT`); gold badges no longer save
+as grey (`badge_palette()` is the one list for swatches, edit form
+and save — the save mapped the index into the 16-entry name list).
+
+**Versions bumped to 1.1.5 on 2026-09-17** (desktop, server, protocol,
+transport, client; app-core 0.3.4, ui 0.4.1). Wire: one new feature
+bit (`LOBBY`, 16), one new permission bit (`DELETE_MESSAGES`, 23),
+no new message variants — a 1.1.4 client on a 1.1.5 server works
+(it renders its own lobby row empty).
+
+**1.1.5 scope** — batch 1 written 2026-09-16 (image menu with Copy
+image + Delete and a Copy button in the gallery, LIVE chip opens or
+raises the viewer, gold in the badge palette, `Theme.admin` green for
+every admin marker; `slint-viewer --check` clean on all three roots,
+sidebar and gallery rendered). Cargo rounds 1–2 done (the bridge's
+`MenuAction`, then our own LIVE chip being clickable); image delete,
+copy and single-click watch confirmed working in QA:
+
+- AEC on Windows per `AEC-SPEC.md` (Communications category when
+  the output is speakers, verified tier in `/audio`, the setting).
+- **Log level** picker in Settings → General (`logging.level`,
+  applied live). *(done 2026-09-17: `LoggingSettings`, `LOG_LEVELS`
+  in settingsui, env_logger filter at trace with
+  `log::set_max_level` as the knob, `RUST_LOG` wins; the settings
+  window grew to 800×740 preferred / 680×580 min — render it in the
+  app, the viewer shows a Window with only preferred sizes as 6×23.)*
+- **`delete-messages` permission** (done 2026-09-17): bit 23, own
+  name, in the admin set; the server's `DeleteMessage` needs it and
+  `RESTRICT` no longer implies it; client `delete_any`/`perm-delete-
+  any` follow it. Existing custom roles need the box ticked.
+- **Lobby banner** now reads "Join a voice channel to start
+  talking" (three catalogs).
+- **Drag a user to a channel** (`DragArea` wrapping each row,
+  `DropArea` in front of channel rows; `AdminCommand::MoveUser`,
+  which needs `MANAGE_CHANNELS` — the server already enforces it).
+  *(batch 2, written 2026-09-17, awaiting its cargo round: the
+  channel row tints `accent` at 35 % while an accepted drag hovers;
+  dropping onto the user's current channel is refused client-side.)*
+- **Invisible lobby**: the default channel becomes a waiting room —
+  no roster presence for others, no voice relayed, no xp; hidden
+  from the channel list behind feature bit `LOBBY` (16); the user is
+  announced when they join a channel ("X joined <channel>"). No xp
+  in the AFK channel either. Posting from the lobby allowed, no
+  "step out" action, automatic reconnect rejoins the channel. The
+  full design is `PERSISTENCE-SPEC.md` §12 (2026-09-16). *(batch 3,
+  server round written 2026-09-17: `features::LOBBY`, `in_lobby`,
+  `announce`/`withdraw` on the `place_in_channel` transitions,
+  filtered `Init`, `UserLeft` only for the announced, relay and xp
+  gates, AFK sweep skips the lobby, no shares seen or started from
+  it. Client round written 2026-09-17: `NetworkMessage::Connected
+  { lobby }` carries the bit; `lobby_name` is the channel `Init` put
+  us in, hidden via `ChannelMeta.hidden`; `State.in-lobby` drives
+  the banner above the roster and the greyed mic; `UserJoined`
+  renders `chat-user-joined-channel`; `rejoin_channel` is set on a
+  connection loss and spent by the next `Init` (a deliberate connect
+  or disconnect clears it). Round 2 (2026-09-17, after QA of round
+  1): the lobby became **implicit** — `config::with_lobby` appends an
+  empty-named entry, `validate_channel_list` returns its index and
+  only warns about `default: true`; `ChannelListUpdated` memberships
+  are filtered per recipient like `Init`; the admin channels tab
+  skips it. Also: system lines carry the local time
+  (`push_chat_system`), channel moves get lines (`chat-user-moved`,
+  `chat-you-moved`; our own move into the lobby is silent), the DM
+  avatar ring is gone, the admin channel is "Admin logs" with a `#`.
+  README updated. Awaiting the cargo round.)*
+- **Window position no longer saved** (2026-09-17): `WindowSettings`
+  keeps only the size; the first show centres the window on its
+  monitor (`center_on_monitor`, winit physical pixels), later shows
+  leave it alone. Old `x`/`y` keys in `settings.json` are ignored.
+  Users were losing the window on a monitor that was gone.
+- **"One profile change every 30 seconds" on relogin** (fixed
+  2026-09-17): the client re-sends its profile after every `Session`
+  and the server stamped `profile_changed_at` (keyed by user, kept
+  across sessions) for every accepted `SetProfile`, identical or not.
+  `handle_set_profile` now treats an unchanged profile as a no-op
+  before the lock and rate checks — no apply, no broadcast, no stamp.
+- **Image messages get Copy image and Delete** (`app-core::menu`
+  returned early for images; the server already allowed it).
+  *(batch 1)*
+- **Click the LIVE chip** opens the viewer (same path as the context
+  menu's "Watch stream"). *(batch 1)*
+- **Badge colours**: gold allowed in the role-badge palette; the
+  built-in admin badge turns green. *(batch 1)*
+
+**Android** (v1: voice + chat, sideloaded, Slint) — `ANDROID-SPEC.md`,
+milestones in its §12; M0 (toolchain + hello) follows 1.1.6.
 
 ## 6. Rough edges (known, not urgent)
 

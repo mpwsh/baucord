@@ -905,6 +905,72 @@ voice unaffected, writes counted as dropped".
   joiner still gets the last `history.replay` of this run from the
   ring; only paging beyond it is empty. The "server forgets" notice
   stays.
+- **The default channel is a lobby (1.1.5, decided 2026-09-16).**
+  Connecting no longer exposes you. The lobby is not a config
+  channel: the server appends one of its own (empty name, so it can
+  collide with nothing; `config::with_lobby`) after the config and UI
+  channels, and `default: true` in a file is ignored with a warning
+  (decided 2026-09-17: a room named "Lobby" is a room). The lobby is
+  a waiting room: from it you see the channel list with
+  everyone in the channels your role can see, and you read General —
+  but nobody sees you. The server leaves lobby members out of `Init`'s
+  memberships, sends no `UserJoined`/`UserDetails` for them, reports
+  them offline in DM presence, relays no voice from them (as the AFK
+  channel already does), shows them no shares and accepts none from
+  them, and grants them no xp. The moment a lobby user picks a
+  channel, the server announces them (`UserJoined`, `UserDetails`,
+  membership) and the client renders **"X joined <channel>"**
+  (`chat-user-joined-channel`) instead of "X joined"; disconnecting
+  from a channel renders "X left"; disconnecting from the lobby
+  renders nothing, because nothing was ever announced. Admin moves and
+  the auto-AFK keep their own lines. Posting in General from the
+  lobby is allowed: a message carries the name, so posting is a
+  choice to be seen, the same as joining. DMs work both ways. There
+  is no "step out" action — leave a channel by disconnecting, or move
+  to AFK; to be invisible again, disconnect and reconnect. The
+  client's *automatic* reconnect (after a blackout) rejoins the
+  channel it was in, remembered password included; a manual connect
+  or a relaunch lands in the lobby. The client hides the lobby row
+  and shows "not in a channel" at the top of the list, only when the
+  server advertises feature bit `LOBBY` (bit 16) — against an older
+  server nothing is hidden. Older clients on a new server simply
+  never see lobby users, render their own lobby row empty, and —
+  like everyone — must pick a channel to be heard; the greeting
+  message is the operator's place to say so during the rollout. The
+  admin panel lists lobby users with channel "lobby"; kick, ban and
+  `MoveUser` reach them by name; `max_clients` counts them. `ChannelKick`
+  sends its target to the lobby, which is what "out" now means.
+- **No xp in the AFK channel either (1.1.5).** The presence minute
+  accrues only in a channel that is neither the lobby nor AFK; the
+  other sources already need company and cannot occur in either.
+- **An image is a message with a blob (1.1.5).** Its menu is *Open
+  image*, *Save image*, *Copy image*, then *Delete* under the same
+  author-or-moderator rule as text, never *Edit*. The server always
+  allowed this; only `app-core::menu` returned early for images.
+- **Badges: gold is a colour, the band is the permission (1.1.5).**
+  Gold joins the role-badge palette (admins assign badges, so a gold
+  badge signifies what the admin says it does); the name *band* stays
+  `GOLD_NAME`'s. The built-in admin badge turns green, as a theme
+  token.
+- **Drag a user onto a channel (1.1.5).** A `DragArea` on the user
+  row, a `DropArea` on each channel row, `AdminCommand::MoveUser` on
+  drop; the drag exists only for sessions holding `MANAGE_CHANNELS`,
+  which the server enforces regardless. Full or gated targets answer
+  with the existing `ChannelDenied` reasons.
+- **The LIVE chip opens the viewer (1.1.5).** Same path as the
+  context menu's "Watch stream".
+- **`delete-messages` is its own permission (1.1.5, decided
+  2026-09-17).** Bit 23, name `delete-messages`, in the admin set and
+  therefore available to custom roles; `AdminCommand::DeleteMessage`
+  needs it and nothing else, and nothing implies it — `RESTRICT`
+  included, so a custom role that could delete by restricting keeps
+  restricting and loses deleting until the box is ticked. DMs stay
+  undeletable for everyone. The panel lists it by name like the rest.
+- **Log level in Settings → General (1.1.5).** `logging.level` in
+  `settings.json` (`error`…`trace`, default `info`), applied live
+  through `log::set_max_level` with env_logger's filter left open;
+  `RUST_LOG` in the environment overrides the setting entirely. The
+  echo-cancellation design is in `AEC-SPEC.md`.
 
 - Chat is general + DMs; no per-channel text (schema leaves the door open).
 - Guests: icon + tooltip from `UserJoined { kind }`; the name is never altered.

@@ -21,7 +21,9 @@ and [`TODO.md`](TODO.md) for where the project is heading.
 | `server`    | the dedicated relay (lib + bin, so integration tests can drive it)  |
 | `client`    | networking, settings, and the voice/screen worker threads           |
 | `app-core`  | platform-agnostic app logic: roster/chat view models, image pipes   |
-| `desktop`   | the desktop shell (binary: `baucord`)                               |
+| `frontend`  | the UI logic every host shares: `AppState`, the Slint models, the   |
+|             | settings/admin windows; host-only bits behind the `desktop` feature |
+| `desktop`   | the desktop host (binary: `baucord`): `main.rs` and nothing else    |
 | `ui`        | the Slint UI and its Rust glue                                      |
 | `i18n`      | Fluent translations — English, Español (AR), Português (BR)         |
 | `audio`     | capture/playback, Opus, VAD, denoise, jitter buffer, rate ladder    |
@@ -35,9 +37,12 @@ and [`TODO.md`](TODO.md) for where the project is heading.
   jitter estimation, burst-safe drain, and per-peer limiting. The
   encoder's bitrate/redundancy ladder is driven by what the relay
   actually received of your voice, reported back every two seconds
-- **Voice channels** — server-defined rooms (TeamSpeak style). Everyone
-  lands in the default channel (the Lobby); channels can have a join
-  password and a user limit. The channel list is **hot-reloadable**:
+- **Voice channels** — server-defined rooms (TeamSpeak style).
+  Connecting puts you in the **lobby**: you see who is where, nobody
+  sees you, and nothing you say goes anywhere until you pick a
+  channel — that is when the others get "X joined General". Channels
+  can have a join password and a user limit. The channel list is
+  **hot-reloadable**:
   edit `server.yaml` while the server runs and connected clients resync
   in place — nobody is ever kicked, members of a removed channel are
   moved to the default
@@ -49,6 +54,9 @@ and [`TODO.md`](TODO.md) for where the project is heading.
   bitrate ladder steps on the groups its own uplink abandoned. Viewers
   get a resizable, aspect-ratio-preserving window with live stats and
   can request keyframes for fast recovery
+- **Drag and drop** — drag a user onto a channel to move them (needs
+  the permission); drop a file or picture from the file manager onto
+  the window to send it.
 - **Text chat** — one room for the whole server regardless of voice
   channel, with message history, inline links, images, gifs, and an
   emoji picker. Images are relayed on a paced stream so a 10 MB paste
@@ -123,14 +131,20 @@ No sockets, no timing flakiness.
 cargo run -p server --release
 ```
 
-Listens on `0.0.0.0:5000` by default. Configuration lives in
-`server.yaml` (written with defaults on first start; `--config`,
-`--host`, `--port` override). The parts you will touch:
+Listens on `0.0.0.0:51000` by default. It was 5000 until 1.1.5; some
+ISP gateways police UDP/5000 and people on them heard each other at
+16 kbps until the relay moved. A server still on 5000 says so at
+startup. To move one without a flag day, keep both doors open in
+Docker while saved addresses catch up — `"51000:51000/udp"` and
+`"5000:51000/udp"` both map to the one socket — and set
+`public_address` to the new port so invites carry it. Configuration
+lives in `server.yaml` (written with defaults on first start;
+`--config`, `--host`, `--port` override). The parts you will touch:
 
 ```yaml
 server:
   name: Baucord Server
-  public_address: "203.0.113.5:5000"   # only used to print the invite
+  public_address: "203.0.113.5:51000"  # only used to print the invite
 authentication:
   secure: true                          # false = open mode, LAN/dev only
   password: hunter2                     # the room secret, sent in Hello
@@ -141,14 +155,17 @@ logging:
   telemetry: true                       # log clients' `telemetry:` samples
   file: server.log                      # "" = stderr only (containers)
 channels:
-  - name: Lobby
-    default: true                       # exactly one channel must be the default
+  - name: General
   - name: Gaming
     password: "hunter2"                 # optional
     user_limit: 8                       # optional
 ```
 
-Omit the `channels` key entirely for a single open Lobby. The
+Omit the `channels` key entirely for a single open `General`. The lobby
+is not a channel in this list: the server adds it itself, everyone
+connects into it, and it never shows in a client that knows it. A
+`default: true` left over from older files is ignored with a warning.
+The
 `channels` section hot-applies on file save while the server runs; a
 bad edit is logged and ignored, never applied. Everything else in the
 file needs a restart.
@@ -201,7 +218,7 @@ feature bits in `Hello`/`Welcome`.
 The production layout is Docker Compose on a Linux host:
 
 ```
-client ──udp/5000 (QUIC)──▶ baucord   (relay, published directly)
+client ──udp/51000 (QUIC)─▶ baucord   (relay, published directly)
 ```
 
 One service: everything — media, control, admission — rides the single
@@ -231,7 +248,7 @@ data/baucord/       # created by setup.sh; identity.key + uploaded client logs (
 
 ### Bootstrapping a host
 
-1. Open `udp/5000` in the cloud firewall. (No DNS or TLS certificate
+1. Open `udp/51000` in the cloud firewall. (No DNS or TLS certificate
    is needed: the server's own key is its identity.)
 2. Set `server.public_address` in `config/baucord.yaml` to the host's
    public IP and port (it is printed in the invite string), and
@@ -264,7 +281,7 @@ data/baucord/       # created by setup.sh; identity.key + uploaded client logs (
    ```bash
    docker compose ps
    docker compose logs -f baucord
-   ss -uln | grep :5000
+   ss -uln | grep :51000
    ```
 
 ### Reading the server log
@@ -344,7 +361,7 @@ media port, which is only safe without DNAT.
   the moment you connect
 - Channel identity is the channel _name_: renaming one in `server.yaml`
   counts as remove + create, so a hot reload moves its members to the
-  default channel
+  lobby
 - Channel and server passwords are stored in plain text on both ends
   (`server.yaml`, `settings.json`) — they're shared room secrets, not
   personal credentials; treat them accordingly

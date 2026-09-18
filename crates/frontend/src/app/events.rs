@@ -1,0 +1,1257 @@
+//! Worker events into the UI: the drain, voice and screen events, and the big `NetworkMessage` dispatch.
+//!
+//! A child of `app`: everything private to `AppState` is in reach
+//! through `super::*`, so these are the same methods, only filed.
+
+// A child module of `app`: its parent's private items and imports are
+// its own, which is the whole point of the file split.
+#[allow(clippy::wildcard_imports)]
+use super::*;
+
+impl AppState {
+    /// Drain every worker channel. Bounded like the FLTK loop was, and
+    /// `FrameReady` is coalesced per stream: if frames queued while the
+    /// UI thread was busy, blitting each stale frame just replays the
+    /// past — show the newest, skip the rest.
+    pub(super) fn drain(app: &Rc<RefCell<AppState>>) {
+        let mut st = app.borrow_mut();
+
+        // Global hotkeys — collect first, then handle.
+        let mut hotkey_actions = Vec::new();
+        if let Some(hotkeys) = &st.hotkeys {
+            while let Some(action) = hotkeys.poll() {
+                hotkey_actions.push(action);
+            }
+        }
+        for (action, pressed) in hotkey_actions {
+            if !st.connected {
+                continue;
+            }
+            match (action, pressed) {
+                // A hold, not a toggle: both edges matter.
+                (BindableAction::PushToTalk, held) => {
+                    st.voice.tx.send(VoiceControl::PushToTalkHeld(held)).ok();
+                    st.main.global::<State>().set_ptt_held(held);
+                }
+                (_, false) => {}
+                (BindableAction::ToggleMute, true) => st.handle_toggle_mute(),
+                (BindableAction::ToggleDeafen, true) => st.handle_toggle_deafen(),
+                (BindableAction::ToggleScreenShare, true) => st.handle_toggle_screenshare(),
+            }
+        }
+
+        for _ in 0..256 {
+            match st.network.msg_rx.try_recv() {
+                Ok(msg) => st.handle_network_message(msg),
+                Err(_) => break,
+            }
+        }
+
+        for _ in 0..32 {
+            match st.voice.event_rx.try_recv() {
+                Ok(evt) => st.handle_voice_event(evt),
+                Err(_) => break,
+            }
+        }
+
+        // Non-frame screen events, forwarded by the present-prep
+        // thread (which owns screen.event_rx now — see present.rs).
+        for _ in 0..64 {
+            match st.ui_screen_rx.try_recv() {
+                Ok(evt) => st.handle_screen_event(evt),
+                Err(_) => break,
+            }
+        }
+        // Frames arrive as ready-made SharedPixelBuffers: the copy was
+        // paid on the prep thread; presenting is an Image wrap + a
+        // property set. Newest-per-stream (older frames were coalesced
+        // prep-side, before anyone paid for their conversion).
+        let prepared: Vec<crate::present::PreparedFrame> = {
+            let mut slots = st.present.slots.lock().unwrap();
+            slots.drain().map(|(_, f)| f).collect()
+        };
+        for frame in prepared {
+            st.present_frame(frame);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  EVENT HANDLERS
+    // ════════════════════════════════════════════════════════════════
+
+    pub(super) fn handle_voice_event(&mut self, evt: VoiceEvent) {
+        match evt {
+            VoiceEvent::Started => {
+                // No sound here: this event fires whenever the engine
+                // boots, including for standalone mic tests. The join
+                // ding is sent from handle_init_client instead.
+                info!("Voice engine ready");
+            }
+            VoiceEvent::Error(e) => self.show_error(&e),
+            VoiceEvent::SpeakingChanged(speaking) => {
+                if let Some(id) = self.our_client_id
+                    && let Some(user) = self.users.get_mut(&id)
+                {
+                    user.is_speaking = speaking;
+                }
+                self.update_user_list();
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    /// Present one prepared frame: wrap the (already-copied) pixel
+    /// buffer in an Image handle and hand it to the viewer window. The
+    /// heavy work happened on the prep thread; this path stays well
+    /// under a millisecond, which is what lets the UI keep up with
+    /// 60 fps streams.
+    pub(super) fn present_frame(&mut self, f: crate::present::PreparedFrame) {
+        let present_at = Instant::now();
+        let net_to_decode_ms = f.decoded_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
+        let decode_to_present_ms = present_at.duration_since(f.decoded_at).as_secs_f32() * 1000.0;
+        let total_ms = present_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
+        if total_ms > 25.0 {
+            warn!(
+                "SLOW FRAME seq={}: {total_ms:.1}ms total (net→decode: {net_to_decode_ms:.1}ms, decode→present: {decode_to_present_ms:.1}ms)",
+                f.seq
+            );
+        }
+        if let Some(viewer) = self.viewers.get_mut(&f.client_id) {
+            let set_start = Instant::now();
+            viewer.update_frame(
+                f.buffer,
+                f.width,
+                f.height,
+                f.frame_bytes,
+                f.buffer_depth_ms,
+                f.buffer_target_ms,
+                f.buffer_jitter_ms,
+            );
+            let set_ms = set_start.elapsed().as_secs_f32() * 1000.0;
+            if set_ms > 5.0 {
+                warn!("Slow present: {set_ms:.1}ms for seq {}", f.seq);
+            }
+        }
+    }
+
+    pub(super) fn handle_screen_event(&mut self, evt: ScreenEvent) {
+        match evt {
+            ScreenEvent::SharingStarted { quality } => {
+                info!("Screen share started: {quality}");
+                self.push_chat_system(&t!("chat-share-started", "quality" => quality.to_string()));
+                self.main.global::<State>().set_sharing(true);
+                // Start the 1-second stream stats timer once. It stops
+                // itself when sharing ends; the guard prevents stacking
+                // a new repeating timer on every share start.
+                if !self.stream_stats_timer_active.swap(true, Ordering::Relaxed) {
+                    let timer_active = self.stream_stats_timer_active.clone();
+                    let is_sharing = self.screen.shared.is_sharing.clone();
+                    let t = slint::Timer::default();
+                    let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+                    if let Some(weak) = weak {
+                        t.start(
+                            slint::TimerMode::Repeated,
+                            Duration::from_secs(1),
+                            move || {
+                                if is_sharing.load(Ordering::Relaxed) {
+                                    with_app(&weak, AppState::update_stream_stats);
+                                } else {
+                                    timer_active.store(false, Ordering::Relaxed);
+                                    with_app(&weak, |app| {
+                                        // Timer removes itself by
+                                        // dropping out of the vec on
+                                        // the next share start.
+                                        app.main.global::<State>().set_stream_stats("".into());
+                                    });
+                                }
+                            },
+                        );
+                        self.timers.push(t);
+                    }
+                }
+            }
+            ScreenEvent::SharingStopped => {
+                info!("Screen share stopped");
+                self.push_chat_system(&t!("chat-share-stopped"));
+                let s = self.main.global::<State>();
+                s.set_sharing(false);
+                // Clear the stats line — it used to keep showing the
+                // last sample after the share ended.
+                s.set_stream_stats("".into());
+            }
+            ScreenEvent::Error(e) => {
+                self.show_error(&t!("error-screen-share", "error" => e.as_str()));
+            }
+            // Frames never reach this handler anymore: the
+            // present-prep thread consumes them from screen.event_rx
+            // and the UI receives PreparedFrames through the slot map
+            // instead (see present.rs / present_frame below).
+            ScreenEvent::FrameReady { .. } => {
+                debug_assert!(false, "FrameReady is consumed by the present-prep thread");
+            }
+            ScreenEvent::PeerStartedSharing {
+                client_id,
+                width,
+                height,
+            } => {
+                let username = self.username_of(client_id);
+                info!("{username} started sharing ({width}x{height})");
+                self.push_chat_system(&t!("chat-peer-sharing", "name" => username.as_str()));
+            }
+            ScreenEvent::PeerStoppedSharing { client_id } => {
+                let username = self.username_of(client_id);
+                info!("{username} stopped sharing");
+                self.push_chat_system(
+                    &t!("chat-peer-stopped-sharing", "name" => username.as_str()),
+                );
+                if let Some(viewer) = self.viewers.remove(&client_id) {
+                    viewer.close();
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn handle_network_message(&mut self, msg: NetworkMessage) {
+        match msg {
+            NetworkMessage::Connected { lobby } => {
+                self.connected = true;
+                self.lobby = lobby;
+                self.reconnect_attempts = 0;
+                self.main.global::<State>().set_error_text("".into());
+                self.clear_connect_verdicts();
+                // Admitted: from now on the key is the login, so the
+                // code has done its one job.
+                if let Some(server) = self.settings.default_server_mut()
+                    && server.invite_code.take().is_some()
+                {
+                    self.settings.save();
+                    crate::settingsui::refresh_servers(self);
+                }
+            }
+            NetworkMessage::Session {
+                user_id,
+                permissions,
+                persistent,
+            } => {
+                self.permissions = permissions;
+                self.our_user_id = Some(user_id);
+                self.server_persistent = persistent;
+                log::info!(
+                    "session: user {}, permissions {permissions:#x}, persistent {persistent}",
+                    short_id(&user_id)
+                );
+                self.push_permissions();
+                self.send_own_profile();
+            }
+            NetworkMessage::NeedInvite { why } => {
+                let s = self.main.global::<State>();
+                match why {
+                    client::NeedInviteReason::UnknownKey => {
+                        info!("Connect refused: this device needs an invite");
+                        s.set_invite_prompt_text(t!("connect-need-invite").into());
+                        s.set_invite_prompt(true);
+                    }
+                    client::NeedInviteReason::KeyRetired => {
+                        info!("Connect refused: this device was unlinked");
+                        s.set_invite_prompt(false);
+                        s.set_connect_notice(t!("connect-key-retired").into());
+                    }
+                }
+            }
+            NetworkMessage::InviteInvalid { why } => {
+                info!("Connect refused: invite {why:?}");
+                // Whatever code we stored is no good; do not resend it.
+                if let Some(server) = self.settings.default_server_mut() {
+                    server.invite_code = None;
+                }
+                self.settings.save();
+                let s = self.main.global::<State>();
+                s.set_invite_prompt_text(
+                    t!(match why {
+                        client::InviteInvalidReason::Expired => "connect-invite-expired",
+                        client::InviteInvalidReason::Revoked => "connect-invite-revoked",
+                        client::InviteInvalidReason::Exhausted => "connect-invite-exhausted",
+                        client::InviteInvalidReason::Unknown => "connect-invite-unknown",
+                    })
+                    .into(),
+                );
+                s.set_invite_code("".into());
+                s.set_invite_prompt(true);
+            }
+            NetworkMessage::NameInUse => {
+                info!("Connect refused: name in use");
+                self.main
+                    .global::<State>()
+                    .set_connect_notice(t!("connect-name-in-use").into());
+            }
+            NetworkMessage::InviteCreated {
+                code,
+                grants_role,
+                expires_at,
+                max_uses,
+            } => {
+                // A newcomer needs the server address, the port and this
+                // code, as plain text; the code goes on the clipboard.
+                let shown = client::invite::display_code(&code);
+                crate::clipboard::set_clipboard_text(&shown);
+                let role = self.role_name_of(grants_role);
+                let expiry = describe_expiry(expires_at);
+                let uses = match max_uses {
+                    Some(n) => t!("invite-uses", "count" => n),
+                    None => t!("invite-uses-unlimited"),
+                };
+                let s = self.main.global::<State>();
+                if s.get_invite_dialog_open() {
+                    // Minted from the dialog: it shows there, to copy.
+                    s.set_invite_dialog_code(shown.into());
+                    s.set_invite_dialog_summary(format!("{role} · {expiry} · {uses}").into());
+                    s.set_invite_dialog_error("".into());
+                } else {
+                    self.push_command_output(&t!(
+                        "chat-invite-created",
+                        "code" => shown.as_str(),
+                        "role" => role.as_str(),
+                        "expiry" => expiry.as_str(),
+                        "uses" => uses.as_str()
+                    ));
+                }
+            }
+            NetworkMessage::InviteDenied { reason } => {
+                let line = t!(match reason {
+                    client::InviteDenyReason::NoPermission => "chat-invite-no-permission",
+                    client::InviteDenyReason::RoleNotAllowed => "chat-invite-role-not-allowed",
+                });
+                let s = self.main.global::<State>();
+                if s.get_invite_dialog_open() {
+                    s.set_invite_dialog_error(line.into());
+                } else {
+                    self.push_command_output(&line);
+                }
+            }
+            NetworkMessage::History {
+                conv,
+                messages,
+                more,
+            } => {
+                // A page lands in its own conversation, active or
+                // parked; a DM's is always one we asked for.
+                let key = match conv {
+                    client::ConvRef::General => None,
+                    client::ConvRef::Dm(user) => Some(user),
+                };
+                if let Some(user) = key
+                    && let Some(meta) = self.dm_meta.get_mut(&user)
+                {
+                    meta.fetched = true;
+                }
+                self.with_conversation(key, |app| app.take_history_page(key, &messages, more));
+            }
+            NetworkMessage::HistoryUnavailable { retry_secs, .. } => {
+                self.history_page_pending = None;
+                self.main.global::<State>().set_history_loading(false);
+                self.push_chat_system(&t!("chat-history-unavailable", "secs" => retry_secs));
+            }
+            NetworkMessage::MessageEdited { msg_id, text } => {
+                if self.pending_edit == Some(msg_id) {
+                    self.pending_edit = None;
+                }
+                if let Some(own) = self.own_texts.get_mut(&msg_id) {
+                    own.clone_from(&text);
+                }
+                let text = app_core::emoji::replace_shortcodes(&text);
+                // In place when the message is on screen; a notice
+                // when it scrolled out of the window (or predates it).
+                let edited = self.with_conversation(None, |app| {
+                    match app.history.edit_message(msg_id, &text) {
+                        Some(delta) => {
+                            app.sync_range(&delta);
+                            true
+                        }
+                        None => false,
+                    }
+                });
+                if !edited {
+                    self.push_chat_system(&t!(
+                        "chat-message-edited",
+                        "id" => msg_id,
+                        "text" => text.as_str()
+                    ));
+                }
+            }
+            NetworkMessage::MessageDeleted { msg_id } => {
+                if self.pending_delete == Some(msg_id) {
+                    self.pending_delete = None;
+                }
+                self.own_texts.remove(&msg_id);
+                if self.editing.as_ref().is_some_and(|e| e.msg_id == msg_id) {
+                    self.edit_cancel();
+                }
+                let deleted =
+                    self.with_conversation(None, |app| match app.history.delete_message(msg_id) {
+                        Some(delta) => {
+                            app.sync_range(&delta);
+                            true
+                        }
+                        None => false,
+                    });
+                if !deleted {
+                    self.push_chat_system(&t!("chat-message-deleted", "id" => msg_id));
+                }
+            }
+            NetworkMessage::ChatRateLimited { retry_ms } => {
+                let secs = retry_ms.div_ceil(1000);
+                self.show_toast(ToastKind::Warning, &t!("chat-rate-limited", "secs" => secs));
+            }
+            NetworkMessage::ProgressUpdate { xp, level } => {
+                if let Some(user) = self.our_client_id.and_then(|id| self.users.get_mut(&id)) {
+                    user.xp = Some(xp);
+                    user.level = level;
+                }
+                self.update_user_list();
+                let line = t!("chat-level-up", "level" => level, "xp" => xp);
+                self.push_chat_system(&line);
+                self.show_toast(ToastKind::Success, &line);
+            }
+            NetworkMessage::UserProgress {
+                client_id,
+                xp,
+                level,
+            } => {
+                if let Some(user) = self.users.get_mut(&client_id) {
+                    user.xp = Some(xp);
+                    user.level = level;
+                    self.update_user_list();
+                }
+            }
+            NetworkMessage::RoleList { roles } => {
+                self.roles = roles.into_iter().map(|r| (r.id, r)).collect();
+                // Custom names on the cards, and in the roster's menu.
+                self.update_user_list();
+            }
+            NetworkMessage::AuditLine { entry } => {
+                self.ensure_admin_channel();
+                let line = audit_line_text(&entry);
+                let open = self.active_dm == Some(ADMIN_CHANNEL_KEY);
+                self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| {
+                    app.push_system_here(&line);
+                });
+                if !open && let Some(meta) = self.dm_meta.get_mut(&ADMIN_CHANNEL_KEY) {
+                    meta.unread += 1;
+                    self.rebuild_dms_model();
+                }
+            }
+            NetworkMessage::FileMessage {
+                conv,
+                from,
+                username,
+                id,
+                ts,
+                client_id,
+                attachment,
+            } => {
+                let key = match conv {
+                    client::ConvRef::General => None,
+                    client::ConvRef::Dm(_) => Some(from),
+                };
+                let file = app_core::chat::FileMeta {
+                    blob: attachment.blob_id,
+                    name: attachment.name.clone(),
+                    mime: attachment.mime.clone(),
+                    size: attachment.size,
+                };
+                match conv {
+                    client::ConvRef::General => {
+                        let meta = Meta {
+                            id,
+                            ts: format_wall_time(ts),
+                            ts_ms: ts,
+                            day: local_day(ts),
+                            user: username,
+                            own: Some(client_id) == self.our_client_id,
+                            pending: false,
+                        };
+                        // Our own post came back: the ack already turned
+                        // the placeholder into this message.
+                        let already = self.with_conversation(None, |app| app.history.has(id));
+                        if !already {
+                            self.want_picture(&attachment, key, id);
+                            self.push_chat_file(&meta, file);
+                        }
+                    }
+                    client::ConvRef::Dm(_) => {
+                        self.want_picture(&attachment, key, id);
+                        self.take_direct(from, &username, id, ts, Incoming::File(file));
+                    }
+                }
+            }
+            NetworkMessage::HistoryAttachments { conv, items } => {
+                let key = match conv {
+                    client::ConvRef::General => None,
+                    client::ConvRef::Dm(user) => Some(user),
+                };
+                for (msg_id, a) in &items {
+                    self.want_picture(a, key, *msg_id);
+                }
+                self.with_conversation(key, |app| {
+                    for (msg_id, a) in items {
+                        let file = app_core::chat::FileMeta {
+                            blob: a.blob_id,
+                            name: a.name,
+                            mime: a.mime,
+                            size: a.size,
+                        };
+                        if let Some(i) = app.history.attach_file(msg_id, file) {
+                            let row = app.chat_row_at(i);
+                            app.chat_model.set_row_data(i, row);
+                        }
+                    }
+                    // Cards are taller than the empty rows they replace.
+                    app.main.invoke_chat_follow_appended();
+                });
+            }
+            NetworkMessage::ChannelDetails {
+                channel_id,
+                stable_id,
+                owner,
+                min_role,
+                permanent,
+                afk_after_min,
+                is_afk,
+            } => {
+                self.channel_details.insert(
+                    channel_id,
+                    ChannelFacts {
+                        stable_id,
+                        owner,
+                        min_role,
+                        permanent,
+                        afk_after_min,
+                        is_afk,
+                    },
+                );
+                // One per channel after every list: cheap to re-derive
+                // the sidebar each time, and the gates are right the
+                // moment the last one lands.
+                self.rebuild_channels();
+                self.update_user_list();
+            }
+            NetworkMessage::ChannelDenied { reason } => {
+                let what = t!(channel_denied_key(reason));
+                if let Some(dialog) = self.channel_dialog.as_mut()
+                    && dialog.pending
+                {
+                    dialog.pending = false;
+                    self.main
+                        .global::<State>()
+                        .set_channel_dialog_error(what.into());
+                } else {
+                    self.show_error(&what);
+                    self.push_chat_system(&what);
+                }
+            }
+            NetworkMessage::MovedIdle { after_min } => {
+                let line = t!("chat-moved-idle", "min" => after_min);
+                self.push_chat_system(&line);
+                self.show_toast(ToastKind::Info, &line);
+            }
+            NetworkMessage::UserDetails {
+                client_id,
+                user_id,
+                roles,
+                level,
+            } => {
+                let before = self.details.insert(client_id, (user_id, roles.clone()));
+                if let Some(user) = self.users.get_mut(&client_id) {
+                    user.role = role_of(&roles);
+                    user.level = level;
+                }
+                if self.dm_meta.contains_key(&user_id) {
+                    self.rebuild_dms_model();
+                }
+                if Some(client_id) == self.our_client_id {
+                    // Our own rank decides which gated channels we see
+                    // and which roles the menu may hand out.
+                    self.rebuild_channels();
+                    self.push_permissions();
+                }
+                self.update_user_list();
+                if Some(client_id) == self.our_client_id
+                    && let Some((_, old)) = before
+                    && old != roles
+                {
+                    let names: Vec<String> = roles.iter().map(|r| self.role_name_of(*r)).collect();
+                    let now = if names.is_empty() {
+                        t!("roles-none")
+                    } else {
+                        names.join(", ")
+                    };
+                    let what = t!("chat-your-roles-changed", "roles" => now.as_str());
+                    self.push_chat_system(&what);
+                    self.show_toast(ToastKind::Info, &what);
+                }
+            }
+            NetworkMessage::Restricted {
+                kind,
+                until,
+                reason,
+            } => {
+                let until_ms = until;
+                // "… for 2 h: spam" / "… indefinitely: spam" / a role gap
+                // has neither: "… — not allowed by your role".
+                let by_role = reason.is_empty() && until.is_none();
+                let until = if by_role {
+                    String::new()
+                } else {
+                    format!(" {}", describe_until(until))
+                };
+                let reason = if by_role {
+                    format!(" — {}", t!("restricted-by-role"))
+                } else if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {reason}")
+                };
+                let what = t!(
+                    restricted_key(kind),
+                    "until" => until.as_str(),
+                    "reason" => reason.as_str()
+                );
+                self.push_chat_system(&what);
+                self.show_toast(ToastKind::Warning, &what);
+                match kind {
+                    // A server mute: stop sending (spec §4.2), and keep
+                    // the button locked until it lifts.
+                    client::RestrictionKind::Voice => {
+                        if self.server_muted.is_none() {
+                            self.server_muted = Some(self.is_muted);
+                        }
+                        if !self.is_muted {
+                            self.set_muted(true);
+                        }
+                    }
+                    client::RestrictionKind::GeneralText => {
+                        self.text_muted = Some(TextMute { until: until_ms });
+                    }
+                    _ => {}
+                }
+            }
+            NetworkMessage::RestrictionLifted { kind } => {
+                self.push_chat_system(&t!(lifted_key(kind)));
+                match kind {
+                    client::RestrictionKind::Voice => {
+                        if let Some(was_muted) = self.server_muted.take()
+                            && !was_muted
+                        {
+                            self.set_muted(false);
+                        }
+                    }
+                    client::RestrictionKind::GeneralText => self.text_muted = None,
+                    _ => {}
+                }
+            }
+            NetworkMessage::AdminResult { request_id, result } => {
+                self.handle_admin_result(request_id, result);
+            }
+            NetworkMessage::ConnectionLost { kind, detail } => {
+                const MAX_AUTO_RECONNECTS: u32 = 5;
+                // Network, not credentials: come back on our own, with
+                // backoff (2, 4, 8, 16, 30 s), instead of dumping the
+                // user on the connect screen with a transport error.
+                // The user sees one plain sentence per kind; the
+                // transport's wording goes to the log only.
+                log::warn!("connection lost ({kind:?}): {detail}");
+                let what = t!(match kind {
+                    LossKind::Timeout => "error-lost-timeout",
+                    LossKind::Reset => "error-lost-reset",
+                    LossKind::Unreachable => "error-lost-unreachable",
+                    LossKind::ServerRestart => "error-lost-restart",
+                });
+                self.push_chat_system(&what);
+                // Where to go back to, if the reconnect is automatic.
+                self.rejoin_channel = if self.lobby && !self.in_lobby() {
+                    self.our_channel().map(|c| self.channel_name(c))
+                } else {
+                    None
+                };
+                self.teardown_connection();
+                self.show_connect_phase();
+                if self.reconnect_attempts >= MAX_AUTO_RECONNECTS {
+                    self.show_error(&format!("{what} {}", t!("error-lost-gave-up")));
+                } else {
+                    self.reconnect_attempts += 1;
+                    let secs = (2u64 << (self.reconnect_attempts - 1)).min(30);
+                    let secs_text = secs.to_string();
+                    self.show_toast(
+                        ToastKind::Warning,
+                        &format!(
+                            "{what} {}",
+                            t!("error-reconnecting", "secs" => secs_text.as_str())
+                        ),
+                    );
+                    let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+                    if let Some(weak) = weak {
+                        self.reconnect_timer.start(
+                            slint::TimerMode::SingleShot,
+                            Duration::from_secs(secs),
+                            move || {
+                                with_app(&weak, |app| {
+                                    if !app.connected {
+                                        let nickname = app.settings.user.nickname.clone();
+                                        app.handle_connect(&nickname);
+                                    }
+                                });
+                            },
+                        );
+                    }
+                }
+            }
+            NetworkMessage::ServerIdentity {
+                fingerprint,
+                first_use,
+            } => {
+                // Trust on first use (or a signed key rotation): pin it
+                // on the server entry so a different key is refused
+                // from now on.
+                let changed = self
+                    .settings
+                    .default_server()
+                    .is_none_or(|s| s.fingerprint.as_deref() != Some(fingerprint.as_str()));
+                if changed {
+                    if let Some(server) = self.settings.default_server_mut() {
+                        server.fingerprint = Some(fingerprint.clone());
+                    }
+                    self.settings.save();
+                    crate::settingsui::refresh_servers(self);
+                    if first_use {
+                        info!("Pinned server identity {fingerprint}");
+                        self.push_chat_system(
+                            &t!("chat-identity-pinned", "fingerprint" => fingerprint.as_str()),
+                        );
+                    }
+                }
+            }
+            NetworkMessage::IdentityChanged { expected, observed } => {
+                // Nothing was sent to that server. No silent accept: the
+                // user decides, by editing (or clearing) the pin.
+                let text = t!(
+                    "error-identity-changed",
+                    "expected" => expected.as_str(),
+                    "observed" => observed.as_str()
+                );
+                self.push_chat_system(&text);
+                self.teardown_connection();
+                self.show_connect_phase();
+                self.show_error(&text);
+            }
+            NetworkMessage::Disconnected { kind, detail } => {
+                log::info!("disconnected ({kind:?}): {detail}");
+                let what = match &kind {
+                    DisconnectKind::UserRequested => t!("disconnect-reason-user"),
+                    DisconnectKind::Refused(client::RefusedReason::ServerFull) => {
+                        t!("error-refused-full")
+                    }
+                    DisconnectKind::Refused(client::RefusedReason::RateLimited) => {
+                        t!("error-refused-rate-limited")
+                    }
+                    DisconnectKind::Refused(client::RefusedReason::Banned { until, reason }) => {
+                        let until = describe_until(*until);
+                        let reason = if reason.is_empty() {
+                            t!("reason-none")
+                        } else {
+                            reason.clone()
+                        };
+                        t!(
+                            "error-banned",
+                            "reason" => reason.as_str(),
+                            "until" => until.as_str()
+                        )
+                    }
+                    DisconnectKind::Refused(_) | DisconnectKind::Outdated => {
+                        t!("error-outdated")
+                    }
+                    DisconnectKind::Removed { kind, reason, by } => {
+                        let reason = if reason.is_empty() {
+                            t!("reason-none")
+                        } else {
+                            reason.clone()
+                        };
+                        let key = match kind {
+                            client::RemovedKind::Disconnected => "removed-disconnected",
+                            client::RemovedKind::Kicked => "removed-kicked",
+                            client::RemovedKind::Banned { .. } => "removed-banned",
+                            client::RemovedKind::Replaced => "removed-replaced",
+                        };
+                        let until = match kind {
+                            client::RemovedKind::Banned { until } => describe_until(*until),
+                            _ => String::new(),
+                        };
+                        t!(
+                            key,
+                            "by" => by.as_str(),
+                            "reason" => reason.as_str(),
+                            "until" => until.as_str()
+                        )
+                    }
+                    DisconnectKind::LocalError => {
+                        t!("error-local", "detail" => detail.as_str())
+                    }
+                    DisconnectKind::Other => t!("error-lost-generic"),
+                };
+                if self.connected {
+                    self.push_chat_system(&t!("chat-disconnected", "reason" => what.as_str()));
+                    self.teardown_connection();
+                    self.show_connect_phase();
+                }
+                match kind {
+                    DisconnectKind::UserRequested => {}
+                    // Verdicts that stay on the card until the next try.
+                    DisconnectKind::Refused(client::RefusedReason::Banned { .. })
+                    | DisconnectKind::Removed { .. } => {
+                        self.main.global::<State>().set_connect_notice(what.into());
+                    }
+                    // A full server is theirs, not ours: a warning.
+                    DisconnectKind::Refused(client::RefusedReason::ServerFull) => {
+                        self.show_toast(ToastKind::Warning, &what);
+                    }
+                    _ => self.show_error(&what),
+                }
+            }
+            NetworkMessage::InitClient {
+                users,
+                client_id,
+                server_name,
+                greeting,
+                channels,
+                memberships,
+            } => {
+                self.handle_init_client(
+                    client_id,
+                    &users,
+                    &server_name,
+                    &greeting,
+                    &channels,
+                    &memberships,
+                );
+            }
+            NetworkMessage::UserJoined {
+                client_id,
+                username,
+                channel_id,
+            } => self.handle_user_joined(client_id, username, channel_id),
+            NetworkMessage::UserMovedChannel {
+                client_id,
+                channel_id,
+            } => self.handle_user_moved(client_id, channel_id),
+            NetworkMessage::ChannelJoinDenied { channel_id, reason } => {
+                self.handle_channel_join_denied(channel_id, reason);
+            }
+            NetworkMessage::ChannelListUpdated {
+                channels,
+                memberships,
+            } => self.handle_channels_updated(&channels, &memberships),
+            NetworkMessage::UserLeft {
+                client_id,
+                username,
+            } => self.handle_user_left(client_id, &username),
+            NetworkMessage::TextMessage {
+                client_id,
+                id,
+                ts,
+                username,
+                text,
+            } => {
+                let meta = Meta {
+                    id,
+                    ts: format_wall_time(ts),
+                    ts_ms: ts,
+                    day: local_day(ts),
+                    user: username,
+                    own: Some(client_id) == self.our_client_id,
+                    pending: false,
+                };
+                if meta.own {
+                    self.own_texts.insert(id, text.clone());
+                }
+                // Render shortcodes from clients that send them raw.
+                let text = app_core::emoji::replace_shortcodes(&text);
+                self.push_chat_message(&meta, &text, false);
+                // Ordinary messages are silent by design; a mention may
+                // chime if the person asked for it.
+                if !meta.own && self.settings.sounds.mention_on() && self.mentions_us(&text) {
+                    self.voice
+                        .tx
+                        .send(VoiceControl::PlaySound(SoundType::Mention))
+                        .ok();
+                }
+            }
+            NetworkMessage::UploadProgress { pct } => {
+                // The card's ring — a file's or an image's.
+                if let Some((conv, id)) = self.uploading {
+                    self.set_transfer(conv, id, Some((1, i32::from(pct.min(99)))));
+                }
+            }
+            NetworkMessage::ImageMessage {
+                client_id,
+                id,
+                ts,
+                username,
+                data,
+            } => {
+                let meta = Meta {
+                    id,
+                    ts: format_wall_time(ts),
+                    ts_ms: ts,
+                    day: local_day(ts),
+                    user: username.clone(),
+                    own: Some(client_id) == self.our_client_id,
+                    pending: false,
+                };
+                if meta.own {
+                    self.drop_image_card();
+                }
+                let shown =
+                    self.with_conversation(None, |app| media::push_image_row(app, &meta, data));
+                if !shown {
+                    self.push_chat_system(
+                        &t!("chat-image-undisplayable", "name" => username.as_str()),
+                    );
+                }
+            }
+            NetworkMessage::UserSpeaking {
+                client_id,
+                is_speaking,
+            } => {
+                if let Some(user) = self.users.get_mut(&client_id) {
+                    user.is_speaking = is_speaking;
+                }
+                self.update_user_list();
+            }
+            NetworkMessage::UserAudioState {
+                client_id,
+                muted,
+                deafened,
+            } => {
+                if let Some(user) = self.users.get_mut(&client_id) {
+                    user.is_self_muted = muted;
+                    user.is_self_deafened = deafened;
+                }
+                self.update_user_list();
+            }
+            NetworkMessage::NetworkStats {
+                rtt_ms,
+                loss_pct,
+                kbps_up,
+                kbps_down,
+            } => {
+                // Skip the label churn when nobody can see it (window in
+                // the tray or minimized). Labels refresh at the next 2 s
+                // sample once visible again.
+                if self.main_on_screen() {
+                    let audio_ms = self.voice.shared.jitter_buffer_ms.load(Ordering::Relaxed);
+                    self.update_latency(rtt_ms, loss_pct, Some(audio_ms), kbps_up, kbps_down);
+                }
+            }
+            NetworkMessage::ShareDenied { reason } => {
+                // The screen thread starts capturing optimistically
+                // before the server answers — stop it so local state
+                // matches the server's.
+                if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+                    self.screen.tx.send(ScreenControl::StopSharing).ok();
+                }
+                self.show_error(&format!("Screen share denied: {}", reason.describe()));
+            }
+            NetworkMessage::SubscribeDenied { target_id, reason } => {
+                // Close the viewer window WatchPeer opened optimistically.
+                if let Some(viewer) = self.viewers.remove(&target_id) {
+                    viewer.close();
+                }
+                let username = self.username_of(target_id);
+                self.push_chat_system(&format!("Can't watch {username}: {}", reason.describe()));
+            }
+            NetworkMessage::ScreenShareStarted {
+                client_id,
+                width,
+                height,
+                scope: _,
+            } => {
+                self.active_sharers.insert(client_id, (width, height));
+                self.sharer_ids = self.active_sharers.keys().copied().collect();
+                self.update_user_list();
+                // A stream going up in our channel — ours included: the
+                // sharer hears that they are live, the same as the room.
+                let in_our_channel = self
+                    .users
+                    .get(&client_id)
+                    .is_some_and(|u| Some(u.channel_id) == self.our_channel());
+                if in_our_channel && self.settings.sounds.share_started_on() {
+                    self.voice
+                        .tx
+                        .send(VoiceControl::PlaySound(SoundType::ShareStarted))
+                        .ok();
+                }
+            }
+            NetworkMessage::ScreenShareStopped { client_id } => {
+                self.active_sharers.remove(&client_id);
+                self.sharer_ids = self.active_sharers.keys().copied().collect();
+                self.update_user_list();
+            }
+            // ── 1.1.2: profiles and blobs (spec §7, §7.1) ────────────
+            NetworkMessage::UserProfile { client_id, profile } => {
+                self.take_profile(client_id, profile);
+            }
+            NetworkMessage::ProfileUpdated { user_id, profile } => {
+                let client = self
+                    .details
+                    .iter()
+                    .find(|(_, (u, _))| *u == user_id)
+                    .map(|(c, _)| *c);
+                if let Some(client_id) = client {
+                    self.take_profile(client_id, profile);
+                }
+            }
+            NetworkMessage::ProfileDenied { reason } => {
+                self.show_toast(ToastKind::Warning, &t!(profile_denied_key(reason)));
+            }
+            NetworkMessage::UserRenamed { client_id, name } => {
+                let old = self.username_of(client_id);
+                if let Some(user) = self.users.get_mut(&client_id) {
+                    user.username.clone_from(&name);
+                }
+                // The Messages list and an open DM header follow a
+                // partner's rename.
+                let renamed_partner = self
+                    .details
+                    .get(&client_id)
+                    .map(|(u, _)| *u)
+                    .filter(|u| self.dm_meta.contains_key(u));
+                if let Some(user_id) = renamed_partner {
+                    if let Some(meta) = self.dm_meta.get_mut(&user_id) {
+                        meta.name.clone_from(&name);
+                    }
+                    self.rebuild_dms_model();
+                    if self.active_dm == Some(user_id) {
+                        self.main
+                            .global::<State>()
+                            .set_conv_name(name.as_str().into());
+                    }
+                }
+                // Every row they authored, in every conversation, takes
+                // the new name (their look follows: profiles are keyed
+                // by session, and the roster row now carries the name).
+                self.rename_author(&old, &name);
+                self.push_chat_system(&t!(
+                    "chat-user-renamed",
+                    "old" => old.as_str(),
+                    "new" => name.as_str()
+                ));
+                self.update_user_list();
+            }
+            NetworkMessage::RenameDenied { reason } => {
+                self.show_toast(ToastKind::Warning, &t!(rename_denied_key(reason)));
+            }
+            NetworkMessage::UploadDone { upload_id, blob_id } => {
+                if let Some(upload) = self.pending_uploads.remove(&upload_id) {
+                    self.file_uploaded(upload_id, upload, blob_id);
+                } else if upload_id == AVATAR_UPLOAD_ID {
+                    // The picture is on the server: now the profile
+                    // can point at it.
+                    self.own_avatar_blob = Some(blob_id);
+                    self.avatar_images
+                        .entry(blob_id)
+                        .or_insert_with(|| self.own_avatar.clone().unwrap_or_default());
+                    self.send_own_profile();
+                }
+            }
+            NetworkMessage::UploadRejected { upload_id, reason } => {
+                if let Some(upload) = self.pending_uploads.remove(&upload_id) {
+                    self.pending_picture_uploads.remove(&upload_id);
+                    self.uploading = None;
+                    self.transfers.remove(&(upload.conv, upload.placeholder));
+                    self.with_conversation(upload.conv, |app| {
+                        if let Some(delta) = app.history.discard_message(upload.placeholder) {
+                            app.sync_range(&delta);
+                        }
+                    });
+                    let line = t!(
+                        "file-upload-failed",
+                        "name" => upload.name.as_str(),
+                        "why" => reason.describe()
+                    );
+                    self.show_toast(ToastKind::Warning, &line);
+                } else if upload_id == AVATAR_UPLOAD_ID {
+                    self.show_toast(
+                        ToastKind::Warning,
+                        &t!("profile-avatar-refused", "why" => reason.describe()),
+                    );
+                    // The rest of the look still goes out.
+                    self.own_avatar_blob = None;
+                    self.send_own_profile();
+                }
+            }
+            NetworkMessage::BlobProgress { blob_id, pct } => {
+                if let Some(d) = self.pending_downloads.get(&blob_id) {
+                    let (conv, msg_id) = (d.conv, d.msg_id);
+                    self.set_transfer(conv, msg_id, Some((2, i32::from(pct))));
+                }
+            }
+            NetworkMessage::BlobFailed { blob_id } => {
+                if let Some(PendingDownload { name, conv, msg_id }) =
+                    self.pending_downloads.remove(&blob_id)
+                {
+                    self.set_transfer(conv, msg_id, None);
+                    self.show_toast(
+                        ToastKind::Warning,
+                        &t!("file-download-broken", "name" => name.as_str()),
+                    );
+                }
+            }
+            NetworkMessage::Blob { blob_id, data } => {
+                if let Some(rows) = self.pending_pictures.remove(&blob_id) {
+                    for (conv, msg_id) in rows {
+                        let bytes = data.clone();
+                        self.with_conversation(conv, |app| {
+                            media::picture_from_file(app, msg_id, bytes);
+                        });
+                    }
+                }
+                if let Some(PendingDownload { name, conv, msg_id }) =
+                    self.pending_downloads.remove(&blob_id)
+                {
+                    self.set_transfer(conv, msg_id, None);
+                    match media::save_to_downloads(&name, &data) {
+                        Ok(path) => {
+                            // The card turns into Open (a check, a
+                            // re-download beside it); a toast says where.
+                            let line = t!("file-saved", "path" => path.display().to_string());
+                            self.downloaded.insert(blob_id, path);
+                            self.set_transfer(conv, msg_id, None);
+                            self.show_toast(ToastKind::Success, &line);
+                        }
+                        Err(e) => self.show_error(&t!(
+                            "file-save-error",
+                            "name" => name.as_str(),
+                            "error" => e.to_string()
+                        )),
+                    }
+                } else {
+                    self.avatar_fetches.remove(&blob_id);
+                    self.take_avatar_bytes(blob_id, &data, true);
+                }
+            }
+            NetworkMessage::BlobMissing { blob_id } => {
+                self.pending_pictures.remove(&blob_id);
+                if let Some(PendingDownload { name, conv, msg_id }) =
+                    self.pending_downloads.remove(&blob_id)
+                {
+                    self.set_transfer(conv, msg_id, None);
+                    self.show_toast(
+                        ToastKind::Warning,
+                        &t!("file-download-failed", "name" => name.as_str()),
+                    );
+                } else {
+                    self.avatar_fetches.remove(&blob_id);
+                }
+            }
+            // ── 1.1.1: direct messages — the conversation UI is the
+            // next drop; until then a DM lands in the general view
+            // marked as such, and a refusal is a toast. ───────────
+            NetworkMessage::Direct {
+                from,
+                username,
+                id,
+                ts,
+                text,
+            } => {
+                self.take_direct(from, &username, id, ts, Incoming::Text(&text));
+            }
+            NetworkMessage::MessageAck { client_ref, msg_id } => {
+                if let Some((key, placeholder)) = self
+                    .pending_dm_sends
+                    .remove(&client_ref)
+                    .or_else(|| self.pending_files.remove(&client_ref))
+                {
+                    self.transfers.remove(&(key, placeholder));
+                    let picture = self.picture_acks.remove(&client_ref);
+                    self.with_conversation(key, |app| {
+                        // Confirm first: the rebuild that follows keeps a
+                        // picture only when the row's id stays the same,
+                        // so the picture goes in under the final id.
+                        if let Some(delta) = app.history.confirm_message(placeholder, msg_id) {
+                            app.sync_range(&delta);
+                        }
+                        app.oldest_history_id.get_or_insert(msg_id);
+                        if let Some(png) = picture {
+                            media::picture_from_file(app, msg_id, png);
+                        }
+                    });
+                    if let Some(user) = key
+                        && let Some(meta) = self.dm_meta.get_mut(&user)
+                    {
+                        meta.last_msg_id = meta.last_msg_id.max(msg_id);
+                    }
+                }
+            }
+            NetworkMessage::MessageFailed { client_ref, reason } => {
+                if let Some((key, placeholder)) = self
+                    .pending_dm_sends
+                    .remove(&client_ref)
+                    .or_else(|| self.pending_files.remove(&client_ref))
+                {
+                    self.with_conversation(key, |app| {
+                        if let Some(delta) = app.history.discard_message(placeholder) {
+                            app.sync_range(&delta);
+                        }
+                    });
+                }
+                self.show_toast(ToastKind::Warning, &t!(dm_failed_key(reason)));
+            }
+            NetworkMessage::Conversations { dms } => {
+                // The list from the store: names, unread counts, the
+                // newest id per partner. Histories load when opened.
+                self.dm_order.clear();
+                for dm in dms {
+                    // Closed by its ✕ and nothing new since: stays out.
+                    if dm.unread == 0 && self.dm_hidden(&dm.user_id) {
+                        continue;
+                    }
+                    if dm.unread > 0 {
+                        self.set_dm_hidden(dm.user_id, false);
+                    }
+                    let meta = self.dm_meta.entry(dm.user_id).or_insert_with(|| DmMeta {
+                        name: dm.name.clone(),
+                        unread: 0,
+                        last_ts: 0,
+                        last_msg_id: 0,
+                        fetched: false,
+                    });
+                    meta.name = dm.name;
+                    meta.unread = dm.unread;
+                    meta.last_ts = dm.last_ts;
+                    meta.last_msg_id = dm.last_msg_id;
+                    self.dm_order.push(dm.user_id);
+                }
+                // The admin channel is ours, not the store's: it keeps
+                // its place at the top.
+                if self.dm_meta.contains_key(&ADMIN_CHANNEL_KEY) {
+                    self.dm_order.insert(0, ADMIN_CHANNEL_KEY);
+                }
+                self.rebuild_dms_model();
+            }
+            // Hot-path variants routed straight to the voice/screen
+            // threads by the network loop. They should never arrive
+            // here; if they do we silently ignore them.
+            NetworkMessage::SystemAudioData { .. }
+            | NetworkMessage::VoiceData { .. }
+            | NetworkMessage::VideoFrame { .. }
+            | NetworkMessage::StreamHealth { .. }
+            | NetworkMessage::VoiceReceiverReport { .. }
+            | NetworkMessage::UplinkVideo { .. }
+            | NetworkMessage::KeyframeRequested { .. } => {}
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  CONNECTION FLOW
+    // ════════════════════════════════════════════════════════════════
+}
