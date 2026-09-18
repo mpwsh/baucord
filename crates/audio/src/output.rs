@@ -478,10 +478,7 @@ fn worker_loop(parts: WorkerParts) {
     #[allow(clippy::cast_possible_truncation)]
     let _rt = crate::platform::promote_current_thread(HOP as u32, OPUS_SAMPLE_RATE);
 
-    debug!(
-        "Output worker started (device {}Hz, resample={})",
-        device_sample_rate, needs_resample
-    );
+    debug!("Output worker started (device {device_sample_rate}Hz, resample={needs_resample})");
     while !should_stop.load(Ordering::Relaxed) {
         // Drain ALL inbound packets into the jitter buffer. Arrival was
         // stamped at intake; the packet buffers sort by sequence.
@@ -557,7 +554,7 @@ fn worker_loop(parts: WorkerParts) {
             // clip and the "limiter" audibly does nothing.
             let gain = f32::from_bits(output_gain.load(Ordering::Relaxed));
             if (gain - 1.0).abs() > f32::EPSILON {
-                for s in hop_buf.iter_mut() {
+                for s in &mut hop_buf {
                     *s *= gain;
                 }
             }

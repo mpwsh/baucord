@@ -74,7 +74,7 @@ const BYTES_PER_SAMPLE: usize = std::mem::size_of::<f32>();
 const BYTES_PER_FRAME: usize = CAPTURE_CHANNELS * BYTES_PER_SAMPLE;
 
 /// Engine capture buffer: 20 ms in 100-ns units — the value used by both
-/// Microsoft's ApplicationLoopback sample and wasapi-rs's own example.
+/// Microsoft's `ApplicationLoopback` sample and wasapi-rs's own example.
 /// Latency is governed by how fast we drain (event-driven), not by this.
 const BUFFER_DURATION_HNS: i64 = 200_000;
 
@@ -316,7 +316,7 @@ fn run_pump(
         // Drain every packet queued behind this event before waiting again.
         loop {
             let frames = match capture.get_next_packet_size() {
-                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(0) | None) => break,
                 Ok(Some(frames)) => frames as usize,
                 Err(e) => {
                     consecutive_errors += 1;

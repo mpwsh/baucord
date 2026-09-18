@@ -23,7 +23,7 @@
 //!
 //! What stays in `AdaptiveJitterBuffer` untouched: jitter estimation,
 //! priming, deferred underrun classification, drift compensation, mix
-//! normalisation, per-peer limiter, adapt(). Only the storage type and
+//! normalisation, per-peer limiter, `adapt()`. Only the storage type and
 //! the pull call change.
 //!
 use std::collections::VecDeque;
@@ -234,6 +234,7 @@ impl PacketBuffer {
     // ── Depth ───────────────────────────────────────────────────────
 
     /// Nothing buffered and nothing staged.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty() && self.pos >= self.staged
     }
@@ -245,6 +246,7 @@ impl PacketBuffer {
     ///
     /// This is the drop-in for every `peer.samples.len()` in
     /// `jitter_buffer.rs` (priming, headroom, hard cap).
+    #[must_use]
     pub fn buffered_media(&self) -> usize {
         let staged_left = self.staged.saturating_sub(self.pos);
         let (Some(head), Some(last)) = (self.slots.front(), self.slots.back()) else {
@@ -293,6 +295,7 @@ impl PacketBuffer {
     }
 
     /// Duration of the most recently decoded real frame (samples).
+    #[must_use]
     pub fn last_frame_samples(&self) -> usize {
         self.last_real_samples
     }
@@ -414,9 +417,8 @@ impl PacketBuffer {
             if media_gap != 0 {
                 self.next_ts = head_ts;
             }
-            let slot = match self.slots.pop_front() {
-                Some(s) => s,
-                None => return Refill::Dry, // unreachable, keeps the borrow checker calm
+            let Some(slot) = self.slots.pop_front() else {
+                return Refill::Dry; // unreachable, keeps the borrow checker calm
             };
             return self.decode_real(&slot);
         }

@@ -390,7 +390,7 @@ pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
         ],
         MessageKind::File => vec![Entry::new(Label::SaveFile, Action::SaveFile)],
         MessageKind::Code => vec![Entry::new(Label::Copy, Action::CopyText)],
-        _ => vec![Entry::new(Label::CopyMessage, Action::CopyText)],
+        MessageKind::Text => vec![Entry::new(Label::CopyMessage, Action::CopyText)],
     };
     if m.kind == MessageKind::Text && m.styled {
         entries.push(if m.selecting {

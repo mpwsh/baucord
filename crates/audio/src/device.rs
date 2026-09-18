@@ -20,8 +20,8 @@
 //! the next backend or driver that lies. A probe stream is never played;
 //! it costs one extra device open at startup.
 //!
-//! Platform notes: CoreAudio honours a 48 kHz request by switching the
-//! device's nominal rate — the same thing every other VoIP client does.
+//! Platform notes: `CoreAudio` honours a 48 kHz request by switching the
+//! device's nominal rate — the same thing every other `VoIP` client does.
 //! WASAPI shared mode (cpal ≥ 0.18.2) converts inside the audio engine
 //! instead, so on a 44.1 kHz Windows mixer the OS does the resampling and
 //! this crate's resampler stays idle either way.
@@ -116,7 +116,7 @@ fn pick_48k(
 /// Windows: `CAPTURE_BUFFER_MS`, but only if a throwaway stream opens
 /// with it — cpal feeds the duration straight into `Initialize` with no
 /// retry, and a refused duration used to mean total silence in the field.
-/// Elsewhere: the existing ~10 ms low-latency request (CoreAudio and ALSA
+/// Elsewhere: the existing ~10 ms low-latency request (`CoreAudio` and ALSA
 /// report honest ranges and their capture paths are not the ones starving).
 pub fn capture_buffer_size(device: &Device, cfg: &SupportedStreamConfig) -> BufferSize {
     if cfg!(windows) {

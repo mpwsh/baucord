@@ -33,7 +33,6 @@ rustls = { version = "0.23.43", default-features = false, features = [
   "ring",
   "std",
 ] }
-rustls-pki-types = "1.15"
 # Self-signed Ed25519 identity certificates and the successor extension.
 rcgen = { version = "0.14.10", default-features = false, features = [
   "ring",

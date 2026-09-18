@@ -20,6 +20,7 @@ pub enum PayloadType {
 
 impl PayloadType {
     /// Decode the wire byte. `None` for values this version doesn't know.
+    #[must_use]
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Opus),
@@ -52,12 +53,14 @@ pub struct AudioPacket {
 
 impl AudioPacket {
     /// Create a plain Opus packet.
+    #[must_use]
     pub fn new(seq: u32, ts_48k: u32, ssrc: u64, opus_data: Vec<u8>) -> Self {
         Self::new_typed(seq, ts_48k, ssrc, PayloadType::Opus, opus_data)
     }
 
     /// Create a packet with an explicit payload type (what a receiver
     /// should call after reading the type byte off the wire).
+    #[must_use]
     pub fn new_typed(
         seq: u32,
         ts_48k: u32,

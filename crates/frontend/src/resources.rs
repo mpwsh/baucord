@@ -99,6 +99,7 @@ pub fn native_monitor_memory() -> Option<u64> {
 /// this process, or `None` when the syscall fails (the caller then
 /// falls back to sysinfo's figure).
 #[cfg(target_os = "windows")]
+#[must_use]
 pub fn native_monitor_memory() -> Option<u64> {
     // PROCESS_MEMORY_COUNTERS_EX2 (psapi.h). The EX2 tail
     // (PrivateWorkingSetSize) is what Task Manager's "Memory" column
@@ -143,7 +144,7 @@ pub fn native_monitor_memory() -> Option<u64> {
         let process = GetCurrentProcess();
 
         counters.cb = full;
-        if K32GetProcessMemoryInfo(process, &mut counters, full) != 0
+        if K32GetProcessMemoryInfo(process, &raw mut counters, full) != 0
             && counters.private_working_set_size != 0
         {
             return Some(counters.private_working_set_size as u64);
@@ -151,7 +152,7 @@ pub fn native_monitor_memory() -> Option<u64> {
 
         counters = std::mem::zeroed();
         counters.cb = ex_size;
-        if K32GetProcessMemoryInfo(process, &mut counters, ex_size) != 0 {
+        if K32GetProcessMemoryInfo(process, &raw mut counters, ex_size) != 0 {
             return Some(counters.private_usage as u64);
         }
     }

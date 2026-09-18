@@ -6,11 +6,10 @@ fn main() {
     env_logger::init();
 
     let quality = match std::env::args().nth(1).as_deref() {
-        Some("hd30") => Quality::HD30,
         Some("hd60") => Quality::HD60,
         Some("fhd30") => Quality::FHD30,
         Some("fhd60") => Quality::FHD60,
-        _ => Quality::HD30,
+        _ => Quality::HD30, // the default, "hd30" included
     };
 
     let seconds: u64 = std::env::args()
@@ -18,7 +17,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
 
-    println!("Stream benchmark: {} for {}s", quality, seconds);
+    println!("Stream benchmark: {quality} for {seconds}s");
 
     let mut capturer = ScreenCapturer::primary(quality).expect("Failed to create capturer");
     let mut encoder = FfmpegEncoder::new(quality).expect("Failed to create encoder");
@@ -68,7 +67,7 @@ fn main() {
         if second_start.elapsed() >= Duration::from_secs(1) {
             let mbps = second_bytes as f64 * 8.0 / 1_000_000.0;
             let avg_kb = if second_frames > 0 {
-                second_bytes as f64 / second_frames as f64 / 1024.0
+                second_bytes as f64 / f64::from(second_frames) / 1024.0
             } else {
                 0.0
             };
@@ -87,20 +86,17 @@ fn main() {
 
         let elapsed = frame_start.elapsed();
         if elapsed < frame_duration {
-            std::thread::sleep(frame_duration - elapsed);
+            std::thread::sleep(frame_duration.checked_sub(elapsed).unwrap());
         } else {
             frames_dropped += 1;
         }
     }
 
     let total_secs = start.elapsed().as_secs_f64();
-    println!("\n--- Summary ({}) ---", quality);
+    println!("\n--- Summary ({quality}) ---");
     println!("  Encoder:  {}", encoder.encoder_name());
-    println!(
-        "  Encoded:  {} frames in {:.1}s",
-        frames_encoded, total_secs
-    );
-    println!("  Dropped:  {} frames", frames_dropped);
+    println!("  Encoded:  {frames_encoded} frames in {total_secs:.1}s");
+    println!("  Dropped:  {frames_dropped} frames");
     println!("  Avg FPS:  {:.1}", frames_encoded as f64 / total_secs);
     println!("  Total:    {:.2} MB", total_bytes as f64 / 1_048_576.0);
     println!(

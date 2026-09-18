@@ -22,13 +22,14 @@ use super::{AudioProcessor, FrameContext};
 pub struct GainStage;
 
 impl GainStage {
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
 }
 
 impl AudioProcessor for GainStage {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "gain"
     }
 

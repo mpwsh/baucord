@@ -48,6 +48,7 @@ impl Limiter {
     ///
     /// Per-sample coefficients for 48 kHz; any block length works.
     /// Threshold 0.4 (~-8 dBFS) — normal speech sits around 0.05–0.15.
+    #[must_use]
     pub fn new() -> Self {
         // Coefficients for 48 kHz:
         // attack ~1 ms:   1 - e^(-1 / (0.001 * 48000)) ≈ 0.021

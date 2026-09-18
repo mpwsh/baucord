@@ -69,11 +69,13 @@ impl Default for ClampStage {
 
 impl ClampStage {
     /// Create a peak stage with the default ceiling (0.95).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_ceiling(0.95)
     }
 
     /// Create a peak stage with a custom ceiling in the range [0.1, 1.0].
+    #[must_use]
     pub fn with_ceiling(ceiling: f32) -> Self {
         Self {
             ceiling: ceiling.clamp(0.1, 1.0),
@@ -84,13 +86,14 @@ impl ClampStage {
     }
 
     /// Current gain being applied (for diagnostics). 1.0 = no reduction.
+    #[must_use]
     pub fn current_gain(&self) -> f32 {
         self.gain
     }
 }
 
 impl AudioProcessor for ClampStage {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "clamp"
     }
 
@@ -290,6 +293,10 @@ mod tests {
         stage.process(&mut spike, &mut ctx);
         assert!(stage.current_gain() < 1.0);
         stage.reset();
-        assert_eq!(stage.current_gain(), 1.0);
+        // `reset` assigns the literal 1.0; nothing is computed.
+        #[expect(clippy::float_cmp)]
+        {
+            assert_eq!(stage.current_gain(), 1.0);
+        }
     }
 }

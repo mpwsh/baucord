@@ -51,9 +51,10 @@ pub fn clipboard_png() -> Option<Vec<u8>> {
 // syscall sequences, layouts from winuser.h/shellapi.h, no new deps.
 // The workspace otherwise avoids `unsafe`; this is the deliberate
 // exception alongside resources.rs.
-/// First file on the clipboard (CF_HDROP), if any.
+/// First file on the clipboard (`CF_HDROP`), if any.
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
+#[must_use]
 pub fn clipboard_file() -> Option<std::path::PathBuf> {
     use core::ffi::c_void;
     use std::os::windows::ffi::OsStringExt;
@@ -105,6 +106,7 @@ pub fn clipboard_file() -> Option<std::path::PathBuf> {
 /// (written by Chromium-family browsers), if any.
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
+#[must_use]
 pub fn clipboard_png() -> Option<Vec<u8>> {
     use core::ffi::c_void;
 
@@ -124,7 +126,7 @@ pub fn clipboard_png() -> Option<Vec<u8>> {
     }
 
     // "PNG\0" as UTF-16.
-    let name: [u16; 4] = [b'P' as u16, b'N' as u16, b'G' as u16, 0];
+    let name: [u16; 4] = [u16::from(b'P'), u16::from(b'N'), u16::from(b'G'), 0];
 
     unsafe {
         let format = RegisterClipboardFormatW(name.as_ptr());
@@ -171,6 +173,7 @@ pub fn clipboard_png() -> Option<Vec<u8>> {
 // ── Plain text (all platforms, via arboard) ─────────────────────────────
 
 /// Read the clipboard as plain text.
+#[must_use]
 pub fn clipboard_text() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
 }

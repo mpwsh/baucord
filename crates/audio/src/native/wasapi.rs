@@ -507,7 +507,7 @@ fn run_capture(
         // Drain every packet queued behind this event.
         loop {
             let frames = match capture.get_next_packet_size() {
-                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(0) | None) => break,
                 Ok(Some(frames)) => frames as usize,
                 Err(e) => {
                     consecutive_errors += 1;

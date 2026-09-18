@@ -730,16 +730,18 @@ impl ClientMessage {
     #[must_use]
     pub fn lane(&self) -> Lane {
         match self {
-            // Timely, tiny, must never queue behind chat.
+            // Timely, tiny, must never queue behind chat; an upload's
+            // announcement and a blob fetch ride here too (spec §7).
             ClientMessage::RequestKeyframe { .. }
             | ClientMessage::SubscribeScreen { .. }
             | ClientMessage::UnsubscribeScreen { .. }
-            | ClientMessage::JoinChannel { .. } => Lane::Signal,
+            | ClientMessage::JoinChannel { .. }
+            | ClientMessage::UploadBegin { .. }
+            | ClientMessage::FetchBlob { .. } => Lane::Signal,
             // Bulk rides its own stream per upload.
             ClientMessage::ChatImageChunk { .. }
             | ClientMessage::LogUploadChunk { .. }
             | ClientMessage::UploadChunk { .. } => Lane::Media,
-            ClientMessage::UploadBegin { .. } | ClientMessage::FetchBlob { .. } => Lane::Signal,
             _ => Lane::Control,
         }
     }

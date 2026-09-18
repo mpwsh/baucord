@@ -119,6 +119,7 @@ impl HotkeyManager {
     ///
     /// Reads our own channel (see [`event_channel`]) — with an event
     /// handler installed, the crate's built-in receiver never fires.
+    #[must_use]
     pub fn poll(&self) -> Option<(BindableAction, bool)> {
         if let Ok(edge) = self.watch_rx.try_recv() {
             return Some(edge);
@@ -146,15 +147,12 @@ impl HotkeyManager {
         let mut taken: Vec<BindableAction> = Vec::new();
         if !watched.is_empty() {
             taken = watched.iter().map(|(a, _, _)| *a).collect();
-            match KeyWatcher::start(watched, self.watch_tx.clone()) {
-                Some(w) => {
-                    info!("Watching {} keybind(s); none registered", taken.len());
-                    self.watcher = Some(w);
-                }
-                None => {
-                    info!("Key state not readable here; registering hotkeys instead");
-                    taken.clear();
-                }
+            if let Some(w) = KeyWatcher::start(watched, self.watch_tx.clone()) {
+                info!("Watching {} keybind(s); none registered", taken.len());
+                self.watcher = Some(w);
+            } else {
+                info!("Key state not readable here; registering hotkeys instead");
+                taken.clear();
             }
         }
 
@@ -301,12 +299,11 @@ impl KeyWatcher {
         }
         // Opening the state is quick; a platform that cannot (Wayland,
         // a macOS without the accessibility grant) says so at once.
-        match ready_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(true) => Some(Self { stop }),
-            _ => {
-                stop.store(true, Ordering::Relaxed);
-                None
-            }
+        if let Ok(true) = ready_rx.recv_timeout(Duration::from_secs(2)) {
+            Some(Self { stop })
+        } else {
+            stop.store(true, Ordering::Relaxed);
+            None
         }
     }
 }

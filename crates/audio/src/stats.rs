@@ -126,7 +126,7 @@ pub struct AudioStats {
     pub pipeline_level: AtomicU32,
 
     // ── Pipeline state ──────────────────────────────────────────────────
-    /// Speaking indicator: RNNoise speech probability + open gate, with
+    /// Speaking indicator: `RNNoise` speech probability + open gate, with
     /// hold (see `processor::speaking`).
     pub vad_active: AtomicBool,
     pub denoise_active: AtomicBool,
@@ -143,6 +143,7 @@ impl Default for AudioStats {
     }
 }
 impl AudioStats {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             packets_sent: AtomicU64::new(0),
@@ -220,11 +221,12 @@ impl AudioStats {
     /// as they do on the wire — the old estimate assumed 100 packets/s of
     /// average size regardless.
     pub fn estimated_send_kbps(&self) -> f32 {
+        // Opus framing (~16 B) plus UDP/IP headers (28 B) per packet.
+        const OVERHEAD_BYTES: f32 = 16.0 + 28.0;
         let elapsed = self.start_time.elapsed().as_secs_f32();
         if elapsed < 0.5 {
             return 0.0;
         }
-        const OVERHEAD_BYTES: f32 = 16.0 + 28.0;
         #[allow(clippy::cast_precision_loss)]
         let bytes = self.bytes_sent.load(Ordering::Relaxed) as f32
             + self.packets_sent.load(Ordering::Relaxed) as f32 * OVERHEAD_BYTES;

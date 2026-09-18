@@ -575,6 +575,7 @@ dm-failed-store = The server couldn't store the message. Try again.
 messages-header = Messages
 voice-header = Voice
 lobby-banner = Join a voice channel to start talking
+drop-to-send = Drop to send
 lobby-mic-hint = Join a channel to talk
 messages-collapse = Collapse messages
 messages-expand = Expand messages

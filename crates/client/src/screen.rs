@@ -642,7 +642,7 @@ const PACE_SCALES: [f32; 3] = [1.0, 0.75, 0.5];
 /// Minimum time between pace changes.
 const PACE_STEP_COOLDOWN: Duration = Duration::from_secs(2);
 /// Repeated viewer keyframe requests mean a viewer keeps failing to
-/// keep a picture. This many requests within PACE_DISTRESS_WINDOW steps
+/// keep a picture. This many requests within `PACE_DISTRESS_WINDOW` steps
 /// the pace down — unless loss on either leg explains them (see
 /// `PACE_LOSS_GATE_PCT`), in which case fewer frames per second fixes
 /// nothing and the transport's resends / the bitrate ladder are the
@@ -671,7 +671,7 @@ const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// and encodes on the next tick.
 const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Upper bound on a keyframe "burst" (see CaptureState::keyframe_burst_until):
+/// Upper bound on a keyframe "burst" (see `CaptureState::keyframe_burst_until)`:
 /// when the encoder can't force IDRs (AMF), a viewer's keyframe request
 /// makes us encode every tick — static screen or not — until the
 /// encoder's own IDR period elapses. At the 2 s AMF IDR period a burst
@@ -870,7 +870,7 @@ fn run_screen_loop(
                     let _ = network_tx.try_send(NetworkControl::SendSystemAudio {
                         seq: pkt.seq,
                         channels: pkt.channels,
-                        duration_ms: pkt.duration_ms as u16,
+                        duration_ms: u16::from(pkt.duration_ms),
                         data: pkt.data,
                     });
                 }
@@ -1588,7 +1588,7 @@ fn decode_incoming_system_audio(
 
 // ── Encoder/decoder factory ─────────────────────────────────────────────
 
-/// Create the video encoder (FFmpeg is currently the only backend).
+/// Create the video encoder (`FFmpeg` is currently the only backend).
 fn create_encoder(
     quality: Quality,
 ) -> Result<(Box<dyn VideoEncoder + Send>, &'static str), CodecError> {
@@ -1605,7 +1605,7 @@ fn create_encoder(
     }
 }
 
-/// Create the video decoder (FFmpeg is currently the only backend).
+/// Create the video decoder (`FFmpeg` is currently the only backend).
 fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
     match FfmpegDecoder::new() {
         Ok(dec) => Ok(Box::new(dec)),

@@ -180,6 +180,7 @@ pub struct GifPlayer {
 }
 
 impl GifPlayer {
+    #[must_use]
     pub fn new(bytes: Rc<Vec<u8>>, first: slint::Image) -> Self {
         Self {
             bytes,
@@ -235,6 +236,7 @@ impl GifPlayer {
         self.playing()
     }
 
+    #[must_use]
     pub fn playing(&self) -> bool {
         !matches!(self.mode, GifMode::Frozen)
     }
@@ -278,17 +280,16 @@ impl GifPlayer {
         let mut latest = None;
         for _ in 0..4 {
             self.in_frame_ms -= self.current_delay_ms;
-            let frame = match stream.next_frame() {
-                Some(frame) => frame,
-                None => {
-                    // End of stream: loop.
-                    if !stream.rewind() {
-                        break;
-                    }
-                    match stream.next_frame() {
-                        Some(frame) => frame,
-                        None => break,
-                    }
+            let frame = if let Some(frame) = stream.next_frame() {
+                frame
+            } else {
+                // End of stream: loop.
+                if !stream.rewind() {
+                    break;
+                }
+                match stream.next_frame() {
+                    Some(frame) => frame,
+                    None => break,
                 }
             };
             self.current_delay_ms = f64::from(frame.delay_ms);
@@ -297,28 +298,25 @@ impl GifPlayer {
                 break;
             }
         }
-        match latest {
-            Some(frame) => {
-                // Drop any remaining catch-up debt: decoding more than
-                // a few frames per tick would stall the UI thread.
-                self.in_frame_ms = self.in_frame_ms.min(self.current_delay_ms);
-                let (width, height) = self
-                    .stream
-                    .as_ref()
-                    .map_or((0, 0), gif::GifStream::dimensions);
-                GifStep::Blit {
-                    rgba: frame.rgba,
-                    width,
-                    height,
-                }
+        if let Some(frame) = latest {
+            // Drop any remaining catch-up debt: decoding more than
+            // a few frames per tick would stall the UI thread.
+            self.in_frame_ms = self.in_frame_ms.min(self.current_delay_ms);
+            let (width, height) = self
+                .stream
+                .as_ref()
+                .map_or((0, 0), gif::GifStream::dimensions);
+            GifStep::Blit {
+                rgba: frame.rgba,
+                width,
+                height,
             }
-            None => {
-                // Rewind failed or stream empty: end playback cleanly.
-                self.mode = GifMode::Frozen;
-                self.stream = None;
-                GifStep::Freeze {
-                    first: self.first.clone(),
-                }
+        } else {
+            // Rewind failed or stream empty: end playback cleanly.
+            self.mode = GifMode::Frozen;
+            self.stream = None;
+            GifStep::Freeze {
+                first: self.first.clone(),
             }
         }
     }
@@ -378,6 +376,16 @@ pub fn paste_into_chat(app: &mut AppState) {
             .collect();
         s.set_draft(capped.into());
     }
+}
+
+/// A file dropped on the window from the OS: the same road as a picked
+/// or pasted path. Several files arrive as several drops; a picture
+/// takes the preview (the last one wins it), anything else uploads.
+pub fn drop_path(app: &mut AppState, path: &std::path::Path) {
+    if !app.connected {
+        return;
+    }
+    attach_path(app, path);
 }
 
 /// Load an image file from disk into the preview.

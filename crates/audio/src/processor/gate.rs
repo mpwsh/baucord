@@ -140,6 +140,7 @@ impl NoiseGate {
     }
 
     /// Whether the gate is currently passing audio.
+    #[must_use]
     pub fn is_open(&self) -> bool {
         matches!(
             self.state,
@@ -241,7 +242,7 @@ impl NoiseGate {
 }
 
 impl AudioProcessor for NoiseGate {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "gate"
     }
 
@@ -271,6 +272,7 @@ pub struct Knobs {
 
 impl Knobs {
     /// Create with an explicit threshold.
+    #[must_use]
     pub fn with_threshold(threshold: f32) -> Self {
         Self {
             threshold: AtomicU32::new(threshold.clamp(0.001, 0.5).to_bits()),

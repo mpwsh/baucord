@@ -192,6 +192,8 @@ export global State {
     /// use, device unlinked, removed by an admin).
     in property <string> connect-notice;
     in property <string> error-text;       // 5s toast, cleared by host
+    /// A file from the OS is being dragged over the window.
+    in property <bool> drop-hover: false;
     in property <ToastKind> toast-kind: ToastKind.error;
     in property <string> device-warning;   // "saved mic missing" notice
 

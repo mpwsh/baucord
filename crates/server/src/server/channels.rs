@@ -313,9 +313,9 @@ impl ChatServer {
             .user_channel_at(channel_id)
             .is_some_and(|c| c.owner == Some(user));
         let perms = self.effective_permissions(&user);
-        if !(owner_here && permissions::has(perms, permissions::MANAGE_OWN_CHANNELS))
-            && !permissions::has(perms, permissions::MANAGE_CHANNELS)
-        {
+        let may_manage = permissions::has(perms, permissions::MANAGE_CHANNELS)
+            || (owner_here && permissions::has(perms, permissions::MANAGE_OWN_CHANNELS));
+        if !may_manage {
             self.deny_channel(client, ChannelUiDenyReason::NoPermission);
             return;
         }

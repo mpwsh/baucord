@@ -181,6 +181,9 @@ impl Drop for VoiceThreadHandle {
 /// hint and jitter depth are recorded for after-the-fact diagnosis.
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+// Mute, deafen, push-to-talk and the rest are independent switches
+// the loop reads every packet; their combinations are all valid.
+#[expect(clippy::struct_excessive_bools)]
 struct VoiceLoopState {
     vc: Option<VoiceChat>,
     our_client_id: Option<u64>,
@@ -457,7 +460,7 @@ fn run_voice_loop(
                 }
             }
         } else {
-            let outgoing = state.vc.as_ref().map(|v| v.outgoing_receiver());
+            let outgoing = state.vc.as_ref().map(audio::VoiceChat::outgoing_receiver);
             select! {
                 recv(control_rx) -> msg => match msg {
                     Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
@@ -497,12 +500,12 @@ fn run_voice_loop(
         if let Some(voice) = state.vc.as_ref() {
             // Forward encoded packets to network (or drain in test mode)
             if let Some(id) = state.our_client_id {
-                if !is_testing_mic.load(Ordering::Relaxed) {
+                if is_testing_mic.load(Ordering::Relaxed) {
+                    while voice.outgoing_receiver().try_recv().is_ok() {}
+                } else {
                     for packet in voice.take_outgoing_packets() {
                         forward_outgoing(&network_tx, id, packet);
                     }
-                } else {
-                    while voice.outgoing_receiver().try_recv().is_ok() {}
                 }
             }
 

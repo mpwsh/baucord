@@ -110,8 +110,8 @@ pub struct AppState {
     pub(crate) channels: Vec<ChannelMeta>,
     /// The wire list as last received (`Init` / `ChannelListUpdated`).
     channel_infos: Vec<client::ChannelInfo>,
-    /// Channel a JoinChannel is in flight for (the password prompt's
-    /// target; also lets a WrongPassword reply reopen the prompt).
+    /// Channel a `JoinChannel` is in flight for (the password prompt's
+    /// target; also lets a `WrongPassword` reply reopen the prompt).
     pending_channel_join: Option<u16>,
     pub connected: bool,
     pub settings: Settings,
@@ -185,14 +185,19 @@ pub struct AppState {
     /// A server voice mute stands (spec §4.2): the mute button is
     /// locked, and `Some(was_muted)` remembers what to restore.
     server_muted: Option<bool>,
-    /// A server text mute stands: the composer refuses to send.
-    text_muted: Option<Option<u64>>,
+    /// A server text mute stands: the composer refuses to send. The
+    /// inner value is the restriction's expiry (ms), `None` for one
+    /// with no end — the shape `describe_until` reads.
+    text_muted: Option<TextMute>,
     /// The oldest history id shown, for paging ("load earlier",
     /// `/history`).
     oldest_history_id: Option<u64>,
     /// The conversation whose `FetchHistory` page is in flight: its
     /// page goes in front of that list; the general replay after
     /// `Init` is appended.
+    // The inner `Option` is the conversation key used throughout this
+    // file (`None` = General); the outer one is "a page is in flight".
+    #[expect(clippy::option_option)]
     history_page_pending: Option<Option<client::UserId>>,
     /// Which conversation the chat pane shows: `None` = General, else
     /// the DM partner (spec §6). `history` / `chat_model` /
@@ -276,7 +281,7 @@ pub struct AppState {
 
     // Windows
     pub main: MainWindow,
-    /// One-shot for repaint_on_reveal: set before showing a hidden
+    /// One-shot for `repaint_on_reveal`: set before showing a hidden
     /// main window (tray Show, reconnect paths).
     main_repaint_arm: Rc<Cell<bool>>,
     /// The main window has been placed once (centred at its first
@@ -436,7 +441,8 @@ pub fn run() {
     apply_log_level(&settings);
 
     // Localize before any UI is built. None = follow the OS locale.
-    i18n::init(settings.language.as_deref());
+    let locale = i18n::init(settings.language.as_deref());
+    info!("Locale: {locale}");
 
     let main = MainWindow::new().expect("failed to create the main window");
 
@@ -667,6 +673,13 @@ pub fn run() {
 /// What a dragged user row carries (inside the opaque
 /// `slint::DataTransfer`): the client id, nothing else.
 struct DragUser(u64);
+
+/// A standing text restriction from the server: `until` is its expiry
+/// in ms, `None` when it has none.
+#[derive(Clone, Copy)]
+struct TextMute {
+    until: Option<u64>,
+}
 
 /// The log level from the settings, unless `RUST_LOG` is set (then the
 /// environment decides and the setting is ignored).
@@ -1063,7 +1076,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_preview_send(move || {
         with_app(&w, |app| {
             if let Some(png) = app.pending_preview.take() {
-                if let Some(until) = app.text_muted {
+                if let Some(TextMute { until }) = app.text_muted {
                     // The server would drop it; say so here instead.
                     let until = format!(" {}", describe_until(until));
                     app.show_toast(
@@ -1153,7 +1166,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_admin_open(move || {
         with_app(&w, |app| {
-            crate::adminui::open(app, crate::adminui::TAB_USERS)
+            crate::adminui::open(app, crate::adminui::TAB_USERS);
         });
     });
     let w = Rc::downgrade(state);
@@ -1165,7 +1178,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_invite_dialog_cancel(move || {
         with_app(&w, |app| {
-            app.main.global::<State>().set_invite_dialog_open(false)
+            app.main.global::<State>().set_invite_dialog_open(false);
         });
     });
     let w = Rc::downgrade(state);
@@ -1235,7 +1248,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 /// its back buffer; partial presents then patch only what changed
 /// since. `flip` toggles the window's imperceptible full-window
 /// overlay, dirtying everything for exactly one frame. Event-driven —
-/// unlike the earlier is_minimized() polling (lost fast
+/// unlike the earlier `is_minimized()` polling (lost fast
 /// minimize/restore races) and flip-on-show (fired before the OS
 /// mapped and cleared the real surface).
 /// Two trigger classes:
@@ -1259,6 +1272,25 @@ pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl 
     use i_slint_backend_winit::WinitWindowAccessor;
     win.on_winit_window_event(move |_w, ev| {
         use i_slint_backend_winit::winit::event::WindowEvent;
+        // OS drag-and-drop of files onto the window (Slint's DropArea
+        // does not see external drops in 1.17; winit does). The hook
+        // runs inside winit's dispatch, so everything is deferred to
+        // the event loop: a hover shows the overlay, a drop feeds the
+        // path down the paste chain's road.
+        match ev {
+            WindowEvent::HoveredFile(_) => set_drop_hover(true),
+            WindowEvent::HoveredFileCancelled => set_drop_hover(false),
+            WindowEvent::DroppedFile(path) => {
+                let path = path.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_current(move |app| {
+                        app.main.global::<State>().set_drop_hover(false);
+                        media::drop_path(app, &path);
+                    });
+                });
+            }
+            _ => {}
+        }
         let reveal = matches!(
             ev,
             WindowEvent::Focused(true)
@@ -1271,6 +1303,13 @@ pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl 
             flip();
         }
         i_slint_backend_winit::EventResult::Propagate
+    });
+}
+
+/// The "drop to send" overlay, from the winit hook (deferred).
+fn set_drop_hover(on: bool) {
+    let _ = slint::invoke_from_event_loop(move || {
+        with_current(move |app| app.main.global::<State>().set_drop_hover(on));
     });
 }
 
@@ -1302,7 +1341,7 @@ fn start_timers(state: &Rc<RefCell<AppState>>) {
     let t = slint::Timer::default();
     t.start(
         slint::TimerMode::Repeated,
-        Duration::from_millis(2000),
+        Duration::from_secs(2),
         move || {
             with_app(&w, AppState::sample_resources);
         },
@@ -1937,7 +1976,7 @@ impl AppState {
                         }
                     }
                     client::RestrictionKind::GeneralText => {
-                        self.text_muted = Some(until_ms);
+                        self.text_muted = Some(TextMute { until: until_ms });
                     }
                     _ => {}
                 }
@@ -1960,6 +1999,7 @@ impl AppState {
                 self.handle_admin_result(request_id, result);
             }
             NetworkMessage::ConnectionLost { kind, detail } => {
+                const MAX_AUTO_RECONNECTS: u32 = 5;
                 // Network, not credentials: come back on our own, with
                 // backoff (2, 4, 8, 16, 30 s), instead of dumping the
                 // user on the connect screen with a transport error.
@@ -1981,7 +2021,6 @@ impl AppState {
                 };
                 self.teardown_connection();
                 self.show_connect_phase();
-                const MAX_AUTO_RECONNECTS: u32 = 5;
                 if self.reconnect_attempts >= MAX_AUTO_RECONNECTS {
                     self.show_error(&format!("{what} {}", t!("error-lost-gave-up")));
                 } else {
@@ -3414,9 +3453,6 @@ impl AppState {
         }
     }
 
-    /// `/invite [guest|member|organizer] [<n>m|h|d] [<uses>]` from the
-    /// composer: ask the server for a code. The answer lands in chat as
-    /// a link (and on the clipboard).
     // ── Invite dialog (spec §3.1) ───────────────────────────────────
     // The picks are indices into option lists the dialog shows; the
     // wire carries what the slash command would send for the same
@@ -3996,6 +4032,7 @@ impl AppState {
 
     /// A user's name of record by id: the roster knows the online
     /// ones; the rest are a short id.
+    #[allow(dead_code)] // kept for the admin feed's next columns
     pub(crate) fn name_of_user_id(&self, user: &client::UserId) -> String {
         self.details
             .iter()
@@ -4186,7 +4223,7 @@ impl AppState {
 
     /// OK on the password prompt: save the password on the server
     /// entry, then retry the join. The prompt closes when the server
-    /// echoes our move (or reopens on WrongPassword).
+    /// echoes our move (or reopens on `WrongPassword`).
     fn channel_password_ok(&mut self) {
         let Some(channel_id) = self.pending_channel_join else {
             self.main.global::<State>().set_channel_prompt_open(false);
@@ -4538,7 +4575,7 @@ impl AppState {
                     })
                     .ok();
                 self.pending_edit = Some(edit.msg_id);
-                self.arm_apply_timeout(edit.msg_id, false);
+                Self::arm_apply_timeout(edit.msg_id, false);
             }
             self.main.global::<State>().set_draft("".into());
             self.main.invoke_focus_composer();
@@ -4554,7 +4591,7 @@ impl AppState {
         } else if let Some(to) = self.active_dm {
             self.send_dm(to, text);
             self.main.invoke_chat_pin_bottom();
-        } else if let Some(until) = self.text_muted {
+        } else if let Some(TextMute { until }) = self.text_muted {
             // The server would drop it anyway; say so here instead.
             let until = format!(" {}", describe_until(until));
             self.show_toast(
@@ -4863,9 +4900,6 @@ impl AppState {
     fn user_menu_action(&mut self, index: i32, action: menu::Action) {
         use menu::Action as A;
         match action {
-            // The slider row is not a pick; its moves come through
-            // `menu_volume`.
-            A::Volume => {}
             A::MuteForMe => {
                 if let Some(id) = self.user_id_at(index) {
                     let username = self.username_of(id);
@@ -4914,6 +4948,8 @@ impl AppState {
             A::Disconnect => self.moderate(index, ModAction::Disconnect),
             A::Kick => self.moderate(index, ModAction::Kick),
             A::Ban => self.moderate(index, ModAction::Ban),
+            // Volume is the slider row, not a pick: its moves come
+            // through `menu_volume`. The rest are not user actions.
             _ => {}
         }
     }
@@ -5684,7 +5720,7 @@ impl AppState {
         }
         let key = hex(&user);
         let list = &mut self.settings.ui.hidden_dms;
-        let present = list.iter().any(|h| *h == key);
+        let present = list.contains(&key);
         if hidden && !present {
             list.push(key);
         } else if !hidden && present {
@@ -5697,7 +5733,7 @@ impl AppState {
 
     fn dm_hidden(&self, user: &client::UserId) -> bool {
         let key = hex(user);
-        self.settings.ui.hidden_dms.iter().any(|h| *h == key)
+        self.settings.ui.hidden_dms.contains(&key)
     }
 
     /// Open (or start) the DM with `user`, named `name`.
@@ -6559,7 +6595,7 @@ impl AppState {
                         .send(NetworkControl::DeleteMessage { msg_id })
                         .ok();
                     self.pending_delete = Some(msg_id);
-                    self.arm_apply_timeout(msg_id, true);
+                    Self::arm_apply_timeout(msg_id, true);
                 }
             }
             Some(Confirm::DeleteChannel { channel_id }) => {
@@ -6582,7 +6618,7 @@ impl AppState {
     /// The server answers an edit or a deletion only by echoing it;
     /// when it refuses (the message left its ring) it says nothing.
     /// After three seconds without the echo, say so here.
-    fn arm_apply_timeout(&self, msg_id: u64, delete: bool) {
+    fn arm_apply_timeout(msg_id: u64, delete: bool) {
         let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
         let Some(weak) = weak else {
             return;
@@ -6887,8 +6923,6 @@ impl AppState {
         row.telemetry = self.user_telemetry(user).into();
     }
 
-    /// "Level 3 · Member" for the hover card.
-
     /// The last telemetry for sessions that may see it — or a note
     /// that none arrived yet; empty for everyone else.
     fn user_telemetry(&self, user: &roster::RosterRow) -> String {
@@ -6971,19 +7005,20 @@ impl AppState {
         if !self.connected {
             return;
         }
-        if self.settings.profile.avatar && self.own_avatar_blob.is_none() {
-            if let Ok(bytes) = std::fs::read(client::config::avatar_path()) {
-                self.network
-                    .tx
-                    .send(NetworkControl::UploadBlob {
-                        upload_id: AVATAR_UPLOAD_ID,
-                        name: "avatar.png".to_string(),
-                        mime: "image/png".to_string(),
-                        data: bytes,
-                    })
-                    .ok();
-                return;
-            }
+        if self.settings.profile.avatar
+            && self.own_avatar_blob.is_none()
+            && let Ok(bytes) = std::fs::read(client::config::avatar_path())
+        {
+            self.network
+                .tx
+                .send(NetworkControl::UploadBlob {
+                    upload_id: AVATAR_UPLOAD_ID,
+                    name: "avatar.png".to_string(),
+                    mime: "image/png".to_string(),
+                    data: bytes,
+                })
+                .ok();
+            return;
         }
         let profile = client::protocol::Profile {
             name_color: self.settings.profile.name_color,
@@ -7832,13 +7867,14 @@ pub(crate) fn format_wall_stamp(ms: u64) -> String {
 
 pub(crate) fn format_wall_time(ms: u64) -> String {
     let secs = i64::try_from(ms / 1000).unwrap_or(0);
-    chrono::DateTime::from_timestamp(secs, 0)
-        .map(|utc| {
+    chrono::DateTime::from_timestamp(secs, 0).map_or_else(
+        || "--:--".to_string(),
+        |utc| {
             utc.with_timezone(&chrono::Local)
                 .format("%H:%M")
                 .to_string()
-        })
-        .unwrap_or_else(|| "--:--".to_string())
+        },
+    )
 }
 
 /// `/kick alice spam` → (`kick`, `alice spam`); `None` for a bare `/`.
@@ -7853,8 +7889,6 @@ fn split_command(rest: &str) -> Option<(&str, &str)> {
     let args = rest[command.len()..].trim_start();
     Some((command, args))
 }
-
-/// A role by name (`member`) or id.
 
 /// A full 64-hex-digit id.
 pub(crate) fn parse_hex_id(text: &str) -> Option<client::UserId> {
@@ -7986,7 +8020,12 @@ struct PendingDownload {
 
 /// Lowercase hex of a hash, the cache file name.
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 fn profile_denied_key(reason: client::protocol::ProfileDenyReason) -> &'static str {
@@ -8317,6 +8356,7 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_menu_save_image(t!("menu-save-image").into());
     tr.set_menu_copy_image(t!("menu-copy-image").into());
     tr.set_lobby_banner(t!("lobby-banner").into());
+    tr.set_drop_to_send(t!("drop-to-send").into());
     tr.set_lobby_mic_hint(t!("lobby-mic-hint").into());
     tr.set_chat_edited_mark(t!("chat-edited-mark").into());
     tr.set_chat_deleted_placeholder(t!("chat-deleted-placeholder").into());

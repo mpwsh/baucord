@@ -79,9 +79,9 @@ fn rescale_nearest(src: &[u8], src_w: u32, src_h: u32, dst: &mut Vec<u8>, dst_w:
     dst.resize(size, 0);
 
     for y in 0..dst_h {
-        let src_y = (y as u64 * src_h as u64 / dst_h as u64) as u32;
+        let src_y = (u64::from(y) * u64::from(src_h) / u64::from(dst_h)) as u32;
         for x in 0..dst_w {
-            let src_x = (x as u64 * src_w as u64 / dst_w as u64) as u32;
+            let src_x = (u64::from(x) * u64::from(src_w) / u64::from(dst_w)) as u32;
             let si = ((src_y * src_w + src_x) * 4) as usize;
             let di = ((y * dst_w + x) * 4) as usize;
             dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
@@ -213,16 +213,14 @@ fn run_threaded(
 
         while Instant::now() < deadline {
             let t = Instant::now();
-            let frame = match capturer.capture() {
-                Ok(f) => f,
-                Err(_) => continue,
+            let Ok(frame) = capturer.capture() else {
+                continue;
             };
             let capture_us = t.elapsed().as_micros() as u64;
 
             let t = Instant::now();
-            let encoded_frames = match encoder.encode(&frame) {
-                Ok(e) => e,
-                Err(_) => continue,
+            let Ok(encoded_frames) = encoder.encode(&frame) else {
+                continue;
             };
             let encode_us = t.elapsed().as_micros() as u64;
 
@@ -255,10 +253,8 @@ fn run_threaded(
         let network_us = simulate_network(&msg.encoded, net_latency_ms, net_bandwidth);
 
         let t = Instant::now();
-        let decoded = match decoder.decode(&msg.encoded) {
-            Ok(Some(d)) => d,
-            Ok(None) => continue,
-            Err(_) => continue,
+        let Ok(Some(decoded)) = decoder.decode(&msg.encoded) else {
+            continue;
         };
         let decode_us = t.elapsed().as_micros() as u64;
 
@@ -477,8 +473,8 @@ fn main() {
         let improvement = (threaded_fps - serial_fps) / serial_fps * 100.0;
 
         println!("\n═══ Comparison ═══");
-        println!("  Serial:    {:.1} fps", serial_fps);
-        println!("  Threaded:  {:.1} fps", threaded_fps);
+        println!("  Serial:    {serial_fps:.1} fps");
+        println!("  Threaded:  {threaded_fps:.1} fps");
         println!(
             "  Δ          {:+.1} fps ({:+.0}%)",
             threaded_fps - serial_fps,

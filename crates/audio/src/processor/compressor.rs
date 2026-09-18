@@ -73,6 +73,7 @@ impl Compressor {
     }
 
     /// Current gain being applied (for diagnostics). 1.0 = no reduction.
+    #[must_use]
     pub fn current_gain(&self) -> f32 {
         self.current_gain
     }
@@ -146,7 +147,7 @@ impl Compressor {
 }
 
 impl AudioProcessor for Compressor {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "compressor"
     }
 

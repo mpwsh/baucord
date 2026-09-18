@@ -57,8 +57,7 @@ pub fn build_input_resampler(
     )?;
 
     info!(
-        "Input resampler: {}Hz → 48kHz (ratio {:.4}), chunk={}, ch={}",
-        input_rate, ratio, chunk_frames, channels,
+        "Input resampler: {input_rate}Hz → 48kHz (ratio {ratio:.4}), chunk={chunk_frames}, ch={channels}",
     );
 
     Ok(resampler)
@@ -82,8 +81,7 @@ pub fn build_output_resampler(
     )?;
 
     info!(
-        "Output resampler: 48kHz → {}Hz (ratio {:.4}), chunk={}, ch={}",
-        device_rate, ratio, chunk_frames, channels,
+        "Output resampler: 48kHz → {device_rate}Hz (ratio {ratio:.4}), chunk={chunk_frames}, ch={channels}",
     );
 
     Ok(resampler)

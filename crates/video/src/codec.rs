@@ -1,8 +1,8 @@
-//! H.264 encode/decode via FFmpeg (`ffmpeg-next` crate).
+//! H.264 encode/decode via `FFmpeg` (`ffmpeg-next` crate).
 //!
 //! Tries hardware encoders in priority order, falling back to the next
 //! candidate **when opening fails**, not just when the encoder is missing
-//! from the build (an FFmpeg build can contain `h264_nvenc` on a machine
+//! from the build (an `FFmpeg` build can contain `h264_nvenc` on a machine
 //! with no NVIDIA GPU — the open is the real capability test).
 //!
 //! # Scaling architecture
@@ -127,6 +127,7 @@ pub struct RateControl {
 }
 
 impl RateControl {
+    #[must_use]
     pub const fn for_target(target: u32) -> Self {
         Self {
             target,
@@ -144,7 +145,7 @@ impl RateControl {
 // Encoder
 // ---------------------------------------------------------------------------
 
-/// Hardware-accelerated (or software fallback) H.264 encoder via FFmpeg.
+/// Hardware-accelerated (or software fallback) H.264 encoder via `FFmpeg`.
 ///
 /// Accepts RGBA input at any resolution. The encoding session (codec
 /// context + scaler + frame buffers) is created lazily on the first
@@ -185,9 +186,9 @@ struct EncSession {
     out_h: u32,
     /// Scale this session's rate control was opened with, percent.
     bitrate_scale_pct: u32,
-    /// Reusable FFmpeg frame for RGBA input (source resolution).
+    /// Reusable `FFmpeg` frame for RGBA input (source resolution).
     rgba_frame: VideoFrame,
-    /// Reusable FFmpeg frame for YUV420P — fed to the encoder.
+    /// Reusable `FFmpeg` frame for YUV420P — fed to the encoder.
     yuv_frame: VideoFrame,
     /// Reusable packet for receiving encoder output.
     pkt: Packet,
@@ -201,7 +202,7 @@ struct EncSession {
 
 impl FfmpegEncoder {
     /// Create an encoder. Tries hardware encoders first, falls back to
-    /// libx264 — including when a hardware encoder exists in the FFmpeg
+    /// libx264 — including when a hardware encoder exists in the `FFmpeg`
     /// build but fails to open (no GPU / driver missing).
     ///
     /// The real encoding session is created lazily on the first
@@ -491,16 +492,19 @@ impl FfmpegEncoder {
     }
 
     /// Whether a forced keyframe is queued but not yet encoded.
+    #[must_use]
     pub fn keyframe_pending(&self) -> bool {
         self.force_next_keyframe
     }
 
     /// See [`VideoEncoder::supports_forced_keyframes`]: everything we
-    /// use honors `pict_type=I` except FFmpeg's AMF wrapper (<= 7.1).
+    /// use honors `pict_type=I` except `FFmpeg`'s AMF wrapper (<= 7.1).
+    #[must_use]
     pub fn supports_forced_keyframes(&self) -> bool {
         self.enc_name != "h264_amf"
     }
 
+    #[must_use]
     pub fn quality(&self) -> Quality {
         self.quality
     }
@@ -512,16 +516,19 @@ impl FfmpegEncoder {
         self.bitrate_scale_pct = crate::clamp_bitrate_scale_pct(pct);
     }
 
+    #[must_use]
     pub fn bitrate_scale_pct(&self) -> u32 {
         self.bitrate_scale_pct
     }
 
-    /// Returns the name of the active encoder (e.g. "h264_nvenc", "libx264").
+    /// Returns the name of the active encoder (e.g. "`h264_nvenc`", "libx264").
+    #[must_use]
     pub fn encoder_name(&self) -> &'static str {
         self.enc_name
     }
 
     /// The output dimensions of the current session, if one exists.
+    #[must_use]
     pub fn output_dimensions(&self) -> Option<(u32, u32)> {
         self.session.as_ref().map(|s| (s.out_w, s.out_h))
     }
@@ -574,7 +581,7 @@ unsafe impl Send for FfmpegDecoder {}
 // Decoder
 // ---------------------------------------------------------------------------
 
-/// H.264 decoder via FFmpeg.
+/// H.264 decoder via `FFmpeg`.
 ///
 /// The YUV→RGBA scaler is created on the first decoded frame and rebuilt
 /// automatically whenever the decoded dimensions, pixel format, or
@@ -583,7 +590,7 @@ unsafe impl Send for FfmpegDecoder {}
 pub struct FfmpegDecoder {
     decoder: ffmpeg::decoder::Video,
     sws: Option<DecoderSws>,
-    /// Reusable FFmpeg frame for decoded YUV output.
+    /// Reusable `FFmpeg` frame for decoded YUV output.
     decoded_frame: VideoFrame,
     /// Scratch frame that `receive_frame` writes into.
     ///
@@ -593,7 +600,7 @@ pub struct FfmpegDecoder {
     /// frame right before we convert it. So we receive here and swap on
     /// success; the terminating EAGAIN only ever clears the scratch.
     scratch_frame: VideoFrame,
-    /// Reusable FFmpeg frame for RGBA conversion output.
+    /// Reusable `FFmpeg` frame for RGBA conversion output.
     rgba_frame: Option<VideoFrame>,
     /// Recycled output buffer (from `return_buffer`). Empty when none.
     rgba_buf: Vec<u8>,
@@ -700,7 +707,7 @@ impl FfmpegDecoder {
             // BT.709/601-by-resolution when the stream is unsignaled.
             let coeffs = sws_coefficients_for(color_space, h);
             let src_full = color_range == ffmpeg::color::Range::JPEG;
-            set_sws_colorspace(&mut ctx, coeffs, src_full as i32, 1);
+            set_sws_colorspace(&mut ctx, coeffs, i32::from(src_full), 1);
 
             self.sws = Some(DecoderSws {
                 ctx,
@@ -780,8 +787,8 @@ impl VideoDecoder for FfmpegDecoder {
 /// preserving aspect ratio, never upscaling, rounded down to even
 /// dimensions (4:2:0 chroma requires them), minimum 2×2.
 fn fit_dimensions(src_w: u32, src_h: u32, quality: Quality) -> (u32, u32) {
-    let (max_w, max_h) = (quality.width() as u64, quality.height() as u64);
-    let (sw, sh) = (src_w.max(1) as u64, src_h.max(1) as u64);
+    let (max_w, max_h) = (u64::from(quality.width()), u64::from(quality.height()));
+    let (sw, sh) = (u64::from(src_w.max(1)), u64::from(src_h.max(1)));
 
     let (out_w, out_h) = if sw <= max_w && sh <= max_h {
         (sw, sh) // never upscale
@@ -1140,7 +1147,7 @@ fn set_sws_colorspace(sws: &mut SwsContext, coeffs: *const i32, src_range: i32, 
     }
 }
 
-/// Copy RGBA pixel data into an ffmpeg VideoFrame (stride-aware).
+/// Copy RGBA pixel data into an ffmpeg `VideoFrame` (stride-aware).
 fn fill_rgba_frame(
     frame: &mut VideoFrame,
     rgba: &[u8],

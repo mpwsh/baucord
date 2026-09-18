@@ -43,7 +43,7 @@ pub(super) fn fallback_text(attachment: &Attachment) -> String {
 /// `3 d`, `5 h`, `20 min`, `40 s`: a span, for audit lines.
 #[must_use]
 pub fn human_duration(secs: u64) -> String {
-    if secs >= 86_400 && secs % 86_400 == 0 {
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
         format!("{} d", secs / 86_400)
     } else if secs >= 3_600 {
         format!("{} h", secs / 3_600)

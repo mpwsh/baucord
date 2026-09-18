@@ -9,7 +9,6 @@ workspace = true
 [dependencies]
 protocol = { path = "../protocol" }
 transport = { path = "../transport" }
-bytes.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 chrono = "0.4"
 log = "0.4"

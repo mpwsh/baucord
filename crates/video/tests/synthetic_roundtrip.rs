@@ -2,7 +2,7 @@
 //!
 //! Runs without a display or capture permission, so it works in CI.
 //! Skips (with a message) if no H.264 encoder is available in the local
-//! FFmpeg build.
+//! `FFmpeg` build.
 
 use video::{
     codec::{FfmpegDecoder, FfmpegEncoder, KEYFRAME_INTERVAL_MS},
@@ -23,8 +23,8 @@ fn synth_frame(w: u32, h: u32, i: u64, timestamp_ms: u64) -> Frame {
         }
     }
     // Moving 64×64 white square
-    let bx = ((i * 8) % (w as u64 - 64)) as u32;
-    let by = ((i * 5) % (h as u64 - 64)) as u32;
+    let bx = ((i * 8) % (u64::from(w) - 64)) as u32;
+    let by = ((i * 5) % (u64::from(h) - 64)) as u32;
     for y in by..by + 64 {
         for x in bx..bx + 64 {
             let o = ((y * w + x) * 4) as usize;
@@ -170,8 +170,8 @@ fn synthetic_roundtrip() {
         let data = last.expect("decoded at least one solid frame");
         let center = ((180 * 640 + 320) * 4) as usize;
         for c in 0..3 {
-            let got = data[center + c] as i32;
-            let want = rgb[c] as i32;
+            let got = i32::from(data[center + c]);
+            let want = i32::from(rgb[c]);
             assert!(
                 (got - want).abs() <= 12,
                 "channel {c} drifted: encoded {want}, decoded {got} (colorspace/range bug?)"

@@ -72,6 +72,7 @@ pub fn encode(primary: &[u8], redundant: &[(u32, &[u8])], out: &mut Vec<u8>) {
 }
 
 /// Parse a bundle. `None` if the payload is malformed.
+#[must_use]
 pub fn decode(payload: &[u8]) -> Option<Bundle<'_>> {
     let (&count, rest) = payload.split_first()?;
     let count = usize::from(count);

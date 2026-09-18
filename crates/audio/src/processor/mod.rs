@@ -10,7 +10,7 @@
 //! - **Zero-alloc hot path**: processors work on borrowed `&mut [f32]`
 //!   slices and fixed-size scratch — no allocation per frame.
 //! - **Frame metadata via context**: processors communicate state
-//!   (e.g., "gate is open", "RNNoise thinks this is speech") through
+//!   (e.g., "gate is open", "`RNNoise` thinks this is speech") through
 //!   [`FrameContext`], not return values, so information flows downstream
 //!   naturally.
 //! - **Bypass via context**: processors that can be toggled at runtime
@@ -45,6 +45,7 @@ pub mod speaking;
     clippy::cast_precision_loss,
     reason = "frame length ≤ 960 samples, well within f32 precision"
 )]
+#[must_use]
 pub fn compute_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -62,6 +63,9 @@ pub fn compute_rms(samples: &[f32]) -> f32 {
 /// frame before calling the chain, and reads result fields after.
 ///
 /// Stack-allocated, cheap to create per frame.
+// The flags are independent per-frame switches read by different
+// stages; a state enum would have to enumerate their product.
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct FrameContext {
     // ── Pipeline config (set by worker before chain runs) ───────────
@@ -89,7 +93,7 @@ pub struct FrameContext {
     /// Written by: `NoiseGate`. Read by: `AGC`, `Compressor`.
     pub gate_holding: bool,
 
-    /// RNNoise VAD probability (0.0–1.0; 1.0 when denoise is bypassed).
+    /// `RNNoise` VAD probability (0.0–1.0; 1.0 when denoise is bypassed).
     /// Written by: `Denoiser`. Read by: `SpeakingIndicator`.
     pub rnnoise_vad_prob: f32,
 

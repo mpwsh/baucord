@@ -461,10 +461,7 @@ fn worker_loop(
     #[allow(clippy::cast_possible_truncation)]
     let _rt = crate::platform::promote_current_thread(FRAME_SIZE as u32, OPUS_SAMPLE_RATE);
 
-    info!(
-        "Input worker started (device {}Hz, resample={})",
-        device_sample_rate, needs_resample
-    );
+    info!("Input worker started (device {device_sample_rate}Hz, resample={needs_resample})");
 
     while !should_stop.load(Ordering::Relaxed) {
         if config.muted.load(Ordering::Relaxed) {

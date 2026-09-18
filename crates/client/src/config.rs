@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// toolchain bump could silently orphan every saved per-peer setting.
 /// The username itself is the key now. Old hashed entries remain in
 /// settings.json but are simply never read again (harmless dead weight).
+#[must_use]
 pub fn peer_key(username: &str) -> String {
     username.to_string()
 }
@@ -36,6 +37,7 @@ impl BindableAction {
         BindableAction::PushToTalk,
     ];
 
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             BindableAction::ToggleMute => "Toggle Mute",
@@ -55,6 +57,7 @@ pub struct KeybindEntry {
 }
 
 impl KeybindEntry {
+    #[must_use]
     pub fn parse(&self) -> Option<ParsedKeybind> {
         if self.bind.is_empty() {
             return None;
@@ -90,6 +93,7 @@ pub struct ParsedKeybind {
     pub code: String,
 }
 
+#[must_use]
 pub fn build_bind_string(ctrl: bool, alt: bool, shift: bool, code: &str) -> String {
     let mut parts = Vec::new();
     if ctrl {
@@ -183,6 +187,9 @@ fn default_image_max_kb() -> u32 {
 /// Which notification sounds play. `enabled` is the master switch;
 /// the rest pick. Ordinary chat messages never make a sound — a busy
 /// general chat must not be able to disturb anyone.
+// One bool per toggle in Settings → Sounds, and the same keys in
+// `settings.json`; the file format is the reason, not a state machine.
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SoundSettings {
     #[serde(default = "default_true")]
@@ -768,10 +775,11 @@ impl Settings {
         serde_json::from_str(&contents).ok()
     }
 
+    #[must_use]
     pub fn load() -> Self {
         let path = Self::get_settings_path();
         if let Some(settings) = Self::read_from(&path) {
-            info!("Loaded settings from {:?}", path);
+            info!("Loaded settings from {}", path.display());
             return settings;
         }
 
@@ -787,7 +795,11 @@ impl Settings {
             if old != path
                 && let Some(settings) = Self::read_from(&old)
             {
-                info!("Migrating settings from {:?} to {:?}", old, path);
+                info!(
+                    "Migrating settings from {} to {}",
+                    old.display(),
+                    path.display()
+                );
                 settings.save();
                 return settings;
             }
@@ -802,7 +814,10 @@ impl Settings {
         if let Some(parent) = path.parent()
             && let Err(e) = fs::create_dir_all(parent)
         {
-            log::error!("Failed to create settings directory {:?}: {e}", parent);
+            log::error!(
+                "Failed to create settings directory {}: {e}",
+                parent.display()
+            );
             return;
         }
         match serde_json::to_string_pretty(self) {
@@ -810,7 +825,7 @@ impl Settings {
                 if let Err(e) = fs::write(&path, contents) {
                     log::error!("Failed to save settings: {e}");
                 } else {
-                    info!("Settings saved to {:?}", path);
+                    info!("Settings saved to {}", path.display());
                 }
             }
             Err(e) => log::error!("Failed to serialize settings: {e}"),
@@ -879,12 +894,12 @@ impl Settings {
         self.servers.get_mut(index)
     }
 
+    #[must_use]
     pub fn bind_for(&self, action: BindableAction) -> &str {
         self.keybinds
             .iter()
             .find(|e| e.action == action)
-            .map(|e| e.bind.as_str())
-            .unwrap_or("")
+            .map_or("", |e| e.bind.as_str())
     }
 
     pub fn set_bind(&mut self, action: BindableAction, bind: String) {

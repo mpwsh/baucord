@@ -271,8 +271,45 @@ impl World {
         self.connect_with_key(name, auth, key)
     }
 
-    /// Connect a device whose key the server may already know.
+    /// Connect a device whose key the server may already know, and
+    /// step out of the lobby into the first room (spec §12, 1.1.5):
+    /// every test here was written for a world where connecting made
+    /// you visible in channel 0, which a join now does. Tests about
+    /// the lobby itself use `connect_lobby`.
     fn connect_with_key(&mut self, name: &str, auth: Auth, key: Arc<ClientKey>) -> TestClient {
+        let mut client = self.connect_lobby_with_key(name, auth, key);
+        client.join(self, 0, None);
+        let id = client.id;
+        client.wait_for(self, &mut [], |m| match m {
+            ServerMessage::UserMovedChannel {
+                client_id,
+                channel_id: 0,
+            } if *client_id == id => Some(()),
+            _ => None,
+        });
+        // The join's own echo would satisfy a later "wait for my move"
+        // in a test; the inbox is left as a pre-lobby connect left it.
+        client.inbox.retain(|m| {
+            !matches!(m, ServerMessage::UserMovedChannel { client_id, channel_id: 0 }
+                if *client_id == id)
+        });
+        client
+    }
+
+    /// Connect and stay in the lobby: announced to nobody until a
+    /// `join`.
+    fn connect_lobby(&mut self, name: &str) -> TestClient {
+        let code = self.guest_code.clone();
+        let key = Arc::new(ClientKey::generate());
+        self.connect_lobby_with_key(name, Auth::Invite { code }, key)
+    }
+
+    fn connect_lobby_with_key(
+        &mut self,
+        name: &str,
+        auth: Auth,
+        key: Arc<ClientKey>,
+    ) -> TestClient {
         let mut client = self.open();
         client.key = key;
         client.hello(self, name, auth);
@@ -2093,6 +2130,9 @@ fn custom_roles_come_from_the_cli_and_reach_the_room() {
 
 /// Upload `bytes` as a file named `name` and post it into `conv`;
 /// returns the message id the server acked.
+// A test helper that plays one whole upload; a struct for its eight
+// knobs would be read in exactly one place.
+#[expect(clippy::too_many_arguments)]
 fn post_file(
     who: &mut TestClient,
     w: &mut World,
@@ -2725,7 +2765,7 @@ fn organizers_make_channels_that_gate_by_role_and_evaporate_when_empty() {
         ServerMessage::ChannelListUpdated { channels, .. } => Some(channels.clone()),
         _ => None,
     });
-    assert_eq!(channels.len(), 2);
+    assert_eq!(channels.len(), 3, "Lobby, Backroom, and the lobby entry");
     assert_eq!(channels[1].name, "Backroom");
     let backroom = channels[1].id;
     org.wait_for(&mut w, &mut [&mut guest], |m| {
@@ -2735,14 +2775,17 @@ fn organizers_make_channels_that_gate_by_role_and_evaporate_when_empty() {
     });
     assert_eq!(w.server().channel_of(org_id), Some(backroom));
     let org_user = org.key.user_id();
+    // The lobby entry held this id before the Backroom was created,
+    // and its `ChannelDetails` (no owner) is still in the inbox: the
+    // Backroom's own details are the ones with an owner.
     let details = guest.wait_for(&mut w, &mut [&mut org], |m| match m {
         ServerMessage::ChannelDetails {
             channel_id,
-            owner,
+            owner: Some(owner),
             min_role,
             permanent,
             ..
-        } if *channel_id == backroom => Some((*owner, *min_role, *permanent)),
+        } if *channel_id == backroom => Some((Some(*owner), *min_role, *permanent)),
         _ => None,
     });
     assert_eq!(details, (Some(org_user), Some(ROLE_MEMBER), false));
@@ -2774,10 +2817,16 @@ fn organizers_make_channels_that_gate_by_role_and_evaporate_when_empty() {
             user_id: member_user,
         },
     );
+    // "Out" is the lobby now (spec §12, 1.1.5): the member alone is
+    // told where they went, and to the others they left.
+    let lobby = channels.last().expect("the lobby is last").id;
     member.wait_for(&mut w, &mut [&mut org, &mut guest], |m| {
-        matches!(m, ServerMessage::UserMovedChannel { client_id, channel_id: 0 }
-            if *client_id == member_id)
+        matches!(m, ServerMessage::UserMovedChannel { client_id, channel_id }
+            if *client_id == member_id && *channel_id == lobby)
         .then_some(())
+    });
+    org.wait_for(&mut w, &mut [&mut guest, &mut member], |m| {
+        matches!(m, ServerMessage::UserLeft { client_id } if *client_id == member_id).then_some(())
     });
     org.join(&mut w, 0, None);
     w.settle(
@@ -2795,7 +2844,7 @@ fn organizers_make_channels_that_gate_by_role_and_evaporate_when_empty() {
         Duration::from_secs(35),
     );
     let channels = guest.wait_for(&mut w, &mut [&mut org, &mut member], |m| match m {
-        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 1 => {
+        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 2 => {
             Some(channels.clone())
         }
         _ => None,
@@ -2821,7 +2870,7 @@ fn the_owner_edits_or_deletes_and_an_admin_can_too_but_config_channels_stay() {
     };
     org.send(&mut w, &ClientMessage::CreateChannel(spec.clone()));
     let games = org.wait_for(&mut w, &mut [&mut admin], |m| match m {
-        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 2 => {
+        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 3 => {
             Some(channels[1].id)
         }
         _ => None,
@@ -2842,7 +2891,7 @@ fn the_owner_edits_or_deletes_and_an_admin_can_too_but_config_channels_stay() {
         &mut w,
         &ClientMessage::EditChannel {
             channel_id: games,
-            spec: spec.clone(),
+            spec,
         },
     );
     org.wait_for(&mut w, &mut [&mut admin], |m| match m {
@@ -2863,7 +2912,7 @@ fn the_owner_edits_or_deletes_and_an_admin_can_too_but_config_channels_stay() {
     assert_eq!(reason, ChannelUiDenyReason::NoPermission);
     admin.send(&mut w, &ClientMessage::DeleteChannel { channel_id: games });
     admin.wait_for(&mut w, &mut [&mut org, &mut other], |m| match m {
-        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 1 => Some(()),
+        ServerMessage::ChannelListUpdated { channels, .. } if channels.len() == 2 => Some(()),
         _ => None,
     });
 }
@@ -3094,13 +3143,16 @@ fn init_carries_channels_and_default_membership() {
         })
         .expect("init");
 
-    assert_eq!(channels.len(), 2);
+    // Two from the config plus the lobby the server appends (1.1.5).
+    assert_eq!(channels.len(), 3);
     assert_eq!(channels[0].name, "Lobby");
     assert!(!channels[0].has_password);
     assert!(channels[1].has_password);
     assert_eq!(channels[1].user_limit, Some(8));
-    // We land in the default channel (index 0).
-    assert_eq!(memberships.get(&my_id), Some(&0));
+    assert_eq!(channels[2].name, "", "the lobby is last and unnamed");
+    // `Init` places us in the lobby (the appended entry); the harness
+    // then joined room 0 on our behalf.
+    assert_eq!(memberships.get(&my_id), Some(&2));
 }
 
 #[test]
@@ -3267,36 +3319,97 @@ fn channel_scoped_share_visibility_follows_membership() {
 }
 
 #[test]
+fn the_lobby_hides_a_session_until_it_joins_a_room() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut alice = w.connect("alice");
+    let mut bob = w.connect_lobby("bob");
+    let bob_id = bob.id;
+
+    // Nothing about bob reaches alice while he sits in the lobby, and
+    // bob's own `Init` lists the rooms' people.
+    w.settle(
+        &mut [&mut admin, &mut alice, &mut bob],
+        Duration::from_secs(1),
+    );
+    assert!(
+        !alice.inbox.iter().any(|m| matches!(m,
+            ServerMessage::UserJoined { client_id, .. } if *client_id == bob_id)),
+        "a lobby member is announced to nobody"
+    );
+    let (usernames, channels) = bob
+        .inbox
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::Init {
+                usernames,
+                channels,
+                ..
+            } => Some((usernames.clone(), channels.clone())),
+            _ => None,
+        })
+        .expect("init");
+    assert!(
+        usernames.contains_key(&alice.id),
+        "the lobby sees the rooms"
+    );
+    let lobby = channels.last().expect("the lobby is last").id;
+
+    // The first join is the announcement, and it carries the room.
+    bob.join(&mut w, 0, None);
+    let room = alice.wait_for(&mut w, &mut [&mut admin, &mut bob], |m| match m {
+        ServerMessage::UserJoined {
+            client_id,
+            channel_id,
+            ..
+        } if *client_id == bob_id => Some(*channel_id),
+        _ => None,
+    });
+    assert_eq!(room, 0);
+
+    // Back to the lobby by an admin's hand: to alice, bob left.
+    let bob_user = bob.key.user_id();
+    admin.admin(
+        &mut w,
+        1,
+        AdminCommand::MoveUser {
+            target: AdminTarget::User(bob_user),
+            channel_id: lobby,
+        },
+    );
+    alice.wait_for(&mut w, &mut [&mut admin, &mut bob], |m| {
+        matches!(m, ServerMessage::UserLeft { client_id } if *client_id == bob_id).then_some(())
+    });
+}
+
+#[test]
 fn config_validation_rejects_bad_channel_lists() {
-    // No default.
+    // No `default: true` anywhere is fine since 1.1.5 (the lobby is
+    // implicit); the index returned is the lobby's, after the list.
     let config = test_config(vec![open_channel("A", false)]);
-    assert!(config.validate_channels().is_err());
-    // Two defaults.
+    assert_eq!(config.validate_channels().expect("valid"), 1);
+    // Two defaults: accepted and ignored, not an error.
     let config = test_config(vec![open_channel("A", true), open_channel("B", true)]);
-    assert!(config.validate_channels().is_err());
-    // Password on the default.
+    assert_eq!(config.validate_channels().expect("valid"), 2);
+    // A password or a limit on a flagged channel: an ordinary room.
     let config = test_config(vec![ChannelSettings {
         name: "A".to_string(),
         default: true,
         password: Some("x".to_string()),
-        user_limit: None,
-    }]);
-    assert!(config.validate_channels().is_err());
-    // user_limit on the default.
-    let config = test_config(vec![ChannelSettings {
-        name: "A".to_string(),
-        default: true,
-        password: None,
         user_limit: Some(4),
     }]);
+    assert!(config.validate_channels().is_ok());
+    // Empty list.
+    let config = test_config(vec![]);
     assert!(config.validate_channels().is_err());
     // Duplicate names.
     let config = test_config(vec![open_channel("A", true), open_channel("A", false)]);
     assert!(config.validate_channels().is_err());
-    // Missing key in YAML → single default Lobby, valid.
+    // Missing key in YAML → a single 'General', plus the lobby at 1.
     let config: Config = serde_yaml::from_str("server:\n  name: test\n").expect("yaml");
-    assert_eq!(config.validate_channels().expect("valid"), 0);
-    assert_eq!(config.channels[0].name, "Lobby");
+    assert_eq!(config.validate_channels().expect("valid"), 1);
+    assert_eq!(config.channels[0].name, "General");
     // A 1.0 `authentication:` section and a stale 0.5 key both still
     // parse (warned about and ignored at startup), and the section is
     // never written back.
@@ -3338,7 +3451,12 @@ fn hot_reload_moves_renamed_channel_members_to_default() {
         _ => None,
     });
     assert_eq!(channels[1].name, "Cinema");
-    assert_eq!(memberships.get(&a.id), Some(&0), "renamed ⇒ back to Lobby");
+    let lobby = channels.last().expect("the lobby is last").id;
+    assert_eq!(
+        memberships.get(&a.id),
+        Some(&lobby),
+        "renamed ⇒ back to the lobby"
+    );
 }
 
 #[test]
@@ -3453,30 +3571,24 @@ fn hot_reload_rederives_channel_scoped_share_visibility() {
         "lobby must not see the Movies-scoped stream yet"
     );
 
-    // Movies disappears: sharer AND viewer land in the Lobby together —
-    // the stream follows them, the viewer keeps watching, and the
-    // lobbyist (newly co-channeled) now learns about it.
+    // Movies disappears: sharer AND viewer are sent to the lobby (spec
+    // §12, 1.1.5), where nobody streams and nobody watches — the
+    // stream ends for the viewer, and the lobbyist (in the "Lobby"
+    // room, a real room) never learns of it.
     w.server()
         .apply_channel_config(vec![open_channel("Lobby", true)])
         .expect("valid list");
 
-    lobbyist.wait_for(&mut w, &mut [&mut sharer, &mut viewer], |m| {
-        matches!(
-            m,
-            ServerMessage::ScreenShareStarted {
-                client_id,
-                scope: ShareScope::Channel,
-                ..
-            } if *client_id == sharer_id
-        )
-        .then_some(())
+    viewer.wait_for(&mut w, &mut [&mut sharer, &mut lobbyist], |m| {
+        matches!(m, ServerMessage::ScreenShareStopped { client_id } if *client_id == sharer_id)
+            .then_some(())
     });
     assert!(
-        !viewer.inbox.iter().any(|m| matches!(
-            m,
-            ServerMessage::ScreenShareStopped { client_id } if *client_id == sharer_id
-        )),
-        "viewer moved together with the sharer — must not be evicted"
+        !lobbyist
+            .inbox
+            .iter()
+            .any(|m| matches!(m, ServerMessage::ScreenShareStarted { .. })),
+        "the lobby shows nothing"
     );
 }
 
@@ -3492,11 +3604,8 @@ fn hot_reload_rejects_invalid_lists_and_keeps_state() {
         matches!(m, ServerMessage::UserMovedChannel { channel_id: 1, .. }).then_some(())
     });
 
-    // No default / duplicate names: both rejected, nothing broadcast.
-    assert!(w
-        .server()
-        .apply_channel_config(vec![open_channel("A", false)])
-        .is_err());
+    // Empty / duplicate names: both rejected, nothing broadcast.
+    assert!(w.server().apply_channel_config(vec![]).is_err());
     assert!(w
         .server()
         .apply_channel_config(vec![open_channel("A", true), open_channel("A", false)])
@@ -3851,7 +3960,7 @@ fn a_stalled_persistence_thread_never_touches_the_media_path() {
     }
     drop(w);
     let stored = stored_message_count(&dir);
-    assert!(stored >= 1 && stored <= 8, "{stored} messages stored");
+    assert!((1..=8).contains(&stored), "{stored} messages stored");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3973,10 +4082,7 @@ fn profiles_reach_everyone_and_late_joiners() {
     });
     assert_eq!(seen.name_color, Some(0x00E0_6C75));
     assert_eq!(seen.name_style, protocol::NameStyle::Bold);
-    assert!(matches!(
-        profile_verdict(&mut alice, &mut w, &mut [&mut bob]),
-        Ok(_)
-    ));
+    assert!(profile_verdict(&mut alice, &mut w, &mut [&mut bob]).is_ok());
 
     // A late joiner learns everyone's look with the roster.
     let mut carol = w.connect("carol");

@@ -157,7 +157,7 @@ struct PeerBuffer {
     /// distinguish mid-stream underruns from DTX pauses).
     playing: bool,
     /// Set when the buffer runs dry while playing; resolved on the next
-    /// push (recent → underrun, stale → pause). See UNDERRUN_CONFIRM_WINDOW.
+    /// push (recent → underrun, stale → pause). See `UNDERRUN_CONFIRM_WINDOW`.
     dry_at: Option<Instant>,
     /// Last sample this peer contributed to the mix — the starting point
     /// for the synthesized decay tail when the PLC budget is exhausted.
@@ -245,13 +245,13 @@ pub struct AdaptiveJitterBuffer {
     mix_scale: f32,
 
     // ── Adaptation state ────────────────────────────────────────────
-    /// Counts adapt() calls since the last concealment/underrun event.
+    /// Counts `adapt()` calls since the last concealment/underrun event.
     /// When this is high, conditions are stable and we can drain.
     stable_ticks: u32,
-    /// Concealment slots (FEC + PLC at a due slot) since last adapt():
+    /// Concealment slots (FEC + PLC at a due slot) since last `adapt()`:
     /// each one is a packet that was lost or arrived too late.
     concealment_count: u32,
-    /// Mid-stream underruns observed since last adapt() call.
+    /// Mid-stream underruns observed since last `adapt()` call.
     underrun_count: u32,
     /// Last target value emitted to the debug log (ms).
     last_logged_target_ms: f32,
@@ -548,7 +548,7 @@ impl AdaptiveJitterBuffer {
     /// join or leave the mix.
     pub fn pull_mixed(&mut self, n: usize, out: &mut [f32]) {
         debug_assert_eq!(out.len(), n);
-        out.iter_mut().for_each(|s| *s = 0.0);
+        out.fill(0.0);
 
         let Ok(settings) = self.peer_settings.lock() else {
             return;
@@ -568,7 +568,7 @@ impl AdaptiveJitterBuffer {
         let prime_cap = (60 * self.sample_rate) / 1000;
         let prime_target = self.target_samples.min(prime_cap);
 
-        for (peer_id, peer) in self.buffers.iter_mut() {
+        for (peer_id, peer) in &mut self.buffers {
             let peer_settings = settings.get(peer_id).cloned().unwrap_or_default();
             if peer_settings.is_muted {
                 peer.packets.clear();
@@ -661,7 +661,20 @@ impl AdaptiveJitterBuffer {
 
             // ── Decode / conceal into scratch ───────────────────────
             let available;
-            if desired != n {
+            if desired == n {
+                let rep = peer.packets.fill(&mut self.scratch[..n], true, shrink);
+                fec += u64::from(rep.fec);
+                plc += u64::from(rep.plc);
+                dry_plc += u64::from(rep.dry_plc);
+                lost += u64::from(rep.fec + rep.plc + rep.skipped);
+                if rep.fec + rep.plc + rep.skipped + rep.dropped_quiet > 0 {
+                    // Missing or skipped media is not clock skew: a lossy
+                    // stretch must restart the window, not teach the
+                    // estimator that the sender's clock is slow.
+                    peer.drift_window_dirty = true;
+                }
+                available = rep.filled;
+            } else {
                 if self.scratch_in.len() < desired {
                     self.scratch_in.resize(desired, 0.0);
                 }
@@ -687,19 +700,6 @@ impl AdaptiveJitterBuffer {
                     self.scratch[..rep.filled].copy_from_slice(&self.scratch_in[..rep.filled]);
                     available = rep.filled;
                 }
-            } else {
-                let rep = peer.packets.fill(&mut self.scratch[..n], true, shrink);
-                fec += u64::from(rep.fec);
-                plc += u64::from(rep.plc);
-                dry_plc += u64::from(rep.dry_plc);
-                lost += u64::from(rep.fec + rep.plc + rep.skipped);
-                if rep.fec + rep.plc + rep.skipped + rep.dropped_quiet > 0 {
-                    // Missing or skipped media is not clock skew: a lossy
-                    // stretch must restart the window, not teach the
-                    // estimator that the sender's clock is slow.
-                    peer.drift_window_dirty = true;
-                }
-                available = rep.filled;
             }
 
             if available > 0 {
@@ -1001,6 +1001,7 @@ impl AdaptiveJitterBuffer {
         std::mem::take(&mut self.stats)
     }
 
+    #[must_use]
     pub fn occupancy_ms(&self) -> f32 {
         if self.buffers.is_empty() {
             return 0.0;
@@ -1019,6 +1020,7 @@ impl AdaptiveJitterBuffer {
     }
 
     /// Current target depth in milliseconds (for stats).
+    #[must_use]
     pub fn target_ms(&self) -> f32 {
         #[allow(clippy::cast_precision_loss)]
         {
@@ -1089,7 +1091,11 @@ mod tests {
             let input = [1.0f32, 2.0, 3.0, 4.0];
             let mut out = [0.0f32; 4];
             resample_linear(&input, &mut out);
-            assert_eq!(out, input);
+            // A 1:1 resample copies samples verbatim.
+            #[expect(clippy::float_cmp)]
+            {
+                assert_eq!(out, input);
+            }
         }
 
         #[test]

@@ -747,11 +747,11 @@ fn wire(win: &SettingsWindow) {
                 .position(|s| s.name == app.settings.server)
                 == Some(index);
             let name = text.trim().to_string();
-            app.settings.servers[index].name = name.clone();
             if was_default {
                 // The default pointer follows its entry's rename.
-                app.settings.server = name;
+                app.settings.server = name.clone();
             }
+            app.settings.servers[index].name = name;
             // Rows only — rewriting the editor's text property while
             // the user types would fight the caret.
             push_server_rows(app);

@@ -385,7 +385,9 @@ fn apply_unix_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
         .map_err(|e| format!("Failed to set mode on {}: {e}", path.display()))
 }
 
+// The Unix version can fail; the callers' `?` needs one signature.
 #[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps)]
 fn apply_unix_mode(_path: &Path, _mode: Option<u32>) -> Result<(), String> {
     Ok(())
 }
@@ -403,7 +405,9 @@ fn ensure_executable(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to make {} executable: {e}", path.display()))
 }
 
+// Same signature as the Unix version, for the callers' `?`.
 #[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps)]
 fn ensure_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }

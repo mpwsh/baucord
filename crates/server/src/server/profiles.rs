@@ -63,7 +63,7 @@ pub(super) fn sanitize_file_name(name: &str) -> String {
     if trimmed.is_empty() {
         return "file".to_string();
     }
-    protocol::truncate_on_char_boundary(trimmed, 120).to_string()
+    protocol::truncate_on_char_boundary(trimmed, 120)
 }
 
 impl ChatServer {
@@ -500,7 +500,7 @@ impl ChatServer {
             name: meta.name.clone(),
             created_by: meta.created_by,
             created_at: meta.created_at,
-            bytes: if is_file { bytes } else { bytes.clone() },
+            bytes,
         };
         let cached = if is_file {
             None
@@ -662,7 +662,7 @@ impl ChatServer {
             frames.push(protocol::Bytes::from(encoded));
         }
         self.stats.bytes_sent += bytes.len() as u64;
-        if let Err(e) = self.driver.send_media(self.now, client, frames.into_iter()) {
+        if let Err(e) = self.driver.send_media(self.now, client, frames) {
             debug!("blob send to {client:#x} failed: {e}");
         }
     }
@@ -707,6 +707,9 @@ pub(super) fn is_gold(color: u32) -> bool {
         return false;
     }
     let saturation = delta / max;
+    // `max` *is* one of r, g, b (a `min`/`max` of them), so equality is
+    // the intended test, not a tolerance question.
+    #[expect(clippy::float_cmp)]
     let hue = if max == r {
         60.0 * (((g - b) / delta) % 6.0)
     } else if max == g {

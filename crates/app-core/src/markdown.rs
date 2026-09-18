@@ -1,8 +1,8 @@
-//! WhatsApp-flavored message markup → CommonMark for Slint's StyledText.
+//! WhatsApp-flavored message markup → `CommonMark` for Slint's `StyledText`.
 //!
 //! Users write `*bold*`, `_italic_`, `` `inline code` `` and
 //! ```` ``` ````-fenced code blocks (WhatsApp/Discord habits). Slint's
-//! `StyledText` consumes CommonMark, whose semantics differ (`*x*` is
+//! `StyledText` consumes `CommonMark`, whose semantics differ (`*x*` is
 //! italic there) and whose 1.17 parser rejects several block
 //! constructs outright (fenced code, headings, block quotes) — a
 //! message like "# yolo" would fail to parse entirely. So:
@@ -11,7 +11,7 @@
 //!   UI renders those as dedicated monospace rows (the same trick the
 //!   history already plays with links).
 //! * [`to_commonmark`] converts a text segment: our tokens are
-//!   re-emitted as CommonMark (`*b*` → `**b**`, `_i_` → `*i*`, code
+//!   re-emitted as `CommonMark` (`*b*` → `**b**`, `_i_` → `*i*`, code
 //!   spans verbatim), every other Markdown-active character is
 //!   backslash-escaped, and newlines become hard breaks. The result
 //!   always parses, and never styles anything the user didn't ask for.
@@ -30,7 +30,7 @@ pub enum Segment {
 /// (```` ```\ncode\n``` ````) or sits inline (```` ```code``` ````).
 /// An optional language word right after the opening fence is dropped
 /// when the block is multi-line. An unterminated ```` ``` ```` is not
-/// a fence — the rest stays literal text, like WhatsApp treats
+/// a fence — the rest stays literal text, like `WhatsApp` treats
 /// unpaired markup.
 #[must_use]
 pub fn split_fences(body: &str) -> Vec<Segment> {
@@ -68,10 +68,10 @@ pub fn split_fences(body: &str) -> Vec<Segment> {
         }
         let code = code.strip_prefix('\n').unwrap_or(code);
         let code = code.strip_suffix('\n').unwrap_or(code);
-        if !text.trim().is_empty() {
-            out.push(Segment::Text(std::mem::take(&mut text)));
-        } else {
+        if text.trim().is_empty() {
             text.clear();
+        } else {
+            out.push(Segment::Text(std::mem::take(&mut text)));
         }
         out.push(Segment::Code(code.to_string()));
         rest = &after[close + 3..];
@@ -85,7 +85,7 @@ pub fn split_fences(body: &str) -> Vec<Segment> {
 
 /// True when `c` starts/ends an emphasis run: flanked by whitespace or
 /// segment edges on the outside, non-whitespace on the inside — the
-/// WhatsApp rule, so `snake_case_names` and `2*3*4` stay literal.
+/// `WhatsApp` rule, so `snake_case_names` and `2*3*4` stay literal.
 fn can_open(chars: &[char], i: usize) -> bool {
     let before_ok = i == 0 || chars[i - 1].is_whitespace();
     let after_ok = i + 1 < chars.len() && !chars[i + 1].is_whitespace() && chars[i + 1] != chars[i];
@@ -147,8 +147,8 @@ fn push_escaped(out: &mut String, c: char) {
     }
 }
 
-/// Convert one text segment to CommonMark. Returns the markup and
-/// whether any styling was produced (callers skip the StyledText path
+/// Convert one text segment to `CommonMark`. Returns the markup and
+/// whether any styling was produced (callers skip the `StyledText` path
 /// entirely for plain messages, keeping them selectable).
 ///
 /// `code_color`: an optional `#RRGGBB` tint for inline code spans —

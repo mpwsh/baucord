@@ -3,7 +3,7 @@
 //! Replaces the earshot-based VAD stage. That stage cost a biquad, a 3:1
 //! decimation, an RNN classifier and a `catch_unwind` per call, and its
 //! result gated nothing: transmission is decided by the gate + Opus DTX.
-//! RNNoise already produces a speech probability for every frame as a
+//! `RNNoise` already produces a speech probability for every frame as a
 //! by-product of denoising, so this stage just combines it with the gate
 //! and adds the hold/cooldown behaviour the UI wants.
 //!
@@ -32,7 +32,7 @@ use std::{
 
 use super::{AudioProcessor, FrameContext};
 
-/// RNNoise speech probability at or above which a frame is speech.
+/// `RNNoise` speech probability at or above which a frame is speech.
 const VAD_THRESHOLD: f32 = 0.5;
 
 /// After speech stops, keep `is_speech` true for this many frames so the
@@ -56,6 +56,7 @@ impl Default for SpeakingIndicator {
 }
 
 impl SpeakingIndicator {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             is_speaking: Arc::new(AtomicBool::new(false)),
@@ -65,6 +66,7 @@ impl SpeakingIndicator {
     }
 
     /// Handle to observe speaking state from outside the audio thread.
+    #[must_use]
     pub fn speaking_handle(&self) -> Arc<AtomicBool> {
         self.is_speaking.clone()
     }
@@ -96,7 +98,7 @@ impl SpeakingIndicator {
 }
 
 impl AudioProcessor for SpeakingIndicator {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "speaking"
     }
 

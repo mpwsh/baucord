@@ -33,6 +33,7 @@ pub struct LevelMeter {
 
 impl LevelMeter {
     /// Create a level meter that writes to the specified context field.
+    #[must_use]
     pub fn new(target: MeterTarget) -> Self {
         Self { target }
     }

@@ -5,8 +5,6 @@ fn main() {
     // actual compilation target.
     println!("cargo:rerun-if-changed=../../assets/icons/icon.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        println!("cargo:rustc-link-lib=static=libx264");
-
         let mut res = winresource::WindowsResource::new();
         res.set_icon("../../assets/icons/icon.ico");
         res.compile()

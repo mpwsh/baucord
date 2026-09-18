@@ -765,7 +765,7 @@ impl ChatServer {
             self.last_restriction_sweep = now;
             self.sweep_restrictions();
         }
-        if now.duration_since(self.last_progress_minute) >= Duration::from_secs(60) {
+        if now.duration_since(self.last_progress_minute) >= Duration::from_mins(1) {
             self.last_progress_minute = now;
             self.flush_progress();
         }
@@ -780,12 +780,14 @@ impl ChatServer {
         self.voice.process(
             &mut self.driver,
             now,
-            &clients,
-            &self.deafened,
-            &self.muted,
-            afk,
-            self.default_channel,
-            &self.channel_of,
+            &crate::relay::Room {
+                clients: &clients,
+                deafened: &self.deafened,
+                muted: &self.muted,
+                afk_channel: afk,
+                lobby: self.default_channel,
+                channel_of: &self.channel_of,
+            },
         );
         self.video.process(&mut self.driver, now, &clients);
         self.video
@@ -1638,7 +1640,7 @@ impl ChatServer {
 
     fn handle_client_connected(&mut self, client_id: ClientId, username: String) {
         info!("{username} ({client_id:#x}) connected (in the lobby)");
-        self.usernames.insert(client_id, username.clone());
+        self.usernames.insert(client_id, username);
         // Everyone lands in the default channel (config guarantees it
         // is open and unlimited) — the lobby (spec §12, 1.1.5): nobody
         // is told until they join a channel, which is when `announce`
@@ -2531,6 +2533,22 @@ impl ChatServer {
             })
             .collect();
 
+        // Whoever a removed room dumps into the lobby is withdrawn
+        // below, exactly as an admin's move there would: their stream
+        // stops, they stop watching, and the others see them leave.
+        let old_lobby = self.default_channel;
+        let demoted: Vec<ClientId> = new_channel_of
+            .iter()
+            .filter(|(client, new_ch)| {
+                **new_ch == new_default
+                    && self
+                        .channel_of
+                        .get(*client)
+                        .is_some_and(|old| *old != old_lobby)
+            })
+            .map(|(client, _)| *client)
+            .collect();
+
         self.channel_list = channels;
         self.channel_infos = channel_infos_of(&self.channel_list);
         self.default_channel = new_default;
@@ -2563,6 +2581,10 @@ impl ChatServer {
                     memberships,
                 },
             );
+        }
+
+        for client in demoted {
+            self.withdraw(client);
         }
 
         // ── Re-derive channel-scoped share visibility ───────────────

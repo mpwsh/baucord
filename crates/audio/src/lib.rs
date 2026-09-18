@@ -27,7 +27,7 @@
 //! owns (`native::wasapi`): registered with MMCSS "Pro Audio" before the
 //! device is opened, event-driven shared mode, and the audio engine
 //! converting to/from 48 kHz so no resampler runs. cpal remains the
-//! fallback there and the primary backend on macOS (whose CoreAudio
+//! fallback there and the primary backend on macOS (whose `CoreAudio`
 //! callback already runs on a real-time thread) and Linux. Either way the
 //! engine asks for 48 kHz first (see [`device`]) and only resamples when a
 //! device cannot provide it.
@@ -150,6 +150,7 @@ pub struct IncomingSender {
 impl IncomingSender {
     /// Non-blocking; returns `false` if the engine's inbound queue is full
     /// or the engine is gone (dropping is correct real-time behaviour).
+    #[must_use]
     pub fn send(&self, packet: AudioPacket) -> bool {
         // Counted at intake: "packets received from the network", which is
         // also correct while deafened or before an output device exists.
@@ -266,7 +267,7 @@ impl VoiceChat {
             opened_input: None,
             opened_output: None,
             last_device_poll: Instant::now(),
-            last_restart_attempt: Instant::now() - RESTART_BACKOFF,
+            last_restart_attempt: Instant::now().checked_sub(RESTART_BACKOFF).unwrap(),
             stats,
             is_speaking: Arc::new(AtomicBool::new(false)),
             output_gain,
@@ -866,8 +867,8 @@ mod voice_loop_repro {
     }
 
     /// Replicates client/voice.rs's select loop shape (post-fix) against a
-    /// real VoiceChat: per-iteration outgoing clone, three-arm select with
-    /// dead-channel fallback, control drain, take_outgoing_packets poll.
+    /// real `VoiceChat`: per-iteration outgoing clone, three-arm select with
+    /// dead-channel fallback, control drain, `take_outgoing_packets` poll.
     #[test]
     fn voice_loop_select_shape_processes_incoming() {
         let (ctrl_tx, ctrl_rx) = cb_bounded::<Ctrl>(64);

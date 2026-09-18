@@ -1,6 +1,6 @@
-//! Noise suppression via nnnoiseless (Mozilla RNNoise, pure Rust).
+//! Noise suppression via nnnoiseless (Mozilla `RNNoise`, pure Rust).
 //!
-//! RNNoise's frame is fixed at 480 samples (10 ms @ 48 kHz); the pipeline
+//! `RNNoise`'s frame is fixed at 480 samples (10 ms @ 48 kHz); the pipeline
 //! frame is 960, so each call runs the network twice. The VAD probability
 //! reported is the larger of the two halves (speech anywhere in the frame
 //! counts).
@@ -42,6 +42,7 @@ impl Default for Denoiser {
 }
 
 impl Denoiser {
+    #[must_use]
     pub fn new() -> Self {
         let mut state = DenoiseState::new();
         Self::warm(&mut state);
@@ -77,7 +78,7 @@ impl Denoiser {
 }
 
 impl AudioProcessor for Denoiser {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "denoise"
     }
 

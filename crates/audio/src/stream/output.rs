@@ -5,7 +5,7 @@
 //! resamples to the output device rate, and plays back through the
 //! default output device.
 //!
-//! ## Why separate from AudioOutput?
+//! ## Why separate from `AudioOutput`?
 //!
 //! - Voice chat is mono; screen share audio is stereo (game panning, music)
 //! - Independent volume controls (voice vs stream audio)
@@ -106,7 +106,7 @@ impl StreamAudioOutput {
         let device = if let Some(name) = device_name {
             host.output_devices()?
                 .find(|d| crate::device_name(d).as_deref() == Some(name))
-                .ok_or_else(|| format!("Output device '{}' not found", name))?
+                .ok_or_else(|| format!("Output device '{name}' not found"))?
         } else {
             host.default_output_device()
                 .ok_or("No default output device available")?
@@ -187,7 +187,7 @@ impl StreamAudioOutput {
             SampleFormat::I16 => self.build_stream::<i16>(sample_rate, channels)?,
             SampleFormat::U16 => self.build_stream::<u16>(sample_rate, channels)?,
             SampleFormat::F32 => self.build_stream::<f32>(sample_rate, channels)?,
-            _ => return Err(format!("Unsupported format: {:?}", format).into()),
+            _ => return Err(format!("Unsupported format: {format:?}").into()),
         };
 
         stream.play()?;
@@ -339,7 +339,7 @@ impl StreamAudioOutput {
 
             if needs_resample {
                 let chunk = crate::resampler::frames_for_ms(OPUS_SAMPLE_RATE, 20);
-                let ratio = device_sample_rate as f64 / OPUS_SAMPLE_RATE as f64;
+                let ratio = f64::from(device_sample_rate) / f64::from(OPUS_SAMPLE_RATE);
                 let params = SincInterpolationParameters {
                     sinc_len: 64,
                     f_cutoff: Some(0.95),
@@ -378,8 +378,7 @@ impl StreamAudioOutput {
             let mut next_tick = Instant::now();
 
             info!(
-                "Stream audio worker started (device {}Hz, resample={})",
-                device_sample_rate, needs_resample,
+                "Stream audio worker started (device {device_sample_rate}Hz, resample={needs_resample})",
             );
 
             while !should_stop.load(Ordering::Relaxed) {

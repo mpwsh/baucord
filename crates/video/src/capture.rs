@@ -105,6 +105,7 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
 /// "show the dialog" (never start a stream the user didn't clearly
 /// ask for).
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[must_use]
 pub fn focused_pid() -> Option<u32> {
     let windows = xcap::Window::all().ok()?;
     windows
@@ -238,6 +239,7 @@ impl Capturer {
     }
 
     /// Short human-readable backend description for logs/diagnostics.
+    #[must_use]
     pub fn backend_name(&self) -> &'static str {
         match self {
             #[cfg(target_os = "windows")]
@@ -523,6 +525,7 @@ impl StreamCapturer {
         self.last.as_ref()
     }
 
+    #[must_use]
     pub fn quality(&self) -> Quality {
         self.quality
     }
@@ -705,10 +708,12 @@ impl ScreenCapturer {
         self.last.as_ref()
     }
 
+    #[must_use]
     pub fn quality(&self) -> Quality {
         self.quality
     }
 
+    #[must_use]
     pub fn frame_count(&self) -> u64 {
         self.frame_count
     }

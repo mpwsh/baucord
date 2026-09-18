@@ -49,7 +49,7 @@ fn main() {
     if let Some(decoded) = last_decoded {
         let path = "loopback_output.bmp";
         write_bmp(path, decoded.width, decoded.height, &decoded.data);
-        println!("Saved decoded frame to {}", path);
+        println!("Saved decoded frame to {path}");
     } else {
         println!("No frames decoded (decoder may still be buffering)");
     }

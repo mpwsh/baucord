@@ -452,6 +452,9 @@ pub enum Outcome {
     TimedOut,
 }
 
+// One message per query on one channel; the small variant is a test
+// hook. Boxing every query to shrink an enum nobody stores buys nothing.
+#[expect(clippy::large_enum_variant)]
 enum Request {
     Query {
         query: Query,

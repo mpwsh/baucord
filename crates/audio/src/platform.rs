@@ -14,7 +14,7 @@
 //!   so small buffers survive load without glitching.
 //!
 //! macOS and Linux get the equivalent through `audio_thread_priority`
-//! (Mach time-constraint policy / SCHED_FIFO): the output worker now
+//! (Mach time-constraint policy / `SCHED_FIFO)`: the output worker now
 //! decodes every peer, and a normal-priority thread loses to a compiler
 //! or a browser tab exactly when the buffers are smallest. Failure is
 //! logged and ignored — on Linux without an rtprio limit the worker just
@@ -111,11 +111,12 @@ impl Drop for RtGuard {
 /// processes; everything inside this crate is already promoted, so a
 /// normal-priority send loop becomes the one place the voice still stalls.
 #[cfg(windows)]
+#[must_use]
 pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<RtGuard> {
     // UTF-16, NUL-terminated.
     let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
     let mut index: u32 = 0;
-    let handle = unsafe { AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index) };
+    let handle = unsafe { AvSetMmThreadCharacteristicsW(task.as_ptr(), &raw mut index) };
     if handle.is_null() {
         log::warn!("MMCSS registration failed — audio worker runs at normal priority");
         None
@@ -164,7 +165,7 @@ pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<
 /// The handle is intentionally leaked: the thread lives exactly as long as
 /// the stream, reverting from any other thread is undefined, and the OS
 /// releases it at thread exit. Skipped on macOS, where the callback runs
-/// on CoreAudio's HAL thread, which is already time-constraint scheduled.
+/// on `CoreAudio`'s HAL thread, which is already time-constraint scheduled.
 pub(crate) fn promote_callback_thread(buffer_frames: u32, sample_rate: u32) {
     #[cfg(target_os = "macos")]
     {
@@ -196,7 +197,7 @@ pub(crate) fn promote_callback_thread(buffer_frames: u32, sample_rate: u32) {
 /// duration doesn't degrade gracefully: it kills stream creation entirely
 /// (observed in the field as total silence). `Default` already means the
 /// ~10 ms shared-mode engine period on Windows; going lower is
-/// IAudioClient3 territory, not this knob.
+/// `IAudioClient3` territory, not this knob.
 #[cfg(windows)]
 pub fn request_low_latency_buffer(
     _supported: &SupportedBufferSize,

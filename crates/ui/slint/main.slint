@@ -325,6 +325,40 @@ export component MainWindow inherits Window {
     // One register per kind: the glyph and the border carry the color,
     // the message stays in primary text so it reads on the tint. A
     // click dismisses it before the 5 s timer does.
+    // A file dragged in from the OS: the whole window says where it
+    // will go. No TouchArea, so a stale hover (a cancel the platform
+    // never sent) still lets clicks through.
+    if State.drop-hover && State.phase == Phase.main : Rectangle {
+        background: Theme.bg-primary.with-alpha(0.82);
+        Rectangle {
+            width: Math.min(root.width - 4 * Theme.gap-lg, 420px);
+            height: 140px;
+            border-radius: Theme.radius-lg;
+            border-width: 2px;
+            border-color: Theme.accent-text;
+            background: Theme.bg-tertiary;
+            VerticalLayout {
+                alignment: center;
+                spacing: Theme.gap-sm;
+                HorizontalLayout {
+                    alignment: center;
+                    IconDisplay {
+                        icon: IconSet.Upload;
+                        size: 32px;
+                        stroke: Theme.accent-text;
+                    }
+                }
+                Text {
+                    text: Tr.drop-to-send;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-lg;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+
     if State.error-text != "" && State.phase == Phase.main : toast-box := Rectangle {
         property <color> tone: State.toast-kind == ToastKind.error ? Theme.danger
             : State.toast-kind == ToastKind.warning ? Theme.warning

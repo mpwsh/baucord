@@ -9,8 +9,8 @@
 //! |----------|----------------------------------------------------------|-------------|
 //! | Windows  | WASAPI process loopback (own audio excluded)             | ✅ Working  |
 //! | Windows  | WASAPI endpoint loopback (fallback, includes own audio)  | ✅ Working  |
-//! | macOS    | ScreenCaptureKit                                         | 🚧 Stub     |
-//! | Linux    | PipeWire / PulseAudio                                    | 🚧 Stub     |
+//! | macOS    | `ScreenCaptureKit`                                         | 🚧 Stub     |
+//! | Linux    | `PipeWire` / `PulseAudio`                                    | 🚧 Stub     |
 //!
 //! ## Own-audio exclusion (echo prevention)
 //!
@@ -27,7 +27,7 @@
 //! backend, not re-ducked at the receiver.
 //! Future macOS/Linux backends should follow the same rule: exclude at
 //! capture time (`SCStreamConfiguration.excludesCurrentProcessAudio`,
-//! PipeWire routing), never filter after the fact.
+//! `PipeWire` routing), never filter after the fact.
 //!
 //! ## Footprint (silence)
 //!
@@ -149,7 +149,7 @@ pub struct SystemAudioPacket {
 ///
 /// Each platform implements this to provide raw audio samples from
 /// the system's audio output. The trait abstracts away WASAPI,
-/// ScreenCaptureKit, PipeWire, etc.
+/// `ScreenCaptureKit`, `PipeWire`, etc.
 ///
 /// Implementations push captured samples into the provided ring buffer
 /// producer. The format contract:
@@ -192,7 +192,7 @@ mod wasapi_loopback {
     };
     use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
 
-    use super::*;
+    use super::{error, info, Arc, AudioStats, Ordering, Producer, Sender, SystemAudioBackend};
 
     pub struct WasapiLoopback {
         device: cpal::Device,
@@ -282,7 +282,7 @@ mod wasapi_loopback {
             // cpal supports this via `build_input_stream` on an output device
             // when using the WASAPI host.
             let stream = device.build_input_stream(
-                config.clone(),
+                *config,
                 move |data: &[T], _: &_| {
                     // Output interleaved stereo (L, R, L, R, ...).
                     // Handle any source channel count:
@@ -321,7 +321,7 @@ mod wasapi_loopback {
                     }
                 },
                 move |err| {
-                    error!("System audio capture error: {}", err);
+                    error!("System audio capture error: {err}");
                     stats_err.input_overruns.fetch_add(1, Ordering::Relaxed);
                 },
                 None,
@@ -375,7 +375,7 @@ mod wasapi_loopback {
                     channels as usize,
                 )?,
                 _ => {
-                    return Err(format!("Unsupported sample format: {:?}", format).into());
+                    return Err(format!("Unsupported sample format: {format:?}").into());
                 }
             };
 
@@ -671,10 +671,7 @@ impl SystemAudioCapture {
         self.backend = Some(backend);
         self.is_active.store(true, Ordering::Relaxed);
 
-        info!(
-            "System audio capture ready: {} @ {}Hz",
-            device_name, device_sample_rate
-        );
+        info!("System audio capture ready: {device_name} @ {device_sample_rate}Hz");
 
         Ok(())
     }
@@ -791,6 +788,7 @@ impl SystemAudioCapture {
     ///
     /// Returns `None` if no packet is ready. The caller should poll
     /// this in the same loop that handles screen share video frames.
+    #[must_use]
     pub fn try_recv(&self) -> Option<SystemAudioPacket> {
         self.packet_rx.try_recv().ok()
     }
@@ -798,6 +796,7 @@ impl SystemAudioCapture {
     /// Drain all available encoded packets into a vec.
     ///
     /// Useful when the caller wants to batch packets for network send.
+    #[must_use]
     pub fn drain_packets(&self) -> Vec<SystemAudioPacket> {
         let mut packets = Vec::new();
         while let Ok(pkt) = self.packet_rx.try_recv() {
@@ -807,6 +806,7 @@ impl SystemAudioCapture {
     }
 
     /// Whether system audio capture is currently active.
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.is_active.load(Ordering::Relaxed)
     }
@@ -820,6 +820,7 @@ impl SystemAudioCapture {
         self.is_muted.store(muted, Ordering::Relaxed);
     }
 
+    #[must_use]
     pub fn is_muted(&self) -> bool {
         self.is_muted.load(Ordering::Relaxed)
     }
@@ -912,7 +913,7 @@ impl SystemAudioCapture {
 
         if needs_resample {
             let chunk = crate::resampler::frames_for_ms(device_sample_rate, 20);
-            let ratio = OPUS_SAMPLE_RATE as f64 / device_sample_rate as f64;
+            let ratio = f64::from(OPUS_SAMPLE_RATE) / f64::from(device_sample_rate);
             let params = SincInterpolationParameters {
                 sinc_len: 64,
                 f_cutoff: Some(0.95),
@@ -964,8 +965,7 @@ impl SystemAudioCapture {
         let interleaved_frame_size = SYSTEM_AUDIO_FRAME_SIZE * SYSTEM_AUDIO_CHANNELS;
 
         info!(
-            "System audio worker started (stereo, device {}Hz, resample={})",
-            device_sample_rate, needs_resample
+            "System audio worker started (stereo, device {device_sample_rate}Hz, resample={needs_resample})"
         );
 
         while !should_stop.load(Ordering::Relaxed) {
@@ -1088,7 +1088,7 @@ impl SystemAudioCapture {
                 let vol = f32::from_bits(volume.load(Ordering::Relaxed));
                 let apply_vol = (vol - 1.0).abs() > f32::EPSILON;
                 let mut peak = 0.0f32;
-                for s in frame.iter_mut() {
+                for s in &mut frame {
                     if apply_vol {
                         *s = (*s * vol).clamp(-0.99, 0.99);
                     }
@@ -1131,13 +1131,11 @@ impl SystemAudioCapture {
                         seq = seq.wrapping_add(1);
 
                         match packet_tx.try_send(packet) {
-                            Ok(_) => {}
-                            Err(TrySendError::Full(_)) => {
-                                // Consumer is behind — drop this frame.
-                                // System audio is less critical than voice;
-                                // dropping a frame causes a barely audible
-                                // 20ms gap in background music.
-                            }
+                            // Full: the consumer is behind — drop this
+                            // frame. System audio is less critical than
+                            // voice; a dropped frame is a barely audible
+                            // 20 ms gap in background music.
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
                             Err(TrySendError::Disconnected(_)) => {
                                 info!("System audio packet channel disconnected, stopping worker");
                                 return;

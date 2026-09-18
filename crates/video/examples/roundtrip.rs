@@ -20,10 +20,7 @@ fn main() {
     let num_frames = 60u32;
 
     let backend = "ffmpeg";
-    println!(
-        "Roundtrip benchmark: {} — {} frames [{}]",
-        quality, num_frames, backend
-    );
+    println!("Roundtrip benchmark: {quality} — {num_frames} frames [{backend}]");
 
     let mut capturer = ScreenCapturer::primary(quality).expect("Failed to create capturer");
 
@@ -74,12 +71,12 @@ fn main() {
     let avg_decode = total_decode / num_frames;
     let avg_frame_bytes = total_bytes / num_frames as usize;
     let total_time = total_capture + total_encode + total_decode;
-    let max_fps = num_frames as f64 / total_time.as_secs_f64();
+    let max_fps = f64::from(num_frames) / total_time.as_secs_f64();
 
-    println!("--- Results ({}) [{}] ---", quality, backend);
-    println!("  Avg capture:  {:?}", avg_capture);
-    println!("  Avg encode:   {:?}", avg_encode);
-    println!("  Avg decode:   {:?}", avg_decode);
+    println!("--- Results ({quality}) [{backend}] ---");
+    println!("  Avg capture:  {avg_capture:?}");
+    println!("  Avg encode:   {avg_encode:?}");
+    println!("  Avg decode:   {avg_decode:?}");
     println!(
         "  Avg frame:    {} bytes ({:.1} KB)",
         avg_frame_bytes,
@@ -92,8 +89,8 @@ fn main() {
     );
     println!(
         "  Avg bitrate:  {:.2} Mbps",
-        total_bytes as f64 * 8.0 / (num_frames as f64 / quality.fps() as f64) / 1_000_000.0
+        total_bytes as f64 * 8.0 / (f64::from(num_frames) / f64::from(quality.fps())) / 1_000_000.0
     );
-    println!("  Max pipeline FPS: {:.1}", max_fps);
-    println!("  Decoded:      {}/{}", decoded_count, num_frames);
+    println!("  Max pipeline FPS: {max_fps:.1}");
+    println!("  Decoded:      {decoded_count}/{num_frames}");
 }

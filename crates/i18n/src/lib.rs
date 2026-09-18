@@ -63,12 +63,18 @@ static STATE: RwLock<Option<State>> = RwLock::new(None);
 
 /// Initialize with a preferred BCP-47 code, or `None` to follow the OS
 /// locale. Returns the resolved locale code. Call before building UI.
+#[must_use]
 pub fn init(preferred: Option<&str>) -> &'static str {
     set_locale(preferred)
 }
 
 /// Switch locale at runtime. Already-constructed widgets keep their
 /// labels — frontends re-set or rebuild per their own strategy.
+///
+/// # Panics
+/// If the locale lock is poisoned, i.e. a translation panicked
+/// while holding it — the bundles are read-only after construction,
+/// so that cannot happen in practice.
 pub fn set_locale(preferred: Option<&str>) -> &'static str {
     let requested = preferred.map(str::to_owned).or_else(sys_locale::get_locale);
     let locale = resolve(requested.as_deref());
@@ -84,11 +90,17 @@ pub fn set_locale(preferred: Option<&str>) -> &'static str {
 }
 
 /// The active locale code ("en" before `init`).
+///
+/// # Panics
+/// If the locale lock is poisoned (see [`set_locale`]).
 pub fn current_locale() -> &'static str {
     STATE.read().unwrap().as_ref().map_or("en", |s| s.code)
 }
 
 /// Translate a message id. Prefer the [`t!`] macro.
+///
+/// # Panics
+/// If the locale lock is poisoned (see [`set_locale`]).
 pub fn translate(id: &str, args: Option<&FluentArgs>) -> String {
     let guard = STATE.read().unwrap();
     let Some(state) = guard.as_ref() else {

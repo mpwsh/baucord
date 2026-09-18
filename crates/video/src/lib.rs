@@ -71,6 +71,7 @@ impl std::fmt::Display for Quality {
 impl Quality {
     /// Maximum encoded width. The actual encoded width may be smaller
     /// to preserve the source aspect ratio.
+    #[must_use]
     pub const fn width(self) -> u32 {
         match self {
             Self::HD30 | Self::HD60 => 1280,
@@ -81,6 +82,7 @@ impl Quality {
 
     /// Maximum encoded height. The actual encoded height may be smaller
     /// to preserve the source aspect ratio.
+    #[must_use]
     pub const fn height(self) -> u32 {
         match self {
             Self::HD30 | Self::HD60 => 720,
@@ -89,6 +91,7 @@ impl Quality {
         }
     }
 
+    #[must_use]
     pub const fn fps(self) -> u32 {
         match self {
             Self::HD30 | Self::FHD30 | Self::QHD30 => 30,
@@ -106,6 +109,7 @@ impl Quality {
     /// This is the *actual* encoder target (ABR + VBV), not a hint. The
     /// sender may run below it under uplink pressure — see
     /// [`Quality::scaled_bitrate`] and [`VideoEncoder::set_bitrate_scale_pct`].
+    #[must_use]
     pub const fn bitrate(self) -> u32 {
         match self {
             Self::HD30 => 3_500_000,
@@ -123,6 +127,7 @@ impl Quality {
     // `From` isn't const, so the widening is an `as`; the result is ≤
     // bitrate() and can't truncate.
     #[allow(clippy::cast_lossless, clippy::cast_possible_truncation)]
+    #[must_use]
     pub const fn scaled_bitrate(self, pct: u32) -> u32 {
         let pct = clamp_bitrate_scale_pct(pct);
         // u64 intermediate: 10 Mbit × 100 overflows u32.
@@ -130,21 +135,25 @@ impl Quality {
     }
 
     /// Duration of one frame.
+    #[must_use]
     pub const fn frame_duration(self) -> std::time::Duration {
         std::time::Duration::from_nanos(1_000_000_000 / self.fps() as u64)
     }
 
     /// Pixel count at the maximum resolution for this preset.
+    #[must_use]
     pub const fn pixel_count(self) -> usize {
         self.width() as usize * self.height() as usize
     }
 
     /// Byte count for one RGBA frame at the maximum resolution.
+    #[must_use]
     pub const fn rgba_size(self) -> usize {
         self.pixel_count() * 4
     }
 
     /// Byte count for one YUV420 frame at the maximum resolution.
+    #[must_use]
     pub const fn yuv420_size(self) -> usize {
         self.pixel_count() * 3 / 2
     }
@@ -161,6 +170,7 @@ impl Quality {
     ///
     /// Unlike an index into [`Quality::ALL`], these survive reordering
     /// or insertion of new presets in future versions.
+    #[must_use]
     pub const fn key(self) -> &'static str {
         match self {
             Self::HD30 => "hd30",
@@ -173,6 +183,7 @@ impl Quality {
 
     /// Inverse of [`Quality::key`]. Returns `None` for unknown keys
     /// (e.g. a settings file written by a newer version).
+    #[must_use]
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|q| q.key() == key)
     }
@@ -186,6 +197,7 @@ impl Quality {
 pub const MIN_BITRATE_SCALE_PCT: u32 = 10;
 
 /// Clamp a bitrate scale into the range the encoder honors.
+#[must_use]
 pub const fn clamp_bitrate_scale_pct(pct: u32) -> u32 {
     if pct < MIN_BITRATE_SCALE_PCT {
         MIN_BITRATE_SCALE_PCT
@@ -290,6 +302,7 @@ pub enum CodecError {
 /// encoder actually emitted. Hardware encoder wrappers have quirks
 /// (missing in-band parameter sets, I-slices flagged as keyframes),
 /// and this makes them visible from the sender's log alone.
+#[must_use]
 pub fn describe_annexb_nals(data: &[u8]) -> String {
     let mut names: Vec<String> = Vec::new();
     let mut i = 0usize;
@@ -351,7 +364,7 @@ pub trait VideoEncoder {
     /// stay as the preset says; only bits per frame change.
     ///
     /// Takes effect on the next [`VideoEncoder::encode`] call. The
-    /// FFmpeg backend reopens its session for this, so the first frame
+    /// `FFmpeg` backend reopens its session for this, so the first frame
     /// at the new rate is an IDR with parameter sets — a recovery point
     /// for viewers who lost packets on the way down. Frames in flight
     /// inside a hardware encoder's pipeline are discarded without
@@ -387,7 +400,7 @@ pub trait VideoEncoder {
     /// Whether [`VideoEncoder::force_keyframe`] can actually produce an
     /// IDR on demand.
     ///
-    /// FFmpeg's AMF wrapper (through 7.1) ignores frame-level keyframe
+    /// `FFmpeg`'s AMF wrapper (through 7.1) ignores frame-level keyframe
     /// requests — IDRs only appear when the encoder's own period
     /// elapses, counted in *submitted frames*. When this is `false`,
     /// the capture loop must keep frames flowing (even on a static

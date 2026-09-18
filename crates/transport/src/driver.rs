@@ -1096,6 +1096,7 @@ impl Driver {
         true
     }
 
+    #[must_use]
     pub fn upload_progress(&self, peer: PeerId, upload: UploadId) -> Option<(usize, usize)> {
         let p = self.peer(peer)?;
         let u = p.uploads.iter().find(|u| u.id == upload)?;

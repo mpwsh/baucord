@@ -95,7 +95,7 @@ impl LatencyStats {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len();
         if n.is_multiple_of(2) && n >= 2 {
-            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+            f64::midpoint(sorted[n / 2 - 1], sorted[n / 2])
         } else {
             sorted[n / 2]
         }
@@ -110,7 +110,7 @@ fn run_measurement_loop(stats: &AudioStats) {
     let mut input_detected_at = Instant::now();
     let mut input_peak: f32 = 0.0;
     // Allow immediate first measurement.
-    let mut last_measurement = Instant::now() - MEASUREMENT_COOLDOWN;
+    let mut last_measurement = Instant::now().checked_sub(MEASUREMENT_COOLDOWN).unwrap();
 
     let mut last_status_print = Instant::now();
     let start = Instant::now();

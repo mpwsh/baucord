@@ -326,11 +326,11 @@ impl EncoderWorker {
         // thread can never wedge in a blocking send (which used to make
         // shutdown hang).
         match self.tx.try_send(packet) {
-            Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.stats.outgoing_dropped.fetch_add(1, Ordering::Relaxed);
             }
-            Err(TrySendError::Disconnected(_)) => {}
+            // Disconnected: the receiver is gone (shutdown); nothing to count.
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
         }
     }
 

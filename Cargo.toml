@@ -35,6 +35,17 @@ nonstandard_style = { level = "deny", priority = -1 }
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 redundant_clone = "deny"
+# Pedantic lints this workspace does not follow, and why (decided in
+# the 2026-09-18 tech-debt cycle, SESSION-GUIDE.md §4):
+# DSP, frame geometry and timing code casts by design, and the values
+# stay in range by construction — `try_from` chains and `f64` detours
+# at ~150 sites would say nothing the surrounding code does not.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# `decoder`/`decoded`, `encoder`/`encoded`: the codec idiom, not a slip.
+similar_names = "allow"
 # ── Release: fast binary ────────────────────────────────────────────────
 [profile.release]
 opt-level = 3

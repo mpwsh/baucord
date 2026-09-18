@@ -575,6 +575,7 @@ dm-failed-store = O servidor não conseguiu guardar a mensagem. Tente de novo.
 messages-header = Mensagens
 voice-header = Voz
 lobby-banner = Entre em um canal de voz para começar a falar
+drop-to-send = Solte para enviar
 lobby-mic-hint = Entre em um canal para falar
 messages-collapse = Recolher mensagens
 messages-expand = Expandir mensagens

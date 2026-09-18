@@ -163,7 +163,7 @@ pub struct JitterBufferStats {
 pub struct VideoJitterBuffer {
     /// Buffered packets keyed by sequence number.
     ///
-    /// Note: BTreeMap ordering is numeric, not wraparound-aware, so all
+    /// Note: `BTreeMap` ordering is numeric, not wraparound-aware, so all
     /// "which packet is next/first/latest" decisions use the wrapping
     /// comparisons below rather than map iteration order.
     pending: BTreeMap<u32, BufferedPacket>,
@@ -199,6 +199,7 @@ impl VideoJitterBuffer {
     /// `fps` seeds the jitter estimator and sizes the overflow cap; the
     /// estimator then learns the sender's real cadence from arrivals, so
     /// the seed only matters for the first second or so of a stream.
+    #[must_use]
     pub fn new(fps: u32) -> Self {
         let fps = fps.max(1);
         Self {
@@ -389,12 +390,14 @@ impl VideoJitterBuffer {
     }
 
     /// Number of packets currently buffered.
+    #[must_use]
     pub fn depth(&self) -> usize {
         self.pending.len()
     }
 
     /// Buffered span in milliseconds: arrival-time spread between the
     /// oldest and newest pending packets.
+    #[must_use]
     pub fn depth_ms(&self) -> f32 {
         let mut oldest: Option<Instant> = None;
         let mut newest: Option<Instant> = None;
@@ -410,22 +413,26 @@ impl VideoJitterBuffer {
 
     /// Current reorder window in milliseconds — the longest the buffer
     /// will stall on a missing packet before recovering.
+    #[must_use]
     pub fn adaptive_target_ms(&self) -> f32 {
         self.reorder_wait().as_secs_f32() * 1000.0
     }
 
     /// Current playout delay in milliseconds — the steady latency the
     /// pacer spends to release frames at the sender's cadence.
+    #[must_use]
     pub fn playout_delay_ms(&self) -> f32 {
         self.playout_delay().as_secs_f32() * 1000.0
     }
 
     /// Smoothed arrival-jitter estimate in milliseconds.
+    #[must_use]
     pub fn adaptive_jitter_ms(&self) -> f32 {
         self.jitter.jitter_ms()
     }
 
     /// Whether the first keyframe has been seen.
+    #[must_use]
     pub fn is_primed(&self) -> bool {
         self.primed
     }
@@ -504,34 +511,29 @@ impl VideoJitterBuffer {
                 .max_by_key(|&s| s.wrapping_sub(next))
         });
 
-        match latest_kf {
-            Some(kf) => {
-                let before = self.pending.len();
-                self.pending.retain(|&s, _| s == kf || is_seq_after(s, kf));
-                self.stats.packets_dropped_overflow += (before - self.pending.len()) as u64;
-                self.stats.keyframe_resets += 1;
-                self.next_seq = Some(kf);
-                self.gap_since = None;
-                log::warn!(
-                    "jitter buffer overflow: jumped to keyframe seq {kf}, dropped {} packet(s)",
-                    before - self.pending.len(),
-                );
-            }
-            None => {
-                self.stats.packets_dropped_overflow += self.pending.len() as u64;
-                self.pending.clear();
-                self.gap_since = None;
-                // Same freeze semantics as an unhealed gap: nothing
-                // buffered is decodable without a keyframe, so drop to
-                // unprimed and resume at the next IDR.
-                self.primed = false;
-                self.next_seq = None;
-                self.unprimed_since = Some(Instant::now());
-                self.want_keyframe = true;
-                log::warn!(
-                    "jitter buffer overflow with no buffered keyframe: froze, requesting IDR"
-                );
-            }
+        if let Some(kf) = latest_kf {
+            let before = self.pending.len();
+            self.pending.retain(|&s, _| s == kf || is_seq_after(s, kf));
+            self.stats.packets_dropped_overflow += (before - self.pending.len()) as u64;
+            self.stats.keyframe_resets += 1;
+            self.next_seq = Some(kf);
+            self.gap_since = None;
+            log::warn!(
+                "jitter buffer overflow: jumped to keyframe seq {kf}, dropped {} packet(s)",
+                before - self.pending.len(),
+            );
+        } else {
+            self.stats.packets_dropped_overflow += self.pending.len() as u64;
+            self.pending.clear();
+            self.gap_since = None;
+            // Same freeze semantics as an unhealed gap: nothing
+            // buffered is decodable without a keyframe, so drop to
+            // unprimed and resume at the next IDR.
+            self.primed = false;
+            self.next_seq = None;
+            self.unprimed_since = Some(Instant::now());
+            self.want_keyframe = true;
+            log::warn!("jitter buffer overflow with no buffered keyframe: froze, requesting IDR");
         }
     }
 
@@ -765,6 +767,7 @@ impl JitterEstimate {
     }
 
     fn record_arrival(&mut self, at: Instant) {
+        const ALPHA: f32 = 1.0 / 16.0; // RFC 3550 smoothing factor
         if let Some(last) = self.last_arrival {
             let gap_ms = at.duration_since(last).as_secs_f32() * 1000.0;
 
@@ -783,7 +786,6 @@ impl JitterEstimate {
             // Clamp the deviation so a stream pause (alt-tab, network
             // hiccup measured in seconds) doesn't poison the estimate.
             let deviation = (gap_ms - self.expected_interval_ms).abs().min(250.0);
-            const ALPHA: f32 = 1.0 / 16.0; // RFC 3550 smoothing factor
             self.jitter_ms += ALPHA * (deviation - self.jitter_ms);
         }
         self.last_arrival = Some(at);
@@ -864,7 +866,7 @@ mod tests {
     #[test]
     fn gap_waits_for_reorder_window() {
         let mut buf = unpaced(30);
-        buf.set_reorder_wait(Duration::from_secs(3600)); // effectively forever
+        buf.set_reorder_wait(Duration::from_hours(1)); // effectively forever
         buf.push(pkt(0, true));
         assert_eq!(buf.pull_next().unwrap().seq, 0);
 
@@ -948,7 +950,7 @@ mod tests {
     #[test]
     fn overflow_jumps_to_freshest_keyframe() {
         let mut buf = unpaced(3); // max_depth = 9
-        buf.set_reorder_wait(Duration::from_secs(3600));
+        buf.set_reorder_wait(Duration::from_hours(1));
         buf.push(pkt(0, true));
         assert_eq!(buf.pull_next().unwrap().seq, 0);
 
@@ -970,7 +972,7 @@ mod tests {
     #[test]
     fn overflow_without_keyframe_freezes_and_requests() {
         let mut buf = unpaced(3); // max_depth = 9
-        buf.set_reorder_wait(Duration::from_secs(3600));
+        buf.set_reorder_wait(Duration::from_hours(1));
         buf.push(pkt(0, true));
         assert_eq!(buf.pull_next().unwrap().seq, 0);
 
@@ -994,7 +996,11 @@ mod tests {
         assert!(!buf.take_keyframe_request()); // inside the grace period
 
         // Simulate the grace period having elapsed.
-        buf.set_unprimed_since(Instant::now() - UNPRIMED_REQUEST_AFTER * 2);
+        buf.set_unprimed_since(
+            Instant::now()
+                .checked_sub(UNPRIMED_REQUEST_AFTER * 2)
+                .unwrap(),
+        );
         buf.push(pkt(101, false));
         assert!(buf.take_keyframe_request());
     }
@@ -1107,7 +1113,11 @@ mod tests {
             buf.push(pkt_at(2, false, t0, 16));
             let later = t0 + OFFSET_BUCKET * (OFFSET_BUCKETS as u32 + 1);
             buf.push(pkt_at(3, false, later, 3000));
-            assert_eq!(buf.playout.late_peak_ms(), 0.0);
+            // Exactly zero by construction: nothing was late.
+            #[expect(clippy::float_cmp)]
+            {
+                assert_eq!(buf.playout.late_peak_ms(), 0.0);
+            }
         }
 
         #[test]
@@ -1149,7 +1159,11 @@ mod tests {
             let mut clock = PlayoutClock::new();
             let before = clock.unwrap_ts(u32::MAX - 5);
             let after = clock.unwrap_ts(10);
-            assert_eq!(after - before, 16.0);
+            // Sixteen ticks apart across the wrap: exact, no rounding.
+            #[expect(clippy::float_cmp)]
+            {
+                assert_eq!(after - before, 16.0);
+            }
         }
 
         #[test]

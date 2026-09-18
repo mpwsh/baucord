@@ -30,8 +30,7 @@ pub fn initial_of(name: &str) -> String {
     name.trim()
         .chars()
         .next()
-        .map(|c| c.to_uppercase().collect())
-        .unwrap_or_else(|| "?".to_string())
+        .map_or_else(|| "?".to_string(), |c| c.to_uppercase().collect())
 }
 
 /// A muted, deterministic tint for a name's fallback tile: the same
@@ -49,7 +48,9 @@ pub fn tile_tint(name: &str) -> [u8; 3] {
     hsl_to_rgb(hue, 0.45, 0.32)
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// h, s, l, c, x and r, g, b are the names the HSL→RGB formula is
+// written with everywhere; longer ones would hide it.
+#[expect(clippy::many_single_char_names)]
 fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let hp = h / 60.0;

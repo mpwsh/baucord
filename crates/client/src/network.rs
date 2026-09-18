@@ -92,11 +92,11 @@ const REPORT_STALL: Duration = Duration::from_secs(6);
 
 /// Longest a relayed image may sit half-assembled before it is
 /// forgotten (its sender vanished or gave up mid-pace).
-const IMAGE_PARTIAL_TTL: Duration = Duration::from_secs(120);
+const IMAGE_PARTIAL_TTL: Duration = Duration::from_mins(2);
 
 /// One "send my log" upload per this interval, mirroring the server's
 /// acceptance window.
-const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_secs(600);
+const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_mins(10);
 
 // ── Messages sent to the UI / App layer ─────────────────────────────────
 

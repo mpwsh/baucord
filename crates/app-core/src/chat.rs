@@ -1,10 +1,10 @@
 //! The chat history model and link detection.
 //!
 //! [`ChatHistory`] is the source of truth the UI model mirrors: rows of
-//! [`ChatItem`], capped at [`MAX_ROWS`] (oldest dropped). ```-fenced
+//! [`ChatItem`], capped at [`MAX_ROWS`] (oldest dropped). Fenced
 //! code becomes its own [`ChatItem::Code`] row; links stay inline in
 //! the message text (the markdown translator linkifies them for
-//! StyledText).
+//! `StyledText`).
 //!
 //! Every user-authored row carries the server's message id, so an
 //! edit or a deletion that arrives later can find its rows
@@ -56,7 +56,7 @@ pub enum ChatItem {
     System {
         body: String,
     },
-    /// A ```-fenced code block extracted from a message.
+    /// A fenced code block extracted from a message.
     Code {
         meta: Meta,
         code: String,
@@ -210,10 +210,10 @@ impl ChatHistory {
         self.next_row_id
     }
 
-    /// Append a user message. ```-fenced blocks become their own
+    /// Append a user message. Fenced blocks become their own
     /// [`ChatItem::Code`] rows (monospace panels in the UI); links
     /// render inline inside the message text (the markdown translator
-    /// linkifies them for StyledText).
+    /// linkifies them for `StyledText`).
     pub fn push_message(&mut self, meta: &Meta, body: &str, edited: bool) -> HistoryDelta {
         let rows = Self::segments(meta, body, edited);
         let appended = rows.len();

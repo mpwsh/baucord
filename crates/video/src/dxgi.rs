@@ -182,11 +182,13 @@ impl DxgiDuplicator {
     }
 
     /// Take the oldest buffered frame, if any arrived since last call.
+    #[must_use]
     pub fn take_frame(&self) -> Option<CapturedFrame> {
         self.shared.slot.lock().unwrap().pop_front()
     }
 
     /// Current worker health.
+    #[must_use]
     pub fn health(&self) -> Health {
         match self.shared.health.load(Ordering::Acquire) {
             HEALTH_RUNNING => Health::Running,
@@ -196,6 +198,7 @@ impl DxgiDuplicator {
     }
 
     /// The loss/failure message, once not [`Health::Running`].
+    #[must_use]
     pub fn failure(&self) -> Option<String> {
         self.shared.failure.lock().unwrap().clone()
     }
@@ -216,7 +219,7 @@ impl Drop for DxgiDuplicator {
 fn worker_loop(
     shared: Arc<Shared>,
     _monitor_index: usize,
-    _device: ID3D11Device,
+    device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
 ) {
@@ -236,15 +239,15 @@ fn worker_loop(
 
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        let acquired =
-            unsafe { duplication.AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut info, &mut resource) };
+        let acquired = unsafe {
+            duplication.AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &raw mut info, &raw mut resource)
+        };
 
         match acquired {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 // No screen change within the timeout — normal on a
                 // static desktop.
                 let _ = unsafe { duplication.ReleaseFrame() };
-                continue;
             }
             Err(e) => {
                 // ACCESS_LOST and friends: the duplication is dead
@@ -283,7 +286,7 @@ fn worker_loop(
                 }
 
                 let grabbed =
-                    unsafe { grab_frame(&_device, &context, &duplication, resource, &mut staging) };
+                    unsafe { grab_frame(&device, &context, &duplication, resource, &mut staging) };
                 match grabbed {
                     Ok(Some(frame)) => {
                         shared.slot.lock().unwrap().push_back(frame);
@@ -337,16 +340,13 @@ unsafe fn grab_frame(
     resource: Option<IDXGIResource>,
     staging: &mut Option<(ID3D11Texture2D, u32, u32)>,
 ) -> Result<Option<CapturedFrame>, GrabError> {
-    let resource = match resource {
-        Some(r) => r,
-        None => {
-            let _ = unsafe { duplication.ReleaseFrame() };
-            return Ok(None);
-        }
+    let Some(resource) = resource else {
+        let _ = unsafe { duplication.ReleaseFrame() };
+        return Ok(None);
     };
     let source: ID3D11Texture2D = resource.cast()?;
     let mut desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe { source.GetDesc(&mut desc) };
+    unsafe { source.GetDesc(&raw mut desc) };
 
     if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
         return Err(GrabError::UnsupportedFormat(desc.Format.0));
@@ -366,7 +366,7 @@ unsafe fn grab_frame(
         staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
 
         let mut tex = None;
-        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut tex)) }?;
+        unsafe { device.CreateTexture2D(&raw const staging_desc, None, Some(&raw mut tex)) }?;
         let tex = tex.ok_or_else(|| {
             GrabError::Windows(windows::core::Error::from_hresult(windows::core::HRESULT(
                 -1,
@@ -395,7 +395,7 @@ unsafe fn grab_frame(
             0,
             Some(&source_res),
             0,
-            Some(&region),
+            Some(&raw const region),
         );
     }
 
@@ -403,7 +403,15 @@ unsafe fn grab_frame(
     let _ = unsafe { duplication.ReleaseFrame() };
 
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe { context.Map(Some(&staging_res), 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }?;
+    unsafe {
+        context.Map(
+            Some(&staging_res),
+            0,
+            D3D11_MAP_READ,
+            0,
+            Some(&raw mut mapped),
+        )
+    }?;
 
     let mut data = vec![0u8; (width as usize) * (height as usize) * 4];
     let row_bytes = (width as usize) * 4;
@@ -444,14 +452,9 @@ fn hmonitor_at(monitor_index: usize) -> Result<isize, CaptureError> {
 
     let mut list: Vec<isize> = Vec::new();
     unsafe {
-        EnumDisplayMonitors(
-            None,
-            None,
-            Some(enum_proc),
-            LPARAM(&mut list as *mut Vec<isize> as isize),
-        )
-        .ok()
-        .map_err(|e| CaptureError::MonitorList(e.to_string()))?;
+        EnumDisplayMonitors(None, None, Some(enum_proc), LPARAM(&raw mut list as isize))
+            .ok()
+            .map_err(|e| CaptureError::MonitorList(e.to_string()))?;
     }
 
     list.get(monitor_index)
@@ -477,7 +480,7 @@ fn open_duplication(
             D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED,
             None,
             D3D11_SDK_VERSION,
-            Some(&mut device),
+            Some(&raw mut device),
             None,
             None,
         )

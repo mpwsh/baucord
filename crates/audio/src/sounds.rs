@@ -57,6 +57,7 @@ impl Default for SoundBank {
 }
 impl SoundBank {
     /// Decode all embedded sounds. Call once at startup.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             join: decode_wav("join", JOIN_WAV),
@@ -75,6 +76,7 @@ impl SoundBank {
     }
 
     /// Get the PCM samples for a sound type.
+    #[must_use]
     pub fn get(&self, sound: SoundType) -> &[f32] {
         match sound {
             SoundType::UserJoined => &self.join,
@@ -151,10 +153,10 @@ fn decode_wav(name: &str, data: &[u8]) -> Vec<f32> {
     };
 
     // Resample to 48 kHz if needed
-    let resampled = if source_rate != OPUS_SAMPLE_RATE {
-        resample(&mono, source_rate, OPUS_SAMPLE_RATE)
-    } else {
+    let resampled = if source_rate == OPUS_SAMPLE_RATE {
         mono
+    } else {
+        resample(&mono, source_rate, OPUS_SAMPLE_RATE)
     };
 
     debug!(
@@ -175,11 +177,14 @@ fn read_samples_f32(mut reader: hound::WavReader<Cursor<&[u8]>>) -> Vec<f32> {
             let max_val = (1u32 << (spec.bits_per_sample - 1)) as f32;
             reader
                 .samples::<i32>()
-                .filter_map(|s| s.ok())
+                .filter_map(std::result::Result::ok)
                 .map(|s| s as f32 / max_val)
                 .collect()
         }
-        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .filter_map(std::result::Result::ok)
+            .collect(),
     }
 }
 
@@ -200,7 +205,7 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
         return samples.to_vec();
     }
 
-    let ratio = to_rate as f64 / from_rate as f64;
+    let ratio = f64::from(to_rate) / f64::from(from_rate);
     let out_len = (samples.len() as f64 * ratio).ceil() as usize;
     let mut output = Vec::with_capacity(out_len);
 

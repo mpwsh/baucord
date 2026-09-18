@@ -58,6 +58,21 @@ pub struct VoiceRelay {
     pub seq: VoiceSeqTracker,
 }
 
+/// What one relay tick needs to know about the room: who is admitted,
+/// who hears nothing, who says nothing, and where everyone is. Built
+/// by the server each tick from its own maps; borrowed, never kept.
+#[derive(Clone, Copy)]
+pub struct Room<'a> {
+    pub clients: &'a [ClientId],
+    pub deafened: &'a HashSet<ClientId>,
+    pub muted: &'a HashSet<ClientId>,
+    /// Voice in the AFK channel goes nowhere (spec §5).
+    pub afk_channel: Option<u16>,
+    /// Voice from the lobby goes nowhere (spec §12, 1.1.5).
+    pub lobby: u16,
+    pub channel_of: &'a HashMap<ClientId, u16>,
+}
+
 impl VoiceRelay {
     #[must_use]
     pub fn new() -> Self {
@@ -85,19 +100,17 @@ impl VoiceRelay {
     /// admission runs before the relay each tick) hears and reaches
     /// nobody rather than everybody: fail closed.
     ///
-    /// `clients` are the *admitted* peers; a connection still in its
-    /// `Hello` is not among them and its voice, if any, is ignored.
-    pub fn process(
-        &mut self,
-        driver: &mut Driver,
-        now: Instant,
-        clients: &[ClientId],
-        deafened: &HashSet<ClientId>,
-        muted: &HashSet<ClientId>,
-        afk_channel: Option<u16>,
-        lobby: u16,
-        channel_of: &HashMap<ClientId, u16>,
-    ) {
+    /// `room.clients` are the *admitted* peers; a connection still in
+    /// its `Hello` is not among them and its voice, if any, is ignored.
+    pub fn process(&mut self, driver: &mut Driver, now: Instant, room: &Room<'_>) {
+        let Room {
+            clients,
+            deafened,
+            muted,
+            afk_channel,
+            lobby,
+            channel_of,
+        } = *room;
         for sender in clients {
             let sender_channel = channel_of.get(sender).copied();
             // A muted sender is told and stops; this is the backstop.

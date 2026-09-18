@@ -249,7 +249,7 @@ mod windows_qos {
     //! qWAVE: `QOSCreateHandle` once, `QOSAddSocketToFlow` with
     //! `QOSTrafficTypeVoice` for the (socket, destination) pair. Without
     //! administrator rights Windows picks the DSCP itself (voice ⇒ 56,
-    //! CS7); that is still a top-priority class for every QoS engine.
+    //! CS7); that is still a top-priority class for every `QoS` engine.
 
     use std::{
         net::{SocketAddr, UdpSocket},
@@ -281,7 +281,7 @@ mod windows_qos {
             let mut handle: HANDLE = 0;
             // SAFETY: plain FFI with valid out-pointers; qwave.dll is part
             // of Windows Vista and later.
-            let ok = unsafe { QOSCreateHandle(&version, &mut handle) };
+            let ok = unsafe { QOSCreateHandle(&raw const version, &raw mut handle) };
             if ok == 0 {
                 return Err(format!(
                     "QOSCreateHandle: {}",
@@ -310,7 +310,7 @@ mod windows_qos {
                             std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
                             QOSTrafficTypeVoice,
                             QOS_NON_ADAPTIVE_FLOW,
-                            &mut flow_id,
+                            &raw mut flow_id,
                         )
                     }
                 }
@@ -336,7 +336,7 @@ mod windows_qos {
                             std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
                             QOSTrafficTypeVoice,
                             QOS_NON_ADAPTIVE_FLOW,
-                            &mut flow_id,
+                            &raw mut flow_id,
                         )
                     }
                 }

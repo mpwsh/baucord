@@ -39,6 +39,7 @@ pub struct Knobs {
 }
 
 impl Knobs {
+    #[must_use]
     pub fn with_target(target_rms: f32) -> Self {
         Self {
             target_rms: AtomicU32::new(target_rms.clamp(0.01, 0.5).to_bits()),
@@ -90,6 +91,7 @@ impl AutoGainControl {
         }
     }
 
+    #[must_use]
     pub fn current_gain(&self) -> f32 {
         self.current_gain
     }
@@ -157,7 +159,7 @@ impl AutoGainControl {
 }
 
 impl AudioProcessor for AutoGainControl {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "agc"
     }
 

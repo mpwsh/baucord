@@ -125,6 +125,8 @@ fn serve(listener: Listener, on_show: impl Fn() + Send + 'static) {
                 }
             }
         })
-        .map(drop)
-        .unwrap_or_else(|e| warn!("could not start the instance guard thread: {e}"));
+        .map_or_else(
+            |e| warn!("could not start the instance guard thread: {e}"),
+            drop,
+        );
 }
