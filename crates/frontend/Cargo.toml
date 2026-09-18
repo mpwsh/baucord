@@ -14,9 +14,26 @@ workspace = true
 
 [features]
 default = ["desktop"]
-# Everything a desktop host has and a phone does not. Round 2 of the
-# split gates the modules on it; for now it is the whole crate.
-desktop = []
+# Everything a desktop host has and a phone does not: raw winit window
+# events (repaint-on-reveal, OS file drops, raise/centre), the system
+# clipboard, global hotkeys and key polling, the single-instance
+# socket, the auto-updater, native file dialogs and the system URL
+# launcher. Without it every host module compiles to its `stubs/`
+# twin and `cargo check -p frontend --no-default-features` is what
+# Android starts from (ANDROID-SPEC.md §5).
+desktop = [
+  "dep:i-slint-backend-winit",
+  "dep:arboard",
+  "dep:global-hotkey",
+  "dep:device_query",
+  "dep:interprocess",
+  "dep:zip",
+  "dep:self-replace",
+  "dep:rfd",
+  "dep:pollster",
+  "dep:open",
+  "dep:objc2-app-kit",
+]
 # System tray via Slint's builtin SystemTrayIcon (1.17+). Closing the
 # window then hides to the tray instead of quitting. Enable it in the
 # release workflow: `--features tray`.
@@ -37,31 +54,31 @@ slint.workspace = true
 # app.rs::repaint_on_reveal hooks them. Default features are empty —
 # this only pulls the accessor trait; cargo unifies the version with
 # slint's own internal dependency.
-i-slint-backend-winit = "1.17"
+i-slint-backend-winit = { version = "1.17", optional = true }
 crossbeam-channel.workspace = true
 log.workspace = true
 chrono = "0.4.45"
 ureq = "3.4"
-open = "5.4"
-global-hotkey = "0.8"
+open = { version = "5.4", optional = true }
+global-hotkey = { version = "0.8", optional = true }
 # One instance per config directory: a second launch knocks on the
 # first one's local socket (named pipe / abstract socket / /tmp file)
 # and the first raises its window. See instance.rs.
-interprocess = "2.4"
+interprocess = { version = "2.4", optional = true }
 # The Downloads folder, for file cards' Save (spec §7).
 dirs = "6"
 # Push-to-talk watches the key state instead of registering a global
 # hotkey, so the key still types everywhere else. See hotkeys.rs.
-device_query = "4"
+device_query = { version = "4", optional = true }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
-zip = "8.6"
-self-replace = "1.5"
+zip = { version = "8.6", optional = true }
+self-replace = { version = "1.5", optional = true }
 # Plain-text clipboard read/write. Slint exposes no clipboard API;
 # TextInput's internal Ctrl+V only covers text typed into it — the
 # rich-paste chain and "Copy message" need programmatic access.
 # clipboard.rs keeps its per-platform file/PNG readers (arboard has
 # no file-list support).
-arboard = { version = "3", default-features = false, features = [
+arboard = { version = "3", default-features = false, optional = true, features = [
   "wayland-data-control",
   "image-data",     # set_image for "Copy image"
 ] }
@@ -72,15 +89,15 @@ arboard = { version = "3", default-features = false, features = [
 # across the whole binary, and the other zbus users (ksni tray,
 # accesskit, xcap) run on async-io with no Tokio runtime — with
 # `tokio` on, the tray panicked at startup ("no reactor running").
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
-pollster = "1.0"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"], optional = true }
+pollster = { version = "1.0", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Native NSPasteboard access for what the toolkit clipboard layer can't
 # see: copied files (paste the file, not its icon) and PNG-only
 # sources like screenshot copies. Only the NSPasteboard header —
 # default features would compile every AppKit binding.
-objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+objc2-app-kit = { version = "0.3.2", default-features = false, optional = true, features = [
   "std",
   "NSPasteboard",
 ] }

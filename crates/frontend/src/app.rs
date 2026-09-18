@@ -689,9 +689,29 @@ pub(crate) fn apply_log_level(settings: &Settings) {
     }
 }
 
+/// Un-minimize and focus a shown window: `show()` alone leaves one
+/// that is merely behind others or minimized where it is.
+#[cfg(feature = "desktop")]
+fn raise_window(win: &slint::Window) {
+    use i_slint_backend_winit::WinitWindowAccessor;
+    win.with_winit_window(|w| {
+        w.set_minimized(false);
+        w.focus_window();
+    });
+}
+
+/// One window, always in front: nothing to raise.
+#[cfg(not(feature = "desktop"))]
+fn raise_window(_win: &slint::Window) {}
+
+/// Fills the screen on a phone: nothing to centre.
+#[cfg(not(feature = "desktop"))]
+fn center_on_monitor(_win: &slint::Window) {}
+
 /// Put a shown window in the middle of the monitor it is on (the
 /// primary one if winit cannot tell). Physical pixels throughout, so
 /// mixed-DPI setups land where they look centred.
+#[cfg(feature = "desktop")]
 fn center_on_monitor(win: &slint::Window) {
     use i_slint_backend_winit::{winit::dpi::PhysicalPosition, WinitWindowAccessor};
     win.with_winit_window(|w| {
@@ -1017,7 +1037,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, media::paste_into_chat);
     });
     logic.on_link_clicked(|url| {
-        if let Err(e) = open::that_detached(url.as_str()) {
+        if let Err(e) = crate::host::open_url(url.as_str()) {
             warn!("Failed to open link: {e}");
         }
     });
@@ -1268,6 +1288,13 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 ///   a drag or a maximize until something forces a full frame. A
 ///   full-window flip per such event is cheap next to the frame it
 ///   already costs.
+/// No raw window events without winit: no reveal glitches to paper
+/// over, and no OS file drags either.
+#[cfg(not(feature = "desktop"))]
+pub fn repaint_on_reveal(_win: &slint::Window, _armed: Rc<Cell<bool>>, _flip: impl Fn() + 'static) {
+}
+
+#[cfg(feature = "desktop")]
 pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl Fn() + 'static) {
     use i_slint_backend_winit::WinitWindowAccessor;
     win.on_winit_window_event(move |_w, ev| {
@@ -5456,14 +5483,10 @@ impl AppState {
     /// merely behind others or minimized (the tray's "Show", a second
     /// launch of the binary): `show()` alone would leave it there.
     pub fn show_main(&self) {
-        use i_slint_backend_winit::WinitWindowAccessor;
         self.main_repaint_arm.set(true);
         let _ = self.main.show();
         self.place_main_once();
-        self.main.window().with_winit_window(|w| {
-            w.set_minimized(false);
-            w.focus_window();
-        });
+        raise_window(self.main.window());
     }
 
     /// Centre the main window on its monitor the first time it is
@@ -6378,8 +6401,8 @@ impl AppState {
             self.show_toast(ToastKind::Warning, &t!("file-gone"));
             return;
         }
-        if let Err(e) = open::that_detached(&path) {
-            self.show_error(&t!("file-open-error", "error" => e.to_string()));
+        if let Err(e) = crate::host::open_target(&path) {
+            self.show_error(&t!("file-open-error", "error" => e));
         }
     }
 

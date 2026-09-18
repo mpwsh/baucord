@@ -542,14 +542,11 @@ fn wire(win: &SettingsWindow) {
         });
     });
     logic.on_avatar_pick(|| {
-        std::thread::spawn(|| {
-            let picked = pollster::block_on(
-                rfd::AsyncFileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
-                    .pick_file(),
-            );
-            let Some(handle) = picked else { return };
-            let path = handle.path().to_path_buf();
+        let filter = (
+            "Images".to_string(),
+            ["png", "jpg", "jpeg", "webp"].map(String::from).to_vec(),
+        );
+        crate::host::pick_file(Some(filter), |path| {
             // Decode, crop and scale off the UI thread; only the
             // verdict crosses back.
             let result = std::fs::read(&path)
@@ -795,39 +792,27 @@ fn wire(win: &SettingsWindow) {
 
     // ── Identity (spec §3.3) ────────────────────────────────────────
     logic.on_identity_export(|| {
-        std::thread::spawn(|| {
-            let picked = pollster::block_on(
-                rfd::AsyncFileDialog::new()
-                    .set_file_name("baucord-identity.key")
-                    .save_file(),
-            );
-            if let Some(handle) = picked {
-                let path = handle.path().to_path_buf();
-                let _ = slint::invoke_from_event_loop(move || {
-                    app::with_current(move |app| match client::config::export_client_key(&path) {
-                        Ok(()) => set_identity_status(app, &t!("identity-exported")),
-                        Err(e) => app.show_error(&e),
-                    });
+        crate::host::save_file("baucord-identity.key", None, |path| {
+            let _ = slint::invoke_from_event_loop(move || {
+                app::with_current(move |app| match client::config::export_client_key(&path) {
+                    Ok(()) => set_identity_status(app, &t!("identity-exported")),
+                    Err(e) => app.show_error(&e),
                 });
-            }
+            });
         });
     });
     logic.on_identity_import(|| {
-        std::thread::spawn(|| {
-            let picked = pollster::block_on(rfd::AsyncFileDialog::new().pick_file());
-            if let Some(handle) = picked {
-                let path = handle.path().to_path_buf();
-                let _ = slint::invoke_from_event_loop(move || {
-                    app::with_current(move |app| match client::config::import_client_key(&path) {
-                        Ok(key) => {
-                            app.client_key = Some(key);
-                            set_identity_status(app, &t!("identity-imported"));
-                            refresh_identity(app);
-                        }
-                        Err(e) => app.show_error(&e),
-                    });
+        crate::host::pick_file(None, |path| {
+            let _ = slint::invoke_from_event_loop(move || {
+                app::with_current(move |app| match client::config::import_client_key(&path) {
+                    Ok(key) => {
+                        app.client_key = Some(key);
+                        set_identity_status(app, &t!("identity-imported"));
+                        refresh_identity(app);
+                    }
+                    Err(e) => app.show_error(&e),
                 });
-            }
+            });
         });
     });
     logic.on_identity_regenerate(|| {
@@ -951,7 +936,7 @@ fn wire(win: &SettingsWindow) {
         // directory for portable installs, or the platform config dir
         // when the exe directory isn't writable (client::config picks).
         if let Some(dir) = client::config::settings_file_path().parent()
-            && let Err(e) = open::that_detached(dir)
+            && let Err(e) = crate::host::open_target(dir)
         {
             log::warn!("Failed to open config folder: {e}");
         }

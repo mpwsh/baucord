@@ -518,14 +518,10 @@ pub fn save_to_downloads(name: &str, bytes: &[u8]) -> std::io::Result<std::path:
 /// run it on a scratch thread and hop back via the event loop. Any
 /// file: images preview, the rest upload as cards.
 pub fn attach_image_from_disk() {
-    std::thread::spawn(|| {
-        let picked = pollster::block_on(rfd::AsyncFileDialog::new().pick_file());
-        if let Some(handle) = picked {
-            let path = handle.path().to_path_buf();
-            let _ = slint::invoke_from_event_loop(move || {
-                crate::app::with_current(move |app| attach_path(app, &path));
-            });
-        }
+    crate::host::pick_file(None, |path| {
+        let _ = slint::invoke_from_event_loop(move || {
+            crate::app::with_current(move |app| attach_path(app, &path));
+        });
     });
 }
 
@@ -635,25 +631,16 @@ pub fn save_image_dialog(app: &mut AppState, row_id: i32) {
         t!("image-save-filter")
     };
     let filter: Vec<String> = filter.iter().map(|s| (*s).to_string()).collect();
-    std::thread::spawn(move || {
-        let picked = pollster::block_on(
-            rfd::AsyncFileDialog::new()
-                .set_file_name(&default_name)
-                .add_filter(&filter_name, &filter)
-                .save_file(),
-        );
-        if let Some(handle) = picked {
-            let path = handle.path().to_path_buf();
-            let write_result = std::fs::write(&path, bytes.as_slice());
-            let _ = slint::invoke_from_event_loop(move || {
-                crate::app::with_current(move |app| {
-                    if let Err(e) = write_result {
-                        app.show_error(&t!("chat-image-save-error", "error" => e.to_string()));
-                    } else {
-                        info!("Saved image to {}", path.display());
-                    }
-                });
+    crate::host::save_file(&default_name, Some((filter_name, filter)), move |path| {
+        let write_result = std::fs::write(&path, bytes.as_slice());
+        let _ = slint::invoke_from_event_loop(move || {
+            crate::app::with_current(move |app| {
+                if let Err(e) = write_result {
+                    app.show_error(&t!("chat-image-save-error", "error" => e.to_string()));
+                } else {
+                    info!("Saved image to {}", path.display());
+                }
             });
-        }
+        });
     });
 }

@@ -7,12 +7,40 @@
 
 pub mod adminui;
 pub mod app;
-pub mod clipboard;
-pub mod hotkeys;
-pub mod instance;
 pub mod media;
 pub mod present;
 pub mod resources;
 pub mod settingsui;
-pub mod updater;
 pub mod viewers;
+
+// Host-only modules have a twin under `stubs/` with the same API and
+// no host: that is what a build without the `desktop` feature gets,
+// and what Android starts from until the `Platform` trait
+// (ANDROID-SPEC.md §5) hands these to the Android host.
+#[cfg(feature = "desktop")]
+pub mod clipboard;
+#[cfg(not(feature = "desktop"))]
+#[path = "stubs/clipboard.rs"]
+pub mod clipboard;
+
+#[cfg(feature = "desktop")]
+pub mod host;
+#[cfg(not(feature = "desktop"))]
+#[path = "stubs/host.rs"]
+pub mod host;
+
+#[cfg(feature = "desktop")]
+pub mod hotkeys;
+#[cfg(not(feature = "desktop"))]
+#[path = "stubs/hotkeys.rs"]
+pub mod hotkeys;
+
+#[cfg(feature = "desktop")]
+pub mod updater;
+#[cfg(not(feature = "desktop"))]
+#[path = "stubs/updater.rs"]
+pub mod updater;
+
+/// One instance per config directory: a desktop binary's concern.
+#[cfg(feature = "desktop")]
+pub mod instance;
