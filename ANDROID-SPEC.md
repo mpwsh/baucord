@@ -77,14 +77,15 @@ drops into `jniLibs`.
 
 ### 2.1 Workspace Cargo.toml
 
-Verified in M0 against Slint 1.17.1's manifests (the workspace file is
-still not in the tarball, so check the first two by hand):
+Verified in M0 against Slint 1.17.1's manifests and, on 2026-10-05,
+against the real root `Cargo.toml`:
 
-- `members` includes the two new crates (a `crates/*` glob does).
-- `[workspace] resolver = "2"` (or `"3"`). A virtual workspace without
-  it falls back to resolver 1, which activates features for
-  dependencies of every target at once.
-- The `[workspace.dependencies] slint` entry **can stay as it is.** In
+- `members = ["crates/*"]` picks the new crate up; `resolver = "2"` is
+  set (a virtual workspace without it falls back to resolver 1, which
+  activates features for dependencies of every target at once).
+- The `[workspace.dependencies] slint` entry (`default-features =
+  false`, `std`, `backend-winit`, `renderer-skia`, `renderer-software`,
+  `compat-1-2`) **stays as it is.** In
   Slint 1.17 `i-slint-backend-winit` and `i-slint-renderer-femtovg` are
   `cfg(not(target_os = "android"))` dependencies of the selector and of
   `slint` itself, so `backend-winit` / `renderer-femtovg` in the
@@ -123,28 +124,39 @@ draft — take the newest stable of each.
 
 | what | where | notes |
 |---|---|---|
-| Android Studio | <https://developer.android.com/studio> | brings the SDK Manager, the JBR (a JDK 21), the emulator, `adb` |
+| Android Studio | <https://developer.android.com/studio> | brings the SDK Manager, the emulator, `adb` (its JBR is a JDK 25 — not usable for Gradle 8, see below) |
 | SDK Platform **36** (Android 16) | SDK Manager → SDK Platforms | `android.jar` for `compileSdk 36`; Slint's backend compiles its Java helper against it |
-| Build-Tools **36.x** | SDK Manager → SDK Tools | `d8` for the same helper |
+| Build-Tools **36.x** and **35.0.0** | SDK Manager → SDK Tools | `d8` for the same helper; AGP 8.13's default build tools are 35.0.0 and it will not use 36 in their place (it downloads 35.0.0 itself once the SDK licences are accepted) |
 | NDK **r29** (or r28+) | SDK Manager → SDK Tools → NDK (Side by side) | r28+ aligns ELF segments to 16 KB by default |
 | CMake (+ Ninja) | SDK Manager → SDK Tools → CMake | `opusic-sys` builds libopus with cmake through the NDK toolchain file; it picks Ninja when `ninja` is on `PATH`, and on Windows Ninja is required (the Visual Studio generator cannot cross-compile). The SDK package ships both in `cmake/<ver>/bin` |
 | Platform-Tools | SDK Manager → SDK Tools | `adb` for sideloading and `logcat` |
 | Emulator + a **Google APIs x86_64, API 36** system image | SDK Manager → SDK Tools / Virtual Device Manager | optional; the emulator can pass the host microphone through |
 | Rust stable + targets | `rustup target add aarch64-linux-android x86_64-linux-android` | Rust ≥ 1.85 (cpal's MSRV) |
 | `cargo-ndk` | `cargo install cargo-ndk` (<https://github.com/bbqsrc/cargo-ndk>) | 4.x (4.1.2 as of M0); finds the newest NDK under `$ANDROID_HOME/ndk` on its own, sets `CC_*`/`AR_*`/the linker per target, exports the cmake toolchain path |
-| a JDK | Android Studio's bundled JBR: `<studio>/jbr` | Gradle 8 needs 17+; Slint's backend `build.rs` needs `javac` and build-tools' `d8` (with JDK 21 use build-tools ≥ 35 — the JBR is 21) |
+| a JDK **21** | Temurin (`winget install EclipseAdoptium.Temurin.21.JDK`), not Android Studio's `jbr` | Gradle 8.14 runs on JDK 17–24 — the JBR shipped with 2026 Studio builds is 25 and fails the Kotlin DSL compile with just the version (`What went wrong: 25.0.3`) as the message (first build, 2026-10-05). Slint's backend `build.rs` needs `javac` and build-tools' `d8`; both fine on 21 with build-tools ≥ 35 |
 | Gradle + AGP | nothing to install: `android/gradlew` fetches Gradle 8.14.3, AGP 8.13.0 comes from Google's Maven | the first `gradlew` run downloads ~200 MB |
 
 Environment (persist them; Gradle, cargo-ndk and Slint's `build.rs`
 all read them):
 
 ```
-ANDROID_HOME      = <sdk root>            (Windows: %LOCALAPPDATA%\Android\Sdk)
-ANDROID_NDK_HOME  = %ANDROID_HOME%\ndk\<r29 version>
-JAVA_HOME         = <android-studio>\jbr
+ANDROID_HOME      = <sdk root>            (the SDK Manager's "Android SDK Location";
+                                           Windows default %LOCALAPPDATA%\Android\Sdk —
+                                           never the Studio install dir or its jbr)
+ANDROID_SDK_ROOT  = same value            (the older name some tools still read)
+ANDROID_NDK_HOME  = %ANDROID_HOME%\ndk\<r29 version>   (cargo-ndk, opusic-sys)
+ANDROID_NDK       = same value            (skia-bindings, only if Skia builds from source)
+JAVA_HOME         = <a JDK 21>              (NOT <android-studio>\jbr — see the table)
 CMAKE_GENERATOR   = Ninja                 (Windows; harmless elsewhere)
+ANDROID_JAR       = %ANDROID_HOME%\platforms\android-36\android.jar
+                                          (only for `cargo ndk` run by hand — the Gradle
+                                           task sets it from compileSdk; see §14, 2026-10-05)
 PATH             += %ANDROID_HOME%\platform-tools ; %ANDROID_HOME%\cmake\<ver>\bin
 ```
+
+`rust-toolchain.toml` pins 1.95, so add the targets to *that* toolchain
+— run `rustup target add aarch64-linux-android x86_64-linux-android`
+inside the repo (rustup follows the pin) or pass `--toolchain 1.95`.
 
 On Windows set them as *user* environment variables (System Properties
 → Environment Variables), not in one PowerShell session: Android
@@ -542,7 +554,9 @@ cd android
 # M0 smoke test instead of the client (toolchain only):
 ./gradlew assembleDebug -PcargoTargets=x86_64 -PcargoFeatures=hello
 
-# Only the Rust half, by hand (what the Exec task runs; cargo-ndk 4 syntax):
+# Only the Rust half, by hand (what the Exec task runs; cargo-ndk 4 syntax).
+# ANDROID_JAR must be set (§3): cargo-ndk's ANDROID_PLATFORM=29 would
+# otherwise send Slint's build.rs looking for platforms/android-29.
 cargo ndk --target x86_64 --platform 29 \
   --output-dir android/app/src/main/jniLibs build -p android
 
@@ -627,9 +641,41 @@ cpal 0.18.2 uses it, cargo-ndk 4.1.2, android_logger 0.15.1). Decisions:
 | D16 | The auxiliary windows (Settings, admin panel, stream viewer) are refused on Android with a toast (`host-single-window`, in the three catalogs) via `frontend::app::SINGLE_WINDOW_HOST` | the backend hands every `Window` the same adapter; opening a second one would collide with the main window. Settings becomes a page in M2; the viewer an in-window overlay when stream viewing comes |
 | D17 | JNI lives in `crates/android/src/java.rs` (not `jni.rs`) | a module named like the crate it uses invites path ambiguity |
 | D18 | Versions pinned by the Gradle project: Gradle 8.14.3 (wrapper, verified to exist), AGP 8.13.0 (from memory — Studio's upgrade assistant corrects it if wrong), compileSdk/targetSdk 36, minSdk 29 | the last 8.x pair; AGP 9 needs Gradle 9 and a Kotlin-DSL migration nobody needs yet |
+| D20 | `Cargo.lock` ships with the Android entries already resolved (android-activity 0.6.1, i-slint-backend-android-activity 1.17.1, android_logger 0.15.1, ndk-context 0.1.1; jni 0.22.4 and ndk 0.9.0 were already locked through cpal) | the first `cargo ndk` run resolves nothing new, and the versions the APIs were read against are the ones that build |
 | D19 | Stream viewing on Android goes through **MediaCodec via the `ndk` crate's `media` feature** as a third `VideoDecoder` behind `video::codec_stub`, when it comes (the user wants it early; it stays after voice) | hardware H.264 decode with no FFmpeg build for Android; the trait, `Quality` and the jitter buffer already compile there |
 
 What the first build will tell us, in order: whether the Skia prebuilt
 downloads (§13), whether cpal's AAudio host opens the emulator's mic,
 and whether the desktop `main.slint` is usable on a tablet AVD. Record
 each in SESSION-GUIDE.md §5 and here.
+
+**First-build log (2026-10-05).** Attempt 1 died before Gradle read
+the project: `What went wrong: 25.0.3` after "Kotlin DSL script
+compilation (Settings/TopLevel/stage1)". That bare version string is
+Gradle's Kotlin compiler choking on an unsupported JVM — `JAVA_HOME`
+was Android Studio's `jbr`, a JDK 25, and Gradle 8.14 runs on 17–24.
+Fix: a Temurin JDK 21 as `JAVA_HOME` (§3), `gradlew --stop`, retry —
+confirmed working the same day. Android Studio needs the same choice
+made in its *Gradle JDK* setting, since it does not read `JAVA_HOME`.
+CI is unaffected (`setup-java` installs Temurin 17). Not taken:
+Gradle 9.1 + AGP 9 to keep JDK 25 — an unverified pair on top of an
+unbuilt project. Attempt 2 got as far as AGP: `Using Android SDK:
+D:\android\jbr` — `ANDROID_HOME` had been set to Studio's runtime
+directory instead of the SDK, and AGP then asked for Build-Tools
+35.0.0 (its default; the installed 36 does not substitute). Fix:
+`ANDROID_HOME`/`ANDROID_SDK_ROOT` to the SDK Manager's location,
+`ANDROID_NDK_HOME`/`ANDROID_NDK` under it, Build-Tools 35.0.0 ticked
+or `sdkmanager --licenses` so Gradle fetches it. Attempt 3 reached
+the Rust build and died in `i-slint-backend-android-activity`'s
+build.rs: "No Android platforms found". **cargo-ndk 4 exports
+`ANDROID_PLATFORM=<--platform>` (29, the NDK API level) to cargo's
+children, and the `android-build` crate reads that same name as the
+SDK platform to compile the Java helper against** — so it wanted
+`platforms/android-29/android.jar`, which nobody installs. It checks
+`ANDROID_JAR` first and cargo-ndk does not touch it: the Gradle Exec
+tasks now set `ANDROID_JAR` to `platforms/android-<compileSdk>/
+android.jar` under the SDK AGP resolves (`pointAtCompileSdkJar`), and
+a hand-run `cargo ndk` needs the variable set (§3). Not chosen:
+installing `platforms;android-29` (compiling the helper against an
+old SDK for no reason) or dropping `--platform` (cargo-ndk's default
+is 21, below minSdk).

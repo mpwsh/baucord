@@ -10,14 +10,22 @@ directory is Rust: `app/build.gradle.kts` runs `cargo ndk` on the
 1. **Android Studio** — <https://developer.android.com/studio>. In its
    SDK Manager (*More Actions → SDK Manager*):
    - *SDK Platforms*: **Android 16 (API 36)**.
-   - *SDK Tools* (tick *Show Package Details*): **Build-Tools 36.x**,
-     **NDK (Side by side) 29.x**, **CMake** (newest), **Platform-Tools**,
-     **Emulator**.
+   - *SDK Tools* (tick *Show Package Details*): **Build-Tools 36.x
+     and 35.0.0** (AGP 8.13 insists on 35.0.0 and downloads it itself
+     only if the SDK licences were accepted — `sdkmanager --licenses`,
+     or just tick it), **NDK (Side by side) 29.x**, **CMake** (newest),
+     **Platform-Tools**, **Emulator**.
+   - Note the **Android SDK Location** shown at the top of that page:
+     it is what `ANDROID_HOME` must be. It is never the Studio install
+     directory — `Using Android SDK: D:\android\jbr` in a Gradle
+     error means the variable points at Studio's Java runtime.
    - *Virtual Device Manager*: create a device with a **Google APIs,
      x86_64, API 36** image. For the desktop UI that M0–M1 show, pick a
      **tablet** profile (Pixel Tablet) or run a phone in landscape.
-2. **Rust targets**:
+2. **Rust targets** — from inside the repo, so they land on the pinned
+   1.95 toolchain (`rust-toolchain.toml`), not on `stable`:
    ```powershell
+   cd <repo>
    rustup target add aarch64-linux-android x86_64-linux-android
    cargo install cargo-ndk
    ```
@@ -26,17 +34,26 @@ directory is Rust: `app/build.gradle.kts` runs `cargo ndk` on the
    Studio's Gradle daemon inherits those, not a PowerShell session:
    | variable | value |
    |---|---|
-   | `ANDROID_HOME` | `C:\Users\<you>\AppData\Local\Android\Sdk` |
+   | `ANDROID_HOME` | the SDK Manager's *Android SDK Location* (usually `C:\Users\<you>\AppData\Local\Android\Sdk`) |
+   | `ANDROID_SDK_ROOT` | the same (older tools read this name) |
    | `ANDROID_NDK_HOME` | `%ANDROID_HOME%\ndk\<the 29.x folder>` |
-   | `JAVA_HOME` | `C:\Program Files\Android\Android Studio\jbr` |
+   | `ANDROID_NDK` | the same folder (only read if Skia ever builds from source) |
+   | `JAVA_HOME` | a **JDK 21** (e.g. Temurin: `winget install EclipseAdoptium.Temurin.21.JDK` → `C:\Program Files\Eclipse Adoptium\jdk-21…`). Not Studio's `jbr`: that is JDK 25 in 2026 builds, and Gradle 8.14 runs on 17–24 only — the symptom is `What went wrong: 25.0.3` while compiling the settings script |
    | `CMAKE_GENERATOR` | `Ninja` |
+   | `ANDROID_JAR` | `<sdk>\platforms\android-36\android.jar` — only needed when running `cargo ndk` by hand; the Gradle tasks set it themselves. (cargo-ndk's `ANDROID_PLATFORM=29` otherwise sends Slint's build script after a `platforms\android-29` nobody has: "No Android platforms found") |
    | `PATH` (append) | `%ANDROID_HOME%\platform-tools`; `%ANDROID_HOME%\cmake\<ver>\bin`; `%USERPROFILE%\.cargo\bin` (rustup adds this one) |
+
+   Android Studio ignores `JAVA_HOME` and runs Gradle on its own JBR
+   (25) unless told otherwise — before the first sync of `android/` in
+   the IDE: *Settings → Build, Execution, Deployment → Build Tools →
+   Gradle → Gradle JDK* → the Temurin 21. Same `25.0.3` failure
+   otherwise, just inside the IDE.
 
    Open a **new** terminal and check:
    ```powershell
    cargo ndk --version      # 4.x
    adb version
-   javac -version           # 21 (the JBR) — fine with build-tools 36
+   javac -version           # 21.x — Gradle 8.14 refuses 25 (see the table)
    cmake --version; ninja --version
    dir $env:ANDROID_HOME\platforms   # android-36
    ```

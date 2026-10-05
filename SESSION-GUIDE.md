@@ -22,13 +22,14 @@ Android target) — check with `which cargo` first. When it is there:
 a placeholder `assets/icons/icon.png`); anything depending on `video`
 (`client`, `frontend`, `desktop`, `android`) fails at `ffmpeg-sys` /
 `pipewire-sys` for lack of system headers — not a code problem. The
-root `Cargo.toml` is not in the tarball; a stand-in with `members =
-["crates/*"]`, `resolver = "2"`, the six `[workspace.dependencies]`
-(`slint = "=1.17.1"`, serde, log, crossbeam-channel, bytes, thiserror,
-`rand = "0.10"`) and a `[workspace.lints.clippy]` table resolves it.
-For Android, `cargo tree -p android --target aarch64-linux-android -e
-normal,build` is the dependency check (needs no target installed).
-Do this at the start of a session:
+root `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` joined the
+upload set on 2026-10-05: **ask for them with every `crates.tar.gz`**
+(the lock is what makes a resolution here match the user's; drop
+`rust-toolchain.toml` locally when its channel cannot be downloaded,
+and hand the lock back when the graph grew). For Android, `cargo tree
+-p android --target aarch64-linux-android -e normal,build` is the
+dependency check (needs no target installed). Do this at the start of
+a session:
 
 ```sh
 # the workspace: the user uploads crates.tar.gz (the crates/ folder)
@@ -808,7 +809,14 @@ the android manifest, and every Android API against the crate sources
 (Slint 1.17.1 `android` module, android-activity 0.6.1, jni 0.22.4 in
 cpal's idiom, cargo-ndk 4.1.2). First build order: `-PcargoFeatures=
 hello` on an x86_64 AVD, then the app; expect a round on jni 0.22
-types in `java.rs` if anything. Record Skia prebuilt / first-build
+types in `java.rs` if anything. First-build round 1: Gradle 8.14
+cannot run on Android Studio's JBR (JDK 25) — `What went wrong:
+25.0.3` is that and nothing else; `JAVA_HOME` must be a JDK 17–24
+(Temurin 21). Round 2: `ANDROID_HOME` must be the SDK Manager's
+location (not the Studio dir) and AGP 8.13 wants Build-Tools 35.0.0.
+Round 3: "No Android platforms found" in Slint's build.rs =
+cargo-ndk's `ANDROID_PLATFORM=29` read by `android-build` as the SDK
+platform; the Gradle tasks set `ANDROID_JAR` now (spec §14). Record Skia prebuilt / first-build
 time / AAudio outcome in ANDROID-SPEC.md §14. Then M1 is mostly done
 already (the split shipped as 1.1.6); next is M2 (the mobile `.slint`
 root behind `ui/mobile`) with the viewer as an in-window overlay and

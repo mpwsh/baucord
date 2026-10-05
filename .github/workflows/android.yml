@@ -1,0 +1,93 @@
+# Builds the Android debug APK (ANDROID-SPEC.md §11) so a phone can be
+# tested from a download rather than a Windows toolchain. Untested as of
+# 2026-10-05: the first green run is the validation; expect one or two
+# rounds on the SDK package names.
+name: android
+
+on:
+  workflow_dispatch:
+    inputs:
+      features:
+        description: "Cargo features for the android crate (empty = the app; hello = M0 smoke test)"
+        default: ""
+  push:
+    paths:
+      - "crates/**"
+      - "android/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/android.yml"
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # arm64 only in CI: the x86_64 emulator image is a local concern.
+      CARGO_TARGETS: arm64-v8a
+    steps:
+      - uses: actions/checkout@v4
+
+      # The JDK Gradle 8 and Slint's build.rs (javac + d8) need.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # cmdline-tools + sdkmanager; the packages themselves next.
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install SDK packages
+        run: |
+          set -eux
+          yes | sdkmanager --licenses >/dev/null || true
+          # Newest NDK r29 and build-tools 36 available to this sdkmanager.
+          NDK=$(sdkmanager --list 2>/dev/null | grep -oE 'ndk;29\.[0-9.]+' | sort -V | tail -1)
+          BT=$(sdkmanager --list 2>/dev/null | grep -oE 'build-tools;36\.[0-9.]+' | sort -V | tail -1)
+          CM=$(sdkmanager --list 2>/dev/null | grep -oE 'cmake;3\.[0-9.]+' | sort -V | tail -1)
+          sdkmanager "platforms;android-36" "$BT" "$NDK" "$CM" "platform-tools"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/${CM/;//}/bin" >> "$GITHUB_PATH"
+
+      # The repo's rust-toolchain.toml picks the Rust version; only the
+      # Android targets are added to it.
+      - name: Rust targets + cargo-ndk
+        run: |
+          set -eux
+          rustup show
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ env.CARGO_TARGETS }}
+
+      - name: Build the debug APK
+        working-directory: android
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: |
+          set -eux
+          cargo ndk --version
+          ./gradlew --no-daemon assembleDebug \
+            -PcargoTargets="$CARGO_TARGETS" \
+            -PcargoFeatures="${{ github.event.inputs.features }}"
+
+      - name: 16 KB page-size check (spec §11)
+        run: |
+          set -eux
+          SO=android/app/src/main/jniLibs/arm64-v8a/libbaucord_android.so
+          READELF="$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
+          "$READELF" -l "$SO" | grep LOAD
+          # Every LOAD segment's alignment column must read 0x4000.
+          if "$READELF" -l "$SO" | grep LOAD | grep -v 0x4000; then
+            echo "a LOAD segment is not 16 KB aligned"; exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baucord-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

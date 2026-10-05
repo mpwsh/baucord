@@ -4,6 +4,8 @@
 // own preDebugBuild / preReleaseBuild. There is no Kotlin or Java
 // source yet — `android.app.NativeActivity` is the Activity.
 
+import java.util.Properties
+
 plugins {
     id("com.android.application")
 }
@@ -20,10 +22,31 @@ val cargoFeatures: String = (project.findProperty("cargoFeatures") as String?) ?
 val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 // The Cargo workspace: the repo root, one level above android/.
 val workspaceDir = rootProject.layout.projectDirectory.dir("..")
+// One number for AGP's compileSdk and for the android.jar the Rust
+// build compiles Slint's Java helper against (see ANDROID_JAR below).
+// Not named like AGP's own deprecated String property on the android
+// extension, which would shadow a script val inside `android { }`.
+val baucordCompileSdk = 36
+
+// The SDK root the way AGP resolves it: local.properties' sdk.dir
+// (written by Android Studio), else ANDROID_HOME, else ANDROID_SDK_ROOT.
+fun androidSdkDir(): File? {
+    val local = rootProject.file("local.properties")
+    if (local.exists()) {
+        val props = Properties()
+        local.inputStream().use { stream -> props.load(stream) }
+        val fromLocal = props.getProperty("sdk.dir")
+        if (fromLocal != null) {
+            return File(fromLocal)
+        }
+    }
+    val fromEnv = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
+    return if (fromEnv != null) File(fromEnv) else null
+}
 
 android {
     namespace = "dev.baucord"
-    compileSdk = 36
+    compileSdk = baucordCompileSdk
 
     defaultConfig {
         applicationId = "dev.baucord"
@@ -98,6 +121,24 @@ android {
 // JAVA_HOME and ANDROID_HOME must be set in the environment Gradle
 // inherits (spec §3). Always `-p android`: a workspace-wide build
 // would unify the desktop-only features in.
+//
+// ANDROID_JAR: cargo-ndk exports ANDROID_PLATFORM=<--platform> (the NDK
+// API level) to cargo's children, and the `android-build` crate behind
+// Slint's build.rs reads that same name as the *SDK platform* to compile
+// against — so it looked for platforms/android-29/android.jar and found
+// nothing (first build, 2026-10-05). It checks ANDROID_JAR first and
+// cargo-ndk leaves that one alone, so the jar is named here from
+// compileSdk.
+fun Exec.pointAtCompileSdkJar() {
+    val sdk = androidSdkDir() ?: return
+    val jar = File(sdk, "platforms/android-$baucordCompileSdk/android.jar")
+    if (jar.exists()) {
+        environment("ANDROID_JAR", jar.absolutePath)
+    } else {
+        logger.warn("ANDROID_JAR: $jar is missing — install SDK Platform $baucordCompileSdk")
+    }
+}
+
 fun cargoNdkArgs(release: Boolean): List<String> {
     val args = mutableListOf(
         "ndk",
@@ -119,6 +160,7 @@ val cargoNdkDebug by tasks.registering(Exec::class) {
     description = "cargo ndk build -p android (debug) → src/main/jniLibs"
     workingDir = workspaceDir.asFile
     commandLine(listOf("cargo") + cargoNdkArgs(release = false))
+    pointAtCompileSdkJar()
     // Cargo is the incremental build system here; let it decide.
     outputs.upToDateWhen { false }
 }
@@ -128,6 +170,7 @@ val cargoNdkRelease by tasks.registering(Exec::class) {
     description = "cargo ndk build -p android --release → src/main/jniLibs"
     workingDir = workspaceDir.asFile
     commandLine(listOf("cargo") + cargoNdkArgs(release = true))
+    pointAtCompileSdkJar()
     outputs.upToDateWhen { false }
 }
 
