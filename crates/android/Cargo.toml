@@ -1,0 +1,57 @@
+[package]
+name = "android"
+# The Android host (ANDROID-SPEC.md): a cdylib that Android's
+# `NativeActivity` loads. `android_main` sets up logging, the config
+# directory and Slint's Android backend, then runs the same
+# `frontend::app::run()` the desktop binary runs. Versioned with the
+# public crates.
+version = "1.1.6"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+# Not `libandroid.so`: that is the NDK's own library and the loader
+# would pick the system one (spec §2.2). The manifest's
+# `android.app.lib_name` meta-data is this name.
+name = "baucord_android"
+crate-type = ["cdylib"]
+
+[features]
+default = ["app"]
+# The real client: `frontend` without its `desktop` feature (no winit,
+# clipboard, hotkeys, updater, dialogs — their `stubs/` twins instead).
+# Always build this crate with `-p android`: a workspace-wide build
+# would unify `frontend/desktop` back in from the desktop crate.
+app = ["dep:frontend", "dep:client"]
+# M0's toolchain smoke test (spec §12): one Slint page in the theme's
+# colours, no engine. `cargo ndk … build -p android --no-default-features
+# --features hello` proves NDK + Skia prebuilt + Gradle + emulator
+# before the whole dependency tree is in play.
+hello = []
+
+[dependencies]
+# The workspace entry's defaults (`backend-winit`, the femtovg and
+# software renderers, `system-tray`) are harmless here: in Slint 1.17
+# `i-slint-backend-winit` and `i-slint-renderer-femtovg` are declared
+# `cfg(not(target_os = "android"))` dependencies, so they are not even
+# resolved for this target (checked in slint 1.17.1's Cargo.toml). The
+# Android backend brings the Skia renderer itself.
+slint = { workspace = true, features = ["backend-android-activity-06"] }
+log.workspace = true
+frontend = { path = "../frontend", default-features = false, optional = true }
+client = { path = "../client", optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# logcat; the file log beside it is ours (logging.rs).
+android_logger = { version = "0.15", default-features = false }
+# `Activity.checkSelfPermission` / `requestPermissions` (java.rs). Same
+# jni major as Slint's backend and cpal's AAudio host, so one copy.
+jni = "0.22"
+# The JavaVM and Activity pointers android-activity registers at
+# startup — the same way cpal reaches `AudioManager`.
+ndk-context = "0.1"
+# Timestamps in baucord.log (the desktop's env_logger format).
+chrono = "0.4"

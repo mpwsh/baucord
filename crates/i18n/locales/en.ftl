@@ -749,3 +749,6 @@ file-cancel = Cancel
 admin-channel = Admin logs
 admin-channel-lead = The audit, as it happens. Slash commands work here: /kick, /ban, /mute, /grant, /invite…
 admin-channel-commands-only = This channel takes commands only — start with /
+
+# ── Android host (ANDROID-SPEC.md; one window per process) ───────────
+host-single-window = Not available on Android yet — this opens in its own window on desktop.

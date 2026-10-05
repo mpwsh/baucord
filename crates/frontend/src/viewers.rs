@@ -35,6 +35,10 @@ impl Viewer {
         height: u32,
         text_scale: f32,
     ) -> Result<Self, slint::PlatformError> {
+        if app::SINGLE_WINDOW_HOST {
+            // The caller shows the message as a toast.
+            return Err(slint::PlatformError::Other(t!("host-single-window")));
+        }
         let win = StreamViewerWindow::new()?;
         app::fill_tr(&win.global::<ui::Tr>());
         win.global::<ui::Theme>().set_scale(text_scale);

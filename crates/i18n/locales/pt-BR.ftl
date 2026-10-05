@@ -749,3 +749,6 @@ file-cancel = Cancelar
 admin-channel = Registros de admin
 admin-channel-lead = A auditoria, ao vivo. Os comandos funcionam aqui: /kick, /ban, /mute, /grant, /invite…
 admin-channel-commands-only = Este canal só aceita comandos — comece com /
+
+# ── Host Android (ANDROID-SPEC.md; uma janela por processo) ──────────
+host-single-window = Ainda não disponível no Android — no desktop isto abre na sua própria janela.

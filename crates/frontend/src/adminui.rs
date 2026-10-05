@@ -46,6 +46,10 @@ pub enum PanelAction {
 
 /// Open the panel (creating it on first use) on `tab`.
 pub fn open(app: &mut AppState, tab: i32) {
+    if app::SINGLE_WINDOW_HOST {
+        app.show_error(&t!("host-single-window"));
+        return;
+    }
     if app.admin_win.is_none() {
         let win = match AdminWindow::new() {
             Ok(w) => w,

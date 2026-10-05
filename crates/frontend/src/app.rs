@@ -78,6 +78,14 @@ mod stats;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Slint's Android backend has one window per process (every `Window`
+/// component is handed the same window adapter), so the auxiliary
+/// windows — Settings, the admin panel, the stream viewer — cannot open
+/// there until they become in-window pages (ANDROID-SPEC.md §9). Their
+/// `open` paths check this and say so instead of colliding with the
+/// main window.
+pub(crate) const SINGLE_WINDOW_HOST: bool = cfg!(target_os = "android");
+
 // ── The UI-thread singleton ─────────────────────────────────────────────
 
 thread_local! {
@@ -410,7 +418,9 @@ fn spawn_workers(
 
 /// Prefer the Skia renderer when compiled in: femtovg (the default)
 /// can't rasterize many color-emoji glyph formats, which shows as tofu
-/// boxes in the emoji palette. Skia renders them all.
+/// boxes in the emoji palette. Skia renders them all. (Android's
+/// backend is Skia already and is installed by the host before `run`.)
+#[cfg(not(target_os = "android"))]
 fn select_renderer() {
     // An explicit SLINT_BACKEND still wins — the no-rebuild escape
     // hatch (`winit-software` forces the basic software renderer;
@@ -445,6 +455,10 @@ fn select_renderer() {
 
 /// Build everything and run the event loop until quit.
 pub fn run() {
+    // On Android the host has already installed Slint's Android backend
+    // (`slint::android::init`, with Skia); a second selection would
+    // only fail and log.
+    #[cfg(not(target_os = "android"))]
     select_renderer();
     let is_testing_mic_shared = Arc::new(AtomicBool::new(false));
     let (voice, screen, network, present_shared, screen_fwd_rx) =
@@ -460,9 +474,11 @@ pub fn run() {
     let main = MainWindow::new().expect("failed to create the main window");
 
     // Saved size only; the position is decided at the first show
-    // (centred on the monitor, see `center_on_monitor`).
+    // (centred on the monitor, see `center_on_monitor`). A phone's
+    // window is the screen: nothing to size there.
     // Saved px dimensions; i32→f32 precision is irrelevant at window
     // scale.
+    #[cfg(not(target_os = "android"))]
     #[allow(clippy::cast_precision_loss)]
     main.window().set_size(slint::LogicalSize::new(
         settings.window.width.max(500) as f32,

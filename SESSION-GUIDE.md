@@ -12,9 +12,23 @@ the repo root.
 
 ## 1. Setting up the assistant's environment
 
-There is no `cargo` in the sandbox. Rust is compiled by the user; the
-assistant edits files, compile-checks and renders every `.slint`
-change, and hands over a tarball. Do this at the start of a session:
+Rust is compiled by the user; the assistant edits files,
+compile-checks and renders every `.slint` change, and hands over a
+tarball. The 2026-10-05 sandbox *did* have `cargo` 1.97 and crates.io
+(no `dl.google.com`, no `static.rust-lang.org`, so no NDK and no
+Android target) — check with `which cargo` first. When it is there:
+`cargo check -p protocol -p app-core -p i18n -p ui` runs on the host
+(`ui` compiles the `.slint` files, which is a free `--check`; it wants
+a placeholder `assets/icons/icon.png`); anything depending on `video`
+(`client`, `frontend`, `desktop`, `android`) fails at `ffmpeg-sys` /
+`pipewire-sys` for lack of system headers — not a code problem. The
+root `Cargo.toml` is not in the tarball; a stand-in with `members =
+["crates/*"]`, `resolver = "2"`, the six `[workspace.dependencies]`
+(`slint = "=1.17.1"`, serde, log, crossbeam-channel, bytes, thiserror,
+`rand = "0.10"`) and a `[workspace.lints.clippy]` table resolves it.
+For Android, `cargo tree -p android --target aarch64-linux-android -e
+normal,build` is the dependency check (needs no target installed).
+Do this at the start of a session:
 
 ```sh
 # the workspace: the user uploads crates.tar.gz (the crates/ folder)
@@ -136,8 +150,13 @@ worth re-running.
   panic hook, `frontend::app::run()`. Its `tray` feature forwards to
   `frontend/tray`. Every `crate::` path inside the moved files still
   resolves: they moved together.
-- Planned, not present: `android` (the cdylib host) and the Gradle
-  project in `android/` beside `crates/`.
+- `android` (M0, 2026-10-05) — the cdylib host: `lib.rs`
+  (`android_main`), `java.rs` (JNI: permissions), `logging.rs`
+  (logcat + `baucord.log` tee), `hello.rs` (feature `hello`, the
+  toolchain smoke test). The Gradle project is `android/` beside
+  `crates/` (AGP 8.13.0, Gradle 8.14.3 wrapper, no Kotlin yet) and
+  `.github/workflows/android.yml` builds the debug APK. Always build
+  it with `-p android` (ANDROID-SPEC.md §2.1).
 
 Server config keys the user runs with are in the spec §1; the
 CLI is `server user|role|invite|restriction|key|telemetry|backup|
@@ -772,7 +791,28 @@ copy and single-click watch confirmed working in QA:
   built-in admin badge turns green. *(batch 1)*
 
 **Android** (v1: voice + chat, sideloaded, Slint) — `ANDROID-SPEC.md`,
-milestones in its §12; M0 (toolchain + hello) follows 1.1.6.
+milestones in its §12, decisions in §14.
+
+**Android M0 written (2026-10-05, awaiting its first build on the
+user's Windows machine):** `crates/android` runs the real
+`frontend::app::run()` on Slint's Android backend (D10) with a `hello`
+feature for the toolchain alone; the `android/` Gradle project runs
+cargo-ndk from `preDebugBuild`/`preReleaseBuild`; `frontend` got
+`SINGLE_WINDOW_HOST` guards (Settings, admin, viewer → toast) and skips
+`select_renderer`/`set_size` on Android; one new string
+(`host-single-window`) in the three catalogs. Verified without an NDK:
+the Android dependency graph (no winit/arboard/hotkeys/ffmpeg/xcap;
+Skia prebuilt key exists in rust-skia's matrix; opus is the one cmake
+build), host `cargo check` of `ui`/`i18n`/`app-core`/`protocol` and of
+the android manifest, and every Android API against the crate sources
+(Slint 1.17.1 `android` module, android-activity 0.6.1, jni 0.22.4 in
+cpal's idiom, cargo-ndk 4.1.2). First build order: `-PcargoFeatures=
+hello` on an x86_64 AVD, then the app; expect a round on jni 0.22
+types in `java.rs` if anything. Record Skia prebuilt / first-build
+time / AAudio outcome in ANDROID-SPEC.md §14. Then M1 is mostly done
+already (the split shipped as 1.1.6); next is M2 (the mobile `.slint`
+root behind `ui/mobile`) with the viewer as an in-window overlay and
+MediaCodec decode (D19) when stream viewing is wanted.
 
 ## 6. Rough edges (known, not urgent)
 

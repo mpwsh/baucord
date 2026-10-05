@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- theme.slint: bg-primary and accent -->
+    <color name="baucord_bg">#1A1D21</color>
+    <color name="baucord_accent">#1264A3</color>
+</resources>

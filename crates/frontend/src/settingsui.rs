@@ -270,6 +270,10 @@ fn format_sensitivity(threshold: f32) -> String {
 
 /// Open the settings window (creating it on first use).
 pub fn open(app: &mut AppState) {
+    if crate::app::SINGLE_WINDOW_HOST {
+        app.show_error(&t!("host-single-window"));
+        return;
+    }
     if app.settings_win.is_none() {
         let win = match SettingsWindow::new() {
             Ok(w) => w,

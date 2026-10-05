@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- No action bar, no title: Slint draws the whole window. The
+         background is theme.slint's bg-primary so the frame Android
+         shows before the first Slint paint is not a white flash. -->
+    <style name="Theme.Baucord" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@color/baucord_bg</item>
+        <item name="android:statusBarColor">@color/baucord_bg</item>
+        <item name="android:navigationBarColor">@color/baucord_bg</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

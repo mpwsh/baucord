@@ -1,9 +1,10 @@
 # baucord — Android (v1) technical spec
 
-Status: draft 1, 2026-09-15. Decisions in §1 are taken; the rest is
-the plan they imply. Read `SESSION-GUIDE.md` §1 for how this codebase
-is worked on; the runtime is in `ARCHITECTURE.md`. Every decision made
-after this draft goes in §14, the way `PERSISTENCE-SPEC.md` §12 works.
+Status: draft 1, 2026-09-15; M0 written 2026-10-05 (§14). Decisions in
+§1 are taken; the rest is the plan they imply. Read `SESSION-GUIDE.md`
+§1 for how this codebase is worked on; the runtime is in
+`ARCHITECTURE.md`. Every decision made after this draft goes in §14,
+the way `PERSISTENCE-SPEC.md` §12 works.
 
 ## 0. Purpose and scope
 
@@ -52,17 +53,20 @@ baucord/
     protocol transport client audio video app-core i18n ui server
     desktop/                  the desktop host; shrinks in M1 (§5)
     frontend/                 NEW  Slint-facing controller shared by both hosts
-    android/                  NEW  cdylib: android_main, JNI shims, Platform impl
-  android/                    NEW  the Gradle project (no Rust in here)
+    android/                  cdylib (M0): lib.rs android_main, java.rs JNI,
+                              logging.rs logcat+file tee, hello.rs smoke test
+  android/                    the Gradle project (no Rust in here)
     settings.gradle.kts
-    build.gradle.kts
-    gradle/ gradlew gradlew.bat
+    build.gradle.kts          AGP 8.13.0
+    gradle.properties         cargoTargets / cargoFeatures knobs
+    gradle/ gradlew gradlew.bat                      Gradle 8.14.3 wrapper
     app/
-      build.gradle.kts
+      build.gradle.kts        runs cargo-ndk before pre<Variant>Build
       src/main/AndroidManifest.xml
-      src/main/kotlin/dev/baucord/VoiceService.kt     the one Kotlin file
-      src/main/res/                                  icon, notification strings
+      src/main/kotlin/dev/baucord/VoiceService.kt     M3 — the one Kotlin file (not yet)
+      src/main/res/                                  theme, strings, placeholder icon
       src/main/jniLibs/                              written by cargo-ndk, git-ignored
+  .github/workflows/android.yml   the debug APK from CI (M0, untested)
 ```
 
 The Rust side of Android is a normal workspace member (`crates/android`)
@@ -73,17 +77,28 @@ drops into `jniLibs`.
 
 ### 2.1 Workspace Cargo.toml
 
-Two things to verify in M0 (the workspace file was not in the tarball):
+Verified in M0 against Slint 1.17.1's manifests (the workspace file is
+still not in the tarball, so check the first two by hand):
 
 - `members` includes the two new crates (a `crates/*` glob does).
-- The `[workspace.dependencies] slint` entry must not turn on desktop
-  backends for everyone. Whatever it enables today (`backend-winit`,
-  `renderer-*`, `compat-*`) becomes `default-features = false` plus the
-  platform-neutral features only; `desktop` adds its winit backend and
-  renderers in its own `Cargo.toml`, `android` adds
-  `backend-android-activity-06`. Cargo unifies features per build, so
-  a desktop backend left in the workspace entry would be compiled into
-  the Android library too.
+- `[workspace] resolver = "2"` (or `"3"`). A virtual workspace without
+  it falls back to resolver 1, which activates features for
+  dependencies of every target at once.
+- The `[workspace.dependencies] slint` entry **can stay as it is.** In
+  Slint 1.17 `i-slint-backend-winit` and `i-slint-renderer-femtovg` are
+  `cfg(not(target_os = "android"))` dependencies of the selector and of
+  `slint` itself, so `backend-winit` / `renderer-femtovg` in the
+  workspace entry resolve to nothing on the Android target
+  (`cargo tree -p android --target aarch64-linux-android` shows no
+  winit, no femtovg, no softbuffer). `renderer-software` and
+  `system-tray` are pure Rust and harmless. The Android backend brings
+  the Skia renderer itself; `android` only adds
+  `backend-android-activity-06`.
+- **Always build the Android crate with `-p android`.** Its `frontend`
+  dependency has `default-features = false`; a workspace-wide build
+  (`--workspace`, or `-p desktop -p android`) would unify
+  `frontend/desktop` back in and pull arboard, global-hotkey, rfd and
+  the rest for the phone.
 
 ### 2.2 The library name
 
@@ -112,21 +127,30 @@ draft — take the newest stable of each.
 | SDK Platform **36** (Android 16) | SDK Manager → SDK Platforms | `android.jar` for `compileSdk 36`; Slint's backend compiles its Java helper against it |
 | Build-Tools **36.x** | SDK Manager → SDK Tools | `d8` for the same helper |
 | NDK **r29** (or r28+) | SDK Manager → SDK Tools → NDK (Side by side) | r28+ aligns ELF segments to 16 KB by default |
+| CMake (+ Ninja) | SDK Manager → SDK Tools → CMake | `opusic-sys` builds libopus with cmake through the NDK toolchain file; it picks Ninja when `ninja` is on `PATH`, and on Windows Ninja is required (the Visual Studio generator cannot cross-compile). The SDK package ships both in `cmake/<ver>/bin` |
 | Platform-Tools | SDK Manager → SDK Tools | `adb` for sideloading and `logcat` |
 | Emulator + a **Google APIs x86_64, API 36** system image | SDK Manager → SDK Tools / Virtual Device Manager | optional; the emulator can pass the host microphone through |
 | Rust stable + targets | `rustup target add aarch64-linux-android x86_64-linux-android` | Rust ≥ 1.85 (cpal's MSRV) |
-| `cargo-ndk` | `cargo install cargo-ndk` (<https://github.com/bbqsrc/cargo-ndk>) | 3.x; finds the newest NDK under `$ANDROID_HOME/ndk` on its own |
-| a JDK | Android Studio's bundled JBR: `<studio>/jbr` | Gradle 8 needs 17+; Slint's backend `build.rs` needs `javac` |
+| `cargo-ndk` | `cargo install cargo-ndk` (<https://github.com/bbqsrc/cargo-ndk>) | 4.x (4.1.2 as of M0); finds the newest NDK under `$ANDROID_HOME/ndk` on its own, sets `CC_*`/`AR_*`/the linker per target, exports the cmake toolchain path |
+| a JDK | Android Studio's bundled JBR: `<studio>/jbr` | Gradle 8 needs 17+; Slint's backend `build.rs` needs `javac` and build-tools' `d8` (with JDK 21 use build-tools ≥ 35 — the JBR is 21) |
+| Gradle + AGP | nothing to install: `android/gradlew` fetches Gradle 8.14.3, AGP 8.13.0 comes from Google's Maven | the first `gradlew` run downloads ~200 MB |
 
 Environment (persist them; Gradle, cargo-ndk and Slint's `build.rs`
 all read them):
 
 ```
-ANDROID_HOME      = <sdk root>            (…/Android/Sdk)
-ANDROID_NDK_HOME  = $ANDROID_HOME/ndk/<r29 version>
-JAVA_HOME         = <android-studio>/jbr
-PATH             += $ANDROID_HOME/platform-tools
+ANDROID_HOME      = <sdk root>            (Windows: %LOCALAPPDATA%\Android\Sdk)
+ANDROID_NDK_HOME  = %ANDROID_HOME%\ndk\<r29 version>
+JAVA_HOME         = <android-studio>\jbr
+CMAKE_GENERATOR   = Ninja                 (Windows; harmless elsewhere)
+PATH             += %ANDROID_HOME%\platform-tools ; %ANDROID_HOME%\cmake\<ver>\bin
 ```
+
+On Windows set them as *user* environment variables (System Properties
+→ Environment Variables), not in one PowerShell session: Android
+Studio's Gradle daemon inherits the user environment, and
+`%USERPROFILE%\.cargo\bin` must be on that `PATH` too for the
+`cargo` Exec task. Restart Studio after changing them.
 
 Verify: `cargo ndk --version`, `adb devices` (phone in developer mode
 with USB debugging), `javac -version`, and `ls $ANDROID_HOME/platforms`
@@ -276,17 +300,30 @@ Then M0.
 
 ### 5.4 `crates/android` (new)
 
-`lib.rs` — `android_main`: `android_logger` to logcat + the file
-logger into `internal_data_path()/baucord.log` (the client log has
-been the most useful artefact in every investigation; keep it),
-`slint::android::init_with_event_listener`, the `OnceLock` engine,
-`AndroidPlatform`, `frontend::run`. `jni.rs` — the calls in §10.
-`audio_route.rs` — speaker/earpiece/Bluetooth through `AudioManager`.
-No `.slint` files here; they live in `ui`.
+As written in M0: `lib.rs` — `android_main`: the logging tee
+(`logging.rs`: `android_logger` to logcat *and* `baucord.log` in
+`internal_data_path()`, rolled at 5 MB — the client log has been the
+most useful artefact in every investigation; keep it), the desktop's
+panic hook, `slint::android::init_with_event_listener` (the listener
+narrates the lifecycle into the log and re-checks permissions on
+`Resume`), `client::config::set_config_dir`, the `RECORD_AUDIO`
+request, then `frontend::app::run()` — and `std::process::exit(0)`
+when it returns (§14, D11). `java.rs` — the calls in §10 (named `java`,
+not `jni`, so the module never shadows the crate); permissions only so
+far. `hello.rs` (feature `hello`) — the M0 smoke test. Still to come:
+the `OnceLock` engine of D8 (with the service, M3) and
+`audio_route.rs`. No `.slint` files here; they live in `ui`.
 
 ## 6. Audio on Android
 
 ### 6.1 Backend
+
+M0 finding: **cpal 0.18.2's Android host is AAudio already** (the
+`ndk` crate's `audio` feature plus JNI for the device list; oboe is
+gone), so the existing cpal path compiles and runs on the phone with no
+new C++ — that is what M0–M2 use. It opens streams without a usage or
+input preset, so the platform's AEC does not engage; M3 adds the
+native backend below for that, on the same `ndk::audio` API cpal uses.
 
 `audio/src/native/aaudio.rs`, a third implementation of the
 `native/mod.rs` contract beside `wasapi.rs`: capture pushes device-rate
@@ -493,21 +530,39 @@ Everything else the app does is Rust.
 ## 11. Build and sideload
 
 ```
-# Rust → jniLibs (release, device ABI)
-cargo ndk --target arm64-v8a --platform 29 \
-  --output-dir android/app/src/main/jniLibs build --release -p android
+# Everything in one: Gradle runs cargo-ndk, then packages the APK.
+cd android
+./gradlew assembleDebug -PcargoTargets=x86_64          # emulator loop
+./gradlew assembleDebug                                 # arm64-v8a + x86_64
+./gradlew assembleRelease -PcargoTargets=arm64-v8a      # a phone build
+#   → app/build/outputs/apk/debug/app-debug.apk
+#   → app/build/outputs/apk/release/app-release.apk (signed if the
+#     BAUCORD_KEYSTORE properties are set, else -unsigned)
 
-# APK
-cd android && ./gradlew assembleRelease
-#   → app/build/outputs/apk/release/app-release.apk (signed with our key)
+# M0 smoke test instead of the client (toolchain only):
+./gradlew assembleDebug -PcargoTargets=x86_64 -PcargoFeatures=hello
+
+# Only the Rust half, by hand (what the Exec task runs; cargo-ndk 4 syntax):
+cargo ndk --target x86_64 --platform 29 \
+  --output-dir android/app/src/main/jniLibs build -p android
 
 # install / logs
-adb install -r app/build/outputs/apk/release/app-release.apk
-adb logcat -s baucord
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+adb logcat -s baucord            # logcat; baucord.log is in the app's files dir
+adb shell run-as dev.baucord cat files/baucord.log   # debug builds only
 ```
 
-Debug loop: `--target x86_64` for the emulator, `assembleDebug`,
-`adb install`. The Gradle `Exec` task makes the first two steps one.
+`cargoTargets` and `cargoFeatures` default in `android/gradle.properties`.
+Until the permission request lands on the first voice join, a build
+whose dialog was dismissed can be fixed with
+`adb shell pm grant dev.baucord android.permission.RECORD_AUDIO`.
+
+Emulator: a **Google APIs x86_64, API 36** image; for the desktop UI
+that M0–M1 show, a tablet profile (Pixel Tablet) or a phone in
+landscape — the phone layout is M2. Extended controls → Microphone →
+"Virtual microphone uses host audio input" for voice. The Windows host
+is `10.0.2.2` from inside the emulator, so a local server is
+`10.0.2.2:51000`.
 Signing: one keystore generated once (`keytool`), kept out of the repo,
 referenced from `~/.gradle/gradle.properties`; a sideloaded update only
 installs over the previous one if the signature matches, so the key is
@@ -538,7 +593,7 @@ Bluetooth SCO on API 29–30, push-to-talk on hardware buttons.
 
 | risk | when | how |
 |---|---|---|
-| Skia has no prebuilt for our NDK/target and builds from source (30+ min, disk) | M0 | try; if so, cache the build or pin `SKIA_BINARIES_URL` |
+| Skia has no prebuilt for our NDK/target and builds from source (30+ min, disk) | M0 | mostly retired on paper: Slint 1.17.1 → skia-safe 0.99 asks for `gl,vulkan,textlayout` on Android, and rust-skia's binaries matrix publishes exactly that for `aarch64-linux-android` and `x86_64-linux-android` (built against API 26). The first `cargo ndk` run confirms; if it ever builds from source, pin `SKIA_BINARIES_URL` |
 | Slint's Android IME: composition, autocorrect, Spanish accents in the composer | M2 | type real text on a real phone in the first chat build |
 | AEC quality varies by OEM; some need `MODE_IN_COMMUNICATION` before the streams open | M3 | open streams after `setMode`; test on ≥ 3 makers |
 | `sys-locale`, `dirs`, `interprocess` or another desktop-shaped crate behind a `frontend` dependency | M1 | `cargo tree -p android --target aarch64-linux-android` must show none of desktop's |
@@ -549,4 +604,32 @@ Bluetooth SCO on API 29–30, push-to-talk on hardware buttons.
 
 ## 14. Decisions taken after this draft
 
-(none yet)
+**2026-10-05 — M0 written (awaiting its first build).** The
+`crates/android` cdylib, the `android/` Gradle project and the CI
+workflow exist; `frontend` gained the four guards a single-window host
+needs. Nothing is built yet: the sandbox has no NDK, so the checks that
+ran are `cargo tree -p android --target aarch64-linux-android` (no
+desktop crate resolves; the C builds are opus via cmake,
+android-activity's glue, ring's asm, and Skia's prebuilt), a host
+`cargo check` of the android manifest (`hello`), `ui`, `i18n`,
+`app-core`, `protocol`, and reading the real APIs (Slint 1.17.1's
+`android` module and backend, android-activity 0.6.1, jni 0.22.4 as
+cpal 0.18.2 uses it, cargo-ndk 4.1.2, android_logger 0.15.1). Decisions:
+
+| # | decision | why |
+|---|---|---|
+| D10 | **M0 runs the real client, not only a hello.** `frontend::app::run()` is the default (`app` feature); `--features hello` is the toolchain smoke test kept for diagnosing the pipeline | the desktop UI is one `Window`, which is what the Android backend renders; on a tablet-sized emulator it is usable as is, so connect + voice can be tested before any mobile `.slint` exists |
+| D11 | **`android_main` ends the process when the Activity is destroyed** (`std::process::exit(0)` after `run()`, as the desktop does) | Slint's platform is set once per process and Android may call `android_main` again in the same process (Back on the root page, then relaunch); a fresh process is correct until the foreground service makes the engine outlive the Activity (D8, M3), when Back must move the task to the background instead of finishing |
+| D12 | The workspace `slint` entry stays unchanged (§2.1) | Slint 1.17 target-gates winit and femtovg; nothing desktop reaches the Android target |
+| D13 | **No Kotlin in M0–M2**: the Gradle module has no Kotlin plugin and no source; `VoiceService.kt` arrives with M3 and the `kotlin-android` plugin with it | one fewer version to pin and one fewer thing to break on the first build |
+| D14 | The `ui` crate's `mobile` feature (§5.3) is deferred to M2 with the mobile root itself | a placeholder root re-exporting the desktop one adds a feature with no behaviour |
+| D15 | `RECORD_AUDIO` is requested at startup for now; M3 moves it to the first voice join (§4.4) | one fewer step to test voice on the emulator |
+| D16 | The auxiliary windows (Settings, admin panel, stream viewer) are refused on Android with a toast (`host-single-window`, in the three catalogs) via `frontend::app::SINGLE_WINDOW_HOST` | the backend hands every `Window` the same adapter; opening a second one would collide with the main window. Settings becomes a page in M2; the viewer an in-window overlay when stream viewing comes |
+| D17 | JNI lives in `crates/android/src/java.rs` (not `jni.rs`) | a module named like the crate it uses invites path ambiguity |
+| D18 | Versions pinned by the Gradle project: Gradle 8.14.3 (wrapper, verified to exist), AGP 8.13.0 (from memory — Studio's upgrade assistant corrects it if wrong), compileSdk/targetSdk 36, minSdk 29 | the last 8.x pair; AGP 9 needs Gradle 9 and a Kotlin-DSL migration nobody needs yet |
+| D19 | Stream viewing on Android goes through **MediaCodec via the `ndk` crate's `media` feature** as a third `VideoDecoder` behind `video::codec_stub`, when it comes (the user wants it early; it stays after voice) | hardware H.264 decode with no FFmpeg build for Android; the trait, `Quality` and the jitter buffer already compile there |
+
+What the first build will tell us, in order: whether the Skia prebuilt
+downloads (§13), whether cpal's AAudio host opens the emulator's mic,
+and whether the desktop `main.slint` is usable on a tablet AVD. Record
+each in SESSION-GUIDE.md §5 and here.

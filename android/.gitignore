@@ -1,0 +1,13 @@
+# Gradle / Android Studio
+.gradle/
+build/
+app/build/
+.idea/
+*.iml
+local.properties
+.kotlin/
+# Written by cargo-ndk on every build (spec §2)
+app/src/main/jniLibs/
+# Signing material never enters the repo (spec §11)
+*.jks
+*.keystore
