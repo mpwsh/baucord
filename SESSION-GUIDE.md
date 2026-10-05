@@ -156,8 +156,9 @@ worth re-running.
   (logcat + `baucord.log` tee), `hello.rs` (feature `hello`, the
   toolchain smoke test). The Gradle project is `android/` beside
   `crates/` (AGP 8.13.0, Gradle 8.14.3 wrapper, no Kotlin yet) and
-  `.github/workflows/android.yml` builds the debug APK. Always build
-  it with `-p android` (ANDROID-SPEC.md §2.1).
+  `.github/workflows/android-release.yml` builds the signed arm64 APK
+  on a published Release (D21; no PR builds). Always build it with
+  `-p android` (ANDROID-SPEC.md §2.1).
 
 Server config keys the user runs with are in the spec §1; the
 CLI is `server user|role|invite|restriction|key|telemetry|backup|
@@ -196,6 +197,13 @@ Memory-mode servers (persistence off) still use the legacy
 - `/kick` forgets keys and roles (needs a new invite); `/ban` is the
   restriction; a ban never catches the actor or an equal rank, and
   skips an address someone else is on.
+- `VoiceChat::start()` fails if *either* stream fails; the caller
+  must check `output_running()` before dropping the engine, or a
+  missing microphone silences playback too (the Android phone test,
+  2026-10-05 — and a PC with no capture device, the field incident
+  the audio crate's comment describes). A never-opened input is
+  retried by `service()` (`input_pending`); a failed one by the
+  existing `input_stream_failed` path.
 - Chat earns 1 xp per message since 1.1.4 (at the minute flush); an
   image counts as a chat message for mutes and
   the rate limit.
@@ -794,8 +802,17 @@ copy and single-click watch confirmed working in QA:
 **Android** (v1: voice + chat, sideloaded, Slint) — `ANDROID-SPEC.md`,
 milestones in its §12, decisions in §14.
 
-**Android M0 written (2026-10-05, awaiting its first build on the
-user's Windows machine):** `crates/android` runs the real
+**Android M0 done (2026-10-05): the hello APK built (1m18s of Rust)
+and ran on a Pixel 10 AVD; the toolchain rounds are in ANDROID-SPEC.md
+§14. The same day the full `app` build compiled first time and
+connected to the official server from the emulator (roster, channels,
+speaking indicators, voice received) on the desktop `main.slint` —
+cpal's AAudio host carries playback unchanged. Chat pane overflows portrait
+(M2's job). The signed arm64 release ran on a real phone (pt-BR
+locale right, 321 MB) with no audio: the client dropped the engine on
+a capture-only failure and the engine never retried an unopened
+input — both fixed (spec §14); the phone's actual device error is
+the next logcat. Next: audio on the phone, then the mobile root.** What follows is the M0 record: `crates/android` runs the real
 `frontend::app::run()` on Slint's Android backend (D10) with a `hello`
 feature for the toolchain alone; the `android/` Gradle project runs
 cargo-ndk from `preDebugBuild`/`preReleaseBuild`; `frontend` got

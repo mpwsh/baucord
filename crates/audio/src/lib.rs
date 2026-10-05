@@ -199,6 +199,10 @@ pub struct VoiceChat {
     /// Names of the devices actually opened, for follow-the-default.
     opened_input: Option<String>,
     opened_output: Option<String>,
+    /// Capture was asked for and never opened (no microphone; on
+    /// Android the permission not granted yet): `service()` keeps
+    /// trying on the restart backoff until it does, playback running.
+    input_pending: bool,
     /// Last default-device poll (non-Windows) and last restart attempt.
     last_device_poll: Instant,
     last_restart_attempt: Instant,
@@ -266,6 +270,7 @@ impl VoiceChat {
             },
             opened_input: None,
             opened_output: None,
+            input_pending: false,
             last_device_poll: Instant::now(),
             last_restart_attempt: Instant::now().checked_sub(RESTART_BACKOFF).unwrap(),
             stats,
@@ -301,6 +306,8 @@ impl VoiceChat {
                     "also failed"
                 }
             );
+            // Retried from `service()` — see `input_pending`.
+            self.input_pending = true;
         }
 
         // Report the first failure, but note: callers that get an Err while
@@ -355,6 +362,20 @@ impl VoiceChat {
             .store(false, Ordering::Relaxed);
         self.output = Some(output);
         Ok(())
+    }
+
+    /// Playback is open. A caller whose `start()` failed on the capture
+    /// side only should keep this instance: the room stays audible and
+    /// the microphone is retried by `service()`.
+    #[must_use]
+    pub fn output_running(&self) -> bool {
+        self.output.is_some()
+    }
+
+    /// Capture is open.
+    #[must_use]
+    pub fn input_running(&self) -> bool {
+        self.input.is_some()
     }
 
     // ── Public API ───────────────────────────────────────────────────────
@@ -614,7 +635,10 @@ impl VoiceChat {
             && (stats.output_stream_failed.load(Ordering::Relaxed)
                 || (self.config.output_device.is_none()
                     && stats.default_output_changed.load(Ordering::Relaxed)));
-        if !input_needs && !output_needs {
+        // A capture side that never opened is not a failed stream (there
+        // is none) — it is a device or permission that may show up later.
+        let input_late = self.input.is_none() && self.input_pending;
+        if !input_needs && !output_needs && !input_late {
             return false;
         }
         if now.duration_since(self.last_restart_attempt) < RESTART_BACKOFF {
@@ -623,6 +647,21 @@ impl VoiceChat {
         self.last_restart_attempt = now;
 
         let mut restarted = false;
+        if input_late {
+            match self.start_input() {
+                Ok(()) => {
+                    self.input_pending = false;
+                    stats.stream_restarts.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "Input started late ({})",
+                        self.opened_input.as_deref().unwrap_or("default device")
+                    );
+                    restarted = true;
+                }
+                // Every 2 s until it works: debug, or the log fills up.
+                Err(e) => debug!("input still unavailable: {e}"),
+            }
+        }
         if input_needs {
             let why = if stats.input_stream_failed.load(Ordering::Relaxed) {
                 "stream failed"

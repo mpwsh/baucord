@@ -22,6 +22,8 @@ use jni::{
 const PERMISSION_GRANTED: i32 = 0;
 /// Our one request code; NativeActivity never hands the result back to
 /// native code anyway (the next `Resume` re-checks).
+// Only the smoke test never asks; the imports it shares stay used.
+#[cfg_attr(feature = "hello", allow(dead_code))]
 const PERMISSION_REQUEST_CODE: i32 = 1;
 
 /// Run `f` with a JNI environment and the current Activity.
@@ -66,6 +68,7 @@ pub fn has_permission(name: &str) -> Result<bool, String> {
 ///
 /// # Errors
 /// Any JNI failure, as text.
+#[cfg_attr(feature = "hello", allow(dead_code))]
 pub fn request_permissions(names: &[&str]) -> Result<(), String> {
     with_activity(|env, activity| {
         // `String[]`, filled with nulls; the element type names the

@@ -1,0 +1,149 @@
+# The Android release APK (ANDROID-SPEC.md §11): built and signed when a
+# GitHub Release is published, attached to that release as
+# baucord-android-<tag>-arm64.apk. Day-to-day builds are local
+# (android/README.md); there is no push/PR build on purpose.
+#
+# Secrets (repo Settings → Secrets and variables → Actions):
+#   BAUCORD_KEYSTORE_BASE64   the release keystore, base64 of the .jks
+#   BAUCORD_KEYSTORE_PASSWORD
+#   BAUCORD_KEY_ALIAS         (baucord)
+#   BAUCORD_KEY_PASSWORD
+# Gradle reads them as project properties through ORG_GRADLE_PROJECT_*
+# (app/build.gradle.kts, signingConfigs). Without them the APK is built
+# unsigned and only uploaded as a workflow artifact, never to a release.
+name: android-release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to label the build with (dry run: the APK is a workflow artifact, not a release asset)"
+        default: "manual"
+
+permissions:
+  contents: write   # gh release upload
+
+jobs:
+  apk:
+    # Pinned: `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19; a build
+    # this toolchain-heavy should change images on purpose.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      # `secrets` cannot be read in a step's `if`; through env it can.
+      KEYSTORE_B64: ${{ secrets.BAUCORD_KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Gradle 8.14 and Slint's build.rs (javac + d8) run on 17–24; never
+      # 25 (spec §3).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # cmdline-tools + sdkmanager on PATH, ANDROID_HOME/ANDROID_SDK_ROOT
+      # exported, licences accepted. The packages themselves next.
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          set -eux
+          yes | sdkmanager --licenses >/dev/null || true
+          LIST=$(sdkmanager --list 2>/dev/null)
+          # Newest of each: NDK r29, Build-Tools 36 (plus 35.0.0, AGP
+          # 8.13's own default), the SDK's cmake (brings ninja).
+          NDK=$(echo "$LIST" | grep -oE 'ndk;29\.[0-9.]+' | sort -V | tail -1)
+          BT=$(echo "$LIST"  | grep -oE 'build-tools;36\.[0-9.]+' | sort -V | tail -1)
+          CM=$(echo "$LIST"  | grep -oE 'cmake;[0-9.]+' | sort -V | tail -1)
+          echo "ndk=$NDK build-tools=$BT cmake=$CM"
+          sdkmanager "platforms;android-36" "$BT" "build-tools;35.0.0" "$NDK" "$CM" "platform-tools"
+          NDK_DIR="$ANDROID_HOME/ndk/${NDK#ndk;}"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          # skia-bindings reads this name, only if it ever builds Skia
+          # from source instead of downloading the prebuilt.
+          echo "ANDROID_NDK=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/${CM/;//}/bin" >> "$GITHUB_PATH"
+
+      # rust-toolchain.toml picks the Rust version; only the Android
+      # target is added to it.
+      - name: Rust toolchain + target
+        run: |
+          set -eux
+          rustup toolchain install
+          rustup target add aarch64-linux-android
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-release-arm64
+
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Signing key
+        if: ${{ env.KEYSTORE_B64 != '' }}
+        run: |
+          set -eu
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/baucord-release.jks"
+          echo "ORG_GRADLE_PROJECT_BAUCORD_KEYSTORE=$RUNNER_TEMP/baucord-release.jks" >> "$GITHUB_ENV"
+          echo "SIGNED=1" >> "$GITHUB_ENV"
+
+      - name: Build the release APK (arm64-v8a)
+        working-directory: android
+        env:
+          ORG_GRADLE_PROJECT_BAUCORD_KEYSTORE_PASSWORD: ${{ secrets.BAUCORD_KEYSTORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_BAUCORD_KEY_ALIAS: ${{ secrets.BAUCORD_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_BAUCORD_KEY_PASSWORD: ${{ secrets.BAUCORD_KEY_PASSWORD }}
+        run: |
+          set -eux
+          # Git on Windows commits scripts without the executable bit.
+          chmod +x gradlew
+          cargo ndk --version
+          ./gradlew --no-daemon assembleRelease \
+            -PcargoTargets=arm64-v8a \
+            -PbaucordVersionCode="${{ github.run_number }}" \
+            -PbaucordVersionName="${TAG#v}"
+          ls -la app/build/outputs/apk/release/
+
+      - name: 16 KB page-size check (spec §11)
+        run: |
+          set -eux
+          SO=android/app/src/main/jniLibs/arm64-v8a/libbaucord_android.so
+          READELF="$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
+          "$READELF" -l "$SO" | grep LOAD
+          # Every LOAD segment's alignment column must read 0x4000.
+          if "$READELF" -l "$SO" | grep LOAD | grep -v 0x4000; then
+            echo "a LOAD segment is not 16 KB aligned"; exit 1
+          fi
+
+      - name: Name the APK
+        id: apk
+        run: |
+          set -eux
+          OUT=android/app/build/outputs/apk/release
+          if [ -f "$OUT/app-release.apk" ]; then
+            SRC="$OUT/app-release.apk"; SUFFIX=""
+          else
+            SRC="$OUT/app-release-unsigned.apk"; SUFFIX="-unsigned"
+          fi
+          NAME="baucord-android-${TAG}-arm64${SUFFIX}.apk"
+          cp "$SRC" "$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      # Dry runs and unsigned builds: an artifact to download.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.name }}
+          if-no-files-found: error
+
+      # A published release with a signing key: the APK joins its assets.
+      - name: Attach to the release
+        if: ${{ github.event_name == 'release' && env.SIGNED == '1' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "${{ steps.apk.outputs.name }}" --clobber

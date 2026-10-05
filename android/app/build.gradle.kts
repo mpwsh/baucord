@@ -47,6 +47,15 @@ fun androidSdkDir(): File? {
 android {
     namespace = "dev.baucord"
     compileSdk = baucordCompileSdk
+    // AGP strips debug symbols out of jniLibs with the NDK's llvm-strip
+    // and needs to be told which NDK; without this it packages the .so
+    // as built ("Unable to strip the following libraries…" — ~10× the
+    // size in a release APK). Newest installed NDK under the SDK.
+    androidSdkDir()?.let { sdk ->
+        File(sdk, "ndk").listFiles()?.filter { it.isDirectory }?.maxByOrNull { it.name }?.let {
+            ndkVersion = it.name
+        }
+    }
 
     defaultConfig {
         applicationId = "dev.baucord"
@@ -55,9 +64,14 @@ android {
         minSdk = 29
         targetSdk = 36
         // versionCode counts up every build that leaves the machine;
-        // versionName follows the workspace version (spec §11).
-        versionCode = 1
-        versionName = "1.1.6"
+        // versionName follows the workspace version (spec §11). The
+        // release workflow passes both (-PbaucordVersionCode=<run
+        // number> -PbaucordVersionName=<tag>); local builds take the
+        // defaults, which install over anything (same or lower code).
+        versionCode = (project.findProperty("baucordVersionCode") as String?)
+            ?.trim()?.toIntOrNull() ?: 1
+        versionName = (project.findProperty("baucordVersionName") as String?)
+            ?.trim()?.takeIf { it.isNotEmpty() } ?: "1.1.6"
 
         ndk {
             abiFilters += cargoTargets.split(',').map { it.trim() }
@@ -122,6 +136,8 @@ android {
 // inherits (spec §3). Always `-p android`: a workspace-wide build
 // would unify the desktop-only features in.
 //
+// The environment the Rust build needs beyond what Gradle inherits:
+//
 // ANDROID_JAR: cargo-ndk exports ANDROID_PLATFORM=<--platform> (the NDK
 // API level) to cargo's children, and the `android-build` crate behind
 // Slint's build.rs reads that same name as the *SDK platform* to compile
@@ -129,13 +145,27 @@ android {
 // nothing (first build, 2026-10-05). It checks ANDROID_JAR first and
 // cargo-ndk leaves that one alone, so the jar is named here from
 // compileSdk.
-fun Exec.pointAtCompileSdkJar() {
+//
+// CMAKE_GENERATOR=Ninja: libopus (opusic-sys) builds with cmake through
+// the NDK toolchain file, which the Visual Studio generator cannot
+// drive. Set here, for this build only, so the desktop build on the
+// same machine keeps whatever generator its target/ cache was made
+// with (a global Ninja broke a cached VS build: "Does not match the
+// generator used previously"). Ninja ships in the SDK's cmake/<ver>/bin.
+fun Exec.cargoNdkEnvironment() {
+    environment("CMAKE_GENERATOR", "Ninja")
     val sdk = androidSdkDir() ?: return
     val jar = File(sdk, "platforms/android-$baucordCompileSdk/android.jar")
     if (jar.exists()) {
         environment("ANDROID_JAR", jar.absolutePath)
     } else {
         logger.warn("ANDROID_JAR: $jar is missing — install SDK Platform $baucordCompileSdk")
+    }
+    // The newest SDK cmake (cmake + ninja) first on PATH, in case the
+    // shell that started Gradle has neither.
+    File(sdk, "cmake").listFiles()?.filter { it.isDirectory }?.maxByOrNull { it.name }?.let {
+        val current = System.getenv("PATH") ?: ""
+        environment("PATH", File(it, "bin").absolutePath + File.pathSeparator + current)
     }
 }
 
@@ -160,7 +190,7 @@ val cargoNdkDebug by tasks.registering(Exec::class) {
     description = "cargo ndk build -p android (debug) → src/main/jniLibs"
     workingDir = workspaceDir.asFile
     commandLine(listOf("cargo") + cargoNdkArgs(release = false))
-    pointAtCompileSdkJar()
+    cargoNdkEnvironment()
     // Cargo is the incremental build system here; let it decide.
     outputs.upToDateWhen { false }
 }
@@ -170,7 +200,7 @@ val cargoNdkRelease by tasks.registering(Exec::class) {
     description = "cargo ndk build -p android --release → src/main/jniLibs"
     workingDir = workspaceDir.asFile
     commandLine(listOf("cargo") + cargoNdkArgs(release = true))
-    pointAtCompileSdkJar()
+    cargoNdkEnvironment()
     outputs.upToDateWhen { false }
 }
 

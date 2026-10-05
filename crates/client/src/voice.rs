@@ -281,11 +281,24 @@ impl VoiceLoopState {
                 match VoiceChat::new(config) {
                     Ok(mut voice) => {
                         if let Err(e) = voice.start() {
+                            if !voice.output_running() {
+                                // Nothing came up: no engine this time.
+                                event_tx
+                                    .send(VoiceEvent::Error(format!("Start failed: {e}")))
+                                    .ok();
+                                wake();
+                                return;
+                            }
+                            // Playback is up and only capture failed (no
+                            // microphone; on Android the permission not
+                            // granted yet). Keep the engine: the room stays
+                            // audible, and `service()` retries the input
+                            // every 2 s until it opens. Dropping it here
+                            // silenced everything (first phone test,
+                            // 2026-10-05).
                             event_tx
-                                .send(VoiceEvent::Error(format!("Start failed: {e}")))
+                                .send(VoiceEvent::Error(format!("Microphone unavailable: {e}")))
                                 .ok();
-                            wake();
-                            return;
                         }
                         self.our_client_id = Some(id);
                         self.vc = Some(voice);

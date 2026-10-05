@@ -66,7 +66,7 @@ baucord/
       src/main/kotlin/dev/baucord/VoiceService.kt     M3 — the one Kotlin file (not yet)
       src/main/res/                                  theme, strings, placeholder icon
       src/main/jniLibs/                              written by cargo-ndk, git-ignored
-  .github/workflows/android.yml   the debug APK from CI (M0, untested)
+  .github/workflows/android-release.yml   signed arm64 APK on a published Release (no PR builds)
 ```
 
 The Rust side of Android is a normal workspace member (`crates/android`)
@@ -147,7 +147,9 @@ ANDROID_SDK_ROOT  = same value            (the older name some tools still read)
 ANDROID_NDK_HOME  = %ANDROID_HOME%\ndk\<r29 version>   (cargo-ndk, opusic-sys)
 ANDROID_NDK       = same value            (skia-bindings, only if Skia builds from source)
 JAVA_HOME         = <a JDK 21>              (NOT <android-studio>\jbr — see the table)
-CMAKE_GENERATOR   = Ninja                 (Windows; harmless elsewhere)
+CMAKE_GENERATOR   = Ninja                 (only for `cargo ndk` by hand — the Gradle task sets
+                                           it per build; a global value also flips the desktop
+                                           build's libopus and breaks its cached VS build)
 ANDROID_JAR       = %ANDROID_HOME%\platforms\android-36\android.jar
                                           (only for `cargo ndk` run by hand — the Gradle
                                            task sets it from compileSdk; see §14, 2026-10-05)
@@ -591,9 +593,9 @@ check is there to catch a regression.
 
 | M | deliverable | done when |
 |---|---|---|
-| M0 | toolchain + hello: `crates/android` shows a Slint page with the theme on a phone; `ui` builds with `mobile`; the workspace `slint` features are platform-neutral | the APK runs on Bartrix's phone and the emulator; first-build time and the Skia prebuilt outcome are recorded in the guide |
+| M0 ✅ 2026-10-05 | toolchain + hello: `crates/android` shows a Slint page with the theme on the emulator (`ui/mobile` deferred, D14; the workspace `slint` entry needed no change, D12) | done on the x86_64 emulator: hello builds in ~1.5 min, Skia prebuilt downloads; the phone comes with the first `app` build |
 | M1 | the split: `frontend` extracted, `Platform` trait, desktop rebuilt on it | desktop 1.1.5 ships with no behaviour change; `frontend` has no desktop dependency |
-| M2 | connect + chat on Android: Connect, Channels, Chat, Members pages; history, unread, images | a DM and a channel conversation with desktop users work; `baucord.log` written; locale right |
+| M2 | connect + chat on Android: Connect, Channels, Chat, Members pages; history, unread, images. *Connecting, the roster and channels already work through the desktop root (2026-10-05); M2 is the phone layout.* | a DM and a channel conversation with desktop users work; `baucord.log` written; locale right |
 | M3 | voice: AAudio backend, AEC, route control, foreground service, focus, permissions | 30 min in voice on speaker with the screen off, no echo reported by the others, telemetry shows the ladder healthy |
 | M4 | resilience + settings: network change rebind, reconnect, Settings page, notifications for DMs in voice | Wi-Fi → cellular mid-call recovers under 10 s |
 | M5 | release: signing, `versionCode`, README section, the guide's Android rules | the three Movistar users run it for a week |
@@ -641,6 +643,7 @@ cpal 0.18.2 uses it, cargo-ndk 4.1.2, android_logger 0.15.1). Decisions:
 | D16 | The auxiliary windows (Settings, admin panel, stream viewer) are refused on Android with a toast (`host-single-window`, in the three catalogs) via `frontend::app::SINGLE_WINDOW_HOST` | the backend hands every `Window` the same adapter; opening a second one would collide with the main window. Settings becomes a page in M2; the viewer an in-window overlay when stream viewing comes |
 | D17 | JNI lives in `crates/android/src/java.rs` (not `jni.rs`) | a module named like the crate it uses invites path ambiguity |
 | D18 | Versions pinned by the Gradle project: Gradle 8.14.3 (wrapper, verified to exist), AGP 8.13.0 (from memory — Studio's upgrade assistant corrects it if wrong), compileSdk/targetSdk 36, minSdk 29 | the last 8.x pair; AGP 9 needs Gradle 9 and a Kotlin-DSL migration nobody needs yet |
+| D21 | **CI builds Android only on a published GitHub Release** (`android-release.yml`: signed arm64 APK attached to the release; secrets for the keystore; `workflow_dispatch` as a dry run). No push/PR build — testing is local, and the desktop `release.yml` stays desktop-only | the user's call on 2026-10-05: the release workflow holds release things, and a PR build buys nothing while one person builds locally |
 | D20 | `Cargo.lock` ships with the Android entries already resolved (android-activity 0.6.1, i-slint-backend-android-activity 1.17.1, android_logger 0.15.1, ndk-context 0.1.1; jni 0.22.4 and ndk 0.9.0 were already locked through cpal) | the first `cargo ndk` run resolves nothing new, and the versions the APIs were read against are the ones that build |
 | D19 | Stream viewing on Android goes through **MediaCodec via the `ndk` crate's `media` feature** as a third `VideoDecoder` behind `video::codec_stub`, when it comes (the user wants it early; it stays after voice) | hardware H.264 decode with no FFmpeg build for Android; the trait, `Quality` and the jitter buffer already compile there |
 
@@ -678,4 +681,42 @@ android.jar` under the SDK AGP resolves (`pointAtCompileSdkJar`), and
 a hand-run `cargo ndk` needs the variable set (§3). Not chosen:
 installing `platforms;android-29` (compiling the helper against an
 old SDK for no reason) or dropping `--platform` (cargo-ndk's default
-is 21, below minSdk).
+is 21, below minSdk). Attempt 4 tripped on three Kotlin-DSL name
+collisions in `app/build.gradle.kts` (`java` is the Java-plugin
+extension in a script, so `java.util.Properties` needs an import;
+`compileSdkVersion` inside `android { }` is AGP's deprecated String
+property and shadows a script val — now `baucordCompileSdk`).
+**Attempt 5: `BUILD SUCCESSFUL` for `hello` on x86_64 — 1m18s of
+Rust, 1m25s total; the Skia prebuilt downloaded (no "FULL BUILD"),
+so §13's first risk is retired.** AGP warned "Unable to strip the
+following libraries" — it had no `ndkVersion`; the module now sets it
+to the newest NDK under the SDK. **Installed and ran on a Pixel 10
+AVD (API 36.1, x86_64): the page renders, taps count, logcat shows the
+start line, `lifecycle: start/resume` and the `RECORD_AUDIO` check —
+i.e. `java.rs`'s jni 0.22 calls work. M0 is done.** Then the `app`
+build: **the whole engine compiled for x86_64 Android first time and
+the client connected to the official server from the Pixel 10 AVD —
+roster, channels, lobby → room, speaking indicators, voice received,
+41 ms RTT in the status line — with the desktop `main.slint` as is.**
+So M2's "connect" and M3's receive path are demonstrated on cpal's
+AAudio host without an Android-specific line of UI. Not yet tested:
+the microphone (emulator mic not enabled); observed: the chat pane
+overflows a portrait phone (the mobile root is M2's job), and the
+sidebar's memory figure read 1164 MB on the debug build — expected to
+be the unstripped `.so` with DWARF mapped in; re-read on the release
+build before treating it as a sysinfo-on-Android issue. Then the
+**signed arm64 release on a real phone**: connects, chat works, the
+toast is in Portuguese (`sys-locale` works), Mem 321 MB (so the debug
+figure was DWARF) — but **no audio either way**, and Settings / the
+stream viewer show the D16 toast as designed. Two client-side causes
+for the silence found by reading: `client/src/voice.rs` dropped the
+whole engine when `VoiceChat::start()` returned any `Err`, so a
+capture failure (no microphone permission yet) also killed playback —
+the audio crate's own comment warned of exactly this; and
+`VoiceChat::service()` never retried an input that had not opened
+(`input.is_some()` gate). Fixed: the client keeps the engine when
+`output_running()` and toasts "Microphone unavailable"; `service()`
+retries a pending input every 2 s (`input_pending`) and logs "Input
+started late". Whether playback itself also failed on the phone is
+what the next logcat says (`Voice output failed to start` vs `Voice
+input failed to start`).

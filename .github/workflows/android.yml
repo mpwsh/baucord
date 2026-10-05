@@ -1,7 +1,7 @@
 # Builds the Android debug APK (ANDROID-SPEC.md §11) so a phone can be
-# tested from a download rather than a Windows toolchain. Untested as of
-# 2026-10-05: the first green run is the validation; expect one or two
-# rounds on the SDK package names.
+# tested from a download rather than a Windows toolchain. First real
+# run pending as of 2026-10-05 (the first attempt died in GitHub's
+# runner allocation before any step ran).
 name: android
 
 on:
@@ -16,11 +16,22 @@ on:
       - "android/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "android/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/android.yml"
 
 jobs:
   apk:
-    runs-on: ubuntu-latest
+    # Pinned: `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19; a build
+    # this toolchain-heavy should change images on purpose.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       # arm64 only in CI: the x86_64 emulator image is a local concern.
@@ -28,41 +39,51 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The JDK Gradle 8 and Slint's build.rs (javac + d8) need.
+      # The JDK Gradle 8 and Slint's build.rs (javac + d8) need. 17 or
+      # 21 — never 25 (Gradle 8.14 runs on 17–24, spec §3).
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
-      # cmdline-tools + sdkmanager; the packages themselves next.
+      # cmdline-tools + sdkmanager on PATH, ANDROID_HOME/ANDROID_SDK_ROOT
+      # exported, licences accepted. The packages themselves next.
       - uses: android-actions/setup-android@v3
-        with:
-          packages: ""
 
       - name: Install SDK packages
         run: |
           set -eux
           yes | sdkmanager --licenses >/dev/null || true
-          # Newest NDK r29 and build-tools 36 available to this sdkmanager.
-          NDK=$(sdkmanager --list 2>/dev/null | grep -oE 'ndk;29\.[0-9.]+' | sort -V | tail -1)
-          BT=$(sdkmanager --list 2>/dev/null | grep -oE 'build-tools;36\.[0-9.]+' | sort -V | tail -1)
-          CM=$(sdkmanager --list 2>/dev/null | grep -oE 'cmake;3\.[0-9.]+' | sort -V | tail -1)
-          sdkmanager "platforms;android-36" "$BT" "$NDK" "$CM" "platform-tools"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
+          LIST=$(sdkmanager --list 2>/dev/null)
+          # Newest of each: NDK r29, Build-Tools 36 (plus 35.0.0, AGP
+          # 8.13's own default), the SDK's cmake (brings ninja).
+          NDK=$(echo "$LIST" | grep -oE 'ndk;29\.[0-9.]+' | sort -V | tail -1)
+          BT=$(echo "$LIST"  | grep -oE 'build-tools;36\.[0-9.]+' | sort -V | tail -1)
+          CM=$(echo "$LIST"  | grep -oE 'cmake;[0-9.]+' | sort -V | tail -1)
+          echo "ndk=$NDK build-tools=$BT cmake=$CM"
+          sdkmanager "platforms;android-36" "$BT" "build-tools;35.0.0" "$NDK" "$CM" "platform-tools"
+          NDK_DIR="$ANDROID_HOME/ndk/${NDK#ndk;}"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          # skia-bindings reads this name, only if it ever builds Skia
+          # from source instead of downloading the prebuilt.
+          echo "ANDROID_NDK=$NDK_DIR" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/${CM/;//}/bin" >> "$GITHUB_PATH"
 
       # The repo's rust-toolchain.toml picks the Rust version; only the
-      # Android targets are added to it.
-      - name: Rust targets + cargo-ndk
+      # Android target is added to it.
+      - name: Rust toolchain + target
         run: |
           set -eux
-          rustup show
+          rustup toolchain install
           rustup target add aarch64-linux-android
-          cargo install cargo-ndk --locked
+          rustup show active-toolchain
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-${{ env.CARGO_TARGETS }}
+
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked
 
       - name: Build the debug APK
         working-directory: android
@@ -70,6 +91,8 @@ jobs:
           CMAKE_GENERATOR: Ninja
         run: |
           set -eux
+          # Git on Windows commits scripts without the executable bit.
+          chmod +x gradlew
           cargo ndk --version
           ./gradlew --no-daemon assembleDebug \
             -PcargoTargets="$CARGO_TARGETS" \

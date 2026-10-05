@@ -39,7 +39,7 @@ directory is Rust: `app/build.gradle.kts` runs `cargo ndk` on the
    | `ANDROID_NDK_HOME` | `%ANDROID_HOME%\ndk\<the 29.x folder>` |
    | `ANDROID_NDK` | the same folder (only read if Skia ever builds from source) |
    | `JAVA_HOME` | a **JDK 21** (e.g. Temurin: `winget install EclipseAdoptium.Temurin.21.JDK` → `C:\Program Files\Eclipse Adoptium\jdk-21…`). Not Studio's `jbr`: that is JDK 25 in 2026 builds, and Gradle 8.14 runs on 17–24 only — the symptom is `What went wrong: 25.0.3` while compiling the settings script |
-   | `CMAKE_GENERATOR` | `Ninja` |
+   | `CMAKE_GENERATOR` | *not needed* — the Gradle tasks set `Ninja` for the Android build only. A global value also switches the **desktop** build's libopus to Ninja and breaks its cached VS build (`Does not match the generator used previously`; fix: `cargo clean -p opusic-sys`). Only set it if you run `cargo ndk` by hand |
    | `ANDROID_JAR` | `<sdk>\platforms\android-36\android.jar` — only needed when running `cargo ndk` by hand; the Gradle tasks set it themselves. (cargo-ndk's `ANDROID_PLATFORM=29` otherwise sends Slint's build script after a `platforms\android-29` nobody has: "No Android platforms found") |
    | `PATH` (append) | `%ANDROID_HOME%\platform-tools`; `%ANDROID_HOME%\cmake\<ver>\bin`; `%USERPROFILE%\.cargo\bin` (rustup adds this one) |
 
@@ -131,10 +131,31 @@ sideload for testing.
 | `-PcargoTargets=` | `arm64-v8a,x86_64` | ABIs to build (both doubles the Rust build time; pick one while iterating) |
 | `-PcargoFeatures=` | *(empty = the app)* | `hello` for the smoke test |
 
-Both also live in `gradle.properties`. Slint picks the **material**
+Both also live in `gradle.properties`. Two more the release workflow
+passes: `-PbaucordVersionCode=` (the run number) and
+`-PbaucordVersionName=` (the tag); local builds default to 1 / the
+workspace version. Slint picks the **material**
 widget style for Android targets (the desktop gets fluent on Windows,
 cupertino on macOS) — only `std-widgets` scrollbars and the like
 differ; `SLINT_STYLE=fluent` in the environment forces the desktop look
-if that ever matters. CI (`.github/workflows/android.yml`)
-builds the arm64 debug APK on every push touching `crates/` or
-`android/` and uploads it as an artifact.
+if that ever matters.
+
+## 6. Releases
+
+There is no push/PR build — day-to-day testing is local. When a GitHub
+Release is **published**, `.github/workflows/android-release.yml`
+builds the signed arm64 release APK and attaches it to the release as
+`baucord-android-<tag>-arm64.apk` (versionCode = the run number,
+versionName = the tag without its `v`). It needs four repository
+secrets (*Settings → Secrets and variables → Actions*):
+
+| secret | value |
+|---|---|
+| `BAUCORD_KEYSTORE_BASE64` | the keystore as base64: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("$env:USERPROFILE\baucord-release.jks")) \| Set-Clipboard`, then paste |
+| `BAUCORD_KEYSTORE_PASSWORD` | its password |
+| `BAUCORD_KEY_ALIAS` | `baucord` |
+| `BAUCORD_KEY_PASSWORD` | the key password |
+
+Without them the job still builds (unsigned) and leaves the APK as a
+workflow artifact but never attaches it. *Run workflow* on the Actions
+tab is a dry run: same build, artifact only.
