@@ -58,6 +58,34 @@ directory is Rust: `app/build.gradle.kts` runs `cargo ndk` on the
    dir $env:ANDROID_HOME\platforms   # android-36
    ```
 
+## 1a. Unpacking a drop
+
+Tarballs from the assistant are unpacked over the repo root with
+`tar -xzf <file>.tar.gz -m` — the `-m` gives every file the extraction
+time as its mtime. Without it, files keep older timestamps and cargo
+can skip rebuilding `ui` (the Slint build script), leaving `frontend`
+to fail on properties that "don't exist".
+
+## 1b. The everyday loop: `run.ps1`
+
+Once §1 is done, `run.ps1` is `cargo run`: it builds the APK, starts
+the emulator if none is running (and waits for Android to boot),
+installs, launches, and tails `logcat` until Ctrl+C.
+
+```powershell
+cd android
+.\run.ps1                   # emulator, debug build
+.\run.ps1 -Avd "Pixel 10"   # a specific AVD (default: the running one, else the first)
+.\run.ps1 -Device           # the USB phone instead (arm64, debug)
+.\run.ps1 -Device -Release  # the signed release on the phone
+.\run.ps1 -Hello            # the M0 smoke test
+.\run.ps1 -NoBuild          # just reinstall + relaunch
+```
+
+`run.cmd` is the same thing for a plain Command Prompt (it bypasses
+the PowerShell script policy for this one file). The sections below
+are the long form of what it does, for the first time through.
+
 ## 2. First build: the toolchain alone
 
 From the repo root:
@@ -102,9 +130,14 @@ Windows host at `10.0.2.2:51000`, and the real server by its invite.
 Accept the microphone dialog (or `adb shell pm grant dev.baucord
 android.permission.RECORD_AUDIO`) and, in the emulator's *Extended
 controls → Microphone*, enable *Virtual microphone uses host audio
-input*. Settings, the admin panel and the stream viewer say "not
-available on Android yet" — they are separate windows on desktop and
-become pages in M2.
+input*. Settings opens as a page over the main screen; *Watch stream*
+on a sharing user opens the viewer as a page (hardware H.264 decode
+through MediaCodec — the first `MediaCodec …: decoding video/avc`,
+`output layout` and `first picture` lines in logcat say which decoder
+the device picked and how its frames are laid out; Back or *Stop
+watching* leaves it). The admin panel still says "not available on
+Android yet" — it is a separate window on desktop and becomes a page
+later.
 
 The log file is `files/baucord.log` inside the app's private
 directory; on a debug build `adb shell run-as dev.baucord cat

@@ -20,6 +20,15 @@
 //! logged and ignored — on Linux without an rtprio limit the worker just
 //! runs at normal priority, as before.
 //!
+//! Android gets Android's own audio class: nice −16
+//! (`THREAD_PRIORITY_AUDIO`, what the framework gives `AudioTrack`'s
+//! threads). The workers otherwise run at the default nice 0 beside the
+//! UI thread (−4) and, while a stream is watched, the video decode and
+//! colour-conversion threads — and on a big.LITTLE phone a nice-0
+//! thread waking every 10 ms is the one the scheduler parks on a slow
+//! core. Apps may lower their own threads' nice (init sets `RLIMIT_NICE`
+//! for every process); a refusal is logged and ignored.
+//!
 //! The two Windows APIs involved (winmm, avrt) are declared directly and
 //! linked from the Windows SDK.
 
@@ -78,6 +87,25 @@ pub struct RtGuard {
     handle: *mut core::ffi::c_void,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     handle: Option<audio_thread_priority::RtPriorityHandle>,
+    /// The thread and the nice value to put back.
+    #[cfg(target_os = "android")]
+    tid: libc::pid_t,
+    #[cfg(target_os = "android")]
+    previous_nice: libc::c_int,
+}
+
+#[cfg(target_os = "android")]
+impl Drop for RtGuard {
+    fn drop(&mut self) {
+        // SAFETY: plain syscall on our own thread id; no memory involved.
+        unsafe {
+            libc::setpriority(
+                libc::PRIO_PROCESS,
+                self.tid as libc::id_t,
+                self.previous_nice,
+            );
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -141,9 +169,42 @@ pub fn promote_current_thread(buffer_frames: u32, sample_rate: u32) -> Option<Rt
     }
 }
 
-/// No-op on platforms without a real-time path (iOS/Android workers rely
-/// on the platform audio session).
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+/// Android: `THREAD_PRIORITY_AUDIO` (nice −16) for the calling thread
+/// (see the module docs). `None` if the kernel refuses (logged once per
+/// thread at info level — it is the first thing to check when Android
+/// voice breaks up).
+#[cfg(target_os = "android")]
+pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<RtGuard> {
+    /// `android.os.Process.THREAD_PRIORITY_AUDIO`.
+    const THREAD_PRIORITY_AUDIO: libc::c_int = -16;
+    let name = std::thread::current().name().unwrap_or("?").to_owned();
+    // SAFETY: plain syscalls on the calling thread's own id.
+    unsafe {
+        let tid = libc::gettid();
+        // bionic returns the nice value itself (−20..19); -1 is a valid
+        // answer, so a failed read just restores to -1 later — harmless.
+        let previous_nice = libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t);
+        if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, THREAD_PRIORITY_AUDIO) == 0 {
+            log::info!("{name}: audio priority (nice {previous_nice} -> {THREAD_PRIORITY_AUDIO})");
+            Some(RtGuard { tid, previous_nice })
+        } else {
+            log::info!(
+                "{name}: audio priority refused ({}); stays at nice {previous_nice}",
+                std::io::Error::last_os_error()
+            );
+            None
+        }
+    }
+}
+
+/// No-op on platforms without a real-time path (iOS workers rely on the
+/// platform audio session).
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android"
+)))]
 pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<RtGuard> {
     None
 }
@@ -165,13 +226,16 @@ pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<
 /// The handle is intentionally leaked: the thread lives exactly as long as
 /// the stream, reverting from any other thread is undefined, and the OS
 /// releases it at thread exit. Skipped on macOS, where the callback runs
-/// on `CoreAudio`'s HAL thread, which is already time-constraint scheduled.
+/// on `CoreAudio`'s HAL thread, which is already time-constraint scheduled,
+/// and on Android, where `AAudio`'s callback thread already runs at the
+/// framework's audio priority (`SCHED_FIFO` in low-latency mode) — our
+/// nice −16 could only lower it.
 pub(crate) fn promote_callback_thread(buffer_frames: u32, sample_rate: u32) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     {
         let _ = (buffer_frames, sample_rate);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     {
         match promote_current_thread(buffer_frames, sample_rate) {
             Some(guard) => {

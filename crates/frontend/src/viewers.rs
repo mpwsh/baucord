@@ -1,20 +1,30 @@
-// viewers.rs — per-peer stream viewer windows, plus the in-window
-// image viewer overlay (chat image tapped → darkened scrim, ◀ ▶
-// stepping, save).
+// viewers.rs — per-peer stream viewers (a window each on the desktop,
+// one page inside the main window on single-window hosts), plus the
+// in-window image viewer overlay (chat image tapped → darkened scrim,
+// ◀ ▶ stepping, save).
 
 use std::rc::Rc;
 
 use app_core::{fps::FpsCounter, stats::FrameRing};
 use i18n::t;
 use slint::{ComponentHandle, Model};
-use ui::{State, StreamViewerWindow};
+use ui::{MainWindow, State, StreamViewerWindow};
 
 use crate::app::{self, AppState};
 
 // ── Stream viewer ───────────────────────────────────────────────────────
 
+/// Where a viewer draws (ANDROID-SPEC.md D23). The desktop gives every
+/// watched peer a `StreamViewerWindow`; Android has one window per
+/// process, so the same `StreamViewerPanel` sits in `MainWindow` as a
+/// page bound to `State.watch-*`, and one stream shows at a time.
+enum Surface {
+    Window(StreamViewerWindow),
+    Page(MainWindow),
+}
+
 pub struct Viewer {
-    pub win: StreamViewerWindow,
+    surface: Surface,
     fps: FpsCounter,
     ring: FrameRing,
     total_bytes: u64,
@@ -24,8 +34,8 @@ pub struct Viewer {
 }
 
 impl Viewer {
-    /// Open a viewer window for `client_id`, sized to the sharer's
-    /// announced dimensions.
+    /// Open a viewer for `client_id`, sized to the sharer's announced
+    /// dimensions (the window; the page fills `main`).
     // Pixel dimensions (≤ 8K) fit losslessly in f32.
     #[allow(clippy::cast_precision_loss)]
     pub fn open(
@@ -34,50 +44,60 @@ impl Viewer {
         width: u32,
         height: u32,
         text_scale: f32,
+        main: &MainWindow,
     ) -> Result<Self, slint::PlatformError> {
-        if app::SINGLE_WINDOW_HOST {
-            // The caller shows the message as a toast.
-            return Err(slint::PlatformError::Other(t!("host-single-window")));
-        }
-        let win = StreamViewerWindow::new()?;
-        app::fill_tr(&win.global::<ui::Tr>());
-        win.global::<ui::Theme>().set_scale(text_scale);
-        win.set_peer_name(peer_name.into());
-        win.window().set_size(slint::LogicalSize::new(
-            width.clamp(320, 1920) as f32,
-            (height.clamp(180, 1080) + 40) as f32, // + toolbar
-        ));
+        let surface = if app::SINGLE_WINDOW_HOST {
+            let s = main.global::<State>();
+            s.set_watch_peer_name(peer_name.into());
+            s.set_watch_stats("--".into());
+            s.set_watch_frame(slint::Image::default());
+            s.set_watch_muted(false);
+            s.set_watch_volume(1.0);
+            s.set_watch_open(true);
+            Surface::Page(main.clone_strong())
+        } else {
+            let win = StreamViewerWindow::new()?;
+            app::fill_tr(&win.global::<ui::Tr>());
+            win.global::<ui::Theme>().set_scale(text_scale);
+            win.set_peer_name(peer_name.into());
+            win.window().set_size(slint::LogicalSize::new(
+                width.clamp(320, 1920) as f32,
+                (height.clamp(180, 1080) + 40) as f32, // + toolbar
+            ));
 
-        // Controls → app actions.
-        let id = client_id;
-        win.on_volume_changed(move |v| {
-            app::with_current(move |app| app.set_stream_volume(id, v));
-        });
-        win.on_mute_toggled(move |muted| {
-            app::with_current(move |app| app.set_stream_muted(id, muted));
-        });
-        win.on_stop_watching(move || {
-            app::with_current(move |app| app.handle_unwatch_peer(id));
-        });
-        win.window().on_close_requested(move || {
-            // Unwatch tears the viewer down (including hiding this
-            // window); returning HideWindow avoids a flash.
-            app::with_current(move |app| app.handle_unwatch_peer(id));
-            slint::CloseRequestResponse::HideWindow
-        });
+            // Controls → app actions. (The page's go through
+            // Logic.watch-*, wired once in `wire_page`.)
+            let id = client_id;
+            win.on_volume_changed(move |v| {
+                app::with_current(move |app| app.set_stream_volume(id, v));
+            });
+            win.on_mute_toggled(move |muted| {
+                app::with_current(move |app| app.set_stream_muted(id, muted));
+            });
+            win.on_stop_watching(move || {
+                app::with_current(move |app| app.handle_unwatch_peer(id));
+            });
+            win.window().on_close_requested(move || {
+                // Unwatch tears the viewer down (including hiding this
+                // window); returning HideWindow avoids a flash.
+                app::with_current(move |app| app.handle_unwatch_peer(id));
+                slint::CloseRequestResponse::HideWindow
+            });
 
-        win.set_stats("--".into());
-        let weak = win.as_weak();
-        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
-        crate::app::repaint_on_reveal(win.window(), armed, move || {
-            if let Some(w) = weak.upgrade() {
-                w.set_repaint_flip(!w.get_repaint_flip());
-            }
-        });
-        win.show()?;
+            win.set_stats("--".into());
+            let weak = win.as_weak();
+            let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+            crate::app::repaint_on_reveal(win.window(), armed, move || {
+                if let Some(w) = weak.upgrade() {
+                    w.set_repaint_flip(!w.get_repaint_flip());
+                }
+            });
+            win.show()?;
+            Surface::Window(win)
+        };
 
         Ok(Self {
-            win,
+            surface,
             fps: FpsCounter::new(),
             ring: FrameRing::default(),
             total_bytes: 0,
@@ -85,6 +105,54 @@ impl Viewer {
             height,
             peer_name: peer_name.to_string(),
         })
+    }
+
+    /// Bring an already-open viewer forward (the window) / back on
+    /// screen (the page, if something hid it).
+    pub fn raise(&self) {
+        match &self.surface {
+            Surface::Window(win) => {
+                let _ = win.show();
+            }
+            Surface::Page(main) => main.global::<State>().set_watch_open(true),
+        }
+    }
+
+    /// The desktop's text-size setting, pushed to a viewer window; the
+    /// page inherits the main window's.
+    pub fn apply_text_scale(&self, scale: f32) {
+        if let Surface::Window(win) = &self.surface {
+            win.global::<ui::Theme>().set_scale(scale);
+        }
+    }
+
+    /// True for the viewer drawn as the main window's page.
+    #[must_use]
+    pub fn is_page(&self) -> bool {
+        matches!(self.surface, Surface::Page(_))
+    }
+
+    fn set_title(&self, title: slint::SharedString) {
+        match &self.surface {
+            // `title` is bound to peer-name in the .slint — pushing the
+            // resolution through it retitles the OS window.
+            Surface::Window(win) => win.set_peer_name(title),
+            Surface::Page(main) => main.global::<State>().set_watch_peer_name(title),
+        }
+    }
+
+    fn set_frame(&self, image: slint::Image) {
+        match &self.surface {
+            Surface::Window(win) => win.set_frame(image),
+            Surface::Page(main) => main.global::<State>().set_watch_frame(image),
+        }
+    }
+
+    fn set_stats(&self, stats: slint::SharedString) {
+        match &self.surface {
+            Surface::Window(win) => win.set_stats(stats),
+            Surface::Page(main) => main.global::<State>().set_watch_stats(stats),
+        }
     }
 
     /// Blit a decoded frame and refresh the once-per-second stats line.
@@ -102,9 +170,7 @@ impl Viewer {
         if (width, height) != (self.width, self.height) {
             self.width = width;
             self.height = height;
-            // `title` is bound to peer-name in the .slint — pushing the
-            // resolution through it retitles the OS window.
-            self.win.set_peer_name(
+            self.set_title(
                 t!("viewer-title",
                     "name" => self.peer_name.as_str(),
                     "width" => width,
@@ -115,7 +181,7 @@ impl Viewer {
 
         // The pixel copy already happened on the present-prep thread;
         // this is a cheap handle wrap + property set.
-        self.win.set_frame(slint::Image::from_rgba8(buffer));
+        self.set_frame(slint::Image::from_rgba8(buffer));
 
         self.total_bytes += frame_bytes as u64;
         self.ring.push(frame_bytes as u64);
@@ -125,7 +191,7 @@ impl Viewer {
             let avg_kb = self.ring.avg_kb();
             let throughput_kb_s = avg_kb * fps as f32;
             let total_mb = self.total_bytes as f64 / (1024.0 * 1024.0);
-            self.win.set_stats(
+            self.set_stats(
                 t!("viewer-stats",
                     "res" => format!("{width}x{height}"),
                     "fps" => fps,
@@ -140,8 +206,50 @@ impl Viewer {
     }
 
     pub fn close(&self) {
-        let _ = self.win.hide();
+        match &self.surface {
+            Surface::Window(win) => {
+                let _ = win.hide();
+            }
+            Surface::Page(main) => {
+                let s = main.global::<State>();
+                s.set_watch_open(false);
+                // The last frame's texture goes with the page.
+                s.set_watch_frame(slint::Image::default());
+            }
+        }
     }
+}
+
+/// The page's controls → app actions, once per process (single-window
+/// hosts only; the desktop wires each window in `Viewer::open`). The
+/// page shows one stream, so the target is whichever viewer is a page.
+pub(crate) fn wire_page(main: &MainWindow) {
+    let logic = main.global::<ui::Logic>();
+    logic.on_watch_volume_changed(|v| {
+        app::with_current(move |app| {
+            if let Some(id) = app.page_viewer_id() {
+                app.set_stream_volume(id, v);
+            }
+        });
+    });
+    logic.on_watch_mute_toggled(|muted| {
+        app::with_current(move |app| {
+            if let Some(id) = app.page_viewer_id() {
+                app.set_stream_muted(id, muted);
+            }
+        });
+    });
+    logic.on_watch_stop(|| {
+        app::with_current(|app| {
+            if let Some(id) = app.page_viewer_id() {
+                app.handle_unwatch_peer(id);
+            } else {
+                // No viewer behind the page (it was torn down by a
+                // disconnect, say): just close it.
+                app.main.global::<State>().set_watch_open(false);
+            }
+        });
+    });
 }
 
 // ── Image viewer overlay ────────────────────────────────────────────────

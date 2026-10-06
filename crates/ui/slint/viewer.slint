@@ -1,24 +1,27 @@
-// viewer.slint — the stream viewer window.
+// viewer.slint — the stream viewer.
 //
-// StreamViewerWindow: one per watched peer. The shell pushes each
-// decoded frame as an `image` property (SharedPixelBuffer → Image on
-// the Rust side) — property damage repaints exactly the canvas, no
-// global-redraw concerns.
+// StreamViewerPanel is the whole viewer: picture, name chip, control
+// bar. The desktop wraps one per watched peer in a StreamViewerWindow;
+// single-window hosts (Android, ANDROID-SPEC.md D23) show the panel as
+// a page inside MainWindow instead, bound to State.watch-*. The shell
+// pushes each decoded frame as an `image` property (SharedPixelBuffer
+// → Image on the Rust side) — property damage repaints exactly the
+// canvas, no global-redraw concerns.
 //
-// The picture fills the window. Everything else floats on it and gets
+// The picture fills the surface. Everything else floats on it and gets
 // out of the way like a video player's chrome: a name chip top-left,
 // a control bar bottom-center (speaker = mute toggle, volume, stats,
 // fullscreen, stop), both fading out after a short pointer rest and
-// back on any movement. Double-click or F toggles fullscreen, Escape
-// leaves it, M mutes. (The chat image viewer is an in-window overlay
-// in main.slint.)
+// back on any movement or tap. Double-click or F toggles fullscreen,
+// Escape leaves it, M mutes, Back (Android) stops watching. (The chat
+// image viewer is an in-window overlay in main.slint.)
 
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { Btn, IconBtn, HSlider } from "widgets.slint";
 
-export component StreamViewerWindow inherits Window {
+export component StreamViewerPanel inherits FocusScope {
     in property <string> peer-name;
     in property <image> frame;
     in property <string> stats: "--";
@@ -26,6 +29,204 @@ export component StreamViewerWindow inherits Window {
     /// The last set level: kept while muted, so unmute restores it.
     in-out property <float> volume: 1.0;
     in-out property <bool> fullscreen: false;
+    /// A page in a single window has nothing to go fullscreen into;
+    /// false hides the button and the F / double-click toggles.
+    in property <bool> fullscreen-available: true;
+    callback volume-changed(float);
+    callback mute-toggled(bool);
+    callback stop-watching();
+
+    /// Chrome shows while the pointer moves and for a moment after;
+    /// hovering the bar itself keeps it. On touch, a tap wakes it.
+    property <bool> chrome-shown: true;
+    rest := Timer {
+        interval: 2500ms;
+        running: root.chrome-shown && !bar-hover.has-hover && !chip-hover.has-hover;
+        triggered => { root.chrome-shown = false; }
+    }
+    function wake() {
+        root.chrome-shown = true;
+        rest.restart();
+    }
+    function toggle-mute() {
+        root.stream-muted = !root.stream-muted;
+        root.mute-toggled(root.stream-muted);
+        root.wake();
+    }
+    function toggle-fullscreen() {
+        if (root.fullscreen-available) {
+            root.fullscreen = !root.fullscreen;
+        }
+    }
+
+    key-pressed(ev) => {
+        if (ev.text == Key.Escape && root.fullscreen) {
+            root.fullscreen = false;
+            return accept;
+        }
+        if (ev.text == Key.Back) {
+            // Android's Back button: leave the stream, not the app.
+            root.stop-watching();
+            return accept;
+        }
+        if (ev.text == "f" || ev.text == "F") {
+            root.toggle-fullscreen();
+            return accept;
+        }
+        if (ev.text == "m" || ev.text == "M") {
+            root.toggle-mute();
+            return accept;
+        }
+        reject
+    }
+
+    Image {
+        width: 100%;
+        height: 100%;
+        source: root.frame;
+        image-fit: contain;   // aspect-preserving letterbox
+    }
+
+    // The pointer over the picture: movement (or a tap) wakes the
+    // chrome, a double-click toggles fullscreen. Sits under the chrome,
+    // so the controls still get their clicks.
+    surface := TouchArea {
+        mouse-cursor: root.chrome-shown ? MouseCursor.default : MouseCursor.none;
+        moved => { root.wake(); }
+        clicked => {
+            root.focus();
+            root.wake();
+        }
+        double-clicked => { root.toggle-fullscreen(); }
+        changed has-hover => {
+            if (self.has-hover) { root.wake(); }
+        }
+    }
+
+    // ── Name chip, top-left ─────────────────────────────────────────
+    chip := Rectangle {
+        x: Theme.gap-md;
+        y: Theme.gap-md;
+        width: chip-text.preferred-width + 2 * Theme.gap-md;
+        height: 28px;
+        border-radius: 14px;
+        background: Theme.surface.with-alpha(0.85);
+        opacity: root.chrome-shown ? 1.0 : 0.0;
+        animate opacity { duration: 200ms; }
+        chip-hover := TouchArea { }
+        chip-text := Text {
+            text: root.peer-name;
+            color: Theme.text-primary;
+            font-size: Theme.font-sm;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+
+    // ── Control bar, bottom-center ──────────────────────────────────
+    bar := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - Theme.gap-md;
+        width: Math.min(parent.width - 2 * Theme.gap-md, bar-row.preferred-width);
+        height: 48px;
+        border-radius: Theme.radius-md;
+        background: Theme.surface.with-alpha(0.85);
+        border-width: 1px;
+        border-color: Theme.border.with-alpha(0.6);
+        opacity: root.chrome-shown ? 1.0 : 0.0;
+        animate opacity { duration: 200ms; }
+        bar-hover := TouchArea { }
+        // Every control sits in a full-height wrapper and centers
+        // itself in it: layout children with a fixed height would
+        // otherwise hug the top. The stats column has a fixed
+        // width, so the bar's width — and the buttons' places —
+        // never move with the numbers.
+        bar-row := HorizontalLayout {
+            padding-left: Theme.gap-md;
+            padding-right: Theme.gap-md;
+            spacing: Theme.gap-sm;
+
+            // Speaker: the mute toggle. The glyph says the level.
+            Rectangle {
+                width: 32px;
+                IconBtn {
+                    y: (parent.height - self.height) / 2;
+                    size: 32px;
+                    icon-size: 18px;
+                    icon: root.stream-muted || root.volume <= 0.0 ? IconSet.VolumeX
+                        : root.volume < 0.5 ? IconSet.Volume1
+                        : IconSet.Volume2;
+                    active: root.stream-muted;
+                    active-danger: true;
+                    tooltip: root.stream-muted ? Tr.unmute : Tr.mute;
+                    clicked => { root.toggle-mute(); }
+                }
+            }
+            Rectangle {
+                width: 130px;
+                HSlider {
+                    y: (parent.height - self.height) / 2;
+                    width: 130px;
+                    minimum: 0.0; maximum: 1.0;
+                    value <=> root.volume;
+                    opacity: root.stream-muted ? 0.5 : 1.0;
+                    live-changed(v) => {
+                        // Touching the level while muted unmutes:
+                        // the person wants to hear the new level.
+                        if (root.stream-muted) {
+                            root.stream-muted = false;
+                            root.mute-toggled(false);
+                        }
+                        root.volume-changed(v);
+                        root.wake();
+                    }
+                }
+            }
+            Text {
+                width: 300px;
+                text: root.stats;
+                color: Theme.text-muted;
+                font-size: Theme.font-xs;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+                overflow: elide;
+            }
+            if root.fullscreen-available : Rectangle {
+                width: 32px;
+                IconBtn {
+                    y: (parent.height - self.height) / 2;
+                    size: 32px;
+                    icon-size: 18px;
+                    icon: root.fullscreen ? IconSet.Minimize : IconSet.Maximize;
+                    tooltip: root.fullscreen ? Tr.viewer-exit-fullscreen : Tr.viewer-fullscreen;
+                    clicked => { root.toggle-fullscreen(); }
+                }
+            }
+            Rectangle {
+                width: stop.preferred-width + 2 * Theme.gap-md;
+                stop := Btn {
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width;
+                    height: 32px;
+                    text: Tr.stop-watching;
+                    clicked => { root.stop-watching(); }
+                }
+            }
+        }
+    }
+}
+
+/// One per watched peer on the desktop. Everything is the panel's;
+/// the window adds the OS title, the fullscreen state and the Windows
+/// reveal workaround.
+export component StreamViewerWindow inherits Window {
+    in property <string> peer-name;
+    in property <image> frame;
+    in property <string> stats: "--";
+    in-out property <bool> stream-muted <=> panel.stream-muted;
+    in-out property <float> volume <=> panel.volume;
+    in-out property <bool> fullscreen <=> panel.fullscreen;
     callback volume-changed(float);
     callback mute-toggled(bool);
     callback stop-watching();
@@ -42,178 +243,18 @@ export component StreamViewerWindow inherits Window {
     min-width: 320px;
     min-height: 272px;
 
-    /// Chrome shows while the pointer moves and for a moment after;
-    /// hovering the bar itself keeps it.
-    property <bool> chrome-shown: true;
-    rest := Timer {
-        interval: 2500ms;
-        running: root.chrome-shown && !bar-hover.has-hover && !chip-hover.has-hover;
-        triggered => { root.chrome-shown = false; }
-    }
-    function wake() {
-        root.chrome-shown = true;
-        rest.restart();
-    }
-    function toggle-mute() {
-        root.stream-muted = !root.stream-muted;
-        root.mute-toggled(root.stream-muted);
-        root.wake();
-    }
-
     Rectangle {
         width: 100%;
         height: 100%;
         background: root.repaint-flip ? #FFFFFF01 : transparent;
     }
 
-    keys := FocusScope {
-        key-pressed(ev) => {
-            if (ev.text == Key.Escape && root.fullscreen) {
-                root.fullscreen = false;
-                return accept;
-            }
-            if (ev.text == "f" || ev.text == "F") {
-                root.fullscreen = !root.fullscreen;
-                return accept;
-            }
-            if (ev.text == "m" || ev.text == "M") {
-                root.toggle-mute();
-                return accept;
-            }
-            reject
-        }
-
-        Image {
-            width: 100%;
-            height: 100%;
-            source: root.frame;
-            image-fit: contain;   // aspect-preserving letterbox
-        }
-
-        // The pointer over the picture: movement wakes the chrome, a
-        // double-click toggles fullscreen. Sits under the chrome, so
-        // the controls still get their clicks.
-        surface := TouchArea {
-            mouse-cursor: root.chrome-shown ? MouseCursor.default : MouseCursor.none;
-            moved => { root.wake(); }
-            clicked => { keys.focus(); }
-            double-clicked => { root.fullscreen = !root.fullscreen; }
-            changed has-hover => {
-                if (self.has-hover) { root.wake(); }
-            }
-        }
-
-        // ── Name chip, top-left ─────────────────────────────────────
-        chip := Rectangle {
-            x: Theme.gap-md;
-            y: Theme.gap-md;
-            width: chip-text.preferred-width + 2 * Theme.gap-md;
-            height: 28px;
-            border-radius: 14px;
-            background: Theme.surface.with-alpha(0.85);
-            opacity: root.chrome-shown ? 1.0 : 0.0;
-            animate opacity { duration: 200ms; }
-            chip-hover := TouchArea { }
-            chip-text := Text {
-                text: root.peer-name;
-                color: Theme.text-primary;
-                font-size: Theme.font-sm;
-                font-weight: 600;
-                vertical-alignment: center;
-                horizontal-alignment: center;
-            }
-        }
-
-        // ── Control bar, bottom-center ──────────────────────────────
-        bar := Rectangle {
-            x: (parent.width - self.width) / 2;
-            y: parent.height - self.height - Theme.gap-md;
-            width: Math.min(parent.width - 2 * Theme.gap-md, bar-row.preferred-width);
-            height: 48px;
-            border-radius: Theme.radius-md;
-            background: Theme.surface.with-alpha(0.85);
-            border-width: 1px;
-            border-color: Theme.border.with-alpha(0.6);
-            opacity: root.chrome-shown ? 1.0 : 0.0;
-            animate opacity { duration: 200ms; }
-            bar-hover := TouchArea { }
-            // Every control sits in a full-height wrapper and centers
-            // itself in it: layout children with a fixed height would
-            // otherwise hug the top. The stats column has a fixed
-            // width, so the bar's width — and the buttons' places —
-            // never move with the numbers.
-            bar-row := HorizontalLayout {
-                padding-left: Theme.gap-md;
-                padding-right: Theme.gap-md;
-                spacing: Theme.gap-sm;
-
-                // Speaker: the mute toggle. The glyph says the level.
-                Rectangle {
-                    width: 32px;
-                    IconBtn {
-                        y: (parent.height - self.height) / 2;
-                        size: 32px;
-                        icon-size: 18px;
-                        icon: root.stream-muted || root.volume <= 0.0 ? IconSet.VolumeX
-                            : root.volume < 0.5 ? IconSet.Volume1
-                            : IconSet.Volume2;
-                        active: root.stream-muted;
-                        active-danger: true;
-                        tooltip: root.stream-muted ? Tr.unmute : Tr.mute;
-                        clicked => { root.toggle-mute(); }
-                    }
-                }
-                Rectangle {
-                    width: 130px;
-                    HSlider {
-                        y: (parent.height - self.height) / 2;
-                        width: 130px;
-                        minimum: 0.0; maximum: 1.0;
-                        value <=> root.volume;
-                        opacity: root.stream-muted ? 0.5 : 1.0;
-                        live-changed(v) => {
-                            // Touching the level while muted unmutes:
-                            // the person wants to hear the new level.
-                            if (root.stream-muted) {
-                                root.stream-muted = false;
-                                root.mute-toggled(false);
-                            }
-                            root.volume-changed(v);
-                            root.wake();
-                        }
-                    }
-                }
-                Text {
-                    width: 300px;
-                    text: root.stats;
-                    color: Theme.text-muted;
-                    font-size: Theme.font-xs;
-                    vertical-alignment: center;
-                    horizontal-alignment: left;
-                    overflow: elide;
-                }
-                Rectangle {
-                    width: 32px;
-                    IconBtn {
-                        y: (parent.height - self.height) / 2;
-                        size: 32px;
-                        icon-size: 18px;
-                        icon: root.fullscreen ? IconSet.Minimize : IconSet.Maximize;
-                        tooltip: root.fullscreen ? Tr.viewer-exit-fullscreen : Tr.viewer-fullscreen;
-                        clicked => { root.fullscreen = !root.fullscreen; }
-                    }
-                }
-                Rectangle {
-                    width: stop.preferred-width + 2 * Theme.gap-md;
-                    stop := Btn {
-                        y: (parent.height - self.height) / 2;
-                        width: parent.width;
-                        height: 32px;
-                        text: Tr.stop-watching;
-                        clicked => { root.stop-watching(); }
-                    }
-                }
-            }
-        }
+    panel := StreamViewerPanel {
+        peer-name: root.peer-name;
+        frame: root.frame;
+        stats: root.stats;
+        volume-changed(v) => { root.volume-changed(v); }
+        mute-toggled(m) => { root.mute-toggled(m); }
+        stop-watching => { root.stop-watching(); }
     }
 }

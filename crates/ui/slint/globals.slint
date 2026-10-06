@@ -245,6 +245,25 @@ export global State {
     /// row id; -1 = none). The row's menu and a double-click toggle it.
     in-out property <int> selecting-row: -1;
 
+    // ── Settings as a page (single-window hosts; ANDROID-SPEC.md D22) ──
+    // The desktop opens SettingsWindow; Android shows the same
+    // SettingsPanel inside MainWindow while this is set. The tab is
+    // what SettingsWindow.tab is there (settingsui::TAB_*).
+    in property <bool> settings-open: false;
+    in-out property <int> settings-tab: 0;
+
+    // ── Stream viewer as a page (single-window hosts; ANDROID-SPEC.md D23)
+    // The desktop opens one StreamViewerWindow per watched peer;
+    // Android shows one StreamViewerPanel inside MainWindow while this
+    // is set, fed by viewers::Viewer exactly like a window would be.
+    // One stream at a time: watching another peer replaces it.
+    in property <bool> watch-open: false;
+    in property <string> watch-peer-name;
+    in property <image> watch-frame;
+    in property <string> watch-stats: "--";
+    in-out property <bool> watch-muted: false;
+    in-out property <float> watch-volume: 1.0;
+
     // ── Invite dialog (spec §3.1) ───────────────────────────────────
     // Options are indices into the lists the host fills; the created
     // code shows in the same dialog, with a copy button.
@@ -494,6 +513,11 @@ export global Logic {
     /// The gallery's copy button: the shown picture to the clipboard.
     callback viewer-copy();
     callback viewer-close();
+    /// Stream viewer page (State.watch-*): the panel's controls, which
+    /// the desktop gets as StreamViewerWindow callbacks instead.
+    callback watch-volume-changed(float);
+    callback watch-mute-toggled(bool);
+    callback watch-stop();
     callback gif-hover(int, bool);        // row-id, entering
 
     // Image preview overlay

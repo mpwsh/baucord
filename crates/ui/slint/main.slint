@@ -15,9 +15,9 @@ import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
 import { Btn, IconBtn, Card, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph } from "widgets.slint";
-import { SettingsWindow, SettingsState, SettingsLogic } from "settings.slint";
+import { SettingsWindow, SettingsPanel, SettingsState, SettingsLogic } from "settings.slint";
 import { AdminWindow, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow } from "admin.slint";
-import { StreamViewerWindow } from "viewer.slint";
+import { StreamViewerWindow, StreamViewerPanel } from "viewer.slint";
 
 import { BaucordTray } from "tray.slint";
 
@@ -319,6 +319,42 @@ export component MainWindow inherits Window {
                 root.height - self.height - Theme.gap-sm));
             activated(action, arg) => { Logic.menu-activated(action, arg); }
         }
+    }
+
+    // ── Stream viewer as a page (single-window hosts; ANDROID-SPEC.md D23)
+    // The desktop never sets State.watch-open (it opens a
+    // StreamViewerWindow per peer). Above the main screen, below the
+    // settings page so Settings can be opened over a running stream.
+    if State.watch-open : Rectangle {
+        background: black;
+        TouchArea { }
+        StreamViewerPanel {
+            // Takes the keyboard so Back / M / Escape reach it; the
+            // composer gets it back when the page closes.
+            init => { self.focus(); }
+            peer-name: State.watch-peer-name;
+            frame: State.watch-frame;
+            stats: State.watch-stats;
+            fullscreen-available: false;
+            stream-muted <=> State.watch-muted;
+            volume <=> State.watch-volume;
+            volume-changed(v) => { Logic.watch-volume-changed(v); }
+            mute-toggled(m) => { Logic.watch-mute-toggled(m); }
+            stop-watching => { Logic.watch-stop(); }
+        }
+    }
+
+    // ── Settings as a page (single-window hosts; ANDROID-SPEC.md D22) ──
+    // The desktop never sets State.settings-open (it opens
+    // SettingsWindow), so this is not instantiated there. Above the
+    // main screen and the context menu, below the toast and dialogs.
+    if State.settings-open : Rectangle {
+        background: Theme.bg-primary;
+        // Swallow taps on the page's empty areas so nothing reaches
+        // the roster and chat underneath (the other overlays do the
+        // same with their scrims).
+        TouchArea { }
+        SettingsPanel { tab <=> State.settings-tab; }
     }
 
     // ── Toast (any phase; the connect view also shows it inline) ───

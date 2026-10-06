@@ -363,6 +363,13 @@ pub struct AppState {
     /// admission; capped so a dead server does not spin forever.
     reconnect_attempts: u32,
     stream_stats_timer_active: Arc<AtomicBool>,
+    /// Once-a-second summaries of frames over the latency budget and
+    /// of slow property sets (`video::timing`), replacing per-frame
+    /// warnings; `slow_frame_worst` keeps the worst frame's stage
+    /// split for the summary line.
+    slow_frames: video::timing::SlowFrames,
+    slow_frame_worst: (f32, f32, f32),
+    slow_presents: video::timing::SlowFrames,
     pub meter_timer: slint::Timer,
     /// The single animation ticker driving every playing GIF (chat
     /// rows + the viewer overlay). Runs only while something plays.
@@ -618,6 +625,9 @@ pub fn run() {
         reconnect_timer: slint::Timer::default(),
         reconnect_attempts: 0,
         stream_stats_timer_active: Arc::new(AtomicBool::new(false)),
+        slow_frames: video::timing::SlowFrames::new("Slow frames"),
+        slow_frame_worst: (0.0, 0.0, 0.0),
+        slow_presents: video::timing::SlowFrames::new("Slow present"),
         meter_timer: slint::Timer::default(),
         gif_ticker: slint::Timer::default(),
     }));
@@ -644,6 +654,14 @@ pub fn run() {
 
     wire_logic(&state);
     start_timers(&state);
+    // A single-window host shows Settings as a page in the main window
+    // (ANDROID-SPEC.md D22): its callbacks are wired once here, where
+    // the desktop wires its SettingsWindow when that is first created.
+    if SINGLE_WINDOW_HOST {
+        crate::settingsui::wire_page(&state.borrow().main);
+        // Same for the stream viewer page (D23).
+        crate::viewers::wire_page(&state.borrow().main);
+    }
 
     // "Start in the tray": the window stays hidden until the tray icon
     // shows it (only meaningful when the tray is compiled in).
@@ -814,8 +832,8 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_edit_servers(move || {
         with_app(&w, |app| {
             crate::settingsui::open(app);
-            if let Some(win) = &app.settings_win {
-                win.set_tab(crate::settingsui::TAB_SERVERS);
+            if let Some(sf) = crate::settingsui::surface(app) {
+                sf.set_tab(crate::settingsui::TAB_SERVERS);
             }
         });
     });

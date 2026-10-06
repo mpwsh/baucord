@@ -38,10 +38,12 @@ use audio::{
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{info, warn};
+#[cfg(not(target_os = "android"))]
+use video::codec::FfmpegDecoder;
 use video::{
     buffer::{BufferedPacket, VideoJitterBuffer},
     capture::{CaptureStatus, Capturer},
-    codec::{FfmpegDecoder, FfmpegEncoder},
+    codec::FfmpegEncoder,
     CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
 };
 
@@ -767,6 +769,9 @@ struct PeerStream {
     /// decoded* vs what the sharer sent (compare against the sharer's
     /// `share telemetry` line for the same wall-clock window).
     rx_telemetry: (Instant, u32),
+    /// Once-a-second summary of decodes over budget (was one warning
+    /// per frame, which drowned the log wherever decoding is slow).
+    slow_decodes: video::timing::SlowFrames,
     /// Jitter buffer for this peer's video stream. Holds encoded packets
     /// and releases them in sequence order at a controlled rate.
     jitter_buffer: VideoJitterBuffer,
@@ -983,8 +988,11 @@ fn drain_and_decode(
                     // that's normal and the jitter buffer absorbs it.
                     // Only flag decodes that actually threaten cadence.
                     let slow_threshold = if is_keyframe { 33.0 } else { 15.0 };
-                    if decode_ms > slow_threshold {
-                        log::warn!("Slow decode: {decode_ms:.1}ms for seq {seq}");
+                    if let Some(line) = stream
+                        .slow_decodes
+                        .record(decode_ms, decode_ms > slow_threshold)
+                    {
+                        log::warn!("{line}");
                     }
                     event_tx
                         .send(ScreenEvent::FrameReady {
@@ -1221,6 +1229,7 @@ fn handle_control(
                             frames_dropped_total: 0,
                             decode_us_total: 0,
                             rx_telemetry: (Instant::now(), 0),
+                            slow_decodes: video::timing::SlowFrames::new("Slow decode"),
                         });
                     }
                     Err(e) => {
@@ -1605,12 +1614,26 @@ fn create_encoder(
     }
 }
 
-/// Create the video decoder (`FFmpeg` is currently the only backend).
+/// Create the video decoder: `FFmpeg` on the desktop.
+#[cfg(not(target_os = "android"))]
 fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
     match FfmpegDecoder::new() {
         Ok(dec) => Ok(Box::new(dec)),
         Err(e) => {
             warn!("FFmpeg decoder unavailable: {e}");
+            Err(CodecError::DecoderInit(e.to_string()))
+        }
+    }
+}
+
+/// Create the video decoder: the platform's `MediaCodec` on Android
+/// (ANDROID-SPEC.md D23). It configures itself on the first keyframe.
+#[cfg(target_os = "android")]
+fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
+    match video::mediacodec::MediaCodecDecoder::new() {
+        Ok(dec) => Ok(Box::new(dec)),
+        Err(e) => {
+            warn!("MediaCodec decoder unavailable: {e}");
             Err(CodecError::DecoderInit(e.to_string()))
         }
     }

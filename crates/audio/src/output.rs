@@ -6,7 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -39,6 +39,13 @@ use crate::{
 /// and the frame stay decoupled.
 const HOP: usize = 480;
 
+/// Ring fill the worker keeps ahead of the device when callbacks are
+/// small (≤ 10 ms): two desktop periods of cushion.
+const BASE_FILL_MS: usize = 20;
+/// What the worker keeps beyond one callback when callbacks are large:
+/// the time it has to wake up and refill after each one.
+const REFILL_MARGIN_MS: usize = 10;
+
 /// Largest single playback callback we serve from the scratch buffer.
 /// Anything bigger is served in pieces (never happens with a 10–20 ms
 /// device period, but cpal does not promise one).
@@ -67,6 +74,10 @@ pub struct AudioOutput {
     /// Wake latch: playback callback → worker ("ring space freed").
     wake_tx: Option<Sender<()>>,
     wake_rx: Option<Receiver<()>>,
+    /// Largest playback callback seen, in device frames (0 = none yet,
+    /// or a backend that does not report — the native WASAPI render).
+    /// The worker sizes its ring fill and the jitter floor from it.
+    callback_frames: Arc<AtomicUsize>,
 
     // Worker
     worker_thread: Option<thread::JoinHandle<()>>,
@@ -142,6 +153,7 @@ impl AudioOutput {
             ring_capacity: ring_size,
             wake_tx: Some(wake_tx),
             wake_rx: Some(wake_rx),
+            callback_frames: Arc::new(AtomicUsize::new(0)),
             worker_thread: None,
             should_stop: Arc::new(AtomicBool::new(false)),
             peer_settings,
@@ -271,6 +283,7 @@ impl AudioOutput {
                 loopback_rx,
                 sound_rx,
                 wake_rx,
+                callback_frames: self.callback_frames.clone(),
                 peer_settings: self.peer_settings.clone(),
                 removed_peers: self.removed_peers.clone(),
                 stats: self.stats.clone(),
@@ -311,6 +324,8 @@ impl AudioOutput {
         let stats = self.stats.clone();
         let stats_err = self.stats.clone();
         let ch = channels as usize;
+        let callback_frames = self.callback_frames.clone();
+        let mut largest_callback = 0usize;
         // Allocated once, outside the callback.
         let mut mono = vec![0.0f32; CALLBACK_SCRATCH];
         // cpal's render thread runs our callback; promote it on first entry.
@@ -328,6 +343,13 @@ impl AudioOutput {
                 let mut rms_acc = 0.0f32;
                 let mut frames_done = 0usize;
                 let frames_total = data.len() / ch;
+                // The worker must keep at least this much queued; tell
+                // it when the device starts asking for more (AAudio
+                // picks its own callback size, and may vary it).
+                if frames_total > largest_callback {
+                    largest_callback = frames_total;
+                    callback_frames.store(frames_total, Ordering::Relaxed);
+                }
 
                 while frames_done < frames_total {
                     let want = (frames_total - frames_done).min(mono.len());
@@ -411,6 +433,7 @@ struct WorkerParts {
     loopback_rx: Receiver<PcmFrame>,
     sound_rx: Receiver<SoundType>,
     wake_rx: Receiver<()>,
+    callback_frames: Arc<AtomicUsize>,
     peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
     removed_peers: Arc<Mutex<HashSet<u64>>>,
     stats: Arc<AudioStats>,
@@ -429,6 +452,7 @@ fn worker_loop(parts: WorkerParts) {
         loopback_rx,
         sound_rx,
         wake_rx,
+        callback_frames,
         peer_settings,
         removed_peers,
         stats,
@@ -467,14 +491,18 @@ fn worker_loop(parts: WorkerParts) {
     }
 
     let high_wm = ring_capacity * 85 / 100;
+    // Ring fill to keep ahead of the device, and how many hops one pass
+    // may produce; both follow the callback size (see `Cushion`).
+    let mut cushion = Cushion::for_callback(0, device_sample_rate, high_wm);
+    let mut known_callback = 0usize;
     let mut hop_buf = vec![0.0f32; HOP];
     let mut resample_accum: Vec<f32> = Vec::with_capacity(2048);
     let mut output_limiter = Limiter::new();
     let mut next_tick = Instant::now();
 
     // Audio-class scheduling: MMCSS "Pro Audio" on Windows, real-time
-    // policy on macOS/Linux. This thread now decodes every peer, so it
-    // needs the priority more than it used to.
+    // policy on macOS/Linux, nice −16 on Android. This thread now
+    // decodes every peer, so it needs the priority more than it used to.
     #[allow(clippy::cast_possible_truncation)]
     let _rt = crate::platform::promote_current_thread(HOP as u32, OPUS_SAMPLE_RATE);
 
@@ -503,17 +531,29 @@ fn worker_loop(parts: WorkerParts) {
         // By filling multiple hops per tick when the ring is low, we
         // absorb OS scheduler jitter and clock drift without underruns.
         //
-        // Target: 20ms of audio in the ring at device sample rate — two
-        // device periods of cushion with event-driven wakeups. Shrink
-        // further only after output_underruns stays flat in the field.
-        let target_fill = (device_sample_rate as usize * 20) / 1000;
-        let max_hops_per_tick = 6; // cap to stay responsive
+        // The target follows the device's callback size: 20 ms (two
+        // desktop periods) while callbacks are ≤ 10 ms, one callback +
+        // 10 ms beyond that. A fixed 20 ms against Android's 40 ms
+        // callbacks left every callback half silence (2026-10-05).
+        let seen = callback_frames.load(Ordering::Relaxed);
+        if seen != known_callback {
+            known_callback = seen;
+            cushion = Cushion::for_callback(seen, device_sample_rate, high_wm);
+            jitter_buffer.set_pull_burst(cushion.burst_48k, HOP);
+            let ms = |frames: usize| frames as f32 * 1000.0 / device_sample_rate as f32;
+            info!(
+                "Output callbacks of {seen} frames ({:.1} ms): keeping {:.1} ms queued, jitter floor {:.1} ms",
+                ms(seen),
+                ms(cushion.target_fill),
+                jitter_buffer.min_target_ms(),
+            );
+        }
 
         let t_hop = Instant::now();
-        for _ in 0..max_hops_per_tick {
+        for _ in 0..cushion.max_hops {
             // Stop if ring is sufficiently full
             let current_fill = ring_capacity - ring_producer.slots();
-            if current_fill >= target_fill || current_fill >= high_wm {
+            if current_fill >= cushion.target_fill || current_fill >= high_wm {
                 break;
             }
 
@@ -667,6 +707,35 @@ fn worker_loop(parts: WorkerParts) {
     debug!("Output worker stopped");
 }
 
+/// How far ahead of the device the worker keeps the ring, for a given
+/// playback callback size. Pure arithmetic, tested below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cushion {
+    /// Ring fill target, device frames.
+    target_fill: usize,
+    /// Hops one refill pass may produce (enough to refill a whole
+    /// callback in one wake, plus one).
+    max_hops: usize,
+    /// One callback in 48 kHz samples — the jitter buffer's pull burst.
+    burst_48k: usize,
+}
+
+impl Cushion {
+    /// `callback` in device frames (0 = unknown: the desktop default).
+    fn for_callback(callback: usize, device_rate: u32, high_wm: usize) -> Self {
+        let rate = device_rate as usize;
+        let base = rate * BASE_FILL_MS / 1000;
+        let with_margin = callback + rate * REFILL_MARGIN_MS / 1000;
+        let target_fill = base.max(with_margin).min(high_wm);
+        let target_48k = target_fill * OPUS_SAMPLE_RATE as usize / rate.max(1);
+        Self {
+            target_fill,
+            max_hops: (target_48k.div_ceil(HOP) + 1).max(6),
+            burst_48k: callback * OPUS_SAMPLE_RATE as usize / rate.max(1),
+        }
+    }
+}
+
 impl Drop for AudioOutput {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Relaxed);
@@ -679,5 +748,44 @@ impl Drop for AudioOutput {
         if let Some(thread) = self.worker_thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HIGH_WM: usize = 9600 * 85 / 100;
+
+    #[test]
+    fn desktop_periods_keep_the_old_cushion() {
+        // Unknown, 10 ms and a hair over: 20 ms, six hops, as before.
+        for cb in [0, 480] {
+            let c = Cushion::for_callback(cb, 48_000, HIGH_WM);
+            assert_eq!(c.target_fill, 960, "callback {cb}");
+            assert_eq!(c.max_hops, 6);
+        }
+        assert_eq!(Cushion::for_callback(512, 48_000, HIGH_WM).target_fill, 992);
+    }
+
+    #[test]
+    fn large_callbacks_get_one_callback_plus_margin() {
+        // Android AAudio, normal mode: 40 ms callbacks.
+        let c = Cushion::for_callback(1920, 48_000, HIGH_WM);
+        assert_eq!(c.target_fill, 1920 + 480);
+        assert!(
+            c.max_hops * HOP >= 1920,
+            "one pass refills a whole callback"
+        );
+        assert_eq!(c.burst_48k, 1920);
+        // 44.1 kHz device: burst converted to the jitter buffer's rate.
+        let c = Cushion::for_callback(1764, 44_100, HIGH_WM);
+        assert_eq!(c.burst_48k, 1920);
+    }
+
+    #[test]
+    fn never_past_the_high_watermark() {
+        let c = Cushion::for_callback(48_000, 48_000, HIGH_WM);
+        assert_eq!(c.target_fill, HIGH_WM);
     }
 }

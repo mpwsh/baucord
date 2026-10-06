@@ -973,6 +973,97 @@ component CreditsPanel inherits VerticalLayout {
 
 // ── Window ──────────────────────────────────────────────────────────────
 
+// The settings UI itself: nav, the tab panels, the button row. The
+// desktop wraps it in `SettingsWindow`; a single-window host (Android,
+// ANDROID-SPEC.md D22) shows it as a page inside `MainWindow`
+// (`State.settings-open`). Same globals either way, so
+// `settingsui.rs` drives both through one `SettingsSurface`.
+export component SettingsPanel inherits FocusScope {
+    /// 0 profile, 1 general, 2 audio, 3 sounds, 4 keyboard, 5 servers,
+    /// 6 credits, 7 about. Mirrored by `settingsui::TAB_*`.
+    in-out property <int> tab: 0;
+
+    public function focus-capture() { root.focus(); }
+
+    // While a keybind is recording, swallow everything here —
+    // Escape cancels, Backspace clears, anything else is the new
+    // bind. Outside recording, keys flow normally.
+    capture-key-pressed(ev) => {
+        if (!SettingsState.capturing) { return reject; }
+        if (ev.text == Key.Escape) { SettingsLogic.capture-cancel(); return accept; }
+        if (ev.text == Key.Backspace) { SettingsLogic.capture-clear(); return accept; }
+        SettingsLogic.capture-key(ev.text, ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
+        accept
+    }
+
+    HorizontalLayout {
+        // Nav
+        Rectangle {
+            width: 188px;
+            background: Theme.surface;
+            VerticalLayout {
+                padding: Theme.gap-md;
+                spacing: Theme.gap-xs;
+                // Indices are mirrored by `settingsui::TAB_*`.
+                NavItem { text: Tr.tab-profile;   icon: IconSet.UserRound;         active: root.tab == 0; clicked => { root.tab = 0; } }
+                NavItem { text: Tr.tab-general;   icon: IconSet.SlidersHorizontal; active: root.tab == 1; clicked => { root.tab = 1; } }
+                NavItem { text: Tr.tab-audio;     icon: IconSet.Volume2;           active: root.tab == 2; clicked => { root.tab = 2; } }
+                NavItem { text: Tr.sounds-header; icon: IconSet.Bell;              active: root.tab == 3; clicked => { root.tab = 3; } }
+                NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard;          active: root.tab == 4; clicked => { root.tab = 4; } }
+                NavItem { text: Tr.tab-servers;   icon: IconSet.Server;            active: root.tab == 5; clicked => { root.tab = 5; } }
+                Rectangle { }
+                NavItem { text: Tr.tab-credits;   icon: IconSet.Heart;             active: root.tab == 6; clicked => { root.tab = 6; } }
+                NavItem { text: Tr.tab-about;     icon: IconSet.Info;              active: root.tab == 7; clicked => { root.tab = 7; } }
+            }
+        }
+        // Content + button row
+        VerticalLayout {
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding: Theme.gap-xl;
+                    // Readable measure: the content column stops
+                    // growing past ~560px on a wide window.
+                    HorizontalLayout {
+                        VerticalLayout {
+                            max-width: 560px;
+                            horizontal-stretch: 100;
+                            if root.tab == 0 : ProfilePanel { }
+                            if root.tab == 1 : GeneralPanel { }
+                            if root.tab == 2 : AudioPanel { }
+                            if root.tab == 3 : SoundsPanel { }
+                            if root.tab == 4 : KeyboardPanel { }
+                            if root.tab == 5 : ServersPanel { }
+                            if root.tab == 6 : CreditsPanel { }
+                            if root.tab == 7 : AboutPanel { }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+            }
+            Rectangle {
+                height: 64px;
+                background: Theme.bg-primary;
+                Rectangle { y: 0; height: 1px; width: 100%; background: Theme.border; }
+                HorizontalLayout {
+                    padding: Theme.gap-md;
+                    spacing: Theme.gap-sm;
+                    Rectangle { }
+                    Btn {
+                        text: Tr.reset-defaults;
+                        clicked => { SettingsLogic.reset-defaults(); }
+                    }
+                    Btn {
+                        text: Tr.save-and-close;
+                        accent: true;
+                        clicked => { SettingsLogic.save-and-close(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component SettingsWindow inherits Window {
     title: Tr.settings-title;
     background: Theme.bg-primary;
@@ -981,9 +1072,7 @@ export component SettingsWindow inherits Window {
     min-width: 680px;
     min-height: 580px;
 
-    /// 0 profile, 1 general, 2 audio, 3 keyboard, 4 servers,
-    /// 5 credits, 6 about.
-    in-out property <int> tab: 0;
+    in-out property <int> tab <=> panel.tab;
 
     // Same Windows minimize→restore workaround as MainWindow: the OS
     // clears the surface while damage tracking trusts the back buffer;
@@ -995,87 +1084,9 @@ export component SettingsWindow inherits Window {
         background: root.repaint-flip ? #FFFFFF01 : transparent;
     }
 
-    public function focus-capture() { keys.focus(); }
+    public function focus-capture() { panel.focus-capture(); }
 
-    keys := FocusScope {
-        // While a keybind is recording, swallow everything here —
-        // Escape cancels, Backspace clears, anything else is the new
-        // bind. Outside recording, keys flow normally.
-        capture-key-pressed(ev) => {
-            if (!SettingsState.capturing) { return reject; }
-            if (ev.text == Key.Escape) { SettingsLogic.capture-cancel(); return accept; }
-            if (ev.text == Key.Backspace) { SettingsLogic.capture-clear(); return accept; }
-            SettingsLogic.capture-key(ev.text, ev.modifiers.control, ev.modifiers.alt, ev.modifiers.shift);
-            accept
-        }
-
-        HorizontalLayout {
-            // Nav
-            Rectangle {
-                width: 188px;
-                background: Theme.surface;
-                VerticalLayout {
-                    padding: Theme.gap-md;
-                    spacing: Theme.gap-xs;
-                    // Indices are mirrored by `settingsui::TAB_*`.
-                    NavItem { text: Tr.tab-profile;   icon: IconSet.UserRound;         active: root.tab == 0; clicked => { root.tab = 0; } }
-                    NavItem { text: Tr.tab-general;   icon: IconSet.SlidersHorizontal; active: root.tab == 1; clicked => { root.tab = 1; } }
-                    NavItem { text: Tr.tab-audio;     icon: IconSet.Volume2;           active: root.tab == 2; clicked => { root.tab = 2; } }
-                    NavItem { text: Tr.sounds-header; icon: IconSet.Bell;              active: root.tab == 3; clicked => { root.tab = 3; } }
-                    NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard;          active: root.tab == 4; clicked => { root.tab = 4; } }
-                    NavItem { text: Tr.tab-servers;   icon: IconSet.Server;            active: root.tab == 5; clicked => { root.tab = 5; } }
-                    Rectangle { }
-                    NavItem { text: Tr.tab-credits;   icon: IconSet.Heart;             active: root.tab == 6; clicked => { root.tab = 6; } }
-                    NavItem { text: Tr.tab-about;     icon: IconSet.Info;              active: root.tab == 7; clicked => { root.tab = 7; } }
-                }
-            }
-            // Content + button row
-            VerticalLayout {
-                ScrollView {
-                    vertical-stretch: 1;
-                    VerticalLayout {
-                        padding: Theme.gap-xl;
-                        // Readable measure: the content column stops
-                        // growing past ~560px on a wide window.
-                        HorizontalLayout {
-                            VerticalLayout {
-                                max-width: 560px;
-                                horizontal-stretch: 100;
-                                if root.tab == 0 : ProfilePanel { }
-                                if root.tab == 1 : GeneralPanel { }
-                                if root.tab == 2 : AudioPanel { }
-                                if root.tab == 3 : SoundsPanel { }
-                                if root.tab == 4 : KeyboardPanel { }
-                                if root.tab == 5 : ServersPanel { }
-                                if root.tab == 6 : CreditsPanel { }
-                                if root.tab == 7 : AboutPanel { }
-                            }
-                            Rectangle { horizontal-stretch: 1; }
-                        }
-                    }
-                }
-                Rectangle {
-                    height: 64px;
-                    background: Theme.bg-primary;
-                    Rectangle { y: 0; height: 1px; width: 100%; background: Theme.border; }
-                    HorizontalLayout {
-                        padding: Theme.gap-md;
-                        spacing: Theme.gap-sm;
-                        Rectangle { }
-                        Btn {
-                            text: Tr.reset-defaults;
-                            clicked => { SettingsLogic.reset-defaults(); }
-                        }
-                        Btn {
-                            text: Tr.save-and-close;
-                            accent: true;
-                            clicked => { SettingsLogic.save-and-close(); }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    panel := SettingsPanel { }
 }
 
 // Shared with the admin window (admin.slint).

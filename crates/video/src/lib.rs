@@ -31,6 +31,15 @@ pub mod codec;
 #[path = "codec_stub.rs"]
 pub mod codec;
 
+// Android decodes with the platform's MediaCodec instead (the stub
+// above still provides the encoder, which Android does not have yet).
+// `yuv` is its plane-to-RGBA step, platform-free so it is tested
+// everywhere.
+#[cfg(target_os = "android")]
+pub mod mediacodec;
+pub mod timing;
+pub mod yuv;
+
 /// Quality preset for screen sharing.
 ///
 /// Each variant encodes a resolution *bound*, frame rate, and target

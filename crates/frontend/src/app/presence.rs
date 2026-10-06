@@ -562,7 +562,7 @@ impl AppState {
             win.global::<ui::Theme>().set_scale(scale);
         }
         for viewer in self.viewers.values() {
-            viewer.win.global::<ui::Theme>().set_scale(scale);
+            viewer.apply_text_scale(scale);
         }
     }
 

@@ -21,7 +21,20 @@ Android target) — check with `which cargo` first. When it is there:
 (`ui` compiles the `.slint` files, which is a free `--check`; it wants
 a placeholder `assets/icons/icon.png`); anything depending on `video`
 (`client`, `frontend`, `desktop`, `android`) fails at `ffmpeg-sys` /
-`pipewire-sys` for lack of system headers — not a code problem. The
+`pipewire-sys` for lack of system headers — not a code problem. **But
+`apt-get` reaches the Ubuntu archive** (found 2026-10-05; the Docker
+repo 403s, ignore it): `apt-get update && apt-get install -y
+libasound2-dev libavcodec-dev libavformat-dev libavutil-dev
+libswscale-dev libavfilter-dev libswresample-dev libavdevice-dev clang
+libclang-dev libwayland-dev libxcb1-dev libxcb-randr0-dev
+libxcb-shm0-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev
+libspa-0.2-dev libegl-dev libgbm-dev libxkbcommon-dev libfontconfig-dev
+libxi-dev libx11-xcb-dev libxcursor-dev libssl-dev libudev-dev`, plus
+placeholder `assets/sounds/{join,leave}.wav` (any short WAV; `audio`
+`include_bytes!`es them), and `cargo check -p client -p frontend -p
+desktop`, `cargo test -p audio -p video` and clippy all run on the
+host (Ubuntu's FFmpeg 6.1 builds `ffmpeg-next` 8). The Android target
+itself still cannot be installed. The
 root `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` joined the
 upload set on 2026-10-05: **ask for them with every `crates.tar.gz`**
 (the lock is what makes a resolution here match the user's; drop
@@ -98,7 +111,14 @@ cargo run -p desktop        # and -- --profile bob for a second instance
 ```
 
 and pastes the first `error:` with its `-->` location. One or two
-compiler rounds per step is normal. Edit scripts must assert their
+compiler rounds per step is normal. **Unpack with `tar -xzf … -m`**
+(Windows' built-in tar has it): `-m` stamps the files with the
+extraction time instead of the sandbox's older mtimes. Without it,
+cargo's mtime-based rerun check skips the Slint build script, `ui`
+does not rebuild, and `frontend` fails with "no method named
+`set_<new property>`" (2026-10-05). `cargo clean -p ui` alone does
+not help for Android — it cleans only the host target; touching
+`crates/ui/slint/*.slint` does. Edit scripts must assert their
 anchors (`assert old in s`): a silent miss once shipped a function
 that did not exist, and once left a script's changes unwritten.
 
@@ -309,6 +329,53 @@ Memory-mode servers (persistence off) still use the legacy
 - Nothing in the app layer knew the negotiated feature set until the
   lobby; `NetworkMessage::Connected { lobby }` is the pattern for the
   next bit a client must gate on (add a field, not a new message).
+- Settings code talks to `settingsui::surface(app)` (an enum over
+  the desktop `SettingsWindow` and Android's in-window page), never
+  to `app.settings_win` directly — the field is the desktop window's
+  storage only. The page is wired once in `app::run`; the window when
+  first created. The stream viewer is the same shape: `viewers::Viewer`
+  owns a private `Surface::{Window, Page}` and the rest of the app
+  only calls its methods (`raise`, `update_frame`, `close`,
+  `apply_text_scale`) — never a `.win`. Anything that opens its own
+  `Window` on the desktop gets a `*Panel` component + `State.*-open`
+  page on Android (ANDROID-SPEC.md D22/D23); that is the pattern for
+  the admin panel too.
+- **`VideoDecoder::flush()` is advisory.** The client calls it before
+  every IDR; FFmpeg honours it (cheap), MediaCodec deliberately does
+  not (it would discard the pipeline's pictures every 2 s, see
+  `video/src/mediacodec.rs`). Don't make a decoder's correctness
+  depend on it — an IDR resets reference state on its own.
+- **A playback cushion is sized from the device's callback, never as
+  a fixed number of ms.** 20 ms ahead was two periods of a 10 ms
+  desktop device and half of one 40 ms AAudio callback — every Android
+  callback came out half silence (D24). The tell in any log: an
+  `Underruns` count that climbs at a steady rate (~one per callback)
+  with `Lost 0`. `output::Cushion` does the arithmetic; the worker
+  logs `Output callbacks of N frames …` once per size it sees.
+- **Read a steady counter as a rate before blaming the platform.** The
+  emulator's `Underruns 162` in 6 s was 27/s — one per callback — and
+  was first written off as the emulator's audio clock. Divide by the
+  time and compare with the callback period first.
+- **No per-frame `warn!`.** A timing alarm that fires once a frame is
+  60 lines a second on any machine slower than the one it was tuned
+  on (the emulator: 652 of 729 logcat lines). Feed the measurement to
+  a `video::timing::SlowFrames` and log the line it returns once a
+  second (count over budget / total, worst, average) — `Slow decode`,
+  `Slow frames`, `Slow present` all do this now.
+- The platform-free half of a platform feature goes in its own module
+  with host tests (`video::yuv` for MediaCodec's planes → RGBA): it is
+  the only part the assistant can run here, and `rustc --test` on the
+  single file beats waiting for the phone. The Android-only half can
+  be type-checked on the host against a signature-only stub of the
+  `ndk` API (a scratch crate named `ndk` with the same method
+  signatures, `unimplemented!()` bodies) — that caught nothing this
+  time but costs a minute, and the real build takes ten.
+- **PowerShell scripts for the user are ASCII-only and saved with a
+  UTF-8 BOM (CRLF).** Windows PowerShell 5.1 reads a BOM-less file as
+  the ANSI code page; a UTF-8 em dash becomes `â€”`, and that `”` is
+  a legal double quote to the PowerShell lexer — the string closed
+  early and the rest of the message ran as a command (`run.ps1`,
+  2026-10-05: "The term 'drop' is not recognized").
 - A menu action lives in **three** places: `app-core::menu::Action`,
   the Slint `MenuAction` enum in `globals.slint` (append only — its
   ordinal crosses the bridge), and both conversions in
@@ -812,7 +879,24 @@ cpal's AAudio host carries playback unchanged. Chat pane overflows portrait
 locale right, 321 MB) with no audio: the client dropped the engine on
 a capture-only failure and the engine never retried an unopened
 input — both fixed (spec §14); the phone's actual device error is
-the next logcat. Next: audio on the phone, then the mobile root.** What follows is the M0 record: `crates/android` runs the real
+the next logcat. Settings on Android is now a page in the main window (`SettingsPanel`
++ `State.settings-open`, `settingsui::SettingsSurface`; D22), and
+voice works on the emulator with the host microphone (run.ps1 starts
+the AVD with `-allow-host-audio`). **Stream viewing landed 2026-10-06
+(D23, untested on a device as of writing): `video::mediacodec` decodes
+H.264 through `AMediaCodec` to byte buffers, `video::yuv` converts the
+planes (8 host tests), `client::screen::create_decoder()` is
+cfg-split, and `viewer.slint`'s `StreamViewerPanel` shows as a page
+under `State.watch-open` through `viewers::Viewer`'s `Surface` enum.
+Stream viewing confirmed on the emulator and the phone the same night.
+Voice then broke up on the phone: the 20 ms playback cushion vs
+AAudio's 20–40 ms callbacks (D24), fixed with a callback-sized cushion,
+a jitter floor for burst pulls and nice −16 audio workers; awaiting
+the phone's `Output callbacks of …` line and `Underruns` rate.
+First device run: watch for `MediaCodec c2.… : decoding video/avc`,
+`MediaCodec output layout: …` and `first picture WxH` in logcat; a
+`ColorConversion` error names the layout it could not read.** Next:
+audio on the phone, then the mobile root.** What follows is the M0 record: `crates/android` runs the real
 `frontend::app::run()` on Slint's Android backend (D10) with a `hello`
 feature for the toolchain alone; the `android/` Gradle project runs
 cargo-ndk from `preDebugBuild`/`preReleaseBuild`; `frontend` got
@@ -836,8 +920,8 @@ cargo-ndk's `ANDROID_PLATFORM=29` read by `android-build` as the SDK
 platform; the Gradle tasks set `ANDROID_JAR` now (spec §14). Record Skia prebuilt / first-build
 time / AAudio outcome in ANDROID-SPEC.md §14. Then M1 is mostly done
 already (the split shipped as 1.1.6); next is M2 (the mobile `.slint`
-root behind `ui/mobile`) with the viewer as an in-window overlay and
-MediaCodec decode (D19) when stream viewing is wanted.
+root behind `ui/mobile`); the viewer page and MediaCodec decode (D19,
+D23) came first.
 
 ## 6. Rough edges (known, not urgent)
 

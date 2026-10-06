@@ -26,6 +26,14 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
 ] }
 
+# Android decodes through the platform's MediaCodec (src/mediacodec.rs,
+# ANDROID-SPEC.md D23): `media` is the AMediaCodec/AMediaFormat
+# binding (links libmediandk), `api-level-29` (= minSdk) unlocks the
+# per-buffer format and crop-rect accessors it uses. Defaults off: the
+# raw-window-handle glue is the Slint backend's business.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", default-features = false, features = ["media", "api-level-29"] }
+
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 #xcap = { git = "https://github.com/nashaofu/xcap" }
 xcap = "0.9.8"

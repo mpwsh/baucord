@@ -579,6 +579,16 @@ impl AppState {
         self.update_user_list();
     }
 
+    /// The peer whose stream the main window's viewer page shows
+    /// (single-window hosts, ANDROID-SPEC.md D23); `None` on the
+    /// desktop, where viewers are windows.
+    pub(crate) fn page_viewer_id(&self) -> Option<u64> {
+        self.viewers
+            .iter()
+            .find(|(_, v)| v.is_page())
+            .map(|(id, _)| *id)
+    }
+
     pub(super) fn handle_watch_peer(&mut self, client_id: u64) {
         if self.viewers.contains_key(&client_id) {
             // Already watching: bring the viewer forward, on the event
@@ -587,7 +597,7 @@ impl AppState {
             let _ = slint::invoke_from_event_loop(move || {
                 with_current(move |app| {
                     if let Some(viewer) = app.viewers.get(&client_id) {
-                        let _ = viewer.win.show();
+                        viewer.raise();
                     }
                 });
             });
@@ -611,12 +621,21 @@ impl AppState {
                 if app.viewers.contains_key(&client_id) {
                     return;
                 }
+                // One page, one stream: on a single-window host the
+                // new stream replaces whatever was being watched.
+                if super::SINGLE_WINDOW_HOST {
+                    let others: Vec<u64> = app.viewers.keys().copied().collect();
+                    for other in others {
+                        app.handle_unwatch_peer(other);
+                    }
+                }
                 match Viewer::open(
                     client_id,
                     &username,
                     share_w,
                     share_h,
                     app.settings.ui.text_scale,
+                    &app.main,
                 ) {
                     Ok(viewer) => {
                         app.viewers.insert(client_id, viewer);

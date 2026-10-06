@@ -496,9 +496,9 @@ voice: channel name, mute, deafen, route, leave.
 | chat, history paging, unread, images inline, context menu | same (long-press opens the menu) |
 | files, GIF picker, drag/paste | images only; the rest greyed with a tooltip string |
 | voice: join, mute, deafen, per-user volume, device pickers | same, route control instead of pickers |
-| settings window | Settings page: nickname, profile, voice activation threshold, noise suppression, language, log level |
+| settings window | Settings page — the desktop panel as a full-window page (D22, done); the phone subset and the route control come with the mobile root |
 | admin panel, slash commands | slash commands only |
-| share, viewers | absent (not stubbed in the UI) |
+| share, viewers | **viewing** works: the desktop viewer panel as a full-window page, decoded by MediaCodec (D23); sharing from the phone is absent (no encoder, not stubbed in the UI) |
 | tray, keybinds, updater, single instance | absent; the foreground notification is the tray |
 
 ## 10. The JNI surface and the Kotlin that remains
@@ -568,6 +568,11 @@ adb logcat -s baucord            # logcat; baucord.log is in the app's files dir
 adb shell run-as dev.baucord cat files/baucord.log   # debug builds only
 ```
 
+`android/run.ps1` (or `run.cmd`) chains all of this — build, start the
+AVD if needed, wait for boot, install, launch, `logcat` — with
+`-Device`, `-Release`, `-Hello`, `-Avd`, `-NoBuild` switches: the
+`cargo run` of the Android host.
+
 `cargoTargets` and `cargoFeatures` default in `android/gradle.properties`.
 Until the permission request lands on the first voice join, a build
 whose dialog was dismissed can be fixed with
@@ -600,8 +605,10 @@ check is there to catch a regression.
 | M4 | resilience + settings: network change rebind, reconnect, Settings page, notifications for DMs in voice | Wi-Fi → cellular mid-call recovers under 10 s |
 | M5 | release: signing, `versionCode`, README section, the guide's Android rules | the three Movistar users run it for a week |
 
-Later (v2 candidates, in rough order): viewing shares (MediaCodec H.264
-decode), file cards with Save, `ConnectivityManager` callback, Leave
+Viewing shares (MediaCodec H.264 decode) was pulled forward at the
+user's request and landed on 2026-10-06 (D23) ahead of M2–M3.
+
+Later (v2 candidates, in rough order): file cards with Save, `ConnectivityManager` callback, Leave
 action from the notification, tablet layout, in-app APK update,
 Bluetooth SCO on API 29–30, push-to-talk on hardware buttons.
 
@@ -640,12 +647,15 @@ cpal 0.18.2 uses it, cargo-ndk 4.1.2, android_logger 0.15.1). Decisions:
 | D13 | **No Kotlin in M0–M2**: the Gradle module has no Kotlin plugin and no source; `VoiceService.kt` arrives with M3 and the `kotlin-android` plugin with it | one fewer version to pin and one fewer thing to break on the first build |
 | D14 | The `ui` crate's `mobile` feature (§5.3) is deferred to M2 with the mobile root itself | a placeholder root re-exporting the desktop one adds a feature with no behaviour |
 | D15 | `RECORD_AUDIO` is requested at startup for now; M3 moves it to the first voice join (§4.4) | one fewer step to test voice on the emulator |
-| D16 | The auxiliary windows (Settings, admin panel, stream viewer) are refused on Android with a toast (`host-single-window`, in the three catalogs) via `frontend::app::SINGLE_WINDOW_HOST` | the backend hands every `Window` the same adapter; opening a second one would collide with the main window. Settings becomes a page in M2; the viewer an in-window overlay when stream viewing comes |
+| D16 | The auxiliary windows (Settings, admin panel, stream viewer) are refused on Android with a toast (`host-single-window`, in the three catalogs) via `frontend::app::SINGLE_WINDOW_HOST` | the backend hands every `Window` the same adapter; opening a second one would collide with the main window. Settings became a page (D22), the stream viewer too (D23); the toast now covers only the admin panel |
 | D17 | JNI lives in `crates/android/src/java.rs` (not `jni.rs`) | a module named like the crate it uses invites path ambiguity |
 | D18 | Versions pinned by the Gradle project: Gradle 8.14.3 (wrapper, verified to exist), AGP 8.13.0 (from memory — Studio's upgrade assistant corrects it if wrong), compileSdk/targetSdk 36, minSdk 29 | the last 8.x pair; AGP 9 needs Gradle 9 and a Kotlin-DSL migration nobody needs yet |
+| D22 | **Settings is a page inside the main window on Android** (2026-10-05): `settings.slint`'s body became `SettingsPanel`, which `SettingsWindow` wraps on desktop and `MainWindow` shows under `if State.settings-open`; `settingsui.rs` drives either through one `SettingsSurface` enum (`surface(app)`: the window when it exists, the page always), wired at startup by `app::run` on a single-window host. The D16 toast now covers only the admin panel and the stream viewer | the same `.slint` and host code on both hosts; the viewer page (D23) follows the same pattern |
 | D21 | **CI builds Android only on a published GitHub Release** (`android-release.yml`: signed arm64 APK attached to the release; secrets for the keystore; `workflow_dispatch` as a dry run). No push/PR build — testing is local, and the desktop `release.yml` stays desktop-only | the user's call on 2026-10-05: the release workflow holds release things, and a PR build buys nothing while one person builds locally |
 | D20 | `Cargo.lock` ships with the Android entries already resolved (android-activity 0.6.1, i-slint-backend-android-activity 1.17.1, android_logger 0.15.1, ndk-context 0.1.1; jni 0.22.4 and ndk 0.9.0 were already locked through cpal) | the first `cargo ndk` run resolves nothing new, and the versions the APIs were read against are the ones that build |
-| D19 | Stream viewing on Android goes through **MediaCodec via the `ndk` crate's `media` feature** as a third `VideoDecoder` behind `video::codec_stub`, when it comes (the user wants it early; it stays after voice) | hardware H.264 decode with no FFmpeg build for Android; the trait, `Quality` and the jitter buffer already compile there |
+| D19 | Stream viewing on Android goes through **MediaCodec via the `ndk` crate's `media` feature** as a third `VideoDecoder` (done 2026-10-06, see D23) | hardware H.264 decode with no FFmpeg build for Android; the trait, `Quality` and the jitter buffer already compile there |
+| D24 | **The playback cushion follows the device's callback size** (2026-10-05): `audio::output` keeps max(20 ms, largest callback + 10 ms) queued and tells the jitter buffer the pull burst (floor = callback − 10 ms); the audio workers run at nice −16 on Android. Details in the voice-breakup paragraph after the first-build log | a fixed 20 ms against AAudio's 20–40 ms callbacks was half silence; the formula is the desktop's old value whenever callbacks are ≤ 10 ms |
+| D23 | **Stream viewing on Android** (2026-10-06), two halves. *Decoder:* `video::mediacodec::MediaCodecDecoder` (`crates/video/src/mediacodec.rs`, `cfg(target_os = "android")`, `ndk` features `media` + `api-level-29`): one `video/avc` `AMediaCodec` in synchronous mode with **byte-buffer output** (no Surface — the picture stays on the existing `FrameReady → present-prep → Image` path), configured lazily on the first keyframe from the `EncodedFrame` size, fed whole Annex-B access units (in-band SPS/PPS before every IDR is what every encoder emits), drained newest-wins with a 4 ms wait; **`flush()` is a no-op** (the client flushes before every IDR, which already resets reference state — an `AMediaCodec_flush` there would drop the pictures in the pipeline every 2 s); codec errors and a keyframe with a new size rebuild the codec at the next keyframe. The output layout comes from the buffer format's `image-data` (`MediaImage2`, Codec2 and OMX both set it), else `color-format` 19/21 + `stride`/`slice-height`, cropped by `crop`; **`video::yuv`** (platform-free, unit-tested on the host) walks any 4:2:0 layout to RGBA with fixed-point BT.709/601/2020 limited/full picked from `color-standard`/`color-range` (default BT.709 limited — what the sender signals). `client::screen::create_decoder()` is `cfg`-split: FFmpeg on the desktop, MediaCodec on Android. *Viewer:* `viewer.slint`'s body became `StreamViewerPanel` (a `FocusScope`; `StreamViewerWindow` wraps it on the desktop); `MainWindow` shows one under `if State.watch-open`, below the settings page; `State.watch-*` carry name/frame/stats/mute/volume and `Logic.watch-*` the controls (wired once by `viewers::wire_page` from `app::run`); `viewers::Viewer` holds a private `Surface::{Window, Page}` and `handle_watch_peer` unwatches any other peer first on a single-window host (one page, one stream). Back stops watching (`Key.Back` in the panel), a tap wakes the chrome, the fullscreen control hides on the page | hardware decode without FFmpeg, ~6 ms of CPU per 1080p frame for the colour conversion (measured scalar on a 2.1 GHz Xeon; a NEON `yuv` crate is the upgrade if a phone can't keep 60 fps), and the same `.slint` + host code on both hosts, as D22. A Surface-backed path (`AImageReader` or a native window under the Slint view) would skip the conversion but needs compositing Slint over video — not for v1 |
 
 What the first build will tell us, in order: whether the Skia prebuilt
 downloads (§13), whether cpal's AAudio host opens the emulator's mic,
@@ -720,3 +730,43 @@ retries a pending input every 2 s (`input_pending`) and logs "Input
 started late". Whether playback itself also failed on the phone is
 what the next logcat says (`Voice output failed to start` vs `Voice
 input failed to start`).
+
+**Stream viewing on the emulator (2026-10-05, later).** Worked first
+run: `c2.goldfish.h264.decoder`, output layout `1920x1080 Y@0 s1920
+U@2073600 s960 V@2592000 s960` (I420 via `image-data`, BT.709
+limited), 336 pictures from 361 frames in 22 s. The emulator decodes a
+1080p frame in 20–70 ms (the goldfish codec pipes every frame through
+the host, and the dev profile builds the workspace at `opt-level = 1`,
+so the colour conversion runs 3× slower than measured), which is ~16
+fps and tripped the per-frame "Slow decode" / "SLOW FRAME" warnings
+on every frame — 652 of 729 log lines. Those are now once-a-second
+summaries (`video::timing::SlowFrames`, in the client and the
+frontend). The phone's hardware decoder is the real measurement. Same
+log, the voice line read `Underruns 162` in 6 s with `Lost 0` — first
+blamed on the emulator's audio clock; wrong, see the next paragraph.
+
+**Voice breaking up on Android (2026-10-05, D24).** The phone played
+voices but broke up constantly. Cause, in `audio::output`: the playback
+worker kept a fixed **20 ms** queued ahead of the device — two periods
+of a 10 ms desktop device — and AAudio outside low-latency mode asks
+for 20–40 ms per callback (cpal leaves `BufferSize::Default` there, and
+the performance mode at NONE without cpal's `realtime` feature). A
+40 ms callback against 20 ms queued is half silence on every callback;
+the emulator's steady ~25.6 underruns/s with zero loss was exactly one
+per ~39 ms callback. A 20 ms callback has zero margin, so any late
+worker wake is a gap. Fixes: the output callback records the largest
+callback it has served and the worker keeps **max(20 ms, callback +
+10 ms)** queued (`output::Cushion`, unit-tested; unchanged for ≤ 10 ms
+callbacks, so the desktop keeps its latency) and logs it once
+(`Output callbacks of N frames (X ms): keeping Y ms queued, jitter floor
+Z ms`); the jitter buffer learns the pull burst (`set_pull_burst`: floor
+= callback − one hop, 2 ms on desktop) so a low target cannot prime,
+play one hop and re-prime inside every burst (simulation test: 40 ms
+bursts against 20 ms arrivals play clean with the floor); and the audio
+worker threads take Android's `THREAD_PRIORITY_AUDIO` (nice −16,
+`platform::promote_current_thread`, logged per thread) instead of
+running at nice 0 beside the UI and the video threads. The AAudio
+callback thread itself is left alone (already audio-class). Next
+step if a device still breaks up: low-latency performance mode +
+`VoiceCommunication` usage, which needs our own AAudio builder (cpal
+exposes neither without its `realtime` feature) — M3's audio work.

@@ -309,6 +309,26 @@ impl AdaptiveJitterBuffer {
         }
     }
 
+    /// Tell the buffer how the output pulls: in bursts of `burst` samples
+    /// (one device callback's worth, at this buffer's rate), `hop` at a
+    /// time. A 10 ms-callback device pulls one hop per callback and the
+    /// 2 ms floor is enough; a device that asks for 40 ms at once (Android
+    /// `AAudio` outside low-latency mode) has the worker pull four hops back
+    /// to back, and hops two to four need cushion that has already
+    /// arrived — so the floor becomes `burst − hop`. Without it a low
+    /// target primes, plays one hop, runs dry inside the same burst and
+    /// re-primes, every burst.
+    pub fn set_pull_burst(&mut self, burst: usize, hop: usize) {
+        let base_floor = (2 * self.sample_rate) / 1000;
+        self.min_samples = burst
+            .saturating_sub(hop)
+            .max(base_floor)
+            .min(self.max_samples);
+        if self.target_samples < self.min_samples {
+            self.target_samples = self.min_samples;
+        }
+    }
+
     /// Minimum target while repairs are worth waiting for (ms); 0 when the
     /// link has been clean for `LOSS_MEMORY`.
     fn protection_floor_ms(&self) -> f32 {
@@ -565,7 +585,9 @@ impl AdaptiveJitterBuffer {
         let now = Instant::now();
         // Sustained-excess threshold: target + 4 hops.
         let headroom = self.target_samples + n * 4;
-        let prime_cap = (60 * self.sample_rate) / 1000;
+        // Never below the pull-burst floor (set_pull_burst): priming to
+        // less than one burst re-primes inside every burst.
+        let prime_cap = ((60 * self.sample_rate) / 1000).max(self.min_samples);
         let prime_target = self.target_samples.min(prime_cap);
 
         for (peer_id, peer) in &mut self.buffers {
@@ -1019,6 +1041,12 @@ impl AdaptiveJitterBuffer {
         }
     }
 
+    /// The floor the target never drains below (ms), for logs.
+    #[must_use]
+    pub fn min_target_ms(&self) -> f32 {
+        self.min_ms()
+    }
+
     /// Current target depth in milliseconds (for stats).
     #[must_use]
     pub fn target_ms(&self) -> f32 {
@@ -1212,6 +1240,73 @@ mod tests {
             let stats = jb.drain_stats();
             assert_eq!(stats.red, 1, "the copy of packet 2 is a recovery");
             assert_eq!((stats.fec, stats.plc, stats.lost), (0, 0, 0));
+        }
+
+        /// Android `AAudio`'s normal mode asks for 40 ms per callback, so
+        /// the output worker pulls four hops back to back every 40 ms
+        /// while packets arrive every 20 ms. Over two seconds of steady
+        /// speech, counts the hops that did not play real audio after
+        /// playout first started: silent hops plus concealed and
+        /// late-dropped frames (PLC sounds as broken as a gap).
+        fn damage_with_bursty_pulls(set_burst: bool) -> (usize, u64, u64) {
+            let mut jb = buffer();
+            if set_burst {
+                jb.set_pull_burst(1920, 480);
+            }
+            let mut enc = encoder();
+            let t0 = Instant::now();
+            let mut out = vec![0.0f32; 480];
+            let mut started = false;
+            let mut silent = 0;
+            let (mut plc, mut late) = (0, 0);
+            let mut seq = 0u32;
+            for t_ms in (0..2_000u64).step_by(10) {
+                if t_ms % 20 == 0 {
+                    jb.push_packet(packet(&mut enc, seq, 7), t0 + Duration::from_millis(t_ms));
+                    seq += 1;
+                }
+                if t_ms % 40 == 0 {
+                    for _ in 0..4 {
+                        jb.pull_mixed(480, &mut out);
+                        let audible = out.iter().any(|s| s.abs() > 1e-3);
+                        if audible {
+                            started = true;
+                        } else if started {
+                            silent += 1;
+                        }
+                    }
+                }
+                jb.adapt();
+                let st = jb.drain_stats();
+                plc += st.plc + st.fec;
+                late += st.late;
+            }
+            (silent, plc, late)
+        }
+
+        #[test]
+        fn bursty_pulls_play_clean_once_the_burst_is_known() {
+            let before = damage_with_bursty_pulls(false);
+            let after = damage_with_bursty_pulls(true);
+            eprintln!("SIM (silent hops, concealed, late) before={before:?} after={after:?}");
+            assert_eq!(
+                after,
+                (0, 0, 0),
+                "with the burst floor (without: {before:?})"
+            );
+        }
+
+        #[test]
+        fn pull_burst_floor_is_burst_minus_one_hop() {
+            let mut jb = buffer();
+            jb.set_pull_burst(480, 480);
+            assert!(
+                (jb.min_target_ms() - 2.0).abs() < 0.01,
+                "desktop keeps 2 ms"
+            );
+            jb.set_pull_burst(1920, 480);
+            assert!((jb.min_target_ms() - 30.0).abs() < 0.01);
+            assert!(jb.target_ms() >= 30.0, "target lifted to the floor");
         }
 
         #[test]

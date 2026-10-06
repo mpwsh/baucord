@@ -110,11 +110,17 @@ impl AppState {
         let net_to_decode_ms = f.decoded_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
         let decode_to_present_ms = present_at.duration_since(f.decoded_at).as_secs_f32() * 1000.0;
         let total_ms = present_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
-        if total_ms > 25.0 {
+        // Summarised once a second (video::timing), with the split of
+        // the worst frame so the slow stage is still named.
+        if total_ms > 25.0 && total_ms >= self.slow_frame_worst.0 {
+            self.slow_frame_worst = (total_ms, net_to_decode_ms, decode_to_present_ms);
+        }
+        if let Some(line) = self.slow_frames.record(total_ms, total_ms > 25.0) {
+            let (_, net_to_decode, decode_to_present) = self.slow_frame_worst;
             warn!(
-                "SLOW FRAME seq={}: {total_ms:.1}ms total (net→decode: {net_to_decode_ms:.1}ms, decode→present: {decode_to_present_ms:.1}ms)",
-                f.seq
+                "{line}; worst split net→decode {net_to_decode:.1} ms, decode→present {decode_to_present:.1} ms"
             );
+            self.slow_frame_worst = (0.0, 0.0, 0.0);
         }
         if let Some(viewer) = self.viewers.get_mut(&f.client_id) {
             let set_start = Instant::now();
@@ -128,8 +134,8 @@ impl AppState {
                 f.buffer_jitter_ms,
             );
             let set_ms = set_start.elapsed().as_secs_f32() * 1000.0;
-            if set_ms > 5.0 {
-                warn!("Slow present: {set_ms:.1}ms for seq {}", f.seq);
+            if let Some(line) = self.slow_presents.record(set_ms, set_ms > 5.0) {
+                warn!("{line}");
             }
         }
     }
