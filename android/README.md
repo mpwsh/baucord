@@ -195,7 +195,7 @@ code, so release builds keep `isMinifyEnabled = false` (R8 would strip
 them).
 
 The launcher icon is `assets/icons/icon.png` at the repo root, the
-desktop's: the `baucordLauncherIcon` task renders it into the adaptive
+desktop's: the `baucordDebugLauncherIcon` / `baucordReleaseLauncherIcon` tasks render it into the adaptive
 icon's foreground at every density on each build (ANDROID-SPEC.md D36).
 Change the PNG and the next build picks it up. The manifest also opts out of predictive back
 (`enableOnBackInvokedCallback="false"`): on Android 16 an app targeting

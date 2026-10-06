@@ -6,7 +6,11 @@
 // D34); the launcher icon is rendered from the repo's
 // assets/icons/icon.png by the task at the bottom (D36).
 
+import java.awt.RenderingHints
+import java.awt.image.BufferedImage
+import java.io.File
 import java.util.Properties
+import javax.imageio.ImageIO
 
 plugins {
     id("com.android.application")
@@ -230,6 +234,9 @@ tasks.matching { it.name == "preReleaseBuild" }.configureEach { dependsOn(cargoN
 // fills the layer and the mask cuts it. One on transparency (a logo) is
 // scaled so its farthest opaque pixel sits on that 66 dp circle — round
 // or square, nothing of it is ever cut — over @color/baucord_bg.
+// (Plain java.awt / javax.imageio, imported at the top: written out in
+// full, `java.awt.…` would resolve `java` to the project's `java`
+// extension and not compile.)
 abstract class LauncherIconTask : DefaultTask() {
     @get:InputFile
     @get:PathSensitive(PathSensitivity.NONE)
@@ -241,7 +248,7 @@ abstract class LauncherIconTask : DefaultTask() {
     @TaskAction
     fun render() {
         val file = source.get().asFile
-        val src = javax.imageio.ImageIO.read(file)
+        val src = ImageIO.read(file)
             ?: throw GradleException("$file: not an image ImageIO reads (a PNG is expected)")
         val out = outputDir.get().asFile
         out.deleteRecursively()
@@ -255,8 +262,8 @@ abstract class LauncherIconTask : DefaultTask() {
         )
         for ((name, scale) in densities) {
             val canvas = Math.round(108 * scale).toInt()
-            val layer = java.awt.image.BufferedImage(
-                canvas, canvas, java.awt.image.BufferedImage.TYPE_INT_ARGB,
+            val layer = BufferedImage(
+                canvas, canvas, BufferedImage.TYPE_INT_ARGB,
             )
             val factor = if (fullBleed || radius <= 0.0) {
                 // Cover the layer.
@@ -270,13 +277,13 @@ abstract class LauncherIconTask : DefaultTask() {
             val g = layer.createGraphics()
             g.drawImage(scaled(src, w, h), (canvas - w) / 2, (canvas - h) / 2, null)
             g.dispose()
-            val dir = java.io.File(out, "mipmap-$name").apply { mkdirs() }
-            javax.imageio.ImageIO.write(layer, "png", java.io.File(dir, "ic_launcher_foreground.png"))
+            val dir = File(out, "mipmap-$name").apply { mkdirs() }
+            ImageIO.write(layer, "png", File(dir, "ic_launcher_foreground.png"))
         }
     }
 
     /** Distance from the picture's centre to its farthest visible pixel. */
-    private fun opaqueRadius(img: java.awt.image.BufferedImage): Double {
+    private fun opaqueRadius(img: BufferedImage): Double {
         val cx = (img.width - 1) / 2.0
         val cy = (img.height - 1) / 2.0
         var best = 0.0
@@ -291,7 +298,7 @@ abstract class LauncherIconTask : DefaultTask() {
     }
 
     /** High-quality resize: halve step by step, then one bicubic pass. */
-    private fun scaled(img: java.awt.image.BufferedImage, w: Int, h: Int): java.awt.image.BufferedImage {
+    private fun scaled(img: BufferedImage, w: Int, h: Int): BufferedImage {
         var current = img
         var cw = img.width
         var ch = img.height
@@ -303,32 +310,32 @@ abstract class LauncherIconTask : DefaultTask() {
         return draw(current, w, h)
     }
 
-    private fun draw(img: java.awt.image.BufferedImage, w: Int, h: Int): java.awt.image.BufferedImage {
-        val out = java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+    private fun draw(img: BufferedImage, w: Int, h: Int): BufferedImage {
+        val out = BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB)
         val g = out.createGraphics()
-        g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
-            java.awt.RenderingHints.VALUE_INTERPOLATION_BICUBIC)
-        g.setRenderingHint(java.awt.RenderingHints.KEY_RENDERING,
-            java.awt.RenderingHints.VALUE_RENDER_QUALITY)
-        g.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
-            java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+            RenderingHints.VALUE_INTERPOLATION_BICUBIC)
+        g.setRenderingHint(RenderingHints.KEY_RENDERING,
+            RenderingHints.VALUE_RENDER_QUALITY)
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+            RenderingHints.VALUE_ANTIALIAS_ON)
         g.drawImage(img, 0, 0, w, h, null)
         g.dispose()
         return out
     }
 }
 
-val baucordLauncherIcon = tasks.register<LauncherIconTask>("baucordLauncherIcon") {
-    group = "build"
-    description = "assets/icons/icon.png → generated mipmap-*/ic_launcher_foreground.png"
-    source.set(workspaceDir.file("assets/icons/icon.png"))
-}
-
 androidComponents {
     onVariants { variant ->
-        variant.sources.res?.addGeneratedSourceDirectory(
-            baucordLauncherIcon,
-            LauncherIconTask::outputDir,
-        )
+        // One task per variant, as AGP expects for generated sources: it
+        // sets the task's outputDir itself (build/generated/…).
+        val icon = tasks.register<LauncherIconTask>(
+            "baucord${variant.name.replaceFirstChar { it.uppercase() }}LauncherIcon",
+        ) {
+            group = "build"
+            description = "assets/icons/icon.png → generated mipmap-*/ic_launcher_foreground.png"
+            source.set(workspaceDir.file("assets/icons/icon.png"))
+        }
+        variant.sources.res?.addGeneratedSourceDirectory(icon, LauncherIconTask::outputDir)
     }
 }

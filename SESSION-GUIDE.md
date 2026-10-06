@@ -426,6 +426,12 @@ Memory-mode servers (persistence off) still use the legacy
   too (D35). The headless harness can set a keyboard with
   `window.set_virtual_keyboard(pos, size, i_slint_core::InternalToken)`
   (dev-dependency `i-slint-core = "=1.17.1"`).
+- **In `build.gradle.kts`, never write `java.awt.…` / `java.io.…`
+  out in full**: `java` resolves to the project's `java` extension (AGP
+  applies java-base) and the script fails with "Unresolved reference:
+  awt". Import the classes at the top. Gradle 8.14.3 is installed here
+  (`/opt/gradle`) but Maven is blocked, so AGP itself cannot run;
+  check Kotlin script code in a scratch project with `java-base`.
 - **Android 16 + targetSdk 36 never delivers `KEYCODE_BACK`**
   (predictive back): the manifest's `enableOnBackInvokedCallback=
   "false"` is what makes every `Key.Back` handler run (D29).
