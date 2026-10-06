@@ -104,7 +104,7 @@ impl UdpIo {
             // Cargo.toml); `set_tos_v4` is always there.
             let sock = socket2::SockRef::from(&self.socket);
             let result = if peer.is_ipv6() {
-                sock.set_tclass_v6(DSCP_EF << 2)
+                set_tclass_v6(&sock, DSCP_EF << 2)
             } else {
                 sock.set_tos_v4(DSCP_EF << 2)
             };
@@ -416,4 +416,23 @@ mod dscp_tests {
             .expect("read tos");
         assert_eq!(tos, DSCP_EF << 2, "expected EF (46 << 2 = 184), got {tos}");
     }
+}
+
+/// The IPv6 traffic-class byte (the v6 twin of `set_tos_v4`). socket2
+/// declares `set_tclass_v6` for macOS but not for iOS, although the
+/// option exists there; iOS's own route to voice priority is
+/// `SO_NET_SERVICE_TYPE` = `NET_SERVICE_TYPE_VO` (IOS-SPEC.md §7), so
+/// until that lands an iPhone sends IPv6 unmarked — which carriers do to
+/// marked traffic anyway.
+#[cfg(not(any(windows, target_os = "ios")))]
+fn set_tclass_v6(sock: &socket2::SockRef<'_>, tclass: u32) -> io::Result<()> {
+    sock.set_tclass_v6(tclass)
+}
+
+#[cfg(target_os = "ios")]
+fn set_tclass_v6(_sock: &socket2::SockRef<'_>, _tclass: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no IPv6 traffic-class binding on iOS",
+    ))
 }

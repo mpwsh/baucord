@@ -227,17 +227,17 @@ pub fn promote_current_thread(_buffer_frames: u32, _sample_rate: u32) -> Option<
 /// Call once per stream from inside the callback (guard with a `bool`).
 /// The handle is intentionally leaked: the thread lives exactly as long as
 /// the stream, reverting from any other thread is undefined, and the OS
-/// releases it at thread exit. Skipped on macOS, where the callback runs
-/// on `CoreAudio`'s HAL thread, which is already time-constraint scheduled,
-/// and on Android, where `AAudio`'s callback thread already runs at the
-/// framework's audio priority (`SCHED_FIFO` in low-latency mode) — our
-/// nice −16 could only lower it.
+/// releases it at thread exit. Skipped on macOS and iOS, where the
+/// callback runs on `CoreAudio`'s I/O thread, which is already
+/// time-constraint scheduled, and on Android, where `AAudio`'s callback
+/// thread already runs at the framework's audio priority (`SCHED_FIFO`
+/// in low-latency mode) — our nice −16 could only lower it.
 pub(crate) fn promote_callback_thread(buffer_frames: u32, sample_rate: u32) {
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
     {
         let _ = (buffer_frames, sample_rate);
     }
-    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
     {
         match promote_current_thread(buffer_frames, sample_rate) {
             Some(guard) => {

@@ -1,0 +1,16 @@
+// Shared build settings for baucord.xcodeproj (IOS-SPEC.md §11).
+//
+// Machine-specific values go in Local.xcconfig beside this file — not
+// committed; copy Local.xcconfig.example. It is included last, so
+// whatever it sets wins.
+
+// The app's bundle id. Bundle ids are unique across every Apple
+// account: if Xcode reports this one as taken, set your own in
+// Local.xcconfig.
+BAUCORD_BUNDLE_ID = dev.baucord
+
+// The signing team; Local.xcconfig sets it. Empty is enough for the
+// simulator.
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

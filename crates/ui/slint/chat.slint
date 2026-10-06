@@ -849,7 +849,7 @@ component ComposerField inherits Rectangle {
         y: 8px;
         width: parent.width - 2 * Theme.gap-md;
         height: parent.height - 16px;
-        viewport-height: max(self.height, input.preferred-height);
+        content-height: max(self.height, input.preferred-height);
         input := TextInput {
             width: fl.width;
             // Fill the field when the draft fits so a single line
@@ -865,10 +865,10 @@ component ComposerField inherits Rectangle {
             selection-foreground-color: Theme.on-accent;
             edited => { root.edited(); }
             cursor-position-changed(pos) => {
-                if (pos.y + fl.viewport-y < 0px) {
-                    fl.viewport-y = -pos.y;
-                } else if (pos.y + fl.viewport-y + 20px > fl.height) {
-                    fl.viewport-y = fl.height - pos.y - 20px;
+                if (pos.y + fl.content-y < 0px) {
+                    fl.content-y = -pos.y;
+                } else if (pos.y + fl.content-y + 20px > fl.height) {
+                    fl.content-y = fl.height - pos.y - 20px;
                 }
             }
         }
@@ -932,7 +932,7 @@ export component ChatPane inherits Rectangle {
     background: Theme.bg-primary;
 
     public function scroll-to-end() {
-        list.viewport-y = -Math.max(0px, list.viewport-height - list.visible-height);
+        list.content-y = -Math.max(0px, list.content-height - list.visible-height);
     }
     /// Pin and go to the newest row: after sending, and after a
     /// conversation switch.
@@ -944,8 +944,8 @@ export component ChatPane inherits Rectangle {
     /// True when the user is at (or within ~40px of) the bottom — the
     /// shell asks before appending, to preserve read position.
     public pure function at-bottom() -> bool {
-        return list.viewport-height <= list.visible-height
-            || list.viewport-y <= -(list.viewport-height - list.visible-height - 40px);
+        return list.content-height <= list.visible-height
+            || list.content-y <= -(list.content-height - list.visible-height - 40px);
     }
     public function focus-composer() { input.focus-input(); }
     public pure function composer-focused() -> bool { return input.input-focused; }
@@ -967,7 +967,7 @@ export component ChatPane inherits Rectangle {
     // reached, or the moment the reader scrolls up.
     private property <bool> follow-pending: false;
     // Nudge to the end once a frame until it lands — a timer, not a
-    // `changed viewport-height` handler: that one ran on every
+    // `changed content-height` handler: that one ran on every
     // virtualization refinement while scrolling and stacked into the
     // runtime's "long callback/instantiation chain" warning. Bounded,
     // so a follow that can never land does not tick forever.
@@ -1128,7 +1128,7 @@ export component ChatPane inherits Rectangle {
 
         // "Load earlier": appears once the reader reaches the top and
         // the server said older pages exist; the page is put in front.
-        if State.history-more && list.viewport-y >= -2px : Rectangle {
+        if State.history-more && list.content-y >= -2px : Rectangle {
             height: 28px;
             border-radius: Theme.radius-sm;
             background: le.has-hover && !State.history-loading ? Theme.hover : transparent;
@@ -1175,7 +1175,7 @@ export component ChatPane inherits Rectangle {
                 // resizes keep the newest message in view; scrolling up
                 // unpins, scrolling back to within 40px re-pins. These fire
                 // AFTER the layout recomputes, unlike a host-side
-                // scroll-after-push, which reads stale viewport-height and
+                // scroll-after-push, which reads stale content-height and
                 // lands short (permanently, once an image row overshoots
                 // the 40px slack).
                 // Pin/unpin rules, in priority order:
@@ -1186,7 +1186,7 @@ export component ChatPane inherits Rectangle {
                 //   2. Any other upward movement unpins immediately. The
                 //      slack must NOT keep the pin on the way *up*: a
                 //      virtualized ListView refines its estimated
-                //      viewport-height while older rows instantiate, and a
+                //      content-height while older rows instantiate, and a
                 //      still-pinned state snap-scrolls the user back on
                 //      every wheel notch ("impossible to scroll up").
                 //   3. Arriving *downward* within the slack of the bottom
@@ -1204,28 +1204,28 @@ export component ChatPane inherits Rectangle {
                 //      change fought a scrollbar drag: dragging near the
                 //      bottom instantiates rows, the estimate refines, and
                 //      the snap-back held the thumb there.
-                private property <length> last-viewport-y;
+                private property <length> last-content-y;
                 pure function at-exact-bottom() -> bool {
-                    self.viewport-y <= -(self.viewport-height - self.visible-height) + 2px
+                    self.content-y <= -(self.content-height - self.visible-height) + 2px
                 }
                 pure function near-bottom() -> bool {
-                    self.viewport-y <= -(self.viewport-height - self.visible-height) + 48px
+                    self.content-y <= -(self.content-height - self.visible-height) + 48px
                 }
-                changed viewport-y => {
+                changed content-y => {
                     if (self.at-exact-bottom()) {
                         // Pinned; the follow, if owed, decides for itself
                         // when it has settled.
                         root.stick-to-bottom = true;
-                    } else if (self.viewport-y > self.last-viewport-y + 0.25px) {
+                    } else if (self.content-y > self.last-content-y + 0.25px) {
                         // The reader scrolled up: nothing follows them down.
                         root.stick-to-bottom = false;
                         root.follow-pending = false;
                         root.follow-ticks = 0;
                         root.follow-settled = 0;
-                    } else if (self.viewport-y < self.last-viewport-y - 0.25px && self.near-bottom()) {
+                    } else if (self.content-y < self.last-content-y - 0.25px && self.near-bottom()) {
                         root.stick-to-bottom = true;
                     }
-                    self.last-viewport-y = self.viewport-y;
+                    self.last-content-y = self.content-y;
                 }
                 // A resize cannot coincide with a drag: keep the tail in view.
                 changed visible-height => { if (root.stick-to-bottom) { root.scroll-to-end(); } }
@@ -1495,7 +1495,7 @@ export component ChatPane inherits Rectangle {
                 x: Theme.gap-sm; y: Theme.gap-sm;
                 width: parent.width - 2 * Theme.gap-sm;
                 height: parent.height - 2 * Theme.gap-sm - 26px;
-                viewport-height: grid.preferred-height;
+                content-height: grid.preferred-height;
                 grid := VerticalLayout {
                     // 8 columns of 40px cells, gap-xs breathing room
                     property <int> cols: 8;

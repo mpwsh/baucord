@@ -233,6 +233,6 @@ impl AppState {
     // ListView pins itself to the bottom reactively (chat.slint's
     // stick-to-bottom `changed` handlers), which runs AFTER layout —
     // a host-side invoke right after a model push reads a stale
-    // viewport-height and lands short (or permanently unsticks once an
+    // content-height and lands short (or permanently unsticks once an
     // image row overshoots the at-bottom slack).
 }

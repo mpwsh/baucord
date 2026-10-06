@@ -83,8 +83,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// windows — Settings, the admin panel, the stream viewer — cannot open
 /// there until they become in-window pages (ANDROID-SPEC.md §9). Their
 /// `open` paths check this and say so instead of colliding with the
-/// main window.
-pub(crate) const SINGLE_WINDOW_HOST: bool = cfg!(target_os = "android");
+/// main window. An iPhone app is one full-screen window too (winit on
+/// `UIKit`, IOS-SPEC.md §4), so iOS takes every page Android has — the
+/// Settings and stream pages, the narrow layout, the touch rules.
+pub(crate) const SINGLE_WINDOW_HOST: bool = cfg!(any(target_os = "android", target_os = "ios"));
 
 // ── The UI-thread singleton ─────────────────────────────────────────────
 
@@ -430,8 +432,11 @@ fn spawn_workers(
 /// Prefer the Skia renderer when compiled in: femtovg (the default)
 /// can't rasterize many color-emoji glyph formats, which shows as tofu
 /// boxes in the emoji palette. Skia renders them all. (Android's
-/// backend is Skia already and is installed by the host before `run`.)
-#[cfg(not(target_os = "android"))]
+/// backend is Skia already and is installed by the host before `run`;
+/// the iOS host selects winit + Skia on Metal itself, IOS-SPEC.md D7 —
+/// the CPU raster choice below is a Windows answer that would cost a
+/// phone its battery and its 120 Hz.)
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn select_renderer() {
     // An explicit SLINT_BACKEND still wins — the no-rebuild escape
     // hatch (`winit-software` forces the basic software renderer;
@@ -467,9 +472,9 @@ fn select_renderer() {
 /// Build everything and run the event loop until quit.
 pub fn run() {
     // On Android the host has already installed Slint's Android backend
-    // (`slint::android::init`, with Skia); a second selection would
-    // only fail and log.
-    #[cfg(not(target_os = "android"))]
+    // (`slint::android::init`, with Skia), and the iOS host has selected
+    // winit + Skia; a second selection would only fail and log.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     select_renderer();
     let is_testing_mic_shared = Arc::new(AtomicBool::new(false));
     let (voice, screen, network, present_shared, screen_fwd_rx) =
@@ -489,7 +494,7 @@ pub fn run() {
     // window is the screen: nothing to size there.
     // Saved px dimensions; i32→f32 precision is irrelevant at window
     // scale.
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     #[allow(clippy::cast_precision_loss)]
     main.window().set_size(slint::LogicalSize::new(
         settings.window.width.max(500) as f32,
@@ -721,7 +726,9 @@ pub fn run() {
     // the FLTK build needed an off-screen sentinel window for this.
     slint::run_event_loop_until_quit().expect("event loop failed");
 
-    // Loop exited (quit_event_loop called). Clean shutdown.
+    // Loop exited (quit_event_loop called). Clean shutdown. (Never
+    // reached on iOS: UIKit owns the process and the loop does not
+    // return — the host calls `persist_for_background` instead.)
     let st = state;
     APP.with(|a| a.borrow_mut().take());
     st.borrow_mut().shutdown();
@@ -804,6 +811,15 @@ pub fn with_current(f: impl FnOnce(&mut AppState)) {
     if let Some(app) = app {
         f(&mut app.borrow_mut());
     }
+}
+
+/// The host is going into the background, where the OS may end the
+/// process without `run` ever returning (iOS always: `UIKit` owns the
+/// loop; IOS-SPEC.md §4.3): write the settings now, as the tray's Quit
+/// does. Settings are saved on nearly every change already; this
+/// catches the rest. UI thread only; a no-op before the app exists.
+pub fn persist_for_background() {
+    with_current(AppState::save_settings_now);
 }
 
 #[allow(clippy::too_many_lines)]

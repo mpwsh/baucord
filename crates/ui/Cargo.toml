@@ -16,7 +16,7 @@ slint.workspace = true
 log.workspace = true
 
 [build-dependencies]
-slint-build = "1.17"
+slint-build = "1.18.1"
 # Lucide icons as pre-converted Slint Path elements, mounted as the
 # `@lucide` library in build.rs. Lives here (not in the shells) so
 # every shell gets the same icon set; needs Slint 1.15+ (Path in the

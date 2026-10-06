@@ -720,6 +720,11 @@ component ServersPanel inherits VerticalLayout {
             width: 110px;
             label: Tr.server-port;
             Field {
+                // Under Field's 120 px floor: Slint 1.18 enforces a
+                // child's min-width over this column's fixed width
+                // (1.17 let the column win), which pushed the field
+                // 10 px past the form's right edge.
+                min-width: 80px;
                 text <=> SettingsState.server-port;
                 edited => { SettingsLogic.server-port-edited(self.text); }
             }

@@ -1,0 +1,13 @@
+// Copy to Local.xcconfig (ignored by git) and fill in. Needed for the
+// phone; the simulator runs without it.
+
+// Your signing team: Xcode → Settings → Accounts → your Apple ID →
+// the team's ID (10 characters; Membership details on
+// developer.apple.com show it too). A free Apple ID works for your own
+// iPhone — Xcode lists it as "(Personal Team)" — but the app then
+// stops opening after 7 days until it is installed again
+// (`ios/run.sh --device`). IOS-SPEC.md §11.
+DEVELOPMENT_TEAM = ABCDE12345
+
+// If Xcode says the bundle id is not available, make it yours:
+// BAUCORD_BUNDLE_ID = dev.baucord.yourname

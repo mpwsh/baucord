@@ -1,0 +1,78 @@
+[package]
+name = "ios"
+# The iOS host (IOS-SPEC.md): the executable Xcode puts inside
+# baucord.app. `main` sets up the log, the app's folders, the audio
+# session and Slint's winit backend (Skia on Metal), then runs the same
+# `frontend::app::run()` the desktop binary runs. Versioned with the
+# public crates.
+version = "1.1.6"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+# `baucord.app/baucord`: ios/scripts/build_with_cargo.sh builds this
+# binary and puts it where Xcode expects the app's executable.
+name = "baucord"
+path = "src/main.rs"
+
+[features]
+default = ["app"]
+# The real client: `frontend` without its `desktop` feature (no
+# clipboard crate, hotkeys, updater, dialogs — their `stubs/` twins).
+# Always build this crate with `-p ios`: a workspace-wide build would
+# unify `frontend/desktop` back in from the desktop crate.
+app = ["dep:frontend", "dep:client"]
+# M0's toolchain smoke test (IOS-SPEC.md §12): one Slint page in the
+# theme's colours, no engine. Proves Xcode + cargo + the Skia prebuilt
+# + signing before the whole dependency tree is in play
+# (`ios/run.sh --hello`).
+hello = []
+
+[dependencies]
+# The workspace entry as is: on iOS `backend-winit` + `renderer-skia`
+# are exactly what Slint's iOS support is (winit on UIKit, Skia on
+# Metal); `renderer-software` is pure Rust and unused here.
+slint.workspace = true
+# `std` for `set_boxed_logger` (logging.rs), asked for here rather than
+# inherited by accident from whichever dependency enables it.
+log = { workspace = true, features = ["std"] }
+frontend = { path = "../frontend", default-features = false, optional = true }
+client = { path = "../client", optional = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+# The Apple bindings already in the tree through cpal and Slint's iOS
+# backend (objc2 0.6 / the 0.3 framework crates), so nothing new
+# compiles; only the features below are added.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "block2",
+  "NSArray",
+  "NSError",
+  "NSFileManager",
+  "NSNotification",
+  "NSOperation",
+  "NSPathUtilities",
+  "NSString",
+  "NSURL",
+  "NSValue",
+] }
+# The audio session (session.rs). cpal's iOS host uses the same crate.
+objc2-avf-audio = { version = "0.3", default-features = false, features = [
+  "std",
+  "AVAudioSession",
+  "AVAudioSessionTypes",
+] }
+# The lifecycle notifications (lifecycle.rs): the scene's background
+# and foreground, the application's memory warning and termination.
+objc2-ui-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "UIApplication",
+  "UIScene",
+] }
+# Timestamps in baucord.log (the desktop's env_logger format).
+chrono = "0.4"

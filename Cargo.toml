@@ -15,7 +15,7 @@ crossbeam-channel = "0.5.15"
 # in the winit adapter's handle_focus_change (slint-ui/slint#6922).
 # Users hit it opening the volume popover. Re-enable once that is fixed
 # upstream.
-slint = { version = "1.17", default-features = false, features = [
+slint = { version = "1.18.1", default-features = false, features = [
   "std",
   "backend-winit",
   "renderer-skia",

@@ -54,7 +54,7 @@ slint.workspace = true
 # app.rs::repaint_on_reveal hooks them. Default features are empty —
 # this only pulls the accessor trait; cargo unifies the version with
 # slint's own internal dependency.
-i-slint-backend-winit = { version = "1.17", optional = true }
+i-slint-backend-winit = { version = "1.18.1", optional = true }
 crossbeam-channel.workspace = true
 log.workspace = true
 chrono = "0.4.45"

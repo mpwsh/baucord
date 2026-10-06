@@ -219,9 +219,9 @@ impl AppState {
     //  MISC
     // ════════════════════════════════════════════════════════════════
 
-    /// Persist geometry + settings immediately (tray Quit path — the
-    /// normal shutdown also does this, but only after the loop exits).
-    #[cfg_attr(not(feature = "tray"), allow(dead_code))]
+    /// Persist geometry + settings immediately (the tray's Quit, and a
+    /// host going into the background — the normal shutdown also does
+    /// this, but only after the loop exits).
     pub fn save_settings_now(&mut self) {
         self.save_window_geometry();
         self.settings.save();
