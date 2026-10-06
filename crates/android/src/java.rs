@@ -1,10 +1,13 @@
 //! The Rust → Java calls (spec §10.2), through the `jni` crate on
-//! whatever thread asks. The `JavaVM` and the `Activity` come from
-//! `ndk-context`, which `android-activity` fills in before
-//! `android_main` runs — the same road cpal's `AAudio` host takes to
-//! `AudioManager`, so the idioms below are the ones that compile there
-//! (jni 0.22: `attach_current_thread` takes a closure, `jni_str!` /
-//! `jni_sig!` name methods and signatures).
+//! whatever thread asks (jni 0.22: `attach_current_thread` takes a
+//! closure, `jni_str!` / `jni_sig!` name methods and signatures).
+//!
+//! **The Activity comes from `AndroidApp`, not `ndk-context`** ([`init`],
+//! from `android_main`): android-activity 0.6 registers the
+//! *Application* with ndk-context, which is right for `AudioManager`
+//! (cpal, the audio crate) but has neither `requestPermissions` nor our
+//! `BaucordActivity` methods — on it the permission prompt never showed
+//! and `pickFile` was "method not found" (ANDROID-SPEC.md D33).
 //!
 //! Permissions, and the file and link helpers `BaucordActivity`
 //! (`android/app/src/main/java/dev/baucord/`) carries for `host.rs`:
@@ -15,36 +18,54 @@
 //! directly. (The audio route lives with the audio engine:
 //! `audio/src/native/android.rs`.)
 
+use std::{ffi::c_void, sync::OnceLock};
+
+#[cfg(feature = "app")]
+use jni::{errors::LogErrorAndDefault, objects::JClass, refs::Reference};
 use jni::{
-    Env, JavaVM,
     errors::Result as JniResult,
     objects::{JObject, JObjectArray, JString, JValue},
     sys::jobject,
+    Env, JavaVM,
 };
-#[cfg(feature = "app")]
-use jni::{errors::LogErrorAndDefault, objects::JClass, refs::Reference};
 
 /// `PackageManager.PERMISSION_GRANTED`.
 const PERMISSION_GRANTED: i32 = 0;
-/// Our one request code; `NativeActivity` never hands the result back to
-/// native code anyway (the next `Resume` re-checks).
+/// Our one request code; the answer is not handed back to native code
+/// (the next `Resume` re-checks, and the voice engine retries the
+/// microphone every 2 s until it opens).
 // Only the smoke test never asks; the imports it shares stay used.
 #[cfg_attr(feature = "hello", allow(dead_code))]
 const PERMISSION_REQUEST_CODE: i32 = 1;
+
+/// The `JavaVM` and the Activity (a global reference android-activity
+/// keeps alive for as long as the `AndroidApp` lives — the whole
+/// process, D11), as addresses.
+static ACTIVITY: OnceLock<(usize, usize)> = OnceLock::new();
+
+/// Remember the Activity for every later call: `app.vm_as_ptr()` and
+/// `app.activity_as_ptr()`, first thing in `android_main`.
+pub fn init(vm: *mut c_void, activity: *mut c_void) {
+    let _ = ACTIVITY.set((vm as usize, activity as usize));
+}
 
 /// Run `f` with a JNI environment and the current Activity.
 fn with_activity<R>(
     f: impl for<'j> FnOnce(&mut Env<'j>, &JObject<'j>) -> JniResult<R>,
 ) -> JniResult<R> {
-    let ctx = ndk_context::android_context();
-    // SAFETY: android-activity registered a live JavaVM pointer for
-    // this process; `from_raw` only wraps it.
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
-    let activity_raw: jobject = ctx.context().cast();
+    let (vm_raw, activity_raw) = ACTIVITY.get().copied().unwrap_or_else(|| {
+        // Before `init` (never, in practice): ndk-context's — the
+        // Application, which answers the Context methods only.
+        let ctx = ndk_context::android_context();
+        (ctx.vm() as usize, ctx.context() as usize)
+    });
+    // SAFETY: a live JavaVM pointer for this process (android-activity's);
+    // `from_raw` only wraps it.
+    let vm = unsafe { JavaVM::from_raw(vm_raw as *mut jni::sys::JavaVM) };
     vm.attach_current_thread(|env: &mut Env<'_>| {
-        // SAFETY: the context pointer is the NativeActivity's own
-        // global reference to the Activity, valid while it lives.
-        let activity = unsafe { JObject::from_raw(env, activity_raw) };
+        // SAFETY: a global reference (android-activity's, see
+        // `ACTIVITY`), valid while the process runs; wrapped, not owned.
+        let activity = unsafe { JObject::from_raw(env, activity_raw as jobject) };
         f(env, &activity)
     })
 }
@@ -69,8 +90,12 @@ pub fn has_permission(name: &str) -> Result<bool, String> {
     .map_err(|e| e.to_string())
 }
 
-/// `Activity.requestPermissions(String[], int)`: one system dialog for
-/// all of `names` (API 23+). Returns as soon as the dialog is queued.
+/// The system's permission prompts for `names` (API 23+), one after
+/// the other: `BaucordActivity.askPermissions`, which posts
+/// `requestPermissions` to the UI thread (called from here at startup it
+/// could land before the Activity is shown); the bare
+/// `Activity.requestPermissions` if the Activity is not ours. Returns as
+/// soon as the prompt is queued.
 ///
 /// # Errors
 /// Any JNI failure, as text.
@@ -84,11 +109,60 @@ pub fn request_permissions(names: &[&str]) -> Result<(), String> {
             let jname = env.new_string(name)?;
             array.set_element(env, i, &jname)?;
         }
+        let asked = env.call_method(
+            activity,
+            jni::jni_str!("askPermissions"),
+            jni::jni_sig!("([Ljava/lang/String;)V"),
+            &[(&array).into()],
+        );
+        if asked.is_err() {
+            env.call_method(
+                activity,
+                jni::jni_str!("requestPermissions"),
+                jni::jni_sig!("([Ljava/lang/String;I)V"),
+                &[(&array).into(), JValue::Int(PERMISSION_REQUEST_CODE)],
+            )?;
+        }
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// `BaucordActivity.startVoiceService(channel, title, text)`: the
+/// foreground service and its notification (D34). `Ok(false)` when the
+/// system refused (asked from the background).
+///
+/// # Errors
+/// Any JNI failure, as text.
+#[cfg(feature = "app")]
+pub fn start_voice_service(channel: &str, title: &str, text: &str) -> Result<bool, String> {
+    with_activity(|env, activity| {
+        let jchannel = env.new_string(channel)?;
+        let jtitle = env.new_string(title)?;
+        let jtext = env.new_string(text)?;
         env.call_method(
             activity,
-            jni::jni_str!("requestPermissions"),
-            jni::jni_sig!("([Ljava/lang/String;I)V"),
-            &[(&array).into(), JValue::Int(PERMISSION_REQUEST_CODE)],
+            jni::jni_str!("startVoiceService"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z"),
+            &[(&jchannel).into(), (&jtitle).into(), (&jtext).into()],
+        )?
+        .z()
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// `BaucordActivity.stopVoiceService()`.
+///
+/// # Errors
+/// Any JNI failure, as text.
+#[cfg(feature = "app")]
+pub fn stop_voice_service() -> Result<(), String> {
+    with_activity(|env, activity| {
+        env.call_method(
+            activity,
+            jni::jni_str!("stopVoiceService"),
+            jni::jni_sig!("()V"),
+            &[],
         )?;
         Ok(())
     })

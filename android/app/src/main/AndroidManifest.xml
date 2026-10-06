@@ -25,6 +25,7 @@
          an update never has to ask again. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Chat without a microphone is still a use; don't hide the app
@@ -57,9 +58,12 @@
             </intent-filter>
         </activity>
 
-        <!-- M3: <service android:name="dev.baucord.VoiceService"
-                          android:foregroundServiceType="microphone"
-                          android:exported="false" /> -->
+        <!-- Keeps the process (and the microphone) running while a
+             session is connected and the app is off screen (D34). -->
+        <service
+            android:name=".VoiceService"
+            android:foregroundServiceType="microphone|mediaPlayback"
+            android:exported="false" />
     </application>
 
 </manifest>

@@ -5,8 +5,10 @@
 //! first slice of the `Platform` trait of ANDROID-SPEC.md §5. Without
 //! hooks every call logs and does nothing, as before.
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use i18n::t;
 
@@ -53,6 +55,31 @@ pub trait Hooks: Send + Sync {
     /// # Errors
     /// The host's own message.
     fn open_url(&self, url: &str) -> Result<(), String>;
+    /// Keep the app running while a session is connected and the app is
+    /// off screen (`Some`: the notification's words), or stop (`None`).
+    fn keep_alive(&self, _notice: Option<&KeepAlive>) {}
+}
+
+/// What the keep-alive notification says (Android's foreground service).
+pub struct KeepAlive {
+    /// The notification channel's name in the system settings.
+    pub channel: String,
+    pub title: String,
+    pub text: String,
+}
+
+/// Connected to `server` (`Some`) or not any more (`None`): the host
+/// keeps the process alive meanwhile, where it has a way to.
+pub fn keep_alive(server: Option<&str>) {
+    let Some(hooks) = HOOKS.get() else { return };
+    match server {
+        Some(server) => hooks.keep_alive(Some(&KeepAlive {
+            channel: t!("notif-channel-voice"),
+            title: t!("notif-connected-title", "server" => server),
+            text: t!("notif-connected-text"),
+        })),
+        None => hooks.keep_alive(None),
+    }
 }
 
 static HOOKS: OnceLock<Box<dyn Hooks>> = OnceLock::new();
@@ -93,7 +120,11 @@ pub fn pick_file(filter: Option<Filter>, on_pick: impl FnOnce(PathBuf) + Send + 
 pub fn pick_failed(name: String, error: String) {
     let _ = slint::invoke_from_event_loop(move || {
         crate::app::with_current(move |app| {
-            let shown = if name.is_empty() { "file".to_string() } else { name };
+            let shown = if name.is_empty() {
+                "file".to_string()
+            } else {
+                name
+            };
             let line = if error == "busy" {
                 t!("file-pick-busy")
             } else if error == "too-large" {

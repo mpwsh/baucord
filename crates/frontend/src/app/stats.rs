@@ -17,7 +17,7 @@ impl AppState {
         kbps_up: f64,
         kbps_down: f64,
     ) {
-        use app_core::stats::{LatencyGrade, latency_grade, net_str};
+        use app_core::stats::{latency_grade, net_str, LatencyGrade};
         let s = self.main.global::<State>();
         s.set_status_text(format!("●  {}", t!("status-connected")).into());
         s.set_status_color(match latency_grade(rtt_ms) {

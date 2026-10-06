@@ -50,10 +50,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use windows::Win32::Media::{
-    Audio::AUDIO_EFFECT_STATE_ON, KernelStreaming::AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION,
-};
-
 use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info, warn};
 use rtrb::{Consumer, Producer};
@@ -61,6 +57,9 @@ use wasapi::{
     AudioCaptureClient, AudioClient, AudioClientProperties, AudioRenderClient, DeviceEnumerator,
     DeviceEventCallbacks, DeviceEventRegistration, Direction, Handle, Role, SampleType,
     StreamCategory, StreamMode, WasapiError, WaveFormat,
+};
+use windows::Win32::Media::{
+    Audio::AUDIO_EFFECT_STATE_ON, KernelStreaming::AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION,
 };
 
 use crate::{

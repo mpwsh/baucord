@@ -1,8 +1,10 @@
 // The APK module. Everything here is packaging: the app is
 // libbaucord_android.so, built by `cargo ndk` (ANDROID-SPEC.md §2, §11)
 // through the two Exec tasks at the bottom, which run before AGP's
-// own preDebugBuild / preReleaseBuild. There is no Kotlin or Java
-// source yet — `android.app.NativeActivity` is the Activity.
+// own preDebugBuild / preReleaseBuild. The only Java is
+// src/main/java/dev/baucord/ (the Activity and the voice service, D30,
+// D34); the launcher icon is rendered from the repo's
+// assets/icons/icon.png by the task at the bottom (D36).
 
 import java.util.Properties
 
@@ -127,6 +129,13 @@ android {
         // stop a build.
         abortOnError = false
     }
+
+    // The default (Java 8) draws a deprecation warning from JDK 21;
+    // D8 desugars 17 for minSdk 29 just the same.
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
 }
 
 // ── cargo-ndk ───────────────────────────────────────────────────────────
@@ -210,3 +219,116 @@ val cargoNdkRelease by tasks.registering(Exec::class) {
 // attaches to them whenever they appear.
 tasks.matching { it.name == "preDebugBuild" }.configureEach { dependsOn(cargoNdkDebug) }
 tasks.matching { it.name == "preReleaseBuild" }.configureEach { dependsOn(cargoNdkRelease) }
+
+// ── Launcher icon: the repo's assets/icons/icon.png (ANDROID-SPEC.md D36) ─
+// Rendered at build time into generated mipmaps, so the phone shows the
+// desktop's icon and follows it when it changes. Every supported phone
+// (API 26+) uses the adaptive icon (res/mipmap-anydpi-v26), whose
+// foreground layer is a 108 dp square the launcher masks to a circle,
+// squircle or rounded square that always shows at least the inner 66 dp
+// circle. A picture with opaque corners is a full-bleed square: it
+// fills the layer and the mask cuts it. One on transparency (a logo) is
+// scaled so its farthest opaque pixel sits on that 66 dp circle — round
+// or square, nothing of it is ever cut — over @color/baucord_bg.
+abstract class LauncherIconTask : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val source: RegularFileProperty
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun render() {
+        val file = source.get().asFile
+        val src = javax.imageio.ImageIO.read(file)
+            ?: throw GradleException("$file: not an image ImageIO reads (a PNG is expected)")
+        val out = outputDir.get().asFile
+        out.deleteRecursively()
+        val fullBleed = listOf(
+            src.getRGB(0, 0), src.getRGB(src.width - 1, 0),
+            src.getRGB(0, src.height - 1), src.getRGB(src.width - 1, src.height - 1),
+        ).all { (it ushr 24) > 200 }
+        val radius = if (fullBleed) 0.0 else opaqueRadius(src)
+        val densities = linkedMapOf(
+            "mdpi" to 1.0, "hdpi" to 1.5, "xhdpi" to 2.0, "xxhdpi" to 3.0, "xxxhdpi" to 4.0,
+        )
+        for ((name, scale) in densities) {
+            val canvas = Math.round(108 * scale).toInt()
+            val layer = java.awt.image.BufferedImage(
+                canvas, canvas, java.awt.image.BufferedImage.TYPE_INT_ARGB,
+            )
+            val factor = if (fullBleed || radius <= 0.0) {
+                // Cover the layer.
+                maxOf(canvas.toDouble() / src.width, canvas.toDouble() / src.height)
+            } else {
+                // The farthest opaque pixel on the 66 dp circle.
+                (33 * scale) / radius
+            }
+            val w = maxOf(1, Math.round(src.width * factor).toInt())
+            val h = maxOf(1, Math.round(src.height * factor).toInt())
+            val g = layer.createGraphics()
+            g.drawImage(scaled(src, w, h), (canvas - w) / 2, (canvas - h) / 2, null)
+            g.dispose()
+            val dir = java.io.File(out, "mipmap-$name").apply { mkdirs() }
+            javax.imageio.ImageIO.write(layer, "png", java.io.File(dir, "ic_launcher_foreground.png"))
+        }
+    }
+
+    /** Distance from the picture's centre to its farthest visible pixel. */
+    private fun opaqueRadius(img: java.awt.image.BufferedImage): Double {
+        val cx = (img.width - 1) / 2.0
+        val cy = (img.height - 1) / 2.0
+        var best = 0.0
+        for (y in 0 until img.height) {
+            for (x in 0 until img.width) {
+                if ((img.getRGB(x, y) ushr 24) > 16) {
+                    best = maxOf(best, Math.hypot(x - cx, y - cy))
+                }
+            }
+        }
+        return best
+    }
+
+    /** High-quality resize: halve step by step, then one bicubic pass. */
+    private fun scaled(img: java.awt.image.BufferedImage, w: Int, h: Int): java.awt.image.BufferedImage {
+        var current = img
+        var cw = img.width
+        var ch = img.height
+        while (cw / 2 >= w && ch / 2 >= h) {
+            cw /= 2
+            ch /= 2
+            current = draw(current, cw, ch)
+        }
+        return draw(current, w, h)
+    }
+
+    private fun draw(img: java.awt.image.BufferedImage, w: Int, h: Int): java.awt.image.BufferedImage {
+        val out = java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+        val g = out.createGraphics()
+        g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
+            java.awt.RenderingHints.VALUE_INTERPOLATION_BICUBIC)
+        g.setRenderingHint(java.awt.RenderingHints.KEY_RENDERING,
+            java.awt.RenderingHints.VALUE_RENDER_QUALITY)
+        g.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
+            java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
+        g.drawImage(img, 0, 0, w, h, null)
+        g.dispose()
+        return out
+    }
+}
+
+val baucordLauncherIcon = tasks.register<LauncherIconTask>("baucordLauncherIcon") {
+    group = "build"
+    description = "assets/icons/icon.png → generated mipmap-*/ic_launcher_foreground.png"
+    source.set(workspaceDir.file("assets/icons/icon.png"))
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.res?.addGeneratedSourceDirectory(
+            baucordLauncherIcon,
+            LauncherIconTask::outputDir,
+        )
+    }
+}

@@ -229,6 +229,11 @@ impl AppState {
     pub fn show_connect_phase(&mut self) {
         self.refresh_device_warning();
         self.main.global::<State>().set_phase(Phase::Connect);
+        // The session is over (unless a reconnect is on its way): the
+        // host may let the app sleep again.
+        if !std::mem::take(&mut self.reconnect_hold) {
+            crate::host::keep_alive(None);
+        }
         let first = !self.startup_done;
         self.startup_done = true;
         let stay_hidden = first && self.settings.startup.start_minimized && cfg!(feature = "tray");

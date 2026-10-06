@@ -243,9 +243,15 @@ mod tests {
     fn labels_name_built_ins_by_role_and_headsets_by_product() {
         assert_eq!(label(&dev(1, kinds::BUILTIN_SPEAKER, "Pixel 8")), SPEAKER);
         assert_eq!(label(&dev(2, kinds::BUILTIN_EARPIECE, "Pixel 8")), EARPIECE);
-        assert_eq!(label(&dev(3, kinds::WIRED_HEADSET, "Pixel 8")), "Wired headset");
+        assert_eq!(
+            label(&dev(3, kinds::WIRED_HEADSET, "Pixel 8")),
+            "Wired headset"
+        );
         assert_eq!(label(&dev(4, kinds::BLE_HEADSET, "Buds")), "Buds");
-        assert_eq!(label(&dev(5, kinds::BLUETOOTH_SCO, " ")), "Bluetooth headset");
+        assert_eq!(
+            label(&dev(5, kinds::BLUETOOTH_SCO, " ")),
+            "Bluetooth headset"
+        );
     }
 
     #[test]

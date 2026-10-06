@@ -42,6 +42,53 @@ public class BaucordActivity extends NativeActivity {
      */
     static native void nativeFilePicked(String path, String name, String error);
 
+    // ── Permissions ──────────────────────────────────────────────────────
+
+    /**
+     * Rust: the system's permission prompts for {@code names}, on the UI
+     * thread (from android_main's thread at startup the request could
+     * land before the Activity is shown). The answer is not passed back:
+     * the voice engine retries the microphone until it opens.
+     */
+    public void askPermissions(final String[] names) {
+        runOnUiThread(() -> requestPermissions(names, 1));
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+            int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        // Granted while connected: the service notification can show now,
+        // and the microphone type is allowed — start it again with both.
+        VoiceService.refresh(this);
+    }
+
+    // ── The voice connection's foreground service (D34) ────────────────
+
+    /**
+     * Rust, on connect: keep the process running in the background — a
+     * foreground service with a notification. Android otherwise freezes
+     * an app soon after it leaves the screen, and the server drops it.
+     * Returns false when the system refused (started from the
+     * background).
+     */
+    public boolean startVoiceService(String channelName, String title, String text) {
+        try {
+            VoiceService.start(this, channelName, title, text);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "the voice service could not start", e);
+            return false;
+        }
+    }
+
+    /** Rust, on disconnect: let the process be an ordinary app again. */
+    public void stopVoiceService() {
+        VoiceService.stop(this);
+    }
+
+    // ── Files ────────────────────────────────────────────────────────────
+
     /** Rust: the system picker for one file of {@code mime}. Any thread. */
     public void pickFile(final String mime, final long maxBytes) {
         runOnUiThread(() -> {

@@ -32,6 +32,9 @@ pub fn save_download(_name: &str, _mime: &str, _bytes: &[u8]) -> Option<Result<S
     None
 }
 
+/// A desktop process keeps running in the background by itself.
+pub fn keep_alive(_server: Option<&str>) {}
+
 /// Whether a saved file is still where it was saved.
 #[must_use]
 pub fn target_exists(target: &Path) -> bool {

@@ -415,6 +415,17 @@ Memory-mode servers (persistence off) still use the legacy
   | KeyPressed { text: Key::Back.into() })` with `mock_elapsed_time`
   + `update_timers_and_animations()` between, asserting on `State`
   and on Logic callbacks hooked to counters. Used for D29 and D32.
+- **`ndk_context::android_context().context()` is the Application,
+  not the Activity** (android-activity 0.6): fine for `AudioManager`,
+  wrong for anything Activity-only (`requestPermissions`, our
+  `BaucordActivity` methods). The Activity is `java::init`'s, from
+  `AndroidApp::activity_as_ptr()` (D33).
+- **The keyboard and system bars on Android** are on the `Window`:
+  `safe-area-insets`, `virtual-keyboard-position/size`. The pages sit
+  in `MainWindow`'s `inset-*` rectangle; a new full-window page must
+  too (D35). The headless harness can set a keyboard with
+  `window.set_virtual_keyboard(pos, size, i_slint_core::InternalToken)`
+  (dev-dependency `i-slint-core = "=1.17.1"`).
 - **Android 16 + targetSdk 36 never delivers `KEYCODE_BACK`**
   (predictive back): the manifest's `enableOnBackInvokedCallback=
   "false"` is what makes every `Key.Back` handler run (D29).

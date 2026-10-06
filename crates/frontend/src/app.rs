@@ -29,8 +29,8 @@ use std::{
     net::SocketAddr,
     rc::{Rc, Weak},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -42,11 +42,11 @@ use app_core::{
 };
 use audio::{PeerAudioSettings, SoundType};
 use client::{
-    AdminCommand, AdminTarget,
-    config::{BindableAction, Settings, peer_key},
+    config::{peer_key, BindableAction, Settings},
     network::{DisconnectKind, LossKind, NetworkControl, NetworkMessage, NetworkThreadHandle},
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
+    AdminCommand, AdminTarget,
 };
 use i18n::t;
 use log::{info, warn};
@@ -362,6 +362,10 @@ pub struct AppState {
     /// Consecutive automatic reconnects since the last successful
     /// admission; capped so a dead server does not spin forever.
     reconnect_attempts: u32,
+    /// The next `show_connect_phase` is a reconnect's pause, not the
+    /// end of the session: the host's keep-alive (Android's foreground
+    /// service) stays on through it (D34).
+    reconnect_hold: bool,
     stream_stats_timer_active: Arc<AtomicBool>,
     /// Once-a-second summaries of frames over the latency budget and
     /// of slow property sets (`video::timing`), replacing per-frame
@@ -622,6 +626,7 @@ pub fn run() {
         keybind_recording: None,
         timers: Vec::new(),
         error_timer: slint::Timer::default(),
+        reconnect_hold: false,
         reconnect_timer: slint::Timer::default(),
         reconnect_attempts: 0,
         stream_stats_timer_active: Arc::new(AtomicBool::new(false)),
@@ -659,11 +664,7 @@ pub fn run() {
     // the desktop wires its SettingsWindow when that is first created.
     if SINGLE_WINDOW_HOST {
         // One window means a phone: touch, a soft keyboard, Back.
-        state
-            .borrow()
-            .main
-            .global::<State>()
-            .set_touch_host(true);
+        state.borrow().main.global::<State>().set_touch_host(true);
         crate::settingsui::wire_page(&state.borrow().main);
         // Same for the stream viewer page (D23).
         crate::viewers::wire_page(&state.borrow().main);
@@ -772,7 +773,7 @@ fn center_on_monitor(_win: &slint::Window) {}
 /// mixed-DPI setups land where they look centred.
 #[cfg(feature = "desktop")]
 fn center_on_monitor(win: &slint::Window) {
-    use i_slint_backend_winit::{WinitWindowAccessor, winit::dpi::PhysicalPosition};
+    use i_slint_backend_winit::{winit::dpi::PhysicalPosition, WinitWindowAccessor};
     win.with_winit_window(|w| {
         let Some(monitor) = w.current_monitor().or_else(|| w.primary_monitor()) else {
             return;
@@ -1393,7 +1394,9 @@ pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl 
     });
 }
 
-/// The "drop to send" overlay, from the winit hook (deferred).
+/// The "drop to send" overlay, from the winit hook (deferred). Only
+/// the desktop's winit hook drops files on the window.
+#[cfg(feature = "desktop")]
 fn set_drop_hover(on: bool) {
     let _ = slint::invoke_from_event_loop(move || {
         with_current(move |app| app.main.global::<State>().set_drop_hover(on));
@@ -2406,7 +2409,7 @@ pub mod tray {
     use i18n::t;
     use log::warn;
 
-    use super::{AppState, with_current};
+    use super::{with_current, AppState};
 
     thread_local! {
         /// Keeps the OS tray item alive for the app's lifetime —

@@ -5,11 +5,13 @@
 //! links. The Java halves are `BaucordActivity`'s, reached through
 //! `java.rs`.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
+};
 
-use frontend::host::{Hooks, OnPick, Saved};
+use frontend::host::{Hooks, KeepAlive, OnPick, Saved};
 
 use crate::java;
 
@@ -33,7 +35,10 @@ impl Hooks for AndroidHost {
     fn pick_file(&self, mime: &str, max_bytes: u64, on_pick: OnPick) {
         {
             let mut slot = pending();
-            if slot.as_ref().is_some_and(|(_, at)| at.elapsed() < PICK_STALE) {
+            if slot
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < PICK_STALE)
+            {
                 drop(slot);
                 frontend::host::pick_failed(String::new(), "busy".to_string());
                 return;
@@ -78,6 +83,20 @@ impl Hooks for AndroidHost {
             Ok(())
         } else {
             Err("no browser on this phone".to_string())
+        }
+    }
+
+    fn keep_alive(&self, notice: Option<&KeepAlive>) {
+        match notice {
+            Some(n) => match java::start_voice_service(&n.channel, &n.title, &n.text) {
+                Ok(true) => log::info!("voice service on: {}", n.title),
+                Ok(false) => log::warn!("voice service refused by the system"),
+                Err(e) => log::warn!("voice service: {e}"),
+            },
+            None => match java::stop_voice_service() {
+                Ok(()) => log::info!("voice service off"),
+                Err(e) => log::warn!("voice service stop: {e}"),
+            },
         }
     }
 }

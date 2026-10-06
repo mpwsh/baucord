@@ -681,6 +681,10 @@ impl AppState {
                     None
                 };
                 self.teardown_connection();
+                // Retrying: the host keeps the process alive meanwhile
+                // (on a phone in the background, the retry could not run
+                // otherwise).
+                self.reconnect_hold = self.reconnect_attempts < MAX_AUTO_RECONNECTS;
                 self.show_connect_phase();
                 if self.reconnect_attempts >= MAX_AUTO_RECONNECTS {
                     self.show_error(&format!("{what} {}", t!("error-lost-gave-up")));

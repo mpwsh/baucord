@@ -182,15 +182,22 @@ turns panning on itself where the host is a touch screen
 the environment would switch the phone's widgets to material, which
 would change how every picker, field and switch looks.
 
-## 5a. The one Java class
+## 5a. The Java, and the icon
 
-`app/src/main/java/dev/baucord/BaucordActivity.java` is the Activity:
-the platform's `NativeActivity` plus what native code cannot receive
-on its own — the system file picker's result — and a few helpers the
-Rust side calls (Downloads, opening files and links). Gradle compiles
-it with the app; there is no Kotlin. Its methods are only called from
-native code, so release builds keep `isMinifyEnabled = false` (R8 would
-strip them). The manifest also opts out of predictive back
+`app/src/main/java/dev/baucord/` holds the only Java: `BaucordActivity`
+(the platform's `NativeActivity` plus what native code cannot receive
+on its own — the file picker's result — and helpers the Rust side calls:
+permissions, Downloads, opening files and links, the voice service)
+and `VoiceService` (the foreground service and notification that keep
+a connected session alive off screen). Gradle compiles them with the
+app; there is no Kotlin. Their methods are only called from native
+code, so release builds keep `isMinifyEnabled = false` (R8 would strip
+them).
+
+The launcher icon is `assets/icons/icon.png` at the repo root, the
+desktop's: the `baucordLauncherIcon` task renders it into the adaptive
+icon's foreground at every density on each build (ANDROID-SPEC.md D36).
+Change the PNG and the next build picks it up. The manifest also opts out of predictive back
 (`enableOnBackInvokedCallback="false"`): on Android 16 an app targeting
 API 36 is otherwise never sent the Back key. ANDROID-SPEC.md D29–D30.
 

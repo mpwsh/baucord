@@ -25,14 +25,20 @@ mod hello;
 use std::sync::OnceLock;
 
 use slint::android::{
-    AndroidApp,
     android_activity::{MainEvent, PollEvent},
+    AndroidApp,
 };
 
-/// Runtime permissions the engine needs before it can do its job. Only
-/// the microphone for now; `POST_NOTIFICATIONS` joins when the
-/// foreground service does (spec §4.4, M3).
-const RUNTIME_PERMISSIONS: &[&str] = &["android.permission.RECORD_AUDIO"];
+/// Runtime permissions asked for at startup: the microphone, and from
+/// Android 13 the notification that comes with staying connected in the
+/// background (the voice service, D34). One prompt each, together.
+fn runtime_permissions() -> Vec<&'static str> {
+    let mut names = vec!["android.permission.RECORD_AUDIO"];
+    if AndroidApp::sdk_version() >= 33 {
+        names.push("android.permission.POST_NOTIFICATIONS");
+    }
+    names
+}
 
 /// Process-wide one-shots: Android may call `android_main` more than
 /// once per process (see the note at the end of it), but a logger and
@@ -52,6 +58,9 @@ fn android_main(app: AndroidApp) {
         logging::init(data_dir.as_deref());
         install_panic_hook();
     });
+    // Every Java call goes to the Activity itself (java.rs: ndk-context
+    // only holds the Application).
+    java::init(app.vm_as_ptr(), app.activity_as_ptr());
 
     log::info!(
         "baucord android {} starting (sdk {}, data dir {:?})",
@@ -121,7 +130,7 @@ fn on_poll_event(event: &PollEvent<'_>) {
         MainEvent::Start => log::info!("lifecycle: start"),
         MainEvent::Resume { .. } => {
             log::info!("lifecycle: resume");
-            for permission in RUNTIME_PERMISSIONS {
+            for permission in runtime_permissions() {
                 match java::has_permission(permission) {
                     Ok(true) => {}
                     Ok(false) => log::warn!("permission {permission} still not granted"),
@@ -145,9 +154,8 @@ fn on_poll_event(event: &PollEvent<'_>) {
 /// microphone, it just cannot join voice.
 #[cfg(not(feature = "hello"))]
 fn request_missing_permissions() {
-    let missing: Vec<&str> = RUNTIME_PERMISSIONS
-        .iter()
-        .copied()
+    let missing: Vec<&str> = runtime_permissions()
+        .into_iter()
         .filter(|p| match java::has_permission(p) {
             Ok(granted) => !granted,
             Err(e) => {
