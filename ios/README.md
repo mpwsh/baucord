@@ -10,7 +10,7 @@ sign and install it. The plan and every decision are in
 
 | what | how | why |
 |---|---|---|
-| Xcode 26 or later | App Store; open it once to install the iOS platform and accept the licence | the SDK, the simulator, signing, `xcodebuild`, `devicectl` |
+| Xcode 16 or later | App Store; open it once to install the iOS platform and accept the licence | the SDK, the simulator, signing, `xcodebuild`, `devicectl`. Nothing in the project needs a newer one for the simulator. The phone may: Xcode refuses to install on an iPhone whose iOS it does not know yet (update Xcode then). TestFlight uploads need Xcode 26 or later |
 | Command-line tools selected | `sudo xcode-select -s /Applications/Xcode.app` | so `xcodebuild` is Xcode's, not the bare CLT's |
 | Homebrew | <https://brew.sh> | for the two tools below |
 | XcodeGen | `brew install xcodegen` | writes `baucord.xcodeproj` from `project.yml` |
@@ -18,7 +18,9 @@ sign and install it. The plan and every decision are in
 | Rust | <https://rustup.rs> | |
 | the iOS targets, **for this repo's toolchain** | `cd <repo> && rustup target add aarch64-apple-ios aarch64-apple-ios-sim` | `rust-toolchain.toml` pins the toolchain; running inside the repo adds them to that one |
 
-An Apple-silicon Mac is assumed (the simulator runs arm64 builds).
+An Apple-silicon Mac is assumed (the simulator runs arm64 builds). Any
+iPhone simulator on **iOS 17 or later** runs the app — the iOS 18.1 one
+included.
 
 ## 2. Run it
 
@@ -26,7 +28,8 @@ An Apple-silicon Mac is assumed (the simulator runs arm64 builds).
 ios/run.sh --hello        # first: the M0 smoke test in the simulator
 ios/run.sh                # the client in the simulator
 ios/run.sh --device       # the client on your iPhone
-ios/run.sh --help         # --release, --sim "iPhone 17", --no-build, --no-log, --open
+ios/run.sh --os 18.1      # the client on an iOS 18.1 iPhone simulator
+ios/run.sh --help         # --release, --sim "iPhone 16" (or a UDID), --no-build, --no-log, --open
 ```
 
 If the shell says *permission denied*, the files lost their executable
@@ -41,6 +44,10 @@ app's log until Ctrl+C. The first build downloads a prebuilt Skia and
 compiles the whole engine for iOS: several minutes. `ios/run.sh --open`
 opens the project in Xcode instead, where ⌘R does the same and the
 debugger works.
+
+Without `--os` or `--sim`, `run.sh` uses a booted iPhone simulator, else
+the newest iOS installed; it prints which (`>> simulator iPhone 16 (iOS
+18.1) …`). `xcrun simctl list devices` lists them all.
 
 In the simulator, a server on this Mac is `127.0.0.1:51000`, and the
 simulator's microphone is the Mac's (macOS asks once).
@@ -72,11 +79,20 @@ After the first USB run the phone also works over Wi-Fi.
   what users send; the same format as the desktop log, rolled at
   5 MB.
 
-## 5. What is here
+## 5. The version
+
+The app's version is the crates' — `crates/ios/Cargo.toml`, which moves
+together with every other platform's (1.1.7 now). `run.sh` writes it
+into `Config/Version.xcconfig` on every run, with the commit count as
+the build number; the cargo build phase stops with an error if the two
+ever disagree (a bump, then a build from Xcode's window before
+`run.sh`: run `ios/run.sh --open` once).
+
+## 6. What is here
 
 ```
 project.yml                  XcodeGen: target, Info.plist keys, build phases
-Config/Base.xcconfig         shared settings; includes Config/Local.xcconfig
+Config/Base.xcconfig         shared settings; includes Version.xcconfig and Local.xcconfig
 Config/Local.xcconfig.example
 scripts/build_with_cargo.sh  the cargo build phase (Xcode runs it)
 scripts/render_icon.sh       the icon phase: ../assets/icons/icon.png → AppIcon
@@ -85,5 +101,6 @@ run.sh                       generate, build, install, launch, log
 ```
 
 Generated, not committed: `baucord.xcodeproj/`, `Generated/Info.plist`,
-the rendered icon, `build/` (run.sh's derived data). Cargo's output
+`Config/Version.xcconfig`, the rendered icon, `build/` (run.sh's
+derived data). Cargo's output
 for Xcode builds is `target/xcode/` at the repo root.

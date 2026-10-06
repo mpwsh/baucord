@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "android"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "android_logger",
  "chrono",
@@ -989,7 +989,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "1.1.5"
+version = "1.1.7"
 dependencies = [
  "audio",
  "crossbeam-channel",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "client",
  "env_logger",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "frontend"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "app-core",
  "arboard",
@@ -3308,7 +3308,7 @@ dependencies = [
 
 [[package]]
 name = "ios"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -5110,7 +5110,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "protocol"
-version = "1.1.5"
+version = "1.1.7"
 dependencies = [
  "bytes",
  "log",
@@ -5816,7 +5816,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "1.1.5"
+version = "1.1.7"
 dependencies = [
  "chrono",
  "clap 4.6.5",
@@ -6661,7 +6661,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "1.1.5"
+version = "1.1.7"
 dependencies = [
  "base64",
  "bytes",

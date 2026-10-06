@@ -179,7 +179,7 @@ worth re-running.
   (`ChatHistory`, `ChatItem`, `FileMeta`), `roster.rs`, `menu.rs`,
   `markdown.rs`, `images.rs`, `emoji.rs`.
 - `i18n` — Fluent bundles; `audio`, `video` — codecs and devices.
-- `frontend` (1.1.6, versioned with the public crates) — the client's UI logic: `app.rs` (`AppState`,
+- `frontend` (1.1.7, versioned with the public crates) — the client's UI logic: `app.rs` (`AppState`,
   the event pump, the models), `settingsui`, `adminui`, `media`,
   `viewers`, `present`, and — until the platform trait replaces them
   (`ANDROID-SPEC.md` §5) — the host-only modules `hotkeys`,
@@ -463,6 +463,15 @@ Memory-mode servers (persistence off) still use the legacy
   filter has no `category.DEFAULT` ("unable to resolve Intent"). `am`
   exits 0 on errors; check its words (D37). A Linux PowerShell 7 can
   be fetched from the PowerShell GitHub releases to test `run.ps1`.
+- **The public crates move together.** `protocol`, `transport`,
+  `client`, `server`, `frontend`, `desktop`, `android` and `ios` carry
+  one version — the release's — and every platform reads it from its
+  crate (the updater and About from `frontend`, the wire from
+  `protocol`, Android's `versionName` and iOS's `MARKETING_VERSION`
+  from their crates; IOS-SPEC.md D25). Bump all eight at once;
+  `cargo test -p protocol --test versions` fails otherwise. 1.1.6
+  bumped only the apps, and clients told the server they were 1.1.5.
+  The internal libraries keep their own numbers.
 - **`target_os = "ios"` is not macOS.** A `cfg(target_os = "macos")`
   branch does not cover the iPhone, and crates declare APIs per OS:
   socket2 0.6.5 has `set_tclass_v6` on macOS but not iOS (IOS-SPEC.md
@@ -659,6 +668,10 @@ roster, animated avatars, anything built on progress (a leaderboard,
 level-gated invites), `Auth::Account` only if a server ever wants
 people rather than devices. Plus:
 
+- **Versions bumped to 1.1.7 on 2026-10-06** (the eight public
+  crates): everything since 1.1.6 — Android, echo cancellation, Slint
+  1.18.1, iOS M0 — ships as 1.1.7 on every platform; tag the release
+  `v1.1.7`.
 - **iOS** (IOS-SPEC.md §12): M0 is written and awaits its first build
   on the user's Mac — record what it says in IOS-SPEC.md §14 and here.
   Then M1 (the client on the iPhone) … M5 (TestFlight). Users still

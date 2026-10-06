@@ -3,11 +3,12 @@
 # project, build, install, launch, and stream the app's log — in the
 # simulator by default, on a connected iPhone with --device.
 #
-#   ios/run.sh                     simulator (a booted iPhone, else the newest), Debug
+#   ios/run.sh                     simulator (a booted iPhone, else the newest iOS), Debug
 #   ios/run.sh --device            the iPhone on USB or the network (needs Config/Local.xcconfig)
 #   ios/run.sh --release           the Release configuration
 #   ios/run.sh --hello             the M0 smoke test instead of the client
-#   ios/run.sh --sim "iPhone 17"   a specific simulator, by name
+#   ios/run.sh --os 18.1           an iPhone simulator on that iOS (any iOS 17 or later works)
+#   ios/run.sh --sim "iPhone 16"   a specific simulator, by name or UDID (with --os: on that iOS)
 #   ios/run.sh --no-build          reinstall and relaunch the last build
 #   ios/run.sh --no-log            launch and return (no log stream)
 #   ios/run.sh --open              generate the project and open it in Xcode
@@ -23,6 +24,7 @@ DEVICE=0
 CONFIG=Debug
 FEATURES=""
 SIM_NAME=""
+SIM_OS=""
 BUILD=1
 STREAM_LOG=1
 OPEN=0
@@ -35,11 +37,12 @@ while [ $# -gt 0 ]; do
     --device) DEVICE=1 ;;
     --release) CONFIG=Release ;;
     --hello) FEATURES=hello ;;
-    --sim) [ $# -ge 2 ] || die "--sim needs a simulator name"; SIM_NAME="$2"; shift ;;
+    --sim) [ $# -ge 2 ] || die "--sim needs a simulator name or UDID"; SIM_NAME="$2"; shift ;;
+    --os) [ $# -ge 2 ] || die "--os needs an iOS version, e.g. 18.1"; SIM_OS="$2"; shift ;;
     --no-build) BUILD=0 ;;
     --no-log) STREAM_LOG=0 ;;
     --open) OPEN=1 ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
   shift
@@ -63,6 +66,22 @@ if [ $DEVICE -eq 1 ] && [ ! -f "$IOS/Config/Local.xcconfig" ]; then
   die "no Config/Local.xcconfig: copy Config/Local.xcconfig.example and set DEVELOPMENT_TEAM (your Apple ID's team in Xcode → Settings → Accounts)"
 fi
 
+# -- Version ------------------------------------------------------------
+# The crates' version — the public crates move together and every
+# platform ships that number (SESSION-GUIDE.md §4) — and a build number
+# that grows with every commit (TestFlight refuses one it has seen).
+# Base.xcconfig includes the file; it is rewritten on every run, so
+# builds from Xcode's window get it too, and the cargo phase refuses to
+# build with a version that disagrees with the crate's.
+VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/crates/ios/Cargo.toml" | head -n 1)"
+[ -n "$VERSION" ] || die "no version line in crates/ios/Cargo.toml"
+BUILD_NUMBER="$(git -C "$REPO" rev-list --count HEAD 2>/dev/null || echo 1)"
+printf '%s\n' \
+  "// Written by ios/run.sh from crates/ios/Cargo.toml and the commit count. Do not edit." \
+  "MARKETING_VERSION = $VERSION" \
+  "CURRENT_PROJECT_VERSION = $BUILD_NUMBER" > "$IOS/Config/Version.xcconfig"
+say "version $VERSION (build $BUILD_NUMBER)"
+
 # -- Project ------------------------------------------------------------
 say "xcodegen generate"
 (cd "$IOS" && mkdir -p Generated && xcodegen generate --quiet)
@@ -79,7 +98,7 @@ if [ $DEVICE -eq 1 ]; then
   # The first paired iPhone that is reachable (USB or network); iPads
   # report the platform "iOS" too, hence the device type.
   xcrun devicectl list devices --json-output "$TMP/devices.json" >/dev/null 2>&1 \
-    || die "xcrun devicectl failed — is Xcode 26 or later installed?"
+    || die "xcrun devicectl failed — is Xcode 15 or later installed and selected (xcode-select -p)?"
   TARGET_ID="$(python3 - "$TMP/devices.json" <<'PY'
 import json, sys
 devices = json.load(open(sys.argv[1])).get("result", {}).get("devices", [])
@@ -99,10 +118,10 @@ PY
   DESTINATION="id=$TARGET_ID"
 else
   xcrun simctl list devices available --json > "$TMP/sims.json"
-  TARGET_ID="$(python3 - "$TMP/sims.json" "$SIM_NAME" <<'PY'
+  PICK="$(python3 - "$TMP/sims.json" "$SIM_NAME" "$SIM_OS" <<'PY'
 import json, re, sys
 data = json.load(open(sys.argv[1]))["devices"]
-wanted = sys.argv[2]
+wanted, wanted_os = sys.argv[2], sys.argv[3]
 def version(runtime):
     m = re.search(r"iOS-(\d+)-(\d+)", runtime)
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
@@ -111,15 +130,21 @@ phones = [
     for rt, ds in data.items() if "iOS" in rt
     for d in ds if d.get("isAvailable") and "iPhone" in d.get("name", "")
 ]
+if wanted_os:
+    # "18.1" → that runtime; "18" → any 18.x.
+    parts = tuple(int(p) for p in wanted_os.split(".")[:2] if p.isdigit())
+    phones = [p for p in phones if p[0][:len(parts)] == parts]
 if wanted:
-    phones = [p for p in phones if p[1]["name"] == wanted]
+    phones = [p for p in phones if wanted in (p[1]["name"], p[1]["udid"])]
 booted = [p for p in phones if p[1].get("state") == "Booted"]
 pick = max(booted or phones, key=lambda p: p[0], default=None)
-print(pick[1]["udid"] if pick else "")
+if pick:
+    print("%s|%s (iOS %d.%d)" % (pick[1]["udid"], pick[1]["name"], pick[0][0], pick[0][1]))
 PY
 )"
-  [ -n "$TARGET_ID" ] || die "no iPhone simulator${SIM_NAME:+ named \"$SIM_NAME\"}: add one in Xcode → Window → Devices and Simulators"
-  say "simulator $TARGET_ID"
+  [ -n "$PICK" ] || die "no iPhone simulator${SIM_NAME:+ \"$SIM_NAME\"}${SIM_OS:+ on iOS $SIM_OS}: add one in Xcode → Window → Devices and Simulators (xcrun simctl list devices shows what is there)"
+  TARGET_ID="${PICK%%|*}"
+  say "simulator ${PICK#*|} $TARGET_ID"
   xcrun simctl boot "$TARGET_ID" >/dev/null 2>&1 || true   # already booted is fine
   open -a Simulator --args -CurrentDeviceUDID "$TARGET_ID" || true
   SDK=iphonesimulator

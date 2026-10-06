@@ -47,8 +47,9 @@ targets:
         # Every iPhone that runs iOS 17 and the simulator on Apple
         # silicon are arm64; the cargo phase builds exactly that.
         ARCHS: arm64
-        MARKETING_VERSION: "1.1.6"
-        CURRENT_PROJECT_VERSION: "1"
+        # MARKETING_VERSION / CURRENT_PROJECT_VERSION come from
+        # Config/Version.xcconfig (ios/run.sh writes it from the crate's
+        # version); set here they would override it.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Automatic
       configs:

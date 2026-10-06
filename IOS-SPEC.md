@@ -106,7 +106,7 @@ naming trap like `libandroid.so`; the binary is `[[bin]] name =
 
 | what | where | notes |
 |---|---|---|
-| Xcode **26 or later** (27 is current) | App Store | the iOS SDK, the simulator, signing, `xcodebuild`, `xcrun devicectl` (device install and log); open it once to install the iOS platform |
+| Xcode **16 or later** (27 is current) | App Store | the iOS SDK, the simulator, signing, `xcodebuild`, `xcrun devicectl` (device install and log); open it once to install the iOS platform. Nothing in the project needs a newer Xcode for the simulator, and any iPhone simulator on iOS 17 or later runs the app (D4) — the user's iOS 18.1 one included (D24). The phone may need a newer Xcode (one that knows the phone's iOS); App Store Connect takes uploads only from Xcode 26 or later (since 2026-04-28) |
 | Xcode selected | `sudo xcode-select -s /Applications/Xcode.app` | otherwise `xcodebuild` is the bare Command Line Tools' |
 | Homebrew | <https://brew.sh> | for the next two |
 | XcodeGen | `brew install xcodegen` | the project from `project.yml` — Slint's documented route for Rust apps |
@@ -471,9 +471,10 @@ Everything else the app does is Rust.
 
 ```sh
 ios/run.sh --hello        # M0 smoke test, simulator
-ios/run.sh                # the client, simulator (a booted iPhone, else the newest)
+ios/run.sh                # the client, simulator (a booted iPhone, else the newest iOS)
+ios/run.sh --os 18.1      # an iPhone simulator on that iOS (D24)
 ios/run.sh --device       # the client on the iPhone (needs Config/Local.xcconfig)
-ios/run.sh --release | --sim "iPhone 17" | --no-build | --no-log | --open
+ios/run.sh --release | --sim "iPhone 16" (name or UDID) | --no-build | --no-log | --open
 ```
 
 `run.sh` regenerates the project (XcodeGen), builds with `xcodebuild`
@@ -501,6 +502,13 @@ that lost the executable bit (a commit from Windows) still builds.
 `BAUCORD_CARGO_FEATURES=hello` (a build setting, which `run.sh` always
 passes) builds the smoke test.
 
+**The version** is the crates' (D25): `run.sh` writes
+`Config/Version.xcconfig` on every run — `MARKETING_VERSION` from
+`crates/ios/Cargo.toml`, `CURRENT_PROJECT_VERSION` = the commit count,
+which only grows, as TestFlight requires — and `Base.xcconfig`
+includes it; the cargo phase stops the build when the bundle's version
+and the crate's disagree.
+
 The Info.plist (from `project.yml`): the version and build number
 from `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` (XcodeGen would
 otherwise write "1.0" and "1"), the scene manifest, the launch colour,
@@ -524,11 +532,10 @@ manifest (`PrivacyInfo.xcprivacy`) declaring the "required reason"
 APIs the binary uses — decided from `nm -u` on the built executable;
 expected: file timestamps (`stat`), system boot time (cpal's iOS host
 calls `mach_absolute_time`; std's `Instant` uses `clock_gettime`, which
-is not on the list), disk space if `sysinfo` reads it — the
+is not on the list), disk space if `sysinfo` reads it — and the
 `ITSAppUsesNonExemptEncryption` answer (standard TLS 1.3 through
-rustls; the user's call), and `CURRENT_PROJECT_VERSION` growing with
-every upload (the commit count, as Slint's CI does).
-`MARKETING_VERSION` follows the workspace version.
+rustls; the user's call). The build number already grows with every
+commit (D25).
 
 CI: none in v1 (Android's D21 stance: testing is local). If wanted,
 Slint's model fits — CI builds an unsigned archive on a macOS runner,
@@ -590,6 +597,8 @@ each proves. Decisions:
 | D21 | XcodeGen + one cargo build phase (Slint's documented route), the signing team in an uncommitted `Local.xcconfig` included by `Base.xcconfig` (`#include?`), Xcode's cargo output in `target/xcode/` | a committed `.xcodeproj` is unreadable in review; machine settings stay out of the repository |
 | D22 | `ios/run.sh` (bash 3.2) and the two build-phase scripts were run under a bash 3.2.57 built from Apple's sources against stand-in `xcodegen`/`xcodebuild`/`xcrun`/`sips`/`codesign`: simulator choice (booted iPhone first, else the newest iOS; never an iPad or a watch), `--device` (paired iPhone, profile updates, `--console`), `--hello`/`--release`/`--no-log`/`--no-build`, the build phase's triples, features, dSYM, signing and its errors. What stand-ins cannot prove: the real JSON of `devicectl`/`simctl`, XcodeGen's reading of `project.yml`, Xcode's environment | macOS ships bash 3.2, where an empty array under `set -u` is an error; the idioms that avoid it are now tested, not assumed |
 | D23 | **Reviewed by a second reader** before hand-over, against XcodeGen's ProjectSpec and sources, the xcodebuild man page, Flutter's devicectl/simctl usage, Apple's documentation and the crate sources. No blocker on the simulator path. Fixed from it: `-allowProvisioningDeviceRegistration` (without it the first `--device` build cannot get a profile for an unregistered phone); the build phases call their scripts through `bash` (a Windows commit drops the executable bit); `CFBundleShortVersionString`/`CFBundleVersion` from the build settings (XcodeGen hard-codes "1.0"/"1"); dSYMs only where the configuration asks (not on every Debug build); `grep` without `-q` under `pipefail` (rustup could die of EPIPE — reproduced 1 in 3000 under bash 3.2); only iPhones among paired devices; `UIRequiresFullScreen` dropped (iPad-only, deprecated); the wording of D1, D6, §4.3, §11 and §13 (wgpu is iOS's render path; the iOS 27 requirement applies to apps built with its SDK; boot-time APIs come from cpal; the `SO_NET_SERVICE_TYPE` constants are not in `libc`) | the scripts cannot run here; a reader who had not written them checked them against the tools' own documentation |
+| D24 | **Any iPhone simulator on iOS 17 or later** (2026-10-06, the user has the iOS 18.1 one): nothing in M0 needs a newer runtime — the deployment target is 17.0, the scene manifest works from iOS 13, and the iOS 17+ APIs of later milestones are on the 18.1 runtime too. `run.sh --os 18.1` picks an iPhone simulator on that runtime (`--os 18` any 18.x, the newest first), and `--sim` takes a name or a UDID; the chosen one is printed with its iOS. Xcode 16 or later builds it; the phone may need the Xcode that knows its iOS, and TestFlight needs Xcode 26+ | the user's machine decides which simulators exist; the script should take what is there |
+| D25 | **One version for every platform: the public crates', 1.1.7** (2026-10-06). The eight crates whose version users, the server and the stores see — `protocol`, `transport`, `client`, `server`, `frontend`, `desktop`, `android`, `ios` — move together (1.1.6 had moved only the apps: they said 1.1.6 and told the server 1.1.5, the protocol crate's version). Every platform reads the number from its crate: the desktop's updater and About from `frontend`, the wire's `client_version` from `protocol`, Android's default `versionName` from `crates/android/Cargo.toml` (Gradle, through `providers.fileContents`; the release workflow checks the tag against it), iOS's `MARKETING_VERSION` from `crates/ios/Cargo.toml` (`run.sh` → `Config/Version.xcconfig`, build number = commit count, the cargo phase refuses a mismatch). `crates/protocol/tests/versions.rs` fails when one of the eight is bumped alone. The internal libraries (`app-core`, `audio`, `video`, `ui`, `i18n`) keep their own numbers | one number per release, written once per crate and checked |
 
 What the first Mac build will tell, in order: whether XcodeGen accepts
 `project.yml`; whether libopus's cmake build and ring compile for iOS;

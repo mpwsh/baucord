@@ -28,6 +28,18 @@ val cargoFeatures: String = (project.findProperty("cargoFeatures") as String?) ?
 val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 // The Cargo workspace: the repo root, one level above android/.
 val workspaceDir = rootProject.layout.projectDirectory.dir("..")
+// The version every platform ships — the public crates move together
+// (SESSION-GUIDE.md §4) — as crates/android/Cargo.toml says it. Read
+// through `providers` so Gradle tracks the file as a configuration
+// input. Not named `versionName`/`version`, which a script val would
+// shadow (or be shadowed by) inside `android { }`.
+val baucordCrateVersion: String = providers
+    .fileContents(workspaceDir.file("crates/android/Cargo.toml"))
+    .asText.get()
+    .lineSequence()
+    .firstOrNull { it.startsWith("version = \"") }
+    ?.substringAfter('"')?.substringBefore('"')
+    ?: throw GradleException("crates/android/Cargo.toml has no version line")
 // One number for AGP's compileSdk and for the android.jar the Rust
 // build compiles Slint's Java helper against (see ANDROID_JAR below).
 // Not named like AGP's own deprecated String property on the android
@@ -70,14 +82,15 @@ android {
         minSdk = 29
         targetSdk = 36
         // versionCode counts up every build that leaves the machine;
-        // versionName follows the workspace version (spec §11). The
+        // versionName is the crates' version (spec §11, D39). The
         // release workflow passes both (-PbaucordVersionCode=<run
-        // number> -PbaucordVersionName=<tag>); local builds take the
-        // defaults, which install over anything (same or lower code).
+        // number> -PbaucordVersionName=<tag>, after checking the tag
+        // is that version); local builds take the defaults, which
+        // install over anything (same or lower code).
         versionCode = (project.findProperty("baucordVersionCode") as String?)
             ?.trim()?.toIntOrNull() ?: 1
         versionName = (project.findProperty("baucordVersionName") as String?)
-            ?.trim()?.takeIf { it.isNotEmpty() } ?: "1.1.6"
+            ?.trim()?.takeIf { it.isNotEmpty() } ?: baucordCrateVersion
 
         ndk {
             abiFilters += cargoTargets.split(',').map { it.trim() }

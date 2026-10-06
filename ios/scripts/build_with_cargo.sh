@@ -47,6 +47,16 @@ if ! rustup target list --installed | grep -x "$TRIPLE" >/dev/null; then
   exit 1
 fi
 
+# The bundle's version must be the crate's: every platform ships the
+# crates' version (SESSION-GUIDE.md §4). ios/run.sh writes it into
+# Config/Version.xcconfig; a build from Xcode's window before that, or
+# after a bump, would otherwise ship a stale number.
+CRATE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/crates/ios/Cargo.toml" | head -n 1)"
+if [ "${MARKETING_VERSION:-}" != "$CRATE_VERSION" ]; then
+  echo "error: the app's version is '${MARKETING_VERSION:-}' but crates/ios/Cargo.toml says $CRATE_VERSION — run ios/run.sh (or ios/run.sh --open) once to refresh Config/Version.xcconfig"
+  exit 1
+fi
+
 if [ "${CONFIGURATION:-Debug}" = "Release" ]; then
   PROFILE=release
   PROFILE_FLAG=--release
