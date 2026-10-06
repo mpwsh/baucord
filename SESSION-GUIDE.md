@@ -426,6 +426,15 @@ Memory-mode servers (persistence off) still use the legacy
   too (D35). The headless harness can set a keyboard with
   `window.set_virtual_keyboard(pos, size, i_slint_core::InternalToken)`
   (dev-dependency `i-slint-core = "=1.17.1"`).
+- **Start the app the way the launcher does, not by a hard-coded
+  class**: `cmd package resolve-activity --brief -a
+  android.intent.action.MAIN -c android.intent.category.LAUNCHER
+  dev.baucord` (last line = the component), then `am start -n` it; or
+  `monkey -p dev.baucord 1`. Not an implicit `am start … dev.baucord`:
+  Activity starts resolve with `MATCH_DEFAULT_ONLY`, and our launcher
+  filter has no `category.DEFAULT` ("unable to resolve Intent"). `am`
+  exits 0 on errors; check its words (D37). A Linux PowerShell 7 can
+  be fetched from the PowerShell GitHub releases to test `run.ps1`.
 - **In `build.gradle.kts`, never write `java.awt.…` / `java.io.…`
   out in full**: `java` resolves to the project's `java` extension (AGP
   applies java-base) and the script fails with "Unresolved reference:

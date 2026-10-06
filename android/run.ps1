@@ -137,8 +137,22 @@ if ($LASTEXITCODE -ne 0) { Fail "install failed (a signature change needs 'adb u
 
 & $adb -s $serial shell am force-stop dev.baucord | Out-Null
 & $adb -s $serial logcat -c
-& $adb -s $serial shell am start -n dev.baucord/android.app.NativeActivity | Out-Null
-if ($LASTEXITCODE -ne 0) { Fail "could not start the activity" }
+# What tapping the icon does: ask the package manager for the launcher
+# Activity, then start that one by name, so this never hard-codes the
+# class. (An implicit `am start ... dev.baucord` does not work: starting
+# an Activity only matches filters that also list category.DEFAULT,
+# which a launcher entry has no reason to.) Both commands report
+# failures as text with exit code 0, so stderr is merged on the device
+# (a local 2>&1 would throw under ErrorActionPreference Stop) and the
+# words are checked. `--brief` prints the component on its last line.
+$resolved = @(& $adb -s $serial shell "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER dev.baucord 2>&1" |
+    ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+$component = $resolved | Select-Object -Last 1
+if ($component -notmatch '^dev\.baucord/') {
+    Fail "no launcher Activity for dev.baucord on $serial (is it installed? adb shell pm list packages dev.baucord):`n$($resolved -join "`n")"
+}
+$started = (& $adb -s $serial shell "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n $component 2>&1") -join "`n"
+if ($LASTEXITCODE -ne 0 -or $started -match "Error|Exception") { Fail "could not start ${component}:`n$started" }
 
 if ($NoLog) { exit 0 }
 # Ours plus the native crash dumper (DEBUG) - Ctrl+C to stop; the app stays up.
