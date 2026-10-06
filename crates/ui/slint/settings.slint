@@ -814,6 +814,7 @@ component AudioPanel inherits VerticalLayout {
     }
     Setting {
         label: Tr.audio-output-device;
+        hint: Tr.audio-output-hint;
         Dropdown {
             options: SettingsState.output-devices;
             current <=> SettingsState.output-index;
@@ -1027,11 +1028,17 @@ component SettingsNav inherits VerticalLayout {
     NavItem { text: Tr.tab-general;   icon: IconSet.SlidersHorizontal; tall: root.narrow; active: !root.narrow && root.tab == 1; clicked => { root.picked(1); } }
     NavItem { text: Tr.tab-audio;     icon: IconSet.Volume2;           tall: root.narrow; active: !root.narrow && root.tab == 2; clicked => { root.picked(2); } }
     NavItem { text: Tr.sounds-header; icon: IconSet.Bell;              tall: root.narrow; active: !root.narrow && root.tab == 3; clicked => { root.picked(3); } }
-    NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard;          tall: root.narrow; active: !root.narrow && root.tab == 4; clicked => { root.picked(4); } }
+    // Shortcuts need a keyboard the OS lets us watch: not on a phone.
+    if !State.touch-host : NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard; tall: root.narrow; active: !root.narrow && root.tab == 4; clicked => { root.picked(4); } }
     NavItem { text: Tr.tab-servers;   icon: IconSet.Server;            tall: root.narrow; active: !root.narrow && root.tab == 5; clicked => { root.picked(5); } }
-    Rectangle { }
+    // Credits and About: their own group. The window's column puts it
+    // at the bottom; the phone's list keeps it under the rest, a group
+    // gap apart, instead of past a screen of empty space.
+    if !root.narrow : Rectangle { }
+    if root.narrow : Rectangle { height: Theme.gap-lg; }
     NavItem { text: Tr.tab-credits;   icon: IconSet.Heart;             tall: root.narrow; active: !root.narrow && root.tab == 6; clicked => { root.picked(6); } }
     NavItem { text: Tr.tab-about;     icon: IconSet.Info;              tall: root.narrow; active: !root.narrow && root.tab == 7; clicked => { root.picked(7); } }
+    if root.narrow : Rectangle { }
 }
 
 /// The selected section, scrolling: the wide layout's right column,
@@ -1066,23 +1073,48 @@ component SettingsContent inherits ScrollView {
     }
 }
 
-/// Reset to defaults · Save & close.
+/// Reset to defaults · Save & close. Resetting erases the saved
+/// servers, the nickname and the picture, so it asks first, right here:
+/// the footer turns into the question (one place for the window and
+/// the phone page, no dialog on top of a dialog).
 component SettingsFooter inherits Rectangle {
-    height: 64px;
+    property <bool> confirming: false;
+    height: footer.preferred-height;
     background: Theme.bg-primary;
     Rectangle { y: 0; height: 1px; width: 100%; background: Theme.border; }
-    HorizontalLayout {
+    footer := VerticalLayout {
         padding: Theme.gap-md;
         spacing: Theme.gap-sm;
-        Rectangle { }
-        Btn {
-            text: Tr.reset-defaults;
-            clicked => { SettingsLogic.reset-defaults(); }
+        if root.confirming : Text {
+            text: Tr.reset-confirm-body;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
         }
-        Btn {
-            text: Tr.save-and-close;
-            accent: true;
-            clicked => { SettingsLogic.save-and-close(); }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Rectangle { }
+            if !root.confirming : Btn {
+                text: Tr.reset-defaults;
+                clicked => { root.confirming = true; }
+            }
+            if !root.confirming : Btn {
+                text: Tr.save-and-close;
+                accent: true;
+                clicked => { SettingsLogic.save-and-close(); }
+            }
+            if root.confirming : Btn {
+                text: Tr.cancel;
+                clicked => { root.confirming = false; }
+            }
+            if root.confirming : Btn {
+                text: Tr.reset-confirm;
+                danger: true;
+                clicked => {
+                    root.confirming = false;
+                    SettingsLogic.reset-defaults();
+                }
+            }
         }
     }
 }

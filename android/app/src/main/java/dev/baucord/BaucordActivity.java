@@ -1,0 +1,253 @@
+package dev.baucord;
+
+import android.app.NativeActivity;
+import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.content.Intent;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.provider.OpenableColumns;
+import android.util.Log;
+import android.webkit.MimeTypeMap;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+
+/**
+ * The platform's NativeActivity plus what native code cannot do on its
+ * own (ANDROID-SPEC.md D30): an activity result. NativeActivity never
+ * hands one to native code, so the system file picker needs this
+ * subclass; the other helpers sit here because they are a few lines of
+ * Java against a page of JNI. Everything is called from Rust
+ * ({@code crates/android/src/java.rs}); {@link #nativeFilePicked} is
+ * registered from Rust at startup ({@code RegisterNatives} — the
+ * library is loaded by NativeActivity, not by this class's loader).
+ */
+public class BaucordActivity extends NativeActivity {
+    private static final String TAG = "baucord";
+    private static final int PICK_FILE = 4201;
+
+    /** The limit of the pick in flight (only one at a time). */
+    private long pickLimit;
+
+    /**
+     * A pick is over: {@code path} is a readable copy in the cache, or
+     * null with {@code error} set ({@code "too-large"} or a message),
+     * or all null when the user backed out.
+     */
+    static native void nativeFilePicked(String path, String name, String error);
+
+    /** Rust: the system picker for one file of {@code mime}. Any thread. */
+    public void pickFile(final String mime, final long maxBytes) {
+        runOnUiThread(() -> {
+            pickLimit = maxBytes;
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType(mime);
+            try {
+                startActivityForResult(intent, PICK_FILE);
+            } catch (ActivityNotFoundException e) {
+                nativeFilePicked(null, null, "no file picker on this device");
+            }
+        });
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_FILE) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            nativeFilePicked(null, null, null);
+            return;
+        }
+        final Uri uri = data.getData();
+        final long limit = pickLimit;
+        // A video off a cloud drive takes a while: not on the UI thread.
+        new Thread(() -> copyPicked(uri, limit), "baucord-pick").start();
+    }
+
+    /** Copy the picked document into cache/picked/ under its own name. */
+    private void copyPicked(Uri uri, long limit) {
+        ContentResolver resolver = getContentResolver();
+        String name = displayName(resolver, uri);
+        File dir = new File(getCacheDir(), "picked");
+        // One pick lives here at a time; the last one has been read.
+        File[] old = dir.listFiles();
+        if (old != null) {
+            for (File f : old) {
+                f.delete();
+            }
+        }
+        dir.mkdirs();
+        File out = new File(dir, name);
+        boolean tooLarge = false;
+        try (InputStream in = resolver.openInputStream(uri);
+             OutputStream os = new FileOutputStream(out)) {
+            if (in == null) {
+                throw new java.io.IOException("the provider returned no data");
+            }
+            byte[] buf = new byte[64 * 1024];
+            long total = 0;
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                total += n;
+                if (total > limit) {
+                    tooLarge = true;
+                    break;
+                }
+                os.write(buf, 0, n);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "copying the picked file failed", e);
+            out.delete();
+            nativeFilePicked(null, name, String.valueOf(e.getMessage()));
+            return;
+        }
+        if (tooLarge) {
+            out.delete();
+            nativeFilePicked(null, name, "too-large");
+            return;
+        }
+        nativeFilePicked(out.getAbsolutePath(), name, null);
+    }
+
+    /**
+     * The document's name, made safe for a file name, with an extension
+     * from its type when it has none (the app tells images from other
+     * files by extension).
+     */
+    private static String displayName(ContentResolver resolver, Uri uri) {
+        String name = null;
+        try (Cursor c = resolver.query(uri, new String[] {OpenableColumns.DISPLAY_NAME},
+                null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                name = c.getString(0);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "no display name for " + uri, e);
+        }
+        if (name == null || name.trim().isEmpty()) {
+            name = "file";
+        }
+        name = name.replaceAll("[/\\\\:\\p{Cntrl}]", "_");
+        if (name.lastIndexOf('.') <= 0) {
+            String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(resolver.getType(uri));
+            if (ext != null) {
+                name = name + "." + ext;
+            }
+        }
+        return name;
+    }
+
+    /**
+     * Rust: write {@code bytes} into the public Downloads (MediaStore,
+     * no permission needed from API 29; the system renames on a clash).
+     * Returns "uri\nDownload/shown-name", or "error\nmessage".
+     */
+    public String saveDownload(String name, String mime, byte[] bytes) {
+        ContentResolver resolver = getContentResolver();
+        Uri uri = null;
+        try {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+            values.put(MediaStore.MediaColumns.MIME_TYPE, downloadType(name, mime));
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (uri == null) {
+                return "error\nDownloads refused the file";
+            }
+            try (OutputStream os = resolver.openOutputStream(uri)) {
+                if (os == null) {
+                    throw new java.io.IOException("Downloads gave no stream");
+                }
+                os.write(bytes);
+            }
+            values.clear();
+            values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+            resolver.update(uri, values, null, null);
+            String shown = name;
+            try (Cursor c = resolver.query(uri,
+                    new String[] {MediaStore.MediaColumns.DISPLAY_NAME}, null, null, null)) {
+                if (c != null && c.moveToFirst() && c.getString(0) != null) {
+                    shown = c.getString(0);
+                }
+            }
+            return uri + "\n" + Environment.DIRECTORY_DOWNLOADS + "/" + shown;
+        } catch (Exception e) {
+            Log.w(TAG, "saving to Downloads failed", e);
+            if (uri != null) {
+                try {
+                    resolver.delete(uri, null, null);
+                } catch (Exception ignored) {
+                    // Nothing more to undo.
+                }
+            }
+            return "error\n" + e.getMessage();
+        }
+    }
+
+    /**
+     * The type MediaStore files a download under. MediaProvider appends
+     * the type's extension when the name's does not match it ("main.rs"
+     * filed as text/plain becomes "main.rs.txt"), so the type comes from
+     * the extension itself; one Android does not know is a plain binary,
+     * which keeps the name as it is.
+     */
+    private static String downloadType(String name, String fallback) {
+        int dot = name.lastIndexOf('.');
+        if (dot > 0 && dot < name.length() - 1) {
+            String ext = name.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
+            String type = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+            if (type != null) {
+                return type;
+            }
+            return "application/octet-stream";
+        }
+        return fallback != null ? fallback : "application/octet-stream";
+    }
+
+    /** Rust: open a saved download with whatever handles its type. */
+    public boolean openUri(String uriText, String mime) {
+        Uri uri = Uri.parse(uriText);
+        String type = getContentResolver().getType(uri);
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(uri, type != null ? type : mime);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(intent);
+            return true;
+        } catch (ActivityNotFoundException e) {
+            return false;
+        }
+    }
+
+    /** Rust: whether a saved download is still there. */
+    public boolean uriExists(String uriText) {
+        try (Cursor c = getContentResolver().query(Uri.parse(uriText),
+                new String[] {MediaStore.MediaColumns._ID}, null, null, null)) {
+            return c != null && c.moveToFirst();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Rust: open a link in the browser. */
+    public boolean openUrl(String url) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(intent);
+            return true;
+        } catch (ActivityNotFoundException e) {
+            return false;
+        }
+    }
+}

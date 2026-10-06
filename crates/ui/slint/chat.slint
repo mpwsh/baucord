@@ -913,6 +913,18 @@ component NavBack inherits Rectangle {
     }
 }
 
+// The narrow header's clear-the-view button, at the trailing edge.
+component ClearChatBtn inherits Rectangle {
+    width: 32px;
+    IconBtn {
+        y: (parent.height - self.height) / 2;
+        size: 32px;
+        icon-size: 18px;
+        icon: IconSet.BrushCleaning;
+        clicked => { Logic.clear-chat(); }
+    }
+}
+
 export component ChatPane inherits Rectangle {
     /// The narrow layout's chat page (ANDROID-SPEC.md D26): the header
     /// leads with the way back to the list.
@@ -1037,6 +1049,7 @@ export component ChatPane inherits Rectangle {
                         overflow: elide;
                     }
                 }
+                if root.narrow : ClearChatBtn { }
             }
         }
         if State.active-dm >= 0 : Rectangle {
@@ -1078,6 +1091,7 @@ export component ChatPane inherits Rectangle {
                         overflow: elide;
                     }
                 }
+                if root.narrow : ClearChatBtn { }
             }
         }
 
@@ -1144,91 +1158,117 @@ export component ChatPane inherits Rectangle {
             }
         }
 
-        list := ListView {
+        // The history, and over an empty one a word on what this place
+        // is and what to do (the composer is right below).
+        Rectangle {
             vertical-stretch: 1;
-            // The app compiles with Slint's default widget style, fluent, on
-            // every target — and fluent's ScrollView never pans on a drag
-            // (a mouse drag selects). A finger has nothing else to scroll
-            // with, so a touch host turns panning on (ANDROID-SPEC.md D27).
-            mouse-drag-pan-enabled: State.touch-host;
-            // Follow the tail reactively: while the user sits at the
-            // bottom, content growth (new rows, GIF reflow) and window
-            // resizes keep the newest message in view; scrolling up
-            // unpins, scrolling back to within 40px re-pins. These fire
-            // AFTER the layout recomputes, unlike a host-side
-            // scroll-after-push, which reads stale viewport-height and
-            // lands short (permanently, once an image row overshoots
-            // the 40px slack).
-            // Pin/unpin rules, in priority order:
-            //   1. Landing EXACTLY at the bottom pins — regardless of
-            //      direction, so programmatic scroll-to-end (including
-            //      the upward correction after history-cap shrinks)
-            //      keeps following.
-            //   2. Any other upward movement unpins immediately. The
-            //      slack must NOT keep the pin on the way *up*: a
-            //      virtualized ListView refines its estimated
-            //      viewport-height while older rows instantiate, and a
-            //      still-pinned state snap-scrolls the user back on
-            //      every wheel notch ("impossible to scroll up").
-            //   3. Arriving *downward* within the slack of the bottom
-            //      pins too. The same estimate refinement means a
-            //      wheel-down that visibly reaches the end can leave the
-            //      viewport a few px short of the exact bottom; without
-            //      this rule nothing pinned and new rows landed out of
-            //      view. The one-time snap the pin causes is what the
-            //      person just asked for.
-            //   4. Anything else keeps the current state, so mid-layout
-            //      geometry never unpins spuriously.
-            //   5. A follow — appended rows, a pin — is owed only until
-            //      the exact bottom is reached, and never against a
-            //      reader who scrolls up. Following on *every* height
-            //      change fought a scrollbar drag: dragging near the
-            //      bottom instantiates rows, the estimate refines, and
-            //      the snap-back held the thumb there.
-            private property <length> last-viewport-y;
-            pure function at-exact-bottom() -> bool {
-                self.viewport-y <= -(self.viewport-height - self.visible-height) + 2px
-            }
-            pure function near-bottom() -> bool {
-                self.viewport-y <= -(self.viewport-height - self.visible-height) + 48px
-            }
-            changed viewport-y => {
-                if (self.at-exact-bottom()) {
-                    // Pinned; the follow, if owed, decides for itself
-                    // when it has settled.
-                    root.stick-to-bottom = true;
-                } else if (self.viewport-y > self.last-viewport-y + 0.25px) {
-                    // The reader scrolled up: nothing follows them down.
-                    root.stick-to-bottom = false;
-                    root.follow-pending = false;
-                    root.follow-ticks = 0;
-                    root.follow-settled = 0;
-                } else if (self.viewport-y < self.last-viewport-y - 0.25px && self.near-bottom()) {
-                    root.stick-to-bottom = true;
+            list := ListView {
+                width: 100%;
+                height: 100%;
+                // The app compiles with Slint's default widget style, fluent, on
+                // every target — and fluent's ScrollView never pans on a drag
+                // (a mouse drag selects). A finger has nothing else to scroll
+                // with, so a touch host turns panning on (ANDROID-SPEC.md D27).
+                mouse-drag-pan-enabled: State.touch-host;
+                // Follow the tail reactively: while the user sits at the
+                // bottom, content growth (new rows, GIF reflow) and window
+                // resizes keep the newest message in view; scrolling up
+                // unpins, scrolling back to within 40px re-pins. These fire
+                // AFTER the layout recomputes, unlike a host-side
+                // scroll-after-push, which reads stale viewport-height and
+                // lands short (permanently, once an image row overshoots
+                // the 40px slack).
+                // Pin/unpin rules, in priority order:
+                //   1. Landing EXACTLY at the bottom pins — regardless of
+                //      direction, so programmatic scroll-to-end (including
+                //      the upward correction after history-cap shrinks)
+                //      keeps following.
+                //   2. Any other upward movement unpins immediately. The
+                //      slack must NOT keep the pin on the way *up*: a
+                //      virtualized ListView refines its estimated
+                //      viewport-height while older rows instantiate, and a
+                //      still-pinned state snap-scrolls the user back on
+                //      every wheel notch ("impossible to scroll up").
+                //   3. Arriving *downward* within the slack of the bottom
+                //      pins too. The same estimate refinement means a
+                //      wheel-down that visibly reaches the end can leave the
+                //      viewport a few px short of the exact bottom; without
+                //      this rule nothing pinned and new rows landed out of
+                //      view. The one-time snap the pin causes is what the
+                //      person just asked for.
+                //   4. Anything else keeps the current state, so mid-layout
+                //      geometry never unpins spuriously.
+                //   5. A follow — appended rows, a pin — is owed only until
+                //      the exact bottom is reached, and never against a
+                //      reader who scrolls up. Following on *every* height
+                //      change fought a scrollbar drag: dragging near the
+                //      bottom instantiates rows, the estimate refines, and
+                //      the snap-back held the thumb there.
+                private property <length> last-viewport-y;
+                pure function at-exact-bottom() -> bool {
+                    self.viewport-y <= -(self.viewport-height - self.visible-height) + 2px
                 }
-                self.last-viewport-y = self.viewport-y;
-            }
-            // A resize cannot coincide with a drag: keep the tail in view.
-            changed visible-height => { if (root.stick-to-bottom) { root.scroll-to-end(); } }
-            for row[i] in State.chat : Rectangle {
-                // One delegate per row, hosting only the matching kind.
-                // `if`, not `visible`: an invisible instance still
-                // hands the ListView its minimum width, and a day
-                // marker's pill sized to a message body was a
-                // horizontal scrollbar. ListView virtualizes, so only
-                // on-screen rows exist.
-                height: cell.preferred-height;
-                cell := VerticalLayout {
-                    if row.kind == 0 : MessageRow {
-                        data: row;
-                        select-mode: State.selecting-row == row.row-id;
-                        select-requested(on) => { State.selecting-row = on ? row.row-id : -1; }
+                pure function near-bottom() -> bool {
+                    self.viewport-y <= -(self.viewport-height - self.visible-height) + 48px
+                }
+                changed viewport-y => {
+                    if (self.at-exact-bottom()) {
+                        // Pinned; the follow, if owed, decides for itself
+                        // when it has settled.
+                        root.stick-to-bottom = true;
+                    } else if (self.viewport-y > self.last-viewport-y + 0.25px) {
+                        // The reader scrolled up: nothing follows them down.
+                        root.stick-to-bottom = false;
+                        root.follow-pending = false;
+                        root.follow-ticks = 0;
+                        root.follow-settled = 0;
+                    } else if (self.viewport-y < self.last-viewport-y - 0.25px && self.near-bottom()) {
+                        root.stick-to-bottom = true;
                     }
-                    if row.kind == 1 : SystemRow { data: row; }
-                    if row.kind == 2 : ImageRow { data: row; }
-                    if row.kind == 3 : CodeRow { data: row; }
-                    if row.kind == 4 : DayMarkerRow { data: row; }
-                    if row.kind == 5 : FileRow { data: row; }
+                    self.last-viewport-y = self.viewport-y;
+                }
+                // A resize cannot coincide with a drag: keep the tail in view.
+                changed visible-height => { if (root.stick-to-bottom) { root.scroll-to-end(); } }
+                for row[i] in State.chat : Rectangle {
+                    // One delegate per row, hosting only the matching kind.
+                    // `if`, not `visible`: an invisible instance still
+                    // hands the ListView its minimum width, and a day
+                    // marker's pill sized to a message body was a
+                    // horizontal scrollbar. ListView virtualizes, so only
+                    // on-screen rows exist.
+                    height: cell.preferred-height;
+                    cell := VerticalLayout {
+                        if row.kind == 0 : MessageRow {
+                            data: row;
+                            select-mode: State.selecting-row == row.row-id;
+                            select-requested(on) => { State.selecting-row = on ? row.row-id : -1; }
+                        }
+                        if row.kind == 1 : SystemRow { data: row; }
+                        if row.kind == 2 : ImageRow { data: row; }
+                        if row.kind == 3 : CodeRow { data: row; }
+                        if row.kind == 4 : DayMarkerRow { data: row; }
+                        if row.kind == 5 : FileRow { data: row; }
+                    }
+                }
+            }
+            if State.chat.length == 0 && !State.history-more && !State.history-loading : VerticalLayout {
+                alignment: center;
+                padding: Theme.gap-xl;
+                spacing: Theme.gap-xs;
+                Text {
+                    text: Tr.chat-empty-title;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: State.active-dm >= 0 ? Tr.chat-empty-dm : Tr.chat-empty-general;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-body;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
                 }
             }
         }
@@ -1283,7 +1323,9 @@ export component ChatPane inherits Rectangle {
                 tooltip: Tr.chat-attach-tooltip;
                 clicked => { Logic.attach-image(); }
             }
-            IconBtn {
+            // Narrow: in the header instead — one tap from Attach was one
+            // tap from losing the view, and the field needs the room.
+            if !root.narrow : IconBtn {
                 icon: IconSet.BrushCleaning;
                 tooltip: Tr.chat-clear-tooltip;
                 clicked => { Logic.clear-chat(); }

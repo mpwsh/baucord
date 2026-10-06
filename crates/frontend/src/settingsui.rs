@@ -110,6 +110,17 @@ pub(crate) fn surface(app: &AppState) -> Option<SettingsSurface<'_>> {
     }
 }
 
+/// A route's name as the picker shows it: the engine's English names
+/// for the built-in ones translated, a headset's own name as it is.
+fn route_label(name: &str) -> String {
+    match name {
+        audio::route::SPEAKER => t!("audio-route-speaker"),
+        audio::route::EARPIECE => t!("audio-route-earpiece"),
+        audio::route::WIRED => t!("audio-route-wired"),
+        other => other.to_string(),
+    }
+}
+
 /// Nav index of the Servers tab (Profile 0, General 1, Audio 2,
 /// Sounds 3, Keyboard 4, Servers 5, Credits 6, About 7) — the connect
 /// view's pencil jumps here. Mirrors the `NavItem`s in settings.slint.
@@ -475,8 +486,13 @@ pub fn populate(app: &mut AppState) {
         .position(|(_, kb)| *kb >= settings.ui.image_max_kb)
         .unwrap_or(IMAGE_SIZES.len() - 1);
     s.set_image_size_index(i32::try_from(size_index).unwrap_or(0));
-    // Audio: transmission mode and the PTT key as bound.
-    let modes: Vec<slint::SharedString> = vec![t!("audio-vad").into(), t!("audio-ptt").into()];
+    // Audio: transmission mode and the PTT key as bound. A phone has no
+    // key to hold, so it gets voice activity alone.
+    let modes: Vec<slint::SharedString> = if app::SINGLE_WINDOW_HOST {
+        vec![t!("audio-vad").into()]
+    } else {
+        vec![t!("audio-vad").into(), t!("audio-ptt").into()]
+    };
     s.set_transmission_modes(ModelRc::new(VecModel::from(modes)));
     s.set_transmission_index(i32::from(settings.audio.push_to_talk));
     s.set_ptt_bind(settings.bind_for(BindableAction::PushToTalk).into());
@@ -548,13 +564,23 @@ pub fn populate(app: &mut AppState) {
             .chain(devices.iter().map(|(n, _)| n.as_str().into()))
             .collect()
     };
+    // A phone's outputs are routes (audio::route): "Automatic" first,
+    // the built-in ones in the user's language. The setting keeps the
+    // engine's names; only the shown text changes.
+    let output_model: Vec<slint::SharedString> = if app::SINGLE_WINDOW_HOST {
+        std::iter::once(t!("audio-route-auto").into())
+            .chain(output_devices.iter().map(|(n, _)| route_label(n).into()))
+            .collect()
+    } else {
+        dev_model(&output_devices)
+    };
     let dev_index = |devices: &[(String, bool)], saved: Option<&str>| -> i32 {
         saved
             .and_then(|name| devices.iter().position(|(n, _)| n == name))
             .map_or(0, |i| i32::try_from(i + 1).unwrap_or(0))
     };
     s.set_input_devices(ModelRc::new(VecModel::from(dev_model(&input_devices))));
-    s.set_output_devices(ModelRc::new(VecModel::from(dev_model(&output_devices))));
+    s.set_output_devices(ModelRc::new(VecModel::from(output_model)));
     s.set_input_index(dev_index(
         &input_devices,
         settings.audio.input.device.as_deref(),
@@ -763,7 +789,7 @@ fn wire(sf: &SettingsSurface<'_>) {
     });
     logic.on_transmission_selected(|index| {
         app::with_current(move |app| {
-            app.settings.audio.push_to_talk = index == 1;
+            app.settings.audio.push_to_talk = index == 1 && !app::SINGLE_WINDOW_HOST;
             app.apply_push_to_talk();
         });
     });
@@ -914,6 +940,26 @@ fn wire(sf: &SettingsSurface<'_>) {
 
     // ── Identity (spec §3.3) ────────────────────────────────────────
     logic.on_identity_export(|| {
+        // No save dialog (Android): into Downloads, and the status line
+        // says where — the user moves it to the other device from there.
+        if !crate::host::HAS_SAVE_DIALOG {
+            app::with_current(|app| {
+                let key = client::config::client_key_path();
+                let saved = std::fs::read(&key)
+                    .map_err(|e| format!("no identity key at {}: {e}", key.display()))
+                    .and_then(|bytes| {
+                        crate::media::save_to_downloads("baucord-identity.key", &bytes)
+                    });
+                match saved {
+                    Ok(saved) => set_identity_status(
+                        app,
+                        &t!("file-saved", "path" => saved.shown.as_str()),
+                    ),
+                    Err(e) => app.show_error(&e),
+                }
+            });
+            return;
+        }
         crate::host::save_file("baucord-identity.key", None, |path| {
             let _ = slint::invoke_from_event_loop(move || {
                 app::with_current(move |app| match client::config::export_client_key(&path) {

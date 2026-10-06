@@ -69,6 +69,7 @@ mod output;
 mod platform;
 pub mod processor;
 mod resampler;
+pub mod route;
 pub mod sounds;
 pub mod stats;
 pub mod stream;
@@ -151,11 +152,22 @@ const PLATFORM_VOICE_PATH: bool = cfg!(any(target_os = "android", windows));
 fn platform_output_kind(_output_device: Option<&str>) -> aec::OutputKind {
     #[cfg(target_os = "android")]
     {
-        match native::android::output_device_types() {
-            Ok(types) => aec::android_output_kind(&types),
+        // The route the call will take (the picker's choice, else a
+        // headset, else the loudspeaker), not merely what is plugged in
+        // — with media-only Bluetooth counted as headphones.
+        let types = native::android::output_device_types().unwrap_or_else(|e| {
+            debug!("output devices: {e}");
+            Vec::new()
+        });
+        match native::android::communication_devices() {
+            Ok(devices) => route::effective_output_kind(
+                route::explicit(_output_device, &devices),
+                &devices,
+                &types,
+            ),
             Err(e) => {
-                debug!("output devices: {e}");
-                aec::OutputKind::Unknown
+                debug!("communication devices: {e}");
+                aec::android_output_kind(&types)
             }
         }
     }
@@ -166,6 +178,28 @@ fn platform_output_kind(_output_device: Option<&str>) -> aec::OutputKind {
     #[cfg(not(any(target_os = "android", windows)))]
     {
         aec::OutputKind::Unknown
+    }
+}
+
+/// Android: does this plan need communication mode, and on which route
+/// (`route::label`)? The call path needs it (`wanted`); so does a
+/// picked device, even with echo cancellation off — the earpiece, or
+/// the loudspeaker over a connected headset, are reachable only in that
+/// mode (plain streams are then routed with it as media).
+#[cfg(target_os = "android")]
+fn android_comm_plan(selection: Option<&str>, wanted: bool) -> (bool, Option<String>) {
+    match native::android::communication_devices() {
+        Ok(devices) => {
+            let need = wanted || route::explicit(selection, &devices).is_some();
+            let label = need
+                .then(|| route::choose(selection, &devices).map(|i| route::label(&devices[i])))
+                .flatten();
+            (need, label)
+        }
+        Err(e) => {
+            debug!("communication devices: {e}");
+            (wanted, None)
+        }
     }
 }
 
@@ -242,6 +276,14 @@ pub struct VoiceChat {
     /// voice-call path or not, and the output that decided it.
     aec_wanted: bool,
     aec_output: aec::OutputKind,
+    /// Android: whether the plan holds communication mode, and the
+    /// route (`route::label`) it points at — a change (a headset
+    /// connected, another picked) re-plans even when the output kind
+    /// stays the same.
+    #[cfg(target_os = "android")]
+    aec_comm: bool,
+    #[cfg(target_os = "android")]
+    aec_route: Option<String>,
     /// The plan no longer matches the output (or the setting changed):
     /// `service()` reopens both streams.
     aec_replan: bool,
@@ -329,6 +371,10 @@ impl VoiceChat {
             last_restart_attempt: Instant::now().checked_sub(RESTART_BACKOFF).unwrap(),
             aec_wanted: false,
             aec_output: aec::OutputKind::Unknown,
+            #[cfg(target_os = "android")]
+            aec_comm: false,
+            #[cfg(target_os = "android")]
+            aec_route: None,
             aec_replan: false,
             #[cfg(target_os = "android")]
             comm_mode: None,
@@ -411,8 +457,14 @@ impl VoiceChat {
             rx
         });
 
+        // On a phone the selection is a route (`route`), applied with
+        // communication mode; the stream itself opens on the default.
+        #[cfg(target_os = "android")]
+        let device = None;
+        #[cfg(not(target_os = "android"))]
+        let device = self.config.output_device.as_deref();
         let mut output = AudioOutput::new(
-            self.config.output_device.as_deref(),
+            device,
             self.network_to_output_rx.clone(),
             self.loopback_rx.clone(),
             sound_rx,
@@ -430,6 +482,15 @@ impl VoiceChat {
             .default_output_changed
             .store(false, Ordering::Relaxed);
         self.output = Some(output);
+        // Whether the route held once a call stream exists (some
+        // phones settle it only then).
+        #[cfg(target_os = "android")]
+        if self.comm_mode.is_some() {
+            match native::android::current_route() {
+                Ok(route) => info!("Android audio: playing to {route}"),
+                Err(e) => debug!("communication device: {e}"),
+            }
+        }
         Ok(())
     }
 
@@ -473,13 +534,16 @@ impl VoiceChat {
         self.aec_communications.store(wanted, Ordering::Relaxed);
         #[cfg(target_os = "android")]
         {
-            // Leave first: a route change (speaker → external output)
-            // re-enters with the new speaker flag.
+            // Leave first: a route change re-enters with the new route.
             self.comm_mode = None;
-            if wanted {
-                match native::android::CommunicationMode::enter(output == aec::OutputKind::Speakers)
-                {
-                    Ok(mode) => self.comm_mode = Some(mode),
+            let (need, label) = android_comm_plan(self.config.output_device.as_deref(), wanted);
+            self.aec_comm = need;
+            self.aec_route = label;
+            if need {
+                match native::android::CommunicationMode::enter(
+                    self.config.output_device.as_deref(),
+                ) {
+                    Ok((mode, _route)) => self.comm_mode = Some(mode),
                     // The streams still open on the voice-call path; the
                     // report says whether the canceller engaged.
                     Err(e) => log::warn!("communication mode unavailable: {e}"),
@@ -506,8 +570,21 @@ impl VoiceChat {
         let output = platform_output_kind(self.config.output_device.as_deref());
         let wanted = aec::wants_aec(self.config.echo_cancellation, output);
         // The output itself matters while on the call path: it decides
-        // the speakerphone route.
-        wanted != self.aec_wanted || (wanted && output != self.aec_output)
+        // the route.
+        if wanted != self.aec_wanted || (wanted && output != self.aec_output) {
+            return true;
+        }
+        // On a phone, so does the device: wired → Bluetooth keeps the
+        // kind (headphones) but needs the new route; a pick can need
+        // communication mode on its own.
+        #[cfg(target_os = "android")]
+        {
+            let (need, label) = android_comm_plan(self.config.output_device.as_deref(), wanted);
+            if need != self.aec_comm || (need && label != self.aec_route) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Close both streams, re-plan, reopen both.
@@ -516,9 +593,11 @@ impl VoiceChat {
         self.input.take();
         self.output.take();
         self.plan_aec();
-        let output_sel = self.config.output_device.clone();
-        if let Err(e) = self.set_output_device(output_sel.as_deref()) {
+        if let Err(e) = self.reopen_output() {
             error!("Output reopen failed ({e}); will retry");
+            // Nothing else would: `service` restarts an output that
+            // exists, and this one does not.
+            self.aec_replan = true;
         }
         let input_sel = self.config.input_device.clone();
         if let Err(e) = self.set_input_device(input_sel.as_deref()) {
@@ -892,8 +971,7 @@ impl VoiceChat {
                 "default device changed"
             };
             info!("Restarting output ({why})");
-            let selection = self.config.output_device.clone();
-            match self.set_output_device(selection.as_deref()) {
+            match self.reopen_output() {
                 Ok(()) => {
                     stats.stream_restarts.fetch_add(1, Ordering::Relaxed);
                     restarted = true;
@@ -983,8 +1061,27 @@ impl VoiceChat {
         &mut self,
         device_name: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.output.take();
+        #[cfg(target_os = "android")]
+        let changed = self.config.output_device.as_deref() != device_name;
         self.config.output_device = device_name.map(String::from);
+        // A phone's "device" is a route for the call (`route`): picking
+        // one re-plans communication mode, which reopens both streams —
+        // only when something changed (the UI's device poll repeats the
+        // current choice when the automatic route moves, which the
+        // engine's own poll has already followed).
+        #[cfg(target_os = "android")]
+        if self.input.is_some() || self.output.is_some() {
+            if changed || self.aec_plan_stale() {
+                self.restart_all("output route changed");
+            }
+            return Ok(());
+        }
+        self.reopen_output()
+    }
+
+    /// Close and reopen playback on the configured output.
+    fn reopen_output(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.output.take();
         let (sound_tx, sound_rx) = bounded::<sounds::SoundType>(4);
         self.sound_tx = sound_tx;
         self.sound_rx = Some(sound_rx);
@@ -1037,6 +1134,16 @@ impl VoiceChat {
     }
 
     pub fn list_output_devices() -> Result<Vec<(String, bool)>, Box<dyn std::error::Error>> {
+        // A phone lists routes for the call, not sound cards (`route`):
+        // cheap, and live (a headset shows up at once).
+        #[cfg(target_os = "android")]
+        return Ok(route::picker(&native::android::communication_devices()?));
+        #[cfg(not(target_os = "android"))]
+        Self::list_cpal_output_devices()
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn list_cpal_output_devices() -> Result<Vec<(String, bool)>, Box<dyn std::error::Error>> {
         // Same 10 s cache as list_input_devices — see the note there.
         static CACHE: DeviceListCache = Mutex::new(None);
         if let Ok(cache) = CACHE.lock() {

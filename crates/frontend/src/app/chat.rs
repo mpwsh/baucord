@@ -307,7 +307,7 @@ impl AppState {
         let Some(path) = self.downloaded.get(&blob).cloned() else {
             return;
         };
-        if !path.exists() {
+        if !crate::host::target_exists(&path) {
             self.downloaded.remove(&blob);
             let row = self.chat_row_at(index);
             self.chat_model.set_row_data(index, row);

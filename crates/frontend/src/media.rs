@@ -439,7 +439,7 @@ fn start_file_upload(app: &mut AppState, path: &std::path::Path) {
 
 /// A MIME type from the extension, for the server to keep when it
 /// cannot sniff one; anything unknown is an octet stream.
-fn mime_for(name: &str) -> &'static str {
+pub(crate) fn mime_for(name: &str) -> &'static str {
     let ext = std::path::Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
@@ -477,8 +477,24 @@ fn mime_for(name: &str) -> &'static str {
 }
 
 /// Write a fetched file into the Downloads folder (spec §7), never
-/// over an existing one. Returns the path written.
-pub fn save_to_downloads(name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+/// over an existing one: through the host where it has its own way
+/// there (Android: `MediaStore`, the public Downloads), else as a plain
+/// file in the folder.
+///
+/// # Errors
+/// The host's or the file system's message.
+pub fn save_to_downloads(name: &str, bytes: &[u8]) -> Result<crate::host::Saved, String> {
+    if let Some(saved) = crate::host::save_download(name, mime_for(name), bytes) {
+        return saved;
+    }
+    let path = write_into_downloads(name, bytes).map_err(|e| e.to_string())?;
+    Ok(crate::host::Saved {
+        shown: path.display().to_string(),
+        target: path,
+    })
+}
+
+fn write_into_downloads(name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
     let dir = dirs::download_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -625,6 +641,18 @@ pub fn save_image_dialog(app: &mut AppState, row_id: i32) {
         "baucord-{}.{ext}",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
+    // No dialog on this host (Android): straight into Downloads, and a
+    // toast says where, as a received file's save does.
+    if !crate::host::HAS_SAVE_DIALOG {
+        match save_to_downloads(&default_name, bytes.as_slice()) {
+            Ok(saved) => app.show_toast(
+                ui::ToastKind::Success,
+                &t!("file-saved", "path" => saved.shown.as_str()),
+            ),
+            Err(e) => app.show_error(&t!("chat-image-save-error", "error" => e.as_str())),
+        }
+        return;
+    }
     let filter_name = if entry.is_gif {
         t!("image-save-filter-gif")
     } else {

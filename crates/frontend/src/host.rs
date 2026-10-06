@@ -14,6 +14,30 @@ use std::path::{Path, PathBuf};
 /// A filter for a dialog: a label and the extensions it admits.
 pub type Filter = (String, Vec<String>);
 
+/// Saving asks where (`save_file`); the mobile twin has no dialog
+/// and saves into Downloads instead.
+pub const HAS_SAVE_DIALOG: bool = true;
+
+/// A file written into the user's Downloads.
+pub struct Saved {
+    /// The path written.
+    pub target: PathBuf,
+    /// Where it went, for the toast.
+    pub shown: String,
+}
+
+/// The desktop writes Downloads itself (`media::save_to_downloads`).
+#[must_use]
+pub fn save_download(_name: &str, _mime: &str, _bytes: &[u8]) -> Option<Result<Saved, String>> {
+    None
+}
+
+/// Whether a saved file is still where it was saved.
+#[must_use]
+pub fn target_exists(target: &Path) -> bool {
+    target.exists()
+}
+
 /// Ask the user for one existing file.
 pub fn pick_file(filter: Option<Filter>, on_pick: impl FnOnce(PathBuf) + Send + 'static) {
     std::thread::spawn(move || {

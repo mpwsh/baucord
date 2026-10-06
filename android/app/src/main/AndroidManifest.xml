@@ -1,7 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  ANDROID-SPEC.md §4.4, §10.1. The Activity is the platform's own
-  NativeActivity; `android.app.lib_name` names libbaucord_android.so.
+  ANDROID-SPEC.md §4.4, §10.1. The Activity is the platform's
+  NativeActivity, subclassed (BaucordActivity.java, D30) for what
+  native code cannot receive; `android.app.lib_name` names
+  libbaucord_android.so.
+  enableOnBackInvokedCallback="false": an app targeting API 36 on
+  Android 16 is never sent KEYCODE_BACK (predictive back answers the
+  gesture itself, with back-to-home), so Back never reached the UI's
+  handlers (chat page → list, Settings section → list → close, the
+  stream and image viewers, dialogs). The opt-out restores the key
+  (ANDROID-SPEC.md D29); the predictive-back API is the later route.
   Runtime permissions (RECORD_AUDIO, POST_NOTIFICATIONS) are asked for
   from Rust; the rest are install-time.
 -->
@@ -30,11 +38,14 @@
         android:allowBackup="false"
         android:theme="@style/Theme.Baucord">
 
+        <!-- NativeActivity plus an activity result (the file picker)
+             and a few helpers: app/src/main/java/dev/baucord/. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".BaucordActivity"
             android:label="@string/app_name"
             android:exported="true"
             android:launchMode="singleTask"
+            android:enableOnBackInvokedCallback="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|uiMode|density|locale|layoutDirection"
             android:windowSoftInputMode="adjustResize">
             <meta-data

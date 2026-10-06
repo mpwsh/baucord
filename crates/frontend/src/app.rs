@@ -693,6 +693,12 @@ pub fn run() {
         let mut st = state.borrow_mut();
         st.reload_own_avatar();
         st.push_ui_prefs();
+        // A phone has no key to hold: push-to-talk there would keep the
+        // microphone shut for good (the picker no longer offers it, but
+        // a settings file may still say so).
+        if SINGLE_WINDOW_HOST {
+            st.settings.audio.push_to_talk = false;
+        }
         st.apply_push_to_talk();
     }
     // The version check gates the splash; without it, straight to the
@@ -1341,6 +1347,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 ///   a drag or a maximize until something forces a full frame. A
 ///   full-window flip per such event is cheap next to the frame it
 ///   already costs.
+///
 /// No raw window events without winit: no reveal glitches to paper
 /// over, and no OS file drags either.
 #[cfg(not(feature = "desktop"))]
@@ -2238,6 +2245,11 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_dm_general(t!("dm-general").into());
     tr.set_dm_direct_message(t!("dm-direct-message").into());
     tr.set_dm_note_memory(t!("dm-note-memory").into());
+    tr.set_reset_confirm_body(t!("reset-confirm-body").into());
+    tr.set_reset_confirm(t!("reset-confirm").into());
+    tr.set_chat_empty_title(t!("chat-empty-title").into());
+    tr.set_chat_empty_general(t!("chat-empty-general").into());
+    tr.set_chat_empty_dm(t!("chat-empty-dm").into());
     tr.set_dm_back(t!("dm-back").into());
     tr.set_chat_placeholder_dm(t!("chat-placeholder-dm").into());
     tr.set_monitor(t!("monitor").into());
@@ -2340,7 +2352,23 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_identity_note(t!("identity-note").into());
     tr.set_audio_devices_header(t!("audio-devices-header").into());
     tr.set_audio_input_device(t!("audio-input-device").into());
-    tr.set_audio_output_device(t!("audio-output-device").into());
+    // A phone picks a route for the call, not a sound card (audio::route).
+    tr.set_audio_output_device(
+        if SINGLE_WINDOW_HOST {
+            t!("audio-output-device-android")
+        } else {
+            t!("audio-output-device")
+        }
+        .into(),
+    );
+    tr.set_audio_output_hint(
+        if SINGLE_WINDOW_HOST {
+            t!("audio-output-hint-android")
+        } else {
+            String::new()
+        }
+        .into(),
+    );
     tr.set_audio_system_default(t!("audio-system-default").into());
     tr.set_audio_input_header(t!("audio-input-header").into());
     tr.set_audio_capture_level(t!("audio-capture-level").into());

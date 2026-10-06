@@ -14,6 +14,8 @@
 
 #![cfg(target_os = "android")]
 
+#[cfg(feature = "app")]
+mod host;
 mod java;
 mod logging;
 
@@ -88,6 +90,9 @@ fn android_main(app: AndroidApp) {
         // `Resume` re-checks and the voice worker's device-open error
         // path covers a refusal in the meantime.
         request_missing_permissions();
+
+        // Files and links (the picker, Downloads, ACTION_VIEW).
+        host::install();
 
         frontend::app::run();
     }

@@ -1126,18 +1126,18 @@ impl AppState {
                 {
                     self.set_transfer(conv, msg_id, None);
                     match media::save_to_downloads(&name, &data) {
-                        Ok(path) => {
+                        Ok(saved) => {
                             // The card turns into Open (a check, a
                             // re-download beside it); a toast says where.
-                            let line = t!("file-saved", "path" => path.display().to_string());
-                            self.downloaded.insert(blob_id, path);
+                            let line = t!("file-saved", "path" => saved.shown.as_str());
+                            self.downloaded.insert(blob_id, saved.target);
                             self.set_transfer(conv, msg_id, None);
                             self.show_toast(ToastKind::Success, &line);
                         }
                         Err(e) => self.show_error(&t!(
                             "file-save-error",
                             "name" => name.as_str(),
-                            "error" => e.to_string()
+                            "error" => e.as_str()
                         )),
                     }
                 } else {

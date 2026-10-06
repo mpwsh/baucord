@@ -105,7 +105,9 @@ android {
             isDebuggable = true
         }
         getByName("release") {
-            // Nothing to shrink: there is no bytecode of ours.
+            // Off: BaucordActivity's methods are only called from
+            // native code (JNI), which R8 cannot see — shrinking would
+            // strip them. One small class; nothing worth shrinking.
             isMinifyEnabled = false
             isShrinkResources = false
             signingConfig = signingConfigs.findByName("release")

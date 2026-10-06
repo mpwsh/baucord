@@ -182,6 +182,18 @@ turns panning on itself where the host is a touch screen
 the environment would switch the phone's widgets to material, which
 would change how every picker, field and switch looks.
 
+## 5a. The one Java class
+
+`app/src/main/java/dev/baucord/BaucordActivity.java` is the Activity:
+the platform's `NativeActivity` plus what native code cannot receive
+on its own — the system file picker's result — and a few helpers the
+Rust side calls (Downloads, opening files and links). Gradle compiles
+it with the app; there is no Kotlin. Its methods are only called from
+native code, so release builds keep `isMinifyEnabled = false` (R8 would
+strip them). The manifest also opts out of predictive back
+(`enableOnBackInvokedCallback="false"`): on Android 16 an app targeting
+API 36 is otherwise never sent the Back key. ANDROID-SPEC.md D29–D30.
+
 ## 6. Releases
 
 There is no push/PR build — day-to-day testing is local. When a GitHub

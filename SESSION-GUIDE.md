@@ -405,6 +405,28 @@ Memory-mode servers (persistence off) still use the legacy
   checks the desktop window didn't move. The slide itself (a `Timer`-free `animate`) cannot be
   captured. Check 1000×640 after any change there: the wide layout
   must not move.
+- **Drive the real `MainWindow` headless** when a fix is about
+  behaviour (a tap, Back, focus): a scratch crate whose `build.rs`
+  runs `slint_build::compile_with_config` on
+  `crates/ui/slint/main.slint` with the `lucide` library path (as
+  `ui/build.rs` does), `slint::include_modules!()`,
+  `i_slint_backend_testing::init_no_event_loop()`, a 412×880 window,
+  `State` set from Rust, then `dispatch_event(PointerPressed/Released
+  | KeyPressed { text: Key::Back.into() })` with `mock_elapsed_time`
+  + `update_timers_and_animations()` between, asserting on `State`
+  and on Logic callbacks hooked to counters. Used for D29 and D32.
+- **Android 16 + targetSdk 36 never delivers `KEYCODE_BACK`**
+  (predictive back): the manifest's `enableOnBackInvokedCallback=
+  "false"` is what makes every `Key.Back` handler run (D29).
+- **JNI from Java into Rust**: NativeActivity `dlopen`s our library
+  itself, so a `Java_…` export is invisible to the Activity's class
+  loader — register natives from Rust (`env.register_native_methods`
+  on `get_object_class(activity)`). jni 0.22's `native_method!` takes
+  `error_policy = Ident` (an identifier in scope, not a path — the
+  docs show a path and it fails to parse). The Java compiles against
+  stubs here: `javac --release 8` with a dozen hand-written
+  `android.*` stub classes (`scratchpad/jstub`) catches syntax and
+  checked-exception mistakes; Gradle is the real check.
 - `z` takes a number literal only (`z: cond ? 0 : 1` is a compile
   error); order siblings, or lay them out so they never overlap.
 - **The widget style is fluent everywhere, Android too** (no style in
