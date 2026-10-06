@@ -29,8 +29,8 @@ use std::{
     net::SocketAddr,
     rc::{Rc, Weak},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -42,11 +42,11 @@ use app_core::{
 };
 use audio::{PeerAudioSettings, SoundType};
 use client::{
-    config::{peer_key, BindableAction, Settings},
+    AdminCommand, AdminTarget,
+    config::{BindableAction, Settings, peer_key},
     network::{DisconnectKind, LossKind, NetworkControl, NetworkMessage, NetworkThreadHandle},
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
-    AdminCommand, AdminTarget,
 };
 use i18n::t;
 use log::{info, warn};
@@ -658,6 +658,12 @@ pub fn run() {
     // (ANDROID-SPEC.md D22): its callbacks are wired once here, where
     // the desktop wires its SettingsWindow when that is first created.
     if SINGLE_WINDOW_HOST {
+        // One window means a phone: touch, a soft keyboard, Back.
+        state
+            .borrow()
+            .main
+            .global::<State>()
+            .set_touch_host(true);
         crate::settingsui::wire_page(&state.borrow().main);
         // Same for the stream viewer page (D23).
         crate::viewers::wire_page(&state.borrow().main);
@@ -760,7 +766,7 @@ fn center_on_monitor(_win: &slint::Window) {}
 /// mixed-DPI setups land where they look centred.
 #[cfg(feature = "desktop")]
 fn center_on_monitor(win: &slint::Window) {
-    use i_slint_backend_winit::{winit::dpi::PhysicalPosition, WinitWindowAccessor};
+    use i_slint_backend_winit::{WinitWindowAccessor, winit::dpi::PhysicalPosition};
     win.with_winit_window(|w| {
         let Some(monitor) = w.current_monitor().or_else(|| w.primary_monitor()) else {
             return;
@@ -2308,6 +2314,19 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_chat_image_size_hint(t!("chat-image-size-hint").into());
     tr.set_privacy_header(t!("privacy-header").into());
     tr.set_privacy_note(t!("privacy-note").into());
+    tr.set_audio_aec(t!("audio-aec").into());
+    // The platform's side effects of the voice-call path, said where
+    // the setting is (AEC-SPEC.md §4.6).
+    tr.set_audio_aec_hint(
+        if cfg!(windows) {
+            t!("audio-aec-hint-windows")
+        } else if cfg!(target_os = "android") {
+            t!("audio-aec-hint-android")
+        } else {
+            t!("audio-aec-hint")
+        }
+        .into(),
+    );
     tr.set_audio_transmission(t!("audio-transmission").into());
     tr.set_audio_vad_hint(t!("audio-vad-hint").into());
     tr.set_audio_ptt_hint(t!("audio-ptt-hint").into());
@@ -2359,7 +2378,7 @@ pub mod tray {
     use i18n::t;
     use log::warn;
 
-    use super::{with_current, AppState};
+    use super::{AppState, with_current};
 
     thread_local! {
         /// Keeps the OS tray item alive for the app's lifetime —

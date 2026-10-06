@@ -20,9 +20,17 @@
 //!   when the device goes away, and stop within ~100 ms of a stop request.
 //!
 //! Windows: [`wasapi`] — event-driven shared mode on our own MMCSS thread.
+//! Android: [`aaudio`] — the voice-call streams (usage and input preset
+//! `VoiceCommunication`, what turns the platform's echo canceller on),
+//! with [`android`] for the `AudioManager` side; cpal's `AAudio` host
+//! still serves sessions that do not want the call path.
 //! macOS: cpal's `CoreAudio` path runs the callback on the HAL's real-time
 //! thread already; nothing to take over yet. Linux: cpal/ALSA until there
 //! is a `PipeWire` backend.
 
+#[cfg(target_os = "android")]
+pub mod aaudio;
+#[cfg(target_os = "android")]
+pub mod android;
 #[cfg(windows)]
 pub mod wasapi;

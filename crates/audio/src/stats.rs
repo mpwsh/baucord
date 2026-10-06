@@ -5,9 +5,14 @@
 //! packet rates, codec stats, bandwidth, latency budgets, and buffer health.
 
 use std::{
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Mutex,
+    },
     time::Instant,
 };
+
+use crate::aec::AecReport;
 
 /// Shared, lock-free audio statistics.
 pub struct AudioStats {
@@ -134,6 +139,16 @@ pub struct AudioStats {
     /// Whether the noise gate is currently open (passing audio).
     pub gate_active: AtomicBool,
 
+    // ── Echo cancellation (AEC-SPEC.md §3.3) ────────────────────────────
+    /// What the last stream open got: set by `VoiceChat` after capture
+    /// opens, `None` while no capture stream is open. A mutex, not an
+    /// atomic: written once per (re)open, read every 10 s and by the
+    /// settings page — never on an audio thread.
+    pub aec: Mutex<Option<AecReport>>,
+    /// Bumped on every change of [`Self::aec`], so a poller compares a
+    /// number instead of cloning the report every tick.
+    pub aec_generation: AtomicU64,
+
     // ── Timing ──────────────────────────────────────────────────────────
     pub start_time: Instant,
 }
@@ -186,6 +201,8 @@ impl AudioStats {
             denoise_active: AtomicBool::new(true),
             dtx_active: AtomicBool::new(false),
             gate_active: AtomicBool::new(false),
+            aec: Mutex::new(None),
+            aec_generation: AtomicU64::new(0),
             start_time: Instant::now(),
         }
     }
@@ -243,8 +260,17 @@ impl AudioStats {
         bytes * 8.0 / elapsed / 1000.0
     }
 
+    /// The current echo-cancellation report, if a capture stream is open.
+    #[must_use]
+    pub fn aec_report(&self) -> Option<AecReport> {
+        self.aec.lock().ok().and_then(|g| g.clone())
+    }
+
     pub fn get_summary(&self) -> String {
         let elapsed = self.start_time.elapsed().as_secs();
+        let aec = self
+            .aec_report()
+            .map_or_else(|| "-".to_string(), |r| r.summary());
         let sent = self.packets_sent.load(Ordering::Relaxed);
         let received = self.packets_received.load(Ordering::Relaxed);
         let lost = self.packets_lost.load(Ordering::Relaxed);
@@ -259,7 +285,7 @@ impl AudioStats {
             "Audio ({}s) | Sent {} Recv {} Lost {} ({:.1}%) | \
              FEC {} RED {} PLC {} (hint {}%, uplink {}%) | Rate {}k/{}ms{} | Overruns {} Underruns {} Drop {} | Jitter {}ms (target {}ms) | \
              BW ↑{:.1}kbps ↓{:.1}kbps | Pkt {}B (avg {:.0}B) | \
-             Enc {}µs Dec {}µs | Errors: enc {} dec {}",
+             Enc {}µs Dec {}µs | Errors: enc {} dec {} | aec: {}",
             elapsed,
             sent,
             received,
@@ -286,6 +312,7 @@ impl AudioStats {
             self.last_decode_us.load(Ordering::Relaxed),
             self.encode_errors.load(Ordering::Relaxed),
             self.decode_errors.load(Ordering::Relaxed),
+            aec,
         )
     }
 }

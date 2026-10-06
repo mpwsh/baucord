@@ -802,6 +802,7 @@ component ComposerField inherits Rectangle {
     out property <int> cursor-offset <=> input.cursor-position-byte-offset;
     out property <int> anchor-offset <=> input.anchor-position-byte-offset;
     callback edited;
+    out property <bool> input-focused: input.has-focus;
     public function focus-input() { input.focus(); }
     public function set-cursor(pos: int) { input.set-selection-offsets(pos, pos); }
     public function select-all() { input.select-all(); }
@@ -874,7 +875,48 @@ component ComposerField inherits Rectangle {
     }
 }
 
+// The narrow layout's way back to the list (ANDROID-SPEC.md D26): an
+// arrow, and how many unread messages wait in the other conversations
+// (every DM's, plus General's while a DM is open) — the list is where
+// they are, and from here nothing else would say so.
+component NavBack inherits Rectangle {
+    callback clicked;
+    property <int> elsewhere: State.dm-unread-total
+        + (State.active-dm >= 0 ? State.general-unread : 0);
+    width: 32px;
+    height: 32px;
+    IconBtn {
+        size: 32px;
+        icon-size: 20px;
+        icon: IconSet.ArrowLeft;
+        idle-color: Theme.text-primary;
+        clicked => { root.clicked(); }
+    }
+    // Centred on the arrow's top-right corner.
+    if root.elsewhere > 0 : Rectangle {
+        x: 26px - self.width / 2;
+        y: 6px - self.height / 2;
+        width: Math.max(self.height, count.preferred-width + 10px);
+        height: 18px;
+        border-radius: 9px;
+        background: Theme.accent;
+        border-width: 2px;
+        border-color: Theme.bg-secondary;
+        count := Text {
+            text: root.elsewhere > 99 ? "99+" : "\{root.elsewhere}";
+            color: Theme.on-accent;
+            font-size: Theme.font-xs;
+            font-weight: 700;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}
+
 export component ChatPane inherits Rectangle {
+    /// The narrow layout's chat page (ANDROID-SPEC.md D26): the header
+    /// leads with the way back to the list.
+    in property <bool> narrow: false;
     background: Theme.bg-primary;
 
     public function scroll-to-end() {
@@ -894,6 +936,7 @@ export component ChatPane inherits Rectangle {
             || list.viewport-y <= -(list.viewport-height - list.visible-height - 40px);
     }
     public function focus-composer() { input.focus-input(); }
+    public pure function composer-focused() -> bool { return input.input-focused; }
     public function composer-set-cursor(pos: int) { input.set-cursor(pos); }
     public function composer-cut() { input.do-cut(); }
     public function composer-copy() { input.do-copy(); }
@@ -955,8 +998,12 @@ export component ChatPane inherits Rectangle {
                 padding-right: Theme.gap-sm;
                 spacing: Theme.gap-sm;
                 // The same slot the DM header's back button takes, so
-                // the title sits at one x in both.
-                Rectangle {
+                // the title sits at one x in both. Narrow: the way back
+                // to the list instead.
+                if root.narrow : NavBack {
+                    clicked => { State.narrow-chat-open = false; }
+                }
+                if !root.narrow : Rectangle {
                     width: 28px;
                     IconDisplay {
                         icon: IconSet.Hash;
@@ -1000,7 +1047,12 @@ export component ChatPane inherits Rectangle {
                 padding-left: Theme.gap-sm;
                 padding-right: Theme.gap-xs;
                 spacing: Theme.gap-sm;
-                IconBtn {
+                // Wide: back to General. Narrow: back to the list
+                // (General is a row there, like this DM).
+                if root.narrow : NavBack {
+                    clicked => { State.narrow-chat-open = false; }
+                }
+                if !root.narrow : IconBtn {
                     size: 28px;
                     icon-size: 16px;
                     icon: IconSet.ArrowLeft;
@@ -1094,6 +1146,11 @@ export component ChatPane inherits Rectangle {
 
         list := ListView {
             vertical-stretch: 1;
+            // The app compiles with Slint's default widget style, fluent, on
+            // every target — and fluent's ScrollView never pans on a drag
+            // (a mouse drag selects). A finger has nothing else to scroll
+            // with, so a touch host turns panning on (ANDROID-SPEC.md D27).
+            mouse-drag-pan-enabled: State.touch-host;
             // Follow the tail reactively: while the user sits at the
             // bottom, content growth (new rows, GIF reflow) and window
             // resizes keep the newest message in view; scrolling up
@@ -1325,7 +1382,9 @@ export component ChatPane inherits Rectangle {
                     context(x, y) => { Logic.composer-context(x, y); }
                 }
             }
-            counter := Text {
+            // Narrow: only once the limit is near — on a phone the
+            // field needs the room more.
+            if !root.narrow || State.draft.character-count > State.max-chars - 50 : Text {
                 width: 52px;
                 text: "\{State.draft.character-count}/\{State.max-chars}";
                 color: State.draft.character-count > State.max-chars - 20

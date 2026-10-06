@@ -15,6 +15,7 @@
   .\run.ps1 -Hello                # the M0 toolchain smoke test
   .\run.ps1 -NoBuild              # reinstall + relaunch what was last built
   .\run.ps1 -NoLog                # leave without tailing logcat
+  .\run.ps1 -ColdBoot             # start the AVD without its quick-boot snapshot
 
 .NOTES
   ANDROID_HOME must point at the SDK (android/README.md section 1). If
@@ -36,7 +37,13 @@ param(
     # Override the ABI (defaults: x86_64 for the emulator, arm64-v8a for a phone).
     [string]$Abi = "",
     [switch]$NoBuild,
-    [switch]$NoLog
+    [switch]$NoLog,
+    # Start the emulator with a full boot instead of its quick-boot
+    # snapshot (-no-snapshot-load). Use it when the AVD hangs at
+    # "device offline" after "Loading snapshot 'default_boot'": a
+    # snapshot saved by an emulator that was killed mid-save restores a
+    # guest that never comes back.
+    [switch]$ColdBoot
 )
 
 $ErrorActionPreference = "Stop"
@@ -103,13 +110,15 @@ if ($Device) {
         # -allow-host-audio: the AVD's microphone is the PC's (the toolbar's
         # "Virtual microphone uses host audio input", preset). Windows must
         # let desktop apps use the microphone (Privacy settings).
-        Start-Process -FilePath $emulator -ArgumentList @("-avd", "`"$Avd`"", "-netdelay", "none", "-netspeed", "full", "-allow-host-audio") | Out-Null
+        $emuArgs = @("-avd", "`"$Avd`"", "-netdelay", "none", "-netspeed", "full", "-allow-host-audio")
+        if ($ColdBoot) { $emuArgs += "-no-snapshot-load" }
+        Start-Process -FilePath $emulator -ArgumentList $emuArgs | Out-Null
         $deadline = (Get-Date).AddMinutes(3)
         while (-not $serial -and (Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 2
             $serial = Serials | Where-Object { $_ -like "emulator-*" } | Select-Object -First 1
         }
-        if (-not $serial) { Fail "the emulator did not show up in adb within 3 minutes" }
+        if (-not $serial) { Fail "the emulator did not show up in adb within 3 minutes - if it sits at 'device offline', close it and try .\run.ps1 -ColdBoot" }
     }
     # Wait for Android itself, not just adb.
     $deadline = (Get-Date).AddMinutes(3)
@@ -117,7 +126,7 @@ if ($Device) {
         $booted = (& $adb -s $serial shell getprop sys.boot_completed 2>$null) -join ""
         if ($booted.Trim() -ne "1") { Start-Sleep -Seconds 2 }
     } while ($booted.Trim() -ne "1" -and (Get-Date) -lt $deadline)
-    if ($booted.Trim() -ne "1") { Fail "emulator did not finish booting" }
+    if ($booted.Trim() -ne "1") { Fail "emulator did not finish booting - close it and try .\run.ps1 -ColdBoot" }
 }
 Write-Host ">> device $serial" -ForegroundColor Cyan
 

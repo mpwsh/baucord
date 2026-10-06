@@ -211,6 +211,16 @@ export global State {
     /// The Messages section's height: dragged at its divider, kept in
     /// settings.
     in-out property <length> messages-height: 200px;
+    /// The narrow layout (a phone held upright; ANDROID-SPEC.md D26)
+    /// shows one page at a time: the sidebar as a list, or the chat.
+    /// Set by tapping General or a DM (or opening one from a menu),
+    /// cleared by the chat header's back arrow and Android's Back. The
+    /// wide layout shows both and ignores it.
+    in-out property <bool> narrow-chat-open: false;
+    /// The host is a touch screen (Android): nothing may hide behind a
+    /// hover, and the soft keyboard comes up only when the composer is
+    /// tapped, never on the app's own initiative.
+    in property <bool> touch-host: false;
     in property <bool> muted;
     in property <bool> deafened;
     /// Push-to-talk: the mic is closed until the key is held.
@@ -251,6 +261,10 @@ export global State {
     // what SettingsWindow.tab is there (settingsui::TAB_*).
     in property <bool> settings-open: false;
     in-out property <int> settings-tab: 0;
+    /// The narrow page shows that tab's section rather than the list
+    /// (D28): cleared when the page opens, set by picking a section —
+    /// or by the shell when it opens Settings at a tab.
+    in-out property <bool> settings-section-open: false;
 
     // ── Stream viewer as a page (single-window hosts; ANDROID-SPEC.md D23)
     // The desktop opens one StreamViewerWindow per watched peer;

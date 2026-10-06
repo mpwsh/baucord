@@ -43,7 +43,19 @@ export component MainWindow inherits Window {
     public function chat-scroll-to-end() { chat-pane.scroll-to-end(); }
     public function chat-pin-bottom() { chat-pane.pin-to-bottom(); }
     public function chat-follow-appended() { chat-pane.follow-appended(); }
-    public function focus-composer() { chat-pane.focus-composer(); }
+    // The shell calls this after anything that took the keyboard (a
+    // conversation switch, a dialog, menu or page closing, a send). On
+    // a touch host the soft keyboard comes up when the composer is
+    // tapped, never on the app's own initiative — so the composer
+    // keeps focus if it has it, and otherwise `nav-keys` takes it, so
+    // Android's Back still finds a handler (ANDROID-SPEC.md D26).
+    public function focus-composer() {
+        if (!State.touch-host) {
+            chat-pane.focus-composer();
+        } else if (!chat-pane.composer-focused()) {
+            nav-keys.focus();
+        }
+    }
     public function composer-set-cursor(pos: int) { chat-pane.composer-set-cursor(pos); }
     // The composer's menu entries (the host dispatches the pick).
     public function composer-cut() { chat-pane.composer-cut(); }
@@ -78,42 +90,101 @@ export component MainWindow inherits Window {
     // build's fresh-chat-per-session semantics.
     if State.phase != Phase.connect && State.phase != Phase.main : StartupView { }
     if State.phase == Phase.connect : ConnectView { }
+    // ── Wide and narrow (ANDROID-SPEC.md D26) ──────────────────────
+    // Wide: the sidebar and the chat side by side, the edge between
+    // them draggable. Narrow (a phone held upright): one page at a
+    // time — the sidebar as a full-width list; tapping General or a DM
+    // slides the chat in from the right, and the chat header's arrow
+    // (or Android's Back) slides the list back. The width alone
+    // decides, so a phone turned sideways or a desktop window made
+    // narrow follows.
+    property <bool> narrow: root.width < 600px;
+    // 0 = the list, 1 = the chat; animated, so the pages slide.
+    property <float> chat-shown: State.narrow-chat-open ? 1 : 0;
+    animate chat-shown { duration: 220ms; easing: ease-out; }
+    property <bool> chat-page: root.narrow && State.narrow-chat-open
+        && State.phase == Phase.main;
+    // Back has to reach a key handler that takes it, or Android
+    // finishes the activity: the handler is `nav-keys` below, which
+    // only sees keys while it or something inside it has focus.
+    // Opening the chat page gives it focus (a tap on the composer
+    // then takes it over; nav-keys still sees Back first). Leaving it
+    // takes focus off the composer it hides, so the keyboard goes too.
+    // (Not when the page changes because the window widened or the
+    // session ended: the composer or the connect view keeps its focus.)
+    changed chat-page => {
+        if (root.narrow && State.phase == Phase.main
+            && (!root.chat-page || !chat-pane.composer-focused())) {
+            nav-keys.focus();
+        }
+    }
     // While the sidebar's edge is dragged, only a line moves: the
     // width lands on release. Re-laying out the chat (every message
     // re-wraps) on every pointer move flickered the whole window.
     property <length> sidebar-preview: -1px;
-    main-screen := HorizontalLayout {
-        visible: State.phase == Phase.main;
-        Rectangle {
-            width: State.sidebar-width;
-            // Above the chat pane, so a tooltip at the edge is not
-            // painted over by it.
-            z: 1;
-            Sidebar { }
-            grip := TouchArea {
-                x: parent.width - 4px;
-                width: 8px;
-                mouse-cursor: MouseCursor.col-resize;
-                pure function target() -> length {
-                    return Math.clamp(State.sidebar-width + (self.mouse-x - self.pressed-x),
-                        220px, Math.min(480px, root.width - 360px));
-                }
-                pointer-event(ev) => {
-                    if (ev.kind == PointerEventKind.down) {
-                        root.sidebar-preview = State.sidebar-width;
-                    } else if (ev.kind == PointerEventKind.up && root.sidebar-preview >= 0px) {
-                        State.sidebar-width = self.target();
-                        root.sidebar-preview = -1px;
-                        Logic.sidebar-resized(State.sidebar-width);
-                    } else if (ev.kind == PointerEventKind.cancel) {
-                        root.sidebar-preview = -1px;
-                    }
-                }
-                moved => { if (self.pressed) { root.sidebar-preview = self.target(); } }
+    nav-keys := FocusScope {
+        // Only ever focused on purpose: a click must leave the
+        // desktop's composer its focus, and Tab must not stop here.
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        width: 100%;
+        height: 100%;
+        // The capture phase, so Back is ours before any field inside
+        // (a read-only message row forwards every key it gets).
+        capture-key-pressed(ev) => {
+            if (ev.text == Key.Back && root.chat-page) {
+                State.narrow-chat-open = false;
+                return accept;
             }
+            reject
         }
-        chat-pane := ChatPane {
-            horizontal-stretch: 1;
+        main-screen := Rectangle {
+            width: 100%;
+            height: 100%;
+            visible: State.phase == Phase.main;
+            // The chat pane is a persistent instance (the shell drives
+            // its scroll and composer at any time), so both pages are
+            // placed by hand rather than swapped with `if`.
+            sidebar-box := Rectangle {
+                // Narrow: pushed out to the left as the chat comes in
+                // from the right (the two never overlap).
+                x: root.narrow ? -root.chat-shown * parent.width : 0;
+                width: root.narrow ? parent.width : State.sidebar-width;
+                visible: !root.narrow || root.chat-shown < 1;
+                // Above the chat pane, so a tooltip at the edge is not
+                // painted over by it.
+                z: 1;
+                Sidebar { }
+                grip := TouchArea {
+                    x: parent.width - 4px;
+                    width: 8px;
+                    enabled: !root.narrow;
+                    mouse-cursor: MouseCursor.col-resize;
+                    pure function target() -> length {
+                        return Math.clamp(State.sidebar-width + (self.mouse-x - self.pressed-x),
+                            220px, Math.min(480px, root.width - 360px));
+                    }
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down) {
+                            root.sidebar-preview = State.sidebar-width;
+                        } else if (ev.kind == PointerEventKind.up && root.sidebar-preview >= 0px) {
+                            State.sidebar-width = self.target();
+                            root.sidebar-preview = -1px;
+                            Logic.sidebar-resized(State.sidebar-width);
+                        } else if (ev.kind == PointerEventKind.cancel) {
+                            root.sidebar-preview = -1px;
+                        }
+                    }
+                    moved => { if (self.pressed) { root.sidebar-preview = self.target(); } }
+                }
+            }
+            chat-pane := ChatPane {
+                narrow: root.narrow;
+                x: root.narrow ? (1 - root.chat-shown) * parent.width : State.sidebar-width;
+                width: root.narrow ? parent.width : parent.width - State.sidebar-width;
+                height: parent.height;
+                visible: !root.narrow || root.chat-shown > 0;
+            }
         }
     }
     if root.sidebar-preview >= 0px : Rectangle {
@@ -291,7 +362,7 @@ export component MainWindow inherits Window {
         menu-keys := FocusScope {
             init => { self.focus(); }
             key-pressed(ev) => {
-                if (ev.text == Key.Escape) { Logic.menu-closed(); return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.menu-closed(); return accept; }
                 reject
             }
         }
@@ -354,7 +425,30 @@ export component MainWindow inherits Window {
         // the roster and chat underneath (the other overlays do the
         // same with their scrims).
         TouchArea { }
-        SettingsPanel { tab <=> State.settings-tab; }
+        // Android's Back steps back (a section → the list → out, saved,
+        // as the button does): taken in the capture phase, before any
+        // field inside sees it.
+        // Focused on open so it is in the focus chain from the start
+        // (the shell hands focus back when the page closes).
+        FocusScope {
+            width: 100%;
+            height: 100%;
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+            init => { self.focus(); }
+            capture-key-pressed(ev) => {
+                if (ev.text == Key.Back) {
+                    settings-panel.back();
+                    return accept;
+                }
+                reject
+            }
+            settings-panel := SettingsPanel {
+                tab <=> State.settings-tab;
+                section-open <=> State.settings-section-open;
+                narrow: root.narrow;
+            }
+        }
     }
 
     // ── Toast (any phase; the connect view also shows it inline) ───
@@ -451,7 +545,7 @@ export component MainWindow inherits Window {
             init => { self.focus(); }
             key-pressed(ev) => {
                 if (ev.text == Key.Return) { Logic.preview-send(); return accept; }
-                if (ev.text == Key.Escape) { Logic.preview-cancel(); return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.preview-cancel(); return accept; }
                 reject
             }
             Card {
@@ -502,18 +596,23 @@ export component MainWindow inherits Window {
     // ── Image viewer (modal overlay; darkened scrim like the preview) ──
     if State.viewer-open : Rectangle {
         background: #000000CC;
-        TouchArea { clicked => { Logic.viewer-close(); } }
-        // Keyboard: Escape closes, ◀ ▶ step the gallery. The scope
-        // grabs focus on creation and hands it back to the composer on
-        // close, so typing resumes without an extra click.
+        TouchArea {
+            clicked => {
+                Logic.viewer-close();
+                root.focus-composer();
+            }
+        }
+        // Keyboard: Escape (Back) closes, ◀ ▶ step the gallery. The
+        // scope grabs focus on creation and hands it back to the
+        // composer on close, so typing resumes without an extra click.
         viewer-keys := FocusScope {
             init => { self.focus(); }
             function close() {
                 Logic.viewer-close();
-                chat-pane.focus-composer();
+                root.focus-composer();
             }
             key-pressed(ev) => {
-                if (ev.text == Key.Escape) { close(); return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { close(); return accept; }
                 if (ev.text == Key.LeftArrow) {
                     if (State.viewer-has-prev) { Logic.viewer-step(-1); }
                     return accept;
@@ -622,7 +721,7 @@ export component MainWindow inherits Window {
         share-keys := FocusScope {
             init => { self.focus(); }
             key-pressed(ev) => {
-                if (ev.text == Key.Escape) { root.share-dialog-open = false; return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { root.share-dialog-open = false; return accept; }
                 reject
             }
             Card {
@@ -678,7 +777,7 @@ export component MainWindow inherits Window {
         chp-keys := FocusScope {
             init => { self.focus(); }
             key-pressed(ev) => {
-                if (ev.text == Key.Escape) { Logic.channel-password-cancel(); return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.channel-password-cancel(); return accept; }
                 reject
             }
             Card {
@@ -736,7 +835,7 @@ export component MainWindow inherits Window {
         inv-keys := FocusScope {
             init => { self.focus(); }
             key-pressed(ev) => {
-                if (ev.text == Key.Escape) { Logic.invite-dialog-cancel(); return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.invite-dialog-cancel(); return accept; }
                 if (ev.text == Key.Return && State.invite-dialog-code == "") {
                     Logic.invite-dialog-create();
                     return accept;
@@ -874,7 +973,7 @@ export component MainWindow inherits Window {
         ch-keys := FocusScope {
             init => { self.focus(); }
             key-pressed(ev) => {
-                if (ev.text == Key.Escape) { Logic.channel-dialog-cancel(); return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.channel-dialog-cancel(); return accept; }
                 reject
             }
             Card {
@@ -977,7 +1076,7 @@ export component MainWindow inherits Window {
         confirm-keys := FocusScope {
             init => { self.focus(); }
             key-pressed(ev) => {
-                if (ev.text == Key.Escape) { Logic.confirm-cancel(); return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.confirm-cancel(); return accept; }
                 if (ev.text == Key.Return) { Logic.confirm-accept(); return accept; }
                 reject
             }
@@ -1023,7 +1122,7 @@ export component MainWindow inherits Window {
         mod-keys := FocusScope {
             init => { self.focus(); }
             key-pressed(ev) => {
-                if (ev.text == Key.Escape) { Logic.moderation-cancel(); return accept; }
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.moderation-cancel(); return accept; }
                 reject
             }
             Card {

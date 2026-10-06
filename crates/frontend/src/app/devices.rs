@@ -141,6 +141,12 @@ impl AppState {
         )
     }
 
+    /// What echo cancellation the voice session got (`None` = none
+    /// running), as the voice thread last published it.
+    pub fn voice_aec(&self) -> Arc<std::sync::Mutex<Option<audio::AecReport>>> {
+        self.voice.shared.aec.clone()
+    }
+
     pub fn apply_reset_defaults(&mut self) {
         self.settings.reset();
         let _ = std::fs::remove_file(client::config::avatar_path());

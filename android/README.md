@@ -80,7 +80,13 @@ cd android
 .\run.ps1 -Device -Release  # the signed release on the phone
 .\run.ps1 -Hello            # the M0 smoke test
 .\run.ps1 -NoBuild          # just reinstall + relaunch
+.\run.ps1 -ColdBoot         # full boot, skipping the AVD's quick-boot snapshot
 ```
+
+If the emulator loads its snapshot (`Loading snapshot 'default_boot'`)
+and then sits at `adb: device offline`, the snapshot is bad (usually an
+emulator closed mid-save): close it and run with `-ColdBoot` once; the
+next normal close saves a good snapshot again.
 
 `run.cmd` is the same thing for a plain Command Prompt (it bypasses
 the PowerShell script policy for this one file). The sections below
@@ -167,11 +173,14 @@ sideload for testing.
 Both also live in `gradle.properties`. Two more the release workflow
 passes: `-PbaucordVersionCode=` (the run number) and
 `-PbaucordVersionName=` (the tag); local builds default to 1 / the
-workspace version. Slint picks the **material**
-widget style for Android targets (the desktop gets fluent on Windows,
-cupertino on macOS) — only `std-widgets` scrollbars and the like
-differ; `SLINT_STYLE=fluent` in the environment forces the desktop look
-if that ever matters.
+workspace version. The `std-widgets` style is **fluent on every target,
+Android included**: `crates/ui/build.rs` names no style, and the Slint
+compiler then uses fluent (only an explicit `native` would pick material
+for Android). Fluent's scroll views do not pan on a drag, so the app
+turns panning on itself where the host is a touch screen
+(`State.touch-host`, ANDROID-SPEC.md D27). `SLINT_STYLE=material` in
+the environment would switch the phone's widgets to material, which
+would change how every picker, field and switch looks.
 
 ## 6. Releases
 

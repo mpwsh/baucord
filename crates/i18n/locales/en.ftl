@@ -524,6 +524,20 @@ audio-ptt = Push to talk
 audio-vad-hint = Your voice is sent whenever it crosses the sensitivity below.
 audio-ptt-hint = Hold to talk:
 audio-ptt-unbound = No key bound yet — set one on the Keyboard tab.
+audio-aec = Echo cancellation
+audio-aec-hint = Keeps others from hearing themselves through your speakers. Automatic leaves headphones alone.
+audio-aec-hint-windows = Keeps others from hearing themselves through your speakers. Automatic leaves headphones alone. On speakers, Windows may lower other apps while you talk (Sound settings → Communications).
+audio-aec-hint-android = Keeps others from hearing themselves through your speaker. Automatic leaves headphones alone. On the speaker your phone treats voice as a call: the volume buttons set call volume.
+audio-aec-auto = Automatic (speakers only)
+audio-aec-always = Always
+audio-aec-off = Off
+aec-status-on = On — your device's echo canceller is running.
+aec-status-headphones = Off — you're on headphones.
+aec-status-off = Off.
+aec-status-no-canceller = Unavailable — this device has no echo canceller.
+aec-status-refused = Unavailable — the system wouldn't open call audio. Details are in baucord.log.
+aec-status-unsupported = Not available on this system yet.
+aec-status-idle = Takes effect when you join voice.
 ptt-tooltip = Push to talk — hold
 
 # ── Profiles on the wire (spec §7.1) ──────────────────────────────────

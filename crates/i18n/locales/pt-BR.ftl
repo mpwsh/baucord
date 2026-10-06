@@ -524,6 +524,20 @@ audio-ptt = Apertar para falar
 audio-vad-hint = Sua voz é enviada sempre que passa da sensibilidade abaixo.
 audio-ptt-hint = Segure para falar:
 audio-ptt-unbound = Nenhuma tecla ainda — defina uma na aba Teclado.
+audio-aec = Cancelamento de eco
+audio-aec-hint = Evita que os outros se ouçam pelos seus alto-falantes. No automático, fones de ouvido ficam como estão.
+audio-aec-hint-windows = Evita que os outros se ouçam pelos seus alto-falantes. No automático, fones de ouvido ficam como estão. Nos alto-falantes, o Windows pode abaixar outros apps enquanto você fala (Configurações de som → Comunicações).
+audio-aec-hint-android = Evita que os outros se ouçam pelo alto-falante. No automático, fones de ouvido ficam como estão. No alto-falante, o celular trata a voz como uma chamada: os botões de volume ajustam o volume da chamada.
+audio-aec-auto = Automático (só alto-falantes)
+audio-aec-always = Sempre
+audio-aec-off = Desligado
+aec-status-on = Ligado — o cancelamento de eco do seu dispositivo está funcionando.
+aec-status-headphones = Desligado — você está de fones de ouvido.
+aec-status-off = Desligado.
+aec-status-no-canceller = Indisponível — este dispositivo não tem cancelamento de eco.
+aec-status-refused = Indisponível — o sistema não abriu o áudio de chamada. Os detalhes estão no baucord.log.
+aec-status-unsupported = Ainda não disponível neste sistema.
+aec-status-idle = Vale quando você entrar num canal de voz.
 ptt-tooltip = Apertar para falar — segure
 
 # ── Perfis na rede (spec §7.1) ────────────────────────────────────────

@@ -31,6 +31,15 @@
 //!
 //! Built against the `wasapi` crate 0.24 API, the same one
 //! `stream::process_loopback` already compiles with.
+//!
+//! **Echo cancellation** (`AEC-SPEC.md` §4): when the session wants the
+//! voice-call path, both streams open in the `Communications` stream
+//! category — the one Windows runs the endpoint's voice chain (the OEM
+//! or inbox AEC effect) on — and "default" means the Default
+//! Communications Device. Capture then points the canceller at our
+//! render endpoint (Windows 11 22H2+) and reads the effect list back to
+//! report whether an AEC effect is actually on (D5). The output's form
+//! factor ([`output_kind`]) is what Auto decides by.
 
 use std::{
     sync::{
@@ -41,16 +50,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+use windows::Win32::Media::{
+    Audio::AUDIO_EFFECT_STATE_ON, KernelStreaming::AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION,
+};
+
 use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info, warn};
 use rtrb::{Consumer, Producer};
 use wasapi::{
-    AudioCaptureClient, AudioClient, AudioRenderClient, DeviceEnumerator, DeviceEventCallbacks,
-    DeviceEventRegistration, Direction, Handle, Role, SampleType, StreamMode, WasapiError,
-    WaveFormat,
+    AudioCaptureClient, AudioClient, AudioClientProperties, AudioRenderClient, DeviceEnumerator,
+    DeviceEventCallbacks, DeviceEventRegistration, Direction, Handle, Role, SampleType,
+    StreamCategory, StreamMode, WasapiError, WaveFormat,
 };
 
-use crate::{input_config::InputConfig, stats::AudioStats, OPUS_SAMPLE_RATE};
+use crate::{
+    aec::{self, OutputKind},
+    input_config::InputConfig,
+    stats::AudioStats,
+    OPUS_SAMPLE_RATE,
+};
 
 /// Capture engine buffer: tolerance, not latency (see module docs).
 const CAPTURE_BUFFER_HNS: i64 = 50 * 10_000;
@@ -175,15 +193,18 @@ impl SampleLayout {
 
 // ── Device lookup ───────────────────────────────────────────────────────
 
+/// The device for `name`, or the default for `role` (Console as ever;
+/// Communications on the voice-call path, AEC-SPEC.md D4).
 fn find_device(
     enumerator: &DeviceEnumerator,
     direction: Direction,
     name: Option<&str>,
+    role: Role,
 ) -> Result<wasapi::Device, String> {
     match name {
         None => enumerator
-            .get_default_device(&direction)
-            .map_err(|e| format!("default {direction} device: {e}")),
+            .get_default_device_for_role(&direction, &role)
+            .map_err(|e| format!("default {direction} device ({role}): {e}")),
         Some(name) => enumerator
             .get_device_collection(&direction)
             .map_err(|e| format!("{direction} device collection: {e}"))?
@@ -275,26 +296,166 @@ fn open_client_mix(
     })
 }
 
+/// A fresh client for `device`, in the `Communications` category when
+/// `voice` (AEC-SPEC.md D3). The category must be set before
+/// `Initialize`, so every attempt below gets its own.
+fn new_client(device: &wasapi::Device, voice: bool, what: &str) -> Result<AudioClient, String> {
+    let client = device
+        .get_iaudioclient()
+        .map_err(|e| format!("{what} audio client: {e}"))?;
+    if voice {
+        let props = AudioClientProperties::new().set_category(StreamCategory::Communications);
+        if let Err(e) = client.set_properties(props) {
+            // IAudioClient2 is Windows 8+; nothing older runs us. Log
+            // and carry on as a plain stream; the report will say so.
+            warn!("{what}: Communications category refused: {e}");
+        }
+    }
+    Ok(client)
+}
+
 /// Open a client for `device`, preferring 48 kHz f32 with conversion.
 fn open_with_fallback(
     device: &wasapi::Device,
     direction: Direction,
     buffer_hns: i64,
     what: &str,
+    voice: bool,
 ) -> Result<(AudioClient, Negotiated), String> {
-    let mut client = device
-        .get_iaudioclient()
-        .map_err(|e| format!("{what} audio client: {e}"))?;
+    let mut client = new_client(device, voice, what)?;
     match open_client(&mut client, direction, buffer_hns, what) {
         Ok(n) => Ok((client, n)),
         Err(first) => {
             debug!("{what}: {first}; retrying at mix format");
-            let mut client = device
-                .get_iaudioclient()
-                .map_err(|e| format!("{what} audio client (retry): {e}"))?;
+            let mut client = new_client(device, voice, what)?;
             let n = open_client_mix(&mut client, direction, buffer_hns, what)?;
             Ok((client, n))
         }
+    }
+}
+
+/// The role "default" means for this session.
+fn role_for(voice: bool) -> Role {
+    if voice {
+        Role::Communications
+    } else {
+        Role::Console
+    }
+}
+
+/// After capture opened in the `Communications` category: point the
+/// canceller at our render endpoint and say whether one is running
+/// (AEC-SPEC.md §4.1 step 5).
+fn engage_platform_aec(
+    client: &AudioClient,
+    enumerator: &DeviceEnumerator,
+    reference: Option<&str>,
+) -> Result<(), &'static str> {
+    // Windows 11 22H2+: the reference is ours to name. Elsewhere (and
+    // when this fails) the effect picks its own, usually the default
+    // communications render device — which is what we opened.
+    match client.get_aec_control() {
+        Ok(control) => {
+            let id = find_device(
+                enumerator,
+                Direction::Render,
+                reference,
+                Role::Communications,
+            )
+            .and_then(|d| d.get_id().map_err(|e| e.to_string()))
+            .ok();
+            match control.set_echo_cancellation_render_endpoint(id.clone()) {
+                Ok(()) => info!(
+                    "AEC reference endpoint set ({})",
+                    id.as_deref().unwrap_or("auto")
+                ),
+                Err(e) => debug!("AEC reference endpoint not set: {e}"),
+            }
+        }
+        Err(e) => debug!("AEC control unavailable ({e}); the effect picks its reference"),
+    }
+    // Verified, not assumed (D5). No effects manager (Windows 10): the
+    // category is set and the OEM chain may still cancel — say on.
+    match client
+        .get_audio_effects_manager()
+        .and_then(|m| m.get_audio_effects())
+    {
+        Ok(Some(effects)) => {
+            let on = effects.iter().any(|e| {
+                e.id == AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION
+                    && e.state == AUDIO_EFFECT_STATE_ON
+            });
+            if on {
+                Ok(())
+            } else {
+                Err(aec::reasons::NO_CANCELLER)
+            }
+        }
+        Ok(None) => Err(aec::reasons::NO_CANCELLER),
+        Err(e) => {
+            debug!("audio effects manager unavailable ({e}); assuming the endpoint's chain");
+            Ok(())
+        }
+    }
+}
+
+/// The render endpoint's form factor as an [`OutputKind`]
+/// (AEC-SPEC.md §4.2): `name`, or the console default. Runs on a
+/// short-lived thread of its own so COM is initialised wherever the
+/// caller is. `Unknown` when anything fails.
+#[must_use]
+pub fn output_kind(name: Option<&str>) -> OutputKind {
+    let name = name.map(String::from);
+    let worker = crate::platform::spawn_named("output-kind", move || {
+        if wasapi::initialize_mta().ok().is_err() {
+            return OutputKind::Unknown;
+        }
+        let kind = (|| -> Result<u32, String> {
+            let enumerator = DeviceEnumerator::new().map_err(|e| e.to_string())?;
+            let device = find_device(
+                &enumerator,
+                Direction::Render,
+                name.as_deref(),
+                Role::Console,
+            )?;
+            let id = device.get_id().map_err(|e| e.to_string())?;
+            form_factor(&id).map_err(|e| e.to_string())
+        })();
+        wasapi::deinitialize();
+        match kind {
+            Ok(ff) => aec::windows_output_kind(ff),
+            Err(e) => {
+                debug!("output form factor: {e}");
+                OutputKind::Unknown
+            }
+        }
+    });
+    worker.join().unwrap_or(OutputKind::Unknown)
+}
+
+/// `PKEY_AudioEndpoint_FormFactor` of the endpoint `id`, through the
+/// `windows` crate directly: `wasapi` reads properties but keeps the
+/// accessor private (AEC-SPEC.md §4.2). COM must be initialised.
+fn form_factor(id: &str) -> windows::core::Result<u32> {
+    use windows::{
+        core::HSTRING,
+        Win32::{
+            Media::Audio::{
+                IMMDeviceEnumerator, MMDeviceEnumerator, PKEY_AudioEndpoint_FormFactor,
+            },
+            System::Com::{CoCreateInstance, CLSCTX_ALL, STGM_READ},
+        },
+    };
+    // SAFETY: plain COM calls on interfaces this function owns; the
+    // HSTRING outlives the call that borrows it.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let w_id = HSTRING::from(id);
+        let device = enumerator.GetDevice(&w_id)?;
+        let store = device.OpenPropertyStore(STGM_READ)?;
+        let value = store.GetValue(&PKEY_AudioEndpoint_FormFactor)?;
+        u32::try_from(&value)
     }
 }
 
@@ -316,7 +477,14 @@ pub struct NativeCapture {
     pub sample_rate: u32,
     /// Friendly name of the endpoint that was opened.
     pub device_name: String,
+    /// On the voice-call path: whether an AEC effect is running on the
+    /// endpoint (`Err` = why not). `None` = a plain stream.
+    pub aec_verdict: Option<Result<(), &'static str>>,
 }
+
+/// What the capture thread reports once the device is open: rate,
+/// endpoint name, and the AEC verdict (voice-call path only).
+type CaptureSetup = (u32, String, Option<Result<(), &'static str>>);
 
 struct CaptureParts {
     producer: Producer<f32>,
@@ -331,8 +499,10 @@ type SetupReport<T> = Result<T, String>;
 impl NativeCapture {
     /// Open `device_name` (or the default capture endpoint) on a new
     /// MMCSS thread and start pumping into `producer`.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         device_name: Option<&str>,
+        voice: Option<Option<String>>,
         producer: Producer<f32>,
         wake_tx: Sender<()>,
         stats: Arc<AudioStats>,
@@ -340,7 +510,7 @@ impl NativeCapture {
         input_level: Arc<AtomicU32>,
     ) -> Result<Self, CaptureStartError> {
         let should_stop = Arc::new(AtomicBool::new(false));
-        let (setup_tx, setup_rx) = bounded::<SetupReport<(u32, String)>>(1);
+        let (setup_tx, setup_rx) = bounded::<SetupReport<CaptureSetup>>(1);
         // Failure path must hand the ring back, so the thread only takes
         // ownership once setup has succeeded: parts travel in a channel.
         let (parts_tx, parts_rx) = bounded::<CaptureParts>(1);
@@ -348,11 +518,11 @@ impl NativeCapture {
         let stop = should_stop.clone();
 
         let thread = crate::platform::spawn_named("voice-capture-wasapi", move || {
-            capture_thread(name.as_deref(), &setup_tx, &parts_rx, &stop);
+            capture_thread(name.as_deref(), voice.as_ref(), &setup_tx, &parts_rx, &stop);
         });
 
         match setup_rx.recv() {
-            Ok(Ok((sample_rate, device_name))) => {
+            Ok(Ok((sample_rate, device_name, aec_verdict))) => {
                 let parts = CaptureParts {
                     producer,
                     wake_tx,
@@ -377,6 +547,7 @@ impl NativeCapture {
                     thread: Some(thread),
                     sample_rate,
                     device_name,
+                    aec_verdict,
                 })
             }
             other => {
@@ -404,9 +575,13 @@ impl Drop for NativeCapture {
     }
 }
 
+/// `voice`: `Some(reference)` = open on the voice-call path with the
+/// AEC reference set to the render endpoint `reference` (`None` inside
+/// = the default communications device); `None` = a plain stream.
 fn capture_thread(
     device_name: Option<&str>,
-    setup_tx: &Sender<SetupReport<(u32, String)>>,
+    voice: Option<&Option<String>>,
+    setup_tx: &Sender<SetupReport<CaptureSetup>>,
     parts_rx: &crossbeam_channel::Receiver<CaptureParts>,
     should_stop: &AtomicBool,
 ) {
@@ -418,13 +593,31 @@ fn capture_thread(
     // the backend exists.
     let _rt = crate::platform::promote_current_thread(480, OPUS_SAMPLE_RATE);
 
+    let mut aec_verdict = None;
     let opened =
         (|| -> Result<(AudioClient, AudioCaptureClient, Handle, Negotiated, String), String> {
             let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
-            let device = find_device(&enumerator, Direction::Capture, device_name)?;
+            let device = find_device(
+                &enumerator,
+                Direction::Capture,
+                device_name,
+                role_for(voice.is_some()),
+            )?;
             let friendly = device.get_friendlyname().unwrap_or_else(|_| "?".into());
-            let (client, negotiated) =
-                open_with_fallback(&device, Direction::Capture, CAPTURE_BUFFER_HNS, "capture")?;
+            let (client, negotiated) = open_with_fallback(
+                &device,
+                Direction::Capture,
+                CAPTURE_BUFFER_HNS,
+                "capture",
+                voice.is_some(),
+            )?;
+            if let Some(reference) = voice {
+                aec_verdict = Some(engage_platform_aec(
+                    &client,
+                    &enumerator,
+                    reference.as_deref(),
+                ));
+            }
             let event = client
                 .set_get_eventhandle()
                 .map_err(|e| format!("capture event handle: {e}"))?;
@@ -446,7 +639,7 @@ fn capture_thread(
         }
     };
     if setup_tx
-        .send(Ok((negotiated.sample_rate, friendly.clone())))
+        .send(Ok((negotiated.sample_rate, friendly.clone(), aec_verdict)))
         .is_err()
     {
         wasapi::deinitialize();
@@ -458,11 +651,16 @@ fn capture_thread(
     };
 
     info!(
-        "Native WASAPI capture: {friendly} @ {} Hz, {}ch, {:?}, {} ms engine buffer",
+        "Native WASAPI capture: {friendly} @ {} Hz, {}ch, {:?}, {} ms engine buffer, category={}",
         negotiated.sample_rate,
         negotiated.channels,
         negotiated.layout,
-        CAPTURE_BUFFER_HNS / 10_000
+        CAPTURE_BUFFER_HNS / 10_000,
+        if voice.is_some() {
+            "Communications"
+        } else {
+            "Other"
+        }
     );
     run_capture(&client, &capture, &event, negotiated, parts, should_stop);
     if let Err(e) = client.stop_stream() {
@@ -620,6 +818,7 @@ struct RenderParts {
 impl NativeRender {
     pub fn start(
         device_name: Option<&str>,
+        voice: bool,
         consumer: Consumer<f32>,
         wake_tx: Sender<()>,
         stats: Arc<AudioStats>,
@@ -631,7 +830,7 @@ impl NativeRender {
         let stop = should_stop.clone();
 
         let thread = crate::platform::spawn_named("voice-render-wasapi", move || {
-            render_thread(name.as_deref(), &setup_tx, &parts_rx, &stop);
+            render_thread(name.as_deref(), voice, &setup_tx, &parts_rx, &stop);
         });
 
         match setup_rx.recv() {
@@ -685,6 +884,7 @@ impl Drop for NativeRender {
 
 fn render_thread(
     device_name: Option<&str>,
+    voice: bool,
     setup_tx: &Sender<SetupReport<(u32, String)>>,
     parts_rx: &crossbeam_channel::Receiver<RenderParts>,
     should_stop: &AtomicBool,
@@ -698,10 +898,15 @@ fn render_thread(
     let opened =
         (|| -> Result<(AudioClient, AudioRenderClient, Handle, Negotiated, String), String> {
             let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
-            let device = find_device(&enumerator, Direction::Render, device_name)?;
+            let device = find_device(&enumerator, Direction::Render, device_name, role_for(voice))?;
             let friendly = device.get_friendlyname().unwrap_or_else(|_| "?".into());
-            let (client, negotiated) =
-                open_with_fallback(&device, Direction::Render, RENDER_BUFFER_HNS, "render")?;
+            let (client, negotiated) = open_with_fallback(
+                &device,
+                Direction::Render,
+                RENDER_BUFFER_HNS,
+                "render",
+                voice,
+            )?;
             let event = client
                 .set_get_eventhandle()
                 .map_err(|e| format!("render event handle: {e}"))?;
@@ -741,11 +946,12 @@ fn render_thread(
     };
 
     info!(
-        "Native WASAPI render: {friendly} @ {} Hz, {}ch, {:?}, {} ms engine buffer",
+        "Native WASAPI render: {friendly} @ {} Hz, {}ch, {:?}, {} ms engine buffer, category={}",
         negotiated.sample_rate,
         negotiated.channels,
         negotiated.layout,
-        RENDER_BUFFER_HNS / 10_000
+        RENDER_BUFFER_HNS / 10_000,
+        if voice { "Communications" } else { "Other" }
     );
     run_render(&client, &render, &event, negotiated, parts, should_stop);
     if let Err(e) = client.stop_stream() {
@@ -866,7 +1072,10 @@ pub struct DeviceWatcher {
 }
 
 impl DeviceWatcher {
-    pub fn start(stats: Arc<AudioStats>) -> Result<Self, String> {
+    /// `communications`: the session is on the voice-call path, so the
+    /// default that matters is the Default Communications Device
+    /// (AEC-SPEC.md §4.5); otherwise Console/Multimedia, as ever.
+    pub fn start(stats: Arc<AudioStats>, communications: Arc<AtomicBool>) -> Result<Self, String> {
         let (stop_tx, stop_rx) = bounded::<()>(1);
         let (setup_tx, setup_rx) = bounded::<Result<(), String>>(1);
         let thread = crate::platform::spawn_named("device-watch", move || {
@@ -874,7 +1083,7 @@ impl DeviceWatcher {
                 let _ = setup_tx.send(Err(format!("COM init: {e}")));
                 return;
             }
-            let registration = match register(&stats) {
+            let registration = match register(&stats, &communications) {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = setup_tx.send(Err(e));
@@ -918,15 +1127,23 @@ impl Drop for DeviceWatcher {
 /// enumerator it came from, so both are returned together.
 fn register(
     stats: &Arc<AudioStats>,
+    communications: &Arc<AtomicBool>,
 ) -> Result<(DeviceEnumerator, DeviceEventRegistration), String> {
     let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
     let mut callbacks = DeviceEventCallbacks::new();
     {
         let stats = stats.clone();
+        let communications = communications.clone();
         callbacks.set_default_device_callback(move |direction, role, id| {
             // Console/Multimedia are what "default device" means for apps;
-            // Communications is a separate user setting.
-            if !matches!(role, Role::Console | Role::Multimedia) {
+            // Communications is a separate user setting — the one that
+            // applies while we are on the voice-call path.
+            let relevant = if communications.load(Ordering::Relaxed) {
+                matches!(role, Role::Communications)
+            } else {
+                matches!(role, Role::Console | Role::Multimedia)
+            };
+            if !relevant {
                 return;
             }
             debug!("default {direction} device changed ({role}): {id:?}");

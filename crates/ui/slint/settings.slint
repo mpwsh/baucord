@@ -1,7 +1,9 @@
 // settings.slint — the settings window.
 //
 // Left nav (Profile / General / Audio / Keyboard / Servers / About),
-// scrollable content, Save & close + Reset row.
+// scrollable content, Save & close + Reset row. Narrow (the Android
+// page on a phone held upright): the nav is a page of its own and a
+// section opens over it, with a back arrow (ANDROID-SPEC.md D28).
 //
 // Live semantics carry over: every control applies immediately through
 // a callback (per keystroke / per tick), persistence happens when the
@@ -17,7 +19,7 @@ import { ScrollView } from "std-widgets.slint";
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { KeybindRow, ServerRow } from "globals.slint";
+import { State, KeybindRow, ServerRow } from "globals.slint";
 import { Btn, IconBtn, Field, FieldLabel, Hint, SectionHeader, Sep, HSlider, VuMeter, GateMeter, Dropdown, CheckRow } from "widgets.slint";
 
 export global SettingsState {
@@ -102,6 +104,12 @@ export global SettingsState {
     in property <[string]> transmission-modes;
     in-out property <int> transmission-index: 0;
     in property <string> ptt-bind;
+    /// Echo cancellation (AEC-SPEC.md §5): Automatic / Always / Off
+    /// (audio::AecMode::ALL order), and what the open streams got,
+    /// localized by the host ("" hides the line).
+    in property <[string]> aec-modes;
+    in-out property <int> aec-index: 0;
+    in property <string> aec-status;
 
     // ── Keyboard ──
     in property <[KeybindRow]> keybinds;
@@ -167,6 +175,7 @@ export global SettingsLogic {
     callback output-gain-changed(float);
     callback toggle-test-mic();
     callback transmission-selected(int);
+    callback aec-selected(int);
 
     // Keyboard
     callback record-keybind(int);
@@ -187,8 +196,11 @@ component NavItem inherits Rectangle {
     in property <string> text;
     in property <Icon> icon;
     in property <bool> active;
+    /// The narrow layout's list: a finger-sized row with a chevron
+    /// (the row opens a page there rather than selecting a tab).
+    in property <bool> tall: false;
     callback clicked;
-    height: 36px;
+    height: root.tall ? 48px : 36px;
     border-radius: Theme.radius-md;
     background: active ? Theme.accent : t.has-hover ? Theme.hover : transparent;
     animate background { duration: 150ms; }
@@ -211,6 +223,14 @@ component NavItem inherits Rectangle {
             font-size: Theme.font-body;
             font-weight: root.active ? 600 : 400;
             horizontal-stretch: 1;
+        }
+        if root.tall : Rectangle {
+            width: 16px;
+            IconDisplay {
+                icon: IconSet.ChevronRight;
+                size: 16px;
+                stroke: Theme.text-muted;
+            }
         }
     }
     t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
@@ -801,6 +821,21 @@ component AudioPanel inherits VerticalLayout {
         }
     }
     Setting {
+        label: Tr.audio-aec;
+        hint: Tr.audio-aec-hint;
+        Dropdown {
+            options: SettingsState.aec-modes;
+            current <=> SettingsState.aec-index;
+            selected(i) => { SettingsLogic.aec-selected(i); }
+        }
+        if SettingsState.aec-status != "" : Text {
+            text: SettingsState.aec-status;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+    }
+    Setting {
         label: Tr.audio-transmission;
         hint: SettingsState.transmission-index == 1
             ? (SettingsState.ptt-bind == "" ? Tr.audio-ptt-unbound : Tr.audio-ptt-hint + " " + SettingsState.ptt-bind)
@@ -978,12 +1013,103 @@ component CreditsPanel inherits VerticalLayout {
 // ANDROID-SPEC.md D22) shows it as a page inside `MainWindow`
 // (`State.settings-open`). Same globals either way, so
 // `settingsui.rs` drives both through one `SettingsSurface`.
+/// The section list: the wide layout's left column, the narrow
+/// layout's first page.
+component SettingsNav inherits VerticalLayout {
+    in property <int> tab;
+    in property <bool> narrow: false;
+    callback picked(int);
+    padding: Theme.gap-md;
+    spacing: Theme.gap-xs;
+    // Indices are mirrored by `settingsui::TAB_*`. The narrow list
+    // highlights nothing: a row there opens its page.
+    NavItem { text: Tr.tab-profile;   icon: IconSet.UserRound;         tall: root.narrow; active: !root.narrow && root.tab == 0; clicked => { root.picked(0); } }
+    NavItem { text: Tr.tab-general;   icon: IconSet.SlidersHorizontal; tall: root.narrow; active: !root.narrow && root.tab == 1; clicked => { root.picked(1); } }
+    NavItem { text: Tr.tab-audio;     icon: IconSet.Volume2;           tall: root.narrow; active: !root.narrow && root.tab == 2; clicked => { root.picked(2); } }
+    NavItem { text: Tr.sounds-header; icon: IconSet.Bell;              tall: root.narrow; active: !root.narrow && root.tab == 3; clicked => { root.picked(3); } }
+    NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard;          tall: root.narrow; active: !root.narrow && root.tab == 4; clicked => { root.picked(4); } }
+    NavItem { text: Tr.tab-servers;   icon: IconSet.Server;            tall: root.narrow; active: !root.narrow && root.tab == 5; clicked => { root.picked(5); } }
+    Rectangle { }
+    NavItem { text: Tr.tab-credits;   icon: IconSet.Heart;             tall: root.narrow; active: !root.narrow && root.tab == 6; clicked => { root.picked(6); } }
+    NavItem { text: Tr.tab-about;     icon: IconSet.Info;              tall: root.narrow; active: !root.narrow && root.tab == 7; clicked => { root.picked(7); } }
+}
+
+/// The selected section, scrolling: the wide layout's right column,
+/// the narrow layout's second page.
+component SettingsContent inherits ScrollView {
+    in property <int> tab;
+    in property <length> pad: Theme.gap-xl;
+    vertical-stretch: 1;
+    // Fluent's ScrollView does not pan on a drag; on the Android page
+    // a finger needs it to (ANDROID-SPEC.md D27). (The desktop
+    // window's own State leaves this false.)
+    mouse-drag-pan-enabled: State.touch-host;
+    VerticalLayout {
+        padding: root.pad;
+        // Readable measure: the content column stops growing past
+        // ~560px on a wide window.
+        HorizontalLayout {
+            VerticalLayout {
+                max-width: 560px;
+                horizontal-stretch: 100;
+                if root.tab == 0 : ProfilePanel { }
+                if root.tab == 1 : GeneralPanel { }
+                if root.tab == 2 : AudioPanel { }
+                if root.tab == 3 : SoundsPanel { }
+                if root.tab == 4 : KeyboardPanel { }
+                if root.tab == 5 : ServersPanel { }
+                if root.tab == 6 : CreditsPanel { }
+                if root.tab == 7 : AboutPanel { }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}
+
+/// Reset to defaults · Save & close.
+component SettingsFooter inherits Rectangle {
+    height: 64px;
+    background: Theme.bg-primary;
+    Rectangle { y: 0; height: 1px; width: 100%; background: Theme.border; }
+    HorizontalLayout {
+        padding: Theme.gap-md;
+        spacing: Theme.gap-sm;
+        Rectangle { }
+        Btn {
+            text: Tr.reset-defaults;
+            clicked => { SettingsLogic.reset-defaults(); }
+        }
+        Btn {
+            text: Tr.save-and-close;
+            accent: true;
+            clicked => { SettingsLogic.save-and-close(); }
+        }
+    }
+}
+
 export component SettingsPanel inherits FocusScope {
     /// 0 profile, 1 general, 2 audio, 3 sounds, 4 keyboard, 5 servers,
     /// 6 credits, 7 about. Mirrored by `settingsui::TAB_*`.
     in-out property <int> tab: 0;
+    /// The narrow layout (a phone held upright; ANDROID-SPEC.md D28):
+    /// the section list and the open section are two pages, as the
+    /// sidebar and the chat are in the main window.
+    in property <bool> narrow: false;
+    /// Narrow only: a section's page is showing, not the list.
+    in-out property <bool> section-open: false;
 
     public function focus-capture() { root.focus(); }
+
+    /// One step back: from a section to the list (narrow), else out
+    /// of Settings — saved, as the button does. The top bar's arrow
+    /// and Android's Back.
+    public function back() {
+        if (root.narrow && root.section-open) {
+            root.section-open = false;
+        } else {
+            SettingsLogic.save-and-close();
+        }
+    }
 
     // While a keybind is recording, swallow everything here —
     // Escape cancels, Backspace clears, anything else is the new
@@ -996,71 +1122,69 @@ export component SettingsPanel inherits FocusScope {
         accept
     }
 
-    HorizontalLayout {
-        // Nav
+    if !root.narrow : HorizontalLayout {
+        width: 100%;
+        height: 100%;
         Rectangle {
             width: 188px;
             background: Theme.surface;
-            VerticalLayout {
-                padding: Theme.gap-md;
-                spacing: Theme.gap-xs;
-                // Indices are mirrored by `settingsui::TAB_*`.
-                NavItem { text: Tr.tab-profile;   icon: IconSet.UserRound;         active: root.tab == 0; clicked => { root.tab = 0; } }
-                NavItem { text: Tr.tab-general;   icon: IconSet.SlidersHorizontal; active: root.tab == 1; clicked => { root.tab = 1; } }
-                NavItem { text: Tr.tab-audio;     icon: IconSet.Volume2;           active: root.tab == 2; clicked => { root.tab = 2; } }
-                NavItem { text: Tr.sounds-header; icon: IconSet.Bell;              active: root.tab == 3; clicked => { root.tab = 3; } }
-                NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard;          active: root.tab == 4; clicked => { root.tab = 4; } }
-                NavItem { text: Tr.tab-servers;   icon: IconSet.Server;            active: root.tab == 5; clicked => { root.tab = 5; } }
-                Rectangle { }
-                NavItem { text: Tr.tab-credits;   icon: IconSet.Heart;             active: root.tab == 6; clicked => { root.tab = 6; } }
-                NavItem { text: Tr.tab-about;     icon: IconSet.Info;              active: root.tab == 7; clicked => { root.tab = 7; } }
+            SettingsNav {
+                tab: root.tab;
+                picked(i) => { root.tab = i; }
             }
         }
-        // Content + button row
         VerticalLayout {
-            ScrollView {
-                vertical-stretch: 1;
-                VerticalLayout {
-                    padding: Theme.gap-xl;
-                    // Readable measure: the content column stops
-                    // growing past ~560px on a wide window.
-                    HorizontalLayout {
-                        VerticalLayout {
-                            max-width: 560px;
-                            horizontal-stretch: 100;
-                            if root.tab == 0 : ProfilePanel { }
-                            if root.tab == 1 : GeneralPanel { }
-                            if root.tab == 2 : AudioPanel { }
-                            if root.tab == 3 : SoundsPanel { }
-                            if root.tab == 4 : KeyboardPanel { }
-                            if root.tab == 5 : ServersPanel { }
-                            if root.tab == 6 : CreditsPanel { }
-                            if root.tab == 7 : AboutPanel { }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
+            SettingsContent { tab: root.tab; }
+            SettingsFooter { }
+        }
+    }
+
+    if root.narrow : VerticalLayout {
+        width: 100%;
+        height: 100%;
+        // The way back, and where you are.
+        Rectangle {
+            height: 52px;
+            background: Theme.surface;
+            HorizontalLayout {
+                padding-left: Theme.gap-sm;
+                padding-right: Theme.gap-md;
+                spacing: Theme.gap-xs;
+                Rectangle {
+                    width: 40px;
+                    IconBtn {
+                        size: 40px;
+                        icon-size: 20px;
+                        icon: IconSet.ArrowLeft;
+                        idle-color: Theme.text-primary;
+                        clicked => { root.back(); }
                     }
                 }
-            }
-            Rectangle {
-                height: 64px;
-                background: Theme.bg-primary;
-                Rectangle { y: 0; height: 1px; width: 100%; background: Theme.border; }
-                HorizontalLayout {
-                    padding: Theme.gap-md;
-                    spacing: Theme.gap-sm;
-                    Rectangle { }
-                    Btn {
-                        text: Tr.reset-defaults;
-                        clicked => { SettingsLogic.reset-defaults(); }
-                    }
-                    Btn {
-                        text: Tr.save-and-close;
-                        accent: true;
-                        clicked => { SettingsLogic.save-and-close(); }
-                    }
+                Text {
+                    text: Tr.settings-title;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
                 }
             }
         }
+        if !root.section-open : SettingsNav {
+            vertical-stretch: 1;
+            narrow: true;
+            tab: root.tab;
+            picked(i) => {
+                root.tab = i;
+                root.section-open = true;
+            }
+        }
+        if root.section-open : SettingsContent {
+            tab: root.tab;
+            pad: Theme.gap-lg;
+        }
+        SettingsFooter { }
     }
 }
 

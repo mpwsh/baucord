@@ -215,6 +215,9 @@ impl Viewer {
                 s.set_watch_open(false);
                 // The last frame's texture goes with the page.
                 s.set_watch_frame(slint::Image::default());
+                // The page held the keyboard focus: hand it back, or
+                // the next Back finds no handler and closes the app.
+                main.invoke_focus_composer();
             }
         }
     }

@@ -481,6 +481,10 @@ pub struct AudioSettings {
     /// still applies); off = voice activity.
     #[serde(default)]
     pub push_to_talk: bool,
+    /// Echo cancellation (`AEC-SPEC.md` §3.1): `"auto"` (the default:
+    /// only on speakers), `"always"`, `"off"`.
+    #[serde(default)]
+    pub echo_cancellation: audio::AecMode,
 }
 
 impl Default for AudioSettings {
@@ -490,6 +494,7 @@ impl Default for AudioSettings {
             output: AudioOutputSettings::default(),
             gate_threshold: 0.010,
             push_to_talk: false,
+            echo_cancellation: audio::AecMode::Auto,
         }
     }
 }

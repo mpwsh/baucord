@@ -63,6 +63,13 @@ pub struct AudioOutput {
     /// Native backend stream, when it opened successfully (Windows).
     #[cfg(windows)]
     native: Option<crate::native::wasapi::NativeRender>,
+    /// The voice-call stream (Android, `native::aaudio`), when the
+    /// session wants the platform's echo canceller and it opened.
+    #[cfg(target_os = "android")]
+    native_voice: Option<crate::native::aaudio::NativeRender>,
+    /// Open on the platform's voice-call path (`aec::wants_aec`).
+    #[cfg_attr(not(any(windows, target_os = "android")), allow(dead_code))]
+    voice: bool,
     packet_rx: Option<Receiver<(AudioPacket, Instant)>>,
     loopback_rx: Option<Receiver<PcmFrame>>,
     sound_rx: Option<Receiver<SoundType>>,
@@ -106,6 +113,7 @@ impl AudioOutput {
         removed_peers: Arc<Mutex<HashSet<u64>>>,
         stats: Arc<AudioStats>,
         output_gain: f32,
+        voice: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
 
@@ -148,6 +156,9 @@ impl AudioOutput {
             stream: None,
             #[cfg(windows)]
             native: None,
+            #[cfg(target_os = "android")]
+            native_voice: None,
+            voice,
             ring_producer: Some(ring_producer),
             ring_consumer: Some(ring_consumer),
             ring_capacity: ring_size,
@@ -174,6 +185,10 @@ impl AudioOutput {
         if let Some(n) = self.native.as_ref() {
             return Some(n.device_name.clone());
         }
+        #[cfg(target_os = "android")]
+        if let Some(n) = self.native_voice.as_ref() {
+            return Some(n.device_name.clone());
+        }
         crate::device_name(&self.device)
     }
 
@@ -197,7 +212,47 @@ impl AudioOutput {
                 Err(e) => log::warn!("Native WASAPI render unavailable ({e}); using cpal"),
             }
         }
+        #[cfg(target_os = "android")]
+        if self.voice {
+            match self.start_native_voice() {
+                Ok(()) => return Ok(()),
+                Err(e) => log::warn!("Voice-call playback unavailable ({e}); using cpal"),
+            }
+        }
         self.start_cpal()
+    }
+
+    /// Android: the speaker on the voice-call path (`native::aaudio`),
+    /// the render half of what Android's echo canceller needs. On
+    /// failure the ring and latch go back for the cpal path.
+    #[cfg(target_os = "android")]
+    fn start_native_voice(&mut self) -> Result<(), String> {
+        let consumer = self
+            .ring_consumer
+            .take()
+            .ok_or("ring consumer already taken")?;
+        let wake_tx = self.wake_tx.take().ok_or("wake sender already taken")?;
+        // Prime before the stream starts pulling (the rate is the one we
+        // ask for; AAudio converts if the device runs at another).
+        self.prime_ring(crate::OPUS_SAMPLE_RATE);
+        match crate::native::aaudio::NativeRender::start(
+            consumer,
+            wake_tx,
+            self.stats.clone(),
+            self.callback_frames.clone(),
+        ) {
+            Ok(native) => {
+                let rate = native.sample_rate;
+                self.native_voice = Some(native);
+                self.spawn_worker_for(rate);
+                Ok(())
+            }
+            Err(err) => {
+                self.ring_consumer = Some(err.consumer);
+                self.wake_tx = Some(err.wake_tx);
+                Err(err.reason)
+            }
+        }
     }
 
     /// Windows: play through our own MMCSS thread (see `native::wasapi`).
@@ -213,6 +268,7 @@ impl AudioOutput {
         let wake_tx = self.wake_tx.take().ok_or("wake sender already taken")?;
         match crate::native::wasapi::NativeRender::start(
             self.device_name.as_deref(),
+            self.voice,
             consumer,
             wake_tx,
             self.stats.clone(),
@@ -745,6 +801,8 @@ impl Drop for AudioOutput {
         self.stream.take();
         #[cfg(windows)]
         self.native.take();
+        #[cfg(target_os = "android")]
+        self.native_voice.take();
         if let Some(thread) = self.worker_thread.take() {
             let _ = thread.join();
         }

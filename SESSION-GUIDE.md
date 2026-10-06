@@ -356,6 +356,17 @@ Memory-mode servers (persistence off) still use the legacy
   emulator's `Underruns 162` in 6 s was 27/s — one per callback — and
   was first written off as the emulator's audio clock. Divide by the
   time and compare with the callback period first.
+- **Android-only code can be type-checked here; Windows-only code
+  cannot.** `ndk` has a `test` feature that compiles its bindings off
+  Android: a scratch crate depending on `ndk` (`audio`, `api-level-28`,
+  `test`), `jni` 0.22, `ndk-context` and the real `audio` crate, with
+  `#[path]` modules pulling in `native/aaudio.rs` + `native/android.rs`
+  and tiny shims for the `crate::` items they use, runs `cargo clippy`
+  clean (2026-10-06). The `windows` 0.62 crates do not build off
+  Windows at all (`windows-future` needs `windows_core::imp::IMarshal`;
+  `--cfg windows` then trips on `std::os::windows`), so `wasapi.rs`
+  changes are checked against the crate sources by reading and by the
+  user's first Windows `cargo check`. Say so in the hand-over.
 - **No per-frame `warn!`.** A timing alarm that fires once a frame is
   60 lines a second on any machine slower than the one it was tuned
   on (the emulator: 652 of 729 logcat lines). Feed the measurement to
@@ -381,6 +392,36 @@ Memory-mode servers (persistence off) still use the legacy
   ordinal crosses the bridge), and both conversions in
   `ui/src/lib.rs` (`menu_action`, `menu_action_back`). Miss one and
   only the compile says so, one round later.
+- **The narrow (phone) layout renders only at a phone width:**
+  `MainWindow` has `preferred-width`/`min-width`, so a fixture alone
+  draws the wide layout. Copy the `.slint` tree, swap
+  `preferred-width: 1000px` → `width: 412px` (and the height; drop
+  both `min-*` lines — the viewer rejects `height` next to
+  `min-height`), then render; `State.narrow-chat-open: true` shows
+  the chat page, `State.touch-host: true` the touch-only affordances
+  (the DM ✕); `State.settings-open: true` the Settings page, with
+  `settings-tab` and `settings-section-open` picking list or section.
+  `--component SettingsWindow ... settings.slint` with `{"tab": 2}`
+  checks the desktop window didn't move. The slide itself (a `Timer`-free `animate`) cannot be
+  captured. Check 1000×640 after any change there: the wide layout
+  must not move.
+- `z` takes a number literal only (`z: cond ? 0 : 1` is a compile
+  error); order siblings, or lay them out so they never overlap.
+- **The widget style is fluent everywhere, Android too** (no style in
+  `ui/build.rs` → the compiler's fallback is fluent, not the per-target
+  "native" table). Fluent's `ScrollView`/`ListView` never pan on a drag,
+  so every scroll view a phone reaches binds
+  `mouse-drag-pan-enabled: State.touch-host` (D27) — a new one must too.
+- Interactions (drags, flicks, long-press) can't be screenshotted, but
+  they can be driven headless: a scratch crate with `slint =
+  { version = "=1.17.1", default-features = false, features = ["std",
+  "compat-1-2"] }` and `i-slint-backend-testing = "=1.17.1"`, a
+  `slint::slint!{}` copy of the element under test,
+  `i_slint_backend_testing::init_no_event_loop()`, then
+  `window.dispatch_event(WindowEvent::Pointer*)` with
+  `mock_elapsed_time` between moves, reading back an `out` property
+  (`viewport-y`). Builds in a few minutes with `debug = 0`; Android's
+  touch input reaches items as these same pointer events.
 - A render fixture's `image` fields (`avatar`, `viewer-image`) must
   point at a real file — `""` makes the whole model fail to load
   ("Failed to load image from path") — a 1×1 PNG written by the
@@ -891,8 +932,24 @@ under `State.watch-open` through `viewers::Viewer`'s `Surface` enum.
 Stream viewing confirmed on the emulator and the phone the same night.
 Voice then broke up on the phone: the 20 ms playback cushion vs
 AAudio's 20–40 ms callbacks (D24), fixed with a callback-sized cushion,
-a jitter floor for burst pulls and nice −16 audio workers; awaiting
-the phone's `Output callbacks of …` line and `Underruns` rate.
+a jitter floor for burst pulls and nice −16 audio workers. Reported
+working; emulator log: 45 ms callbacks, underruns down from ~25.6/s to
+~4/s (back-to-back emulator callbacks, most likely). Still wanted: the
+phone's `Output callbacks of …` line and `Underruns` rate — if it is
+not ~0, grow the cushion by a hop per underrun (spec, after D24's
+paragraph).
+**Echo cancellation (2026-10-06, AEC-SPEC.md §12, D25):** built
+fresh from `AEC-SPEC.md` (the old branch was not recovered):
+`audio::aec` contract + tests, Android voice-call streams and
+`AudioManager` mode, Windows Communications category + verification,
+the Settings → Audio picker with a live status line, strings in the
+three catalogs. Host checks/tests/clippy clean; Android modules
+type-checked against the real `ndk`/`jni`; Windows unverified by a
+compiler. First runs to read: on the phone `Android audio:
+communication mode on (speaker on…)`, `AAudio voice capture: … preset
+VoiceCommunication`, `aec: platform (speakers)`; on Windows `category=
+Communications`, `AEC reference endpoint set`, `aec: platform
+(speakers)` or `none (no canceller on this device)`.
 First device run: watch for `MediaCodec c2.… : decoding video/avc`,
 `MediaCodec output layout: …` and `first picture WxH` in logcat; a
 `ColorConversion` error names the layout it could not read.** Next:

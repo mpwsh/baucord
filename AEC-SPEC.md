@@ -1,6 +1,6 @@
 # baucord — Acoustic echo cancellation (AEC) technical spec
 
-Status: draft 1, 2026-09-15. Ships in 1.1.5 with the other items in
+Status: draft 1, 2026-09-15; implemented 2026-10-06 (§12). Ships in 1.1.5 with the other items in
 `SESSION-GUIDE.md` §5. Decisions in §1 are taken; §12 collects the
 ones taken after this draft, the way `PERSISTENCE-SPEC.md` §12 does.
 
@@ -302,4 +302,16 @@ on every OS.
 
 ## 12. Decisions taken after this draft
 
-(none yet)
+Implemented 2026-10-06 from this draft (the old branch was not
+recovered; only this spec was). Cross-platform in shape, Android and
+Windows in substance.
+
+| # | decision | why |
+|---|---|---|
+| E1 | **The contract is `audio::aec`**, platform-free and host-tested: `AecMode` (serde lowercase, `ALL` order = the picker), `OutputKind`, `wants_aec`, `AecTier { Platform, None }`, `AecReport { mode, tier, output, reference, reason }` with `summary()`, the `reasons` constants, and the two classifiers `android_output_kind(types)` / `windows_output_kind(form_factor)`. `AudioStats.aec` (a mutex: written per (re)open, read every 10 s) plus `aec_generation` for pollers; `VoiceChatConfig.echo_cancellation`; `VoiceChat::set_echo_cancellation` / `aec_report` | one place decides and reports; every backend only says "opened on the call path or not" and "was a canceller there" |
+| E2 | **No vendor in the report.** §4.4 assumed `AUDIO_EFFECT` carries the implementer's CLSID; it carries the effect *type* GUID (`AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION`, checked in windows 0.62), so Inbox vs OEM cannot be told. The tier is `platform` or `none` | the report must not claim what it cannot know |
+| E3 | **`VoiceChat` owns the plan**: `plan_aec()` runs with both streams closed (start, `restart_all`), decides `wants_aec(mode, platform_output_kind())`, puts the platform in the matching state (Android's mode, Windows' watcher role) and hands `voice: bool` to `AudioInput` / `AudioOutput`; `update_aec_report()` after every capture open combines the plan with the backend's verdict. A per-side restart whose plan went stale (headphones plugged) becomes a both-sides reopen (§4.5); on Android, where a rerouted stream need not fail, the 2 s poll checks the output too | the Android mode must be set before streams open and cleared after they close; only the engine sees both sides |
+| E4 | **Android first** (§9): `native/aaudio.rs` opens the voice-call streams on `ndk::audio` (usage + input preset `VoiceCommunication`, content type Speech, LowLatency, shared, 48 kHz mono f32) — only when `wants_aec`; otherwise cpal exactly as before. `native/android.rs` (JNI): `MODE_IN_COMMUNICATION` + `setSpeakerphoneOn(output == Speakers)` held by `VoiceChat` while the streams live (restored to the previous mode on drop; Android also resets it if the process dies), output kind from `AudioManager.getDevices(OUTPUTS)` types, verification = the preset stuck **and** `AcousticEchoCanceler.isAvailable()` | cpal cannot set usage or preset, and without both Android never runs its canceller; headphones (incl. Bluetooth, which call mode would drop to SCO) keep the media path |
+| E5 | **Windows per §4**, with: the category set on *every* `Initialize` attempt (the 48 kHz retry creates a fresh client); the AEC reference = the user's output device or the default communications render device; the verdict from the effects manager (AEC effect present and `AUDIO_EFFECT_STATE_ON` → platform; none → `no canceller on this device`; no manager, i.e. Windows 10 → platform, unverified); the device watcher follows the Communications role while on the call path; the form factor read through `windows` 0.62 (same version and features `wasapi` already uses) on a short-lived COM thread. **Written against the crate sources, not compiled**: the `windows` crates do not type-check off Windows — the first Windows `cargo check` is the check | as specified; the one surprise (E2) is reporting only |
+| E6 | Strings: the picker (Automatic / Always / Off), six status lines keyed off `reasons` (on, headphones, off, no canceller, refused, unsupported) plus "takes effect when you join voice", and the hint per platform — Windows names the ducking (§4.6), Android says the volume buttons become call volume | the status is what tells "no canceller here" from "works" without a log |
+| E7 | Still open: `--audio-probe` (§7), the telemetry column (§6), macOS VPIO / Linux PipeWire role (§9), the README paragraph; on Android the screen-share audio is a media stream outside the call path, so the platform may not cancel it | out of this round |

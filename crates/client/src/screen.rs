@@ -22,8 +22,8 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -36,18 +36,18 @@ use audio::{
         input::SystemAudioCapture,
     },
 };
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use log::{info, warn};
 #[cfg(not(target_os = "android"))]
 use video::codec::FfmpegDecoder;
 use video::{
+    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
     buffer::{BufferedPacket, VideoJitterBuffer},
     capture::{CaptureStatus, Capturer},
     codec::FfmpegEncoder,
-    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
 };
 
-use crate::{network::NetworkControl, WakeFn};
+use crate::{WakeFn, network::NetworkControl};
 
 // ── Channel messages ────────────────────────────────────────────────────
 

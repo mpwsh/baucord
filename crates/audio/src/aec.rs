@@ -1,87 +1,84 @@
-//! Acoustic echo cancellation: the setting, the policy and the report
-//! (`AEC-SPEC.md` §3, with the decisions in its §12).
+//! Acoustic echo cancellation: the cross-platform contract
+//! (`AEC-SPEC.md` §3).
 //!
-//! Platform first: the OS canceller already knows what the speakers
-//! played and when, so the engine only asks for it and reports whether
-//! it got it. Everything in this module is pure; the Windows backend
-//! (`native::wasapi`) feeds it what it observed on the device.
+//! baucord carries no canceller of its own. Every OS ships one that
+//! already has the hard part — the reference signal, i.e. exactly what
+//! the speakers played and when — and switches it on for streams that
+//! say they are a call. So the engine's whole job is: decide whether
+//! this session wants the platform's voice-call path ([`wants_aec`]),
+//! open both streams that way, and report what it actually got
+//! ([`AecReport`]) instead of assuming.
+//!
+//! What "the voice-call path" is per platform lives with each backend:
+//! Android — `VoiceCommunication` usage and input preset plus
+//! `MODE_IN_COMMUNICATION` (`native::aaudio`); Windows — the
+//! `Communications` stream category (`native::wasapi`). Everything in
+//! this file is platform-free and unit-tested on the host.
 
 use std::fmt;
 
 /// The user's setting, `audio.echo_cancellation` in `settings.json`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "lowercase")
 )]
 pub enum AecMode {
-    /// Only when the output is not headphones.
+    /// Only when the sound comes out of speakers (the default): nobody
+    /// on headphones gets the call path's side effects (Windows ducking
+    /// other apps, Android switching Bluetooth to the headset profile).
     #[default]
     Auto,
     /// Whatever the output is.
     Always,
-    /// Never: the streams open exactly as they did before 1.1.5.
+    /// Never.
     Off,
 }
 
 impl AecMode {
-    /// The word `settings.json` and the logs use.
+    /// Every mode, in the order the settings picker shows them.
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Always, Self::Off];
+
+    /// Position in [`Self::ALL`] (the picker index).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Always => "always",
-            Self::Off => "off",
-        }
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0)
+    }
+
+    /// The mode at picker index `i`; out of range → `Auto`.
+    #[must_use]
+    pub fn from_index(i: usize) -> Self {
+        Self::ALL.get(i).copied().unwrap_or_default()
     }
 }
 
-impl fmt::Display for AecMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// What the render endpoint says it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the sound comes out of, as far as the platform says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputKind {
+    /// Built-in or external speakers: the microphone hears them.
     Speakers,
-    /// Headphones, a headset, or a handset: nothing the mic can hear.
+    /// Headphones or a headset: it does not (meaningfully).
     Headphones,
-    /// Anything else (line out, HDMI, S/PDIF, a device that does not
-    /// say). Treated as speakers.
+    /// The platform does not say (HDMI, USB DACs, line out…). Treated
+    /// as speakers: a missing canceller sends everyone their own voice,
+    /// an unneeded one costs one user a few ms.
+    #[default]
     Unknown,
-}
-
-impl OutputKind {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Speakers => "speakers",
-            Self::Headphones => "headphones",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 impl fmt::Display for OutputKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(match self {
+            Self::Speakers => "speakers",
+            Self::Headphones => "headphones",
+            Self::Unknown => "unknown output",
+        })
     }
 }
 
-/// Whether to ask the platform for echo cancellation.
-///
-/// `Unknown` counts as speakers: a missing canceller sends everyone
-/// their own voice back, an unneeded one costs one user a few
-/// milliseconds and possibly some ducking, and that user can pick Off.
-///
-/// ```
-/// use audio::{wants_aec, AecMode, OutputKind};
-/// assert!(wants_aec(AecMode::Auto, OutputKind::Unknown));
-/// assert!(!wants_aec(AecMode::Auto, OutputKind::Headphones));
-/// ```
+/// Should this session open its streams on the platform's voice-call
+/// path? (`AEC-SPEC.md` §3.2.)
 #[must_use]
 pub fn wants_aec(mode: AecMode, output: OutputKind) -> bool {
     match mode {
@@ -91,287 +88,122 @@ pub fn wants_aec(mode: AecMode, output: OutputKind) -> bool {
     }
 }
 
-/// How much the backend could see of the platform canceller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AecEvidence {
-    /// Windows 11: the capture stream's effect list shows AEC, on.
-    Listed,
-    /// Windows 10: the stream is in the Communications category, which
-    /// is what turns the OEM voice chain on, but there is no effect list
-    /// to confirm AEC is part of it. Only a call on speakers tells.
-    Unverified,
+/// The words [`AecReport::reason`] uses, so a UI can map them to its
+/// own strings instead of showing these.
+pub mod reasons {
+    /// Not wanted: the setting is Off.
+    pub const OFF: &str = "off";
+    /// Not wanted: Auto, and the output is headphones.
+    pub const HEADPHONES: &str = "headphones";
+    /// On: the output is speakers.
+    pub const SPEAKERS: &str = "speakers";
+    /// On: the output did not say what it is.
+    pub const UNKNOWN_OUTPUT: &str = "unknown output";
+    /// On: the setting is Always (headphones or not).
+    pub const ALWAYS: &str = "always";
+    /// Wanted, but the device ships no echo canceller.
+    pub const NO_CANCELLER: &str = "no canceller on this device";
+    /// Wanted, but the voice-call stream would not open (or not as
+    /// one); the log line before says why.
+    pub const PATH_REFUSED: &str = "voice-call path refused";
+    /// Wanted, but this platform has no voice-call path in baucord yet.
+    pub const UNSUPPORTED: &str = "not on this platform yet";
 }
 
-/// Which canceller runs on our capture stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which canceller is running on the microphone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AecTier {
-    /// The OS voice chain.
-    Platform(AecEvidence),
-    /// None at all.
+    /// The OS's own (Android's voice-communication chain, the Windows
+    /// endpoint's AEC effect).
+    Platform,
+    /// None: not wanted, or wanted and not available.
     None,
 }
 
-/// Why the report reads the way it does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AecReason {
-    // Why a canceller was asked for.
-    Speakers,
-    OutputUnknown,
-    Always,
-    // Why there is none.
-    Off,
-    Headphones,
-    /// The effect list has no AEC for this microphone.
-    NoEffect,
-    /// AEC is listed but switched off.
-    EffectOff,
-    /// Windows would not put the stream in the Communications category.
-    CategoryRefused,
-    /// The native backend failed to open and cpal took over.
-    CpalFallback,
-    /// This platform has no backend that asks yet.
-    NoPlatformCanceller,
-    /// No capture stream is open.
-    NoCapture,
-}
-
-impl AecReason {
-    /// The words the `audio stats:` line and `/audio` print.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Speakers => "speakers",
-            Self::OutputUnknown => "output unknown",
-            Self::Always => "always",
-            Self::Off => "off",
-            Self::Headphones => "headphones",
-            Self::NoEffect => "no effect on endpoint",
-            Self::EffectOff => "effect switched off",
-            Self::CategoryRefused => "category refused",
-            Self::CpalFallback => "cpal fallback",
-            Self::NoPlatformCanceller => "no platform canceller yet",
-            Self::NoCapture => "no capture stream",
-        }
-    }
-}
-
-impl fmt::Display for AecReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// What the capture side got, refreshed on every open (spec D5): an
-/// AEC that is not there is the next bug report, and this is what tells
-/// the tiers apart.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What the engine got, refreshed on every stream (re)open
+/// (`AEC-SPEC.md` §3.3). Read by the 10-second `audio stats:` line and
+/// the settings page.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AecReport {
+    pub mode: AecMode,
     pub tier: AecTier,
-    pub reason: AecReason,
     pub output: OutputKind,
-    /// Name of the render endpoint the canceller should use as its
-    /// reference, when known.
+    /// The render endpoint the canceller uses as its reference, when
+    /// the platform lets us name it.
     pub reference: Option<String>,
-    /// Windows accepted that endpoint as the reference explicitly
-    /// (Windows 11 22H2 and later); otherwise the effect picks its own.
-    pub reference_set: bool,
-    /// "Default" meant the Default Communications Device for capture
-    /// this session (spec D4).
-    pub communications_defaults: bool,
+    /// Why this tier, in a few log-friendly words.
+    pub reason: &'static str,
 }
 
 impl AecReport {
-    /// No canceller, for `reason`, with nothing else known.
+    /// The report for a session that did not ask for the call path.
     #[must_use]
-    pub fn none(reason: AecReason) -> Self {
-        Self {
-            tier: AecTier::None,
-            reason,
-            output: OutputKind::Unknown,
-            reference: None,
-            reference_set: false,
-            communications_defaults: false,
-        }
-    }
-
-    /// The platform canceller was engaged (whether or not it could be
-    /// confirmed).
-    #[must_use]
-    pub fn is_platform(&self) -> bool {
-        matches!(self.tier, AecTier::Platform(_))
-    }
-}
-
-impl Default for AecReport {
-    fn default() -> Self {
-        Self::none(AecReason::NoCapture)
-    }
-}
-
-/// `platform(listed) ref=Speakers (Realtek(R) Audio)` / `none (headphones)`.
-impl fmt::Display for AecReport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let evidence = match self.tier {
-            AecTier::None => return write!(f, "none ({})", self.reason),
-            AecTier::Platform(AecEvidence::Listed) => "listed",
-            AecTier::Platform(AecEvidence::Unverified) => "unverified",
-        };
-        let reference = self.reference.as_deref().unwrap_or("?");
-        write!(f, "platform({evidence}) ref={reference}")
-    }
-}
-
-/// The render endpoint the engine opened, as the capture side needs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RenderEndpoint {
-    /// The endpoint's `IMMDevice` id when the native WASAPI backend
-    /// opened it — the only form Windows takes as an AEC reference.
-    pub id: Option<String>,
-    pub name: String,
-    pub output: OutputKind,
-    /// "Default" resolved to the Default Communications Device.
-    pub communications_default: bool,
-}
-
-/// What the capture side is asked to do, decided from the setting and
-/// the render endpoint that is already open (output opens first).
-#[derive(Debug, Clone)]
-pub(crate) struct AecPlan {
-    pub(crate) mode: AecMode,
-    pub(crate) output: OutputKind,
-    /// Ask the platform: Communications category, and in AEC mode
-    /// "Default" is the Default Communications Device.
-    pub(crate) wanted: bool,
-    pub(crate) render: Option<RenderEndpoint>,
-}
-
-impl AecPlan {
-    /// No render endpoint (output failed, or not open) reads as
-    /// `Unknown`, i.e. speakers.
-    pub(crate) fn new(mode: AecMode, render: Option<RenderEndpoint>) -> Self {
-        let output = render.as_ref().map_or(OutputKind::Unknown, |r| r.output);
+    pub fn not_wanted(mode: AecMode, output: OutputKind) -> Self {
         Self {
             mode,
+            tier: AecTier::None,
             output,
-            wanted: wants_aec(mode, output),
-            render,
+            reference: None,
+            reason: if mode == AecMode::Off {
+                reasons::OFF
+            } else {
+                reasons::HEADPHONES
+            },
         }
     }
 
-    /// Why the plan asks for a canceller, or why it does not.
-    fn intent(&self) -> AecReason {
-        match (self.mode, self.output) {
-            (AecMode::Off, _) => AecReason::Off,
-            (AecMode::Always, _) => AecReason::Always,
-            (AecMode::Auto, OutputKind::Headphones) => AecReason::Headphones,
-            (AecMode::Auto, OutputKind::Speakers) => AecReason::Speakers,
-            (AecMode::Auto, OutputKind::Unknown) => AecReason::OutputUnknown,
-        }
-    }
-
-    fn report(&self, tier: AecTier, reason: AecReason, reference_set: bool) -> AecReport {
-        AecReport {
-            tier,
-            reason,
-            output: self.output,
-            reference: self.render.as_ref().map(|r| r.name.clone()),
-            reference_set,
-            communications_defaults: false,
-        }
-    }
-
-    /// The report when nothing was asked for, if the plan asks nothing.
-    pub(crate) fn declined(&self) -> Option<AecReport> {
-        (!self.wanted).then(|| self.report(AecTier::None, self.intent(), false))
-    }
-
-    /// The report for a capture stream that could not ask (the cpal
-    /// path, platforms without a backend yet).
-    pub(crate) fn inactive(&self, reason: AecReason) -> AecReport {
-        self.declined()
-            .unwrap_or_else(|| self.report(AecTier::None, reason, false))
-    }
-}
-
-/// What the Windows backend saw on the capture client after opening it.
-#[cfg(any(windows, test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EffectsSeen {
-    /// No effects manager (Windows 10), or it failed: nothing to go on.
-    Unavailable,
-    /// The effect list has no AEC entry.
-    NoAec,
-    /// AEC is listed, switched off.
-    AecOff,
-    /// AEC is listed, on.
-    AecOn,
-}
-
-#[cfg(any(windows, test))]
-impl AecPlan {
-    /// The tier, from what the backend observed after asking.
-    pub(crate) fn classify(
-        &self,
-        category_set: bool,
-        seen: EffectsSeen,
-        reference_set: bool,
-    ) -> AecReport {
-        if let Some(report) = self.declined() {
-            return report;
-        }
-        let (tier, reason) = if category_set {
-            match seen {
-                EffectsSeen::AecOn => (AecTier::Platform(AecEvidence::Listed), self.intent()),
-                EffectsSeen::Unavailable => {
-                    (AecTier::Platform(AecEvidence::Unverified), self.intent())
-                }
-                EffectsSeen::AecOff => (AecTier::None, AecReason::EffectOff),
-                EffectsSeen::NoAec => (AecTier::None, AecReason::NoEffect),
-            }
-        } else {
-            (AecTier::None, AecReason::CategoryRefused)
+    /// Short machine-ish form for logs: `platform (speakers)`,
+    /// `none (headphones)`, `none (no canceller on this device)`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let tier = match self.tier {
+            AecTier::Platform => "platform",
+            AecTier::None => "none",
         };
-        AecReport {
-            communications_defaults: true,
-            ..self.report(tier, reason, reference_set)
+        match &self.reference {
+            Some(r) => format!("{tier} ({}) ref={r}", self.reason),
+            None => format!("{tier} ({})", self.reason),
         }
     }
 }
 
-/// `EndpointFormFactor` values (`mmdeviceapi.h`; `windows` 0.62,
-/// `Win32::Media::Audio`), as `PKEY_AudioEndpoint_FormFactor` stores
-/// them (`VT_UI4`).
-#[cfg(any(windows, test))]
-mod form_factor {
-    pub(super) const SPEAKERS: u32 = 1;
-    pub(super) const HEADPHONES: u32 = 3;
-    pub(super) const HEADSET: u32 = 5;
-    pub(super) const HANDSET: u32 = 6;
+/// Android: classify the output devices `AudioManager.getDevices
+/// (GET_DEVICES_OUTPUTS)` lists, by their `AudioDeviceInfo.TYPE_*`.
+/// Android routes media to a personal-listening device whenever one is
+/// connected, so any of those means headphones; an external device of
+/// another kind means we can't tell; only built-ins means the
+/// loudspeaker. Lives here, platform-free, so it is tested on the host.
+#[must_use]
+pub fn android_output_kind(device_types: &[i32]) -> OutputKind {
+    // AudioDeviceInfo.TYPE_*: WIRED_HEADSET 3, WIRED_HEADPHONES 4,
+    // BLUETOOTH_SCO 7, BLUETOOTH_A2DP 8, USB_HEADSET 22, HEARING_AID 23,
+    // BLE_HEADSET 26.
+    const PERSONAL: [i32; 7] = [3, 4, 7, 8, 22, 23, 26];
+    // Built in, or not a sound outlet at all: BUILTIN_EARPIECE 1,
+    // BUILTIN_SPEAKER 2, TELEPHONY 18, IP 20, BUS 21,
+    // BUILTIN_SPEAKER_SAFE 24, REMOTE_SUBMIX 25, ECHO_REFERENCE 28.
+    const INTERNAL: [i32; 8] = [1, 2, 18, 20, 21, 24, 25, 28];
+    if device_types.iter().any(|t| PERSONAL.contains(t)) {
+        OutputKind::Headphones
+    } else if device_types.iter().any(|t| !INTERNAL.contains(t)) {
+        // HDMI, line out, a USB DAC, a dock, a BLE speaker…
+        OutputKind::Unknown
+    } else {
+        OutputKind::Speakers
+    }
 }
 
-/// Speakers are speakers; headphones, headsets and handsets are
-/// headphones; line out, HDMI, S/PDIF and the rest are `Unknown`.
-#[cfg(any(windows, test))]
-pub(crate) fn output_kind_from_form_factor(value: u32) -> OutputKind {
-    match value {
-        form_factor::SPEAKERS => OutputKind::Speakers,
-        form_factor::HEADPHONES | form_factor::HEADSET | form_factor::HANDSET => {
-            OutputKind::Headphones
-        }
+/// Windows: an endpoint's `PKEY_AudioEndpoint_FormFactor`
+/// (`EndpointFormFactor`) as an [`OutputKind`] (AEC-SPEC.md §4.2).
+#[must_use]
+pub fn windows_output_kind(form_factor: u32) -> OutputKind {
+    // Speakers 1; Headphones 3, Headset 5, Handset 6. Everything else —
+    // remote network device, line level, S/PDIF, HDMI display, unknown —
+    // says nothing about whether the microphone hears it.
+    match form_factor {
+        1 => OutputKind::Speakers,
+        3 | 5 | 6 => OutputKind::Headphones,
         _ => OutputKind::Unknown,
-    }
-}
-
-/// Whether a default-device change should reopen a render stream that
-/// follows the default. Auto looks at both defaults (either can change
-/// which one it lands on); Always lives on the communications default;
-/// Off on the console default, as before. Platforms with one default
-/// raise both flags.
-pub(crate) fn render_follows_change(mode: AecMode, console: bool, communications: bool) -> bool {
-    match mode {
-        AecMode::Off => console,
-        AecMode::Auto => console || communications,
-        AecMode::Always => communications,
     }
 }
 
@@ -379,208 +211,78 @@ pub(crate) fn render_follows_change(mode: AecMode, console: bool, communications
 mod tests {
     use super::*;
 
-    fn render(output: OutputKind) -> RenderEndpoint {
-        RenderEndpoint {
-            id: Some("{0.0.0.00000000}.{speakers}".into()),
-            name: "Speakers (Realtek(R) Audio)".into(),
-            output,
-            communications_default: true,
+    #[test]
+    fn auto_follows_the_output_and_unknown_counts_as_speakers() {
+        assert!(wants_aec(AecMode::Auto, OutputKind::Speakers));
+        assert!(wants_aec(AecMode::Auto, OutputKind::Unknown));
+        assert!(!wants_aec(AecMode::Auto, OutputKind::Headphones));
+    }
+
+    #[test]
+    fn always_and_off_ignore_the_output() {
+        for out in [
+            OutputKind::Speakers,
+            OutputKind::Headphones,
+            OutputKind::Unknown,
+        ] {
+            assert!(wants_aec(AecMode::Always, out));
+            assert!(!wants_aec(AecMode::Off, out));
         }
     }
 
-    fn plan_for(mode: AecMode, output: OutputKind) -> AecPlan {
-        AecPlan::new(mode, Some(render(output)))
+    #[test]
+    fn picker_index_round_trips() {
+        for m in AecMode::ALL {
+            assert_eq!(AecMode::from_index(m.index()), m);
+        }
+        assert_eq!(AecMode::from_index(99), AecMode::Auto);
     }
 
-    /// The common case: Auto, laptop speakers.
-    fn on_speakers() -> AecPlan {
-        plan_for(AecMode::Auto, OutputKind::Speakers)
+    #[test]
+    fn android_outputs_classify() {
+        // A phone with nothing plugged in: earpiece + speaker (+ the
+        // telephony and echo-reference pseudo-devices some list).
+        assert_eq!(android_output_kind(&[1, 2, 18, 28]), OutputKind::Speakers);
+        assert_eq!(android_output_kind(&[2]), OutputKind::Speakers);
+        // Wired headset, Bluetooth A2DP, a USB headset.
+        assert_eq!(android_output_kind(&[1, 2, 3]), OutputKind::Headphones);
+        assert_eq!(android_output_kind(&[1, 2, 8]), OutputKind::Headphones);
+        assert_eq!(android_output_kind(&[2, 22]), OutputKind::Headphones);
+        // HDMI or a plain USB device: can't tell.
+        assert_eq!(android_output_kind(&[1, 2, 9]), OutputKind::Unknown);
+        assert_eq!(android_output_kind(&[2, 11]), OutputKind::Unknown);
+        // Nothing listed at all: the built-in path.
+        assert_eq!(android_output_kind(&[]), OutputKind::Speakers);
     }
 
-    mod wants_aec {
-        use super::*;
-
-        #[test]
-        fn off_never_asks() {
-            assert!(!wants_aec(AecMode::Off, OutputKind::Speakers));
-        }
-
-        #[test]
-        fn always_asks_on_headphones() {
-            assert!(wants_aec(AecMode::Always, OutputKind::Headphones));
-        }
-
-        #[test]
-        fn auto_asks_on_speakers() {
-            assert!(wants_aec(AecMode::Auto, OutputKind::Speakers));
-        }
-
-        #[test]
-        fn auto_skips_headphones() {
-            assert!(!wants_aec(AecMode::Auto, OutputKind::Headphones));
-        }
-
-        #[test]
-        fn auto_treats_unknown_as_speakers() {
-            assert!(wants_aec(AecMode::Auto, OutputKind::Unknown));
-        }
-    }
-
-    mod plan_reports {
-        use super::*;
-
-        #[test]
-        fn without_a_render_endpoint_reads_output_as_unknown() {
-            assert_eq!(AecPlan::new(AecMode::Auto, None).output, OutputKind::Unknown);
-        }
-
-        #[test]
-        fn without_a_render_endpoint_still_asks_in_auto() {
-            assert!(AecPlan::new(AecMode::Auto, None).wanted);
-        }
-
-        #[test]
-        fn inactive_on_headphones_says_headphones() {
-            let plan = plan_for(AecMode::Auto, OutputKind::Headphones);
-            assert_eq!(plan.inactive(AecReason::CpalFallback).reason, AecReason::Headphones);
-        }
-
-        #[test]
-        fn inactive_on_speakers_keeps_the_given_reason() {
-            let report = on_speakers().inactive(AecReason::CpalFallback);
-            assert_eq!(report.reason, AecReason::CpalFallback);
-        }
-
-        #[test]
-        fn inactive_carries_the_reference_name() {
-            let report = on_speakers().inactive(AecReason::CpalFallback);
-            assert_eq!(report.reference.as_deref(), Some("Speakers (Realtek(R) Audio)"));
+    #[test]
+    fn windows_form_factors_classify() {
+        assert_eq!(windows_output_kind(1), OutputKind::Speakers);
+        assert_eq!(windows_output_kind(3), OutputKind::Headphones);
+        assert_eq!(windows_output_kind(5), OutputKind::Headphones);
+        assert_eq!(windows_output_kind(6), OutputKind::Headphones);
+        // HDMI display (9), line level (2), unknown (10).
+        for ff in [0, 2, 7, 8, 9, 10] {
+            assert_eq!(windows_output_kind(ff), OutputKind::Unknown, "{ff}");
         }
     }
 
-    mod classify {
-        use super::*;
-
-        #[test]
-        fn off_reports_off_whatever_was_seen() {
-            let plan = plan_for(AecMode::Off, OutputKind::Speakers);
-            let report = plan.classify(false, EffectsSeen::AecOn, false);
-            assert_eq!((report.tier, report.reason), (AecTier::None, AecReason::Off));
-        }
-
-        #[test]
-        fn listed_and_on_is_platform_listed() {
-            let report = on_speakers().classify(true, EffectsSeen::AecOn, true);
-            assert_eq!(report.tier, AecTier::Platform(AecEvidence::Listed));
-        }
-
-        #[test]
-        fn no_effect_manager_is_platform_unverified() {
-            let report = on_speakers().classify(true, EffectsSeen::Unavailable, false);
-            assert_eq!(report.tier, AecTier::Platform(AecEvidence::Unverified));
-        }
-
-        #[test]
-        fn listed_but_off_is_none() {
-            let report = on_speakers().classify(true, EffectsSeen::AecOff, false);
-            assert_eq!((report.tier, report.reason), (AecTier::None, AecReason::EffectOff));
-        }
-
-        #[test]
-        fn missing_from_the_list_is_none() {
-            let report = on_speakers().classify(true, EffectsSeen::NoAec, false);
-            assert_eq!((report.tier, report.reason), (AecTier::None, AecReason::NoEffect));
-        }
-
-        #[test]
-        fn a_refused_category_wins_over_the_list() {
-            let report = on_speakers().classify(false, EffectsSeen::AecOn, false);
-            assert_eq!(report.reason, AecReason::CategoryRefused);
-        }
-
-        #[test]
-        fn platform_reason_says_why_it_was_asked() {
-            let plan = AecPlan::new(AecMode::Auto, None);
-            let report = plan.classify(true, EffectsSeen::AecOn, false);
-            assert_eq!(report.reason, AecReason::OutputUnknown);
-        }
-
-        #[test]
-        fn asking_marks_communications_defaults() {
-            let report = on_speakers().classify(true, EffectsSeen::Unavailable, false);
-            assert!(report.communications_defaults);
-        }
-    }
-
-    mod report_display {
-        use super::*;
-
-        #[test]
-        fn platform_prints_evidence_and_reference() {
-            let report = on_speakers().classify(true, EffectsSeen::AecOn, true);
-            assert_eq!(report.to_string(), "platform(listed) ref=Speakers (Realtek(R) Audio)");
-        }
-
-        #[test]
-        fn none_prints_the_reason() {
-            let report = AecReport::none(AecReason::Headphones);
-            assert_eq!(report.to_string(), "none (headphones)");
-        }
-    }
-
-    mod form_factor_mapping {
-        use super::*;
-
-        #[test]
-        fn speakers_are_speakers() {
-            assert_eq!(output_kind_from_form_factor(1), OutputKind::Speakers);
-        }
-
-        #[test]
-        fn a_headset_is_headphones() {
-            assert_eq!(output_kind_from_form_factor(5), OutputKind::Headphones);
-        }
-
-        #[test]
-        fn hdmi_is_unknown() {
-            // DigitalAudioDisplayDevice = 9
-            assert_eq!(output_kind_from_form_factor(9), OutputKind::Unknown);
-        }
-
-        /// The constants are copied from the SDK; this keeps them honest
-        /// on the one platform that has it.
-        #[cfg(windows)]
-        #[test]
-        fn constants_match_the_windows_crate() {
-            use windows::Win32::Media::Audio::{Handset, Headphones, Headset, Speakers};
-            let sdk = [Speakers, Headphones, Headset, Handset]
-                .map(|f| u32::try_from(f.0).expect("form factors are non-negative"));
-            let ours = [
-                form_factor::SPEAKERS,
-                form_factor::HEADPHONES,
-                form_factor::HEADSET,
-                form_factor::HANDSET,
-            ];
-            assert_eq!(sdk, ours);
-        }
-    }
-
-    mod default_changes {
-        use super::*;
-
-        #[test]
-        fn off_ignores_the_communications_default() {
-            assert!(!render_follows_change(AecMode::Off, false, true));
-        }
-
-        #[test]
-        fn auto_follows_either_default() {
-            assert!(render_follows_change(AecMode::Auto, false, true));
-        }
-
-        #[test]
-        fn always_ignores_the_console_default() {
-            assert!(!render_follows_change(AecMode::Always, true, false));
-        }
+    #[test]
+    fn report_summaries_read_as_the_spec_says() {
+        let r = AecReport::not_wanted(AecMode::Auto, OutputKind::Headphones);
+        assert_eq!(r.summary(), "none (headphones)");
+        let r = AecReport::not_wanted(AecMode::Off, OutputKind::Speakers);
+        assert_eq!(r.summary(), "none (off)");
+        let r = AecReport {
+            mode: AecMode::Auto,
+            tier: AecTier::Platform,
+            output: OutputKind::Speakers,
+            reference: Some("Speakers (Realtek(R) Audio)".into()),
+            reason: "speakers",
+        };
+        assert_eq!(
+            r.summary(),
+            "platform (speakers) ref=Speakers (Realtek(R) Audio)"
+        );
     }
 }

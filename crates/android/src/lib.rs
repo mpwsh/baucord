@@ -23,8 +23,8 @@ mod hello;
 use std::sync::OnceLock;
 
 use slint::android::{
-    android_activity::{MainEvent, PollEvent},
     AndroidApp,
+    android_activity::{MainEvent, PollEvent},
 };
 
 /// Runtime permissions the engine needs before it can do its job. Only

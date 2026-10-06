@@ -4,7 +4,7 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
 use client::{
-    config::{build_bind_string, BindableAction, ServerEntry},
+    config::{BindableAction, ServerEntry, build_bind_string},
     voice::VoiceControl,
 };
 use i18n::t;
@@ -50,7 +50,13 @@ impl<'a> SettingsSurface<'a> {
     pub(crate) fn set_tab(&self, tab: i32) {
         match self {
             Self::Window(w) => w.set_tab(tab),
-            Self::Page(m) => m.global::<State>().set_settings_tab(tab),
+            Self::Page(m) => {
+                let s = m.global::<State>();
+                s.set_settings_tab(tab);
+                // Asked for a tab (the connect view's pencil): the
+                // narrow page goes straight to that section (D28).
+                s.set_settings_section_open(true);
+            }
         }
     }
 
@@ -67,7 +73,12 @@ impl<'a> SettingsSurface<'a> {
             Self::Window(w) => {
                 let _ = w.show();
             }
-            Self::Page(m) => m.global::<State>().set_settings_open(true),
+            Self::Page(m) => {
+                let s = m.global::<State>();
+                // The narrow page opens on its section list (D28).
+                s.set_settings_section_open(false);
+                s.set_settings_open(true);
+            }
         }
     }
 
@@ -76,7 +87,14 @@ impl<'a> SettingsSurface<'a> {
             Self::Window(w) => {
                 let _ = w.hide();
             }
-            Self::Page(m) => m.global::<State>().set_settings_open(false),
+            Self::Page(m) => {
+                m.global::<State>().set_settings_open(false);
+                // The page held the keyboard focus; without a holder,
+                // Android's Back would find no handler and close the
+                // app (on a touch host this hands it to the main
+                // screen's Back handler, not the composer).
+                m.invoke_focus_composer();
+            }
         }
     }
 }
@@ -462,6 +480,16 @@ pub fn populate(app: &mut AppState) {
     s.set_transmission_modes(ModelRc::new(VecModel::from(modes)));
     s.set_transmission_index(i32::from(settings.audio.push_to_talk));
     s.set_ptt_bind(settings.bind_for(BindableAction::PushToTalk).into());
+    // Echo cancellation: the picker in AecMode::ALL order, and what the
+    // running session got (refreshed by the meter timer).
+    let aec_modes: Vec<slint::SharedString> = audio::AecMode::ALL
+        .iter()
+        .map(|m| aec_mode_label(*m).into())
+        .collect();
+    s.set_aec_modes(ModelRc::new(VecModel::from(aec_modes)));
+    s.set_aec_index(i32::try_from(settings.audio.echo_cancellation.index()).unwrap_or(0));
+    let aec = app.voice_aec();
+    s.set_aec_status(aec_status(aec.lock().ok().and_then(|g| g.clone()).as_ref()).into());
 
     // Profile (spec §7.1): what this device keeps.
     s.set_nickname(settings.user.nickname.as_str().into());
@@ -737,6 +765,15 @@ fn wire(sf: &SettingsSurface<'_>) {
         app::with_current(move |app| {
             app.settings.audio.push_to_talk = index == 1;
             app.apply_push_to_talk();
+        });
+    });
+    logic.on_aec_selected(|index| {
+        app::with_current(move |app| {
+            let mode = audio::AecMode::from_index(usize::try_from(index).unwrap_or(0));
+            app.settings.audio.echo_cancellation = mode;
+            app.voice_tx()
+                .send(VoiceControl::SetEchoCancellation(mode))
+                .ok();
         });
     });
 
@@ -1227,21 +1264,57 @@ fn populate_binds_only(app: &mut AppState) {
 /// `MeterUpdate` tick).
 fn start_meter_timer(app: &mut AppState) {
     let (output_level, denoised_level) = app.voice_levels();
+    let aec = app.voice_aec();
     app.meter_timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(125),
         move || {
             let mic = f32::from_bits(denoised_level.load(Ordering::Relaxed));
             let out = f32::from_bits(output_level.load(Ordering::Relaxed));
+            // Reopening the streams (a headset plugged in, the setting
+            // changed) changes this; property sets of an equal string
+            // cost nothing visible.
+            let aec_line = aec_status(aec.lock().ok().and_then(|g| g.clone()).as_ref());
             app::with_current(move |app| {
                 if let Some(sf) = surface(app) {
                     let s = sf.state();
                     s.set_mic_level(mic);
                     s.set_out_level(out);
+                    if s.get_aec_status() != aec_line.as_str() {
+                        s.set_aec_status(aec_line.into());
+                    }
                 }
             });
         },
     );
+}
+
+/// The picker's word for `mode`.
+fn aec_mode_label(mode: audio::AecMode) -> String {
+    match mode {
+        audio::AecMode::Auto => t!("audio-aec-auto"),
+        audio::AecMode::Always => t!("audio-aec-always"),
+        audio::AecMode::Off => t!("audio-aec-off"),
+    }
+}
+
+/// The status line under the picker: what the open streams got
+/// (AEC-SPEC.md §3.3), in the user's language.
+fn aec_status(report: Option<&audio::AecReport>) -> String {
+    use audio::aec::reasons;
+    let Some(report) = report else {
+        return t!("aec-status-idle");
+    };
+    match report.tier {
+        audio::AecTier::Platform => t!("aec-status-on"),
+        audio::AecTier::None => match report.reason {
+            reasons::OFF => t!("aec-status-off"),
+            reasons::HEADPHONES => t!("aec-status-headphones"),
+            reasons::NO_CANCELLER => t!("aec-status-no-canceller"),
+            reasons::UNSUPPORTED => t!("aec-status-unsupported"),
+            _ => t!("aec-status-refused"),
+        },
+    }
 }
 
 /// Close semantics (both the Save button and the OS close box):

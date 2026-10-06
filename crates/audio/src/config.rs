@@ -68,6 +68,12 @@ pub struct VoiceChatConfig {
     /// AGC target loudness (RMS, 0.01–0.5). Default: `0.10`.
     /// Higher = louder output. 0.10 ≈ -20 dBFS, good for voice chat.
     pub agc_target_rms: f32,
+
+    /// Echo cancellation (`AEC-SPEC.md`): when to open the streams on
+    /// the platform's voice-call path. Default: [`AecMode::Auto`].
+    /// Changed at runtime via
+    /// [`VoiceChat::set_echo_cancellation`](crate::VoiceChat::set_echo_cancellation).
+    pub echo_cancellation: crate::aec::AecMode,
 }
 
 impl Default for VoiceChatConfig {
@@ -82,6 +88,7 @@ impl Default for VoiceChatConfig {
             compressor_enabled: true,
             agc_enabled: true,
             agc_target_rms: 0.10,
+            echo_cancellation: crate::aec::AecMode::Auto,
         }
     }
 }

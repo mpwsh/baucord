@@ -22,12 +22,14 @@
 //!
 //! Android gets Android's own audio class: nice −16
 //! (`THREAD_PRIORITY_AUDIO`, what the framework gives `AudioTrack`'s
-//! threads). The workers otherwise run at the default nice 0 beside the
-//! UI thread (−4) and, while a stream is watched, the video decode and
-//! colour-conversion threads — and on a big.LITTLE phone a nice-0
-//! thread waking every 10 ms is the one the scheduler parks on a slow
-//! core. Apps may lower their own threads' nice (init sets `RLIMIT_NICE`
-//! for every process); a refusal is logged and ignored.
+//! threads). Without it every thread of ours sits at nice −10: Android
+//! boosts the foreground app's main thread to −10
+//! (`THREAD_PRIORITY_TOP_APP_BOOST`) and `android_main`'s thread, created
+//! from it, passes that on to everything it spawns (observed
+//! 2026-10-05: `nice -10 -> -16`). So the audio workers tied with the
+//! video decode, colour conversion and network threads; −16 puts them
+//! first. Apps may lower their own threads' nice (init sets
+//! `RLIMIT_NICE` for every process); a refusal is logged and ignored.
 //!
 //! The two Windows APIs involved (winmm, avrt) are declared directly and
 //! linked from the Windows SDK.

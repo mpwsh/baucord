@@ -279,6 +279,9 @@ impl AppState {
             self.dm_order.insert(0, user);
         }
         self.switch_conversation(Some(user));
+        // From a roster menu or `/dm`: the narrow layout turns to the
+        // chat page, as a tap on the conversation's row would.
+        self.main.global::<State>().set_narrow_chat_open(true);
     }
 
     /// The admin channel's row exists (spec §8): a conversation under

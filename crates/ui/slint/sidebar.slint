@@ -379,6 +379,9 @@ export component Sidebar inherits Rectangle {
 
         list := ListView {
             vertical-stretch: 1;
+            // Fluent's ScrollView does not pan on a drag; a finger needs
+            // it to (ANDROID-SPEC.md D27).
+            mouse-drag-pan-enabled: State.touch-host;
             // Each row sits inside a DragArea (users are sources) with
             // a DropArea in front (channels are targets). The DragArea
             // must be the row's *parent*: it watches the press through
@@ -511,6 +514,7 @@ export component Sidebar inherits Rectangle {
             // A short list: the roster keeps the room.
             height: State.messages-height;
             vertical-stretch: 0;
+            mouse-drag-pan-enabled: State.touch-host;   // D27
             VerticalLayout {
             spacing: 2px;
             // General
@@ -560,7 +564,11 @@ export component Sidebar inherits Rectangle {
                 }
                 general-t := TouchArea {
                     mouse-cursor: pointer;
-                    clicked => { Logic.general-clicked(); }
+                    clicked => {
+                        Logic.general-clicked();
+                        // The narrow layout turns the page to the chat.
+                        State.narrow-chat-open = true;
+                    }
                 }
             }
             for dm[i] in State.dms : dm-row := Rectangle {
@@ -582,6 +590,7 @@ export component Sidebar inherits Rectangle {
                             Logic.dm-closed(i);
                         } else {
                             Logic.dm-clicked(i);
+                            State.narrow-chat-open = true;
                         }
                     }
                 }
@@ -645,7 +654,10 @@ export component Sidebar inherits Rectangle {
                     // messages stay on the server and it comes back on
                     // the next message. General cannot be closed. Pure
                     // affordance: the row's TouchArea handles the click.
-                    if dm-t.has-hover : Rectangle {
+                    // A touch screen has no hover to reveal it, and the
+                    // zone answers taps either way, so there it always
+                    // shows.
+                    if dm-t.has-hover || State.touch-host : Rectangle {
                         width: 20px;
                         Rectangle {
                             y: (parent.height - self.height) / 2;

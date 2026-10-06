@@ -12,10 +12,10 @@
 //! touch JNI directly.
 
 use jni::{
+    Env, JavaVM,
     errors::Result as JniResult,
     objects::{JObject, JObjectArray, JString, JValue},
     sys::jobject,
-    Env, JavaVM,
 };
 
 /// `PackageManager.PERMISSION_GRANTED`.

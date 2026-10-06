@@ -58,11 +58,17 @@ log.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 audio_thread_priority = { version = "0.37", default-features = false }
 
-# ── Android: audio-class nice value for the worker threads ──────────────
-# `setpriority` / `gettid` (platform.rs). Already in the graph through
-# cpal's AAudio host.
+# ── Android: audio-class nice value + the voice-call path ────────────────
+# `libc`: `setpriority` / `gettid` (platform.rs). `ndk` (`audio`, with
+# `api-level-28` for usage / input preset): the AAudio voice streams
+# (native/aaudio.rs). `jni` + `ndk-context`: `AudioManager` mode and
+# route (native/android.rs). All four are already in the graph through
+# cpal's AAudio host, at the same versions.
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
+ndk = { version = "0.9", default-features = false, features = ["audio", "api-level-28"] }
+jni = "0.22"
+ndk-context = "0.1"
 
 # ── Windows: native voice capture/render + process loopback ─────────────
 # `wasapi` runs the voice capture and render pumps on threads this crate
@@ -74,6 +80,19 @@ libc = "0.2"
 # zero footprint elsewhere (target-gated).
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.24"
+# The endpoint form factor for echo cancellation (native/wasapi.rs,
+# AEC-SPEC.md §4.2): `wasapi` keeps its property accessor private. Same
+# 0.62 `wasapi` and `video` use, and only features `wasapi` already
+# turns on, so nothing new compiles.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
 
 [dev-dependencies]
 # examples only — the library itself never initializes a logger
