@@ -1,0 +1,298 @@
+# The iOS app (IOS-SPEC.md §11, §14 D37): built when a GitHub Release is
+# published, or by hand (Actions → ios-release → Run workflow), on
+# GitHub's macOS 26 runner with Xcode 26.6. Day-to-day builds are local
+# (ios/run.sh); there is no push/PR build, as for Android.
+#
+# What comes out depends on the repository's secrets:
+#
+# - Signing secrets set (they need the paid Apple Developer Program): a
+#   signed .ipa for the iPhones listed in an Ad Hoc provisioning profile
+#   ("release testing" in Xcode's words), attached to the release as
+#   baucord-ios-<tag>.ipa. Install it over USB from Xcode's Devices
+#   window or Apple Configurator (ios/README.md §3b) — no Mac build, no
+#   7-day expiry (the profile lasts a year).
+# - Without them: an unsigned build, as a workflow artifact only
+#   (baucord-ios-<tag>-unsigned.ipa). It proves the tag builds for the
+#   iPhone; iOS installs nothing unsigned, so it is not something to put
+#   on a phone as is.
+#
+# Secrets (repo Settings → Secrets and variables → Actions → Secrets):
+#   IOS_CERTIFICATE_P12_BASE64  your "Apple Distribution" certificate with
+#                               its private key, exported from Keychain
+#                               Access as .p12, then base64
+#   IOS_CERTIFICATE_PASSWORD    the password given to that .p12
+#   IOS_PROFILE_BASE64          the Ad Hoc provisioning profile
+#                               (.mobileprovision), base64
+# Variables (same page, Variables tab), optional:
+#   IOS_BUNDLE_ID               the app id the profile is for, when
+#                               dev.baucord is not yours (Config/
+#                               Local.xcconfig's BAUCORD_BUNDLE_ID)
+name: ios-release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to label the build with (dry run: the .ipa is a workflow artifact, not a release asset)"
+        default: "manual"
+
+permissions:
+  contents: write   # gh release upload
+
+jobs:
+  ipa:
+    # Pinned, with Xcode pinned below: an image or Xcode that moves under
+    # a release build should do so on purpose. The runner image lists
+    # Xcode 26.0.1–26.6 (default 26.6); 27 is a preview there.
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      XCODE_APP: /Applications/Xcode_26.6.app
+      BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'dev.baucord' }}
+      # `secrets` cannot be read in a step's `if`; through env they can.
+      P12_B64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+      PROFILE_B64: ${{ secrets.IOS_PROFILE_BASE64 }}
+      # The runner's CMake is 4.x, which refuses projects declaring a
+      # minimum below 3.5 unless told (the desktop release does the same).
+      # libopus is built with it; Xcode's build phases inherit this.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v7
+
+      # A release tag is the crates' version: every platform ships the
+      # number in its crate (SESSION-GUIDE.md §4). Manual dry runs (no
+      # "v" tag) skip the check.
+      - name: Tag matches the crates' version
+        if: startsWith(env.TAG, 'v')
+        run: |
+          set -eu
+          CRATE="$(awk -F'"' '/^version = "/ { print $2; exit }' crates/ios/Cargo.toml)"
+          if [ "${TAG#v}" != "$CRATE" ]; then
+            echo "::error::release tag $TAG, but crates/ios/Cargo.toml says $CRATE — bump the public crates together, then tag v$CRATE"
+            exit 1
+          fi
+          echo "version $CRATE"
+
+      - name: Xcode and tools
+        run: |
+          set -eux
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+          # XcodeGen writes the project from ios/project.yml; CMake is on
+          # the image already (libopus).
+          brew install xcodegen
+          cmake --version
+
+      # rust-toolchain.toml picks the Rust version; only the iPhone target
+      # is added to it (no simulator here).
+      - name: Rust toolchain + target
+        run: |
+          set -eux
+          rustup toolchain install
+          rustup target add aarch64-apple-ios
+          rustup show active-toolchain
+
+      # Xcode's cargo phase builds into target/xcode, inside target/.
+      # Release runs are on tag refs, whose caches no other ref can
+      # restore: only manual runs on the default branch save (run one
+      # once to make the next release warm).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-release-arm64
+          save-if: ${{ github.event_name != 'release' }}
+
+      # A throwaway keychain with the certificate, and the profile where
+      # Xcode looks. Only with both secrets.
+      - name: Signing certificate and profile
+        if: ${{ env.P12_B64 != '' && env.PROFILE_B64 != '' }}
+        env:
+          P12_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/baucord-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "$P12_B64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          echo "$PROFILE_B64" | base64 --decode > "$RUNNER_TEMP/adhoc.mobileprovision"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/signing.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          # Lets codesign use the key without a prompt nobody can answer.
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Ours first in the search list, the runner's after.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/signing.p12"
+          if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep "Apple Distribution" >/dev/null; then
+            security find-identity -v -p codesigning "$KEYCHAIN"
+            echo "::error::the .p12 holds no \"Apple Distribution\" identity with its key — export the certificate *with* its private key (Keychain Access → My Certificates)"
+            exit 1
+          fi
+
+          # What the profile says: its name (what the build asks for),
+          # team, app id, and that it is an Ad Hoc one (it lists devices).
+          security cms -D -i "$RUNNER_TEMP/adhoc.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          PB=/usr/libexec/PlistBuddy
+          UUID="$($PB -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")"
+          NAME="$($PB -c 'Print :Name' "$RUNNER_TEMP/profile.plist")"
+          TEAM="$($PB -c 'Print :TeamIdentifier:0' "$RUNNER_TEMP/profile.plist")"
+          APPID="$($PB -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")"
+          if [ "$APPID" != "$TEAM.$BUNDLE_ID" ]; then
+            echo "::error::the profile is for $APPID, the build for $TEAM.$BUNDLE_ID — make the profile for $BUNDLE_ID, or set the IOS_BUNDLE_ID variable to the profile's app id"
+            exit 1
+          fi
+          if ! $PB -c 'Print :ProvisionedDevices' "$RUNNER_TEMP/profile.plist" > "$RUNNER_TEMP/devices.txt" 2>/dev/null; then
+            echo "::error::\"$NAME\" lists no devices: not an Ad Hoc profile (an App Store one is for TestFlight, which this workflow does not upload to)"
+            exit 1
+          fi
+          DEVICES="$(grep -c '^ ' "$RUNNER_TEMP/devices.txt" || true)"
+          echo "profile \"$NAME\" ($UUID): team $TEAM, $APPID, $DEVICES device(s), expires $($PB -c 'Print :ExpirationDate' "$RUNNER_TEMP/profile.plist")"
+
+          # Xcode 16+ reads UserData; older tools the MobileDevice folder.
+          for DIR in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+                     "$HOME/Library/MobileDevice/Provisioning Profiles"; do
+            mkdir -p "$DIR"
+            cp "$RUNNER_TEMP/adhoc.mobileprovision" "$DIR/$UUID.mobileprovision"
+          done
+          {
+            echo "SIGNED=1"
+            echo "KEYCHAIN=$KEYCHAIN"
+            echo "TEAM_ID=$TEAM"
+            echo "PROFILE_NAME=$NAME"
+          } >> "$GITHUB_ENV"
+
+      # The version file ios/run.sh writes on a Mac: the crate's version,
+      # and this workflow's run number as the build number.
+      - name: Project
+        working-directory: ios
+        run: |
+          set -eux
+          VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' ../crates/ios/Cargo.toml)"
+          printf '%s\n' \
+            "// Written by .github/workflows/ios-release.yml." \
+            "MARKETING_VERSION = $VERSION" \
+            "CURRENT_PROJECT_VERSION = ${{ github.run_number }}" > Config/Version.xcconfig
+          xcodegen generate --quiet
+
+      - name: Archive (Release, arm64)
+        run: |
+          set -euo pipefail
+          ARGS=(
+            -project ios/baucord.xcodeproj
+            -scheme baucord
+            -configuration Release
+            -destination generic/platform=iOS
+            -archivePath "$RUNNER_TEMP/baucord.xcarchive"
+            BAUCORD_BUNDLE_ID="$BUNDLE_ID"
+          )
+          if [ "${SIGNED:-}" = 1 ]; then
+            ARGS+=(
+              CODE_SIGN_STYLE=Manual
+              DEVELOPMENT_TEAM="$TEAM_ID"
+              CODE_SIGN_IDENTITY="Apple Distribution"
+              PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
+              OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN"
+            )
+          else
+            # The cargo phase skips its own codesign when this is NO.
+            ARGS+=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO)
+          fi
+          xcodebuild "${ARGS[@]}" archive
+
+      # The app must be what was asked for: arm64, iOS 17 or later (a
+      # higher floor would refuse older iPhones at install time).
+      - name: Check the app
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/baucord.xcarchive/Products/Applications/baucord.app"
+          lipo -info "$APP/baucord"
+          MINOS="$(otool -l "$APP/baucord" | awk '/LC_BUILD_VERSION/ { f = 1 } f && /minos/ { print $2; exit }')"
+          echo "minos: $MINOS"
+          if [ "$MINOS" != "17.0" ]; then
+            echo "::error::the binary targets iOS $MINOS, not 17.0 (IPHONEOS_DEPLOYMENT_TARGET did not reach cargo?)"
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' -c 'Print :CFBundleShortVersionString' -c 'Print :CFBundleVersion' "$APP/Info.plist"
+
+      - name: Export the signed .ipa
+        if: ${{ env.SIGNED == '1' }}
+        run: |
+          set -euo pipefail
+          # release-testing = Ad Hoc (Xcode 15.3+'s name for it).
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>release-testing</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict><key>$BUNDLE_ID</key><string>$PROFILE_NAME</string></dict>
+            <key>thinning</key><string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/baucord.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+          ls -la "$RUNNER_TEMP/export"
+          cp "$RUNNER_TEMP/export/baucord.ipa" "baucord-ios-${TAG}.ipa"
+          # Signed by the distribution identity, profile embedded.
+          mkdir -p "$RUNNER_TEMP/check" && cd "$RUNNER_TEMP/check"
+          unzip -q "$GITHUB_WORKSPACE/baucord-ios-${TAG}.ipa"
+          codesign --verify --deep --strict Payload/baucord.app
+          codesign -dv Payload/baucord.app 2>&1 | grep -E "Identifier|Authority=Apple Distribution|TeamIdentifier"
+
+      # Without signing: the bundle as an .ipa all the same (Payload/),
+      # so the artifact has the usual shape.
+      - name: Package the unsigned build
+        if: ${{ env.SIGNED != '1' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unsigned/Payload"
+          cp -R "$RUNNER_TEMP/baucord.xcarchive/Products/Applications/baucord.app" "$RUNNER_TEMP/unsigned/Payload/"
+          (cd "$RUNNER_TEMP/unsigned" && zip -qry "$GITHUB_WORKSPACE/baucord-ios-${TAG}-unsigned.ipa" Payload)
+
+      - name: Name the outputs
+        id: out
+        run: |
+          set -eu
+          if [ "${SIGNED:-}" = 1 ]; then
+            echo "ipa=baucord-ios-${TAG}.ipa" >> "$GITHUB_OUTPUT"
+          else
+            echo "ipa=baucord-ios-${TAG}-unsigned.ipa" >> "$GITHUB_OUTPUT"
+          fi
+          # The symbols, for reading crash reports later (the cargo phase
+          # makes the dSYM; a build without one still ships).
+          if [ -d "$RUNNER_TEMP/baucord.xcarchive/dSYMs" ]; then
+            ditto -c -k --keepParent "$RUNNER_TEMP/baucord.xcarchive/dSYMs" "baucord-ios-${TAG}-dSYMs.zip"
+            echo "dsyms=baucord-ios-${TAG}-dSYMs.zip" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::the archive has no dSYMs"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.out.outputs.ipa }}
+          path: |
+            ${{ steps.out.outputs.ipa }}
+            ${{ steps.out.outputs.dsyms }}
+          if-no-files-found: error
+
+      # A published release with signing: the .ipa joins its assets.
+      - name: Attach to the release
+        if: ${{ github.event_name == 'release' && env.SIGNED == '1' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "${{ steps.out.outputs.ipa }}" --clobber
+
+      - name: Remove the signing keychain
+        if: ${{ always() && env.KEYCHAIN != '' }}
+        run: security delete-keychain "$KEYCHAIN" || true

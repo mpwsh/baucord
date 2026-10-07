@@ -711,8 +711,10 @@ people rather than devices. Plus:
   from Photos and Files worked in the simulator (one Files pick was
   delivered twice — now claimed once, D36), and the sidebar has a
   compact form under 600 px of height so a phone on its side keeps its
-  controls (D35 / ANDROID-SPEC.md D42). Next: `lifecycle: background`
-  on ⌘⇧H, then the phone.
+  controls (D35 / ANDROID-SPEC.md D42). A release workflow for iOS
+  exists (`ios-release.yml`, D37): a signed Ad Hoc `.ipa` with the
+  paid program's secrets, an unsigned build without. Next: `lifecycle:
+  background` on ⌘⇧H, then the phone (ios/README.md §3a/3b).
   Record each next step in IOS-SPEC.md §14 and here.
   Then M1 (the client on the iPhone) … M5 (TestFlight). Users still
   report echo: AEC-SPEC.md E8 / IOS-SPEC.md §6.3's VPIO backend is

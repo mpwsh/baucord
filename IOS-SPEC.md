@@ -544,9 +544,11 @@ is not on the list), disk space if `sysinfo` reads it — and the
 rustls; the user's call). The build number already grows with every
 commit (D25).
 
-CI: none in v1 (Android's D21 stance: testing is local). If wanted,
-Slint's model fits — CI builds an unsigned archive on a macOS runner,
-signing stays on the Mac.
+CI: `.github/workflows/ios-release.yml` (§14 D37) builds on a published
+release, like the Android APK — a signed Ad Hoc `.ipa` when the paid
+program's certificate and profile are in the repository's secrets, an
+unsigned build (an artifact, not installable) otherwise. Development
+builds stay local (`run.sh`).
 
 ## 12. Milestones
 
@@ -658,6 +660,10 @@ fix was installed, so still with portrait insets):
 |---|---|---|
 | D35 | **A compact sidebar for short screens** (shared `sidebar.slint`; ANDROID-SPEC.md D42): below 600 px of height — a phone on its side (~370 px with the right insets), a small desktop window — the sidebar keeps every control on screen by giving up room: gaps of 8 px instead of 12, the *New channel* / *Invite* chips on the server-name row (a `ChipButton` component now draws both rows' chips), Messages capped at 30 % of the height and at its own rows, the status and latency on one line (the resource line dropped), the control bar 44 px tall, and *Disconnect* as a red hang-up icon in that bar instead of its own button. The full stack needs ~600 px (Messages alone is 200); on its side, with Messages open, the status, the mic/deafen/settings bar and Disconnect had been pushed off the bottom entirely, and with it folded Disconnect was cut by the screen's corner. Rendered at 852×393 with landscape insets: everything on screen open or folded, the voice list keeping two to four rows; upright (393×852) unchanged | the controls are the part that must never be cut; a phone on its side has a third of a desktop's height |
 | D36 | **One delivery per pick** (`host.rs`): the pick's callback is *claimed* by the first file delivered (`claim()`); a second delivery of the same pick is ignored, and a cancel no longer frees a slot whose file is still being copied. The simulator reported one Files pick twice within the same millisecond: the first moved the file and attached it, the second found it gone — `file pick failed: No such file or directory`, shown as an error toast over a successful attach | whatever UIKit's reason, a pick's file is handed over once |
+
+| # | decision | why |
+|---|---|---|
+| D37 | **An iOS build in GitHub Actions** (2026-10-07, `.github/workflows/ios-release.yml`), the Android APK's sibling: on a published release (or by hand), on the `macos-26` runner with Xcode 26.6 pinned, `xcodebuild archive` of the XcodeGen project for `generic/platform=iOS` (the same cargo phase as on the Mac; build number = the run number; the tag must be the crates' version). With three secrets — an *Apple Distribution* `.p12`, its password, an *Ad Hoc* profile — it signs in a throwaway keychain, exports a `release-testing` `.ipa` and attaches it to the release; it checks the identity is in the `.p12`, the profile is for the app id (`IOS_BUNDLE_ID`, default `dev.baucord`) and lists devices, and the app is arm64 with `minos` 17.0. Without the secrets it builds unsigned and leaves the bundle as an artifact only (iOS installs nothing unsigned). `CMAKE_POLICY_VERSION_MINIMUM=3.5` for the runner's CMake 4 (libopus), as the desktop release does. The dSYMs ride along as an artifact. ios/README.md §3 has both ways onto a phone: `run.sh --device` (free Apple ID, 7 days) and the CI `.ipa` over USB (Devices window or Apple Configurator; paid program, a year, the profile's devices). Checked with actionlint + shellcheck and the export options generated and parsed; not yet run on GitHub | iOS has no APK: what installs is decided by signing, so CI can only hand out something installable with a paid account's distribution identity; TestFlight (M5) is the next step from the same archive |
 
 In the simulator, Photos has Apple's sample pictures and Files starts
 empty: drag a file from the Mac onto the simulator window to put it in

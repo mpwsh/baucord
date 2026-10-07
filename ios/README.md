@@ -64,23 +64,100 @@ up).
 
 ## 3. Your iPhone
 
-1. Copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig` and
-   set `DEVELOPMENT_TEAM`: Xcode → Settings → Accounts → add your
-   Apple ID → the team ID. A free Apple ID is enough ("Personal
-   Team"): the app then stops opening after **7 days** and needs
+Two ways onto the phone, both over USB the first time. iOS only runs
+apps signed for it, which is what decides between them:
+
+| | 3a. Built on this Mac | 3b. Built by GitHub Actions |
+|---|---|---|
+| Apple account | a free Apple ID is enough | the paid Developer Program ($99/year) |
+| How | `ios/run.sh --device` | publish a release (or run the workflow), install the `.ipa` |
+| Lasts | 7 days with a free Apple ID, then run it again | a year (the profile's life) |
+| Who | your own phones | any iPhone whose UDID is in the profile (up to 100 a year) |
+
+### 3a. From this Mac (`run.sh --device`)
+
+1. Xcode → Settings → Accounts → **+** → Apple ID. Then Manage
+   Certificates → **+** → *Apple Development*, so the Mac has a
+   signing certificate.
+2. Copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig` and
+   set `DEVELOPMENT_TEAM` to your team ID. It is the certificate's
+   "OU":
+   ```sh
+   security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject
+   ```
+   (the 10 characters after `OU=`). A free Apple ID is a "Personal
+   Team": the app stops opening after **7 days** and needs
    `ios/run.sh --device` again, and one Apple ID can have 3 such apps
-   on a phone. The paid Developer Program ($99/year) gives one-year
-   profiles and TestFlight (IOS-SPEC.md §11).
-2. If Xcode says the bundle id `dev.baucord` is not available, set
+   on a phone.
+3. If Xcode says the bundle id `dev.baucord` is not available, set
    `BAUCORD_BUNDLE_ID = dev.baucord.<yourname>` in the same file.
-3. On the iPhone: connect it, unlock it, tap **Trust**; turn on
-   **Developer Mode** (Settings → Privacy & Security, then restart).
-4. `ios/run.sh --device`. The first launch with a free Apple ID is
-   refused until you trust yourself as a developer on the phone:
-   Settings → General → VPN & Device Management → your Apple ID →
-   Trust. Run it again.
+4. Connect the iPhone by USB, unlock it, tap **Trust**. Open Xcode →
+   Window → Devices and Simulators once with it connected: only then
+   does the phone offer **Developer Mode** (Settings → Privacy &
+   Security → Developer Mode → on → restart → confirm).
+5. `ios/run.sh --device`. With a free Apple ID the first launch is
+   refused until the phone trusts you as a developer: Settings →
+   General → VPN & Device Management → your Apple ID → Trust. Run it
+   again. `--device --release` installs an optimised build.
 
 After the first USB run the phone also works over Wi-Fi.
+
+If Xcode refuses the phone because of its iOS version (a phone on
+iOS 26 or 27 and Xcode 16), update Xcode: 26.x needs macOS Sequoia
+15.6 or later, 27 needs macOS Tahoe 26.6.
+
+### 3b. From GitHub Actions (`.github/workflows/ios-release.yml`)
+
+The workflow runs when a release is published, like the Android APK,
+or by hand (Actions → ios-release → Run workflow). With the signing
+secrets below it attaches a signed `baucord-ios-<tag>.ipa` to the
+release; without them it only proves the tag builds and leaves an
+unsigned `.ipa` as a workflow artifact, which no iPhone installs.
+
+Once, in the Developer Program (developer.apple.com → Certificates,
+IDs & Profiles):
+
+1. **Identifiers → +** → App IDs → App → explicit bundle id
+   `dev.baucord` (or your own — then add a repository *variable*
+   `IOS_BUNDLE_ID` with it). No capabilities are needed.
+2. **Devices → +**: each iPhone that should install it, by UDID. With
+   the phone connected: Finder → the phone in the sidebar → click the
+   line under its name until it shows the UDID → right-click → Copy.
+3. A distribution certificate: Xcode → Settings → Accounts → Manage
+   Certificates → **+** → *Apple Distribution*. Then Keychain Access →
+   login → My Certificates → *Apple Distribution: …* (with its key
+   underneath) → right-click → Export → `.p12`, with a password.
+4. **Profiles → +** → *Ad Hoc* → the app id → that certificate → the
+   devices → name it → download the `.mobileprovision`. A new device
+   later means editing the profile (add it), downloading it again and
+   replacing the secret.
+5. Repository → Settings → Secrets and variables → Actions → *New
+   repository secret*, three times:
+   ```sh
+   base64 -i baucord-distribution.p12 | pbcopy        # → IOS_CERTIFICATE_P12_BASE64
+                                                      #   IOS_CERTIFICATE_PASSWORD: the .p12's password
+   base64 -i baucord_Ad_Hoc.mobileprovision | pbcopy  # → IOS_PROFILE_BASE64
+   ```
+
+Then publish a release (`v1.1.7`, the crates' version — the workflow
+checks), or run the workflow by hand to try it; a manual run leaves
+the `.ipa` under the run's *Artifacts*. The first build takes a while
+(the whole engine for iOS); run the workflow once by hand on the
+default branch and later releases start from its cache.
+
+**Installing the `.ipa` over USB** (an Ad Hoc build is not
+development-signed, so Developer Mode should not be needed; if the
+phone says it is, turn it on as in 3a, step 4):
+
+- Xcode → Window → **Devices and Simulators** → the phone → under
+  *Installed Apps* press **+** → choose `baucord-ios-<tag>.ipa`; or
+  drag the file onto that list.
+- Or **Apple Configurator** (free, Mac App Store): drag the `.ipa`
+  onto the phone's tile.
+
+A phone that is not in the profile refuses it ("unable to install");
+add its UDID (steps 2 and 4). To give it to people without USB, the
+next step is TestFlight (spec M5).
 
 ## 4. Logs
 
