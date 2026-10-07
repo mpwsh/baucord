@@ -225,6 +225,16 @@ export global State {
     /// exit there, and Apple's rule is that only the user closes an
     /// app): the connect page's Quit is hidden.
     in property <bool> can-quit: true;
+    /// The screen edges the system draws over, as the host itself
+    /// measures them (IOS-SPEC.md §14 D39): iOS pushes `UIKit`'s safe
+    /// area here whenever it changes. The pages keep clear of the larger
+    /// of this and the window's own `safe-area-insets`, so a stale or
+    /// missing value on either side cannot put the UI under the status
+    /// bar. Zero elsewhere.
+    in property <length> host-inset-top;
+    in property <length> host-inset-left;
+    in property <length> host-inset-bottom;
+    in property <length> host-inset-right;
     in property <bool> muted;
     in property <bool> deafened;
     /// Push-to-talk: the mic is closed until the key is held.

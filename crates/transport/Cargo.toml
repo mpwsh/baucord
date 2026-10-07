@@ -54,6 +54,12 @@ socket2 = { version = "0.6", features = ["all"] }
 [dev-dependencies]
 env_logger = "0.11"
 
+[target.'cfg(unix)'.dependencies]
+# `poll(2)` on the socket (`udp::ReadWaiter`): a connected client's
+# network thread sleeps until a datagram arrives instead of polling
+# every millisecond. Already in the tree (quinn-udp, socket2).
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # qWAVE: the Windows way to mark a UDP flow as voice (DSCP + 802.1p) —
 # IP_TOS is ignored by the Windows stack. Discord's "High Packet

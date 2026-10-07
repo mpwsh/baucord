@@ -29,8 +29,8 @@ use std::{
     net::SocketAddr,
     rc::{Rc, Weak},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -42,11 +42,11 @@ use app_core::{
 };
 use audio::{PeerAudioSettings, SoundType};
 use client::{
-    AdminCommand, AdminTarget,
-    config::{BindableAction, Settings, peer_key},
+    config::{peer_key, BindableAction, Settings},
     network::{DisconnectKind, LossKind, NetworkControl, NetworkMessage, NetworkThreadHandle},
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
+    AdminCommand, AdminTarget,
 };
 use i18n::t;
 use log::{info, warn};
@@ -86,14 +86,65 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// main window. An iPhone app is one full-screen window too (winit on
 /// `UIKit`, IOS-SPEC.md §4), so iOS takes every page Android has — the
 /// Settings and stream pages, the narrow layout, the touch rules.
-pub(crate) const SINGLE_WINDOW_HOST: bool =
-    cfg!(any(target_os = "android", target_os = "ios"));
+pub(crate) const SINGLE_WINDOW_HOST: bool = cfg!(any(target_os = "android", target_os = "ios"));
 
 /// Whether the app may end its own process. Not on iOS: winit ignores
 /// `ControlFlow::Exit` there (the loop never returns, IOS-SPEC.md
 /// §4.1) and Apple's rule is that only the user closes an app, from the
 /// app switcher. The Quit button is hidden and `/quit` says how.
 pub(crate) const HOST_CAN_QUIT: bool = !cfg!(target_os = "ios");
+
+// ── What the host tells the app (phones) ────────────────────────────────
+
+/// Whether the host shows the app: false while a phone app is in the
+/// background (IOS-SPEC.md §14 D42). Voice goes on there; what only
+/// feeds the screen — the latency and resource lines, the stream stats,
+/// GIF animation, the device poll — waits until the app is shown again,
+/// instead of drawing frames nobody sees. The desktop never clears it
+/// (`main_on_screen` has its own tray and minimize checks).
+static HOST_VISIBLE: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn host_visible() -> bool {
+    HOST_VISIBLE.load(Ordering::Relaxed)
+}
+
+/// The host's app went into the background (`false`) or came back to
+/// the screen. Callable from any thread.
+pub fn set_host_visible(visible: bool) {
+    if HOST_VISIBLE.swap(visible, Ordering::Relaxed) == visible {
+        return;
+    }
+    info!("host: app {}", if visible { "shown" } else { "hidden" });
+    if visible {
+        let _ = slint::invoke_from_event_loop(|| with_current(AppState::host_shown));
+    }
+}
+
+/// The screen edges the host measured itself (logical px: top, left,
+/// bottom, right), applied as `State.host-inset-*` (IOS-SPEC.md §14 D39).
+static HOST_INSETS: std::sync::Mutex<[f32; 4]> = std::sync::Mutex::new([0.0; 4]);
+
+/// The host's own measure of the edges the system draws over (iOS: the
+/// window's safe area), whenever it changes. The pages keep clear of
+/// the larger of this and the window's `safe-area-insets`. Callable
+/// from any thread, before the app exists too.
+pub fn set_host_insets(top: f32, left: f32, bottom: f32, right: f32) {
+    if let Ok(mut insets) = HOST_INSETS.lock() {
+        *insets = [top, left, bottom, right];
+    }
+    let _ = slint::invoke_from_event_loop(|| {
+        with_current(|app| apply_host_insets(&app.main));
+    });
+}
+
+fn apply_host_insets(main: &MainWindow) {
+    let [top, left, bottom, right] = HOST_INSETS.lock().map_or([0.0; 4], |i| *i);
+    let s = main.global::<State>();
+    s.set_host_inset_top(top);
+    s.set_host_inset_left(left);
+    s.set_host_inset_bottom(bottom);
+    s.set_host_inset_right(right);
+}
 
 // ── The UI-thread singleton ─────────────────────────────────────────────
 
@@ -495,6 +546,7 @@ pub fn run() {
     info!("Locale: {locale}");
 
     let main = MainWindow::new().expect("failed to create the main window");
+    apply_host_insets(&main);
 
     // Saved size only; the position is decided at the first show
     // (centred on the monitor, see `center_on_monitor`). A phone's
@@ -676,11 +728,7 @@ pub fn run() {
     // the desktop wires its SettingsWindow when that is first created.
     if SINGLE_WINDOW_HOST {
         // One window means a phone: touch, a soft keyboard, Back.
-        state
-            .borrow()
-            .main
-            .global::<State>()
-            .set_touch_host(true);
+        state.borrow().main.global::<State>().set_touch_host(true);
         crate::settingsui::wire_page(&state.borrow().main);
         // Same for the stream viewer page (D23).
         crate::viewers::wire_page(&state.borrow().main);
@@ -795,7 +843,7 @@ fn center_on_monitor(_win: &slint::Window) {}
 /// mixed-DPI setups land where they look centred.
 #[cfg(feature = "desktop")]
 fn center_on_monitor(win: &slint::Window) {
-    use i_slint_backend_winit::{WinitWindowAccessor, winit::dpi::PhysicalPosition};
+    use i_slint_backend_winit::{winit::dpi::PhysicalPosition, WinitWindowAccessor};
     win.with_winit_window(|w| {
         let Some(monitor) = w.current_monitor().or_else(|| w.primary_monitor()) else {
             return;
@@ -1447,6 +1495,12 @@ fn start_timers(state: &Rc<RefCell<AppState>>) {
         slint::TimerMode::Repeated,
         Duration::from_millis(2500),
         move || {
+            // In the background (a phone) nobody reads the notices; the
+            // first poll back on screen reports whatever changed. The
+            // voice engine follows device loss on its own meanwhile.
+            if !host_visible() {
+                return;
+            }
             let input = audio::VoiceChat::list_input_devices().unwrap_or_default();
             let output = audio::VoiceChat::list_output_devices().unwrap_or_default();
             with_app(&w, |app| app.handle_devices_changed(input, output));
@@ -2294,6 +2348,10 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_viewer_exit_fullscreen(t!("viewer-exit-fullscreen").into());
     tr.set_viewer_fill(t!("viewer-fill").into());
     tr.set_viewer_fit(t!("viewer-fit").into());
+    tr.set_viewer_mic_mute(t!("viewer-mic-mute").into());
+    tr.set_viewer_mic_unmute(t!("viewer-mic-unmute").into());
+    tr.set_viewer_stream_mute(t!("viewer-stream-mute").into());
+    tr.set_viewer_stream_unmute(t!("viewer-stream-unmute").into());
     tr.set_settings_title(t!("settings-title").into());
     tr.set_tab_profile(t!("tab-profile").into());
     tr.set_tab_general(t!("tab-general").into());
@@ -2442,7 +2500,7 @@ pub mod tray {
     use i18n::t;
     use log::warn;
 
-    use super::{AppState, with_current};
+    use super::{with_current, AppState};
 
     thread_local! {
         /// Keeps the OS tray item alive for the app's lifetime —

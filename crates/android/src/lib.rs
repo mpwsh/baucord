@@ -127,7 +127,13 @@ fn on_poll_event(event: &PollEvent<'_>) {
         return;
     };
     match main {
-        MainEvent::Start => log::info!("lifecycle: start"),
+        MainEvent::Start => {
+            log::info!("lifecycle: start");
+            // On screen again: the stats lines, GIFs and the device
+            // poll resume (ANDROID-SPEC.md D43).
+            #[cfg(feature = "app")]
+            frontend::app::set_host_visible(true);
+        }
         MainEvent::Resume { .. } => {
             log::info!("lifecycle: resume");
             for permission in runtime_permissions() {
@@ -139,7 +145,14 @@ fn on_poll_event(event: &PollEvent<'_>) {
             }
         }
         MainEvent::Pause => log::info!("lifecycle: pause"),
-        MainEvent::Stop => log::info!("lifecycle: stop"),
+        MainEvent::Stop => {
+            log::info!("lifecycle: stop");
+            // Off screen (home, another app, the screen locked); voice
+            // goes on under the foreground service, the UI-only work
+            // pauses.
+            #[cfg(feature = "app")]
+            frontend::app::set_host_visible(false);
+        }
         MainEvent::Destroy => log::info!("lifecycle: destroy"),
         MainEvent::LowMemory => log::warn!("lifecycle: low memory"),
         MainEvent::GainedFocus => log::debug!("lifecycle: focus gained"),

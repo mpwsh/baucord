@@ -638,6 +638,7 @@ impl AppState {
                     &app.main,
                 ) {
                     Ok(viewer) => {
+                        viewer.set_self_audio(app.is_muted, app.is_deafened);
                         app.viewers.insert(client_id, viewer);
                         app.network
                             .tx

@@ -491,6 +491,16 @@ impl Peer {
         }
     }
 
+    /// See [`Driver::wants_tick`].
+    fn wants_tick(&self) -> bool {
+        self.close_at.is_some()
+            || self.control.as_ref().is_some_and(|l| !l.out.is_empty())
+            || self.signal.as_ref().is_some_and(|l| !l.out.is_empty())
+            || !self.video_out.is_empty()
+            || !self.video_finishing.is_empty()
+            || !self.uploads.is_empty()
+    }
+
     fn bidi_mut(&mut self, lane: Lane) -> Option<&mut BidiLane> {
         match lane {
             Lane::Control => self.control.as_mut(),
@@ -851,6 +861,19 @@ impl Driver {
             }
         }
         earliest
+    }
+
+    /// Whether the per-tick work of [`Self::handle_timeouts`] has
+    /// anything to move: lane bytes the stream would not take yet,
+    /// video groups open or waiting for their acks, paced uploads,
+    /// a deferred close, transmits not yet polled. None of these has a
+    /// timer of its own in [`Self::next_timeout`], so a loop that
+    /// sleeps longer than a millisecond between ticks must keep ticking
+    /// while this is true. With it false, an idle connection needs a
+    /// tick only at `next_timeout` or when a datagram arrives.
+    #[must_use]
+    pub fn wants_tick(&self) -> bool {
+        !self.transmits.is_empty() || self.peers.values().any(Peer::wants_tick)
     }
 
     /// Fire every timer at or before `now`, and run the per-tick work

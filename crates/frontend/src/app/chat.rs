@@ -727,6 +727,14 @@ impl AppState {
             })
         }
 
+        // A phone app in the background: nothing is on screen, the
+        // gallery page included. Stop ticking (every frame would be a
+        // redraw nobody sees); `host_shown` restarts the ticker, and
+        // the players carry on from where they were.
+        if !host_visible() {
+            self.gif_ticker.stop();
+            return;
+        }
         // Tray/minimized: chat rows and the in-window preview are
         // invisible — stop paying decode for them. The gallery viewer
         // is its own window and may still be on screen, so it keeps

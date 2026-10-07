@@ -217,6 +217,21 @@ impl UdpIo {
         }
     }
 
+    /// A second handle on this socket that can block until a datagram
+    /// is waiting, for a thread that should sleep instead of polling
+    /// the socket on a timer ([`ReadWaiter`]). The handle shares the
+    /// socket (a `dup`): reading still happens here, through
+    /// [`Self::recv_batch`].
+    ///
+    /// # Errors
+    /// The descriptor could not be duplicated.
+    #[cfg(unix)]
+    pub fn read_waiter(&self) -> io::Result<ReadWaiter> {
+        Ok(ReadWaiter {
+            socket: self.socket.try_clone()?,
+        })
+    }
+
     /// Send one transmit (a GSO batch if `segment_size` is set). A
     /// kernel refusal is counted and swallowed.
     pub fn send(&mut self, t: &Transmit) {
@@ -241,6 +256,51 @@ impl UdpIo {
                 );
             }
         }
+    }
+}
+
+/// Blocks until the socket it came from has a datagram to read
+/// ([`UdpIo::read_waiter`]). It never reads: whoever owns the
+/// [`UdpIo`] does, and must drain the socket before waiting again —
+/// readiness is level-triggered, so a datagram left queued makes the
+/// next [`Self::wait`] return at once.
+#[cfg(unix)]
+pub struct ReadWaiter {
+    socket: UdpSocket,
+}
+
+#[cfg(unix)]
+impl ReadWaiter {
+    /// Wait up to `timeout` for a readable datagram: `Ok(true)` when
+    /// one is there, `Ok(false)` on timeout or a signal.
+    ///
+    /// # Errors
+    /// `poll` failed (the descriptor is gone).
+    pub fn wait(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd {
+            fd: self.socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one valid `pollfd` for the call's duration; the
+        // descriptor is ours (a dup) and open while `self` lives.
+        let n = unsafe { libc::poll(&raw mut fd, 1, ms) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            return if err.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(err)
+            };
+        }
+        if n > 0 && fd.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        // An error or hang-up condition counts as readable: the owner's
+        // next receive reports it.
+        Ok(n > 0)
     }
 }
 
@@ -398,6 +458,58 @@ mod tests {
         }
         assert_eq!(got.len(), N);
         assert!(got.iter().all(|len| *len == 100));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod read_waiter_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// Nothing queued: the wait times out (and does not return early).
+    /// A datagram arrives: the wait returns true until it is read, and
+    /// times out again once it has been.
+    #[test]
+    fn wait_follows_what_is_queued() {
+        let mut rx = UdpIo::bind("127.0.0.1:0".parse().unwrap(), 1 << 20).expect("bind rx");
+        let waiter = rx.read_waiter().expect("waiter");
+        let start = Instant::now();
+        assert!(!waiter.wait(Duration::from_millis(50)).expect("wait"));
+        assert!(start.elapsed() >= Duration::from_millis(40));
+
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind tx");
+        tx.send_to(&[7u8; 32], rx.local_addr().expect("addr"))
+            .expect("send");
+        assert!(waiter.wait(Duration::from_secs(2)).expect("wait"));
+        // Level-triggered: still readable until someone reads.
+        assert!(waiter.wait(Duration::ZERO).expect("wait"));
+
+        let mut got = 0;
+        rx.recv_batch(|_| got += 1).expect("recv");
+        assert_eq!(got, 1);
+        assert!(!waiter.wait(Duration::from_millis(20)).expect("wait"));
+    }
+
+    /// A waiter blocked on another thread wakes as soon as the datagram
+    /// lands, not at its timeout.
+    #[test]
+    fn a_blocked_wait_wakes_on_arrival() {
+        let rx = UdpIo::bind("127.0.0.1:0".parse().unwrap(), 1 << 20).expect("bind rx");
+        let to = rx.local_addr().expect("addr");
+        let waiter = rx.read_waiter().expect("waiter");
+        let t = std::thread::spawn(move || {
+            let start = Instant::now();
+            let ready = waiter.wait(Duration::from_secs(5)).expect("wait");
+            (ready, start.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind tx");
+        tx.send_to(&[1u8; 8], to).expect("send");
+        let (ready, took) = t.join().expect("join");
+        assert!(ready);
+        assert!(took < Duration::from_secs(2), "woke after {took:?}");
+        drop(rx);
     }
 }
 

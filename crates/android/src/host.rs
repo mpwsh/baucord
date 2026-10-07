@@ -99,6 +99,12 @@ impl Hooks for AndroidHost {
             },
         }
     }
+
+    fn keep_screen_on(&self, on: bool) {
+        if let Err(e) = java::keep_screen_on(on) {
+            log::warn!("keep screen on ({on}): {e}");
+        }
+    }
 }
 
 /// `nativeFilePicked`: a readable copy of the picked file, a failure,

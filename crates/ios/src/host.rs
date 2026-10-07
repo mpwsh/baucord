@@ -19,20 +19,22 @@
 //! are called from. Photos hands its file over on a background queue;
 //! the pick's callback is `Send` and hops back to the UI itself.
 
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::{
+    cell::RefCell,
+    path::{Path, PathBuf},
+    ptr::NonNull,
+    sync::{Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
+};
 
 use block2::RcBlock;
 use frontend::host::{Hooks, OnPick, Saved};
 use i18n::t;
-use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, extern_class, extern_methods,
-    msg_send,
+    define_class, extern_class, extern_methods, msg_send,
+    rc::{Allocated, Retained},
+    runtime::{NSObject, NSObjectProtocol, ProtocolObject},
+    DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSString, NSURL};
@@ -188,6 +190,17 @@ impl Hooks for IosHost {
     // `keep_alive`: nothing to do. In voice the audio background mode
     // keeps the process running (spec D13); chat alone is suspended
     // with the app and reconnects on return.
+
+    /// While a stream is watched the idle timer is off, so the screen
+    /// neither dims nor locks (spec §14 D45). iOS applies it only while
+    /// the app is in front: leaving the app lets the phone sleep.
+    fn keep_screen_on(&self, on: bool) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            log::warn!("keep screen on: not on the main thread");
+            return;
+        };
+        UIApplication::sharedApplication(mtm).setIdleTimerDisabled(on);
+    }
 }
 
 /// Hand the frontend its hooks; before `frontend::app::run`.

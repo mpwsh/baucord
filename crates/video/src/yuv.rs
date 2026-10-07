@@ -420,23 +420,30 @@ pub fn bgra_to_rgba(
 ) -> Result<(), String> {
     let (w, h) = (width as usize, height as usize);
     let row = w * 4;
-    out.clear();
     if w == 0 || h == 0 {
+        out.clear();
         return Ok(());
     }
     if stride < row {
+        out.clear();
         return Err(format!(
             "{stride} byte rows cannot hold {width} BGRA pixels"
         ));
     }
     let need = stride * (h - 1) + row;
     if src.len() < need {
+        out.clear();
         return Err(format!(
             "{width}x{height} BGRA at stride {stride} needs {need} bytes, decoder gave {}",
             src.len()
         ));
     }
-    out.resize(row * h, 0);
+    // Every byte is written below: a buffer already this size (the
+    // decoder reuses it frame after frame) is not zero-filled first.
+    if out.len() != row * h {
+        out.clear();
+        out.resize(row * h, 0);
+    }
     for (dst, src_row) in out.chunks_exact_mut(row).zip(src.chunks(stride)) {
         for (d, s) in dst.chunks_exact_mut(4).zip(src_row[..row].chunks_exact(4)) {
             d[0] = s[2];

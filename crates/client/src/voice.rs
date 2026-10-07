@@ -191,6 +191,10 @@ impl Drop for VoiceThreadHandle {
 /// hint and jitter depth are recorded for after-the-fact diagnosis.
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The voice loop's longest sleep while the engine runs (meters,
+/// speaking edges, device supervision); see the loop.
+const VOICE_TICK: Duration = Duration::from_millis(20);
+
 // Mute, deafen, push-to-talk and the rest are independent switches
 // the loop reads every packet; their combinations are all valid.
 #[expect(clippy::struct_excessive_bools)]
@@ -509,9 +513,17 @@ fn run_voice_loop(
                         forward_outgoing(&network_tx, id, packet);
                     }
                 },
-                // Engine running: the 5 ms cadence feeds the UI level
-                // meters even when the gate is closed (no packets).
-                default(Duration::from_millis(5)) => {}
+                // Engine running: this cadence feeds the UI level
+                // meters even when the gate is closed (no packets),
+                // notices the gate closing (the speaking light), and
+                // supervises the devices. Packets and commands wake the
+                // loop at once, so nothing waits on it but those. It was
+                // 5 ms — 200 wakes a second for as long as a session
+                // lasted, a quiet channel included; the meters redraw
+                // every 125 ms and the speaking indicator holds for
+                // hundreds, so 20 ms is still far finer than anything
+                // reads it (IOS-SPEC.md §14 D41).
+                default(VOICE_TICK) => {}
             }
         }
 

@@ -61,6 +61,10 @@ use crate::{
     PcmFrame, FRAME_SIZE, OPUS_SAMPLE_RATE,
 };
 
+/// The capture worker's sleep while the microphone is muted (see the
+/// worker loop).
+const MUTED_WAIT: Duration = Duration::from_millis(50);
+
 pub struct AudioInput {
     device: Device,
     device_config: SupportedStreamConfig,
@@ -576,7 +580,12 @@ fn worker_loop(
             if let Ok(chunk) = ring_consumer.read_chunk(stale) {
                 chunk.commit_all();
             }
-            crate::platform::wait_for_wake(&wake_rx, Duration::from_millis(10));
+            // The capture callback stops waking us while muted, so this
+            // timeout is the whole wake rate of a muted microphone: 20
+            // a second rather than 100. Unmuting costs nothing — the
+            // callback's next (unmuted) buffer rings at once — and a
+            // stop waits at most this long for the worker to leave.
+            crate::platform::wait_for_wake(&wake_rx, MUTED_WAIT);
             chain.reset();
             accumulator.clear();
             resampler_accum.clear();

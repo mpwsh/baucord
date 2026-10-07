@@ -1,27 +1,34 @@
-//! Keeps Slint's safe area right after a rotation (IOS-SPEC.md §14 D34).
+//! Keeps the app clear of the status bar, the notch and the home
+//! indicator (IOS-SPEC.md §14 D34, D39).
 //!
-//! Slint reads the window's safe area (the notch or Dynamic Island, the
-//! home indicator, the status bar) when winit reports a resize, and
-//! winit reports one from its view's `layoutSubviews`. The simulator
-//! showed the app keeping the portrait insets in landscape — 62 pt at
-//! the top and 34 at the bottom, none at the sides: the name chip under
-//! the Dynamic Island, the stream page letterboxed into a band 96 pt
-//! short. So on a rotation that layout evidently runs before `UIKit`
-//! has given the window its new safe area, and nothing asks again.
+//! Slint reads the window's safe area when winit reports a resize, and
+//! winit reports one from its view's `layoutSubviews`. Two things went
+//! wrong with that alone:
 //!
-//! The fix is a probe: an empty, non-interactive view behind winit's,
-//! as large as the window. `UIKit` tells it `safeAreaInsetsDidChange`
-//! whenever the window's safe area changes, and it then asks winit's
-//! view to lay out again — winit re-sends the resize, and Slint reads
-//! the insets afresh, now the new ones.
+//! - After a rotation the simulator kept the portrait insets in
+//!   landscape — 62 pt at the top and 34 at the bottom, none at the
+//!   sides: the name chip under the Dynamic Island, the stream page
+//!   letterboxed into a band 96 pt short. The layout evidently runs
+//!   before `UIKit` has given the window its new safe area, and nothing
+//!   asks again (D34).
+//! - On an iPhone SE the main page started right under the status bar:
+//!   whatever Slint had, its top inset was 0 where `UIKit`'s is 20 pt
+//!   (D39).
+//!
+//! So a probe — an empty, non-interactive view behind winit's, as large
+//! as the window — is told `safeAreaInsetsDidChange` whenever the
+//! window's safe area changes. It then does two things: asks winit's
+//! view to lay out again (winit re-sends the resize and Slint re-reads
+//! its insets), and hands `UIKit`'s own numbers to the app, which keeps
+//! its pages clear of the larger of the two (`State.host-inset-*`).
+//! The numbers go to the log once per change: "safe area: top 20 …".
 
-use std::cell::Cell;
-use std::ptr::NonNull;
+use std::{cell::Cell, ptr::NonNull};
 
 use block2::RcBlock;
-use objc2::rc::Retained;
-use objc2::runtime::NSObject;
-use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{
+    define_class, msg_send, rc::Retained, runtime::NSObject, MainThreadMarker, MainThreadOnly,
+};
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSOperationQueue};
 use objc2_ui_kit::{
     UIResponder, UIView, UIViewAutoresizing, UIWindow, UIWindowDidBecomeKeyNotification,
@@ -40,7 +47,9 @@ define_class!(
         fn safe_area_insets_did_change(&self) {
             // SAFETY: UIView's own implementation, as the docs ask.
             let _: () = unsafe { msg_send![super(self), safeAreaInsetsDidChange] };
-            relayout(self.window().as_deref());
+            let window = self.window();
+            relayout(window.as_deref());
+            report(window.as_deref());
         }
     }
 );
@@ -60,6 +69,39 @@ thread_local! {
     /// The probe is added to the first window that becomes key —
     /// winit's, the app's only one.
     static PROBED: Cell<bool> = const { Cell::new(false) };
+    /// The safe area last reported (pt: top, left, bottom, right, as
+    /// bits: compared for change, never for closeness).
+    static REPORTED: Cell<Option<[u64; 4]>> = const { Cell::new(None) };
+}
+
+/// Hand the window's safe area to the app (and the log) when it
+/// changed.
+fn report(window: Option<&UIWindow>) {
+    let Some(window) = window else {
+        return;
+    };
+    let insets = window.safeAreaInsets();
+    let edges = [insets.top, insets.left, insets.bottom, insets.right];
+    let bits = edges.map(f64::to_bits);
+    if REPORTED.replace(Some(bits)) == Some(bits) {
+        return;
+    }
+    log::info!(
+        "safe area: top {} left {} bottom {} right {} pt",
+        edges[0],
+        edges[1],
+        edges[2],
+        edges[3]
+    );
+    // Points are Slint's logical pixels (its scale factor is the
+    // screen's).
+    #[cfg(all(feature = "app", not(feature = "hello")))]
+    frontend::app::set_host_insets(
+        edges[0] as f32,
+        edges[1] as f32,
+        edges[2] as f32,
+        edges[3] as f32,
+    );
 }
 
 fn add_probe(window: &UIWindow, mtm: MainThreadMarker) {
@@ -80,6 +122,7 @@ fn add_probe(window: &UIWindow, mtm: MainThreadMarker) {
     // The window keeps the probe; and if the app started rotated, the
     // insets Slint has may already be stale.
     relayout(Some(window));
+    report(Some(window));
 }
 
 /// Watch for winit's window; install before `frontend::app::run`.

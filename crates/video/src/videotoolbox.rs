@@ -31,8 +31,10 @@
 //!   P-frames until then are dropped (the senders send an IDR every
 //!   couple of seconds, and the jitter buffer asks for one on loss).
 
-use std::ffi::c_void;
-use std::ptr::{self, NonNull};
+use std::{
+    ffi::c_void,
+    ptr::{self, NonNull},
+};
 
 use log::{debug, info};
 use objc2_core_foundation::{kCFBooleanTrue, CFDictionary, CFNumber, CFRetained, CFString, CFType};

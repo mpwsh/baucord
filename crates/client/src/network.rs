@@ -48,7 +48,28 @@ use transport::{
     PeerId, Trust, UdpIo, UploadId, VideoItem, OWN_TRACK,
 };
 
-use crate::{screen::ScreenControl, voice::VoiceControl, WakeFn};
+use crate::{inbound_wake::InboundWake, screen::ScreenControl, voice::VoiceControl, WakeFn};
+
+/// The loop's tick while the transport has per-tick work queued (paced
+/// uploads, video groups, lane bytes the stream would not take yet), or
+/// where nothing announces a datagram and the socket must be polled.
+const BUSY_TICK: Duration = Duration::from_millis(1);
+
+/// The loop's longest sleep on a quiet connection with the inbound
+/// wake: datagrams and commands wake it at once, the transport's timers
+/// cap it, and only the 2 s link stats and the telemetry wait for it.
+/// A thousand wakes a second became about ten (IOS-SPEC.md §14 D41).
+const QUIET_TICK: Duration = Duration::from_millis(100);
+
+/// Passes of the network loop since the process started: each is one
+/// wake of the thread. For the battery tests and diagnostics.
+static LOOP_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the network thread has woken so far.
+#[must_use]
+pub fn loop_passes() -> u64 {
+    LOOP_PASSES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How often to sample link statistics for the UI and the screen
 /// thread's bitrate ladder. The ladder's dwell time is sized against
@@ -679,6 +700,9 @@ pub(crate) struct NetworkClient {
     last_report: Instant,
     /// A stall has been reported; cleared when reports resume.
     reports_stalled: bool,
+    /// Rings the loop when a datagram arrives, so it can sleep between
+    /// them (`inbound_wake`); `None` = poll the socket every tick.
+    inbound: Option<InboundWake>,
 }
 
 impl NetworkClient {
@@ -709,6 +733,7 @@ impl NetworkClient {
         let mut driver = Driver::new_client(fingerprint, budget)
             .map_err(|e| format!("Failed to set up the transport: {e}"))?;
         driver.set_max_gso_segments(udp.max_gso_segments());
+        let inbound = InboundWake::start(&udp);
         let now = Instant::now();
         let server = driver
             .connect(now, server_addr)
@@ -762,6 +787,7 @@ impl NetworkClient {
             backlog: false,
             last_report: now,
             reports_stalled: false,
+            inbound,
         })
     }
 
@@ -773,8 +799,22 @@ impl NetworkClient {
             return;
         }
         let now = Instant::now();
-        if let Err(e) = self.udp.recv_batch(|d| self.driver.handle_datagram(now, d)) {
-            warn!("UDP receive error: {e}");
+        match self.udp.recv_batch(|d| self.driver.handle_datagram(now, d)) {
+            Ok(outcome) => {
+                self.backlog = !outcome.drained;
+                if outcome.drained
+                    && let Some(w) = self.inbound.as_mut()
+                {
+                    w.drained();
+                }
+            }
+            Err(e) => {
+                warn!("UDP receive error: {e}");
+                self.backlog = false;
+                if let Some(w) = self.inbound.as_mut() {
+                    w.drained();
+                }
+            }
         }
         self.driver.handle_timeouts(now);
 
@@ -799,14 +839,48 @@ impl NetworkClient {
         }
     }
 
-    /// The next moment the transport needs a tick, for the loop's sleep.
-    pub fn next_timeout(&mut self) -> Option<Instant> {
-        self.driver.next_timeout()
-    }
-
     /// Datagrams were still queued on the socket after the last tick.
     pub fn has_backlog(&self) -> bool {
         self.backlog
+    }
+
+    /// How long the loop may sleep before the next tick, unless a
+    /// command or (with the inbound wake) a datagram comes first.
+    ///
+    /// [`BUSY_TICK`] while anything needs the per-tick work — the
+    /// transport's paced queues, or the socket itself when nothing
+    /// rings on arrival; otherwise [`QUIET_TICK`], which only the
+    /// 2-second stats and the telemetry ride on. Never past the
+    /// transport's next timer (acks, keep-alive, loss recovery).
+    pub fn loop_wait(&mut self, now: Instant) -> Duration {
+        let tick = if self.inbound.is_some() && !self.driver.wants_tick() {
+            QUIET_TICK
+        } else {
+            BUSY_TICK
+        };
+        match self.driver.next_timeout() {
+            Some(deadline) => tick.min(deadline.saturating_duration_since(now)),
+            None => tick,
+        }
+    }
+
+    /// The inbound wake's ring, for the loop's select.
+    fn inbound_ready(&self) -> Option<Receiver<()>> {
+        self.inbound.as_ref().map(|w| w.ready().clone())
+    }
+
+    /// The loop took a ring; the next drained receive re-arms it.
+    fn took_inbound(&mut self) {
+        if let Some(w) = self.inbound.as_mut() {
+            w.took();
+        }
+    }
+
+    /// The watcher is gone (its `poll` failed): back to polling.
+    fn lost_inbound(&mut self) {
+        if self.inbound.take().is_some() {
+            warn!("inbound wake lost; polling the socket every {BUSY_TICK:?}");
+        }
     }
 
     fn process_events(&mut self, now: Instant) {
@@ -3076,23 +3150,41 @@ fn run_network_loop(
     let mut running = true;
 
     while running {
+        LOOP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Block on the control channel. Outbound work (voice frames
         // from the voice thread, video chunks from the screen thread)
-        // wakes this loop *immediately*. Connected, the timeout is the
-        // inbound polling cadence — 1 ms, capped by the transport's
-        // next timer so acks and keep-alives are never late.
-        // Disconnected there is nothing to poll, so block outright.
+        // wakes this loop *immediately*; so does an arriving datagram
+        // where the inbound wake runs (`inbound_wake.rs`). The timeout
+        // is `loop_wait`: 1 ms while the transport has per-tick work
+        // (or nothing announces datagrams and the socket must be
+        // polled), up to 100 ms on a quiet connection — always capped
+        // by the transport's next timer so acks and keep-alives are
+        // never late. Disconnected there is nothing to poll, so block
+        // outright.
         let recv_result = match &mut client {
             Some(c) if c.has_backlog() => control_rx.try_recv().map_err(|e| match e {
                 TryRecvError::Empty => RecvTimeoutError::Timeout,
                 TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
             }),
             Some(c) => {
-                let mut wait = Duration::from_millis(1);
-                if let Some(deadline) = c.next_timeout() {
-                    wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+                let wait = c.loop_wait(Instant::now());
+                match c.inbound_ready() {
+                    Some(ready) => crossbeam_channel::select! {
+                        recv(control_rx) -> msg => {
+                            msg.map_err(|_| RecvTimeoutError::Disconnected)
+                        }
+                        recv(ready) -> rang => {
+                            if rang.is_ok() {
+                                c.took_inbound();
+                            } else {
+                                c.lost_inbound();
+                            }
+                            Err(RecvTimeoutError::Timeout)
+                        }
+                        default(wait) => Err(RecvTimeoutError::Timeout),
+                    },
+                    None => control_rx.recv_timeout(wait),
                 }
-                control_rx.recv_timeout(wait)
             }
             None => control_rx
                 .recv()

@@ -54,6 +54,9 @@ impl Viewer {
             s.set_watch_muted(false);
             s.set_watch_volume(1.0);
             s.set_watch_open(true);
+            // A phone watching a stream keeps its screen on (IOS-SPEC.md
+            // §14 D45); `close` lets it sleep again.
+            crate::host::keep_screen_on(true);
             Surface::Page(main.clone_strong())
         } else {
             let win = StreamViewerWindow::new()?;
@@ -77,6 +80,11 @@ impl Viewer {
             win.on_stop_watching(move || {
                 app::with_current(move |app| app.handle_unwatch_peer(id));
             });
+            // Your own mic and headphones, from the stream (IOS-SPEC.md
+            // §14 D43): the main window's toggles; the new state comes
+            // back through `set_self_audio`.
+            win.on_self_mute_toggled(|| app::with_current(AppState::handle_toggle_mute));
+            win.on_self_deafen_toggled(|| app::with_current(AppState::handle_toggle_deafen));
             win.window().on_close_requested(move || {
                 // Unwatch tears the viewer down (including hiding this
                 // window); returning HideWindow avoids a flash.
@@ -123,6 +131,15 @@ impl Viewer {
     pub fn apply_text_scale(&self, scale: f32) {
         if let Surface::Window(win) = &self.surface {
             win.global::<ui::Theme>().set_scale(scale);
+        }
+    }
+
+    /// The session's mute and deafen, for a window's own buttons. The
+    /// page binds `State.muted` / `State.deafened` itself.
+    pub fn set_self_audio(&self, muted: bool, deafened: bool) {
+        if let Surface::Window(win) = &self.surface {
+            win.set_self_muted(muted);
+            win.set_self_deafened(deafened);
         }
     }
 
@@ -213,6 +230,7 @@ impl Viewer {
             Surface::Page(main) => {
                 let s = main.global::<State>();
                 s.set_watch_open(false);
+                crate::host::keep_screen_on(false);
                 // The last frame's texture goes with the page.
                 s.set_watch_frame(slint::Image::default());
                 // The page held the keyboard focus: hand it back, or
@@ -250,6 +268,7 @@ pub(crate) fn wire_page(main: &MainWindow) {
                 // No viewer behind the page (it was torn down by a
                 // disconnect, say): just close it.
                 app.main.global::<State>().set_watch_open(false);
+                crate::host::keep_screen_on(false);
             }
         });
     });

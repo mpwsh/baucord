@@ -1,9 +1,12 @@
 // Copy to Local.xcconfig (ignored by git) and fill in. Needed for the
 // phone; the simulator runs without it.
 
-// Your signing team: Xcode → Settings → Accounts → your Apple ID →
-// the team's ID (10 characters; Membership details on
-// developer.apple.com show it too). A free Apple ID works for your own
+// Your signing team: the 10 characters after "OU=" in
+//   security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject
+// (the certificate Xcode makes in Settings → Accounts → Manage
+// Certificates). `ios/run.sh --device` fills this in by itself when the
+// keychain holds one team's certificate and this line is missing or
+// still the placeholder below. A free Apple ID works for your own
 // iPhone — Xcode lists it as "(Personal Team)" — but the app then
 // stops opening after 7 days until it is installed again
 // (`ios/run.sh --device`). IOS-SPEC.md §11.

@@ -12,6 +12,7 @@
 #   ios/run.sh --no-build          reinstall and relaunch the last build
 #   ios/run.sh --no-log            launch and return (no log stream)
 #   ios/run.sh --open              generate the project and open it in Xcode
+#   ios/run.sh --renderer skia-software   draw with Skia on the CPU (a diagnostic; also: software)
 #
 # Ctrl+C ends the log stream (and, in the simulator, the app).
 # Written for macOS's bash 3.2.
@@ -28,6 +29,7 @@ SIM_OS=""
 BUILD=1
 STREAM_LOG=1
 OPEN=0
+RENDERER=""
 
 die() { echo "run.sh: $*" >&2; exit 1; }
 say() { echo ">> $*"; }
@@ -39,6 +41,20 @@ first_line() { local s="$1"; echo "${s%%$'\n'*}"; }
 # Whatever stops the script says where: under `set -e` a failing command
 # would otherwise end it without a word.
 trap 'echo "run.sh: stopped near line $LINENO (exit $?)" >&2' ERR
+# The teams of the "Apple Development" certificates in the keychain —
+# each certificate's subject OU — one per line, sorted, unique. Needs
+# $TMP. Every command reads its input to the end (no early-leaving
+# reader under pipefail, D27).
+signing_teams() {
+  local pems f
+  pems="$(security find-certificate -a -c "Apple Development" -p 2>/dev/null)" || return 0
+  [ -n "$pems" ] || return 0
+  printf '%s\n' "$pems" | awk -v dir="$TMP" '/BEGIN CERTIFICATE/ { n++ } n { print > (dir "/cert" n ".pem") }'
+  for f in "$TMP"/cert*.pem; do
+    [ -f "$f" ] || continue
+    openssl x509 -in "$f" -noout -subject 2>/dev/null || true
+  done | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p' | sort -u
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +66,13 @@ while [ $# -gt 0 ]; do
     --no-build) BUILD=0 ;;
     --no-log) STREAM_LOG=0 ;;
     --open) OPEN=1 ;;
+    --renderer)
+      [ $# -ge 2 ] || die "--renderer needs a name: skia (the default), skia-software or software"
+      case "$2" in
+        skia|skia-software|software) RENDERER="$2" ;;
+        *) die "--renderer: skia, skia-software or software (not $2)" ;;
+      esac
+      shift ;;
     -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
@@ -74,9 +97,8 @@ if [ $BUILD -eq 1 ]; then
       || die "Rust target $t missing for this repository's toolchain: cd \"$REPO\" && rustup target add aarch64-apple-ios aarch64-apple-ios-sim"
   done
 fi
-if [ $DEVICE -eq 1 ] && [ ! -f "$IOS/Config/Local.xcconfig" ]; then
-  die "no Config/Local.xcconfig: copy Config/Local.xcconfig.example and set DEVELOPMENT_TEAM (your Apple ID's team in Xcode → Settings → Accounts)"
-fi
+# The phone's signing team is settled below, once a phone is found
+# (Config/Local.xcconfig, else the keychain's development certificate).
 
 # -- Version ------------------------------------------------------------
 # The crates' version — the public crates move together and every
@@ -164,6 +186,46 @@ PY
   DESTINATION="id=$TARGET_ID"
 fi
 
+# -- Signing (the phone) ------------------------------------------------
+# The team whose certificate signs the app. Without Config/Local.xcconfig,
+# or with the example's placeholder still in it, Xcode fails late with
+# "No Account for Team" and "No profiles for 'dev.baucord'" — so check
+# here, and when the keychain holds the development certificate of
+# exactly one team, use it and write it down (IOS-SPEC.md D38).
+if [ $DEVICE -eq 1 ]; then
+  LOCAL="$IOS/Config/Local.xcconfig"
+  PLACEHOLDER="$(awk -F= '/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$IOS/Config/Local.xcconfig.example")"
+  TEAM=""
+  if [ -f "$LOCAL" ]; then
+    TEAM="$(awk -F= '/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$LOCAL")"
+  fi
+  if [ -z "$TEAM" ] || [ "$TEAM" = "$PLACEHOLDER" ]; then
+    if [ -z "$TEAM" ]; then
+      WHY="ios/Config/Local.xcconfig sets no DEVELOPMENT_TEAM"
+    else
+      WHY="ios/Config/Local.xcconfig still has the example team ($TEAM)"
+    fi
+    TEAMS="$(signing_teams)"
+    COUNT="$(printf '%s\n' "$TEAMS" | grep -c . || true)"
+    if [ "$COUNT" -eq 0 ]; then
+      die "$WHY, and the keychain has no Apple Development certificate to take a team from. Xcode → Settings → Accounts → + → your Apple ID, then Manage Certificates → + → Apple Development; run this again"
+    elif [ "$COUNT" -gt 1 ]; then
+      die "$WHY, and your Apple Development certificates belong to $COUNT teams: $(printf '%s\n' "$TEAMS" | paste -s -d ' ' -). Set DEVELOPMENT_TEAM = <one of them> in ios/Config/Local.xcconfig"
+    fi
+    TEAM="$TEAMS"
+    SRC="$LOCAL"
+    [ -f "$SRC" ] || SRC="$IOS/Config/Local.xcconfig.example"
+    awk -v team="$TEAM" '
+      /^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=/ && !done { print "DEVELOPMENT_TEAM = " team; done = 1; next }
+      { print }
+      END { if (!done) print "DEVELOPMENT_TEAM = " team }' "$SRC" > "$TMP/local.xcconfig"
+    cat "$TMP/local.xcconfig" > "$LOCAL"
+    say "signing team $TEAM, from your Apple Development certificate (written to ios/Config/Local.xcconfig)"
+  else
+    say "signing team $TEAM"
+  fi
+fi
+
 APP="$IOS/build/Build/Products/$CONFIG-$SDK/baucord.app"
 
 # -- Build --------------------------------------------------------------
@@ -187,6 +249,18 @@ if [ $BUILD -eq 1 ]; then
       MISSING="$(first_line "$(sed -n 's/.*error:\(iOS [0-9.]*\) is not installed.*/\1/p' "$TMP/xcodebuild.log")")"
       die "$XCODE builds against ${MISSING:-a newer iOS} and needs that platform installed before it builds for any iPhone or simulator; older simulators do not count. Install it once — xcodebuild -downloadPlatform iOS (or Xcode → Settings → Components); it may fetch a newer simulator of the same major version, which is Apple's pairing for this Xcode — then run this again."
     fi
+    # Signing, on the phone: the usual first-run stops, in plain words.
+    if [ $DEVICE -eq 1 ]; then
+      if grep "No Account for Team" "$TMP/xcodebuild.log" >/dev/null; then
+        die "Xcode is not signed in to team $TEAM: Xcode → Settings → Accounts → + → the Apple ID whose certificate this is; then run this again"
+      fi
+      if grep "cannot be registered to your development team" "$TMP/xcodebuild.log" >/dev/null; then
+        die "the bundle id is taken by another team: set BAUCORD_BUNDLE_ID = dev.baucord.<yourname> in ios/Config/Local.xcconfig and run this again"
+      fi
+      if grep -E "Developer Mode" "$TMP/xcodebuild.log" >/dev/null; then
+        die "the iPhone needs Developer Mode: Settings → Privacy & Security → Developer Mode → on → restart (it is listed once the phone has been connected to Xcode — Window → Devices and Simulators)"
+      fi
+    fi
     die "xcodebuild failed (its output is above)"
   fi
 fi
@@ -195,11 +269,23 @@ fi
 BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
 
 # -- Install + launch ---------------------------------------------------
+# Diagnostic switches reach the app as environment variables of this
+# launch only (IOS-SPEC.md §14 D40); opened from the home screen it runs
+# as normal. The values are fixed words, so the JSON needs no escaping.
+ENV_JSON=""
+add_env() {
+  ENV_JSON="${ENV_JSON:+$ENV_JSON, }\"$1\": \"$2\""
+  export "SIMCTL_CHILD_$1=$2"   # what simctl hands the app
+}
+[ -n "$RENDERER" ] && add_env BAUCORD_RENDERER "$RENDERER"
+[ -n "$ENV_JSON" ] && say "diagnostic launch: {$ENV_JSON}"
+
 if [ $DEVICE -eq 1 ]; then
   say "installing on the iPhone"
   xcrun devicectl device install app --device "$TARGET_ID" "$APP" >/dev/null \
-    || die "install failed (a free Apple ID allows 3 apps per device; Xcode's Devices window shows why)"
+    || die "install failed (its message is above). Usual causes: Developer Mode off (Settings → Privacy & Security → Developer Mode, listed once the phone has been connected to Xcode), or a free Apple ID's limit of 3 apps per device; Xcode's Devices window shows more"
   LAUNCH=(xcrun devicectl device process launch --device "$TARGET_ID" --terminate-existing)
+  [ -n "$ENV_JSON" ] && LAUNCH+=(--environment-variables "{$ENV_JSON}")
   [ $STREAM_LOG -eq 1 ] && LAUNCH+=(--console) && say "log (Ctrl+C to stop)"
   "${LAUNCH[@]}" "$BUNDLE_ID" || die "launch failed — the first time with a free Apple ID, trust the developer on the iPhone: Settings → General → VPN & Device Management"
 else

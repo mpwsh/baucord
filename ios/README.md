@@ -31,6 +31,7 @@ ios/run.sh                # the client in the simulator
 ios/run.sh --device       # the client on your iPhone
 ios/run.sh --os 18.1      # the client on an iOS 18.1 iPhone simulator
 ios/run.sh --help         # --release, --sim "iPhone 16" (or a UDID), --no-build, --no-log, --open
+ios/run.sh --device --renderer skia-software   # a diagnostic: draw on the CPU (see §4)
 ```
 
 If the shell says *permission denied*, the files lost their executable
@@ -79,8 +80,10 @@ apps signed for it, which is what decides between them:
 1. Xcode → Settings → Accounts → **+** → Apple ID. Then Manage
    Certificates → **+** → *Apple Development*, so the Mac has a
    signing certificate.
-2. Copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig` and
-   set `DEVELOPMENT_TEAM` to your team ID. It is the certificate's
+2. The signing team: `ios/run.sh --device` takes it from that
+   certificate and writes it into `Config/Local.xcconfig` (made from
+   the `.example` if missing) when the file has none or still has the
+   example's `ABCDE12345`. To set it by hand, it is the certificate's
    "OU":
    ```sh
    security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject
@@ -177,12 +180,31 @@ on iOS`) are filtered out of the log (D32).
 
 Watching a stream: turn the phone (⌘← / ⌘→ in the simulator) for
 the big picture; in landscape a double-tap, or the zoom button in the
-bar, switches between the whole picture and filling the screen.
+bar, switches between the whole picture and filling the screen. Pinch
+to zoom in (in the simulator hold ⌥ and drag for two fingers), drag
+to move around, tap the "2.4×" chip top-right to go back. The bar's
+first two buttons are your own microphone and headphones. The screen
+stays on while the stream page is open.
 
 Lines worth looking for: `VideoToolbox: decoding H.264 to BGRA` and
 `VideoToolbox: first picture WxH` when you watch a share;
 `photo pick: loading …` and `picked …` when you attach;
-`lifecycle: background` when you leave the app.
+`lifecycle: background` and `host: app hidden` when you leave the app
+(in voice it keeps talking, and stops drawing); `safe area: top 20
+left 0 bottom 0 right 0 pt` — what `UIKit` says the system bars cover,
+which the pages keep clear of (on an iPhone SE, 20 at the top).
+
+**Text drawn half-wrong now and then** (glyphs with their top missing
+— IOS-SPEC.md D40): launch with `--renderer skia-software` (Skia on
+the CPU) and use the app as before. If it never happens that way, it
+is the GPU path; if it still does, try `--renderer software` (Slint's
+own renderer). The log's first lines say `renderer: … (a diagnostic
+launch)`. Only that launch is affected: opened from the home screen,
+the app draws on the GPU as normal.
+
+**Debug or Release on the phone:** `--device` builds Debug, with the
+pixel and audio code optimised all the same; `--device --release`
+is what users get, and the one to judge speed and battery by.
 
 ## 5. The version
 

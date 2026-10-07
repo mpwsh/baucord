@@ -563,6 +563,10 @@ viewer-fullscreen = Full screen (F)
 viewer-exit-fullscreen = Exit full screen (Esc)
 viewer-fill = Zoom to fill (double-tap)
 viewer-fit = Fit to screen (double-tap)
+viewer-mic-mute = Mute your microphone
+viewer-mic-unmute = Unmute your microphone
+viewer-stream-mute = Mute the stream
+viewer-stream-unmute = Unmute the stream
 
 # ── Chat day dividers ─────────────────────────────────────────────────
 chat-day-today = Today

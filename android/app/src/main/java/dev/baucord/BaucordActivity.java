@@ -11,6 +11,7 @@ import android.os.Environment;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.util.Log;
+import android.view.WindowManager;
 import android.webkit.MimeTypeMap;
 
 import java.io.File;
@@ -85,6 +86,24 @@ public class BaucordActivity extends NativeActivity {
     /** Rust, on disconnect: let the process be an ordinary app again. */
     public void stopVoiceService() {
         VoiceService.stop(this);
+    }
+
+    // ── The screen while a stream plays (ANDROID-SPEC.md D45) ──────────
+
+    /**
+     * Rust: keep the screen on while a stream is watched ({@code true}),
+     * or let it time out and lock again ({@code false}). The window flag
+     * only holds while this window is visible, so leaving the app lets
+     * the phone sleep regardless. Window flags belong to the UI thread.
+     */
+    public void keepScreenOn(final boolean on) {
+        runOnUiThread(() -> {
+            if (on) {
+                getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            } else {
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
+        });
     }
 
     // ── Files ────────────────────────────────────────────────────────────

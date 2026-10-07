@@ -255,13 +255,7 @@ impl AppState {
     pub(super) fn commands_available(&self) -> String {
         use client::permissions as p;
         let has = |bit: u64| p::has(self.permissions, bit);
-        let mut out: Vec<&str> = vec![
-            "/help",
-            "/history [n]",
-            "/channel list",
-            "/mem",
-            "/leave",
-        ];
+        let mut out: Vec<&str> = vec!["/help", "/history [n]", "/channel list", "/mem", "/leave"];
         if super::HOST_CAN_QUIT {
             out.push("/quit");
         }

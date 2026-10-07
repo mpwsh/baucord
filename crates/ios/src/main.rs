@@ -29,6 +29,8 @@ mod lifecycle;
 mod logging;
 #[cfg(target_os = "ios")]
 mod paths;
+#[cfg(target_os = "ios")]
+mod render;
 #[cfg(all(target_os = "ios", feature = "app", not(feature = "hello")))]
 mod session;
 
@@ -53,7 +55,11 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         dirs.as_ref().map_or_else(
             || "no app folders: settings will not persist".to_string(),
-            |d| format!("config {}, log {}", d.config.display(), d.documents.display()),
+            |d| format!(
+                "config {}, log {}",
+                d.config.display(),
+                d.documents.display()
+            ),
         ),
     );
     if let Some(d) = &dirs {
@@ -66,15 +72,16 @@ fn main() {
     // (spec D7). Chosen explicitly, before any Slint type is touched: the
     // frontend's own choice (Skia on the CPU, for Windows' sake) is
     // compiled out on iOS. In Slint 1.18 "skia" draws through wgpu's
-    // Metal backend and falls back to the CPU only if that fails, saying
-    // so on stderr alone; `BackendSelector::require_metal()` would pick
-    // Skia's own Metal surface instead (spec §13).
+    // Metal backend (the only Skia GPU path it has on Apple platforms)
+    // and falls back to the CPU only if that fails, saying so on stderr
+    // alone. A diagnostic launch may name another renderer (render.rs).
+    let renderer = render::renderer_name();
     if let Err(e) = slint::BackendSelector::new()
         .backend_name("winit".into())
-        .renderer_name("skia".into())
+        .renderer_name(renderer.clone())
         .select()
     {
-        log::error!("slint backend (winit + skia): {e}");
+        log::error!("slint backend (winit + {renderer}): {e}");
     }
 
     // Slint keeps the safe area it read at the last resize; after a

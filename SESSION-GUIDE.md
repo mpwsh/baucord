@@ -502,6 +502,23 @@ Memory-mode servers (persistence off) still use the legacy
   `kSomething` constants — use a table). UIKit delegates are weak:
   keep them alive yourself. A sheet the user swipes down tells only
   its presentation controller's delegate.
+- **Slint 1.18's touch pinch overshoots** (IOS-SPEC.md D44): the
+  runtime feeds `ScaleRotateGestureHandler` increments of the finger
+  distance's ratio and the handler multiplies them, so on a
+  touchscreen `scale` ≈ e^(r−1) (twice the distance → ×2.7). The
+  stream page uses `1 + ln(scale)` when `pinch-from-touch`; a
+  trackpad's pinch is right as it is. Re-check on a Slint upgrade.
+  And chrome that fades with `opacity` still takes taps unless it is
+  also made invisible (`visible: self.opacity > 0.01`).
+- **No worker polls on a fixed short timer** (IOS-SPEC.md D41,
+  ANDROID-SPEC.md D43): a thread blocks on what wakes it — a channel,
+  the audio callback's latch, the socket through `ReadWaiter` — with
+  a timeout only for timers it really has. The network loop's 1 ms
+  poll was a thousand wakes a second for a whole session on a phone.
+  `client/tests/network_idle.rs` counts a quiet connection's wakes
+  (`network::loop_passes`): keep it under 100. And what only feeds
+  the screen checks `main_on_screen()` / `host_visible()`: a phone in
+  the background shows nothing (D42).
 - **In `build.gradle.kts`, never write `java.awt.…` / `java.io.…`
   out in full**: `java` resolves to the project's `java` extension (AGP
   applies java-base) and the script fails with "Unresolved reference:
@@ -714,7 +731,30 @@ people rather than devices. Plus:
   controls (D35 / ANDROID-SPEC.md D42). A release workflow for iOS
   exists (`ios-release.yml`, D37): a signed Ad Hoc `.ipa` with the
   paid program's secrets, an unsigned build without. Next: `lifecycle:
-  background` on ⌘⇧H, then the phone (ios/README.md §3a/3b).
+  background` on ⌘⇧H, then the phone (ios/README.md §3a/3b). The
+  first phone run stopped on the example's placeholder team; `run.sh
+  --device` now takes the team from the keychain's development
+  certificate (D38). **The app then ran on the user's iPhone SE
+  (2026-10-07)**, and that run gave three things, written the same
+  day (IOS-SPEC.md D39–D42, ANDROID-SPEC.md D43): the main page under
+  the status bar → the app reads `UIKit`'s safe area itself and keeps
+  clear of the larger of it and Slint's (`State.host-inset-*`, log
+  line `safe area: top 20 …`); half-drawn glyphs now and then → Skia's
+  glyph images, not our text, diagnosed but not fixed — `run.sh
+  --renderer skia-software` / `software` tells GPU atlas from
+  rasteriser; and "are we blasting through battery?" → yes, in wakes:
+  the network thread polled its socket every 1 ms all session; now a
+  `poll(2)` watcher wakes it (10 wakes in a quiet second, measured
+  by `client/tests/network_idle.rs`), the voice tick is 20 ms, a muted
+  mic's worker 50 ms, and a phone app in the background draws nothing
+  (`set_host_visible`). Then, asked for while that was tested
+  (IOS-SPEC.md D43–D45, ANDROID-SPEC.md D44–D45): the stream page's
+  bar carries your own mic and headphones (desktop viewer windows
+  too), the picture zooms (pinch, wheel, double-tap; a chip resets;
+  Slint 1.18's touch pinch overshoots and is corrected), and the
+  screen stays on while a stream is watched. Next: the same phone
+  with these — the log's `safe area:` line, the glyphs with
+  `--renderer skia-software`, a pinch on a real screen.
   Record each next step in IOS-SPEC.md §14 and here.
   Then M1 (the client on the iPhone) … M5 (TestFlight). Users still
   report echo: AEC-SPEC.md E8 / IOS-SPEC.md §6.3's VPIO backend is

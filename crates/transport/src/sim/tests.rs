@@ -905,3 +905,39 @@ fn stats_track_traffic() {
     assert!((after.path_loss_pct_since(&before) - 0.0).abs() < f64::EPSILON);
     let _ = Instant::now(); // keep the import honest for future timing asserts
 }
+
+/// What lets a client's network thread sleep between datagrams
+/// (`Driver::wants_tick`): an idle connection has no per-tick work; a
+/// paced upload has, until it is acknowledged and retired.
+#[test]
+fn an_idle_connection_wants_no_tick_and_a_paced_upload_does() {
+    let mut p = pair(23, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, _) = connect(&mut p);
+    let client = p.client;
+    p.net.run_for(Duration::from_millis(300), TICK);
+    assert!(
+        !p.net.driver(client).wants_tick(),
+        "an idle connection asks for ticks"
+    );
+
+    let frames: Vec<Bytes> = (0..20u8)
+        .map(|i| Bytes::from(vec![i; protocol::IMAGE_CHUNK_BYTES]))
+        .collect();
+    let now = p.net.now();
+    let upload = p
+        .net
+        .driver(client)
+        .send_media(now, server_peer, frames)
+        .expect("upload");
+    assert!(p.net.driver(client).wants_tick(), "an upload needs ticks");
+    let settled = p.net.run_until(Duration::from_secs(10), TICK, |net| {
+        net.driver(client)
+            .upload_progress(server_peer, upload)
+            .is_none()
+    });
+    assert!(settled, "the upload was never retired");
+    assert!(
+        !p.net.driver(client).wants_tick(),
+        "ticks still wanted after the upload"
+    );
+}

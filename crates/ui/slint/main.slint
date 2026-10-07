@@ -96,10 +96,17 @@ export component MainWindow inherits Window {
     // whole window. All zero on the desktop.
     property <length> keyboard-overlap: root.virtual-keyboard-size.height > 0
         ? Math.max(0px, root.height - root.virtual-keyboard-position.y) : 0px;
-    property <length> inset-left: root.safe-area-insets.left;
-    property <length> inset-top: root.safe-area-insets.top;
-    property <length> inset-right: root.safe-area-insets.right;
-    property <length> inset-bottom: Math.max(root.safe-area-insets.bottom, root.keyboard-overlap);
+    // The system's edges: the larger of what the window reports and
+    // what the host measured itself (iOS, IOS-SPEC.md §14 D39 — the
+    // window's value was 0 under an iPhone SE's status bar).
+    property <length> edge-left: Math.max(root.safe-area-insets.left, State.host-inset-left);
+    property <length> edge-top: Math.max(root.safe-area-insets.top, State.host-inset-top);
+    property <length> edge-right: Math.max(root.safe-area-insets.right, State.host-inset-right);
+    property <length> edge-bottom: Math.max(root.safe-area-insets.bottom, State.host-inset-bottom);
+    property <length> inset-left: root.edge-left;
+    property <length> inset-top: root.edge-top;
+    property <length> inset-right: root.edge-right;
+    property <length> inset-bottom: Math.max(root.edge-bottom, root.keyboard-overlap);
     property <length> page-width: root.width - root.inset-left - root.inset-right;
     property <length> page-height: root.height - root.inset-top - root.inset-bottom;
 
@@ -433,10 +440,10 @@ export component MainWindow inherits Window {
             // the keyboard's: nothing types here).
             width: parent.width;
             height: parent.height;
-            chrome-inset-left: root.safe-area-insets.left;
-            chrome-inset-top: root.safe-area-insets.top;
-            chrome-inset-right: root.safe-area-insets.right;
-            chrome-inset-bottom: root.safe-area-insets.bottom;
+            chrome-inset-left: root.edge-left;
+            chrome-inset-top: root.edge-top;
+            chrome-inset-right: root.edge-right;
+            chrome-inset-bottom: root.edge-bottom;
             // Takes the keyboard so Back / M / Escape reach it; the
             // composer gets it back when the page closes.
             init => { self.focus(); }
@@ -449,9 +456,17 @@ export component MainWindow inherits Window {
             fill <=> State.watch-fill;
             stream-muted <=> State.watch-muted;
             volume <=> State.watch-volume;
+            // Your own mic and headphones, without leaving (IOS-SPEC.md
+            // §14 D43): the sidebar's buttons, here too.
+            self-controls: true;
+            pinch-from-touch: true;
+            self-muted: State.muted;
+            self-deafened: State.deafened;
             volume-changed(v) => { Logic.watch-volume-changed(v); }
             mute-toggled(m) => { Logic.watch-mute-toggled(m); }
             stop-watching => { Logic.watch-stop(); }
+            self-mute-toggled => { Logic.toggle-mute(); }
+            self-deafen-toggled => { Logic.toggle-deafen(); }
         }
     }
 

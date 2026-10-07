@@ -563,6 +563,10 @@ viewer-fullscreen = Tela cheia (F)
 viewer-exit-fullscreen = Sair da tela cheia (Esc)
 viewer-fill = Ampliar para preencher (toque duplo)
 viewer-fit = Ajustar à tela (toque duplo)
+viewer-mic-mute = Silenciar seu microfone
+viewer-mic-unmute = Ativar seu microfone
+viewer-stream-mute = Silenciar a transmissão
+viewer-stream-unmute = Ativar o som da transmissão
 
 # ── Divisores de dia no chat ──────────────────────────────────────────
 chat-day-today = Hoje

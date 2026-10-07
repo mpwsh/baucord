@@ -58,6 +58,9 @@ pub trait Hooks: Send + Sync {
     /// Keep the app running while a session is connected and the app is
     /// off screen (`Some`: the notification's words), or stop (`None`).
     fn keep_alive(&self, _notice: Option<&KeepAlive>) {}
+    /// Keep the screen on (`true`: a stream is being watched) or let the
+    /// system dim and lock it again (`false`). Called on the UI thread.
+    fn keep_screen_on(&self, _on: bool) {}
 }
 
 /// What the keep-alive notification says (Android's foreground service).
@@ -79,6 +82,24 @@ pub fn keep_alive(server: Option<&str>) {
             text: t!("notif-connected-text"),
         })),
         None => hooks.keep_alive(None),
+    }
+}
+
+/// A stream is on the screen (`true`) or no longer (`false`): the host
+/// keeps the display awake meanwhile, as a video player does (IOS-SPEC.md
+/// §14 D45). Only while it is watched — chat and the voice lists let the
+/// phone sleep as usual.
+pub fn keep_screen_on(on: bool) {
+    if let Some(hooks) = HOOKS.get() {
+        log::info!(
+            "screen {}",
+            if on {
+                "kept on (watching a stream)"
+            } else {
+                "may sleep again"
+            }
+        );
+        hooks.keep_screen_on(on);
     }
 }
 

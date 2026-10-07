@@ -45,10 +45,15 @@ pub fn install() {
         // The settings now: iOS may end the process from here without
         // another word (and `run` never returns to save them).
         frontend::app::persist_for_background();
+        // In voice the process keeps running (the audio background
+        // mode): what only feeds the screen stops, so the app does not
+        // draw frames nobody sees (spec §14 D42).
+        frontend::app::set_host_visible(false);
         log::logger().flush();
     });
     observe(&center, &queue, foreground, || {
         log::info!("lifecycle: foreground");
+        frontend::app::set_host_visible(true);
     });
     observe(&center, &queue, memory, || {
         // app-core bounds its image caches already; worth knowing

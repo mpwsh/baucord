@@ -252,7 +252,7 @@ impl AppState {
     //  VOICE CONTROLS
     // ════════════════════════════════════════════════════════════════
 
-    pub(super) fn handle_toggle_mute(&mut self) {
+    pub(crate) fn handle_toggle_mute(&mut self) {
         if self.is_muted && self.server_muted.is_some() {
             self.show_toast(ToastKind::Warning, &t!("chat-server-muted-locked"));
             return;
@@ -276,10 +276,18 @@ impl AppState {
             })
             .ok();
         self.main.global::<State>().set_muted(self.is_muted);
+        self.push_self_audio();
         self.update_user_list();
     }
 
-    pub(super) fn handle_toggle_deafen(&mut self) {
+    /// Mute and deafen to every stream window's own buttons (D43).
+    fn push_self_audio(&self) {
+        for viewer in self.viewers.values() {
+            viewer.set_self_audio(self.is_muted, self.is_deafened);
+        }
+    }
+
+    pub(crate) fn handle_toggle_deafen(&mut self) {
         self.is_deafened = !self.is_deafened;
         self.voice
             .tx
@@ -293,6 +301,7 @@ impl AppState {
             })
             .ok();
         self.main.global::<State>().set_deafened(self.is_deafened);
+        self.push_self_audio();
         self.update_user_list();
     }
 

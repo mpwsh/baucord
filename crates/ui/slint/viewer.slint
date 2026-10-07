@@ -23,6 +23,14 @@
 // whole picture and filling the screen with it, cropping its edges —
 // a 4:3 or 16:9 stream on a 19.5:9 phone otherwise leaves bands
 // (ANDROID-SPEC.md D41, IOS-SPEC.md D33).
+//
+// The picture zooms, to read small text on a shared screen (IOS-SPEC.md
+// §14 D44): two fingers pinch (a Mac's trackpad too), the mouse wheel
+// zooms where the pointer is, + / - / 0 from the keyboard; zoomed, one
+// finger or the mouse drags it around. A chip top-right says how far
+// and takes it back to the whole picture, as does a double-tap. The
+// bar also carries the viewer's own microphone and headphones (D43):
+// watching full screen, nobody should have to leave to mute.
 
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
@@ -50,10 +58,24 @@ export component StreamViewerPanel inherits FocusScope {
     in property <length> chrome-inset-top: 0px;
     in property <length> chrome-inset-right: 0px;
     in property <length> chrome-inset-bottom: 0px;
+    /// The viewer's own microphone and headphones, left of the
+    /// stream's sound (D43): the session's mute and deafen.
+    in property <bool> self-controls: false;
+    in property <bool> self-muted: false;
+    in property <bool> self-deafened: false;
+    /// Pinches come from a touchscreen (the phones' page). Slint 1.18
+    /// turns two fingers into scale *increments* of the finger distance's
+    /// ratio, and the gesture handler multiplies them up: its `scale`
+    /// comes out near e^(r − 1) for a true ratio r — a pinch to twice
+    /// the distance zoomed ×2.7, to three times ×7. `1 + ln(scale)`
+    /// gives r back. A trackpad's pinch (macOS) is already right.
+    in property <bool> pinch-from-touch: false;
     property <bool> fill-offered: root.fill-available && root.width > root.height;
     callback volume-changed(float);
     callback mute-toggled(bool);
     callback stop-watching();
+    callback self-mute-toggled();
+    callback self-deafen-toggled();
 
     /// Chrome shows while the pointer moves and for a moment after;
     /// hovering the bar itself keeps it. On touch, a tap wakes it.
@@ -80,7 +102,75 @@ export component StreamViewerPanel inherits FocusScope {
     function toggle-fill() {
         if (root.fill-offered) {
             root.fill = !root.fill;
-            root.wake();
+            root.reset-zoom();
+        }
+    }
+
+    // ── Zoom and pan (D44) ──────────────────────────────────────────
+    // The picture's size is the fit (or fill) scale times `zoom`; its
+    // place is centred plus `pan`, held so the picture always covers
+    // the surface along any axis where it is larger than it. Changes of
+    // geometry (a rotation, a new resolution from the sharer) keep the
+    // zoom, relative to the fit, and re-clamp the pan.
+    property <float> zoom: 1.0;
+    property <length> pan-x: 0px;
+    property <length> pan-y: 0px;
+    property <float> max-zoom: 8.0;
+    property <bool> zoomed: root.zoom > 1.01;
+    property <bool> has-frame: root.frame.width > 0 && root.frame.height > 0;
+    property <length> frame-w: root.frame.width * 1px;
+    property <length> frame-h: root.frame.height * 1px;
+    property <float> fit-scale: !root.has-frame ? 1.0
+        : root.fill-offered && root.fill
+            ? Math.max(root.width / root.frame-w, root.height / root.frame-h)
+            : Math.min(root.width / root.frame-w, root.height / root.frame-h);
+    property <length> pic-w: root.has-frame ? root.frame-w * root.fit-scale * root.zoom : root.width;
+    property <length> pic-h: root.has-frame ? root.frame-h * root.fit-scale * root.zoom : root.height;
+    property <length> pic-x: (root.width - root.pic-w) / 2 + root.clamp-pan(root.pan-x, root.pic-w, root.width);
+    property <length> pic-y: (root.height - root.pic-h) / 2 + root.clamp-pan(root.pan-y, root.pic-h, root.height);
+    /// Larger than the surface in some direction: a drag moves it.
+    property <bool> pannable: root.pic-w > root.width + 1px || root.pic-h > root.height + 1px;
+    // A pinch keeps the point it started on under the fingers.
+    property <float> pinch-zoom: 1.0;
+    property <float> pinch-fx: 0.5;
+    property <float> pinch-fy: 0.5;
+
+    pure function clamp-pan(p: length, size: length, room: length) -> length {
+        if (size <= room) {
+            return 0px;
+        }
+        return Math.clamp(p, (room - size) / 2, (size - room) / 2);
+    }
+    /// Zoom to `target` with the picture's point at fractions (fx, fy)
+    /// of its size placed at (cx, cy).
+    function place(target: float, fx: float, fy: float, cx: length, cy: length) {
+        if (!root.has-frame) {
+            return;
+        }
+        root.zoom = Math.clamp(target, 1.0, root.max-zoom);
+        // `pic-w`/`pic-h` already follow the new zoom.
+        root.pan-x = root.clamp-pan(cx - fx * root.pic-w - (root.width - root.pic-w) / 2,
+            root.pic-w, root.width);
+        root.pan-y = root.clamp-pan(cy - fy * root.pic-h - (root.height - root.pic-h) / 2,
+            root.pic-h, root.height);
+    }
+    /// Zoom to `target`, keeping what is under (cx, cy) there.
+    function zoom-about(target: float, cx: length, cy: length) {
+        root.place(target, (cx - root.pic-x) / root.pic-w, (cy - root.pic-y) / root.pic-h, cx, cy);
+        root.wake();
+    }
+    function reset-zoom() {
+        root.zoom = 1.0;
+        root.pan-x = 0px;
+        root.pan-y = 0px;
+        root.wake();
+    }
+    // A new stream (the page empties its picture first) starts whole.
+    changed has-frame => {
+        if (!root.has-frame) {
+            root.zoom = 1.0;
+            root.pan-x = 0px;
+            root.pan-y = 0px;
         }
     }
 
@@ -102,38 +192,108 @@ export component StreamViewerPanel inherits FocusScope {
             root.toggle-mute();
             return accept;
         }
+        if (ev.text == "+" || ev.text == "=") {
+            root.zoom-about(root.zoom * 1.25, root.width / 2, root.height / 2);
+            return accept;
+        }
+        if (ev.text == "-") {
+            root.zoom-about(root.zoom / 1.25, root.width / 2, root.height / 2);
+            return accept;
+        }
+        if (ev.text == "0") {
+            root.reset-zoom();
+            return accept;
+        }
         reject
     }
 
-    Image {
-        width: 100%;
-        height: 100%;
-        source: root.frame;
-        // Aspect-preserving either way: letterboxed whole, or scaled to
-        // cover the surface with the overflow clipped.
-        image-fit: root.fill-offered && root.fill ? ImageFit.cover : ImageFit.contain;
-    }
-
-    // The pointer over the picture: movement (or a tap) wakes the
-    // chrome, a double-click toggles fullscreen. Sits under the chrome,
-    // so the controls still get their clicks.
-    surface := TouchArea {
-        mouse-cursor: root.chrome-shown ? MouseCursor.default : MouseCursor.none;
-        moved => { root.wake(); }
-        clicked => {
-            root.focus();
+    // Two fingers (or a trackpad's pinch) zoom; inside it the picture
+    // and the surface that takes taps, drags and the wheel.
+    ScaleRotateGestureHandler {
+        started => {
+            root.pinch-zoom = root.zoom;
+            root.pinch-fx = (self.center.x - root.pic-x) / root.pic-w;
+            root.pinch-fy = (self.center.y - root.pic-y) / root.pic-h;
             root.wake();
         }
-        // Fullscreen where there is one (desktop), else fit ⇄ fill.
-        double-clicked => {
-            if (root.fullscreen-available) {
-                root.toggle-fullscreen();
-            } else {
-                root.toggle-fill();
+        // Following the fingers' midpoint pans as it zooms.
+        updated => {
+            root.place(
+                root.pinch-zoom
+                    * (root.pinch-from-touch ? Math.max(0.1, 1 + Math.ln(self.scale)) : self.scale),
+                root.pinch-fx, root.pinch-fy, self.center.x, self.center.y);
+        }
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            // The zoomed picture stays inside the viewer.
+            clip: true;
+            Image {
+                x: root.pic-x;
+                y: root.pic-y;
+                width: root.pic-w;
+                height: root.pic-h;
+                source: root.frame;
+                // The box already has the picture's proportions.
+                image-fit: ImageFit.fill;
             }
         }
-        changed has-hover => {
-            if (self.has-hover) { root.wake(); }
+
+        // The pointer over the picture: movement (or a tap) wakes the
+        // chrome; a drag pans a picture larger than the surface; the
+        // wheel zooms where the pointer is; a double-click resets a zoom,
+        // else toggles fullscreen (desktop) or fit ⇄ fill (a phone on
+        // its side), else zooms in where it landed. Sits under the
+        // chrome, so the controls still get their clicks.
+        surface := TouchArea {
+            // Where the picture was when this press began.
+            property <length> drag-pan-x;
+            property <length> drag-pan-y;
+            mouse-cursor: root.pannable ? (self.pressed ? MouseCursor.grabbing : MouseCursor.grab)
+                : root.chrome-shown ? MouseCursor.default : MouseCursor.none;
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down) {
+                    self.drag-pan-x = root.pic-x - (root.width - root.pic-w) / 2;
+                    self.drag-pan-y = root.pic-y - (root.height - root.pic-h) / 2;
+                }
+            }
+            moved => {
+                root.wake();
+                if (self.pressed && root.pannable) {
+                    root.pan-x = root.clamp-pan(self.drag-pan-x + self.mouse-x - self.pressed-x,
+                        root.pic-w, root.width);
+                    root.pan-y = root.clamp-pan(self.drag-pan-y + self.mouse-y - self.pressed-y,
+                        root.pic-h, root.height);
+                }
+            }
+            scroll-event(ev) => {
+                if (ev.delta-y == 0px) {
+                    return reject;
+                }
+                // One wheel notch (60 px) ≈ ×1.16.
+                root.zoom-about(root.zoom * Math.pow(1.0025, ev.delta-y / 1px),
+                    self.mouse-x, self.mouse-y);
+                accept
+            }
+            clicked => {
+                root.focus();
+                root.wake();
+            }
+            double-clicked => {
+                if (root.zoomed) {
+                    root.reset-zoom();
+                } else if (root.fullscreen-available) {
+                    root.toggle-fullscreen();
+                } else if (root.fill-offered) {
+                    root.toggle-fill();
+                } else {
+                    root.zoom-about(2.5, self.mouse-x, self.mouse-y);
+                }
+            }
+            changed has-hover => {
+                if (self.has-hover) { root.wake(); }
+            }
         }
     }
 
@@ -147,6 +307,8 @@ export component StreamViewerPanel inherits FocusScope {
         background: Theme.surface.with-alpha(0.85);
         opacity: root.chrome-shown ? 1.0 : 0.0;
         animate opacity { duration: 200ms; }
+        // Faded out, it takes no taps: they belong to the picture.
+        visible: self.opacity > 0.01;
         chip-hover := TouchArea { }
         chip-text := Text {
             text: root.peer-name;
@@ -158,15 +320,57 @@ export component StreamViewerPanel inherits FocusScope {
         }
     }
 
+    // ── Zoom chip, top-right: how far, and a tap back to the whole ──
+    if root.zoomed : Rectangle {
+        x: root.width - root.chrome-inset-right - Theme.gap-md - self.width;
+        y: root.chrome-inset-top + Theme.gap-md;
+        width: zoom-row.preferred-width;
+        height: 28px;
+        border-radius: 14px;
+        background: Theme.surface.with-alpha(0.85);
+        opacity: root.chrome-shown ? 1.0 : 0.0;
+        animate opacity { duration: 200ms; }
+        visible: self.opacity > 0.01;
+        zoom-row := HorizontalLayout {
+            padding-left: Theme.gap-md;
+            padding-right: Theme.gap-sm;
+            spacing: Theme.gap-xs;
+            Text {
+                text: "\{Math.round(root.zoom * 10) / 10}×";
+                color: Theme.text-primary;
+                font-size: Theme.font-sm;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                width: 18px;
+                IconDisplay {
+                    icon: IconSet.ZoomOut;
+                    size: 16px;
+                    stroke: Theme.text-secondary;
+                }
+            }
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.reset-zoom(); }
+        }
+    }
+
     // ── Control bar, bottom-center ──────────────────────────────────
+    // The room the bar may take; on a narrow surface (a phone upright,
+    // a small window) it tightens: closer spacing, a shorter volume
+    // slider, Stop watching as an ✕.
+    property <length> bar-room: root.width - root.chrome-inset-left - root.chrome-inset-right
+        - 2 * Theme.gap-md;
+    property <bool> bar-tight: root.bar-room < 480px;
+    property <length> slider-w: root.bar-room < 360px ? 64px : root.bar-tight ? 96px : 130px;
     bar := Rectangle {
         // Centred in the safe area, above its bottom edge.
         x: root.chrome-inset-left
             + (parent.width - root.chrome-inset-left - root.chrome-inset-right - self.width) / 2;
         y: parent.height - root.chrome-inset-bottom - self.height - Theme.gap-md;
-        width: Math.min(
-            parent.width - root.chrome-inset-left - root.chrome-inset-right - 2 * Theme.gap-md,
-            bar-row.preferred-width);
+        width: Math.min(root.bar-room, bar-row.preferred-width);
         height: 48px;
         border-radius: Theme.radius-md;
         background: Theme.surface.with-alpha(0.85);
@@ -174,21 +378,66 @@ export component StreamViewerPanel inherits FocusScope {
         border-color: Theme.border.with-alpha(0.6);
         opacity: root.chrome-shown ? 1.0 : 0.0;
         animate opacity { duration: 200ms; }
+        // Faded out, its buttons take no taps: a tap to bring the bar
+        // back must not land on Stop watching.
+        visible: self.opacity > 0.01;
         bar-hover := TouchArea { }
         // Every control sits in a full-height wrapper and centers
         // itself in it: layout children with a fixed height would
         // otherwise hug the top. The stats column has a fixed
         // preferred width, so the bar's width — and the buttons'
-        // places — never move with the numbers; on a screen too
-        // narrow for the whole bar (a phone upright) it is the one
-        // part that gives, eliding, so Stop watching stays on screen
-        // (iOS has no Back key to leave by).
+        // places — never move with the numbers; it is the part that
+        // gives on a narrow surface, eliding.
         bar-row := HorizontalLayout {
-            padding-left: Theme.gap-md;
-            padding-right: Theme.gap-md;
-            spacing: Theme.gap-sm;
+            padding-left: root.bar-tight ? Theme.gap-sm : Theme.gap-md;
+            padding-right: root.bar-tight ? Theme.gap-sm : Theme.gap-md;
+            spacing: root.bar-tight ? Theme.gap-xs : Theme.gap-sm;
 
-            // Speaker: the mute toggle. The glyph says the level.
+            // The viewer's own microphone and headphones (D43).
+            if root.self-controls : Rectangle {
+                width: 32px;
+                IconBtn {
+                    y: (parent.height - self.height) / 2;
+                    size: 32px;
+                    icon-size: 18px;
+                    icon: root.self-muted ? IconSet.MicOff : IconSet.Mic;
+                    active: root.self-muted;
+                    active-danger: true;
+                    tooltip: root.self-muted ? Tr.viewer-mic-unmute : Tr.viewer-mic-mute;
+                    clicked => {
+                        root.self-mute-toggled();
+                        root.wake();
+                    }
+                }
+            }
+            if root.self-controls : Rectangle {
+                width: 32px;
+                IconBtn {
+                    y: (parent.height - self.height) / 2;
+                    size: 32px;
+                    icon-size: 18px;
+                    icon: root.self-deafened ? IconSet.HeadphoneOff : IconSet.Headphones;
+                    active: root.self-deafened;
+                    active-danger: true;
+                    tooltip: root.self-deafened ? Tr.undeafen : Tr.deafen;
+                    clicked => {
+                        root.self-deafen-toggled();
+                        root.wake();
+                    }
+                }
+            }
+            // Between you and the stream's own sound.
+            if root.self-controls : Rectangle {
+                width: 1px;
+                Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    width: 1px;
+                    height: 20px;
+                    background: Theme.border;
+                }
+            }
+
+            // Speaker: the stream's mute toggle. The glyph says the level.
             Rectangle {
                 width: 32px;
                 IconBtn {
@@ -200,15 +449,15 @@ export component StreamViewerPanel inherits FocusScope {
                         : IconSet.Volume2;
                     active: root.stream-muted;
                     active-danger: true;
-                    tooltip: root.stream-muted ? Tr.unmute : Tr.mute;
+                    tooltip: root.stream-muted ? Tr.viewer-stream-unmute : Tr.viewer-stream-mute;
                     clicked => { root.toggle-mute(); }
                 }
             }
             Rectangle {
-                width: 130px;
+                width: root.slider-w;
                 HSlider {
                     y: (parent.height - self.height) / 2;
-                    width: 130px;
+                    width: parent.width;
                     minimum: 0.0; maximum: 1.0;
                     value <=> root.volume;
                     opacity: root.stream-muted ? 0.5 : 1.0;
@@ -257,13 +506,26 @@ export component StreamViewerPanel inherits FocusScope {
                     clicked => { root.toggle-fullscreen(); }
                 }
             }
-            Rectangle {
+            if !root.bar-tight : Rectangle {
                 width: stop.preferred-width + 2 * Theme.gap-md;
                 stop := Btn {
                     y: (parent.height - self.height) / 2;
                     width: parent.width;
                     height: 32px;
                     text: Tr.stop-watching;
+                    clicked => { root.stop-watching(); }
+                }
+            }
+            // Narrow: the same, as an ✕ (iOS has no Back key to leave
+            // by, so it must stay on screen).
+            if root.bar-tight : Rectangle {
+                width: 32px;
+                IconBtn {
+                    y: (parent.height - self.height) / 2;
+                    size: 32px;
+                    icon-size: 18px;
+                    icon: IconSet.X;
+                    tooltip: Tr.stop-watching;
                     clicked => { root.stop-watching(); }
                 }
             }
@@ -281,9 +543,14 @@ export component StreamViewerWindow inherits Window {
     in-out property <bool> stream-muted <=> panel.stream-muted;
     in-out property <float> volume <=> panel.volume;
     in-out property <bool> fullscreen <=> panel.fullscreen;
+    /// The session's mute and deafen, pushed by the app (D43).
+    in property <bool> self-muted;
+    in property <bool> self-deafened;
     callback volume-changed(float);
     callback mute-toggled(bool);
     callback stop-watching();
+    callback self-mute-toggled();
+    callback self-deafen-toggled();
     // Windows reveal workaround (see MainWindow) — streams mostly
     // self-heal since every frame dirties the picture, but the
     // controls do not.
@@ -307,8 +574,13 @@ export component StreamViewerWindow inherits Window {
         peer-name: root.peer-name;
         frame: root.frame;
         stats: root.stats;
+        self-controls: true;
+        self-muted: root.self-muted;
+        self-deafened: root.self-deafened;
         volume-changed(v) => { root.volume-changed(v); }
         mute-toggled(m) => { root.mute-toggled(m); }
         stop-watching => { root.stop-watching(); }
+        self-mute-toggled => { root.self-mute-toggled(); }
+        self-deafen-toggled => { root.self-deafen-toggled(); }
     }
 }

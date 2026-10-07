@@ -169,6 +169,25 @@ pub fn stop_voice_service() -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// `BaucordActivity.keepScreenOn(on)`: the window's keep-screen-on flag
+/// while a stream is watched (D45).
+///
+/// # Errors
+/// Any JNI failure, as text.
+#[cfg(feature = "app")]
+pub fn keep_screen_on(on: bool) -> Result<(), String> {
+    with_activity(|env, activity| {
+        env.call_method(
+            activity,
+            jni::jni_str!("keepScreenOn"),
+            jni::jni_sig!("(Z)V"),
+            &[JValue::Bool(on)],
+        )?;
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
+}
+
 // ── Files and links (BaucordActivity, ANDROID-SPEC.md D30) ─────────────
 
 /// `BaucordActivity.nativeFilePicked(String path, String name, String

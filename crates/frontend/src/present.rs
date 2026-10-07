@@ -101,10 +101,20 @@ pub fn spawn(
                             );
                             continue;
                         }
-                        // The one full-frame copy, off the UI thread.
-                        let mut buffer =
-                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
-                        buffer.make_mut_bytes().copy_from_slice(&rgba);
+                        // A phone app in the background shows nothing:
+                        // no copy, no redraw. The decoder keeps going (its
+                        // pictures depend on each other), so the next frame
+                        // after the return is current.
+                        if !crate::app::host_visible() {
+                            continue;
+                        }
+                        // The one full-frame copy, off the UI thread —
+                        // straight from the decoder's bytes (`new` +
+                        // `copy_from_slice` zero-filled the buffer first:
+                        // a second 8 MB write per 1080p frame).
+                        let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                            &rgba, width, height,
+                        );
 
                         let prepared = PreparedFrame {
                             client_id,
