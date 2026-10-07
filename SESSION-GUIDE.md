@@ -472,6 +472,12 @@ Memory-mode servers (persistence off) still use the legacy
   `cargo test -p protocol --test versions` fails otherwise. 1.1.6
   bumped only the apps, and clients told the server they were 1.1.5.
   The internal libraries keep their own numbers.
+- **No early-leaving readers under `pipefail`.** `cmd | head -n 1` or
+  `cmd | grep -q x` in a `set -euo pipefail` script ends it silently
+  when `cmd` writes after the reader has left (SIGPIPE, 141) — a race
+  that passes on one run and kills the next (IOS-SPEC.md D27). Read the
+  output whole and cut it in the shell, let `awk` read the file and
+  `exit`, or `grep … >/dev/null`; and trap `ERR` so a stop says where.
 - **`target_os = "ios"` is not macOS.** A `cfg(target_os = "macos")`
   branch does not cover the iPhone, and crates declare APIs per OS:
   socket2 0.6.5 has `set_tclass_v6` on macOS but not iOS (IOS-SPEC.md
@@ -482,7 +488,20 @@ Memory-mode servers (persistence off) still use the legacy
   the main thread to `UIApplicationMain`; the desktop's `shutdown()`
   never runs and a suspended app is ended without notice. Whatever
   must survive is saved when it changes or in
-  `persist_for_background` (IOS-SPEC.md §4.3).
+  `persist_for_background` (IOS-SPEC.md §4.3). Nor may the app end
+  itself (`HOST_CAN_QUIT`, D29).
+- **objc2 on iOS** (`crates/ios/src/host.rs`, IOS-SPEC.md D31): in a
+  `define_class!`, put a protocol's methods inside that protocol's
+  `unsafe impl` block — a Debug build checks at class registration
+  that every *required* method was registered there and panics
+  otherwise; the generated bindings sometimes declare a method for
+  macOS only (the Rust trait is then empty on iOS), and the selector
+  goes in the block all the same. Rust names stay snake_case and the
+  selector lives in the attribute (the workspace denies
+  `nonstandard_style`, which also rules out matching on a framework's
+  `kSomething` constants — use a table). UIKit delegates are weak:
+  keep them alive yourself. A sheet the user swipes down tells only
+  its presentation controller's delegate.
 - **In `build.gradle.kts`, never write `java.awt.…` / `java.io.…`
   out in full**: `java` resolves to the project's `java` extension (AGP
   applies java-base) and the script fails with "Unresolved reference:
@@ -672,8 +691,29 @@ people rather than devices. Plus:
   crates): everything since 1.1.6 — Android, echo cancellation, Slint
   1.18.1, iOS M0 — ships as 1.1.7 on every platform; tag the release
   `v1.1.7`.
-- **iOS** (IOS-SPEC.md §12): M0 is written and awaits its first build
-  on the user's Mac — record what it says in IOS-SPEC.md §14 and here.
+- **iOS** (IOS-SPEC.md §12): **M0's hello runs in the iOS 18.3
+  simulator (2026-10-06, IOS-SPEC.md D28)** — Xcode 16.2 needed its
+  iOS platform first (`xcodebuild -downloadPlatform iOS`, D26), and
+  `run.sh` had a silent SIGPIPE exit (D27). Skia draws on the GPU
+  (wgpu's Metal device); the wgpu downlevel/discrete-GPU warnings and
+  one Skia shader-compile timeout in the log are the simulator's.
+  **The client runs in the simulator too (same evening):** libopus and
+  ring compiled for iOS unchanged; connect, chat, voice both ways.
+  From that run, written the same night and awaiting their first run
+  (IOS-SPEC.md D29–D32): no Quit on iOS (`HOST_CAN_QUIT`), stream
+  viewing through VideoToolbox (`video::videotoolbox`, `video::annexb`),
+  the file/link hooks (`crates/ios/src/host.rs`: Photos/Files pickers,
+  `Documents/Downloads`, Quick Look, Safari), winit's iOS log noise
+  filtered. A share then played in the simulator; the stream page
+  now fills the screen on both phones (edge to edge, double-tap fit ⇄
+  fill in landscape; IOS-SPEC.md D33 / ANDROID-SPEC.md D41) and iOS
+  re-reads the safe area after a rotation (D34, `insets.rs`). Attach
+  from Photos and Files worked in the simulator (one Files pick was
+  delivered twice — now claimed once, D36), and the sidebar has a
+  compact form under 600 px of height so a phone on its side keeps its
+  controls (D35 / ANDROID-SPEC.md D42). Next: `lifecycle: background`
+  on ⌘⇧H, then the phone.
+  Record each next step in IOS-SPEC.md §14 and here.
   Then M1 (the client on the iPhone) … M5 (TestFlight). Users still
   report echo: AEC-SPEC.md E8 / IOS-SPEC.md §6.3's VPIO backend is
   also the macOS answer, and can be pulled forward on its own.

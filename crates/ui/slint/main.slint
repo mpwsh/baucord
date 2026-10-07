@@ -427,10 +427,16 @@ export component MainWindow inherits Window {
         background: black;
         TouchArea { }
         StreamViewerPanel {
-            x: root.inset-left;
-            y: root.inset-top;
-            width: root.page-width;
-            height: root.page-height;
+            // The whole screen, edge to edge: the picture is no UI and
+            // may sit under the notch, the home indicator and the
+            // system bars. Only the chrome keeps to the safe area (not
+            // the keyboard's: nothing types here).
+            width: parent.width;
+            height: parent.height;
+            chrome-inset-left: root.safe-area-insets.left;
+            chrome-inset-top: root.safe-area-insets.top;
+            chrome-inset-right: root.safe-area-insets.right;
+            chrome-inset-bottom: root.safe-area-insets.bottom;
             // Takes the keyboard so Back / M / Escape reach it; the
             // composer gets it back when the page closes.
             init => { self.focus(); }
@@ -438,6 +444,9 @@ export component MainWindow inherits Window {
             frame: State.watch-frame;
             stats: State.watch-stats;
             fullscreen-available: false;
+            // Zoom-to-fill, kept for the session across streams.
+            fill-available: true;
+            fill <=> State.watch-fill;
             stream-muted <=> State.watch-muted;
             volume <=> State.watch-volume;
             volume-changed(v) => { Logic.watch-volume-changed(v); }

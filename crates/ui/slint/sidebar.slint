@@ -257,14 +257,60 @@ component UserRowView inherits Rectangle {
     }
 }
 
+/// A small action chip under (or, compact, beside) the server's name.
+component ChipButton inherits Rectangle {
+    in property <string> text;
+    /// A trailing "+" (New channel).
+    in property <bool> plus: false;
+    callback clicked;
+    width: chip-lbl.preferred-width + 2 * Theme.gap-md
+        + (root.plus ? 14px + Theme.gap-xs : 0px);
+    height: 26px;
+    border-radius: Theme.radius-sm;
+    background: chip-t.has-hover ? Theme.hover : Theme.bg-tertiary;
+    animate background { duration: 150ms; }
+    HorizontalLayout {
+        padding-left: Theme.gap-md;
+        padding-right: Theme.gap-md;
+        spacing: Theme.gap-xs;
+        chip-lbl := Text {
+            text: root.text;
+            color: Theme.text-primary;
+            font-size: Theme.font-sm;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+        if root.plus : Rectangle {
+            width: 14px;
+            IconDisplay {
+                icon: IconSet.Plus;
+                size: 14px;
+                stroke: Theme.text-secondary;
+            }
+        }
+    }
+    chip-t := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 export component Sidebar inherits Rectangle {
     /// The Messages height the divider is being dragged to (-1 = no drag).
     property <length> divider-preview: -1px;
+    /// Too short for the full stack — a phone on its side (~370 px
+    /// tall), a small desktop window. Everything stays on screen by
+    /// giving up room, not controls: tighter gaps, the chips beside
+    /// the server's name, Messages capped to a share of the height,
+    /// the status on one line, Disconnect as a button in the control
+    /// bar (ANDROID-SPEC.md D42, IOS-SPEC.md D35). The full stack
+    /// needs about 600 px.
+    property <bool> compact: root.height < 600px;
     background: Theme.bg-secondary;
 
     VerticalLayout {
-        padding: Theme.gap-md;
-        spacing: Theme.gap-md;
+        padding: root.compact ? Theme.gap-sm : Theme.gap-md;
+        spacing: root.compact ? Theme.gap-sm : Theme.gap-md;
 
         // ── The server, and what this session may add to it ───────
         // Its name is the title (the greeting in chat no longer
@@ -280,6 +326,16 @@ export component Sidebar inherits Rectangle {
                 vertical-alignment: center;
                 overflow: elide;
                 horizontal-stretch: 1;
+            }
+            // Compact: the chips ride on this row instead of their own.
+            if root.compact && State.perm-create-channels : ChipButton {
+                text: Tr.channel-new;
+                plus: true;
+                clicked => { Logic.channel-create(); }
+            }
+            if root.compact && State.perm-create-invites : ChipButton {
+                text: Tr.invite-button;
+                clicked => { Logic.invite-create(); }
             }
             // Admin: the panel (spec §8), for whoever holds `panel`.
             if State.perm-panel : Rectangle {
@@ -302,59 +358,18 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
-        if State.perm-create-channels || State.perm-create-invites : HorizontalLayout {
+        if !root.compact && (State.perm-create-channels || State.perm-create-invites) : HorizontalLayout {
             spacing: Theme.gap-sm;
-            if State.perm-create-channels : Rectangle {
-                width: new-lbl.preferred-width + 14px + 2 * Theme.gap-md + Theme.gap-xs;
-                height: 26px;
-                border-radius: Theme.radius-sm;
-                background: new-t.has-hover ? Theme.hover : Theme.bg-tertiary;
-                animate background { duration: 150ms; }
-                HorizontalLayout {
-                    padding-left: Theme.gap-md;
-                    padding-right: Theme.gap-md;
-                    spacing: Theme.gap-xs;
-                    new-lbl := Text {
-                        text: Tr.channel-new;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-sm;
-                        font-weight: 500;
-                        vertical-alignment: center;
-                    }
-                    Rectangle {
-                        width: 14px;
-                        IconDisplay {
-                            icon: IconSet.Plus;
-                            size: 14px;
-                            stroke: Theme.text-secondary;
-                        }
-                    }
-                }
-                new-t := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { Logic.channel-create(); }
-                }
+            if State.perm-create-channels : ChipButton {
+                text: Tr.channel-new;
+                plus: true;
+                clicked => { Logic.channel-create(); }
             }
             // Invite: a code with the defaults; it lands in chat and
             // on the clipboard.
-            if State.perm-create-invites : Rectangle {
-                width: invite-lbl.preferred-width + 2 * Theme.gap-md;
-                height: 26px;
-                border-radius: Theme.radius-sm;
-                background: invite-t.has-hover ? Theme.hover : Theme.bg-tertiary;
-                animate background { duration: 150ms; }
-                invite-lbl := Text {
-                    text: Tr.invite-button;
-                    color: Theme.text-primary;
-                    font-size: Theme.font-sm;
-                    font-weight: 500;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                }
-                invite-t := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { Logic.invite-create(); }
-                }
+            if State.perm-create-invites : ChipButton {
+                text: Tr.invite-button;
+                clicked => { Logic.invite-create(); }
             }
             Rectangle { }   // keep the chips at their natural width
         }
@@ -428,7 +443,8 @@ export component Sidebar inherits Rectangle {
             divider-grip := TouchArea {
                 y: -4px;
                 height: 9px;
-                enabled: !State.messages-collapsed;
+                // Compact caps the height (below): no dragging there.
+                enabled: !State.messages-collapsed && !root.compact;
                 mouse-cursor: MouseCursor.row-resize;
                 // Dragging the divider up grows Messages. Only a line
                 // moves during the drag; the height lands on release
@@ -511,8 +527,15 @@ export component Sidebar inherits Rectangle {
             }
         }
         if (State.perm-dm || State.dms.length > 0) && !State.messages-collapsed : dm-list := ScrollView {
-            // A short list: the roster keeps the room.
-            height: State.messages-height;
+            // A short list: the roster keeps the room. Compact: at
+            // most 30 % of the sidebar (about three rows on a phone on
+            // its side) and no taller than its rows (General and each
+            // DM: 32 px + 2 px apart), so the voice list and the
+            // controls keep theirs.
+            height: root.compact
+                ? Math.min(State.messages-height, Math.max(64px, root.height * 0.3),
+                    (State.dms.length + 1) * 34px)
+                : State.messages-height;
             vertical-stretch: 0;
             mouse-drag-pan-enabled: State.touch-host;   // D27
             VerticalLayout {
@@ -694,8 +717,27 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        // Status block
-        VerticalLayout {
+        // Status block. Compact: the status and the latency on one
+        // line (the resource line is for the desktop's curious).
+        if root.compact : HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Text {
+                text: State.status-text;
+                color: State.status-color;
+                font-size: Theme.font-sm;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Text {
+                text: State.latency-line;
+                color: Theme.text-muted;
+                font-size: Theme.font-xs;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+        if !root.compact : VerticalLayout {
             spacing: 2px;
             Text {
                 text: State.status-text;
@@ -719,11 +761,11 @@ export component Sidebar inherits Rectangle {
 
         // ── Control bar: mic / headphones / screen ─────────────────
         Rectangle {
-            height: 52px;
+            height: root.compact ? 44px : 52px;
             border-radius: Theme.radius-md;
             background: Theme.bg-primary;
             HorizontalLayout {
-                padding: 6px;
+                padding: root.compact ? 2px : 6px;
                 spacing: Theme.gap-xs;
                 alignment: space-around;
                 // In push-to-talk mode the mic lights up while the key
@@ -762,10 +804,19 @@ export component Sidebar inherits Rectangle {
                     tooltip: Tr.settings;
                     clicked => { Logic.open-settings(); }
                 }
+                // Compact: Disconnect joins the bar — a red hang-up,
+                // not filled, so it does not read as a toggle that is
+                // on (muted and deafened are filled red).
+                if root.compact : IconBtn {
+                    icon: IconSet.PhoneOff;
+                    idle-color: Theme.danger;
+                    tooltip: Tr.disconnect;
+                    clicked => { Logic.disconnect(); }
+                }
             }
         }
 
-        Btn {
+        if !root.compact : Btn {
             text: Tr.disconnect;
             accent: true;
             clicked => { Logic.disconnect(); }

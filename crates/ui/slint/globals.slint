@@ -221,6 +221,10 @@ export global State {
     /// hover, and the soft keyboard comes up only when the composer is
     /// tapped, never on the app's own initiative.
     in property <bool> touch-host: false;
+    /// The host lets the app end itself. iOS does not (winit ignores the
+    /// exit there, and Apple's rule is that only the user closes an
+    /// app): the connect page's Quit is hidden.
+    in property <bool> can-quit: true;
     in property <bool> muted;
     in property <bool> deafened;
     /// Push-to-talk: the mic is closed until the key is held.
@@ -277,6 +281,9 @@ export global State {
     in property <string> watch-stats: "--";
     in-out property <bool> watch-muted: false;
     in-out property <float> watch-volume: 1.0;
+    /// The page's zoom-to-fill (landscape): set by the person, kept for
+    /// the session, so the next stream opens the way they left it.
+    in-out property <bool> watch-fill: false;
 
     // ── Invite dialog (spec §3.1) ───────────────────────────────────
     // Options are indices into the lists the host fills; the created

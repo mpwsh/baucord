@@ -31,6 +31,14 @@ OPEN=0
 
 die() { echo "run.sh: $*" >&2; exit 1; }
 say() { echo ">> $*"; }
+# The first line of "$1", without a pipe: `cmd | head -n 1` under
+# pipefail ends the script — silently — when cmd writes its next line
+# after head has left (SIGPIPE, exit 141). `xcodebuild -version` did
+# exactly that on the first Mac run (IOS-SPEC.md D27).
+first_line() { local s="$1"; echo "${s%%$'\n'*}"; }
+# Whatever stops the script says where: under `set -e` a failing command
+# would otherwise end it without a word.
+trap 'echo "run.sh: stopped near line $LINENO (exit $?)" >&2' ERR
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +58,10 @@ done
 
 # -- Tools --------------------------------------------------------------
 command -v xcodebuild >/dev/null 2>&1 || die "Xcode is not installed (App Store), or xcode-select points at the Command Line Tools: sudo xcode-select -s /Applications/Xcode.app"
+XCODE_OUT="$(xcodebuild -version 2>&1)" \
+  || die "xcodebuild -version failed — after an install or update Xcode may need its first-launch setup (sudo xcodebuild -runFirstLaunch) or the licence (sudo xcodebuild -license). It said: $XCODE_OUT"
+XCODE="$(first_line "$XCODE_OUT")"
+say "$XCODE"
 command -v xcodegen >/dev/null 2>&1 || die "xcodegen not found: brew install xcodegen"
 command -v python3 >/dev/null 2>&1 || die "python3 not found (it comes with Xcode's command line tools: xcode-select --install)"
 if [ $BUILD -eq 1 ]; then
@@ -73,7 +85,7 @@ fi
 # Base.xcconfig includes the file; it is rewritten on every run, so
 # builds from Xcode's window get it too, and the cargo phase refuses to
 # build with a version that disagrees with the crate's.
-VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/crates/ios/Cargo.toml" | head -n 1)"
+VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' "$REPO/crates/ios/Cargo.toml")"
 [ -n "$VERSION" ] || die "no version line in crates/ios/Cargo.toml"
 BUILD_NUMBER="$(git -C "$REPO" rev-list --count HEAD 2>/dev/null || echo 1)"
 printf '%s\n' \
@@ -117,7 +129,8 @@ PY
   SDK=iphoneos
   DESTINATION="id=$TARGET_ID"
 else
-  xcrun simctl list devices available --json > "$TMP/sims.json"
+  xcrun simctl list devices available --json > "$TMP/sims.json" \
+    || die "xcrun simctl list failed (its message is above) — is Xcode's simulator set up? Open Xcode once"
   PICK="$(python3 - "$TMP/sims.json" "$SIM_NAME" "$SIM_OS" <<'PY'
 import json, re, sys
 data = json.load(open(sys.argv[1]))["devices"]
@@ -165,7 +178,17 @@ if [ $BUILD -eq 1 ]; then
   # Read by scripts/build_with_cargo.sh. Always passed, so switching
   # between --hello and the app takes effect.
   ARGS+=("BAUCORD_CARGO_FEATURES=$FEATURES")
-  xcodebuild "${ARGS[@]}" -quiet build || die "build failed (the cargo output is above)"
+  if ! xcodebuild "${ARGS[@]}" -quiet build 2>&1 | tee "$TMP/xcodebuild.log"; then
+    # Since Xcode 15 the iOS platform matching Xcode's own SDK must be
+    # installed before it builds for *any* iOS destination: older
+    # simulator runtimes do not count, and the simulator picked above is
+    # then not even listed (IOS-SPEC.md D26).
+    if grep "first download and install the platform" "$TMP/xcodebuild.log" >/dev/null; then
+      MISSING="$(first_line "$(sed -n 's/.*error:\(iOS [0-9.]*\) is not installed.*/\1/p' "$TMP/xcodebuild.log")")"
+      die "$XCODE builds against ${MISSING:-a newer iOS} and needs that platform installed before it builds for any iPhone or simulator; older simulators do not count. Install it once — xcodebuild -downloadPlatform iOS (or Xcode → Settings → Components); it may fetch a newer simulator of the same major version, which is Apple's pairing for this Xcode — then run this again."
+    fi
+    die "xcodebuild failed (its output is above)"
+  fi
 fi
 [ -d "$APP" ] || die "no app at $APP — build first (drop --no-build)"
 

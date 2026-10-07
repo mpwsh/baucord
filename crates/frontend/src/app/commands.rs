@@ -80,9 +80,10 @@ impl AppState {
                 self.push_command_output(&line);
             }
             "leave" => self.handle_disconnect(),
-            "quit" | "exit" => {
+            "quit" | "exit" if super::HOST_CAN_QUIT => {
                 let _ = slint::quit_event_loop();
             }
+            "quit" | "exit" => self.push_command_output(&t!("quit-ios")),
             "users" => self.send_admin(AdminCommand::ListUsers, PendingAdmin::Show),
             "restrictions" | "bans" => {
                 self.send_admin(AdminCommand::ListRestrictions, PendingAdmin::Show);
@@ -260,8 +261,10 @@ impl AppState {
             "/channel list",
             "/mem",
             "/leave",
-            "/quit",
         ];
+        if super::HOST_CAN_QUIT {
+            out.push("/quit");
+        }
         if has(p::CREATE_INVITES) {
             out.push("/invite [role] [24h] [uses]");
         }

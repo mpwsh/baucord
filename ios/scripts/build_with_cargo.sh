@@ -11,6 +11,9 @@
 # setting it in Config/Local.xcconfig only affects builds from Xcode's
 # own window.
 set -euo pipefail
+# Whatever stops the script says where (in Xcode's build log), instead of
+# `set -e` ending it without a word.
+trap 'echo "error: build_with_cargo.sh stopped near line $LINENO (exit $?)"' ERR
 
 # Xcode runs build phases with a minimal PATH. cargo lives in
 # ~/.cargo/bin; Homebrew's cmake (libopus builds with it) in
@@ -51,7 +54,9 @@ fi
 # crates' version (SESSION-GUIDE.md §4). ios/run.sh writes it into
 # Config/Version.xcconfig; a build from Xcode's window before that, or
 # after a bump, would otherwise ship a stale number.
-CRATE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/crates/ios/Cargo.toml" | head -n 1)"
+# awk reads the file itself and stops at the first match: no pipe into
+# `head`, which pipefail would turn into a silent exit (IOS-SPEC.md D27).
+CRATE_VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' "$REPO/crates/ios/Cargo.toml")"
 if [ "${MARKETING_VERSION:-}" != "$CRATE_VERSION" ]; then
   echo "error: the app's version is '${MARKETING_VERSION:-}' but crates/ios/Cargo.toml says $CRATE_VERSION — run ios/run.sh (or ios/run.sh --open) once to refresh Config/Version.xcconfig"
   exit 1

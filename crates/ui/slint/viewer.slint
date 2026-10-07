@@ -15,6 +15,14 @@
 // back on any movement or tap. Double-click or F toggles fullscreen,
 // Escape leaves it, M mutes, Back (Android) stops watching. (The chat
 // image viewer is an in-window overlay in main.slint.)
+//
+// On a phone (the page in main.slint) the picture goes edge to edge —
+// under the notch, the home indicator and the system bars — while the
+// chrome keeps to the safe area (`chrome-inset-*`); and in landscape a
+// double-tap or the bar's zoom button toggles between fitting the
+// whole picture and filling the screen with it, cropping its edges —
+// a 4:3 or 16:9 stream on a 19.5:9 phone otherwise leaves bands
+// (ANDROID-SPEC.md D41, IOS-SPEC.md D33).
 
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
@@ -32,6 +40,17 @@ export component StreamViewerPanel inherits FocusScope {
     /// A page in a single window has nothing to go fullscreen into;
     /// false hides the button and the F / double-click toggles.
     in property <bool> fullscreen-available: true;
+    /// Zoom-to-fill is offered (phones). Only in landscape: in portrait
+    /// a landscape stream filling the screen would show a quarter of it.
+    in property <bool> fill-available: false;
+    /// Fill the surface (crop) rather than fit (letterbox).
+    in-out property <bool> fill: false;
+    /// What the chrome keeps clear of; the picture ignores it.
+    in property <length> chrome-inset-left: 0px;
+    in property <length> chrome-inset-top: 0px;
+    in property <length> chrome-inset-right: 0px;
+    in property <length> chrome-inset-bottom: 0px;
+    property <bool> fill-offered: root.fill-available && root.width > root.height;
     callback volume-changed(float);
     callback mute-toggled(bool);
     callback stop-watching();
@@ -56,6 +75,12 @@ export component StreamViewerPanel inherits FocusScope {
     function toggle-fullscreen() {
         if (root.fullscreen-available) {
             root.fullscreen = !root.fullscreen;
+        }
+    }
+    function toggle-fill() {
+        if (root.fill-offered) {
+            root.fill = !root.fill;
+            root.wake();
         }
     }
 
@@ -84,7 +109,9 @@ export component StreamViewerPanel inherits FocusScope {
         width: 100%;
         height: 100%;
         source: root.frame;
-        image-fit: contain;   // aspect-preserving letterbox
+        // Aspect-preserving either way: letterboxed whole, or scaled to
+        // cover the surface with the overflow clipped.
+        image-fit: root.fill-offered && root.fill ? ImageFit.cover : ImageFit.contain;
     }
 
     // The pointer over the picture: movement (or a tap) wakes the
@@ -97,7 +124,14 @@ export component StreamViewerPanel inherits FocusScope {
             root.focus();
             root.wake();
         }
-        double-clicked => { root.toggle-fullscreen(); }
+        // Fullscreen where there is one (desktop), else fit ⇄ fill.
+        double-clicked => {
+            if (root.fullscreen-available) {
+                root.toggle-fullscreen();
+            } else {
+                root.toggle-fill();
+            }
+        }
         changed has-hover => {
             if (self.has-hover) { root.wake(); }
         }
@@ -105,8 +139,8 @@ export component StreamViewerPanel inherits FocusScope {
 
     // ── Name chip, top-left ─────────────────────────────────────────
     chip := Rectangle {
-        x: Theme.gap-md;
-        y: Theme.gap-md;
+        x: root.chrome-inset-left + Theme.gap-md;
+        y: root.chrome-inset-top + Theme.gap-md;
         width: chip-text.preferred-width + 2 * Theme.gap-md;
         height: 28px;
         border-radius: 14px;
@@ -126,9 +160,13 @@ export component StreamViewerPanel inherits FocusScope {
 
     // ── Control bar, bottom-center ──────────────────────────────────
     bar := Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: parent.height - self.height - Theme.gap-md;
-        width: Math.min(parent.width - 2 * Theme.gap-md, bar-row.preferred-width);
+        // Centred in the safe area, above its bottom edge.
+        x: root.chrome-inset-left
+            + (parent.width - root.chrome-inset-left - root.chrome-inset-right - self.width) / 2;
+        y: parent.height - root.chrome-inset-bottom - self.height - Theme.gap-md;
+        width: Math.min(
+            parent.width - root.chrome-inset-left - root.chrome-inset-right - 2 * Theme.gap-md,
+            bar-row.preferred-width);
         height: 48px;
         border-radius: Theme.radius-md;
         background: Theme.surface.with-alpha(0.85);
@@ -140,8 +178,11 @@ export component StreamViewerPanel inherits FocusScope {
         // Every control sits in a full-height wrapper and centers
         // itself in it: layout children with a fixed height would
         // otherwise hug the top. The stats column has a fixed
-        // width, so the bar's width — and the buttons' places —
-        // never move with the numbers.
+        // preferred width, so the bar's width — and the buttons'
+        // places — never move with the numbers; on a screen too
+        // narrow for the whole bar (a phone upright) it is the one
+        // part that gives, eliding, so Stop watching stays on screen
+        // (iOS has no Back key to leave by).
         bar-row := HorizontalLayout {
             padding-left: Theme.gap-md;
             padding-right: Theme.gap-md;
@@ -184,13 +225,26 @@ export component StreamViewerPanel inherits FocusScope {
                 }
             }
             Text {
-                width: 300px;
+                preferred-width: 300px;
+                min-width: 0px;
+                horizontal-stretch: 1;
                 text: root.stats;
                 color: Theme.text-muted;
                 font-size: Theme.font-xs;
                 vertical-alignment: center;
                 horizontal-alignment: left;
                 overflow: elide;
+            }
+            if root.fill-offered : Rectangle {
+                width: 32px;
+                IconBtn {
+                    y: (parent.height - self.height) / 2;
+                    size: 32px;
+                    icon-size: 18px;
+                    icon: root.fill ? IconSet.Shrink : IconSet.Expand;
+                    tooltip: root.fill ? Tr.viewer-fit : Tr.viewer-fill;
+                    clicked => { root.toggle-fill(); }
+                }
             }
             if root.fullscreen-available : Rectangle {
                 width: 32px;

@@ -34,6 +34,45 @@ windows = { version = "0.62", features = [
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", default-features = false, features = ["media", "api-level-29"] }
 
+# iOS decodes through VideoToolbox (src/videotoolbox.rs, IOS-SPEC.md D9):
+# the objc2 framework bindings, 0.3 like the rest of the tree (cpal and
+# Slint's iOS backend already bring objc2-core-foundation and
+# objc2-core-video; objc2-core-media and objc2-video-toolbox are new).
+# Default features off: only what the decoder calls.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "CFDictionary",
+  "CFNumber",
+  "CFString",
+] }
+objc2-core-media = { version = "0.3", default-features = false, features = [
+  "std",
+  "CMBase",
+  "CMBlockBuffer",
+  "CMFormatDescription",
+  "CMSampleBuffer",
+  "CMTime",
+] }
+objc2-core-video = { version = "0.3", default-features = false, features = [
+  "std",
+  "CVBase",
+  "CVBuffer",
+  "CVImageBuffer",
+  "CVPixelBuffer",
+  "CVReturn",
+] }
+objc2-video-toolbox = { version = "0.3", default-features = false, features = [
+  "std",
+  "VTBase",
+  "VTErrors",
+  "VTSession",
+  "VTDecompressionProperties",
+  "VTDecompressionSession",
+  "objc2-core-media",
+  "objc2-core-video",
+] }
+
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 #xcap = { git = "https://github.com/nashaofu/xcap" }
 xcap = "0.9.8"

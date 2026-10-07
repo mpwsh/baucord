@@ -576,7 +576,10 @@ component GeneralPanel inherits VerticalLayout {
     Sep { }
     SectionHeader { text: Tr.files-header; }
     Hint { text: Tr.about-config-file + " " + SettingsState.config-path; }
-    HorizontalLayout {
+    // A phone has no file manager that opens an app's private folder
+    // (on iOS the share sheet would even offer the device key); the
+    // path above says where it is.
+    if !State.touch-host : HorizontalLayout {
         spacing: Theme.gap-sm;
         Btn {
             text: Tr.about-open-config;

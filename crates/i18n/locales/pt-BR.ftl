@@ -561,6 +561,8 @@ rename-denied-invalid = Esse nome está vazio.
 rename-denied-rate-limited = Uma troca de nome a cada 30 segundos.
 viewer-fullscreen = Tela cheia (F)
 viewer-exit-fullscreen = Sair da tela cheia (Esc)
+viewer-fill = Ampliar para preencher (toque duplo)
+viewer-fit = Ajustar à tela (toque duplo)
 
 # ── Divisores de dia no chat ──────────────────────────────────────────
 chat-day-today = Hoje
@@ -779,5 +781,8 @@ admin-channel = Registros de admin
 admin-channel-lead = A auditoria, ao vivo. Os comandos funcionam aqui: /kick, /ban, /mute, /grant, /invite…
 admin-channel-commands-only = Este canal só aceita comandos — comece com /
 
-# ── Host Android (ANDROID-SPEC.md; uma janela por processo) ──────────
-host-single-window = Ainda não disponível no Android — no desktop isto abre na sua própria janela.
+# ── Hosts de celular (ANDROID-SPEC.md, IOS-SPEC.md; uma janela por processo) ──
+host-single-window = Ainda não disponível no celular — no desktop isto abre na sua própria janela.
+quit-ios = No iPhone, os apps são fechados pelo seletor de apps: deslize para cima a partir da borda inferior, pare um instante e deslize o baucord para cima.
+pick-from-photos = Fotos
+pick-from-files = Arquivos

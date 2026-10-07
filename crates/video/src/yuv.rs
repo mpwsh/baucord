@@ -7,6 +7,11 @@
 //! `color-format` + `stride` + `slice-height` trio. [`Yuv420Layout`]
 //! names the common shape of both and [`to_rgba`] walks it.
 //!
+//! `VideoToolbox` (`videotoolbox.rs`, iOS) is asked for BGRA instead —
+//! it converts on the GPU with the stream's own colour signalling — and
+//! [`bgra_to_rgba`] only swaps two bytes per pixel and drops the row
+//! padding.
+//!
 //! Pure code, no platform dependencies: the unit tests run on the host.
 
 use std::fmt::Write as _;
@@ -397,6 +402,52 @@ fn convert_row(
     }
 }
 
+/// Copy the top-left `width × height` pixels of a BGRA image whose rows
+/// start `stride` bytes apart into tightly packed RGBA in `out` (resized
+/// to fit). Alpha is set opaque: a decoded video frame has none, and
+/// some decoders leave the byte undefined.
+///
+/// # Errors
+/// The buffer is too small for the rectangle, or `stride` is shorter
+/// than a row — an error, not a panic, since both come from the
+/// decoder.
+pub fn bgra_to_rgba(
+    src: &[u8],
+    stride: usize,
+    width: u32,
+    height: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let (w, h) = (width as usize, height as usize);
+    let row = w * 4;
+    out.clear();
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    if stride < row {
+        return Err(format!(
+            "{stride} byte rows cannot hold {width} BGRA pixels"
+        ));
+    }
+    let need = stride * (h - 1) + row;
+    if src.len() < need {
+        return Err(format!(
+            "{width}x{height} BGRA at stride {stride} needs {need} bytes, decoder gave {}",
+            src.len()
+        ));
+    }
+    out.resize(row * h, 0);
+    for (dst, src_row) in out.chunks_exact_mut(row).zip(src.chunks(stride)) {
+        for (d, s) in dst.chunks_exact_mut(4).zip(src_row[..row].chunks_exact(4)) {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
+            d[3] = 255;
+        }
+    }
+    Ok(())
+}
+
 /// A one-line description for logs.
 #[must_use]
 pub fn describe(layout: &Yuv420Layout, spec: ColorSpec) -> String {
@@ -483,6 +534,37 @@ mod tests {
             Yuv420Layout::from_media_image2(&bytes).is_err(),
             "4:4:4 chroma"
         );
+    }
+
+    #[test]
+    fn bgra_swaps_red_and_blue_and_drops_row_padding() {
+        // 2×2 at a 12-byte stride (4 bytes of padding per row).
+        let src = [
+            1, 2, 3, 0, 4, 5, 6, 0, 0xEE, 0xEE, 0xEE, 0xEE, //
+            7, 8, 9, 0, 10, 11, 12, 0,
+        ];
+        let mut out = vec![0xAB; 3];
+        bgra_to_rgba(&src, 12, 2, 2, &mut out).unwrap();
+        assert_eq!(
+            out,
+            [3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255]
+        );
+    }
+
+    #[test]
+    fn bgra_refuses_short_buffers_and_rows() {
+        let mut out = Vec::new();
+        assert!(
+            bgra_to_rgba(&[0; 8], 4, 2, 1, &mut out).is_err(),
+            "stride < row"
+        );
+        assert!(
+            bgra_to_rgba(&[0; 15], 8, 2, 2, &mut out).is_err(),
+            "one byte short"
+        );
+        assert!(bgra_to_rgba(&[0; 16], 8, 2, 2, &mut out).is_ok());
+        assert!(bgra_to_rgba(&[], 0, 0, 0, &mut out).is_ok());
+        assert!(out.is_empty());
     }
 
     #[test]

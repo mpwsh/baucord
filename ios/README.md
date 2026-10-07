@@ -12,6 +12,7 @@ sign and install it. The plan and every decision are in
 |---|---|---|
 | Xcode 16 or later | App Store; open it once to install the iOS platform and accept the licence | the SDK, the simulator, signing, `xcodebuild`, `devicectl`. Nothing in the project needs a newer one for the simulator. The phone may: Xcode refuses to install on an iPhone whose iOS it does not know yet (update Xcode then). TestFlight uploads need Xcode 26 or later |
 | Command-line tools selected | `sudo xcode-select -s /Applications/Xcode.app` | so `xcodebuild` is Xcode's, not the bare CLT's |
+| **Xcode's own iOS platform** | `xcodebuild -downloadPlatform iOS`, or Xcode → Settings → Components | Xcode 15+ builds for no iOS destination — simulator included — until the platform matching its SDK is installed (Xcode 16.2 → iOS 18.2). An older simulator (18.1) does not count; it runs the app once the platform is there. `run.sh` says so when it happens |
 | Homebrew | <https://brew.sh> | for the two tools below |
 | XcodeGen | `brew install xcodegen` | writes `baucord.xcodeproj` from `project.yml` |
 | CMake | `brew install cmake` | libopus (the voice codec) builds with it |
@@ -50,7 +51,16 @@ the newest iOS installed; it prints which (`>> simulator iPhone 16 (iOS
 18.1) …`). `xcrun simctl list devices` lists them all.
 
 In the simulator, a server on this Mac is `127.0.0.1:51000`, and the
-simulator's microphone is the Mac's (macOS asks once).
+simulator's microphone is the Mac's (macOS asks once). There is no
+echo cancellation on iOS yet: use headphones in voice.
+
+To try **Attach** in the simulator: Photos comes with Apple's sample
+pictures, and Files starts empty — drag a file from the Mac onto the
+simulator window to put it there (a picture goes into Photos). Files
+you save from a chat land in Files → On My iPhone → baucord →
+Downloads. There is no Quit on iOS: close the app from the app
+switcher (in the simulator Device → App Switcher, ⌃⇧⌘H, then swipe it
+up).
 
 ## 3. Your iPhone
 
@@ -78,6 +88,24 @@ After the first USB run the phone also works over Wi-Fi.
 - On the phone: **Files → On My iPhone → baucord → baucord.log** —
   what users send; the same format as the desktop log, rolled at
   5 MB.
+
+Normal in the **simulator's** log, and not errors of ours (IOS-SPEC.md
+D28): wgpu's `Missing downlevel flags …` with a capabilities dump and
+`MAPPABLE_PRIMARY_BUFFERS enabled on a discrete gpu` (the simulator's
+GPU is a reduced one), and now and then Skia's `Compilation took
+longer than 1000 ms` on a first launch (a shader compiled late; the
+next frame draws it). They mean the app is drawing on the GPU. winit's
+iOS warnings (`processing non RedrawRequested event …`, `… is ignored
+on iOS`) are filtered out of the log (D32).
+
+Watching a stream: turn the phone (⌘← / ⌘→ in the simulator) for
+the big picture; in landscape a double-tap, or the zoom button in the
+bar, switches between the whole picture and filling the screen.
+
+Lines worth looking for: `VideoToolbox: decoding H.264 to BGRA` and
+`VideoToolbox: first picture WxH` when you watch a share;
+`photo pick: loading …` and `picked …` when you attach;
+`lifecycle: background` when you leave the app.
 
 ## 5. The version
 

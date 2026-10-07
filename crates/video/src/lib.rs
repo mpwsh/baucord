@@ -32,12 +32,16 @@ pub mod codec;
 pub mod codec;
 
 // Android decodes with the platform's MediaCodec instead (the stub
-// above still provides the encoder, which Android does not have yet).
-// `yuv` is its plane-to-RGBA step, platform-free so it is tested
+// above still provides the encoder, which Android does not have yet),
+// iOS with VideoToolbox. `yuv` is their step to RGBA and `annexb` the
+// re-framing VideoToolbox needs, both platform-free so they are tested
 // everywhere.
+pub mod annexb;
 #[cfg(target_os = "android")]
 pub mod mediacodec;
 pub mod timing;
+#[cfg(target_os = "ios")]
+pub mod videotoolbox;
 pub mod yuv;
 
 /// Quality preset for screen sharing.

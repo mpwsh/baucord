@@ -20,6 +20,10 @@
 #[cfg(all(target_os = "ios", feature = "hello"))]
 mod hello;
 #[cfg(all(target_os = "ios", feature = "app", not(feature = "hello")))]
+mod host;
+#[cfg(target_os = "ios")]
+mod insets;
+#[cfg(all(target_os = "ios", feature = "app", not(feature = "hello")))]
 mod lifecycle;
 #[cfg(target_os = "ios")]
 mod logging;
@@ -49,11 +53,7 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         dirs.as_ref().map_or_else(
             || "no app folders: settings will not persist".to_string(),
-            |d| format!(
-                "config {}, log {}",
-                d.config.display(),
-                d.documents.display()
-            ),
+            |d| format!("config {}, log {}", d.config.display(), d.documents.display()),
         ),
     );
     if let Some(d) = &dirs {
@@ -77,6 +77,11 @@ fn main() {
         log::error!("slint backend (winit + skia): {e}");
     }
 
+    // Slint keeps the safe area it read at the last resize; after a
+    // rotation that is the old orientation's. A probe view makes winit
+    // resend the resize once UIKit has the new one (spec §14 D34).
+    insets::install();
+
     #[cfg(feature = "hello")]
     hello::run();
 
@@ -95,6 +100,10 @@ fn main() {
         // Save on the way into the background, where iOS may end the
         // process without warning (spec §4.3).
         lifecycle::install();
+
+        // Attachments, saved files, links: UIKit's pickers, Quick Look
+        // and Safari behind the frontend's host seam (spec §10).
+        host::install(dirs.as_ref().map(|d| d.documents.clone()));
 
         frontend::app::run();
     }

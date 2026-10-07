@@ -22,8 +22,8 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -36,18 +36,18 @@ use audio::{
         input::SystemAudioCapture,
     },
 };
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use log::{info, warn};
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use video::codec::FfmpegDecoder;
 use video::{
+    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
     buffer::{BufferedPacket, VideoJitterBuffer},
     capture::{CaptureStatus, Capturer},
     codec::FfmpegEncoder,
-    CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
 };
 
-use crate::{network::NetworkControl, WakeFn};
+use crate::{WakeFn, network::NetworkControl};
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -1615,7 +1615,7 @@ fn create_encoder(
 }
 
 /// Create the video decoder: `FFmpeg` on the desktop.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
     match FfmpegDecoder::new() {
         Ok(dec) => Ok(Box::new(dec)),
@@ -1634,6 +1634,19 @@ fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
         Ok(dec) => Ok(Box::new(dec)),
         Err(e) => {
             warn!("MediaCodec decoder unavailable: {e}");
+            Err(CodecError::DecoderInit(e.to_string()))
+        }
+    }
+}
+
+/// Create the video decoder: `VideoToolbox` on iOS (IOS-SPEC.md D9). It
+/// makes its session on the first keyframe.
+#[cfg(target_os = "ios")]
+fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
+    match video::videotoolbox::VideoToolboxDecoder::new() {
+        Ok(dec) => Ok(Box::new(dec)),
+        Err(e) => {
+            warn!("VideoToolbox decoder unavailable: {e}");
             Err(CodecError::DecoderInit(e.to_string()))
         }
     }

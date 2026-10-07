@@ -6,9 +6,9 @@
 //! `create_decoder` factories already convert into UI-visible errors
 //! (and, for incoming streams, a one-time warning + dropped frames).
 //!
-//! A future mobile *viewer* replaces `FfmpegDecoder` here with a
-//! VideoToolbox / MediaCodec implementation of [`VideoDecoder`] — the
-//! trait, `Quality`, and the jitter buffer already compile on mobile.
+//! The mobile *viewers* do not use this decoder: Android decodes with
+//! `mediacodec.rs`, iOS with `videotoolbox.rs` (the client's
+//! `create_decoder` picks them); only the encoder stub matters there.
 
 use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder, VideoEncoder};
 

@@ -179,3 +179,79 @@ fn synthetic_roundtrip() {
         }
     }
 }
+
+/// What iOS's decoder receives (IOS-SPEC.md §14 D30): the real encoder's
+/// access units, re-framed by `annexb::split` into parameter sets plus
+/// length-prefixed NAL units. Rebuilt into Annex-B and decoded, they must
+/// give the same pictures as the originals — so the re-framing loses and
+/// adds nothing, on this machine's actual encoder output.
+#[test]
+fn avcc_reframing_keeps_every_picture() {
+    use video::annexb;
+
+    let mut encoder = match FfmpegEncoder::new(Quality::HD30) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("SKIP: no usable H.264 encoder in this environment: {e}");
+            return;
+        }
+    };
+    let mut direct = FfmpegDecoder::new().expect("decoder init");
+    let mut reframed = FfmpegDecoder::new().expect("decoder init");
+    let (mut keyframes, mut compared) = (0, 0);
+    for i in 0..75u64 {
+        let frame = synth_frame(1280, 720, i, i * 33);
+        for ef in encoder.encode(&frame).expect("encode") {
+            let split = annexb::split(&ef.data, Vec::new());
+            if ef.is_keyframe {
+                keyframes += 1;
+                assert!(
+                    !split.sps.is_empty() && !split.pps.is_empty(),
+                    "keyframe without in-band SPS/PPS: {}",
+                    video::describe_annexb_nals(&ef.data)
+                );
+            }
+            assert!(
+                !split.avcc.is_empty(),
+                "an access unit with no picture data"
+            );
+
+            // AVCC back to Annex-B: parameter sets, then each
+            // length-prefixed unit behind a start code.
+            let mut rebuilt = Vec::new();
+            for unit in split.sps.iter().chain(&split.pps) {
+                rebuilt.extend_from_slice(&[0, 0, 0, 1]);
+                rebuilt.extend_from_slice(unit);
+            }
+            let mut rest = split.avcc.as_slice();
+            while !rest.is_empty() {
+                let (len, tail) = rest.split_at(annexb::AVCC_LENGTH_BYTES);
+                let len = u32::from_be_bytes(len.try_into().unwrap()) as usize;
+                assert!(len > 0 && len <= tail.len(), "bad length prefix {len}");
+                rebuilt.extend_from_slice(&[0, 0, 0, 1]);
+                rebuilt.extend_from_slice(&tail[..len]);
+                rest = &tail[len..];
+            }
+            let again = video::EncodedFrame {
+                data: rebuilt,
+                timestamp_ms: ef.timestamp_ms,
+                is_keyframe: ef.is_keyframe,
+                width: ef.width,
+                height: ef.height,
+            };
+            let a = direct.decode(&ef).expect("decode original");
+            let b = reframed.decode(&again).expect("decode re-framed");
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    assert_eq!((a.width, a.height), (b.width, b.height));
+                    assert!(a.data == b.data, "frame {i}: pictures differ");
+                    compared += 1;
+                }
+                (None, None) => {}
+                _ => panic!("frame {i}: one decoder produced a picture, the other not"),
+            }
+        }
+    }
+    assert!(keyframes >= 1, "no keyframe in 75 frames");
+    assert!(compared >= 70, "only {compared} pictures compared");
+}

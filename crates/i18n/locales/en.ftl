@@ -561,6 +561,8 @@ rename-denied-invalid = That name is empty.
 rename-denied-rate-limited = One rename every 30 seconds.
 viewer-fullscreen = Full screen (F)
 viewer-exit-fullscreen = Exit full screen (Esc)
+viewer-fill = Zoom to fill (double-tap)
+viewer-fit = Fit to screen (double-tap)
 
 # ── Chat day dividers ─────────────────────────────────────────────────
 chat-day-today = Today
@@ -779,5 +781,10 @@ admin-channel = Admin logs
 admin-channel-lead = The audit, as it happens. Slash commands work here: /kick, /ban, /mute, /grant, /invite…
 admin-channel-commands-only = This channel takes commands only — start with /
 
-# ── Android host (ANDROID-SPEC.md; one window per process) ───────────
-host-single-window = Not available on Android yet — this opens in its own window on desktop.
+# ── Phone hosts (ANDROID-SPEC.md, IOS-SPEC.md; one window per process) ──
+host-single-window = Not available on phones yet — this opens in its own window on desktop.
+# iOS has no Quit (apps never close themselves there): what /quit says.
+quit-ios = On iPhone, apps close from the app switcher: swipe up from the bottom edge and pause, then swipe baucord away.
+# The attach sheet on iOS: where to pick from.
+pick-from-photos = Photos
+pick-from-files = Files

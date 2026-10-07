@@ -1,7 +1,10 @@
 # baucord — iOS (v1) technical spec
 
-Status: draft 1, 2026-10-06; M0 written the same day, awaiting its
-first build on a Mac (§14). Decisions in §1 are taken; the rest is the
+Status: draft 1, 2026-10-06; M0 written the same day and running in
+the iOS 18.3 simulator the same evening — the hello page (§14 D28),
+then the client, connected (§14, after D28); stream viewing and the
+file pickers pulled forward the same night (D30, D31), awaiting their
+first run. Decisions in §1 are taken; the rest is the
 plan they imply. Read `SESSION-GUIDE.md` §1 for how this codebase is
 worked on. `ANDROID-SPEC.md` is this spec's older sibling: almost
 everything the Android port learned — the `frontend` split, the
@@ -108,6 +111,7 @@ naming trap like `libandroid.so`; the binary is `[[bin]] name =
 |---|---|---|
 | Xcode **16 or later** (27 is current) | App Store | the iOS SDK, the simulator, signing, `xcodebuild`, `xcrun devicectl` (device install and log); open it once to install the iOS platform. Nothing in the project needs a newer Xcode for the simulator, and any iPhone simulator on iOS 17 or later runs the app (D4) — the user's iOS 18.1 one included (D24). The phone may need a newer Xcode (one that knows the phone's iOS); App Store Connect takes uploads only from Xcode 26 or later (since 2026-04-28) |
 | Xcode selected | `sudo xcode-select -s /Applications/Xcode.app` | otherwise `xcodebuild` is the bare Command Line Tools' |
+| Xcode's own iOS platform | `xcodebuild -downloadPlatform iOS` (or Settings → Components) | Xcode 15+ builds for no iOS destination until the platform matching its SDK is installed; older simulator runtimes do not count (D26) |
 | Homebrew | <https://brew.sh> | for the next two |
 | XcodeGen | `brew install xcodegen` | the project from `project.yml` — Slint's documented route for Rust apps |
 | CMake | `brew install cmake` | `opusic-sys` builds libopus with it; cmake-rs passes the iOS system name and SDK |
@@ -236,8 +240,11 @@ root, when it comes, serves Android and iOS alike — D14 there),
 - `hello.rs` (feature `hello`) — the M0 smoke test: a page in the
   theme's colours, inside the safe area, with a tap counter.
 
-To come: `host.rs` (the `Hooks` of §10: pickers, saving, opening,
-links), the audio route, the background task.
+- `host.rs` (2026-10-06, D31) — the `Hooks` of §10: the Photos and
+  Files pickers behind an action sheet, saving into
+  `Documents/Downloads`, Quick Look, links.
+
+To come: the audio route, the background task.
 
 ### 5.2 What M0 changed outside `crates/ios`
 
@@ -455,12 +462,12 @@ Android's JNI table, for iOS. Everything is called on the main thread.
 | `AVAudioSession` mode, activation, route, override, preferred input, notifications | §6.2–6.5 | M3 |
 | `AVAudioApplication` record permission | §4.4 | M3 |
 | VPIO through `coreaudio-rs` | §6.3 | M3 |
-| `UIApplication openURL:options:completionHandler:` | `Hooks::open_url` | M2 |
-| `PHPickerViewController` (photos), `UIDocumentPickerViewController` (any file, `asCopy`) presented from the key window's root view controller; their delegates declared in Rust (`define_class!`) | `Hooks::pick_file` → the same `attach_path` as the desktop dialog | M2 |
-| `Documents/Downloads` + `UIActivityViewController` (Save to Files, Photos, AirDrop) | `Hooks::save_download`, a file card's Save | M2 |
-| `QLPreviewController` (Quick Look) | `Hooks::open_target` | M2 |
+| `UIApplication openURL:options:completionHandler:` | `Hooks::open_url` | written 2026-10-06 (D31) |
+| `PHPickerViewController` (photos), `UIDocumentPickerViewController` (any file, `asCopy`) behind a `UIAlertController` action sheet, presented from the key window's top view controller; their delegates declared in Rust (`define_class!`) | `Hooks::pick_file` → the same `attach_path` as the desktop dialog | written 2026-10-06 (D31) |
+| `Documents/Downloads` | `Hooks::save_download`, a file card's Save | written 2026-10-06 (D31); a share sheet straight from Save (into Photos, AirDrop) is still M2 |
+| Quick Look through `UIDocumentInteractionController` (share sheet for what it cannot preview) | `Hooks::open_target` | written 2026-10-06 (D31) |
 | `UIPasteboard` | Slint's iOS clipboard (built in) | done |
-| `VTDecompressionSession`, `CMVideoFormatDescriptionCreateFromH264ParameterSets` (`objc2-video-toolbox`, `objc2-core-media`, `objc2-core-video`): Annex-B → length-prefixed samples, output as NV12 through `video::yuv` or as BGRA | stream viewing (D9) | M4 |
+| `VTDecompressionSession`, `CMVideoFormatDescriptionCreateFromH264ParameterSets` (`objc2-video-toolbox`, `objc2-core-media`, `objc2-core-video`): Annex-B → length-prefixed samples (`video::annexb`), output as BGRA, `yuv::bgra_to_rgba` | stream viewing (D9) | written 2026-10-06 (D30) |
 | `beginBackgroundTask` / `endBackgroundTask` | `Hooks::keep_alive` on iOS: finish what is in flight | M4 |
 | `UNUserNotificationCenter` | a DM while in voice (Android's M3 item) | M4 |
 | `setsockopt SO_NET_SERVICE_TYPE` | §7 | M4 |
@@ -545,11 +552,11 @@ signing stays on the Mac.
 
 | M | deliverable | done when |
 |---|---|---|
-| M0 ✍ 2026-10-06 | toolchain + hello + the client in the simulator: `crates/ios`, `ios/`, `run.sh`, Slint 1.18.1 | `run.sh --hello` shows the page in the simulator and on the phone; `run.sh` connects to a server from the simulator — the narrow layout, chat, voice received (headphones) |
+| M0 ✍ 2026-10-06, hello ✓ and the client ✓ in the simulator (D28, §14) | toolchain + hello + the client in the simulator: `crates/ios`, `ios/`, `run.sh`, Slint 1.18.1 | `run.sh --hello` shows the page in the simulator and on the phone; `run.sh` connects to a server from the simulator — the narrow layout, chat, voice received (headphones) |
 | M1 | the client on the iPhone: signing, the narrow layout at the phone's size, safe areas, rotation, typing in the composer (accents, emoji), every page's way back, `sys-locale` | a DM and a channel conversation from the iPhone |
-| M2 | files and links (the `Hooks` of §10), localized permission strings, the local-network hint, the iOS hint strings | attach a photo and a file; open a received file; a link opens Safari |
+| M2 | files and links (the `Hooks` of §10 — written early, D31), localized permission strings, the local-network hint, the iOS hint strings | attach a photo and a file; open a received file; a link opens Safari |
 | M3 | voice: the session lifecycle, VPIO, routes, interruptions, the record permission at join | 30 min in voice on the loudspeaker with the screen locked, no echo reported by the others; a phone call pauses and resumes it |
-| M4 | viewing (VideoToolbox); resilience: background task, network change, NAT64, `SO_NET_SERVICE_TYPE`; the local notification for a DM in voice | Wi-Fi → cellular recovers in under 10 s; a 1080p share plays |
+| M4 | viewing (VideoToolbox — written early, D30); resilience: background task, network change, NAT64, `SO_NET_SERVICE_TYPE`; the local notification for a DM in voice | Wi-Fi → cellular recovers in under 10 s; a 1080p share plays |
 | M5 | release: TestFlight, privacy manifest, icon without alpha, build numbers, README | testers install it from TestFlight |
 
 Later (v2 candidates, roughly in order): VPIO on macOS (AEC-SPEC E7),
@@ -563,10 +570,10 @@ VideoToolbox encoding).
 
 | risk | when | how |
 |---|---|---|
-| Skia has no prebuilt for the iOS targets | M0 | retired on paper 2026-10-06: the `aarch64-apple-ios` and `-sim` binaries (Metal) downloaded in the sandbox; the Mac's first build confirms |
+| Skia has no prebuilt for the iOS targets | M0 | **retired 2026-10-06**: the simulator build linked the `-sim` prebuilt and drew with it (D28); the device prebuilt was downloaded in the sandbox, `--device` links it |
 | The engine does not compile for iOS | M0 | type-checked and clippy-clean for `aarch64-apple-ios` in the sandbox (§14 D15), which found and fixed two errors (§5.2); the real compile of libopus and ring, and the link, are the Mac's |
 | libopus's cmake build for iOS | M0 | cmake-rs sets `CMAKE_SYSTEM_NAME=iOS` and the SDK; if it fails, a `CMAKE_TOOLCHAIN_FILE` or building opus with cc — the first build says |
-| Xcode's environment leaking into cargo's host builds (`SDKROOT`, `PATH`) | M0 | Slint's script lineage, the PATH fix, a separate target directory; first build says |
+| Xcode's environment leaking into cargo's host builds (`SDKROOT`, `PATH`) | M0 | Slint's script lineage, the PATH fix, a separate target directory. The hello build's build scripts (Slint's compiler, skia-bindings) ran clean under Xcode (D28); the app adds C builds for the target (libopus, ring), which the next build shows |
 | Background/foreground notifications under the scene life cycle | M0 | `lifecycle.rs` observes the scene's; the first run's log must show `lifecycle: background` when the app is swiped away |
 | Text input limited to `UIKeyInput` | M1 | type Spanish and Portuguese on the phone; autocorrect is the gap — upstream `UITextInput`, or a native text view over the composer |
 | VPIO side effects: quieter loudspeaker, ducking, 48 kHz | M3 | test on the user's iPhone; the ducking configuration; measure |
@@ -574,7 +581,8 @@ VideoToolbox encoding).
 | Free provisioning expires every 7 days | ongoing | the paid program before anyone else tests |
 | IPv6-only networks | M4 | `getaddrinfo` for literals |
 | App Store Connect's privacy-manifest and icon checks | M5 | §11 |
-| Skia falls back to the CPU on iOS without telling the app (Slint 1.18: wgpu first, then software; the reason goes to stderr only) | M0 | the first run checks that it draws on the GPU (Xcode's Debug navigator shows GPU work; stderr has no surface error); if it ever falls back, `BackendSelector::require_metal()` selects Skia's own Metal surface and fails loudly instead |
+| Skia falls back to the CPU on iOS without telling the app (Slint 1.18: wgpu first, then software; the reason goes to stderr only) | M0 | **retired in the simulator 2026-10-06** (D28): the log shows wgpu opening a Metal device and Skia compiling Metal shaders — the GPU path; the phone's first log confirms it there. If it ever falls back, `BackendSelector::require_metal()` selects Skia's own Metal surface and fails loudly instead |
+| Skia's 1-second wait on the Metal shader compiler (Ganesh gives up on a program whose compile takes longer and skips that draw for the frame; nothing is cached, so the next frame retries) | M1 | seen once in the simulator's first launch (D28), no visible effect. Watch the phone's first launch after an install for `Compilation took longer than 1000 ms` and a missing shape in the first frame; if it is visible, it is Slint's to fix (Skia's persistent program cache, `GrContextOptions::fPersistentCache`), not ours |
 | Slint 1.18 compiles wgpu into every winit + Skia build (iOS's render path; unused weight on the desktop, which draws on the CPU) | — | measured on the desktop side (+4 MB, +35 s on a minimal app, §14 D14); accepted |
 
 ## 14. Decisions taken after this draft
@@ -599,9 +607,69 @@ each proves. Decisions:
 | D23 | **Reviewed by a second reader** before hand-over, against XcodeGen's ProjectSpec and sources, the xcodebuild man page, Flutter's devicectl/simctl usage, Apple's documentation and the crate sources. No blocker on the simulator path. Fixed from it: `-allowProvisioningDeviceRegistration` (without it the first `--device` build cannot get a profile for an unregistered phone); the build phases call their scripts through `bash` (a Windows commit drops the executable bit); `CFBundleShortVersionString`/`CFBundleVersion` from the build settings (XcodeGen hard-codes "1.0"/"1"); dSYMs only where the configuration asks (not on every Debug build); `grep` without `-q` under `pipefail` (rustup could die of EPIPE — reproduced 1 in 3000 under bash 3.2); only iPhones among paired devices; `UIRequiresFullScreen` dropped (iPad-only, deprecated); the wording of D1, D6, §4.3, §11 and §13 (wgpu is iOS's render path; the iOS 27 requirement applies to apps built with its SDK; boot-time APIs come from cpal; the `SO_NET_SERVICE_TYPE` constants are not in `libc`) | the scripts cannot run here; a reader who had not written them checked them against the tools' own documentation |
 | D24 | **Any iPhone simulator on iOS 17 or later** (2026-10-06, the user has the iOS 18.1 one): nothing in M0 needs a newer runtime — the deployment target is 17.0, the scene manifest works from iOS 13, and the iOS 17+ APIs of later milestones are on the 18.1 runtime too. `run.sh --os 18.1` picks an iPhone simulator on that runtime (`--os 18` any 18.x, the newest first), and `--sim` takes a name or a UDID; the chosen one is printed with its iOS. Xcode 16 or later builds it; the phone may need the Xcode that knows its iOS, and TestFlight needs Xcode 26+ | the user's machine decides which simulators exist; the script should take what is there |
 | D25 | **One version for every platform: the public crates', 1.1.7** (2026-10-06). The eight crates whose version users, the server and the stores see — `protocol`, `transport`, `client`, `server`, `frontend`, `desktop`, `android`, `ios` — move together (1.1.6 had moved only the apps: they said 1.1.6 and told the server 1.1.5, the protocol crate's version). Every platform reads the number from its crate: the desktop's updater and About from `frontend`, the wire's `client_version` from `protocol`, Android's default `versionName` from `crates/android/Cargo.toml` (Gradle, through `providers.fileContents`; the release workflow checks the tag against it), iOS's `MARKETING_VERSION` from `crates/ios/Cargo.toml` (`run.sh` → `Config/Version.xcconfig`, build number = commit count, the cargo phase refuses a mismatch). `crates/protocol/tests/versions.rs` fails when one of the eight is bumped alone. The internal libraries (`app-core`, `audio`, `video`, `ui`, `i18n`) keep their own numbers | one number per release, written once per crate and checked |
+| D26 | **First Mac run (2026-10-06): Xcode 16.2 refused every destination** — "Unable to find a destination matching { id:<the iOS 18.1 simulator> }", with the only ineligible destination "Any iOS Device … error: iOS 18.2 is not installed. To use with Xcode, first download and install the platform". Since Xcode 15 the iOS platform matching Xcode's SDK (18.2 for 16.2) must be installed before `xcodebuild` builds for any iOS destination, simulators of other runtimes included; once it is, the 18.1 simulator is usable as D24 says. Fix on the Mac: `xcodebuild -downloadPlatform iOS` (or Xcode → Settings → Components) — for Xcode 16.2 it fetches the iOS 18.3.1 simulator, Apple's pairing with the 18.2 SDK (`-buildVersion 18.2` would take exactly 18.2; no need). `run.sh` now prints the Xcode it uses, and turns this error into that instruction (tested under bash 3.2 against the exact output); its other build failure says "xcodebuild failed" instead of blaming cargo, which had not run. Also noted: an iPhone on iOS 26/27 needs Xcode 26+ to install on, which needs a newer macOS (Xcode 27: macOS Tahoe 26.6, Apple silicon) — if Xcode is updated for the phone anyway, that replaces the 18.2 download | the project was fine; the machine needed its platform. The script should say what to do instead of the raw resolver dump |
+| D27 | **`run.sh` ended silently on the second Mac run** (2026-10-06): no output at all, after the first run had printed `>> Xcode 16.2`. Cause: `XCODE="$(xcodebuild -version | head -n 1)"` under `set -euo pipefail` — `head` leaves after the first line, `xcodebuild` writes its second ("Build version …") into the closed pipe and dies of SIGPIPE (141), `pipefail` makes the assignment fail and `set -e` ends the script; stderr was sent to `/dev/null`, so nothing said why. A race: it lost this time. Reproduced under bash 3.2 with a stand-in that sleeps between the two lines (exit 141, no output). Fixed: `xcodebuild -version` is read whole and its first line taken in bash (`first_line`), and a failing `-version` now shows Xcode's message (first-launch setup or licence after an install); every `… \| head -n 1` in `run.sh`, the cargo phase and the Android release workflow became `awk … { print; exit }` reading the file itself; both scripts trap `ERR` and print where they stopped ("near line N" — bash 3.2 reports the end of the enclosing block), and `simctl list` has its own message. Re-tested: the slow stand-in passes 3 of 3, every earlier scenario unchanged, no false trap firings | the reviewer had flagged this class for `grep -q`; the fix then missed `head`. Under `pipefail` no pipeline may have a reader that leaves early |
 
-What the first Mac build will tell, in order: whether XcodeGen accepts
-`project.yml`; whether libopus's cmake build and ring compile for iOS;
-whether the hello page renders in the simulator (on the GPU, with the
-scene delegate and the safe area); then the client in the simulator;
-then the phone. Record each here and in SESSION-GUIDE.md §5.
+| D28 | **M0's hello runs in the simulator** (2026-10-06, Xcode 16.2, iPhone 16 Pro on iOS 18.3, `run.sh --hello --os 18.3`): the page drew in the theme's colours and the button counted taps. That proves, in one go: XcodeGen reads `project.yml`; the cargo phase builds `aarch64-apple-ios-sim` from Xcode (Slint's compiler and skia-bindings' build scripts included) and the binary lands in the bundle; the version guard passes (`MARKETING_VERSION` 1.1.7); the icon phase runs; the app launches under the scene manifest with `SlintWindowSceneDelegate`; `paths.rs` and `logging.rs` work (the start line names `…/Library/Application Support/baucord` and the log in `…/Documents`); and Skia draws **on the GPU** through wgpu's Metal device. What the log also said, none of it ours to fix: wgpu's `Missing downlevel flags` (the simulator offers only the Apple2 GPU family, so wgpu reports it as not fully WebGPU-compliant); `MAPPABLE_PRIMARY_BUFFERS enabled on a discrete gpu` (Slint requests every feature the adapter has, and wgpu calls a Metal device without unified memory "discrete" — the simulator's device; an iPhone has unified memory, so the phone should not say it); and one Skia `Compilation took longer than 1000 ms` (`org.skia.ganesh`) for a circle-edge vertex shader — Ganesh waits one second for the Metal compiler and drops that draw for the frame if it is late, without caching the failure, so the next frame compiles it again with the system's compiler warm (§13) | the first Apple-hardware result; it retires the Skia-prebuilt and CPU-fallback risks in the simulator and leaves the C builds (libopus, ring) to the app build |
+
+**2026-10-06 (evening) — the client runs in the simulator.** `run.sh
+--os 18.3` built the whole app (libopus's cmake build and ring compiled
+for `aarch64-apple-ios-sim` without a change) and it connected from
+the iPhone 16 Pro simulator: roster, channels, chat, voice both ways
+(`audio stats … Sent 30 Recv 157 Lost 0 … Underruns 0 … aec: none (not
+on this platform yet)`), the audio session line, `lifecycle:
+foreground`, the device key generated in Application Support. The
+user's report: "all looks good" except three things — a stream showed
+"Video decoder init failed: … no video codec backend on this platform",
+Attach did nothing (`no file picker on this host`), and Quit did
+nothing (`ControlFlow::Exit ignored on iOS`) — plus a log flooded with
+winit's `processing non RedrawRequested event after the main event
+loop: AboutToWait`. The first two were M4's and M2's; pulled forward:
+
+| # | decision | why |
+|---|---|---|
+| D29 | **No Quit on iOS.** `frontend::app::HOST_CAN_QUIT` is false there: the connect page's Quit is hidden (`State.can-quit`), `/quit` answers with how iPhone apps close (the app switcher; `quit-ios` in the three catalogs) and leaves the command list. `host-single-window` (the admin panel's toast) no longer says "Android" but "phones" | winit ignores `ControlFlow::Exit` on iOS (the loop never returns, §4.1), and Apple's rule is that only the user closes an app — a button that does nothing is worse than none |
+| D30 | **Stream viewing through VideoToolbox, now** (D9 pulled forward from M4): `video::videotoolbox::VideoToolboxDecoder`, chosen by `client::screen::create_decoder()` on iOS. The in-band SPS/PPS of each keyframe make a `CMVideoFormatDescription` and a `VTDecompressionSession`; each Annex-B access unit is re-framed as AVCC (`video::annexb::split`, platform-free: 6 host tests), wrapped in a `CMBlockBuffer`/`CMSampleBuffer` and decoded **synchronously** (no async or temporal flag: the output callback runs before `DecodeFrame` returns, so it writes into a `Target` on the caller's stack) to **BGRA** — VideoToolbox converts the colours on the GPU from the stream's own signalling — and `yuv::bgra_to_rgba` swaps two bytes a pixel into the client's RGBA (2 host tests). `kVTDecompressionPropertyKey_RealTime` on. New parameter sets rebuild the session; any decode error (`kVTInvalidSessionErr` after iOS took the hardware decoder back in the background, among them) rebuilds it at the next keyframe, dropping P-frames meanwhile — the senders send an IDR every 2 s. `flush()` is a no-op, as MediaCodec's. New crates (iOS only): `objc2-video-toolbox`, `objc2-core-media`. Checked: a host test runs the real encoder (libx264 here) through `annexb::split`, rebuilds Annex-B from the AVCC and decodes both — 75 frames, identical pictures; the iOS build clippy-clean (D15's method) | the simulator showed the gap first-hand; the Android sibling (MediaCodec, ANDROID-SPEC.md D23) set the shape, and the first device run says whether VideoToolbox agrees: `VideoToolbox: decoding H.264 to BGRA`, then `VideoToolbox: first picture WxH` |
+| D31 | **The host's file and link hooks** (§10's M2 rows, pulled forward): `crates/ios/src/host.rs` implements `frontend::host::Hooks` in Rust. *Attach* shows an action sheet (*Photos* / *Files* / Cancel, `pick-from-photos`/`pick-from-files` in the catalogs): Photos is `PHPickerViewController` (out of process, no permission; *compatible* representation, so HEIC arrives as JPEG; one item; images only for the avatar) — declared in `host.rs` with `extern_class!` because `objc2-photos-ui` 0.3.2 binds it for macOS only — and Files is `UIDocumentPickerViewController` (any item, `asCopy`). The item is copied (Photos: inside the completion handler, before Photos deletes it) or moved (Files' own copy) into `tmp/picks/` and handed to the desktop dialog's road (`attach_path`); one pick at a time and the 64 MiB cap as on Android. *Save* writes `Documents/Downloads` ("Files › baucord › Downloads" in the toast). *Open* is Quick Look through `UIDocumentInteractionController`, with the share sheet for types it cannot preview. *Links* go to `UIApplication openURL:`. Delegates (weak in UIKit) and the open interaction controller are kept in a main-thread `thread_local`. Reviewed by a second reader against the crate sources and Apple's forums; fixed from it: a picker swiped down tells neither of its own delegate methods (Apple DTS), so both pickers' presentation controllers report `presentationControllerDidDismiss:` to the same delegate, which frees the slot — before, every Attach said "still reading" for 10 minutes; a Photos item with no usable type falls back to any image or movie, never to the item's first type (a Live Photo's is a folder); the callback runs after the slot's lock is released; a refused Files copy is deleted. Settings' *Open config folder* is hidden on touch hosts (Android too): no phone app opens another's private folder, and on iOS the share sheet would have offered the device key | users attach photos from a phone more than anything; doing it now, with the simulator at hand, beats waiting for M2. New crates (iOS only): `objc2-photos-ui`, `objc2-uniform-type-identifiers` |
+| D32 | **winit's iOS log noise is dropped below `Error`** (`logging.rs`): winit 0.30.13 sends `AboutToWait` after switching itself into redraw processing and then warns about its own event on every run-loop turn (up to 120 a second while anything animates), and warns `… is ignored on iOS` for each desktop-only window call Slint makes. Filtered by target before formatting, so it costs nothing | none of it is actionable, and it buried the lines that are — and filled `baucord.log` |
+
+**2026-10-06 (night) — the first stream in the simulator.** A share
+(a 16:9 game) played through VideoToolbox (D30). It did not fill the
+landscape screen, which the user asked for, on both phones:
+
+| # | decision | why |
+|---|---|---|
+| D33 | **The stream page fills the screen** (shared `viewer.slint`; ANDROID-SPEC.md D41): on a phone the picture goes edge to edge — under the notch, the home indicator and the system bars — and only the chrome (name chip, control bar) keeps to the safe area (`chrome-inset-*`, not the keyboard's). In landscape a **double-tap**, or the bar's zoom button (Expand/Shrink; `viewer-fill`/`viewer-fit` in the catalogs), switches between *fit* (the whole picture, letterboxed) and *fill* (`ImageFit.cover`: the screen covered, the picture's edges cropped); the choice is `State.watch-fill`, kept for the session. Portrait offers no fill — a landscape stream filling an upright phone would show a quarter of it. The control bar's stats column now gives way (elides) when the bar does not fit: upright, *Stop watching* had been pushed off the screen, and iOS has no Back key to leave by. The desktop window is unchanged (double-click is still fullscreen). Rendered with Slint's software renderer at 852×393 (an iPhone 16 Pro on its side) and 393×852, a 4:3 and a 16:9 frame: fit fills the height, fill covers the screen, a double-tap toggles, the chrome sits inside the insets, the portrait bar keeps its Stop button | a 4:3 or 16:9 stream on a 19.5:9 phone is a small picture with bands; the screen's own edges were being given up to the safe area too |
+| D34 | **iOS: Slint's safe area is refreshed after a rotation** (`crates/ios/src/insets.rs`). The screenshots showed portrait insets in landscape (the name chip under the Dynamic Island, the page 96 pt short — top 62 + bottom 34): Slint reads the safe area only when winit reports a resize, which winit does from its view's `layoutSubviews`, evidently before UIKit has the new orientation's insets; nothing asks again. A probe — an empty, non-interactive `UIView` subclass behind winit's view, sized with the window — hears `safeAreaInsetsDidChange` and calls `setNeedsLayout` on winit's view, which re-sends the resize, and Slint reads the insets afresh. Installed on the first `UIWindowDidBecomeKeyNotification`, with one relayout then for an app that starts rotated. Every page benefits, not only the stream's | the platform's layout pass, not the app, holds the stale value; a view that is told when the safe area changes is UIKit's own signal for it |
+
+**2026-10-06 (night) — attach and watch, in the simulator.** The log
+of that run: a Photos pick (`photo pick: loading public.jpeg for
+IMG_0005 (has ["public.jpeg", …])` — the *compatible* mode gave JPEG
+first, as D31 hoped), copied and previewed; a Files pick of a 2.6 MB
+`baucord.log`, attached as a card; a 1600×900 share decoded by
+VideoToolbox at a steady 30 fps (`VideoToolbox: first picture
+1600x900`, then `viewer telemetry … 30.0 fps`), with a few `Slow
+decode` frames of 20–50 ms — the simulator decodes on the Mac's CPU;
+the phone's hardware decoder is the measure. Two findings, and the
+user's screenshots of the main screen on its side (taken before D34's
+fix was installed, so still with portrait insets):
+
+| # | decision | why |
+|---|---|---|
+| D35 | **A compact sidebar for short screens** (shared `sidebar.slint`; ANDROID-SPEC.md D42): below 600 px of height — a phone on its side (~370 px with the right insets), a small desktop window — the sidebar keeps every control on screen by giving up room: gaps of 8 px instead of 12, the *New channel* / *Invite* chips on the server-name row (a `ChipButton` component now draws both rows' chips), Messages capped at 30 % of the height and at its own rows, the status and latency on one line (the resource line dropped), the control bar 44 px tall, and *Disconnect* as a red hang-up icon in that bar instead of its own button. The full stack needs ~600 px (Messages alone is 200); on its side, with Messages open, the status, the mic/deafen/settings bar and Disconnect had been pushed off the bottom entirely, and with it folded Disconnect was cut by the screen's corner. Rendered at 852×393 with landscape insets: everything on screen open or folded, the voice list keeping two to four rows; upright (393×852) unchanged | the controls are the part that must never be cut; a phone on its side has a third of a desktop's height |
+| D36 | **One delivery per pick** (`host.rs`): the pick's callback is *claimed* by the first file delivered (`claim()`); a second delivery of the same pick is ignored, and a cancel no longer frees a slot whose file is still being copied. The simulator reported one Files pick twice within the same millisecond: the first moved the file and attached it, the second found it gone — `file pick failed: No such file or directory`, shown as an error toast over a successful attach | whatever UIKit's reason, a pick's file is handed over once |
+
+In the simulator, Photos has Apple's sample pictures and Files starts
+empty: drag a file from the Mac onto the simulator window to put it in
+Files (or a picture, into Photos).
+
+What the next Mac runs will tell, in order: the main screen on its
+side with the compact sidebar and the right insets (D34, D35); the
+stream page in landscape filling the screen, a double-tap zooming to fill, and the
+name chip clear of the Dynamic Island after a rotation (D33, D34);
+a shared screen in the simulator (`VideoToolbox: first picture WxH`,
+seen 2026-10-06); Attach from Photos and
+from Files, a received file saved and opened, a link; `lifecycle:
+background` in the log on going to the home screen (⌘⇧H); then the
+phone (`--device`), where the Xcode/iOS pairing of D26 may ask for a
+newer Xcode. Record each here and in SESSION-GUIDE.md §5.

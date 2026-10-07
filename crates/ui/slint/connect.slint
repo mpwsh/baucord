@@ -120,7 +120,7 @@ export component ConnectView inherits Rectangle {
             HorizontalLayout {
                 spacing: Theme.gap-sm;
                 Btn { text: Tr.settings; clicked => { Logic.open-settings(); } }
-                Btn { text: Tr.quit; clicked => { Logic.quit(); } }
+                if State.can-quit : Btn { text: Tr.quit; clicked => { Logic.quit(); } }
             }
 
             // "Saved device isn't connected" — the fix (Settings) sits

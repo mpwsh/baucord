@@ -25,13 +25,27 @@ struct Tee {
     file: Mutex<Option<File>>,
 }
 
+/// winit 0.30's iOS backend warns on every turn of the run loop: it
+/// sends `AboutToWait` after switching itself to redraw processing, then
+/// warns that a non-redraw event came after the main event loop (its own
+/// event, every wake — up to 120 a second while anything animates), and
+/// it says `… is ignored on iOS` for each desktop-only window call
+/// Slint makes. None of it is actionable for the app (IOS-SPEC.md §14
+/// D32), so below `Error` that module is dropped — before the line is
+/// formatted, so it costs nothing either.
+const NOISY: &str = "winit::platform_impl::ios";
+
 impl Log for Tee {
-    fn enabled(&self, _metadata: &Metadata) -> bool {
-        // `log::max_level()` already gated the record.
-        true
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        // `log::max_level()` already gated the level.
+        metadata.level() == log::Level::Error || !metadata.target().starts_with(NOISY)
     }
 
     fn log(&self, record: &Record) {
+        // `log`'s macros do not ask `enabled` first; ask here.
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         // env_logger's default line: `[ts LEVEL target] message`.
         let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z");
         let line = format!(

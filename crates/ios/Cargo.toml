@@ -24,7 +24,7 @@ default = ["app"]
 # clipboard crate, hotkeys, updater, dialogs — their `stubs/` twins).
 # Always build this crate with `-p ios`: a workspace-wide build would
 # unify `frontend/desktop` back in from the desktop crate.
-app = ["dep:frontend", "dep:client"]
+app = ["dep:frontend", "dep:client", "dep:i18n"]
 # M0's toolchain smoke test (IOS-SPEC.md §12): one Slint page in the
 # theme's colours, no engine. Proves Xcode + cargo + the Skia prebuilt
 # + signing before the whole dependency tree is in play
@@ -41,22 +41,29 @@ slint.workspace = true
 log = { workspace = true, features = ["std"] }
 frontend = { path = "../frontend", default-features = false, optional = true }
 client = { path = "../client", optional = true }
+# The attach sheet's words (host.rs), from the app's own catalogs.
+i18n = { path = "../i18n", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-# The Apple bindings already in the tree through cpal and Slint's iOS
-# backend (objc2 0.6 / the 0.3 framework crates), so nothing new
-# compiles; only the features below are added.
+# The Apple bindings (objc2 0.6 / the 0.3 framework crates), mostly
+# already in the tree through cpal and Slint's iOS backend; new with
+# host.rs are objc2-photos-ui and objc2-uniform-type-identifiers (and
+# objc2-video-toolbox / -core-media in `video`).
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
   "std",
   "block2",
   "NSArray",
+  "NSDictionary",
   "NSError",
   "NSFileManager",
+  "NSItemProvider",
   "NSNotification",
   "NSOperation",
   "NSPathUtilities",
+  "NSProgress",
+  "NSSet",
   "NSString",
   "NSURL",
   "NSValue",
@@ -69,10 +76,43 @@ objc2-avf-audio = { version = "0.3", default-features = false, features = [
 ] }
 # The lifecycle notifications (lifecycle.rs): the scene's background
 # and foreground, the application's memory warning and termination.
+# The pickers, Quick Look and links (host.rs): the action sheet, the
+# document picker, the document interaction controller, and the window
+# to present them from.
 objc2-ui-kit = { version = "0.3", default-features = false, features = [
   "std",
+  "block2",
+  "objc2-core-foundation",
+  "objc2-uniform-type-identifiers",
+  "UIAlertController",
   "UIApplication",
+  "UIDocumentInteractionController",
+  "UIDocumentPickerViewController",
+  "UIPresentationController",
+  "UIResponder",
   "UIScene",
+  "UIView",
+  "UIViewController",
+  "UIWindow",
+  "UIWindowScene",
+] }
+# Photos' picker (host.rs): its configuration, filter and results. The
+# iOS picker class itself is declared in host.rs (the crate binds it for
+# macOS only). Links PhotosUI.
+objc2-photos-ui = { version = "0.3", default-features = false, features = [
+  "std",
+  "PHPicker",
+] }
+# "Any file" for the document picker.
+objc2-uniform-type-identifiers = { version = "0.3", default-features = false, features = [
+  "std",
+  "UTType",
+  "UTCoreTypes",
+] }
+# CGRect for anchoring the share sheet.
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "CFCGTypes",
 ] }
 # Timestamps in baucord.log (the desktop's env_logger format).
 chrono = "0.4"
