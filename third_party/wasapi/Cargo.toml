@@ -1,0 +1,72 @@
+# wasapi 0.24.0 from crates.io, vendored with one addition for baucord:
+# `AudioClient::as_iaudioclient` (see BAUCORD-PATCH.md). The workspace
+# root's `[patch.crates-io]` points here; `[workspace] exclude` keeps it
+# out of the workspace (no fmt, no clippy, not built off Windows).
+# Examples and dev-dependencies were removed. The manifest is the
+# registry's normalized one otherwise.
+
+[package]
+edition = "2021"
+rust-version = "1.76"
+name = "wasapi"
+version = "0.24.0"
+authors = ["HEnquist <henrik.enquist@gmail.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Bindings for the Wasapi API on Windows"
+readme = "README.md"
+keywords = [
+    "audio",
+    "sound",
+    "windows",
+    "wasapi",
+]
+categories = [
+    "multimedia::audio",
+    "os::windows-apis",
+]
+license = "MIT"
+repository = "https://github.com/HEnquist/wasapi-rs"
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+
+[lib]
+name = "wasapi"
+path = "src/lib.rs"
+
+[dependencies.log]
+version = "0.4"
+
+[dependencies.num-integer]
+version = "0.1"
+
+[dependencies.thiserror]
+version = "2.0"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Foundation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Security",
+]
+
+[dependencies.windows-core]
+version = "0.62"

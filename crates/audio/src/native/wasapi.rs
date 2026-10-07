@@ -342,6 +342,49 @@ fn role_for(voice: bool) -> Role {
     }
 }
 
+/// On the voice-call path: ask Windows not to lower other apps while
+/// this stream runs (AEC-SPEC.md E11). A `Communications` stream is what
+/// Windows' "communications activity" ducking reacts to — by default
+/// every other app drops 80 % for as long as we are in voice — and
+/// `IAudioClientDuckingControl` is the per-stream opt-out. It exists
+/// from Windows 10 build 20348 (Windows 11); before that the service is
+/// missing and only the user's Sound settings help. Microsoft documents
+/// it for render streams; capture is asked too, and the stream's log
+/// line says what each answered. Call after `Initialize` (an
+/// uninitialized client refuses services) and before `Start`, on the
+/// thread that owns the client. Returns the word for the log line.
+fn ask_not_to_duck(client: &AudioClient, what: &str) -> &'static str {
+    use windows::Win32::Media::Audio::{
+        IAudioClientDuckingControl, AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS,
+    };
+    // SAFETY: a COM call on the client's own interface, on the thread
+    // that initialised COM and owns the client; the service comes back
+    // reference-counted and is released when `control` drops.
+    let control = match unsafe {
+        client
+            .as_iaudioclient()
+            .GetService::<IAudioClientDuckingControl>()
+    } {
+        Ok(control) => control,
+        Err(e) => {
+            // E_NOINTERFACE: Windows before build 20348, or (capture on
+            // a newer one) a stream kind that has none.
+            debug!("{what}: no ducking control for this stream ({e})");
+            return "unavailable";
+        }
+    };
+    // SAFETY: as above, on the interface just obtained.
+    match unsafe {
+        control.SetDuckingOptionsForCurrentStream(AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS)
+    } {
+        Ok(()) => "requested",
+        Err(e) => {
+            warn!("{what}: Windows refused \"do not duck other streams\": {e}");
+            "refused"
+        }
+    }
+}
+
 /// After capture opened in the `Communications` category: point the
 /// canceller at our render endpoint and say whether one is running
 /// (AEC-SPEC.md §4.1 step 5).
@@ -593,6 +636,7 @@ fn capture_thread(
     let _rt = crate::platform::promote_current_thread(480, OPUS_SAMPLE_RATE);
 
     let mut aec_verdict = None;
+    let mut ducking = "n/a";
     let opened =
         (|| -> Result<(AudioClient, AudioCaptureClient, Handle, Negotiated, String), String> {
             let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
@@ -616,6 +660,7 @@ fn capture_thread(
                     &enumerator,
                     reference.as_deref(),
                 ));
+                ducking = ask_not_to_duck(&client, "capture");
             }
             let event = client
                 .set_get_eventhandle()
@@ -650,7 +695,8 @@ fn capture_thread(
     };
 
     info!(
-        "Native WASAPI capture: {friendly} @ {} Hz, {}ch, {:?}, {} ms engine buffer, category={}",
+        "Native WASAPI capture: {friendly} @ {} Hz, {}ch, {:?}, {} ms engine buffer, category={}, \
+         do-not-duck={ducking}",
         negotiated.sample_rate,
         negotiated.channels,
         negotiated.layout,
@@ -894,6 +940,7 @@ fn render_thread(
     }
     let _rt = crate::platform::promote_current_thread(480, OPUS_SAMPLE_RATE);
 
+    let mut ducking = "n/a";
     let opened =
         (|| -> Result<(AudioClient, AudioRenderClient, Handle, Negotiated, String), String> {
             let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
@@ -906,6 +953,9 @@ fn render_thread(
                 "render",
                 voice,
             )?;
+            if voice {
+                ducking = ask_not_to_duck(&client, "render");
+            }
             let event = client
                 .set_get_eventhandle()
                 .map_err(|e| format!("render event handle: {e}"))?;
@@ -945,7 +995,8 @@ fn render_thread(
     };
 
     info!(
-        "Native WASAPI render: {friendly} @ {} Hz, {}ch, {:?}, {} ms engine buffer, category={}",
+        "Native WASAPI render: {friendly} @ {} Hz, {}ch, {:?}, {} ms engine buffer, category={}, \
+         do-not-duck={ducking}",
         negotiated.sample_rate,
         negotiated.channels,
         negotiated.layout,

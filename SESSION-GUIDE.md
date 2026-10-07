@@ -241,6 +241,7 @@ ten-line parity script over the `.ftl` keys is worth re-running.
 | 1.1.5 | the lobby (connect invisible, `LOBBY` bit 16, implicit channel, "joined <room>" lines, reconnect-rejoin, no xp in lobby or AFK); relay port 51000 by default with the client following the official server's move; drag a user onto a channel; images get Copy/Delete and a gallery copy button; LIVE chip opens the viewer; gold badges, green admin marker; timestamps on system lines and channel-move lines; `delete-messages` permission; log-level setting; window centred instead of remembered; the DM avatar ring gone, "Admin logs" with a `#`; unchanged profiles no longer trip the rate limit |
 | 1.1.6 | the `frontend` split (the UI logic shared by every host; `desktop` is `main.rs`), dropping files from the OS onto the window, the tech-debt cycles (clippy clean at `deny`), drag-to-move and badge fixes |
 | 1.1.7 | the Android client (sideloaded; voice, chat, DMs, files, stream viewing through MediaCodec, the in-window Settings and stream pages), the iPhone client (Ad Hoc; the same, VideoToolbox), echo cancellation (Windows, Android, iOS VPIO), Slint 1.18.1, the battery work (no polling workers, nothing drawn in the background), the stream page (zoom, fill, rotate), Settings → Debug (log upload), the one-row sidebar header, notifications on the phones |
+| 1.1.8 | Windows asks not to lower other apps while in voice (AEC-SPEC E11, the vendored `wasapi`); the phones open the microphone only in a voice room and unmuted (ANDROID-SPEC D53, IOS-SPEC D51); the APK on the website, named like the desktop zips (D55); the Android release workflow on maintained actions, with *Run workflow* able to rebuild a release (D54) |
 
 Memory-mode servers (persistence off) still use the legacy
 `ImageMessage` relay for pictures and refuse files.
@@ -626,6 +627,15 @@ Memory-mode servers (persistence off) still use the legacy
   `sync_voice_room` count it, as the microphone test does. An Android
   engine in the lobby has no playback either: chimes there go through
   `host::play_chime`.
+- **A Windows Communications stream ducks every other app** (by 80 %
+  by default). Any stream opened on the voice-call path asks Windows
+  not to (`ask_not_to_duck` in `native/wasapi.rs`, AEC-SPEC.md E11)
+  and logs `do-not-duck=` on its open line; a new one must too.
+- **`third_party/wasapi` is crates.io's `wasapi` 0.24.0 plus one
+  accessor** (`AudioClient::as_iaudioclient`), wired in by the root
+  `[patch.crates-io]` and kept out of the workspace (`exclude`): never
+  `cargo fmt` or edit it beyond the patch, and re-apply the patch if
+  the crate is upgraded (`third_party/wasapi/BAUCORD-PATCH.md`).
 - **Off screen, a phone notifies instead of chiming** (`app::alerts`):
   a DM is a notification whose tap opens the conversation; the first
   voice into empty rooms is "X joined Y". Notifications exist only while

@@ -200,6 +200,18 @@ What stands between this and "production for strangers":
   `client/src/voice.rs` ~547 ignores `service()`). Pending flags for
   both sides on any failed reopen, a `DeviceLost/Restored` event, the
   mic button shows it.
+- [ ] **CLI-11 [P0][S] Windows lowers other apps while baucord is in
+  voice** (user reports, 1.1.7). The echo canceller's Communications
+  streams trigger Windows' "reduce other sounds by 80 %" (AEC-SPEC
+  §4.6). 2026-10-07: each voice stream asks Windows not to duck others
+  (AEC-SPEC E11; vendored `wasapi` with one accessor). To verify on
+  Windows 11, speakers, Echo cancellation Auto: music playing, join
+  voice — the music must keep its volume, and both
+  `Native WASAPI capture/render:` lines read `do-not-duck=requested`.
+  Windows 10 cannot be helped this way. If 11 still ducks: the
+  software canceller (AEC-SPEC §8) or Auto keeping speakers off the
+  call path — decide then. Meanwhile users: `control mmsys.cpl,,3` →
+  "Do nothing".
 - [ ] **CLI-10 [P2] Smaller client items** *(review)*: auto-reconnect
   gives up after ~60 s (5 tries) — phones on a train need longer;
   server addresses must be IP literals (no DNS — also an App Review

@@ -5,7 +5,7 @@ name = "ios"
 # session and Slint's winit backend (Skia on Metal), then runs the same
 # `frontend::app::run()` the desktop binary runs. Versioned with the
 # public crates.
-version = "1.1.7"
+version = "1.1.8"
 edition = "2024"
 publish = false
 

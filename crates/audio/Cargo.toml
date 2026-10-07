@@ -115,6 +115,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 # Cost note: pulls `windows` 0.62 — compile-time only on Windows targets,
 # zero footprint elsewhere (target-gated).
 [target.'cfg(target_os = "windows")'.dependencies]
+# Resolved to third_party/wasapi (0.24.0 + `AudioClient::as_iaudioclient`,
+# for the ducking opt-out) by the root `[patch.crates-io]`.
 wasapi = "0.24"
 # The endpoint form factor for echo cancellation (native/wasapi.rs,
 # AEC-SPEC.md §4.2): `wasapi` keeps its property accessor private. Same

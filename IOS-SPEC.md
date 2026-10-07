@@ -1,6 +1,6 @@
 # baucord — iOS (v1) technical spec
 
-> **Status (2026-10-07):** running on users' iPhones as 1.1.7 (Ad Hoc).
+> **Status (2026-10-07):** 1.1.8 (Ad Hoc builds on users' iPhones).
 > §0–§13 are the first draft (decisions D1…D13 in §1); §14 holds every
 > decision since (D14…D51, in order) — **where they disagree, §14 is
 > right**. What is left:

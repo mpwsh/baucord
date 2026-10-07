@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "android"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "android_logger",
  "chrono",
@@ -996,7 +996,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "audio",
  "crossbeam-channel",
@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "client",
  "env_logger",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "frontend"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "app-core",
  "arboard",
@@ -3315,7 +3315,7 @@ dependencies = [
 
 [[package]]
 name = "ios"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -5168,7 +5168,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "protocol"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "bytes",
  "log",
@@ -5874,7 +5874,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "chrono",
  "clap 4.6.5",
@@ -6719,7 +6719,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "1.1.7"
+version = "1.1.8"
 dependencies = [
  "base64",
  "bytes",
@@ -7102,8 +7102,6 @@ dependencies = [
 [[package]]
 name = "wasapi"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee144c215d8d31e94c1a599fbaf540ca82a7017e4f1786816b179f334fac751d"
 dependencies = [
  "log",
  "num-integer",

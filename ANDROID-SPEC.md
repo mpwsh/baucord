@@ -1,6 +1,6 @@
 # baucord — Android (v1) technical spec
 
-> **Status (2026-10-07):** shipping as 1.1.7, sideloaded. §0–§13 are the
+> **Status (2026-10-07):** shipping as 1.1.8, sideloaded (and on the website, D55). §0–§13 are the
 > first draft (decisions D1…D9 in §1); §14 holds every decision since
 > (D10…D55, the newest at the top of its second table) — **where they disagree, §14 is right**
 > (stream viewing, "not in v1" in §0, arrived with D23). What is left:

@@ -1,5 +1,9 @@
 [workspace]
 members = ["crates/*"]
+# Vendored dependencies (`[patch.crates-io]` below) are not members: no
+# fmt or clippy of upstream code, and nothing Windows-only built
+# elsewhere.
+exclude = ["third_party"]
 resolver = "2"
 # ── Shared dependency versions ──────────────────────────────────────────
 # Crates opt in per dependency with `dep.workspace = true`. Only deps
@@ -81,3 +85,11 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.audio]
 opt-level = 3
+
+# ── Vendored with a patch ───────────────────────────────────────────────
+# wasapi 0.24.0 plus `AudioClient::as_iaudioclient`, which the Windows
+# voice path needs to ask Windows not to lower other apps
+# (third_party/wasapi/BAUCORD-PATCH.md, AEC-SPEC.md E11). Drop this once
+# upstream exposes the client.
+[patch.crates-io]
+wasapi = { path = "third_party/wasapi" }
