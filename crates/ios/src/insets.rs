@@ -13,7 +13,11 @@
 //!   asks again (D34).
 //! - On an iPhone SE the main page started right under the status bar:
 //!   whatever Slint had, its top inset was 0 where `UIKit`'s is 20 pt
-//!   (D39).
+//!   (D39). Except that on the user's SE `UIKit` said 0 as well ("safe
+//!   area: top 0 …" in the log, the status bar plainly on screen): a
+//!   window on a phone without a notch need not count the status bar
+//!   in its safe area. So the top is also at least the status bar's
+//!   height while the scene shows one (`UIStatusBarManager`) — D46.
 //!
 //! So a probe — an empty, non-interactive view behind winit's, as large
 //! as the window — is told `safeAreaInsetsDidChange` whenever the
@@ -21,14 +25,18 @@
 //! view to lay out again (winit re-sends the resize and Slint re-reads
 //! its insets), and hands `UIKit`'s own numbers to the app, which keeps
 //! its pages clear of the larger of the two (`State.host-inset-*`).
-//! The numbers go to the log once per change: "safe area: top 20 …".
+//! The probe also reports from `layoutSubviews` — it is resized with
+//! the window, so a rotation reaches it even when the safe area stays
+//! put and only the status bar came or went. The numbers go to the log
+//! once per change: "safe area: top 20 … (status bar 20)".
 
-use std::{cell::Cell, ptr::NonNull};
+use std::cell::Cell;
+use std::ptr::NonNull;
 
 use block2::RcBlock;
-use objc2::{
-    define_class, msg_send, rc::Retained, runtime::NSObject, MainThreadMarker, MainThreadOnly,
-};
+use objc2::rc::Retained;
+use objc2::runtime::NSObject;
+use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSOperationQueue};
 use objc2_ui_kit::{
     UIResponder, UIView, UIViewAutoresizing, UIWindow, UIWindowDidBecomeKeyNotification,
@@ -36,8 +44,8 @@ use objc2_ui_kit::{
 
 define_class!(
     // SAFETY: UIView may be subclassed; this one only overrides
-    // `safeAreaInsetsDidChange`, calling UIView's first, and has no
-    // `Drop`.
+    // `safeAreaInsetsDidChange` and `layoutSubviews`, calling UIView's
+    // first, and has no `Drop`.
     #[unsafe(super(UIView, UIResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     struct SafeAreaProbe;
@@ -50,6 +58,16 @@ define_class!(
             let window = self.window();
             relayout(window.as_deref());
             report(window.as_deref());
+        }
+
+        #[unsafe(method(layoutSubviews))]
+        fn layout_subviews(&self) {
+            // SAFETY: UIView's own implementation, as the docs ask.
+            let _: () = unsafe { msg_send![super(self), layoutSubviews] };
+            // Only the report: a changed number reaches Slint through
+            // the app's own insets, and winit's view lays itself out
+            // on the same pass.
+            report(self.window().as_deref());
         }
     }
 );
@@ -74,20 +92,35 @@ thread_local! {
     static REPORTED: Cell<Option<[u64; 4]>> = const { Cell::new(None) };
 }
 
+/// The status bar's height while the window's scene shows one, else 0.
+fn status_bar_height(window: &UIWindow) -> f64 {
+    window
+        .windowScene()
+        .and_then(|scene| scene.statusBarManager())
+        .filter(|bar| !bar.isStatusBarHidden())
+        .map_or(0.0, |bar| bar.statusBarFrame().size.height)
+}
+
 /// Hand the window's safe area to the app (and the log) when it
-/// changed.
+/// changed: `UIKit`'s, with the top raised to the status bar.
 fn report(window: Option<&UIWindow>) {
     let Some(window) = window else {
         return;
     };
     let insets = window.safeAreaInsets();
-    let edges = [insets.top, insets.left, insets.bottom, insets.right];
+    let status_bar = status_bar_height(window);
+    let edges = [
+        insets.top.max(status_bar),
+        insets.left,
+        insets.bottom,
+        insets.right,
+    ];
     let bits = edges.map(f64::to_bits);
     if REPORTED.replace(Some(bits)) == Some(bits) {
         return;
     }
     log::info!(
-        "safe area: top {} left {} bottom {} right {} pt",
+        "safe area: top {} left {} bottom {} right {} pt (status bar {status_bar})",
         edges[0],
         edges[1],
         edges[2],

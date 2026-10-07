@@ -5,7 +5,8 @@ the iOS 18.3 simulator the same evening — the hello page (§14 D28),
 then the client, connected (§14, after D28); stream viewing and the
 file pickers pulled forward the same night (D30, D31) and seen working
 in the simulator; on the user's iPhone SE on 2026-10-07 (D38), whose
-run led to D39–D42. Decisions in §1 are taken; the rest is the
+run led to D39–D42; M3's echo cancellation (§6.3) written the same
+day (D47), not yet run on the phone. Decisions in §1 are taken; the rest is the
 plan they imply. Read `SESSION-GUIDE.md` §1 for how this codebase is
 worked on. `ANDROID-SPEC.md` is this spec's older sibling: almost
 everything the Android port learned — the `frontend` split, the
@@ -278,8 +279,10 @@ the earpiece and the app seems silent), `AllowBluetoothHFP` and
 `AllowBluetoothA2DP`. Nothing is activated at startup; the session
 becomes active when the first stream starts — which is when other
 apps' music stops — and that is also when the microphone prompt
-appears. RemoteIO has **no echo cancellation**: M0–M2 voice tests use
-headphones, as Android's did before its call path.
+appears. RemoteIO has **no echo cancellation**: M0–M2 voice tests used
+headphones, as Android's did before its call path. Since D47 RemoteIO
+serves only sessions that do not want the call path (headphones under
+Automatic, or Off); the rest open the VPIO unit of §6.3.
 
 ### 6.2 The session (M3)
 
@@ -696,9 +699,18 @@ Files (or a picture, into Photos).
 | D43 | **Your own microphone and headphones on the stream page** (2026-10-07, shared `viewer.slint`; ANDROID-SPEC.md D44). Watching full screen, muting yourself meant leaving the stream. The bar now starts with the mic and headphones (the sidebar's toggles: `Logic.toggle-mute` / `toggle-deafen`, red when on), a thin rule, then the stream's own speaker and level — whose tooltips now say "Mute the stream", so two mutes are never confused. The desktop's viewer windows have them too (`StreamViewerWindow.self-*`, pushed by `set_muted` / `handle_toggle_deafen` through `Viewer::set_self_audio`), so a fullscreen stream on a PC can be left muted as well. The bar fits narrower surfaces now: under 480 px of room (a phone upright, a small window) it tightens its spacing, shortens the level slider (130 → 96, or 64 under 360 px) and Stop watching becomes an ✕ — rendered at 320, 375, 667 and 852 px wide with every control on the bar | the controls belong where the person is looking |
 | D44 | **Zoom into the stream** (2026-10-07, `viewer.slint`; ANDROID-SPEC.md D44). To read small text on a shared screen: two fingers pinch (Slint 1.18's `ScaleRotateGestureHandler`, also a Mac trackpad's pinch), the mouse wheel zooms where the pointer is (one notch ≈ ×1.16), `+` `-` `0` from the keyboard; up to ×8 of the fitted picture. Zoomed — or filling the screen with an edge cropped — one finger or the mouse drags it, held so the picture always covers the surface where it is larger than it. A chip top-right says how far ("2.4×") and a tap on it goes back to the whole picture; so does a double-tap, which otherwise keeps its job (fullscreen on the desktop, fit ⇄ fill on a phone on its side) and on a phone upright zooms ×2.5 where it landed. The zoom is kept, relative to the fit, through a rotation or a change of the sharer's resolution; a new stream starts whole. Found on the way: Slint 1.18 turns two fingers into increments of the finger-distance ratio and its gesture handler multiplies them up, so on a touchscreen `scale` comes out near e^(r−1) — pinching to twice the distance zoomed ×2.7, to three times ×7; the page (`pinch-from-touch`) takes `1 + ln(scale)` back to the ratio, a trackpad's value is used as it is (rendered: a simulated pinch to ×2.5 shows "2.4×", the gap being the simulation's ten large steps). Also fixed: the faded bar and chips still took taps, so a tap to bring the controls back could land on an invisible Stop watching; faded out, they are now not there (`visible: opacity > 0.01`) | reading a shared terminal or document on a phone needs it; the gestures are the ones every photo viewer has |
 | D45 | **The screen stays on while a stream is watched** (2026-10-07; `frontend::host::keep_screen_on`, `host.rs`, ANDROID-SPEC.md D45). The phone dimmed and locked in the middle of a stream like any idle app. Now the stream page asks the host to keep the screen on when it opens and lets go when it closes (any way it closes: Stop, the sharer ending, a disconnect). iOS: `UIApplication.idleTimerDisabled`, which iOS applies only while the app is in front; Android: the window's `FLAG_KEEP_SCREEN_ON` (`BaucordActivity.keepScreenOn`, on the UI thread), likewise only while the window is visible. Chat and the voice lists let the phone sleep as before. The desktop is unchanged (its viewer is a window the user arranges) | what every video player does, and only for as long as there is a picture to watch |
+| D46 | **The status bar as a floor for the top inset** (2026-10-07; `insets.rs`). The phone's log after D39 read `safe area: top 0 …` with the status bar on screen: `UIKit`'s window safe area on the SE left it out, so D39's floor was 0 too and the main page still started under the clock. The top is now the larger of the safe area and the status bar's height while the scene shows one (`windowScene.statusBarManager`, `isStatusBarHidden` / `statusBarFrame`; objc2-ui-kit feature `UIStatusBarManager`). The probe also reports from `layoutSubviews`, which a rotation reaches even when only the status bar came or went (the SE hides it in landscape). The log line names it: `safe area: top 20 … (status bar 20)` | the D39 check the log was for; notched phones are unchanged (their safe area is already larger than the bar) |
+| D47 | **Echo cancellation: the voice-processing unit** (2026-10-07; `audio/src/native/vpio.rs`, `native/avsession.rs`, `native/pump.rs`; AEC-SPEC.md E10). The phone's `aec: none (not on this platform yet)` was accurate: §6.3 was M3 and had not been written. It is now, as §6.3 planned, with three things §6 did not say: (1) the plan opens the unit before either side starts and holds it (`vpio::prepare`): its playback is the canceller's reference, so both sides attach to it or — if it will not open — both take plain streams; the sides still open on their own (a process-wide `Weak`, a one-slot mailbox per side, a dropped side flags its half off, halves freed off the I/O thread), so a reopen of either side works; a failure of either reopens both (`SHARED_VOICE_UNIT`). (2) `plan_aec` sets the mode (`voiceChat` on the call path, `default` off it) with both streams closed, re-stating the host's options; if the mode change put the call on the earpiece the speaker override brings back the loudspeaker. (3) The interruption-ended and media-services-reset notifications mark both sides failed, and `service()` reopens them (cpal's own streams already recover by themselves). Automatic follows the route (`aec::ios_output_kind`: headphones, Bluetooth, USB → off; the speaker, the earpiece, AirPlay/car/HDMI → on). Not done from §6.2–6.5: activation on join / deactivation on leave with `notifyOthersOnDeactivation`, the route picker (§6.4), the "paused — call" line. Known gaps: a watched stream's sound still plays through its own `RemoteIO`, outside the canceller's reference; an interruption that never posts *ended* leaves voice stopped until the next reopen. Untested on a device: written against coreaudio-rs 0.14.2, objc2-audio-toolbox and objc2-avf-audio 0.3.2 and type-checked for `aarch64-apple-ios` | the voice path on the loudspeaker is the iPhone's main use, and VPIO is the canceller Apple's own calls use |
 
-What the next phone run will tell (D39–D45): `safe area: top 20 …`
-in the log and the main page below the status bar; whether the
+What the next phone run will tell (D39–D47): `safe area: top 20 …
+(status bar 20)` in the log and the main page below the status bar
+(D46); in voice on the loudspeaker, `VPIO voice processing on: 48000 Hz
+mono both ways, route Speaker`, `audio session: mode` naming
+the voice-chat mode, and `aec: platform (speakers)`, and the
+others no longer hearing themselves (D47) — with headphones in under
+Automatic, `aec: none (headphones)` and the plain streams; a phone
+call in the middle, then `voice processing: interruption over;
+reopening`; whether the
 half-drawn glyphs come back with `--renderer skia-software` (D40);
 `host: app hidden` / `shown` on leaving and returning, with voice
 carrying on; on a stream, mute and deafen from its bar, a pinch that

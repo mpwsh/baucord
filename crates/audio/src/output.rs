@@ -63,12 +63,16 @@ pub struct AudioOutput {
     /// Native backend stream, when it opened successfully (Windows).
     #[cfg(windows)]
     native: Option<crate::native::wasapi::NativeRender>,
-    /// The voice-call stream (Android, `native::aaudio`), when the
-    /// session wants the platform's echo canceller and it opened.
-    #[cfg(target_os = "android")]
-    native_voice: Option<crate::native::aaudio::NativeRender>,
+    /// The voice-call stream (Android `native::aaudio`, iOS
+    /// `native::vpio`), when the session wants the platform's echo
+    /// canceller and it opened.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    native_voice: Option<crate::native::VoiceRender>,
     /// Open on the platform's voice-call path (`aec::wants_aec`).
-    #[cfg_attr(not(any(windows, target_os = "android")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(windows, target_os = "android", target_os = "ios")),
+        allow(dead_code)
+    )]
     voice: bool,
     packet_rx: Option<Receiver<(AudioPacket, Instant)>>,
     loopback_rx: Option<Receiver<PcmFrame>>,
@@ -156,7 +160,7 @@ impl AudioOutput {
             stream: None,
             #[cfg(windows)]
             native: None,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             native_voice: None,
             voice,
             ring_producer: Some(ring_producer),
@@ -185,7 +189,7 @@ impl AudioOutput {
         if let Some(n) = self.native.as_ref() {
             return Some(n.device_name.clone());
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         if let Some(n) = self.native_voice.as_ref() {
             return Some(n.device_name.clone());
         }
@@ -212,7 +216,7 @@ impl AudioOutput {
                 Err(e) => log::warn!("Native WASAPI render unavailable ({e}); using cpal"),
             }
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         if self.voice {
             match self.start_native_voice() {
                 Ok(()) => return Ok(()),
@@ -222,10 +226,11 @@ impl AudioOutput {
         self.start_cpal()
     }
 
-    /// Android: the speaker on the voice-call path (`native::aaudio`),
-    /// the render half of what Android's echo canceller needs. On
+    /// Android and iOS: the speaker on the voice-call path
+    /// (`native::aaudio`, `native::vpio`), the render half — the
+    /// reference — of what the platform's echo canceller needs. On
     /// failure the ring and latch go back for the cpal path.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     fn start_native_voice(&mut self) -> Result<(), String> {
         let consumer = self
             .ring_consumer
@@ -233,9 +238,9 @@ impl AudioOutput {
             .ok_or("ring consumer already taken")?;
         let wake_tx = self.wake_tx.take().ok_or("wake sender already taken")?;
         // Prime before the stream starts pulling (the rate is the one we
-        // ask for; AAudio converts if the device runs at another).
+        // ask for; AAudio and VPIO convert if the device runs at another).
         self.prime_ring(crate::OPUS_SAMPLE_RATE);
-        match crate::native::aaudio::NativeRender::start(
+        match crate::native::VoiceRender::start(
             consumer,
             wake_tx,
             self.stats.clone(),
@@ -801,7 +806,7 @@ impl Drop for AudioOutput {
         self.stream.take();
         #[cfg(windows)]
         self.native.take();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         self.native_voice.take();
         if let Some(thread) = self.worker_thread.take() {
             let _ = thread.join();

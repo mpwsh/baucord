@@ -16,10 +16,12 @@
 //! Nothing is activated here: the session becomes active when the first
 //! stream starts — which is when other apps' audio stops — and the
 //! system asks for microphone permission at that moment (the Info.plist
-//! carries `NSMicrophoneUsageDescription`). There is no echo
-//! cancellation on this path: that is M3's voice-processing backend,
-//! with the `voiceChat` mode, activation on join, interruptions and
-//! the route control (spec §6.2–6.5).
+//! carries `NSMicrophoneUsageDescription`). Echo cancellation is the
+//! voice engine's (`audio::native::vpio`, spec §6.3, D47): on the
+//! voice-call path it switches the mode to `voiceChat` with these same
+//! options, opens the voice-processing unit, and switches back after.
+//! Activation on join and the route control are still to come (spec
+//! §6.2, §6.4).
 
 use objc2_avf_audio::{
     AVAudioSession, AVAudioSessionCategoryOptions, AVAudioSessionCategoryPlayAndRecord,

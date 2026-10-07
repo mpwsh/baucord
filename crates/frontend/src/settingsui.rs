@@ -4,7 +4,7 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
 use client::{
-    config::{build_bind_string, BindableAction, ServerEntry},
+    config::{BindableAction, ServerEntry, build_bind_string},
     voice::VoiceControl,
 };
 use i18n::t;
@@ -951,9 +951,10 @@ fn wire(sf: &SettingsSurface<'_>) {
                         crate::media::save_to_downloads("baucord-identity.key", &bytes)
                     });
                 match saved {
-                    Ok(saved) => {
-                        set_identity_status(app, &t!("file-saved", "path" => saved.shown.as_str()))
-                    }
+                    Ok(saved) => set_identity_status(
+                        app,
+                        &t!("file-saved", "path" => saved.shown.as_str()),
+                    ),
                     Err(e) => app.show_error(&e),
                 }
             });
@@ -1356,6 +1357,7 @@ fn aec_status(report: Option<&audio::AecReport>) -> String {
             reasons::OFF => t!("aec-status-off"),
             reasons::HEADPHONES => t!("aec-status-headphones"),
             reasons::NO_CANCELLER => t!("aec-status-no-canceller"),
+            reasons::CANCELLER_OFF => t!("aec-status-canceller-off"),
             reasons::UNSUPPORTED => t!("aec-status-unsupported"),
             _ => t!("aec-status-refused"),
         },

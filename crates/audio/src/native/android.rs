@@ -22,7 +22,7 @@
 use jni::{
     errors::Result as JniResult,
     objects::{JObject, JObjectArray, JString, JValue},
-    refs::Reference,
+    refs::{Global, Reference},
     sys::jobject,
     Env, JavaVM,
 };
@@ -102,8 +102,10 @@ fn output_types<'j>(env: &mut Env<'j>, context: &JObject<'j>) -> JniResult<Vec<i
 }
 
 /// `AcousticEchoCanceler.isAvailable()`: whether this phone ships an
-/// AEC effect at all. Reporting only — a phone that says no still gets
-/// the voice-communication path, which may cancel in the HAL anyway.
+/// AEC effect at all. Asked when no effect could be put on the session
+/// ([`attach_echo_canceller`] found none): a phone that says no gets
+/// reported as having no canceller, though its voice path may still
+/// cancel in the HAL.
 ///
 /// # Errors
 /// Any JNI failure, as text.
@@ -116,6 +118,97 @@ pub fn echo_canceller_available() -> Result<bool, String> {
             &[],
         )?
         .z()
+    })
+}
+
+/// An `AcousticEchoCanceler` on our capture stream's audio session,
+/// kept for as long as the stream lives and released after
+/// (`AudioEffect.release()`).
+///
+/// Android attaches the voice-communication pre-processing (AEC among
+/// it) to a `VoiceCommunication` capture by itself on most phones; this
+/// is the belt to that: create the effect on our session explicitly,
+/// switch it on, and read back whether it is on — the same thing
+/// WebRTC's Android audio does, and what makes the verdict a fact
+/// instead of an assumption (`AEC-SPEC.md` D5).
+pub struct EchoCanceller {
+    effect: Global<JObject<'static>>,
+}
+
+impl Drop for EchoCanceller {
+    fn drop(&mut self) {
+        let effect = std::mem::take(&mut self.effect);
+        // Released, and the global reference dropped, on an attached
+        // thread (jni warns about the latter otherwise).
+        let released = with_context(move |env, _context| {
+            env.call_method(&effect, jni::jni_str!("release"), jni::jni_sig!("()V"), &[])?;
+            drop(effect);
+            Ok(())
+        });
+        if let Err(e) = released {
+            warn!("AcousticEchoCanceler.release: {e}");
+        }
+    }
+}
+
+/// What putting an `AcousticEchoCanceler` on a session came to.
+pub enum EchoEffect {
+    /// Created and on (`getEnabled()` true after `setEnabled(true)`).
+    On(EchoCanceller),
+    /// Created but off: `setEnabled` answered the status given (another
+    /// app holding control of it, say). Kept anyway, released with the
+    /// stream.
+    Off(EchoCanceller, i32),
+    /// `create` returned null: no AEC effect for this session.
+    Missing,
+}
+
+/// `AcousticEchoCanceler.create(session)`, `setEnabled(true)`,
+/// `getEnabled()`.
+///
+/// # Errors
+/// Any JNI failure or Java exception (`create` throws on a session it
+/// does not know), as text.
+pub fn attach_echo_canceller(session: i32) -> Result<EchoEffect, String> {
+    with_context(|env, _context| {
+        let effect = env
+            .call_static_method(
+                jni::jni_str!("android/media/audiofx/AcousticEchoCanceler"),
+                jni::jni_str!("create"),
+                jni::jni_sig!("(I)Landroid/media/audiofx/AcousticEchoCanceler;"),
+                &[JValue::Int(session)],
+            )?
+            .l()?;
+        if effect.is_null() {
+            return Ok(EchoEffect::Missing);
+        }
+        let status = env
+            .call_method(
+                &effect,
+                jni::jni_str!("setEnabled"),
+                jni::jni_sig!("(Z)I"),
+                &[JValue::Bool(true)],
+            )?
+            .i()?;
+        let enabled = env
+            .call_method(
+                &effect,
+                jni::jni_str!("getEnabled"),
+                jni::jni_sig!("()Z"),
+                &[],
+            )?
+            .z()?;
+        let effect = EchoCanceller {
+            effect: env.new_global_ref(&effect)?,
+        };
+        // Already on counts: the platform's own pre-processing may hold
+        // control of the effect, in which case our `setEnabled` is
+        // refused while the canceller runs anyway.
+        Ok(if enabled {
+            EchoEffect::On(effect)
+        } else {
+            EchoEffect::Off(effect, status)
+        })
     })
 }
 
@@ -261,11 +354,7 @@ fn apply_route<'j>(
             "{name} (type {}, id {}){}",
             chosen.kind,
             chosen.id,
-            if accepted {
-                ""
-            } else {
-                " — refused by the system"
-            }
+            if accepted { "" } else { " — refused by the system" }
         ))
     } else {
         // Before API 31: the loudspeaker by its switch; a wired headset
@@ -383,12 +472,7 @@ pub fn current_route() -> Result<String, String> {
             return Ok("none".to_string());
         }
         let d = route_device(env, &device)?;
-        Ok(format!(
-            "{} (type {}, id {})",
-            route::label(&d),
-            d.kind,
-            d.id
-        ))
+        Ok(format!("{} (type {}, id {})", route::label(&d), d.kind, d.id))
     })
 }
 

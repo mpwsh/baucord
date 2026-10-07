@@ -10,8 +10,8 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed},
     },
     thread,
     time::{Duration, Instant},
@@ -20,10 +20,10 @@ use std::{
 use audio::{
     AecMode, AecReport, AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig,
 };
-use crossbeam_channel::{bounded, select, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded, select};
 use log::info;
 
-use crate::{config::Settings, network::NetworkControl, WakeFn};
+use crate::{WakeFn, config::Settings, network::NetworkControl};
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -296,6 +296,11 @@ impl VoiceLoopState {
                 our_client_id: id,
             } => {
                 let config = settings_to_config(&settings);
+                // The old engine goes first: its device state (Android's
+                // communication mode, iOS's voice-processing unit and
+                // session mode) is process-wide, and leaving it after the
+                // new one entered would undo the new one's.
+                self.vc.take();
                 match VoiceChat::new(config) {
                     Ok(mut voice) => {
                         if let Err(e) = voice.start() {

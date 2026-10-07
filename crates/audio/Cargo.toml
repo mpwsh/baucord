@@ -70,6 +70,42 @@ ndk = { version = "0.9", default-features = false, features = ["audio", "api-lev
 jni = "0.22"
 ndk-context = "0.1"
 
+# ── iOS: the voice-processing unit (echo cancellation) ──────────────────
+# `native::vpio` opens Apple's VoiceProcessingIO unit through the same
+# `coreaudio-rs` cpal's iOS host uses, with the property constants from
+# `objc2-audio-toolbox`; `native::avsession` sets the session's mode,
+# reads its route and watches its interruptions. Every crate and version
+# here is already in the graph through cpal (IOS-SPEC.md §6.3), with
+# features cpal already turns on, plus `AVAudioSessionRoute`.
+[target.'cfg(target_os = "ios")'.dependencies]
+coreaudio-rs = { version = "0.14.2", default-features = false, features = ["audio_toolbox"] }
+objc2 = "0.6"
+block2 = "0.6"
+objc2-audio-toolbox = { version = "0.3", default-features = false, features = [
+    "std",
+    "AUComponent",
+    "AudioUnitProperties",
+] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = [
+    "std",
+    "CoreAudioBaseTypes",
+] }
+objc2-avf-audio = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVAudioSession",
+    "AVAudioSessionRoute",
+    "AVAudioSessionTypes",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "NSDictionary",
+    "NSNotification",
+    "NSOperation",
+    "NSString",
+    "NSValue",
+] }
+
 # ── Windows: native voice capture/render + process loopback ─────────────
 # `wasapi` runs the voice capture and render pumps on threads this crate
 # owns (`native::wasapi`: MMCSS-registered, event-driven shared mode,

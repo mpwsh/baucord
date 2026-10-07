@@ -29,8 +29,8 @@ use std::{
     net::SocketAddr,
     rc::{Rc, Weak},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -42,11 +42,11 @@ use app_core::{
 };
 use audio::{PeerAudioSettings, SoundType};
 use client::{
-    config::{peer_key, BindableAction, Settings},
+    AdminCommand, AdminTarget,
+    config::{BindableAction, Settings, peer_key},
     network::{DisconnectKind, LossKind, NetworkControl, NetworkMessage, NetworkThreadHandle},
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
-    AdminCommand, AdminTarget,
 };
 use i18n::t;
 use log::{info, warn};
@@ -86,7 +86,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// main window. An iPhone app is one full-screen window too (winit on
 /// `UIKit`, IOS-SPEC.md §4), so iOS takes every page Android has — the
 /// Settings and stream pages, the narrow layout, the touch rules.
-pub(crate) const SINGLE_WINDOW_HOST: bool = cfg!(any(target_os = "android", target_os = "ios"));
+pub(crate) const SINGLE_WINDOW_HOST: bool =
+    cfg!(any(target_os = "android", target_os = "ios"));
 
 /// Whether the app may end its own process. Not on iOS: winit ignores
 /// `ControlFlow::Exit` there (the loop never returns, IOS-SPEC.md
@@ -728,7 +729,11 @@ pub fn run() {
     // the desktop wires its SettingsWindow when that is first created.
     if SINGLE_WINDOW_HOST {
         // One window means a phone: touch, a soft keyboard, Back.
-        state.borrow().main.global::<State>().set_touch_host(true);
+        state
+            .borrow()
+            .main
+            .global::<State>()
+            .set_touch_host(true);
         crate::settingsui::wire_page(&state.borrow().main);
         // Same for the stream viewer page (D23).
         crate::viewers::wire_page(&state.borrow().main);
@@ -843,7 +848,7 @@ fn center_on_monitor(_win: &slint::Window) {}
 /// mixed-DPI setups land where they look centred.
 #[cfg(feature = "desktop")]
 fn center_on_monitor(win: &slint::Window) {
-    use i_slint_backend_winit::{winit::dpi::PhysicalPosition, WinitWindowAccessor};
+    use i_slint_backend_winit::{WinitWindowAccessor, winit::dpi::PhysicalPosition};
     win.with_winit_window(|w| {
         let Some(monitor) = w.current_monitor().or_else(|| w.primary_monitor()) else {
             return;
@@ -2428,6 +2433,8 @@ pub fn fill_tr(tr: &Tr) {
             t!("audio-aec-hint-windows")
         } else if cfg!(target_os = "android") {
             t!("audio-aec-hint-android")
+        } else if cfg!(target_os = "ios") {
+            t!("audio-aec-hint-ios")
         } else {
             t!("audio-aec-hint")
         }
@@ -2500,7 +2507,7 @@ pub mod tray {
     use i18n::t;
     use log::warn;
 
-    use super::{with_current, AppState};
+    use super::{AppState, with_current};
 
     thread_local! {
         /// Keeps the OS tray item alive for the app's lifetime —

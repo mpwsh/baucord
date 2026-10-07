@@ -24,6 +24,10 @@
 //! `VoiceCommunication`, what turns the platform's echo canceller on),
 //! with [`android`] for the `AudioManager` side; cpal's `AAudio` host
 //! still serves sessions that do not want the call path.
+//! iOS: [`vpio`] — Apple's voice-processing unit, one for both
+//! directions, with [`avsession`] for the session's mode, route and
+//! interruptions; cpal's `RemoteIO` serves the rest, as on Android.
+//! The two callback backends share their real-time halves ([`pump`]).
 //! macOS: cpal's `CoreAudio` path runs the callback on the HAL's real-time
 //! thread already; nothing to take over yet. Linux: cpal/ALSA until there
 //! is a `PipeWire` backend.
@@ -32,5 +36,18 @@
 pub mod aaudio;
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(target_os = "ios")]
+pub mod avsession;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+mod pump;
+#[cfg(target_os = "ios")]
+pub mod vpio;
 #[cfg(windows)]
 pub mod wasapi;
+
+/// The voice-call path's two halves where a callback backend provides
+/// them (same constructors, fields and errors on both).
+#[cfg(target_os = "android")]
+pub use aaudio::{NativeCapture as VoiceCapture, NativeRender as VoiceRender};
+#[cfg(target_os = "ios")]
+pub use vpio::{NativeCapture as VoiceCapture, NativeRender as VoiceRender};

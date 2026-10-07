@@ -14,6 +14,16 @@
 //! plugged in, a phone call taking the device) so `VoiceChat::service`
 //! reopens them.
 //!
+//! Both streams ask for performance mode *None*, and capture for an
+//! audio session of its own. A low-latency stream with no session is
+//! what `AAudio` puts on its MMAP path, which bypasses the platform's
+//! effects altogether — the echo canceller included — on the phones
+//! that have MMAP (most current ones). The legacy path costs a period
+//! or two of latency; it is the path calls take. With the session, the
+//! canceller is also created on it explicitly and read back
+//! ([`super::android::attach_echo_canceller`]), so the verdict says what
+//! the phone did (`AEC-SPEC.md` §9.3, `ANDROID-SPEC.md` D46).
+//!
 //! The data callbacks run on `AAudio`'s real-time thread: no locks, no
 //! allocation, no logging there. Their state reaches them through a
 //! one-slot channel only once the stream has opened *and* started (the
@@ -33,15 +43,15 @@ use log::{info, warn};
 use ndk::audio::{
     AudioCallbackResult, AudioContentType, AudioDirection, AudioError, AudioFormat,
     AudioInputPreset, AudioPerformanceMode, AudioSharingMode, AudioStream, AudioStreamBuilder,
-    AudioStreamDataCallback, AudioUsage,
+    AudioStreamDataCallback, AudioUsage, SessionId,
 };
 use rtrb::{Consumer, Producer};
 
-use crate::{input_config::InputConfig, stats::AudioStats, OPUS_SAMPLE_RATE};
-
-/// Largest render callback served in one piece from the scratch
-/// buffer; bigger ones are served in pieces.
-const RENDER_SCRATCH: usize = 8192;
+use super::{
+    android::{self, EchoCanceller, EchoEffect},
+    pump::{CapturePump, RenderPump},
+};
+use crate::{aec::reasons, input_config::InputConfig, stats::AudioStats, OPUS_SAMPLE_RATE};
 
 /// An open, started `AAudio` stream; stops and closes on drop.
 struct Running(AudioStream);
@@ -60,7 +70,11 @@ impl Drop for Running {
     }
 }
 
-/// A builder with everything the voice-call path needs.
+/// A builder with everything the voice-call path needs: the call's
+/// usage and preset, performance mode *None* (never MMAP, never a FAST
+/// track — the paths that skip the effects, see the top of the file),
+/// and for capture a freshly allocated session the canceller is then
+/// attached to.
 fn voice_builder(direction: AudioDirection) -> Result<AudioStreamBuilder, AudioError> {
     let builder = AudioStreamBuilder::new()?
         .direction(direction)
@@ -68,10 +82,13 @@ fn voice_builder(direction: AudioDirection) -> Result<AudioStreamBuilder, AudioE
         .channel_count(1)
         .sample_rate(OPUS_SAMPLE_RATE as i32)
         .sharing_mode(AudioSharingMode::Shared)
-        .performance_mode(AudioPerformanceMode::LowLatency)
+        .performance_mode(AudioPerformanceMode::None)
         .usage(AudioUsage::VoiceCommunication);
     Ok(match direction {
-        AudioDirection::Input => builder.input_preset(AudioInputPreset::VoiceCommunication),
+        AudioDirection::Input => builder
+            .input_preset(AudioInputPreset::VoiceCommunication)
+            // `None` = allocate one when the stream opens.
+            .session_id(None),
         _ => builder.content_type(AudioContentType::Speech),
     })
 }
@@ -95,16 +112,19 @@ fn positive_u32(v: i32) -> u32 {
 
 // ── Capture ─────────────────────────────────────────────────────────────
 
-/// A running voice-call capture stream. Dropping it stops it.
+/// A running voice-call capture stream. Dropping it stops the stream,
+/// then releases the echo canceller (field order).
 pub struct NativeCapture {
     _stream: Running,
+    _echo: Option<EchoCanceller>,
     /// Rate of the samples arriving in the ring.
     pub sample_rate: u32,
     /// What the log calls it.
     pub device_name: String,
-    /// The stream really carries the `VoiceCommunication` preset (`AAudio`
-    /// may substitute on an odd device).
-    pub voice_preset: bool,
+    /// Whether the platform canceller is on this microphone, and if not
+    /// why (`aec::reasons`): the preset has to have stuck and the
+    /// canceller has to be on the session.
+    pub aec_verdict: Result<(), &'static str>,
 }
 
 /// Handed back when the stream could not be opened, so the cpal path
@@ -116,46 +136,8 @@ pub struct CaptureStartError {
 }
 
 struct CaptureParts {
-    producer: Producer<f32>,
-    wake_tx: Sender<()>,
-    stats: Arc<AudioStats>,
-    config: Arc<InputConfig>,
-    input_level: Arc<AtomicU32>,
+    pump: CapturePump,
     channels: usize,
-}
-
-impl CaptureParts {
-    /// One callback's worth of interleaved `f32` → mono into the ring.
-    fn push(&mut self, data: &[f32]) {
-        if self.config.muted.load(Ordering::Relaxed) {
-            self.input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
-            return;
-        }
-        let ch = self.channels.max(1);
-        let frames = data.len() / ch;
-        let want = frames.min(self.producer.slots());
-        if want < frames {
-            self.stats.input_overruns.fetch_add(1, Ordering::Relaxed);
-        }
-        if want == 0 {
-            return;
-        }
-        let mut rms_acc = 0.0f32;
-        if let Ok(chunk) = self.producer.write_chunk_uninit(want) {
-            let mut it = data.chunks_exact(ch).take(want).map(|frame| {
-                #[allow(clippy::cast_precision_loss)]
-                let mono = frame.iter().sum::<f32>() / ch as f32;
-                rms_acc += mono * mono;
-                mono
-            });
-            chunk.fill_from_iter(&mut it);
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let rms = (rms_acc / want as f32).sqrt();
-        self.input_level
-            .store((rms * 3.0).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-        let _ = self.wake_tx.try_send(());
-    }
 }
 
 impl NativeCapture {
@@ -205,27 +187,88 @@ impl NativeCapture {
         let channels = usize::try_from(stream.channel_count()).unwrap_or(1).max(1);
         let sample_rate = positive_u32(stream.sample_rate());
         let voice_preset = stream.input_preset() == AudioInputPreset::VoiceCommunication;
+        let session = match stream.session_id() {
+            SessionId::Allocated(id) => Some(id.get()),
+            SessionId::None => None,
+        };
         info!(
-            "AAudio voice capture: {}, preset {:?}",
+            "AAudio voice capture: {}, preset {:?}, session {}",
             describe(&stream),
-            stream.input_preset()
+            stream.input_preset(),
+            session.map_or_else(|| "none".to_string(), |id| id.to_string()),
         );
         let device_name = format!("voice microphone (device {})", stream.device_id());
-        // The channel is empty and ours: this cannot fail.
+        // The channel is empty and ours: this cannot fail. Sent before
+        // the canceller's JNI round trips, so capture is not held up by
+        // them.
         let _ = parts_tx.send(CaptureParts {
-            producer,
-            wake_tx,
-            stats,
-            config,
-            input_level,
+            pump: CapturePump {
+                producer,
+                wake_tx,
+                stats,
+                config,
+                input_level,
+            },
             channels,
         });
+        let (echo, aec_verdict) = if voice_preset {
+            echo_canceller_on(session)
+        } else {
+            warn!("AAudio voice capture: the voice preset did not stick; no echo cancellation");
+            (None, Err(reasons::PATH_REFUSED))
+        };
         Ok(Self {
             _stream: Running(stream),
+            _echo: echo,
             sample_rate,
             device_name,
-            voice_preset,
+            aec_verdict,
         })
+    }
+}
+
+/// Put the canceller on the capture session and say whether it runs
+/// (one log line either way). Without a session, or with no effect to
+/// create, the answer is `AcousticEchoCanceler.isAvailable()`: a phone
+/// with a canceller is taken to run it on the voice path (the HAL often
+/// does, without exposing an effect); one without has none.
+fn echo_canceller_on(session: Option<i32>) -> (Option<EchoCanceller>, Result<(), &'static str>) {
+    let fallback = |why: &str| {
+        let verdict = match android::echo_canceller_available() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(reasons::NO_CANCELLER),
+            Err(e) => {
+                log::debug!("AcousticEchoCanceler.isAvailable: {e}");
+                Ok(())
+            }
+        };
+        info!(
+            "AAudio voice capture: echo canceller {} ({why})",
+            if verdict.is_ok() {
+                "assumed on the voice path"
+            } else {
+                "not on this phone"
+            }
+        );
+        verdict
+    };
+    let Some(id) = session else {
+        return (None, fallback("no audio session to put it on"));
+    };
+    match android::attach_echo_canceller(id) {
+        Ok(EchoEffect::On(effect)) => {
+            info!("AAudio voice capture: echo canceller on (AcousticEchoCanceler, session {id})");
+            (Some(effect), Ok(()))
+        }
+        Ok(EchoEffect::Off(effect, status)) => {
+            warn!(
+                "AAudio voice capture: echo canceller would not switch on \
+                 (AcousticEchoCanceler.setEnabled = {status}, session {id})"
+            );
+            (Some(effect), Err(reasons::CANCELLER_OFF))
+        }
+        Ok(EchoEffect::Missing) => (None, fallback("no AcousticEchoCanceler for the session")),
+        Err(e) => (None, fallback(&format!("AcousticEchoCanceler.create: {e}"))),
     }
 }
 
@@ -242,7 +285,7 @@ fn capture_callback(parts_rx: Receiver<CaptureParts>) -> AudioStreamDataCallback
                 // samples in the format the stream was opened with
                 // (PCM_Float), valid for the duration of the callback.
                 let samples = unsafe { slice::from_raw_parts(data.cast::<f32>(), n) };
-                p.push(samples);
+                p.pump.push(samples, p.channels);
             }
         }
         AudioCallbackResult::Continue
@@ -267,54 +310,8 @@ pub struct RenderStartError {
 }
 
 struct RenderParts {
-    consumer: Consumer<f32>,
-    wake_tx: Sender<()>,
-    stats: Arc<AudioStats>,
-    callback_frames: Arc<AtomicUsize>,
-    largest_callback: usize,
+    pump: RenderPump,
     channels: usize,
-    scratch: Vec<f32>,
-}
-
-impl RenderParts {
-    /// Fill one callback's interleaved buffer from the mono ring.
-    fn pull(&mut self, out: &mut [f32]) {
-        let ch = self.channels.max(1);
-        let frames_total = out.len() / ch;
-        // The worker keeps one callback + margin queued (D24); tell it
-        // when the device starts asking for more.
-        if frames_total > self.largest_callback {
-            self.largest_callback = frames_total;
-            self.callback_frames.store(frames_total, Ordering::Relaxed);
-        }
-        let mut rms_acc = 0.0f32;
-        let mut done = 0usize;
-        while done < frames_total {
-            let want = (frames_total - done).min(self.scratch.len());
-            let mono = &mut self.scratch[..want];
-            let (_, missing) = self.consumer.pop_partial_slice(mono);
-            if !missing.is_empty() {
-                self.stats.output_underruns.fetch_add(1, Ordering::Relaxed);
-                missing.fill(0.0);
-            }
-            for (i, &s) in mono.iter().enumerate() {
-                rms_acc += s * s;
-                let base = (done + i) * ch;
-                // Mono to every channel: a phone's voice path is mono
-                // or a stereo pair; there is no surround to protect.
-                out[base..base + ch].fill(s);
-            }
-            done += want;
-        }
-        if frames_total > 0 {
-            #[allow(clippy::cast_precision_loss)]
-            let rms = (rms_acc / frames_total as f32).sqrt();
-            self.stats
-                .output_level
-                .store((rms * 3.0).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-        }
-        let _ = self.wake_tx.try_send(());
-    }
 }
 
 impl NativeRender {
@@ -366,13 +363,8 @@ impl NativeRender {
         );
         let device_name = format!("voice speaker (device {})", stream.device_id());
         let _ = parts_tx.send(RenderParts {
-            consumer,
-            wake_tx,
-            stats,
-            callback_frames,
-            largest_callback: 0,
+            pump: RenderPump::new(consumer, wake_tx, stats, callback_frames),
             channels,
-            scratch: vec![0.0; RENDER_SCRATCH],
         });
         Ok(Self {
             _stream: Running(stream),
@@ -398,7 +390,7 @@ fn render_callback(parts_rx: Receiver<RenderParts>) -> AudioStreamDataCallback {
         // valid for the duration of the callback.
         let out = unsafe { slice::from_raw_parts_mut(data.cast::<f32>(), n) };
         match parts.as_mut() {
-            Some(p) => p.pull(out),
+            Some(p) => p.pump.pull(out, p.channels),
             None => out.fill(0.0),
         }
         AudioCallbackResult::Continue

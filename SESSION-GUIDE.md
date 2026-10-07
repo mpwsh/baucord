@@ -510,6 +510,12 @@ Memory-mode servers (persistence off) still use the legacy
   trackpad's pinch is right as it is. Re-check on a Slint upgrade.
   And chrome that fades with `opacity` still takes taps unless it is
   also made invisible (`visible: self.opacity > 0.01`).
+- **A platform canceller is verified on the stream we opened, not
+  assumed from the device** (AEC-SPEC D5, E9): on Android the
+  low-latency mode without a session id is MMAP, which skips every
+  effect — the voice-call streams use performance mode None and read
+  `AcousticEchoCanceler.getEnabled()` back on their own session; on
+  iOS the VPIO bypass property is read back after `initialize`.
 - **No worker polls on a fixed short timer** (IOS-SPEC.md D41,
   ANDROID-SPEC.md D43): a thread blocks on what wakes it — a channel,
   the audio callback's latch, the socket through `ReadWaiter` — with
@@ -752,13 +758,24 @@ people rather than devices. Plus:
   bar carries your own mic and headphones (desktop viewer windows
   too), the picture zooms (pinch, wheel, double-tap; a chip resets;
   Slint 1.18's touch pinch overshoots and is corrected), and the
-  screen stays on while a stream is watched. Next: the same phone
-  with these — the log's `safe area:` line, the glyphs with
-  `--renderer skia-software`, a pinch on a real screen.
-  Record each next step in IOS-SPEC.md §14 and here.
-  Then M1 (the client on the iPhone) … M5 (TestFlight). Users still
-  report echo: AEC-SPEC.md E8 / IOS-SPEC.md §6.3's VPIO backend is
-  also the macOS answer, and can be pulled forward on its own.
+  screen stays on while a stream is watched. The phone's log then
+  said `safe area: top 0` (the SE's window leaves the status bar out:
+  the top is now at least the status bar's height, D46) and `aec:
+  none (not on this platform yet)` — true: §6.3 was M3. It is written
+  now (D47, AEC-SPEC E10): the VPIO unit shared by both sides, the
+  `voiceChat` mode with the plan, interruptions reopening both sides.
+  The same day two Android users heard echo on Always: the voice
+  streams were low-latency without a session, i.e. MMAP, which skips
+  the effects; now performance mode None, a capture session, and an
+  `AcousticEchoCanceler` created on it and read back (ANDROID-SPEC
+  D46, AEC-SPEC E9). Next: the phone with these — `safe area: top 20
+  … (status bar 20)`, `VPIO voice processing on`, `aec: platform
+  (speakers)` and nobody hearing themselves; an Android log with
+  `AAudio voice capture: echo canceller on (AcousticEchoCanceler,
+  session N)`. Record each next step in IOS-SPEC.md §14 and here.
+  Then M1 (the client on the iPhone) … M5 (TestFlight). The VPIO
+  backend is also the macOS answer (AEC-SPEC §9): the same file with
+  the device chosen through `kAudioOutputUnitProperty_CurrentDevice`.
 - **Hands-on passes the sandbox cannot do:** the watched keybinds on
   each OS (Wayland and macOS-without-accessibility fall back to
   grabs), the single-instance guard, the tray, `server restore` on a

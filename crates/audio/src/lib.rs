@@ -143,9 +143,15 @@ const DEFAULT_DEVICE_POLL: std::time::Duration = std::time::Duration::from_secs(
 const DEFAULT_MAX_PEERS: usize = 32;
 
 /// This build can open streams on a platform voice-call path (and so
-/// get the OS echo canceller): Android today; Windows per
-/// `AEC-SPEC.md` §4; macOS and Linux later (§9).
-const PLATFORM_VOICE_PATH: bool = cfg!(any(target_os = "android", windows));
+/// get the OS echo canceller): Android; Windows per `AEC-SPEC.md` §4;
+/// iOS through the voice-processing unit (`IOS-SPEC.md` §6.3); macOS
+/// and Linux later (§9).
+const PLATFORM_VOICE_PATH: bool = cfg!(any(target_os = "android", target_os = "ios", windows));
+
+/// Capture and playback on the voice-call path are one device object
+/// (iOS's voice-processing unit), so a side that needs reopening takes
+/// the other with it.
+const SHARED_VOICE_UNIT: bool = cfg!(target_os = "ios");
 
 /// What the sound is coming out of, as the platform reports it
 /// (`AEC-SPEC.md` §3.2, §4.2, §9). `Unknown` where nobody asks yet.
@@ -175,7 +181,12 @@ fn platform_output_kind(_output_device: Option<&str>) -> aec::OutputKind {
     {
         native::wasapi::output_kind(_output_device)
     }
-    #[cfg(not(any(target_os = "android", windows)))]
+    // The session's route: there is no device to pick on iOS.
+    #[cfg(target_os = "ios")]
+    {
+        native::avsession::output_kind()
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios", windows)))]
     {
         aec::OutputKind::Unknown
     }
@@ -230,6 +241,9 @@ impl IncomingSender {
 ///
 /// Owns the full audio pipeline from capture to playback.
 /// The caller is responsible for shuttling [`AudioPacket`]s to/from the network.
+// The flags are independent facts (a capture retry pending, the plan,
+// the plan gone stale, the sides on the call path), not one state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct VoiceChat {
     input: Option<AudioInput>,
     output: Option<AudioOutput>,
@@ -276,6 +290,17 @@ pub struct VoiceChat {
     /// voice-call path or not, and the output that decided it.
     aec_wanted: bool,
     aec_output: aec::OutputKind,
+    /// The sides open on the voice-call path: the plan, unless the
+    /// path could not be had at plan time (iOS: the voice-processing
+    /// unit would not open), in which case they take plain streams and
+    /// the report says the path was refused.
+    voice_streams: bool,
+    /// iOS: the voice-processing unit, opened by the plan before either
+    /// side starts and held while it lasts, so both sides attach to it
+    /// — never one on it and the other on a plain stream outside its
+    /// reference (`native::vpio`).
+    #[cfg(target_os = "ios")]
+    voice_unit: Option<native::vpio::Prepared>,
     /// Android: whether the plan holds communication mode, and the
     /// route (`route::label`) it points at — a change (a headset
     /// connected, another picked) re-plans even when the output kind
@@ -371,6 +396,9 @@ impl VoiceChat {
             last_restart_attempt: Instant::now().checked_sub(RESTART_BACKOFF).unwrap(),
             aec_wanted: false,
             aec_output: aec::OutputKind::Unknown,
+            voice_streams: false,
+            #[cfg(target_os = "ios")]
+            voice_unit: None,
             #[cfg(target_os = "android")]
             aec_comm: false,
             #[cfg(target_os = "android")]
@@ -435,7 +463,7 @@ impl VoiceChat {
             self.loopback_tx.clone(),
             self.stats.clone(),
             self.input_config.clone(),
-            self.aec_wanted,
+            self.voice_streams,
         )?;
         #[cfg(windows)]
         input.set_aec_reference(self.config.output_device.clone());
@@ -472,7 +500,7 @@ impl VoiceChat {
             self.removed_peers.clone(),
             self.stats.clone(),
             self.config.output_gain,
-            self.aec_wanted,
+            self.voice_streams,
         )?;
         self.output_gain = output.output_gain_handle();
         self.deafened = output.deafened_handle();
@@ -529,9 +557,29 @@ impl VoiceChat {
         let wanted = PLATFORM_VOICE_PATH && aec::wants_aec(self.config.echo_cancellation, output);
         self.aec_output = output;
         self.aec_wanted = wanted;
+        self.voice_streams = wanted;
         self.aec_replan = false;
         #[cfg(windows)]
         self.aec_communications.store(wanted, Ordering::Relaxed);
+        // The session's mode goes with the plan: `voiceChat` for the
+        // voice-processing unit, the default for cpal's plain streams.
+        // The unit opens here, before either side: both attach to it,
+        // or — if it will not open — neither does.
+        #[cfg(target_os = "ios")]
+        {
+            self.voice_unit = None;
+            native::avsession::set_voice_mode(wanted);
+            if wanted {
+                match native::vpio::prepare(&self.stats) {
+                    Ok(unit) => self.voice_unit = Some(unit),
+                    Err(e) => {
+                        log::warn!("Voice processing unavailable ({e}); plain streams, no echo cancellation");
+                        self.voice_streams = false;
+                        native::avsession::set_voice_mode(false);
+                    }
+                }
+            }
+        }
         #[cfg(target_os = "android")]
         {
             // Leave first: a route change re-enters with the new route.
@@ -922,8 +970,12 @@ impl VoiceChat {
 
         // A side going down usually means the output changed; if the
         // voice-call plan changes with it, both sides reopen together
-        // (AEC-SPEC.md §4.5: re-evaluated on every reopen).
-        if self.aec_replan || ((input_needs || output_needs) && self.aec_plan_stale()) {
+        // (AEC-SPEC.md §4.5: re-evaluated on every reopen). So do they
+        // when both are one unit (iOS, `SHARED_VOICE_UNIT`): an
+        // interruption stops both at once.
+        let one_unit = SHARED_VOICE_UNIT && self.voice_streams;
+        if self.aec_replan || ((input_needs || output_needs) && (one_unit || self.aec_plan_stale()))
+        {
             stats.input_stream_failed.store(false, Ordering::Relaxed);
             stats.output_stream_failed.store(false, Ordering::Relaxed);
             stats.default_input_changed.store(false, Ordering::Relaxed);
@@ -1008,9 +1060,10 @@ impl VoiceChat {
                 self.aec_replan = true;
             }
         }
-        // Android has no default device to follow (routing is the OS's),
-        // and our voice-call streams are not named like cpal's default.
-        #[cfg(not(target_os = "android"))]
+        // Android and iOS have no default device to follow (routing is
+        // the OS's), and their voice-call streams are not named like
+        // cpal's default.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if poll_due {
             let host = cpal::default_host();
             if self.input.is_some() && self.config.input_device.is_none() {
@@ -1189,6 +1242,12 @@ impl Drop for VoiceChat {
         // Only now let the phone out of communication mode.
         #[cfg(target_os = "android")]
         self.comm_mode.take();
+        // And the iPhone's voice-processing unit closed, and its session
+        // out of the voice-chat mode.
+        #[cfg(target_os = "ios")]
+        if self.voice_unit.take().is_some() {
+            native::avsession::set_voice_mode(false);
+        }
 
         // Drop the encoder's input sender to unblock its recv(); the input
         // worker's clone is already gone with `input`.

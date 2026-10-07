@@ -12,8 +12,10 @@
 //! What "the voice-call path" is per platform lives with each backend:
 //! Android — `VoiceCommunication` usage and input preset plus
 //! `MODE_IN_COMMUNICATION` (`native::aaudio`); Windows — the
-//! `Communications` stream category (`native::wasapi`). Everything in
-//! this file is platform-free and unit-tested on the host.
+//! `Communications` stream category (`native::wasapi`); iOS — Apple's
+//! voice-processing I/O unit in the `voiceChat` mode (`native::vpio`).
+//! Everything in this file is platform-free and unit-tested on the
+//! host.
 
 use std::fmt;
 
@@ -103,6 +105,9 @@ pub mod reasons {
     pub const ALWAYS: &str = "always";
     /// Wanted, but the device ships no echo canceller.
     pub const NO_CANCELLER: &str = "no canceller on this device";
+    /// Wanted, and the device has a canceller, but it would not switch
+    /// on for our microphone (Android: the effect refused `setEnabled`).
+    pub const CANCELLER_OFF: &str = "canceller would not switch on";
     /// Wanted, but the voice-call stream would not open (or not as
     /// one); the log line before says why.
     pub const PATH_REFUSED: &str = "voice-call path refused";
@@ -193,6 +198,54 @@ pub fn android_output_kind(device_types: &[i32]) -> OutputKind {
     }
 }
 
+/// iOS: what one output port of the session's route is
+/// (`AVAudioSessionPort*`, `IOS-SPEC.md` §6.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplePort {
+    /// `BuiltInSpeaker`.
+    Speaker,
+    /// `BuiltInReceiver`, the earpiece: next to the microphone, so it
+    /// counts as a speaker.
+    Receiver,
+    /// `Headphones` (wired).
+    Headphones,
+    /// `BluetoothA2DP`, `BluetoothHFP`, `BluetoothLE`.
+    Bluetooth,
+    /// `USBAudio`.
+    Usb,
+    /// `CarAudio`, `AirPlay`, `HDMI`: a loudspeaker in the room.
+    Room,
+    /// Anything else (line out, virtual…).
+    Other,
+}
+
+/// iOS: classify the session route's outputs. Personal listening
+/// anywhere on the route means headphones (iOS sends the call there);
+/// otherwise a built-in or room loudspeaker means speakers; otherwise
+/// it can't be told.
+#[must_use]
+pub fn ios_output_kind(outputs: &[ApplePort]) -> OutputKind {
+    let personal = |p: &ApplePort| {
+        matches!(
+            p,
+            ApplePort::Headphones | ApplePort::Bluetooth | ApplePort::Usb
+        )
+    };
+    let loud = |p: &ApplePort| {
+        matches!(
+            p,
+            ApplePort::Speaker | ApplePort::Receiver | ApplePort::Room
+        )
+    };
+    if outputs.iter().any(personal) {
+        OutputKind::Headphones
+    } else if outputs.iter().any(loud) {
+        OutputKind::Speakers
+    } else {
+        OutputKind::Unknown
+    }
+}
+
 /// Windows: an endpoint's `PKEY_AudioEndpoint_FormFactor`
 /// (`EndpointFormFactor`) as an [`OutputKind`] (AEC-SPEC.md §4.2).
 #[must_use]
@@ -253,6 +306,25 @@ mod tests {
         assert_eq!(android_output_kind(&[2, 11]), OutputKind::Unknown);
         // Nothing listed at all: the built-in path.
         assert_eq!(android_output_kind(&[]), OutputKind::Speakers);
+    }
+
+    #[test]
+    fn ios_routes_classify() {
+        use ApplePort::*;
+        assert_eq!(ios_output_kind(&[Speaker]), OutputKind::Speakers);
+        // The earpiece is a speaker next to the microphone.
+        assert_eq!(ios_output_kind(&[Receiver]), OutputKind::Speakers);
+        assert_eq!(ios_output_kind(&[Room]), OutputKind::Speakers);
+        assert_eq!(ios_output_kind(&[Headphones]), OutputKind::Headphones);
+        assert_eq!(ios_output_kind(&[Bluetooth]), OutputKind::Headphones);
+        assert_eq!(ios_output_kind(&[Usb]), OutputKind::Headphones);
+        // A headset beside a speaker (AirPlay with AirPods, say): the
+        // personal one wins.
+        assert_eq!(ios_output_kind(&[Room, Bluetooth]), OutputKind::Headphones);
+        assert_eq!(ios_output_kind(&[Other]), OutputKind::Unknown);
+        // No route (the session not active yet): can't tell, which
+        // Automatic treats as speakers.
+        assert_eq!(ios_output_kind(&[]), OutputKind::Unknown);
     }
 
     #[test]
