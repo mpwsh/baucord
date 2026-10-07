@@ -10,8 +10,8 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed},
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -20,10 +20,10 @@ use std::{
 use audio::{
     AecMode, AecReport, AudioPacket, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig,
 };
-use crossbeam_channel::{Receiver, Sender, bounded, select};
+use crossbeam_channel::{bounded, select, Receiver, Sender};
 use log::info;
 
-use crate::{WakeFn, config::Settings, network::NetworkControl};
+use crate::{config::Settings, network::NetworkControl, WakeFn};
 
 // ── Channel messages ────────────────────────────────────────────────────
 

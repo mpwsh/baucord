@@ -30,13 +30,12 @@
 //! put and only the status bar came or went. The numbers go to the log
 //! once per change: "safe area: top 20 … (status bar 20)".
 
-use std::cell::Cell;
-use std::ptr::NonNull;
+use std::{cell::Cell, ptr::NonNull};
 
 use block2::RcBlock;
-use objc2::rc::Retained;
-use objc2::runtime::NSObject;
-use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{
+    define_class, msg_send, rc::Retained, runtime::NSObject, MainThreadMarker, MainThreadOnly,
+};
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSOperationQueue};
 use objc2_ui_kit::{
     UIResponder, UIView, UIViewAutoresizing, UIWindow, UIWindowDidBecomeKeyNotification,

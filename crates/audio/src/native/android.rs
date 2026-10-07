@@ -354,7 +354,11 @@ fn apply_route<'j>(
             "{name} (type {}, id {}){}",
             chosen.kind,
             chosen.id,
-            if accepted { "" } else { " — refused by the system" }
+            if accepted {
+                ""
+            } else {
+                " — refused by the system"
+            }
         ))
     } else {
         // Before API 31: the loudspeaker by its switch; a wired headset
@@ -472,7 +476,12 @@ pub fn current_route() -> Result<String, String> {
             return Ok("none".to_string());
         }
         let d = route_device(env, &device)?;
-        Ok(format!("{} (type {}, id {})", route::label(&d), d.kind, d.id))
+        Ok(format!(
+            "{} (type {}, id {})",
+            route::label(&d),
+            d.kind,
+            d.id
+        ))
     })
 }
 

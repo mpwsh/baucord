@@ -4,7 +4,7 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
 use client::{
-    config::{BindableAction, ServerEntry, build_bind_string},
+    config::{build_bind_string, BindableAction, ServerEntry},
     voice::VoiceControl,
 };
 use i18n::t;
@@ -951,10 +951,9 @@ fn wire(sf: &SettingsSurface<'_>) {
                         crate::media::save_to_downloads("baucord-identity.key", &bytes)
                     });
                 match saved {
-                    Ok(saved) => set_identity_status(
-                        app,
-                        &t!("file-saved", "path" => saved.shown.as_str()),
-                    ),
+                    Ok(saved) => {
+                        set_identity_status(app, &t!("file-saved", "path" => saved.shown.as_str()))
+                    }
                     Err(e) => app.show_error(&e),
                 }
             });
