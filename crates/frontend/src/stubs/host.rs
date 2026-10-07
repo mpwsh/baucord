@@ -84,6 +84,12 @@ pub trait Hooks: Send + Sync {
     fn chime_route(&self) -> ChimeRoute {
         ChimeRoute::App
     }
+    /// Play the message chime (`wav`) itself, for when the voice engine
+    /// has no playback open (Android out of a voice room). `false`: the
+    /// host cannot, and the engine is asked as before.
+    fn play_chime(&self, _wav: &[u8]) -> bool {
+        false
+    }
 }
 
 /// What the keep-alive notification says (Android's foreground service).
@@ -171,12 +177,24 @@ pub fn open_conversation(dm: String) {
     crate::app::open_noticed_conversation(dm);
 }
 
+/// Have the host play the message chime itself (`Hooks::play_chime`);
+/// `false` when it cannot.
+pub fn play_chime() -> bool {
+    HOOKS
+        .get()
+        .is_some_and(|h| h.play_chime(&alert_sound_wav()))
+}
+
 /// The DM chime as a WAV file, for a host that plays it through the
 /// system (iOS writes it where notifications find their sounds).
 #[must_use]
 pub fn alert_sound_wav() -> Vec<u8> {
-    let bank = audio::sounds::SoundBank::new();
-    audio::sounds::wav_bytes(bank.get(audio::SoundType::DirectMessage))
+    static WAV: OnceLock<Vec<u8>> = OnceLock::new();
+    WAV.get_or_init(|| {
+        let bank = audio::sounds::SoundBank::new();
+        audio::sounds::wav_bytes(bank.get(audio::SoundType::DirectMessage))
+    })
+    .clone()
 }
 
 static HOOKS: OnceLock<Box<dyn Hooks>> = OnceLock::new();

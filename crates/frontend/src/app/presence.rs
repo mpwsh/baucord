@@ -67,12 +67,15 @@ impl AppState {
                 .insert(id, UserState::new(name.clone(), audio, channel_id));
         }
 
-        // Start voice engine
+        // Start voice engine. With the lobby we arrive in it, and a
+        // phone opens no microphone there (ANDROID-SPEC.md D53).
+        self.voice_in_room = !self.lobby || self.is_testing_mic;
         self.voice
             .tx
             .send(VoiceControl::Start {
                 settings: Box::new(self.settings.clone()),
                 our_client_id: client_id,
+                in_room: self.voice_in_room,
             })
             .ok();
         // Join ding, queued behind Start on the same channel so it
@@ -224,6 +227,9 @@ impl AppState {
             }
             let channel = self.channel_name(channel_id);
             self.push_chat_system(&t!("chat-you-moved", "channel" => channel.as_str()));
+            // The streams for the room first (a phone opens them only
+            // now, D53), then the ding — on the new output, not the old.
+            self.sync_voice_room();
             self.play_chime(SoundType::UserJoined);
         } else {
             let name = self.username_of(client_id);

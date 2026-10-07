@@ -11,6 +11,9 @@ use super::*;
 impl AppState {
     pub fn update_user_list(&mut self) {
         self.main.global::<State>().set_in_lobby(self.in_lobby());
+        // Every presence change lands here: a phone's microphone follows
+        // the room (ANDROID-SPEC.md D53).
+        self.sync_voice_room();
         let items = roster::grouped_rows(
             &self.channels,
             &self.users,

@@ -9,8 +9,13 @@ import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.drawable.Drawable;
+import android.media.AudioAttributes;
 import android.media.AudioManager;
+import android.media.MediaPlayer;
 import android.util.Log;
+
+import java.io.File;
+import java.io.FileOutputStream;
 
 /**
  * The app's notifications (ANDROID-SPEC.md D52): its look — the status-bar
@@ -39,6 +44,11 @@ final class Notices {
     private static final String QUIET_GROUP = "dev.baucord.quiet";
 
     private static Bitmap largeIcon;
+
+    /** The message chime, written to the cache once a process. */
+    private static File chime;
+    /** The chime playing: held so the collector cannot cut it short. */
+    private static MediaPlayer player;
 
     private Notices() {}
 
@@ -143,6 +153,54 @@ final class Notices {
         NotificationChannel channel = manager.getNotificationChannel(id);
         return channel == null
                 || channel.getImportance() != NotificationManager.IMPORTANCE_NONE;
+    }
+
+    /**
+     * Play the message chime ({@code wav}) as a notification sound — for
+     * when the voice engine has no stream open (out of a voice room,
+     * ANDROID-SPEC.md D53). Rust has already checked the ringer and Do
+     * Not Disturb; the notification volume applies. UI thread.
+     */
+    static void playChime(Context context, byte[] wav) {
+        try {
+            if (chime == null) {
+                File file = new File(context.getCacheDir(), "chime.wav");
+                try (FileOutputStream out = new FileOutputStream(file)) {
+                    out.write(wav);
+                }
+                chime = file;
+            }
+            if (player != null) {
+                player.release();
+            }
+            player = new MediaPlayer();
+            player.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build());
+            player.setOnCompletionListener(Notices::releasePlayer);
+            player.setOnErrorListener((mp, what, extra) -> {
+                releasePlayer(mp);
+                return true;
+            });
+            player.setDataSource(chime.getPath());
+            player.prepare();
+            player.start();
+        } catch (Exception e) {
+            Log.w(TAG, "chime", e);
+            if (player != null) {
+                player.release();
+                player = null;
+            }
+        }
+    }
+
+    /** A chime finished (or failed): let its player go. UI thread. */
+    private static void releasePlayer(MediaPlayer done) {
+        done.release();
+        if (player == done) {
+            player = null;
+        }
     }
 
     /** Take down the notification posted under {@code key}. */

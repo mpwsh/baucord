@@ -618,6 +618,12 @@ sized from the device's callback (ANDROID-SPEC D24). Whether echo
 cancellation is on is decided from the stream that was opened, never
 assumed from the device, and Settings → Audio says what was found.
 
+The phones open only what their presence needs
+(`VoiceChat::set_presence`, ANDROID-SPEC D53, IOS-SPEC D51): nothing in the lobby on
+Android and a plain output on iOS (to stay alive in the background);
+in a room both sides on the call path; muted, the microphone closed
+(or muted on iOS's voice unit). The desktop keeps both streams open.
+
 ### 7.4 Notifications on the phones
 
 `app::alerts` is the policy, the hosts carry it out (ANDROID-SPEC D52,

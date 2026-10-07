@@ -60,6 +60,9 @@ impl AppState {
     /// through the system.
     pub(super) fn play_alert_chime(&self, sound: SoundType, notice: Notice) {
         match crate::host::chime_route() {
+            // Out of a voice room an Android engine plays nothing (no
+            // stream is open, D53): the host plays the chime itself.
+            ChimeRoute::App if !self.voice_in_room && crate::host::play_chime() => {}
             ChimeRoute::App => {
                 self.voice.tx.send(VoiceControl::PlaySound(sound)).ok();
             }

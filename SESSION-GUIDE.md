@@ -617,6 +617,15 @@ Memory-mode servers (persistence off) still use the legacy
   silenced or in Do Not Disturb (Android), a sound-only notification on
   iOS. A new alert sound takes the same road; the join/leave and share
   chimes are part of the call and do not.
+- **A phone opens the microphone only in a voice room, unmuted**
+  (ANDROID-SPEC.md D53, IOS-SPEC.md D51): the system shows an open
+  capture stream as recording, muted or not. `sync_voice_room` (from
+  `update_user_list`) tells the voice thread `SetInRoom`; the engine's
+  `set_presence` opens and closes what that needs. Anything new that
+  needs the microphone outside a room (a test, a recorder) must make
+  `sync_voice_room` count it, as the microphone test does. An Android
+  engine in the lobby has no playback either: chimes there go through
+  `host::play_chime`.
 - **Off screen, a phone notifies instead of chiming** (`app::alerts`):
   a DM is a notification whose tap opens the conversation; the first
   voice into empty rooms is "X joined Y". Notifications exist only while
@@ -764,6 +773,10 @@ outcome in the spec's decision log):
   dog icon, a tap opens the conversation; on silent, no chime with the
   app open; someone joining empty rooms → "X joined Y" (ANDROID-SPEC
   D52, IOS-SPEC D50).
+- Both: no microphone indicator in the lobby; in a room it goes off on
+  mute and comes back on unmute, and the first words after unmuting
+  are heard (ANDROID-SPEC D53, IOS-SPEC D51); the battery over an hour
+  in the lobby with the screen off.
 
 ## 6. Site screenshots
 

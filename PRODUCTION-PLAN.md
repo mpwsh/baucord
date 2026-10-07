@@ -45,10 +45,9 @@ What stands between this and "production for strangers":
 4. **Nothing runs the tests automatically** — releases are
    compile-only (REL-1).
 5. **Crashes in the field are invisible** (OPS-2).
-6. **Phones**: the microphone (and Android's microphone service, and
-   iOS's background audio) run from the moment of connecting, even in
-   the lobby where the server drops voice (MOB-1); store submission
-   needs several items (MOB-2…MOB-6), report/block above all.
+6. **Phones**: store submission needs several items (MOB-2…MOB-6),
+   report/block above all. (The microphone running in the lobby and
+   while muted, MOB-1, is fixed.)
 7. **Malicious content from other users** can freeze or exhaust a
    client: image/GIF decode bombs, oversized video, unbounded audio
    buffers (CLI-1…CLI-3).
@@ -327,7 +326,12 @@ What stands between this and "production for strangers":
 Today's plan says sideloaded APK (ANDROID-SPEC D4) and Ad Hoc builds
 (IOS-SPEC D37; D10 planned TestFlight). If the stores become the goal (§6, 2), these block it.
 
-- [ ] **MOB-1 [P0][M] The microphone runs in the lobby.** Every connect
+- [x] **MOB-1 [P0][M] The microphone runs in the lobby.** Done
+  2026-10-07 (§7; ANDROID-SPEC D53, IOS-SPEC D51) — what remains is the
+  Play/App Store side: the Android service still declares the
+  microphone type for the whole session (needed for a background
+  rejoin), and iOS keeps a silent output in the lobby to stay alive.
+  The original finding: every connect
   starts the voice engine (`frontend/src/app/presence.rs` ~70) and the
   keep-alive (Android's *microphone* foreground service, iOS's
   background audio), though the server drops lobby voice. Capture
@@ -486,8 +490,9 @@ Today's plan says sideloaded APK (ANDROID-SPEC D4) and Ad Hoc builds
    long, telemetry consent, who answers for self-hosted servers.
 4. **Push** (PRD-1): run an official push relay, or live with
    "notifications only while connected".
-5. **The lobby** (MOB-1): no microphone in the lobby changes the
-   keep-alive story (ANDROID-SPEC D43 assumed "connected = in voice").
+5. **The lobby** (MOB-1) — *decided 2026-10-07*: no microphone in the
+   lobby or while muted, on the phones only; the desktop keeps its
+   streams.
 6. **Mute across reconnects and restarts** (CLI-5): assumed yes.
 7. **The default branch**: `chunk` or `main` — the workflows disagree.
 
@@ -505,6 +510,12 @@ Today's plan says sideloaded APK (ANDROID-SPEC D4) and Ad Hoc builds
   whose tap opens the conversation; "Ana joined General" when someone
   joins while every voice room was empty (at most every 10 minutes).
   All only while the app stays connected — PRD-1 for the rest.
+- **2026-10-07 — MOB-1, the phones' microphone** (ANDROID-SPEC D53,
+  IOS-SPEC D51): in the lobby Android opens no audio at all and iOS only
+  a plain output (to stay alive in the background); muted or deafened in
+  a room, Android closes the microphone and iOS mutes it on the voice
+  unit (plain streams: closed). The desktop is unchanged. The voice
+  thread ticks at 250 ms while no microphone is open.
 - **2026-10-07 — the documents**: `START-HERE.md` (the way in, the
   reading order), this plan (replacing `todo.md`, `todos` and
   SESSION-GUIDE's diary), SESSION-GUIDE §1–§3 brought up to date (the

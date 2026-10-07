@@ -634,7 +634,7 @@ impl CommunicationMode {
                     took.as_millis()
                 ),
                 Ok(None) => {
-                    info!("Android audio: route to device {id} not confirmed; opening anyway")
+                    info!("Android audio: route to device {id} not confirmed; opening anyway");
                 }
                 Err(e) => warn!("Android audio: waiting for the route: {e}"),
             }

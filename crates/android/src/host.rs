@@ -135,6 +135,16 @@ impl Hooks for AndroidHost {
         }
     }
 
+    fn play_chime(&self, wav: &[u8]) -> bool {
+        match java::play_chime(wav) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("chime: {e}");
+                false
+            }
+        }
+    }
+
     fn chime_route(&self) -> ChimeRoute {
         match java::chime_allowed() {
             Ok(true) => ChimeRoute::App,

@@ -39,11 +39,12 @@ use coreaudio::audio_unit::{
     AudioUnit, Element, IOType, SampleFormat, Scope, StreamFormat,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
-use log::{debug, info};
+use log::{debug, info, warn};
 use objc2_audio_toolbox::{
-    kAUVoiceIOProperty_BypassVoiceProcessing, kAUVoiceIOProperty_OtherAudioDuckingConfiguration,
-    kAudioOutputUnitProperty_EnableIO, kAudioUnitProperty_MaximumFramesPerSlice,
-    AUVoiceIOOtherAudioDuckingConfiguration, AUVoiceIOOtherAudioDuckingLevel,
+    kAUVoiceIOProperty_BypassVoiceProcessing, kAUVoiceIOProperty_MuteOutput,
+    kAUVoiceIOProperty_OtherAudioDuckingConfiguration, kAudioOutputUnitProperty_EnableIO,
+    kAudioUnitProperty_MaximumFramesPerSlice, AUVoiceIOOtherAudioDuckingConfiguration,
+    AUVoiceIOOtherAudioDuckingLevel,
 };
 use objc2_core_audio_types::AudioBufferList;
 use rtrb::{Consumer, Producer};
@@ -162,8 +163,11 @@ impl<P> Mailbox<P> {
 struct Unit {
     /// Stops, uninitialises and disposes of the unit — and frees its
     /// callbacks and whatever halves they hold — on drop. Behind a
-    /// mutex only so the shared `Arc<Unit>` is `Sync`.
-    _io: Mutex<AudioUnit>,
+    /// mutex so the shared `Arc<Unit>` is `Sync`, and for the mute
+    /// property, set from the control side.
+    io: Mutex<AudioUnit>,
+    /// The microphone is muted on the unit (`set_mic_muted`).
+    mic_muted: AtomicBool,
     capture: Arc<Mailbox<CapturePump>>,
     render: Arc<Mailbox<RenderPump>>,
     /// Voice processing confirmed on after initialisation (the bypass
@@ -181,26 +185,83 @@ static LIVE: Mutex<Weak<Unit>> = Mutex::new(Weak::new());
 /// held by `VoiceChat` for as long as the plan lasts: both sides then
 /// attach to it, never to a unit of their own.
 pub struct Prepared {
-    _unit: Arc<Unit>,
+    unit: Arc<Unit>,
 }
 
-/// Open the unit (or take the one running) for a voice plan.
+impl Prepared {
+    /// Mute or unmute the microphone on the unit
+    /// (`kAUVoiceIOProperty_MuteOutput`: the unit stops delivering the
+    /// microphone, and the system no longer shows the app as recording —
+    /// what `AVAudioEngine`'s `voiceProcessingInputMuted` sets; iOS 17+
+    /// may play its own mute tone). Playback and the canceller's state
+    /// carry on, so unmuting is immediate (IOS-SPEC.md D51). Logged on
+    /// a change; a refusal leaves the samples dropped by the capture
+    /// side's own mute, as before.
+    pub fn set_mic_muted(&self, muted: bool) {
+        self.unit.set_mic_muted(muted);
+    }
+}
+
+impl Unit {
+    fn set_mic_muted(&self, muted: bool) {
+        if self.mic_muted.load(Ordering::Relaxed) == muted {
+            return;
+        }
+        let result = set_mute(
+            &mut self.io.lock().unwrap_or_else(PoisonError::into_inner),
+            muted,
+        );
+        match result {
+            Ok(()) => {
+                // Only a change that took: a refusal is tried again on
+                // the next call.
+                self.mic_muted.store(muted, Ordering::Relaxed);
+                info!(
+                    "VPIO microphone {}",
+                    if muted {
+                        "muted on the unit"
+                    } else {
+                        "unmuted"
+                    }
+                );
+            }
+            Err(e) => warn!("VPIO microphone mute ({muted}): {e}"),
+        }
+    }
+}
+
+/// Open the unit (or take the one running) for a voice plan, its
+/// microphone muted on the unit when `mic_muted` (IOS-SPEC.md D51).
 ///
 /// # Errors
 /// The unit would not open: the plan takes plain streams instead.
-pub fn prepare(stats: &Arc<AudioStats>) -> Result<Prepared, String> {
-    shared_unit(stats).map(|unit| Prepared { _unit: unit })
+pub fn prepare(stats: &Arc<AudioStats>, mic_muted: bool) -> Result<Prepared, String> {
+    let unit = shared_unit(stats, mic_muted)?;
+    unit.set_mic_muted(mic_muted);
+    Ok(Prepared { unit })
 }
 
-/// The running unit, opening it if nobody holds one.
-fn shared_unit(stats: &Arc<AudioStats>) -> Result<Arc<Unit>, String> {
+/// The running unit, opening it if nobody holds one — muted from the
+/// start when `mic_muted`, so a muted plan never records a moment.
+fn shared_unit(stats: &Arc<AudioStats>, mic_muted: bool) -> Result<Arc<Unit>, String> {
     let mut live = LIVE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(unit) = live.upgrade() {
         return Ok(unit);
     }
-    let unit = Arc::new(Unit::open(stats)?);
+    let unit = Arc::new(Unit::open(stats, mic_muted)?);
     *live = Arc::downgrade(&unit);
     Ok(unit)
+}
+
+/// The unit's microphone mute (`kAUVoiceIOProperty_MuteOutput`).
+fn set_mute(unit: &mut AudioUnit, muted: bool) -> Result<(), coreaudio::Error> {
+    let value = u32::from(muted);
+    unit.set_property(
+        kAUVoiceIOProperty_MuteOutput,
+        Scope::Global,
+        Element::Output,
+        Some(&value),
+    )
 }
 
 fn ca(what: &str) -> impl FnOnce(coreaudio::Error) -> String + '_ {
@@ -208,7 +269,7 @@ fn ca(what: &str) -> impl FnOnce(coreaudio::Error) -> String + '_ {
 }
 
 impl Unit {
-    fn open(stats: &Arc<AudioStats>) -> Result<Self, String> {
+    fn open(stats: &Arc<AudioStats>, mic_muted: bool) -> Result<Self, String> {
         avsession::prefer_voice_io();
         avsession::activate();
         // Before the unit runs, so the reroute does not hit it.
@@ -299,6 +360,12 @@ impl Unit {
                 },
                 |b| b == 0,
             );
+        // Muted before it runs, when the plan wants no microphone; the
+        // flag says what took, so a refusal is tried again later.
+        let muted = mic_muted
+            && set_mute(&mut unit, true)
+                .inspect_err(|e| warn!("VPIO microphone mute before start: {e}"))
+                .is_ok();
         // Observers first: an interruption between start and here would
         // otherwise go unseen.
         let watch = avsession::SessionWatch::start(stats);
@@ -313,7 +380,8 @@ impl Unit {
             OPUS_SAMPLE_RATE,
         );
         Ok(Self {
-            _io: Mutex::new(unit),
+            io: Mutex::new(unit),
+            mic_muted: AtomicBool::new(muted),
             capture,
             render,
             processing,
@@ -427,7 +495,7 @@ impl NativeCapture {
         config: Arc<InputConfig>,
         input_level: Arc<AtomicU32>,
     ) -> Result<Self, CaptureStartError> {
-        let unit = match shared_unit(&stats) {
+        let unit = match shared_unit(&stats, false) {
             Ok(unit) => unit,
             Err(reason) => {
                 return Err(CaptureStartError {
@@ -500,7 +568,7 @@ impl NativeRender {
         stats: Arc<AudioStats>,
         callback_frames: Arc<AtomicUsize>,
     ) -> Result<Self, RenderStartError> {
-        let unit = match shared_unit(&stats) {
+        let unit = match shared_unit(&stats, false) {
             Ok(unit) => unit,
             Err(reason) => {
                 return Err(RenderStartError {

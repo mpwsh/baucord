@@ -116,6 +116,11 @@ public class BaucordActivity extends NativeActivity {
         return Notices.allowed(this, kind);
     }
 
+    /** Rust: play the message chime while no voice stream is open (D53). */
+    public void playChime(final byte[] wav) {
+        runOnUiThread(() -> Notices.playChime(this, wav));
+    }
+
     /** Rust: whether the phone's ringer and Do Not Disturb allow an alert chime now. */
     public boolean chimeAllowed() {
         return Notices.chimeAllowed(this);

@@ -337,6 +337,26 @@ pub fn notices_allowed(kind: frontend::notice::NoticeKind) -> Result<bool, Strin
     .map_err(|e| e.to_string())
 }
 
+/// `BaucordActivity.playChime(wav)`: the message chime as a
+/// notification sound, while no voice stream is open (D53).
+///
+/// # Errors
+/// Any JNI failure, as text.
+#[cfg(feature = "app")]
+pub fn play_chime(wav: &[u8]) -> Result<(), String> {
+    with_activity(|env, activity| {
+        let jwav = env.byte_array_from_slice(wav)?;
+        env.call_method(
+            activity,
+            jni::jni_str!("playChime"),
+            jni::jni_sig!("([B)V"),
+            &[(&jwav).into()],
+        )?;
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// `BaucordActivity.cancelNotice(key)`.
 ///
 /// # Errors

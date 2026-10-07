@@ -387,6 +387,10 @@ pub struct AppState {
     /// When a phone last said someone started a call (`alerts`): once
     /// per ten minutes at most.
     last_join_notice: Option<Instant>,
+    /// What the voice engine was last told: in a voice room (or testing
+    /// the microphone). A phone keeps no microphone open otherwise
+    /// (`sync_voice_room`).
+    voice_in_room: bool,
     /// The room to go back to after an automatic reconnect: set when
     /// the connection drops, spent by the next `Init`, cleared by a
     /// deliberate connect or disconnect.
@@ -681,6 +685,7 @@ pub fn run() {
         lobby: false,
         lobby_name: None,
         last_join_notice: None,
+        voice_in_room: true,
         rejoin_channel: None,
         settings_win: None,
         admin_win: None,

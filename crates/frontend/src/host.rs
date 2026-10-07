@@ -59,6 +59,12 @@ pub fn chime_route() -> ChimeRoute {
     ChimeRoute::App
 }
 
+/// The desktop's engine always has playback open.
+#[must_use]
+pub fn play_chime() -> bool {
+    false
+}
+
 /// The desktop's viewer is a window the user arranges; the display's
 /// sleep is left to the OS (a phone keeps its screen on while a stream
 /// plays, `stubs/host.rs`).
