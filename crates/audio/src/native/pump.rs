@@ -77,18 +77,21 @@ pub struct RenderPump {
 
 impl RenderPump {
     /// Allocates the scratch buffer: build it off the real-time thread.
+    /// Starts from what `callback_frames` already says (a backend that
+    /// knows its burst seeds it), so it only ever grows.
     pub fn new(
         consumer: Consumer<f32>,
         wake_tx: Sender<()>,
         stats: Arc<AudioStats>,
         callback_frames: Arc<AtomicUsize>,
     ) -> Self {
+        let largest_callback = callback_frames.load(Ordering::Relaxed);
         Self {
             consumer,
             wake_tx,
             stats,
             callback_frames,
-            largest_callback: 0,
+            largest_callback,
             scratch: vec![0.0; RENDER_SCRATCH],
         }
     }

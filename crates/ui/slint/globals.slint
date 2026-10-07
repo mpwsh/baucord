@@ -294,6 +294,9 @@ export global State {
     /// The page's zoom-to-fill (landscape): set by the person, kept for
     /// the session, so the next stream opens the way they left it.
     in-out property <bool> watch-fill: false;
+    /// The stream page turned a quarter for a phone whose rotation is
+    /// locked (viewer.slint), kept for the session across streams.
+    in-out property <bool> watch-rotated: false;
 
     // ── Invite dialog (spec §3.1) ───────────────────────────────────
     // Options are indices into the lists the host fills; the created

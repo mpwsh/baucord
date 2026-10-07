@@ -809,6 +809,21 @@ component ComposerField inherits Rectangle {
     public function do-cut() { input.cut(); }
     public function do-copy() { input.copy(); }
     public function do-paste() { input.paste(); }
+    /// Android: the word the keyboard is still composing is shown in
+    /// the field but is not in `text` until the keyboard commits it —
+    /// on a space or punctuation, not on Enter or the send button, so a
+    /// message sent mid-word went out without it and the word stayed
+    /// behind (users: "it won't send until I type a space"). Slint
+    /// commits the composition when the field loses focus; losing it
+    /// and taking it straight back does that and keeps the keyboard.
+    /// Elsewhere a composition is the IME's to finish (desktop IMEs
+    /// commit before Enter reaches us).
+    public function commit-composition() {
+        if (Platform.os == OperatingSystemType.android && input.preedit-text != "") {
+            input.clear-focus();
+            input.focus();
+        }
+    }
 
     // Grows with the draft like Discord: one line at rest, up to ~5
     // lines, then scrolls internally with the caret kept visible.
@@ -834,7 +849,8 @@ component ComposerField inherits Rectangle {
         }
     }
     // The hint for an empty draft: the room, or the person.
-    if root.placeholder != "" && input.text == "" : Text {
+    // (Not over a first word the keyboard is still composing.)
+    if root.placeholder != "" && input.text == "" && input.preedit-text == "" : Text {
         x: Theme.gap-md;
         y: 0;
         height: parent.height;
@@ -861,8 +877,11 @@ component ComposerField inherits Rectangle {
             wrap: word-wrap;
             font-size: Theme.font-body;
             color: Theme.text-primary;
-            selection-background-color: Theme.accent;
-            selection-foreground-color: Theme.on-accent;
+            // Slint draws a composing word with the selection colours,
+            // so on Android every word looked selected while typed;
+            // plain text instead until the keyboard commits it.
+            selection-background-color: self.preedit-text != "" ? transparent : Theme.accent;
+            selection-foreground-color: self.preedit-text != "" ? Theme.text-primary : Theme.on-accent;
             edited => { root.edited(); }
             cursor-position-changed(pos) => {
                 if (pos.y + fl.content-y < 0px) {
@@ -1346,6 +1365,7 @@ export component ChatPane inherits Rectangle {
                 height: input.height;
                 capture-key-pressed(ev) => {
                     if (ev.text == Key.Return && !ev.modifiers.shift) {
+                        input.commit-composition();
                         Logic.send-message();
                         return accept;
                     }
@@ -1448,7 +1468,10 @@ export component ChatPane inherits Rectangle {
                 }
                 st := TouchArea {
                     mouse-cursor: pointer;
-                    clicked => { Logic.send-message(); }
+                    clicked => {
+                        input.commit-composition();
+                        Logic.send-message();
+                    }
                 }
             }
         }

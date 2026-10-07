@@ -24,6 +24,13 @@
 // a 4:3 or 16:9 stream on a 19.5:9 phone otherwise leaves bands
 // (ANDROID-SPEC.md D41, IOS-SPEC.md D33).
 //
+// A phone held upright with its rotation locked can still watch in
+// landscape: the bar's Rotate button turns the picture and its chrome a
+// quarter (a stage inside the panel, turned about its middle; Slint
+// turns taps back, so zoom, pan and the buttons work as they do on a
+// screen that turned by itself). It is offered only while the screen is
+// upright, and a screen that turns by itself undoes it.
+//
 // The picture zooms, to read small text on a shared screen (IOS-SPEC.md
 // §14 D44): two fingers pinch (a Mac's trackpad too), the mouse wheel
 // zooms where the pointer is, + / - / 0 from the keyboard; zoomed, one
@@ -70,7 +77,31 @@ export component StreamViewerPanel inherits FocusScope {
     /// the distance zoomed ×2.7, to three times ×7. `1 + ln(scale)`
     /// gives r back. A trackpad's pinch (macOS) is already right.
     in property <bool> pinch-from-touch: false;
-    property <bool> fill-offered: root.fill-available && root.width > root.height;
+    /// Turning the picture and its chrome a quarter is offered (phones):
+    /// for a phone held upright with its rotation locked, a landscape
+    /// stream at landscape size. Only while the screen is upright — a
+    /// screen that turns by itself undoes it.
+    in property <bool> rotate-available: false;
+    in-out property <bool> rotated: false;
+    property <bool> rotate-offered: root.rotate-available && (root.rotated || root.width < root.height);
+    property <bool> screen-landscape: root.width > root.height;
+    changed screen-landscape => {
+        if (root.screen-landscape && root.rotated) {
+            root.rotated = false;
+            root.reset-zoom();
+        }
+    }
+    // Everything below is laid out on the stage: the panel, or — turned
+    // a quarter clockwise — the panel on its side. Its edges keep clear
+    // of the screen edges they now face: its top faces the screen's
+    // right, its left the screen's top.
+    property <length> w: root.rotated ? root.height : root.width;
+    property <length> h: root.rotated ? root.width : root.height;
+    property <length> inset-l: root.rotated ? root.chrome-inset-top : root.chrome-inset-left;
+    property <length> inset-t: root.rotated ? root.chrome-inset-right : root.chrome-inset-top;
+    property <length> inset-r: root.rotated ? root.chrome-inset-bottom : root.chrome-inset-right;
+    property <length> inset-b: root.rotated ? root.chrome-inset-left : root.chrome-inset-bottom;
+    property <bool> fill-offered: root.fill-available && root.w > root.h;
     callback volume-changed(float);
     callback mute-toggled(bool);
     callback stop-watching();
@@ -99,6 +130,10 @@ export component StreamViewerPanel inherits FocusScope {
             root.fullscreen = !root.fullscreen;
         }
     }
+    function toggle-rotation() {
+        root.rotated = !root.rotated;
+        root.reset-zoom();
+    }
     function toggle-fill() {
         if (root.fill-offered) {
             root.fill = !root.fill;
@@ -122,14 +157,14 @@ export component StreamViewerPanel inherits FocusScope {
     property <length> frame-h: root.frame.height * 1px;
     property <float> fit-scale: !root.has-frame ? 1.0
         : root.fill-offered && root.fill
-            ? Math.max(root.width / root.frame-w, root.height / root.frame-h)
-            : Math.min(root.width / root.frame-w, root.height / root.frame-h);
-    property <length> pic-w: root.has-frame ? root.frame-w * root.fit-scale * root.zoom : root.width;
-    property <length> pic-h: root.has-frame ? root.frame-h * root.fit-scale * root.zoom : root.height;
-    property <length> pic-x: (root.width - root.pic-w) / 2 + root.clamp-pan(root.pan-x, root.pic-w, root.width);
-    property <length> pic-y: (root.height - root.pic-h) / 2 + root.clamp-pan(root.pan-y, root.pic-h, root.height);
+            ? Math.max(root.w / root.frame-w, root.h / root.frame-h)
+            : Math.min(root.w / root.frame-w, root.h / root.frame-h);
+    property <length> pic-w: root.has-frame ? root.frame-w * root.fit-scale * root.zoom : root.w;
+    property <length> pic-h: root.has-frame ? root.frame-h * root.fit-scale * root.zoom : root.h;
+    property <length> pic-x: (root.w - root.pic-w) / 2 + root.clamp-pan(root.pan-x, root.pic-w, root.w);
+    property <length> pic-y: (root.h - root.pic-h) / 2 + root.clamp-pan(root.pan-y, root.pic-h, root.h);
     /// Larger than the surface in some direction: a drag moves it.
-    property <bool> pannable: root.pic-w > root.width + 1px || root.pic-h > root.height + 1px;
+    property <bool> pannable: root.pic-w > root.w + 1px || root.pic-h > root.h + 1px;
     // A pinch keeps the point it started on under the fingers.
     property <float> pinch-zoom: 1.0;
     property <float> pinch-fx: 0.5;
@@ -149,10 +184,10 @@ export component StreamViewerPanel inherits FocusScope {
         }
         root.zoom = Math.clamp(target, 1.0, root.max-zoom);
         // `pic-w`/`pic-h` already follow the new zoom.
-        root.pan-x = root.clamp-pan(cx - fx * root.pic-w - (root.width - root.pic-w) / 2,
-            root.pic-w, root.width);
-        root.pan-y = root.clamp-pan(cy - fy * root.pic-h - (root.height - root.pic-h) / 2,
-            root.pic-h, root.height);
+        root.pan-x = root.clamp-pan(cx - fx * root.pic-w - (root.w - root.pic-w) / 2,
+            root.pic-w, root.w);
+        root.pan-y = root.clamp-pan(cy - fy * root.pic-h - (root.h - root.pic-h) / 2,
+            root.pic-h, root.h);
     }
     /// Zoom to `target`, keeping what is under (cx, cy) there.
     function zoom-about(target: float, cx: length, cy: length) {
@@ -193,11 +228,11 @@ export component StreamViewerPanel inherits FocusScope {
             return accept;
         }
         if (ev.text == "+" || ev.text == "=") {
-            root.zoom-about(root.zoom * 1.25, root.width / 2, root.height / 2);
+            root.zoom-about(root.zoom * 1.25, root.w / 2, root.h / 2);
             return accept;
         }
         if (ev.text == "-") {
-            root.zoom-about(root.zoom / 1.25, root.width / 2, root.height / 2);
+            root.zoom-about(root.zoom / 1.25, root.w / 2, root.h / 2);
             return accept;
         }
         if (ev.text == "0") {
@@ -207,326 +242,353 @@ export component StreamViewerPanel inherits FocusScope {
         reject
     }
 
-    // Two fingers (or a trackpad's pinch) zoom; inside it the picture
-    // and the surface that takes taps, drags and the wheel.
-    ScaleRotateGestureHandler {
-        started => {
-            root.pinch-zoom = root.zoom;
-            root.pinch-fx = (self.center.x - root.pic-x) / root.pic-w;
-            root.pinch-fy = (self.center.y - root.pic-y) / root.pic-h;
-            root.wake();
-        }
-        // Following the fingers' midpoint pans as it zooms.
-        updated => {
-            root.place(
-                root.pinch-zoom
-                    * (root.pinch-from-touch ? Math.max(0.1, 1 + Math.ln(self.scale)) : self.scale),
-                root.pinch-fx, root.pinch-fy, self.center.x, self.center.y);
-        }
+    // The room the control bar may take; on a narrow surface (a phone
+    // upright, a small window) it tightens: closer spacing, a shorter
+    // volume slider, Stop watching as an ✕.
+    property <length> bar-room: root.w - root.inset-l - root.inset-r
+        - 2 * Theme.gap-md;
+    property <bool> bar-tight: root.bar-room < 480px;
+    property <length> slider-w: root.bar-room < 360px ? 64px : root.bar-tight ? 96px : 130px;
 
-        Rectangle {
-            width: 100%;
-            height: 100%;
-            // The zoomed picture stays inside the viewer.
-            clip: true;
-            Image {
-                x: root.pic-x;
-                y: root.pic-y;
-                width: root.pic-w;
-                height: root.pic-h;
-                source: root.frame;
-                // The box already has the picture's proportions.
-                image-fit: ImageFit.fill;
-            }
-        }
+    stage := Rectangle {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: root.w;
+        height: root.h;
+        // A quarter turn clockwise about the middle: the stage's top edge
+        // lands on the screen's right. Taps and drags are turned back by
+        // Slint, so everything inside works in the stage's own frame.
+        transform-rotation: root.rotated ? 90deg : 0deg;
+        transform-origin: { x: self.width / 2, y: self.height / 2 };
 
-        // The pointer over the picture: movement (or a tap) wakes the
-        // chrome; a drag pans a picture larger than the surface; the
-        // wheel zooms where the pointer is; a double-click resets a zoom,
-        // else toggles fullscreen (desktop) or fit ⇄ fill (a phone on
-        // its side), else zooms in where it landed. Sits under the
-        // chrome, so the controls still get their clicks.
-        surface := TouchArea {
-            // Where the picture was when this press began.
-            property <length> drag-pan-x;
-            property <length> drag-pan-y;
-            mouse-cursor: root.pannable ? (self.pressed ? MouseCursor.grabbing : MouseCursor.grab)
-                : root.chrome-shown ? MouseCursor.default : MouseCursor.none;
-            pointer-event(ev) => {
-                if (ev.kind == PointerEventKind.down) {
-                    self.drag-pan-x = root.pic-x - (root.width - root.pic-w) / 2;
-                    self.drag-pan-y = root.pic-y - (root.height - root.pic-h) / 2;
-                }
-            }
-            moved => {
-                root.wake();
-                if (self.pressed && root.pannable) {
-                    root.pan-x = root.clamp-pan(self.drag-pan-x + self.mouse-x - self.pressed-x,
-                        root.pic-w, root.width);
-                    root.pan-y = root.clamp-pan(self.drag-pan-y + self.mouse-y - self.pressed-y,
-                        root.pic-h, root.height);
-                }
-            }
-            scroll-event(ev) => {
-                if (ev.delta-y == 0px) {
-                    return reject;
-                }
-                // One wheel notch (60 px) ≈ ×1.16.
-                root.zoom-about(root.zoom * Math.pow(1.0025, ev.delta-y / 1px),
-                    self.mouse-x, self.mouse-y);
-                accept
-            }
-            clicked => {
-                root.focus();
+        // Two fingers (or a trackpad's pinch) zoom; inside it the picture
+        // and the surface that takes taps, drags and the wheel.
+        ScaleRotateGestureHandler {
+            started => {
+                root.pinch-zoom = root.zoom;
+                root.pinch-fx = (self.center.x - root.pic-x) / root.pic-w;
+                root.pinch-fy = (self.center.y - root.pic-y) / root.pic-h;
                 root.wake();
             }
-            double-clicked => {
-                if (root.zoomed) {
-                    root.reset-zoom();
-                } else if (root.fullscreen-available) {
-                    root.toggle-fullscreen();
-                } else if (root.fill-offered) {
-                    root.toggle-fill();
-                } else {
-                    root.zoom-about(2.5, self.mouse-x, self.mouse-y);
+            // Following the fingers' midpoint pans as it zooms.
+            updated => {
+                root.place(
+                    root.pinch-zoom
+                        * (root.pinch-from-touch ? Math.max(0.1, 1 + Math.ln(self.scale)) : self.scale),
+                    root.pinch-fx, root.pinch-fy, self.center.x, self.center.y);
+            }
+
+            Rectangle {
+                width: 100%;
+                height: 100%;
+                // The zoomed picture stays inside the viewer.
+                clip: true;
+                Image {
+                    x: root.pic-x;
+                    y: root.pic-y;
+                    width: root.pic-w;
+                    height: root.pic-h;
+                    source: root.frame;
+                    // The box already has the picture's proportions.
+                    image-fit: ImageFit.fill;
                 }
             }
-            changed has-hover => {
-                if (self.has-hover) { root.wake(); }
+
+            // The pointer over the picture: movement (or a tap) wakes the
+            // chrome; a drag pans a picture larger than the surface; the
+            // wheel zooms where the pointer is; a double-click resets a zoom,
+            // else toggles fullscreen (desktop) or fit ⇄ fill (a phone on
+            // its side), else zooms in where it landed. Sits under the
+            // chrome, so the controls still get their clicks.
+            surface := TouchArea {
+                // Where the picture was when this press began.
+                property <length> drag-pan-x;
+                property <length> drag-pan-y;
+                mouse-cursor: root.pannable ? (self.pressed ? MouseCursor.grabbing : MouseCursor.grab)
+                    : root.chrome-shown ? MouseCursor.default : MouseCursor.none;
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) {
+                        self.drag-pan-x = root.pic-x - (root.w - root.pic-w) / 2;
+                        self.drag-pan-y = root.pic-y - (root.h - root.pic-h) / 2;
+                    }
+                }
+                moved => {
+                    root.wake();
+                    if (self.pressed && root.pannable) {
+                        root.pan-x = root.clamp-pan(self.drag-pan-x + self.mouse-x - self.pressed-x,
+                            root.pic-w, root.w);
+                        root.pan-y = root.clamp-pan(self.drag-pan-y + self.mouse-y - self.pressed-y,
+                            root.pic-h, root.h);
+                    }
+                }
+                scroll-event(ev) => {
+                    if (ev.delta-y == 0px) {
+                        return reject;
+                    }
+                    // One wheel notch (60 px) ≈ ×1.16.
+                    root.zoom-about(root.zoom * Math.pow(1.0025, ev.delta-y / 1px),
+                        self.mouse-x, self.mouse-y);
+                    accept
+                }
+                clicked => {
+                    root.focus();
+                    root.wake();
+                }
+                double-clicked => {
+                    if (root.zoomed) {
+                        root.reset-zoom();
+                    } else if (root.fullscreen-available) {
+                        root.toggle-fullscreen();
+                    } else if (root.fill-offered) {
+                        root.toggle-fill();
+                    } else {
+                        root.zoom-about(2.5, self.mouse-x, self.mouse-y);
+                    }
+                }
+                changed has-hover => {
+                    if (self.has-hover) { root.wake(); }
+                }
             }
         }
-    }
 
-    // ── Name chip, top-left ─────────────────────────────────────────
-    chip := Rectangle {
-        x: root.chrome-inset-left + Theme.gap-md;
-        y: root.chrome-inset-top + Theme.gap-md;
-        width: chip-text.preferred-width + 2 * Theme.gap-md;
-        height: 28px;
-        border-radius: 14px;
-        background: Theme.surface.with-alpha(0.85);
-        opacity: root.chrome-shown ? 1.0 : 0.0;
-        animate opacity { duration: 200ms; }
-        // Faded out, it takes no taps: they belong to the picture.
-        visible: self.opacity > 0.01;
-        chip-hover := TouchArea { }
-        chip-text := Text {
-            text: root.peer-name;
-            color: Theme.text-primary;
-            font-size: Theme.font-sm;
-            font-weight: 600;
-            vertical-alignment: center;
-            horizontal-alignment: center;
-        }
-    }
-
-    // ── Zoom chip, top-right: how far, and a tap back to the whole ──
-    if root.zoomed : Rectangle {
-        x: root.width - root.chrome-inset-right - Theme.gap-md - self.width;
-        y: root.chrome-inset-top + Theme.gap-md;
-        width: zoom-row.preferred-width;
-        height: 28px;
-        border-radius: 14px;
-        background: Theme.surface.with-alpha(0.85);
-        opacity: root.chrome-shown ? 1.0 : 0.0;
-        animate opacity { duration: 200ms; }
-        visible: self.opacity > 0.01;
-        zoom-row := HorizontalLayout {
-            padding-left: Theme.gap-md;
-            padding-right: Theme.gap-sm;
-            spacing: Theme.gap-xs;
-            Text {
-                text: "\{Math.round(root.zoom * 10) / 10}×";
+        // ── Name chip, top-left ─────────────────────────────────────────
+        chip := Rectangle {
+            x: root.inset-l + Theme.gap-md;
+            y: root.inset-t + Theme.gap-md;
+            width: chip-text.preferred-width + 2 * Theme.gap-md;
+            height: 28px;
+            border-radius: 14px;
+            background: Theme.surface.with-alpha(0.85);
+            opacity: root.chrome-shown ? 1.0 : 0.0;
+            animate opacity { duration: 200ms; }
+            // Faded out, it takes no taps: they belong to the picture.
+            visible: self.opacity > 0.01;
+            chip-hover := TouchArea { }
+            chip-text := Text {
+                text: root.peer-name;
                 color: Theme.text-primary;
                 font-size: Theme.font-sm;
                 font-weight: 600;
                 vertical-alignment: center;
-            }
-            Rectangle {
-                width: 18px;
-                IconDisplay {
-                    icon: IconSet.ZoomOut;
-                    size: 16px;
-                    stroke: Theme.text-secondary;
-                }
+                horizontal-alignment: center;
             }
         }
-        TouchArea {
-            mouse-cursor: pointer;
-            clicked => { root.reset-zoom(); }
-        }
-    }
 
-    // ── Control bar, bottom-center ──────────────────────────────────
-    // The room the bar may take; on a narrow surface (a phone upright,
-    // a small window) it tightens: closer spacing, a shorter volume
-    // slider, Stop watching as an ✕.
-    property <length> bar-room: root.width - root.chrome-inset-left - root.chrome-inset-right
-        - 2 * Theme.gap-md;
-    property <bool> bar-tight: root.bar-room < 480px;
-    property <length> slider-w: root.bar-room < 360px ? 64px : root.bar-tight ? 96px : 130px;
-    bar := Rectangle {
-        // Centred in the safe area, above its bottom edge.
-        x: root.chrome-inset-left
-            + (parent.width - root.chrome-inset-left - root.chrome-inset-right - self.width) / 2;
-        y: parent.height - root.chrome-inset-bottom - self.height - Theme.gap-md;
-        width: Math.min(root.bar-room, bar-row.preferred-width);
-        height: 48px;
-        border-radius: Theme.radius-md;
-        background: Theme.surface.with-alpha(0.85);
-        border-width: 1px;
-        border-color: Theme.border.with-alpha(0.6);
-        opacity: root.chrome-shown ? 1.0 : 0.0;
-        animate opacity { duration: 200ms; }
-        // Faded out, its buttons take no taps: a tap to bring the bar
-        // back must not land on Stop watching.
-        visible: self.opacity > 0.01;
-        bar-hover := TouchArea { }
-        // Every control sits in a full-height wrapper and centers
-        // itself in it: layout children with a fixed height would
-        // otherwise hug the top. The stats column has a fixed
-        // preferred width, so the bar's width — and the buttons'
-        // places — never move with the numbers; it is the part that
-        // gives on a narrow surface, eliding.
-        bar-row := HorizontalLayout {
-            padding-left: root.bar-tight ? Theme.gap-sm : Theme.gap-md;
-            padding-right: root.bar-tight ? Theme.gap-sm : Theme.gap-md;
-            spacing: root.bar-tight ? Theme.gap-xs : Theme.gap-sm;
-
-            // The viewer's own microphone and headphones (D43).
-            if root.self-controls : Rectangle {
-                width: 32px;
-                IconBtn {
-                    y: (parent.height - self.height) / 2;
-                    size: 32px;
-                    icon-size: 18px;
-                    icon: root.self-muted ? IconSet.MicOff : IconSet.Mic;
-                    active: root.self-muted;
-                    active-danger: true;
-                    tooltip: root.self-muted ? Tr.viewer-mic-unmute : Tr.viewer-mic-mute;
-                    clicked => {
-                        root.self-mute-toggled();
-                        root.wake();
-                    }
+        // ── Zoom chip, top-right: how far, and a tap back to the whole ──
+        if root.zoomed : Rectangle {
+            x: root.w - root.inset-r - Theme.gap-md - self.width;
+            y: root.inset-t + Theme.gap-md;
+            width: zoom-row.preferred-width;
+            height: 28px;
+            border-radius: 14px;
+            background: Theme.surface.with-alpha(0.85);
+            opacity: root.chrome-shown ? 1.0 : 0.0;
+            animate opacity { duration: 200ms; }
+            visible: self.opacity > 0.01;
+            zoom-row := HorizontalLayout {
+                padding-left: Theme.gap-md;
+                padding-right: Theme.gap-sm;
+                spacing: Theme.gap-xs;
+                Text {
+                    text: "\{Math.round(root.zoom * 10) / 10}×";
+                    color: Theme.text-primary;
+                    font-size: Theme.font-sm;
+                    font-weight: 600;
+                    vertical-alignment: center;
                 }
-            }
-            if root.self-controls : Rectangle {
-                width: 32px;
-                IconBtn {
-                    y: (parent.height - self.height) / 2;
-                    size: 32px;
-                    icon-size: 18px;
-                    icon: root.self-deafened ? IconSet.HeadphoneOff : IconSet.Headphones;
-                    active: root.self-deafened;
-                    active-danger: true;
-                    tooltip: root.self-deafened ? Tr.undeafen : Tr.deafen;
-                    clicked => {
-                        root.self-deafen-toggled();
-                        root.wake();
-                    }
-                }
-            }
-            // Between you and the stream's own sound.
-            if root.self-controls : Rectangle {
-                width: 1px;
                 Rectangle {
-                    y: (parent.height - self.height) / 2;
-                    width: 1px;
-                    height: 20px;
-                    background: Theme.border;
-                }
-            }
-
-            // Speaker: the stream's mute toggle. The glyph says the level.
-            Rectangle {
-                width: 32px;
-                IconBtn {
-                    y: (parent.height - self.height) / 2;
-                    size: 32px;
-                    icon-size: 18px;
-                    icon: root.stream-muted || root.volume <= 0.0 ? IconSet.VolumeX
-                        : root.volume < 0.5 ? IconSet.Volume1
-                        : IconSet.Volume2;
-                    active: root.stream-muted;
-                    active-danger: true;
-                    tooltip: root.stream-muted ? Tr.viewer-stream-unmute : Tr.viewer-stream-mute;
-                    clicked => { root.toggle-mute(); }
-                }
-            }
-            Rectangle {
-                width: root.slider-w;
-                HSlider {
-                    y: (parent.height - self.height) / 2;
-                    width: parent.width;
-                    minimum: 0.0; maximum: 1.0;
-                    value <=> root.volume;
-                    opacity: root.stream-muted ? 0.5 : 1.0;
-                    live-changed(v) => {
-                        // Touching the level while muted unmutes:
-                        // the person wants to hear the new level.
-                        if (root.stream-muted) {
-                            root.stream-muted = false;
-                            root.mute-toggled(false);
-                        }
-                        root.volume-changed(v);
-                        root.wake();
+                    width: 18px;
+                    IconDisplay {
+                        icon: IconSet.ZoomOut;
+                        size: 16px;
+                        stroke: Theme.text-secondary;
                     }
                 }
             }
-            Text {
-                preferred-width: 300px;
-                min-width: 0px;
-                horizontal-stretch: 1;
-                text: root.stats;
-                color: Theme.text-muted;
-                font-size: Theme.font-xs;
-                vertical-alignment: center;
-                horizontal-alignment: left;
-                overflow: elide;
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.reset-zoom(); }
             }
-            if root.fill-offered : Rectangle {
-                width: 32px;
-                IconBtn {
-                    y: (parent.height - self.height) / 2;
-                    size: 32px;
-                    icon-size: 18px;
-                    icon: root.fill ? IconSet.Shrink : IconSet.Expand;
-                    tooltip: root.fill ? Tr.viewer-fit : Tr.viewer-fill;
-                    clicked => { root.toggle-fill(); }
+        }
+
+        // ── Control bar, bottom-center ──────────────────────────────────
+        bar := Rectangle {
+            // Centred in the safe area, above its bottom edge.
+            x: root.inset-l
+                + (parent.width - root.inset-l - root.inset-r - self.width) / 2;
+            y: parent.height - root.inset-b - self.height - Theme.gap-md;
+            width: Math.min(root.bar-room, bar-row.preferred-width);
+            height: 48px;
+            border-radius: Theme.radius-md;
+            background: Theme.surface.with-alpha(0.85);
+            border-width: 1px;
+            border-color: Theme.border.with-alpha(0.6);
+            opacity: root.chrome-shown ? 1.0 : 0.0;
+            animate opacity { duration: 200ms; }
+            // Faded out, its buttons take no taps: a tap to bring the bar
+            // back must not land on Stop watching.
+            visible: self.opacity > 0.01;
+            bar-hover := TouchArea { }
+            // Every control sits in a full-height wrapper and centers
+            // itself in it: layout children with a fixed height would
+            // otherwise hug the top. The stats column has a fixed
+            // preferred width, so the bar's width — and the buttons'
+            // places — never move with the numbers; it is the part that
+            // gives on a narrow surface, eliding.
+            bar-row := HorizontalLayout {
+                padding-left: root.bar-tight ? Theme.gap-sm : Theme.gap-md;
+                padding-right: root.bar-tight ? Theme.gap-sm : Theme.gap-md;
+                spacing: root.bar-tight ? Theme.gap-xs : Theme.gap-sm;
+
+                // The viewer's own microphone and headphones (D43).
+                if root.self-controls : Rectangle {
+                    width: 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 32px;
+                        icon-size: 18px;
+                        icon: root.self-muted ? IconSet.MicOff : IconSet.Mic;
+                        active: root.self-muted;
+                        active-danger: true;
+                        tooltip: root.self-muted ? Tr.viewer-mic-unmute : Tr.viewer-mic-mute;
+                        clicked => {
+                            root.self-mute-toggled();
+                            root.wake();
+                        }
+                    }
                 }
-            }
-            if root.fullscreen-available : Rectangle {
-                width: 32px;
-                IconBtn {
-                    y: (parent.height - self.height) / 2;
-                    size: 32px;
-                    icon-size: 18px;
-                    icon: root.fullscreen ? IconSet.Minimize : IconSet.Maximize;
-                    tooltip: root.fullscreen ? Tr.viewer-exit-fullscreen : Tr.viewer-fullscreen;
-                    clicked => { root.toggle-fullscreen(); }
+                if root.self-controls : Rectangle {
+                    width: 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 32px;
+                        icon-size: 18px;
+                        icon: root.self-deafened ? IconSet.HeadphoneOff : IconSet.Headphones;
+                        active: root.self-deafened;
+                        active-danger: true;
+                        tooltip: root.self-deafened ? Tr.undeafen : Tr.deafen;
+                        clicked => {
+                            root.self-deafen-toggled();
+                            root.wake();
+                        }
+                    }
                 }
-            }
-            if !root.bar-tight : Rectangle {
-                width: stop.preferred-width + 2 * Theme.gap-md;
-                stop := Btn {
-                    y: (parent.height - self.height) / 2;
-                    width: parent.width;
-                    height: 32px;
-                    text: Tr.stop-watching;
-                    clicked => { root.stop-watching(); }
+                // Between you and the stream's own sound.
+                if root.self-controls : Rectangle {
+                    width: 1px;
+                    Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        width: 1px;
+                        height: 20px;
+                        background: Theme.border;
+                    }
                 }
-            }
-            // Narrow: the same, as an ✕ (iOS has no Back key to leave
-            // by, so it must stay on screen).
-            if root.bar-tight : Rectangle {
-                width: 32px;
-                IconBtn {
-                    y: (parent.height - self.height) / 2;
-                    size: 32px;
-                    icon-size: 18px;
-                    icon: IconSet.X;
-                    tooltip: Tr.stop-watching;
-                    clicked => { root.stop-watching(); }
+
+                // Speaker: the stream's mute toggle. The glyph says the level.
+                Rectangle {
+                    width: 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 32px;
+                        icon-size: 18px;
+                        icon: root.stream-muted || root.volume <= 0.0 ? IconSet.VolumeX
+                            : root.volume < 0.5 ? IconSet.Volume1
+                            : IconSet.Volume2;
+                        active: root.stream-muted;
+                        active-danger: true;
+                        tooltip: root.stream-muted ? Tr.viewer-stream-unmute : Tr.viewer-stream-mute;
+                        clicked => { root.toggle-mute(); }
+                    }
+                }
+                Rectangle {
+                    width: root.slider-w;
+                    HSlider {
+                        y: (parent.height - self.height) / 2;
+                        width: parent.width;
+                        minimum: 0.0; maximum: 1.0;
+                        value <=> root.volume;
+                        opacity: root.stream-muted ? 0.5 : 1.0;
+                        live-changed(v) => {
+                            // Touching the level while muted unmutes:
+                            // the person wants to hear the new level.
+                            if (root.stream-muted) {
+                                root.stream-muted = false;
+                                root.mute-toggled(false);
+                            }
+                            root.volume-changed(v);
+                            root.wake();
+                        }
+                    }
+                }
+                Text {
+                    preferred-width: 300px;
+                    min-width: 0px;
+                    horizontal-stretch: 1;
+                    text: root.stats;
+                    color: Theme.text-muted;
+                    font-size: Theme.font-xs;
+                    vertical-alignment: center;
+                    horizontal-alignment: left;
+                    overflow: elide;
+                }
+                if root.rotate-offered : Rectangle {
+                    width: 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 32px;
+                        icon-size: 18px;
+                        icon: root.rotated ? IconSet.RotateCcw : IconSet.RotateCw;
+                        active: root.rotated;
+                        tooltip: root.rotated ? Tr.viewer-unrotate : Tr.viewer-rotate;
+                        clicked => {
+                            root.toggle-rotation();
+                        }
+                    }
+                }
+                if root.fill-offered : Rectangle {
+                    width: 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 32px;
+                        icon-size: 18px;
+                        icon: root.fill ? IconSet.Shrink : IconSet.Expand;
+                        tooltip: root.fill ? Tr.viewer-fit : Tr.viewer-fill;
+                        clicked => { root.toggle-fill(); }
+                    }
+                }
+                if root.fullscreen-available : Rectangle {
+                    width: 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 32px;
+                        icon-size: 18px;
+                        icon: root.fullscreen ? IconSet.Minimize : IconSet.Maximize;
+                        tooltip: root.fullscreen ? Tr.viewer-exit-fullscreen : Tr.viewer-fullscreen;
+                        clicked => { root.toggle-fullscreen(); }
+                    }
+                }
+                if !root.bar-tight : Rectangle {
+                    width: stop.preferred-width + 2 * Theme.gap-md;
+                    stop := Btn {
+                        y: (parent.height - self.height) / 2;
+                        width: parent.width;
+                        height: 32px;
+                        text: Tr.stop-watching;
+                        clicked => { root.stop-watching(); }
+                    }
+                }
+                // Narrow: the same, as an ✕ (iOS has no Back key to leave
+                // by, so it must stay on screen).
+                if root.bar-tight : Rectangle {
+                    width: 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 32px;
+                        icon-size: 18px;
+                        icon: IconSet.X;
+                        tooltip: Tr.stop-watching;
+                        clicked => { root.stop-watching(); }
+                    }
                 }
             }
         }

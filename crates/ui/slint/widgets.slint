@@ -47,10 +47,28 @@ export component Btn inherits Rectangle {
         vertical-alignment: center;
     }
 
+    // Android: the tap takes the focus first. A word the keyboard is
+    // still composing in the field being edited is not in that field's
+    // text until committed, and Slint commits it when the field loses
+    // focus — so "Connect" or "Save" now sees the whole name, not the
+    // name without its last word. The keyboard closes, as on any
+    // Android form.
+    sink := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+    }
+
     touch := TouchArea {
         enabled: root.enabled;
         mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        clicked => {
+            if (Platform.os == OperatingSystemType.android) {
+                sink.focus();
+            }
+            root.clicked();
+        }
     }
 }
 
@@ -126,6 +144,15 @@ export component Field inherits Rectangle {
     public function do-cut() { input.cut(); }
     public function do-copy() { input.copy(); }
     public function do-paste() { input.paste(); }
+    /// Android: commit the word the keyboard is still composing into
+    /// `text` (Slint does it when the field loses focus) — see the
+    /// composer's twin in chat.slint.
+    function commit-composition() {
+        if (Platform.os == OperatingSystemType.android && input.preedit-text != "") {
+            input.clear-focus();
+            input.focus();
+        }
+    }
 
     height: 40px;
     // Never let content inflate the layout: a single-line TextInput's
@@ -157,9 +184,17 @@ export component Field inherits Rectangle {
             vertical-alignment: center;
             font-size: Theme.font-body;
             color: Theme.text-primary;
-            selection-background-color: Theme.accent;
+            // A composing word is drawn with the selection colours:
+            // plain text instead (see the composer in chat.slint).
+            selection-background-color: self.preedit-text != "" ? transparent : Theme.accent;
+            selection-foreground-color: self.preedit-text != "" ? Theme.text-primary : Theme.on-accent;
             input-type: root.input-type;
-            accepted => { root.accepted(); }
+            // Enter on Android: the keyboard finishes its word without
+            // telling the field, so commit it before acting on the text.
+            accepted => {
+                root.commit-composition();
+                root.accepted();
+            }
             edited => { root.edited(); }
             cursor-position-changed(pos) => {
                 if (pos.x + self.computed-x < 0px) {

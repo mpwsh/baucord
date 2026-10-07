@@ -510,6 +510,13 @@ Memory-mode servers (persistence off) still use the legacy
   trackpad's pinch is right as it is. Re-check on a Slint upgrade.
   And chrome that fades with `opacity` still takes taps unless it is
   also made invisible (`visible: self.opacity > 0.01`).
+- **An Android keyboard's composing word is not in a TextInput's
+  `text`** (ANDROID-SPEC.md D48): Slint keeps it in `preedit-text`,
+  draws it with the selection colours, and commits it only on a space
+  from the keyboard or when the field loses focus. Anything that acts
+  on a field's text from Enter or a button commits first (the composer
+  and `Field` cycle focus when `preedit-text != ""`; `Btn` takes focus
+  on Android). A new editable field: same pattern.
 - **A platform canceller is verified on the stream we opened, not
   assumed from the device** (AEC-SPEC D5, E9): on Android the
   low-latency mode without a session id is MMAP, which skips every
@@ -771,7 +778,14 @@ people rather than devices. Plus:
   D46, AEC-SPEC E9). And so users can send logs at all: Settings →
   Debug (IOS-SPEC D48, ANDROID-SPEC D47) — the log level, Send log to
   server (the long-unused upload; the server files it under its
-  identity folder's `logs/`), Clear log, and the last 100 lines. Next: the phone with these — `safe area: top 20
+  identity folder's `logs/`), Clear log, and the last 100 lines.
+  The first log from a user (Galaxy S24 FE) confirmed it: on 1.1.6
+  the mic stream was MMAP (`LowLatency … burst 96`) and sent only
+  silence; on 1.1.7 `None … session N` and `echo canceller on`. Then
+  (ANDROID-SPEC.md D48–D51, IOS-SPEC.md D49): the composing-word fix
+  for typing on Android, the sidebar header in one row, Rotate on the
+  stream page, and voice that opens on the routed device with its
+  cushion sized from the start. Next: the phone with these — `safe area: top 20
   … (status bar 20)`, `VPIO voice processing on`, `aec: platform
   (speakers)` and nobody hearing themselves; an Android log with
   `AAudio voice capture: echo canceller on (AcousticEchoCanceler,

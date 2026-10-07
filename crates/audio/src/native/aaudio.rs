@@ -361,6 +361,12 @@ impl NativeRender {
             describe(&stream),
             stream.usage()
         );
+        // The device's burst is the callback it will ask for: size the
+        // playout cushion (D24) for it now, rather than learn it from
+        // the first callbacks' underruns (4–6 at every join on a Galaxy
+        // S24 FE, whose speaker asks for 1280 frames).
+        let burst = usize::try_from(stream.frames_per_burst()).unwrap_or(0);
+        callback_frames.fetch_max(burst, Ordering::Relaxed);
         let device_name = format!("voice speaker (device {})", stream.device_id());
         let _ = parts_tx.send(RenderParts {
             pump: RenderPump::new(consumer, wake_tx, stats, callback_frames),

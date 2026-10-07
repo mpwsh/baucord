@@ -454,6 +454,10 @@ export component MainWindow inherits Window {
             // Zoom-to-fill, kept for the session across streams.
             fill-available: true;
             fill <=> State.watch-fill;
+            // A quarter turn for a phone held upright with its rotation
+            // locked (the bar's Rotate button), kept the same way.
+            rotate-available: true;
+            rotated <=> State.watch-rotated;
             stream-muted <=> State.watch-muted;
             volume <=> State.watch-volume;
             // Your own mic and headphones, without leaving (IOS-SPEC.md

@@ -23,7 +23,7 @@
 // from the shell, so scroll position survives (same contract as before).
 
 import { ListView, ScrollView } from "std-widgets.slint";
-import { IconSet, IconDisplay } from "@lucide";
+import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, UserRow } from "globals.slint";
@@ -257,41 +257,59 @@ component UserRowView inherits Rectangle {
     }
 }
 
-/// A small action chip under (or, compact, beside) the server's name.
+/// An action chip beside the server's name: an icon and its word, or
+/// — when the row has no room for the words — the icon alone, with the
+/// word as a tooltip under a mouse.
 component ChipButton inherits Rectangle {
     in property <string> text;
-    /// A trailing "+" (New channel).
-    in property <bool> plus: false;
+    in property <Icon> icon;
+    in property <bool> show-text: true;
+    in property <brush> tint: Theme.text-primary;
     callback clicked;
-    width: chip-lbl.preferred-width + 2 * Theme.gap-md
-        + (root.plus ? 14px + Theme.gap-xs : 0px);
+    width: root.show-text ? lbl.preferred-width + 2 * Theme.gap-sm + 14px + Theme.gap-xs : 28px;
     height: 26px;
     border-radius: Theme.radius-sm;
     background: chip-t.has-hover ? Theme.hover : Theme.bg-tertiary;
     animate background { duration: 150ms; }
     HorizontalLayout {
-        padding-left: Theme.gap-md;
-        padding-right: Theme.gap-md;
+        padding-left: root.show-text ? Theme.gap-sm : 7px;
+        padding-right: root.show-text ? Theme.gap-sm : 7px;
         spacing: Theme.gap-xs;
-        chip-lbl := Text {
+        Rectangle {
+            width: 14px;
+            IconDisplay {
+                icon: root.icon;
+                size: 14px;
+                stroke: root.tint;
+            }
+        }
+        lbl := Text {
+            visible: root.show-text;
             text: root.text;
-            color: Theme.text-primary;
+            color: root.tint;
             font-size: Theme.font-sm;
             font-weight: 500;
             vertical-alignment: center;
-        }
-        if root.plus : Rectangle {
-            width: 14px;
-            IconDisplay {
-                icon: IconSet.Plus;
-                size: 14px;
-                stroke: Theme.text-secondary;
-            }
         }
     }
     chip-t := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+    }
+    if !root.show-text && chip-t.has-hover : Rectangle {
+        y: root.height + 6px;
+        x: root.width - self.width;
+        height: 22px;
+        width: tip.preferred-width + 16px;
+        border-radius: Theme.radius-sm;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        tip := Text {
+            text: root.text;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+        }
     }
 }
 
@@ -300,22 +318,36 @@ export component Sidebar inherits Rectangle {
     property <length> divider-preview: -1px;
     /// Too short for the full stack — a phone on its side (~370 px
     /// tall), a small desktop window. Everything stays on screen by
-    /// giving up room, not controls: tighter gaps, the chips beside
-    /// the server's name, Messages capped to a share of the height,
-    /// the status on one line, Disconnect as a button in the control
-    /// bar (ANDROID-SPEC.md D42, IOS-SPEC.md D35). The full stack
-    /// needs about 600 px.
+    /// giving up room, not controls: tighter gaps, Messages capped to a
+    /// share of the height, the status on one line, Disconnect as a
+    /// button in the control bar (ANDROID-SPEC.md D42, IOS-SPEC.md
+    /// D35). The full stack needs about 600 px.
     property <bool> compact: root.height < 600px;
     background: Theme.bg-secondary;
+
+    // The header's chips keep their words while the server's name
+    // keeps ~96 px beside them; on a narrower sidebar (or a longer
+    // language) they become icons. Measured off-layout, per language.
+    invite-words := Text { visible: false; text: Tr.invite-button; font-size: Theme.font-sm; font-weight: 500; }
+    channel-words := Text { visible: false; text: Tr.channel-new; font-size: Theme.font-sm; font-weight: 500; }
+    admin-words := Text { visible: false; text: Tr.admin-button; font-size: Theme.font-sm; font-weight: 500; }
+    property <length> chip-frame: 2 * Theme.gap-sm + 14px + Theme.gap-xs + Theme.gap-sm;
+    property <length> chips-with-words:
+        (State.perm-create-invites ? invite-words.preferred-width + root.chip-frame : 0px)
+        + (State.perm-create-channels ? channel-words.preferred-width + root.chip-frame : 0px)
+        + (State.perm-panel ? admin-words.preferred-width + root.chip-frame : 0px);
+    property <bool> chip-words:
+        root.width - 2 * (root.compact ? Theme.gap-sm : Theme.gap-md) - root.chips-with-words >= 96px;
 
     VerticalLayout {
         padding: root.compact ? Theme.gap-sm : Theme.gap-md;
         spacing: root.compact ? Theme.gap-sm : Theme.gap-md;
 
         // ── The server, and what this session may add to it ───────
-        // Its name is the title (the greeting in chat no longer
-        // repeats it); the two chips below are gated by what the
-        // server said we may (spec §3.1, §5).
+        // One row: its name (the title — the greeting in chat no longer
+        // repeats it), then Invite users, New channel and Admin, each
+        // only for whoever the server lets (spec §3.1, §5, §8). They
+        // used to take a row of their own under the name.
         HorizontalLayout {
             spacing: Theme.gap-sm;
             Text {
@@ -327,51 +359,28 @@ export component Sidebar inherits Rectangle {
                 overflow: elide;
                 horizontal-stretch: 1;
             }
-            // Compact: the chips ride on this row instead of their own.
-            if root.compact && State.perm-create-channels : ChipButton {
-                text: Tr.channel-new;
-                plus: true;
-                clicked => { Logic.channel-create(); }
-            }
-            if root.compact && State.perm-create-invites : ChipButton {
-                text: Tr.invite-button;
-                clicked => { Logic.invite-create(); }
-            }
-            // Admin: the panel (spec §8), for whoever holds `panel`.
-            if State.perm-panel : Rectangle {
-                width: admin-lbl.preferred-width + 2 * Theme.gap-md;
-                height: 24px;
-                border-radius: Theme.radius-sm;
-                background: admin-t.has-hover ? Theme.hover : Theme.bg-tertiary;
-                animate background { duration: 150ms; }
-                admin-lbl := Text {
-                    text: Tr.admin-button;
-                    color: Theme.admin;
-                    font-size: Theme.font-sm;
-                    font-weight: 600;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                }
-                admin-t := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { Logic.admin-open(); }
-                }
-            }
-        }
-        if !root.compact && (State.perm-create-channels || State.perm-create-invites) : HorizontalLayout {
-            spacing: Theme.gap-sm;
-            if State.perm-create-channels : ChipButton {
-                text: Tr.channel-new;
-                plus: true;
-                clicked => { Logic.channel-create(); }
-            }
             // Invite: a code with the defaults; it lands in chat and
             // on the clipboard.
             if State.perm-create-invites : ChipButton {
+                icon: IconSet.UserPlus;
                 text: Tr.invite-button;
+                show-text: root.chip-words;
                 clicked => { Logic.invite-create(); }
             }
-            Rectangle { }   // keep the chips at their natural width
+            if State.perm-create-channels : ChipButton {
+                icon: IconSet.Plus;
+                text: Tr.channel-new;
+                show-text: root.chip-words;
+                clicked => { Logic.channel-create(); }
+            }
+            // Admin: the panel (spec §8), for whoever holds `panel`.
+            if State.perm-panel : ChipButton {
+                icon: IconSet.Shield;
+                text: Tr.admin-button;
+                tint: Theme.admin;
+                show-text: root.chip-words;
+                clicked => { Logic.admin-open(); }
+            }
         }
 
         // The lobby (spec §12, 1.1.5): connected, invisible, silent,

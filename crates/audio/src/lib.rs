@@ -519,6 +519,13 @@ impl VoiceChat {
                 Err(e) => debug!("communication device: {e}"),
             }
         }
+        // The report names the output as the canceller's reference: a
+        // playback reopened under a running capture (a device change,
+        // a failed stream) changes it. (At start, and in `restart_all`,
+        // capture opens after this and reports then.)
+        if self.input.is_some() {
+            self.update_aec_report();
+        }
         Ok(())
     }
 

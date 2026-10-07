@@ -2348,6 +2348,8 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_viewer_exit_fullscreen(t!("viewer-exit-fullscreen").into());
     tr.set_viewer_fill(t!("viewer-fill").into());
     tr.set_viewer_fit(t!("viewer-fit").into());
+    tr.set_viewer_rotate(t!("viewer-rotate").into());
+    tr.set_viewer_unrotate(t!("viewer-unrotate").into());
     tr.set_viewer_mic_mute(t!("viewer-mic-mute").into());
     tr.set_viewer_mic_unmute(t!("viewer-mic-unmute").into());
     tr.set_viewer_stream_mute(t!("viewer-stream-mute").into());
