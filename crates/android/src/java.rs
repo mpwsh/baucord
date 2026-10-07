@@ -230,7 +230,31 @@ fn optional_string(env: &Env<'_>, s: &JString<'_>) -> JniResult<Option<String>> 
     }
 }
 
-/// Bind `nativeFilePicked` on the running Activity's class.
+/// `BaucordActivity.nativeOpenConversation(String dm)`: a message
+/// notification was tapped while the app runs (D52).
+#[cfg(feature = "app")]
+const OPEN_CONVERSATION: jni::NativeMethod = jni::native_method! {
+    static fn native_open_conversation(dm: JString),
+    fn = open_conversation,
+    error_policy = LogErrorAndDefault,
+};
+
+#[cfg(feature = "app")]
+// The JNI signature hands the string over by value.
+#[allow(clippy::needless_pass_by_value)]
+fn open_conversation<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    dm: JString<'local>,
+) -> JniResult<()> {
+    if let Some(dm) = optional_string(env, &dm)? {
+        frontend::host::open_conversation(dm);
+    }
+    Ok(())
+}
+
+/// Bind `nativeFilePicked` and `nativeOpenConversation` on the running
+/// Activity's class.
 ///
 /// # Errors
 /// The Activity is not a `BaucordActivity` (an old manifest), or any
@@ -239,9 +263,114 @@ fn optional_string(env: &Env<'_>, s: &JString<'_>) -> JniResult<Option<String>> 
 pub fn register_natives() -> Result<(), String> {
     with_activity(|env, activity| {
         let class = env.get_object_class(activity)?;
-        // SAFETY: FILE_PICKED is built by `native_method!`, which checks
-        // the Rust function against the declared static signature.
-        unsafe { env.register_native_methods(&class, &[FILE_PICKED]) }
+        // SAFETY: both are built by `native_method!`, which checks the
+        // Rust function against the declared static signature.
+        unsafe { env.register_native_methods(&class, &[FILE_PICKED, OPEN_CONVERSATION]) }
+    })
+    .map_err(|e| e.to_string())
+}
+
+// ── Notifications (BaucordActivity → Notices, ANDROID-SPEC.md D52) ─────
+
+/// `BaucordActivity.postNotice(kind, key, channelName, title, text, dm,
+/// sound)`: a message or voice-activity notification. `dm` empty = a tap
+/// only brings the app back.
+///
+/// # Errors
+/// Any JNI failure, as text.
+#[cfg(feature = "app")]
+pub fn post_notice(notice: &frontend::notice::Notice) -> Result<(), String> {
+    let kind = match notice.kind {
+        frontend::notice::NoticeKind::Message => "message",
+        frontend::notice::NoticeKind::Activity => "activity",
+    };
+    with_activity(|env, activity| {
+        let jkind = env.new_string(kind)?;
+        let jkey = env.new_string(&notice.key)?;
+        let jchannel = env.new_string(&notice.channel)?;
+        let jtitle = env.new_string(&notice.title)?;
+        let jtext = env.new_string(&notice.body)?;
+        let jdm = env.new_string(notice.open_dm.as_deref().unwrap_or_default())?;
+        env.call_method(
+            activity,
+            jni::jni_str!("postNotice"),
+            jni::jni_sig!(
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;\
+                 Ljava/lang/String;Ljava/lang/String;Z)V"
+            ),
+            &[
+                (&jkind).into(),
+                (&jkey).into(),
+                (&jchannel).into(),
+                (&jtitle).into(),
+                (&jtext).into(),
+                (&jdm).into(),
+                JValue::Bool(notice.sound),
+            ],
+        )?;
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// `BaucordActivity.noticesAllowed(kind)`: notifications allowed for
+/// the app and the kind's channel not switched off.
+///
+/// # Errors
+/// Any JNI failure, as text.
+#[cfg(feature = "app")]
+pub fn notices_allowed(kind: frontend::notice::NoticeKind) -> Result<bool, String> {
+    let kind = match kind {
+        frontend::notice::NoticeKind::Message => "message",
+        frontend::notice::NoticeKind::Activity => "activity",
+    };
+    with_activity(|env, activity| {
+        let jkind = env.new_string(kind)?;
+        env.call_method(
+            activity,
+            jni::jni_str!("noticesAllowed"),
+            jni::jni_sig!("(Ljava/lang/String;)Z"),
+            &[(&jkind).into()],
+        )?
+        .z()
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// `BaucordActivity.cancelNotice(key)`.
+///
+/// # Errors
+/// Any JNI failure, as text.
+#[cfg(feature = "app")]
+pub fn cancel_notice(key: &str) -> Result<(), String> {
+    with_activity(|env, activity| {
+        let jkey = env.new_string(key)?;
+        env.call_method(
+            activity,
+            jni::jni_str!("cancelNotice"),
+            jni::jni_sig!("(Ljava/lang/String;)V"),
+            &[(&jkey).into()],
+        )?;
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// `BaucordActivity.chimeAllowed()`: the ringer is on and Do Not
+/// Disturb is off.
+///
+/// # Errors
+/// Any JNI failure, as text.
+#[cfg(feature = "app")]
+pub fn chime_allowed() -> Result<bool, String> {
+    with_activity(|env, activity| {
+        env.call_method(
+            activity,
+            jni::jni_str!("chimeAllowed"),
+            jni::jni_sig!("()Z"),
+            &[],
+        )?
+        .z()
     })
     .map_err(|e| e.to_string())
 }

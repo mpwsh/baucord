@@ -1,8 +1,12 @@
 # baucord — Acoustic echo cancellation (AEC) technical spec
 
-Status: draft 1, 2026-09-15; implemented 2026-10-06 (§12). Ships in 1.1.5 with the other items in
-`SESSION-GUIDE.md` §5. Decisions in §1 are taken; §12 collects the
-ones taken after this draft, the way `PERSISTENCE-SPEC.md` §12 does.
+Status: draft 1, 2026-09-15; implemented 2026-10-06 (§12) — Windows
+(Communications category), Android (voice-call streams with
+`AcousticEchoCanceler`, E9) and iOS (the VPIO unit, E10) as of 1.1.7.
+macOS, Linux and the stream's own audio are open (PRODUCTION-PLAN.md
+PRD-5, MOB-12). Start from `START-HERE.md`. Decisions in §1 are
+taken; §12 collects the ones taken after this draft, the way
+`PERSISTENCE-SPEC.md` §12 does.
 
 ## 0. Purpose and scope
 

@@ -1,16 +1,19 @@
 # baucord
 
-A lightweight voice, text, and screen sharing application built with Rust.
+A lightweight voice, text, and screen sharing application built with Rust,
+for Windows, macOS, Linux, Android and iPhone.
 
-Uses [Slint](https://slint.dev) for the UI, QUIC (`quinn-proto`, driven
-from the app's own threads with no async runtime) for network transport,
-and FFmpeg for video encoding/decoding. Audio runs on dedicated threads
-with crossbeam channels. Screen sharing follows the same architecture:
-capture → encode → network → decode → viewer window. The server is a
-simple relay — no mixing, no transcoding.
+Uses [Slint](https://slint.dev) for the UI on every platform, QUIC
+(`quinn-proto`, driven from the app's own threads with no async runtime)
+for network transport, and FFmpeg for video on the desktop (MediaCodec on
+Android, VideoToolbox on iOS). Audio runs on dedicated threads with
+crossbeam channels. Screen sharing follows the same architecture:
+capture → encode → network → decode → viewer. The server is a simple
+relay — no mixing, no transcoding.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together
-and [`TODO.md`](TODO.md) for where the project is heading.
+Working on the code? Start with [`START-HERE.md`](START-HERE.md).
+[`ARCHITECTURE.md`](ARCHITECTURE.md) is how the pieces fit together,
+[`PRODUCTION-PLAN.md`](PRODUCTION-PLAN.md) what is left.
 
 ## Workspace
 
@@ -26,8 +29,11 @@ and [`TODO.md`](TODO.md) for where the project is heading.
 | `desktop`   | the desktop host (binary: `baucord`): `main.rs` and nothing else    |
 | `ui`        | the Slint UI and its Rust glue                                      |
 | `i18n`      | Fluent translations — English, Español (AR), Português (BR)         |
-| `audio`     | capture/playback, Opus, VAD, denoise, jitter buffer, rate ladder    |
-| `video`     | FFmpeg H.264 encode/decode, screen capture                          |
+| `audio`     | capture/playback, Opus, VAD, denoise, jitter buffer, rate ladder,   |
+|             | echo cancellation, the AAudio/VPIO/WASAPI backends                  |
+| `video`     | H.264 encode/decode (FFmpeg, MediaCodec, VideoToolbox), capture     |
+| `android`   | the Android host (a cdylib; the Gradle project is `android/`)      |
+| `ios`       | the iPhone host (a binary; the Xcode project is `ios/`)            |
 
 ## Features
 
@@ -45,8 +51,9 @@ and [`TODO.md`](TODO.md) for where the project is heading.
   **hot-reloadable**:
   edit `server.yaml` while the server runs and connected clients resync
   in place — nobody is ever kicked, members of a removed channel are
-  moved to the default
-- **Screen sharing** — H.264 via FFmpeg with the source's audio, 720p or
+  moved to the lobby
+- **Screen sharing** — H.264 via FFmpeg (with the source's audio on
+  Windows), 720p or
   1080p at 30 or 60 fps. Streams are visible to **your channel only or
   the whole server** (sharer's choice, per share). Video travels in
   keyframe-led groups: a viewer that falls behind loses whole groups,
@@ -61,21 +68,36 @@ and [`TODO.md`](TODO.md) for where the project is heading.
   channel, with message history, inline links, images, gifs, and an
   emoji picker. Images are relayed on a paced stream so a 10 MB paste
   never dents anyone's voice
+- **Accounts without registration** — your device's key is your
+  identity; an invite code lets a new key in, with the role the invite
+  carries. Roles (built-in and custom, with badges), moderation (mute,
+  kick, ban, restrictions), and an admin panel for users, roles,
+  invites, channels, files and the audit log
+- **History, DMs and files** — the server keeps General's history and
+  replays it, direct messages are delivered when the other side comes
+  back, files and pictures travel by content hash
+- **Profiles** — a name colour and style, an avatar, levels
 - **Multiple servers** — save several servers in settings, pick a
   default, switch from the connect screen. Every connection is
   encrypted and the server's identity is pinned — from an invite
   string (`host:port#SHA256:…`) or on first use; a server whose key
-  changed is refused before anything is sent. Secure servers
-  additionally require a shared room password
+  changed is refused before anything is sent
 - **Stays connected** — a dropped session (Wi-Fi roam, ISP hiccup,
   server restart) reconnects on its own with backoff; short blackouts
   under 30 s don't even end the session
 - **Global hotkeys** — toggle mute, deafen, and screen share from any
   window; rebind with live key capture
+- **Echo cancellation** — the platform's own canceller, verified on the
+  stream that was opened (Windows and Android; written for iPhone and
+  awaiting confirmation on a device)
 - **Three languages** — English, Español (Argentina), Português (Brasil)
 - **Stays out of the way** — closes to the tray with the call running;
-  the whole client idles around 30–50 MB of RAM
-- **Cross-platform** — Windows, Linux, and macOS
+  the client idles around 40 MB of RAM on Windows (more on macOS and
+  Linux, where the figure counts shared pages)
+- **Cross-platform** — Windows, Linux and macOS, plus Android (a
+  sideloaded APK) and iPhone with the same engine and UI: voice in the
+  background, stream viewing, and notifications for DMs and a call
+  starting while the app stays connected
 
 ## Building and Running
 
@@ -145,9 +167,6 @@ lives in `server.yaml` (written with defaults on first start;
 server:
   name: Baucord Server
   public_address: "203.0.113.5:51000"  # only used to print the invite
-authentication:
-  secure: true                          # false = open mode, LAN/dev only
-  password: hunter2                     # the room secret, sent in Hello
 identity:
   dir: data/baucord                     # identity.key lives here — back it up
 logging:
@@ -172,15 +191,18 @@ file needs a restart.
 
 Every connection is QUIC over UDP, encrypted, and authenticated by the
 server's Ed25519 identity key (generated on first start in
-`identity.dir`; clients pin its fingerprint). Open mode
-(`authentication.secure: false`) then accepts anyone and is meant for
-LAN/dev — the server logs loudly about it. Secure mode requires clients
-to send `authentication.password` in their hello (checked in constant
-time, failures rate-limited per address).
+`identity.dir`; clients pin its fingerprint). Since 1.1 the door is an
+**invite**: a client's device key is its account, and a key the server
+does not know needs an invite code (failures are rate-limited per
+address). On any start while nobody holds the admin role, the server
+logs a one-shot admin invite (`No admin yet. Bootstrap invite
+(admin, 1 use, 1 h): code …`) — use it from your client, then make
+invites from the admin panel or with `server invite create`. The 1.0 `authentication` section
+(a shared room password) is ignored, with a warning.
 
-The startup log prints the identity and an invite string,
-`host:port#SHA256:…`; hand that to people so their client verifies the
-server before saying hello. To rotate the key, stop the server and run
+The startup log prints the address and the identity (`Address for
+clients: host:port — identity SHA256:…`); hand both to people (with an
+invite code) so their client verifies the server before saying hello. To rotate the key, stop the server and run
 `server rotate-key` — the new key is signed by the old one, so pinned
 clients migrate automatically.
 
@@ -202,8 +224,8 @@ Support/baucord`). The client's own identity key (`identity.key`) lives
 next to it; it signs the handshake so the server can derive a stable
 user id, and never leaves the machine.
 
-A server entry holds the address, the room password, and the pinned
-fingerprint. Paste an invite string into the identity field to verify
+A server entry holds the address, the pinned fingerprint, an invite
+code waiting to be used, and the channel passwords you saved. Paste an invite string into the identity field to verify
 a server up front; leave it empty and it is pinned on the first
 successful connection.
 
@@ -215,7 +237,15 @@ feature bits in `Hello`/`Welcome`.
 
 ## Deploying a server
 
-The production layout is Docker Compose on a Linux host:
+The production layout is Docker Compose on a Linux host.
+
+> **As committed, the deploy files lag this text** (PRODUCTION-PLAN.md
+> OPS-1): `docker-compose.yaml`, `config/baucord.yaml`, the `Dockerfile`
+> and `scripts/setup.sh` still use UDP 5000, and `setup.sh` looks for
+> `docker-compose.yml` and stops. Until that is fixed, rename or edit
+> accordingly, and read the address and the bootstrap code from the log
+> yourself: `docker compose logs baucord | grep -E 'Address for
+> clients|Bootstrap invite'`.
 
 ```
 client ──udp/51000 (QUIC)─▶ baucord   (relay, published directly)
@@ -237,13 +267,13 @@ that is the log.
 
 ```
 Dockerfile          # cargo-chef build, distroless runtime
-docker-compose.yml
+docker-compose.yaml
 config/
   baucord.yaml      # mounted as /app/server.yaml
 scripts/
   setup.sh          # bootstrap / re-apply host + stack
   monitor-net.sh    # UDP / NIC drop logger
-data/baucord/       # created by setup.sh; identity.key + uploaded client logs (keep out of git, back it up)
+data/baucord/       # created by setup.sh; identity key, database, blobs, uploaded client logs (keep out of git, back it up)
 ```
 
 ### Bootstrapping a host
@@ -251,8 +281,8 @@ data/baucord/       # created by setup.sh; identity.key + uploaded client logs (
 1. Open `udp/51000` in the cloud firewall. (No DNS or TLS certificate
    is needed: the server's own key is its identity.)
 2. Set `server.public_address` in `config/baucord.yaml` to the host's
-   public IP and port (it is printed in the invite string), and
-   `authentication.password` to the room secret.
+   public IP and port (the server prints it in its `Address for
+   clients` line).
 3. Clone this directory onto the host and run:
 
    ```bash
@@ -270,7 +300,8 @@ data/baucord/       # created by setup.sh; identity.key + uploaded client logs (
      sizing for Docker's port publishing, a boot-time service for NIC
      ring buffers / RPS, and disables cloud-init network hotplug
    - runs `docker compose up -d`
-   - prints the invite string (`host:port#SHA256:…`) from the log
+   - prints the address and identity line from the log (and, on a new
+     server, the bootstrap admin invite — see "Server" above)
 
    The settings block at the top of the script (`MEDIA_PORT`,
    `MEDIA_VIA_DOCKER_NAT`, `BAUCORD_UID`, interface auto-detection) is
@@ -352,25 +383,25 @@ media port, which is only safe without DNAT.
 
 ## Known Limitations
 
+The full, prioritized list is [`PRODUCTION-PLAN.md`](PRODUCTION-PLAN.md);
+what a user notices:
+
 - No end-to-end encryption: every hop is TLS-encrypted QUIC and the
-  server is pinned, but the relay sees all media in the clear; open
-  mode (no password) is for LAN/dev
+  server is pinned, but the relay sees all media in the clear
 - Push-to-talk is reserved in the settings format but not implemented
   yet — voice activation only for now
-- Chat history is not replayed to new joiners; you see the room from
-  the moment you connect
-- Channel identity is the channel _name_: renaming one in `server.yaml`
+- Phones get notifications only while the app stays connected; there is
+  no push service yet, so a closed app hears nothing
+- Server addresses are IP:port only (no host names yet)
+- Channel identity in `server.yaml` is the channel _name_: renaming one
   counts as remove + create, so a hot reload moves its members to the
   lobby
-- Channel and server passwords are stored in plain text on both ends
-  (`server.yaml`, `settings.json`) — they're shared room secrets, not
-  personal credentials; treat them accordingly
+- Channel passwords are stored in plain text on both ends
+  (`server.yaml`, the database, `settings.json`) — they're shared room
+  secrets, not personal credentials; treat them accordingly
 - Speaking indicators are global: you see the green dot for people in
   other channels even though you can't hear them
 - A server whose identity changed must be accepted by editing (or
   clearing) the pin in Settings; there is no accept/reject dialog yet
-- Resampling between different audio sample rates is basic
-- Screen share viewer creates a new FFmpeg decoder per keyframe
-  (stateless recovery, not optimal for bandwidth)
-- A user's stable id (from their client key) is logged by the server
-  but not yet used for anything — no per-user settings, roles, or bans
+- Screen sharing on Wayland falls back to slow screenshots; no echo
+  cancellation on macOS or Linux yet

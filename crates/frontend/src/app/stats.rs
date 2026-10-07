@@ -108,6 +108,7 @@ impl AppState {
     /// the background paused. The stats lines come back with the next
     /// 2-second sample by themselves.
     pub(super) fn host_shown(&mut self) {
+        self.clear_seen_notices();
         let animating = self.gallery_gif.is_some()
             || self.preview_gif.is_some()
             || self.gifs.values().any(GifPlayer::playing);

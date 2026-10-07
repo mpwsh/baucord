@@ -192,17 +192,24 @@ would change how every picker, field and switch looks.
 `app/src/main/java/dev/baucord/` holds the only Java: `BaucordActivity`
 (the platform's `NativeActivity` plus what native code cannot receive
 on its own — the file picker's result — and helpers the Rust side calls:
-permissions, Downloads, opening files and links, the voice service)
-and `VoiceService` (the foreground service and notification that keep
-a connected session alive off screen). Gradle compiles them with the
-app; there is no Kotlin. Their methods are only called from native
+permissions, Downloads, opening files and links, the voice service),
+`VoiceService` (the foreground service and notification that keep
+a connected session alive off screen) and `Notices` (every
+notification's look, the message and voice-activity notifications, and
+the ringer / Do Not Disturb check before a chime — ANDROID-SPEC.md
+D52). Gradle compiles them with the app; there is no Kotlin. Their methods are only called from native
 code, so release builds keep `isMinifyEnabled = false` (R8 would strip
 them).
 
 The launcher icon is `assets/icons/icon.png` at the repo root, the
 desktop's: the `baucordDebugLauncherIcon` / `baucordReleaseLauncherIcon` tasks render it into the adaptive
 icon's foreground at every density on each build (ANDROID-SPEC.md D36).
-Change the PNG and the next build picks it up. The manifest also opts out of predictive back
+Change the PNG and the next build picks it up. The notifications'
+status-bar icon is different: Android draws it as a white silhouette,
+so `notification-icon.py` (Pillow) cuts the dog out of `icon.png` into
+`app/src/main/res/drawable-*/ic_stat_baucord.png`; it is tuned to the
+current picture, run by hand and committed — re-run it (and check the
+result) when the icon changes. The manifest also opts out of predictive back
 (`enableOnBackInvokedCallback="false"`): on Android 16 an app targeting
 API 36 is otherwise never sent the Back key. ANDROID-SPEC.md D29–D30.
 

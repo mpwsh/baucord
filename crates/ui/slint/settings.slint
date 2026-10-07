@@ -71,6 +71,10 @@ export global SettingsState {
     in-out property <bool> dm-sound: true;
     in-out property <bool> share-started-sound: true;
     in-out property <bool> viewer-joined-sound: true;
+    // Notifications (phones only: ANDROID-SPEC.md D52, IOS-SPEC.md D50)
+    in property <bool> notifications-available: false;
+    in-out property <bool> notify-messages: true;
+    in-out property <bool> notify-first-join: true;
     // Chat
     in-out property <bool> show-timestamps: true;
     in-out property <bool> compact-rows: false;
@@ -164,6 +168,8 @@ export global SettingsLogic {
     callback dm-sound-changed(bool);
     callback share-started-sound-changed(bool);
     callback viewer-joined-sound-changed(bool);
+    callback notify-messages-changed(bool);
+    callback notify-first-join-changed(bool);
     callback show-timestamps-changed(bool);
     callback compact-rows-changed(bool);
     callback image-size-selected(int);
@@ -814,6 +820,31 @@ component SoundsPanel inherits VerticalLayout {
             enabled: SettingsState.sounds-enabled;
             checked <=> SettingsState.mention-sound;
             toggled(on) => { SettingsLogic.mention-sound-changed(on); }
+        }
+    }
+
+    // A phone: what reaches you while the app is in the background.
+    // The system shows these, so its silent and Do Not Disturb modes
+    // apply — and to the message chimes above as well.
+    if SettingsState.notifications-available : VerticalLayout {
+        spacing: Theme.gap-lg;
+        padding-top: Theme.gap-md;
+        Sep { }
+        PanelHeader { title: Tr.notifs-header; lead: Tr.notifs-lead; }
+        VerticalLayout {
+            spacing: 2px;
+            CheckRow {
+                text: Tr.notifs-messages;
+                hint: Tr.notifs-messages-hint;
+                checked <=> SettingsState.notify-messages;
+                toggled(on) => { SettingsLogic.notify-messages-changed(on); }
+            }
+            CheckRow {
+                text: Tr.notifs-first-join;
+                hint: Tr.notifs-first-join-hint;
+                checked <=> SettingsState.notify-first-join;
+                toggled(on) => { SettingsLogic.notify-first-join-changed(on); }
+            }
         }
     }
 }

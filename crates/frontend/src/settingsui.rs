@@ -505,6 +505,9 @@ pub fn populate(app: &mut AppState) {
     s.set_dm_sound(settings.sounds.direct_message);
     s.set_share_started_sound(settings.sounds.share_started);
     s.set_viewer_joined_sound(settings.sounds.viewer_joined);
+    s.set_notifications_available(crate::host::notifies());
+    s.set_notify_messages(settings.notifications.messages);
+    s.set_notify_first_join(settings.notifications.first_join);
     s.set_show_timestamps(settings.ui.show_timestamps);
     s.set_compact_rows(settings.ui.compact_rows);
     let sizes: Vec<slint::SharedString> = IMAGE_SIZES
@@ -820,6 +823,12 @@ fn wire(sf: &SettingsSurface<'_>) {
     logic.on_viewer_joined_sound_changed(|on| {
         app::with_current(move |app| app.settings.sounds.viewer_joined = on);
     });
+    logic.on_notify_messages_changed(|on| {
+        app::with_current(move |app| app.settings.notifications.messages = on);
+    });
+    logic.on_notify_first_join_changed(|on| {
+        app::with_current(move |app| app.settings.notifications.first_join = on);
+    });
     logic.on_auto_connect_changed(|on| {
         app::with_current(move |app| app.settings.startup.auto_connect = on);
     });
@@ -1013,7 +1022,7 @@ fn wire(sf: &SettingsSurface<'_>) {
                     });
                 match saved {
                     Ok(saved) => {
-                        set_identity_status(app, &t!("file-saved", "path" => saved.shown.as_str()))
+                        set_identity_status(app, &t!("file-saved", "path" => saved.shown.as_str()));
                     }
                     Err(e) => app.show_error(&e),
                 }

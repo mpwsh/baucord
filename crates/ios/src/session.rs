@@ -53,4 +53,14 @@ pub fn configure() {
         Ok(()) => log::info!("audio session: play and record (loudspeaker, Bluetooth allowed)"),
         Err(e) => log::warn!("audio session category: {}", e.localizedDescription()),
     }
+    // A recording session silences system sounds and haptics by default;
+    // the message chime is a notification's sound on iOS (IOS-SPEC.md
+    // D50), so let it through while the microphone is open.
+    // SAFETY: a plain flag on the shared session.
+    if let Err(e) = unsafe { session.setAllowHapticsAndSystemSoundsDuringRecording_error(true) } {
+        log::warn!(
+            "audio session: system sounds while recording: {}",
+            e.localizedDescription()
+        );
+    }
 }

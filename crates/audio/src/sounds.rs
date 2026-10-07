@@ -89,6 +89,35 @@ impl SoundBank {
     }
 }
 
+/// `samples` (48 kHz mono, as [`SoundBank::get`] gives them) as a
+/// 16-bit PCM WAV file — for a host that plays an alert through the
+/// system instead of the voice engine (iOS: a notification's sound,
+/// IOS-SPEC.md D50). Empty if the encoder fails.
+#[must_use]
+pub fn wav_bytes(samples: &[f32]) -> Vec<u8> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: OPUS_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut out = Cursor::new(Vec::new());
+    let written = hound::WavWriter::new(&mut out, spec).and_then(|mut w| {
+        for &s in samples {
+            #[allow(clippy::cast_possible_truncation)]
+            w.write_sample((s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16)?;
+        }
+        w.finalize()
+    });
+    match written {
+        Ok(()) => out.into_inner(),
+        Err(e) => {
+            warn!("encoding an alert sound failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
 // ── Synthesis ───────────────────────────────────────────────────────────
 
 /// A sequence of sine notes `(hz, seconds)` at 48 kHz mono, each with
@@ -232,4 +261,26 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     );
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_alert_sound_survives_the_wav_round_trip() {
+        let bank = SoundBank::new();
+        let samples = bank.get(SoundType::DirectMessage);
+        let wav = wav_bytes(samples);
+        // A 44-byte header, then two bytes a sample.
+        assert_eq!(wav.len(), 44 + samples.len() * 2);
+        let back = decode_wav("dm", &wav);
+        assert_eq!(back.len(), samples.len());
+        let worst = samples
+            .iter()
+            .zip(&back)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 1e-3, "16-bit rounding only, got {worst}");
+    }
 }

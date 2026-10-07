@@ -43,6 +43,13 @@ public class BaucordActivity extends NativeActivity {
      */
     static native void nativeFilePicked(String path, String name, String error);
 
+    /**
+     * A message notification was tapped while the app runs: open the DM
+     * conversation with {@code dm} (the user id in hex). Registered from
+     * Rust like {@link #nativeFilePicked} (ANDROID-SPEC.md D52).
+     */
+    static native void nativeOpenConversation(String dm);
+
     // ── Permissions ──────────────────────────────────────────────────────
 
     /**
@@ -86,6 +93,51 @@ public class BaucordActivity extends NativeActivity {
     /** Rust, on disconnect: let the process be an ordinary app again. */
     public void stopVoiceService() {
         VoiceService.stop(this);
+    }
+
+    // ── Notifications (ANDROID-SPEC.md D52) ─────────────────────────────
+
+    /**
+     * Rust: post (or replace, by {@code key}) a message or voice-activity
+     * notification. Any thread.
+     */
+    public void postNotice(String kind, String key, String channelName, String title,
+            String text, String dm, boolean sound) {
+        Notices.post(this, kind, key, channelName, title, text, dm, sound);
+    }
+
+    /** Rust: take down the notification posted under {@code key}. */
+    public void cancelNotice(String key) {
+        Notices.cancel(this, key);
+    }
+
+    /** Rust: whether a notification of {@code kind} would show at all. */
+    public boolean noticesAllowed(String kind) {
+        return Notices.allowed(this, kind);
+    }
+
+    /** Rust: whether the phone's ringer and Do Not Disturb allow an alert chime now. */
+    public boolean chimeAllowed() {
+        return Notices.chimeAllowed(this);
+    }
+
+    /**
+     * A notification's tap with the app running (singleTask: the same
+     * Activity, a new intent). One about a message opens its
+     * conversation; the voice service's just brings the app back.
+     */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        String dm = intent != null ? intent.getStringExtra(Notices.EXTRA_DM) : null;
+        if (dm != null && !dm.isEmpty()) {
+            try {
+                nativeOpenConversation(dm);
+            } catch (UnsatisfiedLinkError e) {
+                Log.w(TAG, "nativeOpenConversation is not bound", e);
+            }
+        }
     }
 
     // ── The screen while a stream plays (ANDROID-SPEC.md D45) ──────────

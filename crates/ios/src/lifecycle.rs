@@ -53,6 +53,8 @@ pub fn install() {
     });
     observe(&center, &queue, foreground, || {
         log::info!("lifecycle: foreground");
+        // The user may have changed the notification settings meanwhile.
+        crate::notices::refresh();
         frontend::app::set_host_visible(true);
     });
     observe(&center, &queue, memory, || {

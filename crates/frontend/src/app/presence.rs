@@ -133,6 +133,9 @@ impl AppState {
             self.push_chat_system(&t!("chat-user-joined", "name" => username.as_str()));
         }
         self.rebuild_dms_model();
+        // Off screen on a phone, the first voice into empty rooms is
+        // news: someone is starting a call.
+        self.alert_first_join(client_id, &username, channel_id);
         let mut user = UserState::new(username, peer_audio_from(&saved), channel_id);
         // `UserDetails` normally follows `UserJoined`; if it got here
         // first (a replaced session's details), honor it.
@@ -230,6 +233,10 @@ impl AppState {
                 "name" => name.as_str(),
                 "channel" => channel.as_str()
             ));
+            // Out of the AFK room into empty rooms: a call starting too.
+            if old.is_some_and(|room| self.is_quiet_room(room)) {
+                self.alert_first_join(client_id, &name, channel_id);
+            }
             if Some(channel_id) == our_channel_before {
                 // Someone stepped into our room.
                 self.play_chime(SoundType::UserJoined);

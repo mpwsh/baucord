@@ -43,14 +43,17 @@ viewer on an 8 Mbit/s share or a 20-second blackout, run as an ordinary
 | `server`    | protocol, transport           | `ChatServer` (lib) + binary; relay, admission, config, hot reload       |
 | `client`    | protocol, transport, audio, video | network/voice/screen threads, settings, invites, client key         |
 | `app-core`  | —                             | UI-agnostic view models: roster, chat, composer, images, emoji, stats   |
-| `desktop`   | client, app-core, ui, i18n    | the app: `AppState`, Slint glue, hotkeys, tray, updater, viewer windows |
-| `ui`        | slint                         | `.slint` files and the generated Rust                                   |
+| `frontend`  | client, app-core, ui, i18n    | the UI logic every host runs: `AppState`, the models, settings/admin/viewer, the host seams |
+| `desktop`   | frontend                      | the desktop binary: `main.rs` only (logging, config dir, single instance, panic hook) |
+| `android`   | frontend                      | the Android host: a cdylib under `NativeActivity`, JNI, the `Hooks` |
+| `ios`       | frontend                      | the iPhone host: a binary on UIKit through `objc2`, the `Hooks`        |
+| `ui`        | slint, app-core               | `.slint` files and the generated Rust                                   |
 | `i18n`      | fluent                        | `t!()` and the three `.ftl` locales                                     |
-| `audio`     | cpal, opus, …                 | devices, capture/playback, encoder + rate ladder, jitter buffer, PLC/FEC/RED |
-| `video`     | ffmpeg-next                   | capture backends, H.264 encode/decode, frame chunk buffer                |
+| `audio`     | cpal, opus, …                 | devices, capture/playback, encoder + rate ladder, jitter buffer, PLC/FEC/RED, AEC, native backends |
+| `video`     | ffmpeg-next, ndk, objc2       | capture backends, H.264 encode/decode (FFmpeg, MediaCodec, VideoToolbox), frame chunk buffer |
 
-`server` and `client` are libraries with thin binaries so tests can
-drive them. `protocol` and `transport` have no platform dependencies
+`server` is a library with a thin binary, so tests can drive it;
+`client` is a library the hosts (`desktop`, `android`, `ios`) run. `protocol` and `transport` have no platform dependencies
 and build anywhere.
 
 Lints: workspace-wide `clippy::all = deny`, `pedantic = warn`. Keep new
@@ -307,8 +310,8 @@ session from the rosters at once.
 roles, invites, restrictions) in both modes; every change is applied
 there first and then queued to the persistence thread. With nobody
 holding `ADMIN` at startup the server mints a one-shot admin invite
-(1 h, 1 use) and prints `baucord://host:port/CODE#fingerprint` at warn
-level. `ChatServer::mint_invite / revoke_invite / restrict /
+(1 h, 1 use) and logs its code, the address and the fingerprint at warn
+level (`No admin yet. Bootstrap invite …`). `ChatServer::mint_invite / revoke_invite / restrict /
 lift_restriction / unlink_key` are the single implementations behind
 `ClientMessage::CreateInvite`, the bootstrap code, the tests, and the
 admin commands to come. `server invite create|list|revoke` (persistence
@@ -519,11 +522,13 @@ older files load unchanged.
 
 ## 7. The UI logic (`crates/frontend`) and the hosts
 
+### 7.1 The shared UI logic
+
 Since 1.1.6 the client's UI logic lives in `frontend`, shared by
 every host; `desktop` is `main.rs` alone (the config directory from
 `--profile`/`--config-dir`, file logging, the single instance, the
-panic hook, `frontend::app::run()`), and the Android host will be a
-cdylib of the same size (`ANDROID-SPEC.md`). Host-only pieces — the
+panic hook, `frontend::app::run()`), and the phone hosts (§7.2) are as
+thin. Host-only pieces — the
 winit window hooks, the system clipboard, global hotkeys, the single
 instance, the updater, native dialogs and the URL launcher (the
 `host` module) — sit behind `frontend`'s `desktop` feature; without it
@@ -549,7 +554,7 @@ by concern in child modules under `src/app/` — `events` (the drain
 and `handle_network_message`, which is exhaustive over
 `NetworkMessage`; the compiler will tell you where to add an arm),
 `commands`, `presence`, `session`, `menus`, `devices`,
-`conversations`, `chat`, `profiles`, `stats` — each a child of `app`
+`conversations`, `chat`, `profiles`, `stats`, `alerts` — each a child of `app`
 so nothing private had to open up; new methods go in the child that
 owns the concern.
 
@@ -561,6 +566,70 @@ crash leaves no trace.
 `app-core` holds the view models the UI binds to (roster, chat with
 markdown/links/images/gifs, composer, emoji, stats formatting) and is
 deliberately free of Slint so it can be unit-tested and reused.
+
+### 7.2 The hosts
+
+Three hosts run `frontend::app::run()`; the UI is the same `.slint`
+tree everywhere, with `State.touch-host` and the window's size deciding
+the phone layout (the sidebar and the chat as pages, Settings and the
+stream viewer as pages inside the one window, ANDROID-SPEC D22/D23).
+
+- **Desktop** (`crates/desktop`): winit, Skia (software raster by
+  default), the tray, global hotkeys, the self-updater, native dialogs —
+  the `desktop` feature of `frontend`.
+- **Android** (`crates/android`, `android/`): a cdylib loaded by
+  `BaucordActivity` (a `NativeActivity` subclass) through Slint's
+  android-activity backend, Skia on the GPU. What native code cannot do
+  is a few lines of Java called through JNI (`java.rs`): permissions,
+  the file picker, Downloads through MediaStore, opening files and
+  links, the foreground `VoiceService` that keeps a connected session
+  alive off screen, notifications (`Notices.java`). The process ends
+  when the Activity is destroyed (D11).
+- **iPhone** (`crates/ios`, `ios/`): a binary; winit on UIKit, Skia on
+  Metal; `UIApplicationMain` never returns, so settings are saved on the
+  way into the background (`lifecycle.rs`). UIKit is reached from Rust
+  through `objc2` (`host.rs`: Photos/Files pickers, Quick Look, Safari;
+  `notices.rs`: UserNotifications; `session.rs`: the audio session).
+  No Swift.
+
+The phones' hooks are one trait, `frontend::host::Hooks`
+(`stubs/host.rs`), that each host installs at startup: pick a file,
+save a download, open a target or a link, keep alive (the service, or
+on iOS the moment to ask for notifications), keep the screen on, and
+the notification calls (§7.4). A phone tells the app when it goes to the
+background (`set_host_visible`), and everything that only feeds the
+screen — stats lines, GIFs, stream frames, the device poll — stops
+until it comes back.
+
+### 7.3 Audio and video per platform
+
+| | capture/playback | echo cancellation | video decode | screen capture |
+|---|---|---|---|---|
+| Windows | WASAPI, event-driven on an MMCSS thread (`native/wasapi.rs`); cpal enumerates | the Communications category, verified (AEC-SPEC §4) | FFmpeg (static) | DXGI |
+| macOS | cpal (CoreAudio) | none yet (VPIO planned, AEC-SPEC §9) | FFmpeg (static) | xcap |
+| Linux | cpal (ALSA/PipeWire) | none | FFmpeg (system) | xcap (X11; Wayland is screenshots) |
+| Android | AAudio voice-call streams (`native/aaudio.rs`, `native/android.rs`) | `AcousticEchoCanceler` on the capture session, read back (E9) | MediaCodec (`video::mediacodec`, `video::yuv`) | — |
+| iPhone | the VPIO unit for both sides (`native/vpio.rs`, `native/avsession.rs`) | VPIO, bypass read back (E10) | VideoToolbox (`video::videotoolbox`, `video::annexb`) | — |
+
+Every backend feeds the same contract: one capture callback's samples
+into a ring, one render callback's buffer out of one (`native/pump.rs`),
+no locks or allocation on the real-time thread, the playout cushion
+sized from the device's callback (ANDROID-SPEC D24). Whether echo
+cancellation is on is decided from the stream that was opened, never
+assumed from the device, and Settings → Audio says what was found.
+
+### 7.4 Notifications on the phones
+
+`app::alerts` is the policy, the hosts carry it out (ANDROID-SPEC D52,
+IOS-SPEC D50). On screen, a DM or mention chimes — through the voice
+engine where the phone's ringer allows it (`host::chime_route()`:
+Android checks the ringer mode and Do Not Disturb), or as a sound-only
+system notification on iOS, the only route that honours the ring/silent
+switch. Off screen, a DM becomes a system notification whose tap opens
+the conversation, and the first voice into empty rooms becomes "Ana
+joined General". All of it lives in the running app: there is no push
+service, so a phone whose app is closed or suspended gets nothing
+(PRODUCTION-PLAN.md PRD-1).
 
 ## 8. Wire contracts and constants to respect
 
@@ -579,8 +648,8 @@ deliberately free of Slint so it can be unit-tested and reused.
 
 ```bash
 cargo test --all                # everything; media crates need their system libs
-cargo test -p transport         # 40 tests, 19 of them sim scenarios
-cargo test -p server            # 13 unit + 21 e2e through the simulator
+cargo test -p transport         # 45 tests, the sim scenarios among them
+cargo test -p server            # 49 unit + 76 e2e through the simulator (2026-10-07)
 cargo clippy --all-targets      # all = deny, pedantic = warn
 cargo +nightly fmt --all        # imports_granularity/group_imports are nightly-only
 ```

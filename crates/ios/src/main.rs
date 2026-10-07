@@ -27,6 +27,8 @@ mod insets;
 mod lifecycle;
 #[cfg(target_os = "ios")]
 mod logging;
+#[cfg(all(target_os = "ios", feature = "app", not(feature = "hello")))]
+mod notices;
 #[cfg(target_os = "ios")]
 mod paths;
 #[cfg(target_os = "ios")]
@@ -111,6 +113,11 @@ fn main() {
         // Attachments, saved files, links: UIKit's pickers, Quick Look
         // and Safari behind the frontend's host seam (spec §10).
         host::install(dirs.as_ref().map(|d| d.documents.clone()));
+
+        // Notifications: the delegate, before anything can be posted,
+        // and the message chime where notification sounds are found
+        // (spec D50).
+        notices::install(dirs.as_ref().map(|d| d.config.as_path()));
 
         frontend::app::run();
     }

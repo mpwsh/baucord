@@ -193,6 +193,7 @@ impl AppState {
 
         self.users.clear();
         self.our_client_id = None;
+        Self::clear_call_notice();
         self.is_muted = false;
         self.is_deafened = false;
         // A menu open on a row that is about to vanish.

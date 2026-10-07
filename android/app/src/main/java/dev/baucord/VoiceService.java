@@ -78,8 +78,7 @@ public class VoiceService extends Service {
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent tap = PendingIntent.getActivity(this, 0, open,
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        Notification.Builder builder = new Notification.Builder(this, CHANNEL)
-                .setSmallIcon(R.drawable.ic_stat_voice)
+        Notification.Builder builder = Notices.styled(this, new Notification.Builder(this, CHANNEL))
                 .setContentTitle(title)
                 .setContentText(text)
                 .setContentIntent(tap)

@@ -1,6 +1,11 @@
 # baucord 1.1 — persistence: accounts, roles, history, DMs, files
 
-**Status:** proposal. Builds on the 1.0 line as shipped (Part C seams:
+> **Status (2026-10-07):** all of it shipped, 1.1.0–1.1.4 (§11); §12
+> holds every decision taken since. This is the design record for
+> admission, roles, history, DMs, files and profiles; what is left is
+> `PRODUCTION-PLAN.md`. Start from `START-HERE.md`.
+
+**Status when written:** proposal. Builds on the 1.0 line as shipped (Part C seams:
 `Hello.auth` enum, feature bits, client keys sent on every connect,
 server-assigned chat `id`/`ts`, content-hashed images, telemetry).
 Identity follows TeamSpeak 3: a key on the device, roles on the key,

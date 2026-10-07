@@ -190,6 +190,7 @@ impl AppState {
                 s.set_general_unread(0);
             }
             Some(user) => {
+                Self::clear_dm_notice(&user);
                 let index = self.dm_order.iter().position(|u| *u == user);
                 s.set_active_dm(index.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1));
                 let name = self
@@ -436,12 +437,12 @@ impl AppState {
                 })
                 .ok();
         }
-        if self.settings.sounds.direct_message_on() {
-            self.voice
-                .tx
-                .send(VoiceControl::PlaySound(SoundType::DirectMessage))
-                .ok();
-        }
+        // The chime on screen; a notification off screen on a phone.
+        let text = match &body {
+            Incoming::Text(text) => app_core::emoji::replace_shortcodes(text),
+            Incoming::File(file) => t!("notif-dm-file", "name" => file.name.as_str()),
+        };
+        self.alert_direct_message(from, username, &text);
         self.rebuild_dms_model();
     }
 

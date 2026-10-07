@@ -1,5 +1,0 @@
-Threads on messages, or being able to reply under messages in general chat 
-reactions to messages
-a feedback tab in settings with a button to 'attach logs' that should send the last 200 lines from baucord.log + a textbox for the user to fill up with details. Clicking send should attach the file and send it via the file uploading protocol and the server should persist it there. Admins should be able to pull this via their admin panel on a feedback tab or something.
-
-

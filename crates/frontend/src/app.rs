@@ -62,6 +62,7 @@ use crate::{
     viewers::Viewer,
 };
 
+mod alerts;
 mod chat;
 mod commands;
 mod conversations;
@@ -118,6 +119,15 @@ pub fn set_host_visible(visible: bool) {
     if visible {
         let _ = slint::invoke_from_event_loop(|| with_current(AppState::host_shown));
     }
+}
+
+/// A notification about the DM with `dm` (the user id in hex) was
+/// tapped: open that conversation (ANDROID-SPEC.md D52). Any thread.
+#[cfg_attr(feature = "desktop", expect(dead_code, reason = "phones only"))]
+pub(crate) fn open_noticed_conversation(dm: String) {
+    let _ = slint::invoke_from_event_loop(move || {
+        with_current(|app| app.open_noticed_dm(&dm));
+    });
 }
 
 /// The screen edges the host measured itself (logical px: top, left,
@@ -374,6 +384,9 @@ pub struct AppState {
     lobby: bool,
     /// The lobby's name (ids renumber on a hot reload; names hold).
     pub(crate) lobby_name: Option<String>,
+    /// When a phone last said someone started a call (`alerts`): once
+    /// per ten minutes at most.
+    last_join_notice: Option<Instant>,
     /// The room to go back to after an automatic reconnect: set when
     /// the connection drops, spent by the next `Init`, cleared by a
     /// deliberate connect or disconnect.
@@ -667,6 +680,7 @@ pub fn run() {
         main_placed: Cell::new(false),
         lobby: false,
         lobby_name: None,
+        last_join_notice: None,
         rejoin_channel: None,
         settings_win: None,
         admin_win: None,
@@ -2413,6 +2427,12 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_sounds_mention(t!("sounds-mention").into());
     tr.set_sounds_mention_hint(t!("sounds-mention-hint").into());
     tr.set_sounds_dm(t!("sounds-dm").into());
+    tr.set_notifs_header(t!("notifs-header").into());
+    tr.set_notifs_lead(t!("notifs-lead").into());
+    tr.set_notifs_messages(t!("notifs-messages").into());
+    tr.set_notifs_messages_hint(t!("notifs-messages-hint").into());
+    tr.set_notifs_first_join(t!("notifs-first-join").into());
+    tr.set_notifs_first_join_hint(t!("notifs-first-join-hint").into());
     tr.set_sounds_lead(t!("sounds-lead").into());
     tr.set_sounds_share_started(t!("sounds-share-started").into());
     tr.set_sounds_viewer_joined(t!("sounds-viewer-joined").into());

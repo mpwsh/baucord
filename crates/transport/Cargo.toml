@@ -22,7 +22,10 @@ thiserror.workspace = true
 # workspace logger; `rustls-ring` is the TLS provider (ring over aws-lc-rs
 # for footprint). No default features: that would pull `bloom` (fastbloom)
 # which we don't need.
-quinn-proto = { version = "0.11.17", default-features = false, features = [
+# 0.11.19 at least: earlier 0.11 releases panic on a peer whose
+# min_ack_delay exceeds the RTT once ack frequency is on (ours is) — a
+# remote crash of the server with `panic = "abort"` (PRODUCTION-PLAN.md).
+quinn-proto = { version = "0.11.19", default-features = false, features = [
   "rustls-ring",
   "log",
 ] }

@@ -889,10 +889,7 @@ impl AppState {
                 // Ordinary messages are silent by design; a mention may
                 // chime if the person asked for it.
                 if !meta.own && self.settings.sounds.mention_on() && self.mentions_us(&text) {
-                    self.voice
-                        .tx
-                        .send(VoiceControl::PlaySound(SoundType::Mention))
-                        .ok();
+                    self.alert_mention(&meta.user, &text);
                 }
             }
             NetworkMessage::UploadProgress { pct } => {

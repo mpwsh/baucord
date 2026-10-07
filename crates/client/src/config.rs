@@ -255,6 +255,30 @@ impl SoundSettings {
     }
 }
 
+/// What a phone tells the user while the app is in the background
+/// (ANDROID-SPEC.md D52, IOS-SPEC.md D50): system notifications, which
+/// follow the phone's own silent, vibrate and Do Not Disturb modes.
+/// The desktop has none yet; the fields are kept there all the same.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationSettings {
+    /// A direct message arrives while the app is in the background.
+    #[serde(default = "default_true")]
+    pub messages: bool,
+    /// Someone joins a voice channel while nobody else is in one — the
+    /// call is starting. Only while the app stays connected.
+    #[serde(default = "default_true")]
+    pub first_join: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            messages: true,
+            first_join: true,
+        }
+    }
+}
+
 /// What happens when the app launches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartupSettings {
@@ -598,6 +622,8 @@ pub struct Settings {
     pub sounds: SoundSettings,
     #[serde(default)]
     pub logging: LoggingSettings,
+    #[serde(default)]
+    pub notifications: NotificationSettings,
 }
 
 /// How much `baucord.log` records (1.1.5). `RUST_LOG` in the
@@ -671,6 +697,8 @@ struct SettingsDe {
     sounds: SoundSettings,
     #[serde(default)]
     logging: LoggingSettings,
+    #[serde(default)]
+    notifications: NotificationSettings,
 }
 
 #[derive(Deserialize)]
@@ -729,6 +757,7 @@ impl From<SettingsDe> for Settings {
             startup: de.startup,
             sounds: de.sounds,
             logging: de.logging,
+            notifications: de.notifications,
         };
         settings.normalize_servers();
         settings
@@ -752,6 +781,7 @@ impl Default for Settings {
             startup: StartupSettings::default(),
             sounds: SoundSettings::default(),
             logging: LoggingSettings::default(),
+            notifications: NotificationSettings::default(),
         }
     }
 }

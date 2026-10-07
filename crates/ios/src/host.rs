@@ -28,7 +28,7 @@ use std::{
 };
 
 use block2::RcBlock;
-use frontend::host::{Hooks, OnPick, Saved};
+use frontend::host::{ChimeRoute, Hooks, KeepAlive, Notice, NoticeKind, OnPick, Saved};
 use i18n::t;
 use objc2::{
     define_class, extern_class, extern_methods, msg_send,
@@ -187,9 +187,39 @@ impl Hooks for IosHost {
         Ok(())
     }
 
-    // `keep_alive`: nothing to do. In voice the audio background mode
-    // keeps the process running (spec D13); chat alone is suspended
-    // with the app and reconnects on return.
+    /// Connected: the moment to ask for notifications (D50) — the
+    /// process itself needs nothing. In voice the audio background mode
+    /// keeps it running (spec D13); chat alone is suspended with the app
+    /// and reconnects on return.
+    fn keep_alive(&self, notice: Option<&KeepAlive>) {
+        if notice.is_some() {
+            crate::notices::request_permission();
+        }
+    }
+
+    // Notifications (D50): `notices.rs`.
+    fn notifies(&self) -> bool {
+        true
+    }
+
+    fn notify(&self, notice: &Notice) {
+        crate::notices::post(notice);
+    }
+
+    fn notices_allowed(&self, _kind: NoticeKind) -> bool {
+        crate::notices::allowed()
+    }
+
+    fn cancel_notice(&self, key: &str) {
+        crate::notices::cancel(key);
+    }
+
+    /// An alert chime goes through the system, which honours the
+    /// ring/silent switch (the voice session's audio would not) — while
+    /// the user lets notifications sound; else through the engine.
+    fn chime_route(&self) -> ChimeRoute {
+        crate::notices::chime_route()
+    }
 
     /// While a stream is watched the idle timer is off, so the screen
     /// neither dims nor locks (spec §14 D45). iOS applies it only while

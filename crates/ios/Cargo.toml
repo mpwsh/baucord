@@ -118,5 +118,20 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
   "std",
   "CFCGTypes",
 ] }
+# Notifications (notices.rs, IOS-SPEC.md D50): a DM or a call starting
+# while the app is in the background, and the message chime under the
+# ring/silent switch. Local notifications only — no push entitlement.
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+  "std",
+  "block2",
+  "UNNotification",
+  "UNNotificationContent",
+  "UNNotificationRequest",
+  "UNNotificationResponse",
+  "UNNotificationSettings",
+  "UNNotificationSound",
+  "UNNotificationTrigger",
+  "UNUserNotificationCenter",
+] }
 # Timestamps in baucord.log (the desktop's env_logger format).
 chrono = "0.4"
