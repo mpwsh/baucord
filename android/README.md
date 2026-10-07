@@ -147,7 +147,12 @@ later.
 
 The log file is `files/baucord.log` inside the app's private
 directory; on a debug build `adb shell run-as dev.baucord cat
-files/baucord.log` prints it.
+files/baucord.log` prints it. A release build's users have no way
+there: **Settings → Debug → Send log to server** sends the end of it
+(up to 2 MB, once per 10 minutes) to the server they are connected to,
+which keeps it in its identity folder's `logs/` (`<name>-<id>-<time>.log`;
+the server's own log names the file). The same tab shows the last 100
+lines and can clear the log.
 
 ## 4. A phone
 

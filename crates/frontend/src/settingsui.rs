@@ -1,10 +1,17 @@
 // settingsui.rs — the settings window: populate, wire, and the two
 // live loops (8 Hz level meters, keybind capture).
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{
+    cell::Cell,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
+use app_core::{chat::human_size, logfile};
 use client::{
     config::{build_bind_string, BindableAction, ServerEntry},
+    network::{NetworkControl, LOG_UPLOAD_MIN_INTERVAL},
+    protocol::MAX_LOG_UPLOAD_BYTES,
     voice::VoiceControl,
 };
 use i18n::t;
@@ -57,6 +64,14 @@ impl<'a> SettingsSurface<'a> {
                 // narrow page goes straight to that section (D28).
                 s.set_settings_section_open(true);
             }
+        }
+    }
+
+    /// The selected nav tab (`TAB_*`).
+    fn tab(&self) -> i32 {
+        match self {
+            Self::Window(w) => w.get_tab(),
+            Self::Page(m) => m.global::<State>().get_settings_tab(),
         }
     }
 
@@ -122,9 +137,28 @@ fn route_label(name: &str) -> String {
 }
 
 /// Nav index of the Servers tab (Profile 0, General 1, Audio 2,
-/// Sounds 3, Keyboard 4, Servers 5, Credits 6, About 7) — the connect
-/// view's pencil jumps here. Mirrors the `NavItem`s in settings.slint.
+/// Sounds 3, Keyboard 4, Servers 5, Credits 6, About 7, Debug 8) — the
+/// connect view's pencil jumps here. Mirrors the `NavItem`s in
+/// settings.slint.
 pub const TAB_SERVERS: i32 = 5;
+/// Nav index of the Debug tab, whose log view the settings timer
+/// refreshes while it shows.
+const TAB_DEBUG: i32 = 8;
+
+/// The Debug tab's log view: this many of the last lines…
+const LOG_TAIL_LINES: usize = 100;
+/// …read from at most the log's last this many bytes.
+const LOG_TAIL_BYTES: usize = 128 * 1024;
+/// How often the log view reads the file again, in settings-timer
+/// ticks (125 ms): every 2 s while the Debug tab shows.
+const LOG_REFRESH_TICKS: u32 = 16;
+
+thread_local! {
+    /// When this run last sent its log: the server takes one per
+    /// `LOG_UPLOAD_MIN_INTERVAL`, and the network thread drops a second
+    /// one silently, so the button says so instead.
+    static LOG_SENT: Cell<Option<Instant>> = const { Cell::new(None) };
+}
 
 /// The name-color palette (spec §7.1): sixteen colors that all pass
 /// 3:1 on the chat background (#1A1D21, measured 4.9–15.5) and none
@@ -457,6 +491,9 @@ pub fn populate(app: &mut AppState) {
             .to_string()
             .into(),
     );
+    // Debug: what the last send or clear said belongs to that visit.
+    s.set_debug_status("".into());
+    refresh_log(app);
     // Startup / sounds / chat.
     s.set_auto_connect(settings.startup.auto_connect);
     s.set_start_minimized(settings.startup.start_minimized);
@@ -739,6 +776,30 @@ fn wire(sf: &SettingsSurface<'_>) {
             app.settings.logging.level = level.to_string();
             app::apply_log_level(&app.settings);
             log::info!("log level set to {level}");
+        });
+    });
+    // ── Debug ──────────────────────────────────────────────────────
+    // Deferred: the panel's `init` can run while the UI is being laid
+    // out from inside a handler that already holds the app.
+    logic.on_refresh_log(|| {
+        slint::Timer::single_shot(Duration::ZERO, || app::with_current(|app| refresh_log(app)));
+    });
+    logic.on_send_log(|| {
+        app::with_current(|app| {
+            let status = send_log(app);
+            if let Some(sf) = surface(app) {
+                sf.state().set_debug_status(status.into());
+            }
+            refresh_log(app);
+        });
+    });
+    logic.on_clear_log(|| {
+        app::with_current(|app| {
+            let status = clear_log();
+            if let Some(sf) = surface(app) {
+                sf.state().set_debug_status(status.into());
+            }
+            refresh_log(app);
         });
     });
     logic.on_sounds_enabled_changed(|on| {
@@ -1306,14 +1367,23 @@ fn populate_binds_only(app: &mut AppState) {
 }
 
 /// 8 Hz meter loop while the window is open (the FLTK build's
-/// `MeterUpdate` tick).
+/// `MeterUpdate` tick); every 2 s of it, the Debug tab's log view.
 fn start_meter_timer(app: &mut AppState) {
     let (output_level, denoised_level) = app.voice_levels();
     let aec = app.voice_aec();
+    let mut ticks = 0u32;
     app.meter_timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(125),
         move || {
+            ticks = ticks.wrapping_add(1);
+            if ticks.is_multiple_of(LOG_REFRESH_TICKS) {
+                app::with_current(|app| {
+                    if surface(app).is_some_and(|sf| sf.tab() == TAB_DEBUG) {
+                        refresh_log(app);
+                    }
+                });
+            }
             let mic = f32::from_bits(denoised_level.load(Ordering::Relaxed));
             let out = f32::from_bits(output_level.load(Ordering::Relaxed));
             // Reopening the streams (a headset plugged in, the setting
@@ -1332,6 +1402,94 @@ fn start_meter_timer(app: &mut AppState) {
             });
         },
     );
+}
+
+// ── Debug ───────────────────────────────────────────────────────────────
+
+/// The Debug tab's log view: where the file is, how big, and its last
+/// lines. A read of the file's last 128 KB; properties are set only
+/// when they changed, so an idle log redraws nothing.
+pub fn refresh_log(app: &AppState) {
+    let Some(sf) = surface(app) else { return };
+    let s = sf.state();
+    let Some(path) = logfile::path() else {
+        s.set_log_file_available(false);
+        return;
+    };
+    s.set_log_file_available(true);
+    let line = t!(
+        "debug-log-file",
+        "path" => path.display().to_string(),
+        "size" => human_size(logfile::total_len(path))
+    );
+    if s.get_log_file_line() != line.as_str() {
+        s.set_log_file_line(line.into());
+    }
+    let tail = logfile::tail_lines(path, LOG_TAIL_LINES, LOG_TAIL_BYTES)
+        .unwrap_or_else(|e| t!("debug-read-failed", "error" => e.to_string()));
+    if s.get_log_tail() != tail.as_str() {
+        s.set_log_tail(tail.into());
+    }
+}
+
+/// "Send log to server": the end of the log, up to the protocol's
+/// cap, to the connected server (spec §9.1), which files it under its
+/// identity folder's `logs/`. Says what happened under the buttons.
+fn send_log(app: &AppState) -> String {
+    let Some(path) = logfile::path() else {
+        return t!("debug-no-log-file");
+    };
+    if !app.connected {
+        return t!("debug-send-offline");
+    }
+    if let Some(left) = LOG_SENT
+        .get()
+        .and_then(|at| LOG_UPLOAD_MIN_INTERVAL.checked_sub(at.elapsed()))
+    {
+        return t!("debug-send-wait", "minutes" => left.as_secs().div_ceil(60).max(1));
+    }
+    // Who sent it and from what, for whoever opens the file.
+    let header = format!(
+        "# baucord {} ({}/{}), sent from Settings → Debug at {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
+    );
+    match logfile::upload_bytes(path, &header, MAX_LOG_UPLOAD_BYTES) {
+        Err(e) => t!("debug-read-failed", "error" => e.to_string()),
+        Ok(bytes) if bytes.len() <= header.len() + 1 => t!("debug-send-empty"),
+        Ok(bytes) => {
+            let size = human_size(bytes.len() as u64);
+            app.network.tx.send(NetworkControl::SendLog(bytes)).ok();
+            LOG_SENT.set(Some(Instant::now()));
+            log::info!("log sent to the server from Settings → Debug ({size})");
+            let server = if app.server_name.is_empty() {
+                app.settings
+                    .default_server()
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default()
+            } else {
+                app.server_name.clone()
+            };
+            t!("debug-sent", "server" => server, "size" => size)
+        }
+    }
+}
+
+/// "Clear log": empty the file (and the rolled-over one). The line
+/// saying so is the new log's first.
+fn clear_log() -> String {
+    let Some(path) = logfile::path() else {
+        return t!("debug-no-log-file");
+    };
+    match logfile::clear(path) {
+        Ok(()) => {
+            log::info!("log cleared from Settings → Debug");
+            t!("debug-cleared")
+        }
+        Err(e) => t!("debug-clear-failed", "error" => e.to_string()),
+    }
 }
 
 /// The picker's word for `mode`.

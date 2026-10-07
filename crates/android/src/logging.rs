@@ -85,7 +85,12 @@ fn open_log_file(dir: &Path) -> Option<File> {
         let _ = std::fs::rename(&path, dir.join("baucord.log.1"));
     }
     match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(file) => Some(file),
+        Ok(file) => {
+            // Settings → Debug shows, sends and clears it.
+            #[cfg(feature = "app")]
+            frontend::logfile::set_path(path);
+            Some(file)
+        }
         Err(e) => {
             // Nothing to log to yet; logcat gets it once the tee is up.
             eprintln!("baucord: could not open {}: {e}", path.display());

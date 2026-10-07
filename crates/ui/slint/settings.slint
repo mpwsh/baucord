@@ -1,6 +1,7 @@
 // settings.slint — the settings window.
 //
-// Left nav (Profile / General / Audio / Keyboard / Servers / About),
+// Left nav (Profile / General / Audio / Keyboard / Servers / Debug /
+// About),
 // scrollable content, Save & close + Reset row. Narrow (the Android
 // page on a phone held upright): the nav is a page of its own and a
 // section opens over it, with a back arrow (ANDROID-SPEC.md D28).
@@ -116,6 +117,17 @@ export global SettingsState {
     /// True while some row is recording — arms the window's key capture.
     in property <bool> capturing: false;
 
+    // ── Debug ──
+    /// This build writes a log file (a release desktop build, the
+    /// phones); a debug desktop build logs to its terminal only.
+    in property <bool> log-file-available: false;
+    /// Where the file is and how big ("Log file: … (1.2 MB)").
+    in property <string> log-file-line;
+    /// The log's last 100 lines, oldest first ("" = empty).
+    in property <string> log-tail;
+    /// What the last send or clear did ("" hides the line).
+    in property <string> debug-status;
+
     // ── About — host-formatted blocks ──
     in property <string> credits-super-heading;
     in property <[string]> credits-super;     // gold-highlighted honors
@@ -184,6 +196,12 @@ export global SettingsLogic {
     callback capture-key(string, bool, bool, bool);
     callback capture-cancel();
     callback capture-clear();
+
+    // Debug: read the log again (the panel just opened), send its end
+    // to the connected server, empty it.
+    callback refresh-log();
+    callback send-log();
+    callback clear-log();
 
     callback save-and-close();
     callback reset-defaults();
@@ -512,15 +530,6 @@ component GeneralPanel inherits VerticalLayout {
             options: SettingsState.text-sizes;
             current <=> SettingsState.text-size-index;
             selected(i) => { SettingsLogic.text-size-selected(i); }
-        }
-    }
-    Setting {
-        label: Tr.log-level;
-        hint: Tr.log-level-hint;
-        Dropdown {
-            options: SettingsState.log-levels;
-            current <=> SettingsState.log-level-index;
-            selected(i) => { SettingsLogic.log-level-selected(i); }
         }
     }
 
@@ -964,6 +973,110 @@ component KeyboardPanel inherits VerticalLayout {
     Rectangle { }
 }
 
+/// The log's last lines, small and monospace, in a box of its own that
+/// scrolls. It follows the end as lines arrive, unless the reader has
+/// scrolled up to read; scrolling back to the bottom follows again.
+component LogView inherits Rectangle {
+    in property <string> text;
+    in property <string> empty-text;
+    property <bool> follow: true;
+    height: 300px;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.surface;
+    clip: true;
+
+    function to-end() {
+        scroll.content-y = Math.min(0px, scroll.visible-height - scroll.content-height);
+    }
+    init => { root.to-end(); }
+    changed text => {
+        if (root.follow) {
+            root.to-end();
+        }
+    }
+
+    scroll := ScrollView {
+        width: 100%;
+        height: 100%;
+        // A finger drags the text, as in the rest of Settings on a
+        // phone (ANDROID-SPEC.md D27).
+        mouse-drag-pan-enabled: State.touch-host;
+        // Wrap at the box's width rather than scroll sideways.
+        content-width: self.visible-width;
+        scrolled => {
+            root.follow = self.content-y <= self.visible-height - self.content-height + 4px;
+        }
+        VerticalLayout {
+            padding: Theme.gap-sm;
+            Text {
+                text: root.text == "" ? root.empty-text : root.text;
+                color: root.text == "" ? Theme.text-muted : Theme.text-secondary;
+                font-family: "monospace";
+                font-size: Theme.font-xs;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+/// For reporting a problem: how much is logged, the log's last lines,
+/// and a way to get it to the server's admin (or to empty it).
+component DebugPanel inherits VerticalLayout {
+    spacing: Theme.gap-lg;
+    // The panel exists only while its tab shows: read the log now; the
+    // settings timer reads it again every 2 s while it stays open.
+    init => { SettingsLogic.refresh-log(); }
+    PanelHeader { title: Tr.tab-debug; lead: Tr.debug-lead; }
+    Setting {
+        label: Tr.log-level;
+        hint: Tr.log-level-hint;
+        Dropdown {
+            options: SettingsState.log-levels;
+            current <=> SettingsState.log-level-index;
+            selected(i) => { SettingsLogic.log-level-selected(i); }
+        }
+    }
+
+    Sep { }
+    SectionHeader { text: Tr.debug-log-header; }
+    if !SettingsState.log-file-available : Hint { text: Tr.debug-no-log-file; }
+    if SettingsState.log-file-available : VerticalLayout {
+        spacing: Theme.gap-sm;
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn {
+                text: Tr.debug-send-log;
+                accent: true;
+                enabled: SettingsState.connected;
+                clicked => { SettingsLogic.send-log(); }
+            }
+            Btn {
+                text: Tr.debug-clear-log;
+                clicked => { SettingsLogic.clear-log(); }
+            }
+            Rectangle { }   // keep the buttons their natural width
+        }
+        Hint { text: Tr.debug-send-hint; }
+        if SettingsState.debug-status != "" : Text {
+            text: SettingsState.debug-status;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+    }
+    if SettingsState.log-file-available : Setting {
+        label: Tr.debug-tail-label;
+        hint: SettingsState.log-file-line;
+        LogView {
+            text: SettingsState.log-tail;
+            empty-text: Tr.debug-tail-empty;
+        }
+    }
+    Rectangle { }
+}
+
 component AboutPanel inherits VerticalLayout {
     spacing: Theme.gap-lg;
     PanelHeader { title: Tr.tab-about; }
@@ -1039,6 +1152,7 @@ component SettingsNav inherits VerticalLayout {
     // Shortcuts need a keyboard the OS lets us watch: not on a phone.
     if !State.touch-host : NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard; tall: root.narrow; active: !root.narrow && root.tab == 4; clicked => { root.picked(4); } }
     NavItem { text: Tr.tab-servers;   icon: IconSet.Server;            tall: root.narrow; active: !root.narrow && root.tab == 5; clicked => { root.picked(5); } }
+    NavItem { text: Tr.tab-debug;     icon: IconSet.Bug;               tall: root.narrow; active: !root.narrow && root.tab == 8; clicked => { root.picked(8); } }
     // Credits and About: their own group. The window's column puts it
     // at the bottom; the phone's list keeps it under the rest, a group
     // gap apart, instead of past a screen of empty space.
@@ -1075,6 +1189,7 @@ component SettingsContent inherits ScrollView {
                 if root.tab == 5 : ServersPanel { }
                 if root.tab == 6 : CreditsPanel { }
                 if root.tab == 7 : AboutPanel { }
+                if root.tab == 8 : DebugPanel { }
             }
             Rectangle { horizontal-stretch: 1; }
         }
@@ -1129,7 +1244,7 @@ component SettingsFooter inherits Rectangle {
 
 export component SettingsPanel inherits FocusScope {
     /// 0 profile, 1 general, 2 audio, 3 sounds, 4 keyboard, 5 servers,
-    /// 6 credits, 7 about. Mirrored by `settingsui::TAB_*`.
+    /// 6 credits, 7 about, 8 debug. Mirrored by `settingsui::TAB_*`.
     in-out property <int> tab: 0;
     /// The narrow layout (a phone held upright; ANDROID-SPEC.md D28):
     /// the section list and the open section are two pages, as the

@@ -24,6 +24,7 @@ mod emoji_table;
 pub mod fps;
 pub mod gif;
 pub mod images;
+pub mod logfile;
 pub mod markdown;
 pub mod menu;
 pub mod roster;

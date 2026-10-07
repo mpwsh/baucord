@@ -2393,6 +2393,15 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_general_lead(t!("general-lead").into());
     tr.set_text_size(t!("text-size").into());
     tr.set_text_size_hint(t!("text-size-hint").into());
+    tr.set_tab_debug(t!("tab-debug").into());
+    tr.set_debug_lead(t!("debug-lead").into());
+    tr.set_debug_log_header(t!("debug-log-header").into());
+    tr.set_debug_send_log(t!("debug-send-log").into());
+    tr.set_debug_clear_log(t!("debug-clear-log").into());
+    tr.set_debug_send_hint(t!("debug-send-hint").into());
+    tr.set_debug_tail_label(t!("debug-tail-label").into());
+    tr.set_debug_tail_empty(t!("debug-tail-empty").into());
+    tr.set_debug_no_log_file(t!("debug-no-log-file").into());
     tr.set_log_level(t!("log-level").into());
     tr.set_log_level_hint(t!("log-level-hint").into());
     tr.set_sounds_header(t!("sounds-header").into());

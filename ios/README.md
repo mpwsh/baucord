@@ -166,8 +166,12 @@ next step is TestFlight (spec M5).
 
 - Live: the stream `run.sh` shows (stderr), or Xcode's console.
 - On the phone: **Files → On My iPhone → baucord → baucord.log** —
-  what users send; the same format as the desktop log, rolled at
-  5 MB.
+  the same format as the desktop log, rolled at 5 MB.
+- From anyone's phone: **Settings → Debug → Send log to server** sends
+  the end of it (up to 2 MB, once per 10 minutes) to the server they
+  are connected to, which keeps it in its identity folder's `logs/`
+  (`<name>-<id>-<time>.log`; the server's own log names the file). The
+  same tab shows the last 100 lines and can clear the log.
 
 Normal in the **simulator's** log, and not errors of ours (IOS-SPEC.md
 D28): wgpu's `Missing downlevel flags …` with a capabilities dump and

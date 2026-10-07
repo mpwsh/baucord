@@ -117,7 +117,7 @@ const IMAGE_PARTIAL_TTL: Duration = Duration::from_mins(2);
 
 /// One "send my log" upload per this interval, mirroring the server's
 /// acceptance window.
-const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_mins(10);
+pub const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_mins(10);
 
 // ── Messages sent to the UI / App layer ─────────────────────────────────
 

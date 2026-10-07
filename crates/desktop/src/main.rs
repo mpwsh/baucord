@@ -56,6 +56,10 @@ fn main() {
                 )
                 .target(Target::Pipe(Box::new(log_file)))
                 .init();
+                // Settings → Debug shows, sends and clears it.
+                if let Ok(dir) = std::env::current_dir() {
+                    frontend::logfile::set_path(dir.join("baucord.log"));
+                }
             }
             Err(e) => {
                 // Read-only install dir etc. — run without file logging

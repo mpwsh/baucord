@@ -768,7 +768,10 @@ people rather than devices. Plus:
   streams were low-latency without a session, i.e. MMAP, which skips
   the effects; now performance mode None, a capture session, and an
   `AcousticEchoCanceler` created on it and read back (ANDROID-SPEC
-  D46, AEC-SPEC E9). Next: the phone with these — `safe area: top 20
+  D46, AEC-SPEC E9). And so users can send logs at all: Settings →
+  Debug (IOS-SPEC D48, ANDROID-SPEC D47) — the log level, Send log to
+  server (the long-unused upload; the server files it under its
+  identity folder's `logs/`), Clear log, and the last 100 lines. Next: the phone with these — `safe area: top 20
   … (status bar 20)`, `VPIO voice processing on`, `aec: platform
   (speakers)` and nobody hearing themselves; an Android log with
   `AAudio voice capture: echo canceller on (AcousticEchoCanceler,
