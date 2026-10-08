@@ -78,9 +78,9 @@ objc2-avf-audio = { version = "0.3", default-features = false, features = [
 # and foreground, the application's memory warning and termination.
 # The pickers, Quick Look and links (host.rs): the action sheet, the
 # document picker, the document interaction controller, and the window
-# to present them from. The window's safe area (insets.rs): UIGeometry,
-# and the status bar's height where the window's safe area leaves it
-# out (UIStatusBarManager).
+# to present them from; the pasteboard (Copy log). The window's safe
+# area (insets.rs): UIGeometry, and the status bar's height where the
+# window's safe area leaves it out (UIStatusBarManager).
 objc2-ui-kit = { version = "0.3", default-features = false, features = [
   "std",
   "block2",
@@ -91,6 +91,7 @@ objc2-ui-kit = { version = "0.3", default-features = false, features = [
   "UIDocumentInteractionController",
   "UIDocumentPickerViewController",
   "UIGeometry",
+  "UIPasteboard",
   "UIPresentationController",
   "UIResponder",
   "UIScene",

@@ -444,13 +444,6 @@ pub struct AppState {
     /// service) stays on through it (D34).
     reconnect_hold: bool,
     stream_stats_timer_active: Arc<AtomicBool>,
-    /// Once-a-second summaries of frames over the latency budget and
-    /// of slow property sets (`video::timing`), replacing per-frame
-    /// warnings; `slow_frame_worst` keeps the worst frame's stage
-    /// split for the summary line.
-    slow_frames: video::timing::SlowFrames,
-    slow_frame_worst: (f32, f32, f32),
-    slow_presents: video::timing::SlowFrames,
     pub meter_timer: slint::Timer,
     /// The single animation ticker driving every playing GIF (chat
     /// rows + the viewer overlay). Runs only while something plays.
@@ -482,14 +475,16 @@ fn spawn_workers(
     );
     let screen = ScreenThreadHandle::spawn(network_tx.clone(), wake_fn.clone());
     // Present-prep thread: takes over screen.event_rx (the UI drain
-    // must not read it), pays the per-frame pixel copy off the UI
-    // thread, forwards non-frame events back via this channel.
+    // must not read it), converts or copies the newest frame of each
+    // stream into the UI's pixel buffer off the UI thread, forwards
+    // non-frame events back via this channel.
     let present_shared = Arc::new(crate::present::PresentShared::default());
     let (screen_fwd_tx, screen_fwd_rx) = crossbeam_channel::unbounded();
     crate::present::spawn(
         screen.event_rx.clone(),
         screen_fwd_tx,
         Arc::clone(&present_shared),
+        screen.shared.present.clone(),
         wake_fn.clone(),
     );
     let network = NetworkThreadHandle::spawn(
@@ -713,9 +708,6 @@ pub fn run() {
         reconnect_timer: slint::Timer::default(),
         reconnect_attempts: 0,
         stream_stats_timer_active: Arc::new(AtomicBool::new(false)),
-        slow_frames: video::timing::SlowFrames::new("Slow frames"),
-        slow_frame_worst: (0.0, 0.0, 0.0),
-        slow_presents: video::timing::SlowFrames::new("Slow present"),
         meter_timer: slint::Timer::default(),
         gif_ticker: slint::Timer::default(),
     }));
@@ -2418,6 +2410,7 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_debug_lead(t!("debug-lead").into());
     tr.set_debug_log_header(t!("debug-log-header").into());
     tr.set_debug_send_log(t!("debug-send-log").into());
+    tr.set_debug_copy_log(t!("debug-copy-log").into());
     tr.set_debug_clear_log(t!("debug-clear-log").into());
     tr.set_debug_send_hint(t!("debug-send-hint").into());
     tr.set_debug_tail_label(t!("debug-tail-label").into());

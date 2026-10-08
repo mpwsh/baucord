@@ -286,10 +286,16 @@ pub struct VoiceChat {
     /// Names of the devices actually opened, for follow-the-default.
     opened_input: Option<String>,
     opened_output: Option<String>,
-    /// Capture was asked for and never opened (no microphone; on
-    /// Android the permission not granted yet): `service()` keeps
-    /// trying on the restart backoff until it does, playback running.
+    /// Capture was asked for and is not open — it never opened (no
+    /// microphone; on Android the permission not granted yet) or a
+    /// reopen failed: `service()` keeps trying on the restart backoff
+    /// until it does, playback running.
     input_pending: bool,
+    /// The same for playback: a reopen failed (the device went away
+    /// with nothing to replace it yet) and `service()` keeps trying.
+    /// Without it a failed restart left the room silent until the app
+    /// was restarted — `service()` only restarts a stream that exists.
+    output_pending: bool,
     /// Last default-device poll (non-Windows) and last restart attempt.
     last_device_poll: Instant,
     last_restart_attempt: Instant,
@@ -418,6 +424,7 @@ impl VoiceChat {
             opened_input: None,
             opened_output: None,
             input_pending: false,
+            output_pending: false,
             last_device_poll: Instant::now(),
             last_restart_attempt: Instant::now().checked_sub(RESTART_BACKOFF).unwrap(),
             aec_wanted: false,
@@ -476,6 +483,8 @@ impl VoiceChat {
 
         if let Err(e) = &output_result {
             log::error!("Voice output failed to start: {e}");
+            // Retried from `service()` if the caller keeps the engine.
+            self.output_pending = true;
         }
         if let Err(e) = &input_result {
             log::error!(
@@ -514,6 +523,7 @@ impl VoiceChat {
         self.is_speaking = input.speaking_handle();
         self.opened_input = input.opened_device_name();
         self.input = Some(input);
+        self.input_pending = false;
         self.stats
             .default_input_changed
             .store(false, Ordering::Relaxed);
@@ -559,6 +569,7 @@ impl VoiceChat {
             .default_output_changed
             .store(false, Ordering::Relaxed);
         self.output = Some(output);
+        self.output_pending = false;
         // Whether the route held once a call stream exists (some
         // phones settle it only then).
         #[cfg(target_os = "android")]
@@ -716,13 +727,16 @@ impl VoiceChat {
         self.close_input();
         self.output.take();
         self.input_pending = false;
+        self.output_pending = false;
         self.plan_aec();
         if self.playback_wanted() {
             if let Err(e) = self.reopen_output() {
                 error!("Output reopen failed ({e}); will retry");
-                // Nothing else would: `service` restarts an output that
-                // exists, and this one does not.
-                self.aec_replan = true;
+                // `service` retries playback alone: re-planning both
+                // every 2 s closed and reopened a working microphone
+                // for as long as the output stayed away. A plan the
+                // output's return makes stale still reopens both.
+                self.output_pending = true;
             }
         }
         if self.capture_wanted() {
@@ -1149,10 +1163,12 @@ impl VoiceChat {
             && (stats.output_stream_failed.load(Ordering::Relaxed)
                 || (self.config.output_device.is_none()
                     && stats.default_output_changed.load(Ordering::Relaxed)));
-        // A capture side that never opened is not a failed stream (there
-        // is none) — it is a device or permission that may show up later.
+        // A side that is not open is not a failed stream (there is none)
+        // — it is a device or permission that may show up later: one
+        // that never opened, or whose reopen failed.
         let input_late = self.input.is_none() && self.input_pending && self.capture_wanted();
-        if !input_needs && !output_needs && !input_late && !self.aec_replan {
+        let output_late = self.output.is_none() && self.output_pending && self.playback_wanted();
+        if !input_needs && !output_needs && !input_late && !output_late && !self.aec_replan {
             return false;
         }
         if now.duration_since(self.last_restart_attempt) < RESTART_BACKOFF {
@@ -1162,11 +1178,13 @@ impl VoiceChat {
 
         // A side going down usually means the output changed; if the
         // voice-call plan changes with it, both sides reopen together
-        // (AEC-SPEC.md §4.5: re-evaluated on every reopen). So do they
+        // (AEC-SPEC.md §4.5: re-evaluated on every reopen) — so does an
+        // output coming back as another kind of device. So do they
         // when both are one unit (iOS, `SHARED_VOICE_UNIT`): an
         // interruption stops both at once.
         let one_unit = SHARED_VOICE_UNIT && self.voice_streams;
-        if self.aec_replan || ((input_needs || output_needs) && (one_unit || self.aec_plan_stale()))
+        if self.aec_replan
+            || ((input_needs || output_needs || output_late) && (one_unit || self.aec_plan_stale()))
         {
             stats.input_stream_failed.store(false, Ordering::Relaxed);
             stats.output_stream_failed.store(false, Ordering::Relaxed);
@@ -1177,6 +1195,20 @@ impl VoiceChat {
         }
 
         let mut restarted = false;
+        if output_late {
+            match self.reopen_output() {
+                Ok(()) => {
+                    stats.stream_restarts.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "Output started late ({})",
+                        self.opened_output.as_deref().unwrap_or("default device")
+                    );
+                    restarted = true;
+                }
+                // Every 2 s until it works: debug, or the log fills up.
+                Err(e) => debug!("output still unavailable: {e}"),
+            }
+        }
         if input_late {
             match self.start_input() {
                 Ok(()) => {
@@ -1205,7 +1237,11 @@ impl VoiceChat {
                     stats.stream_restarts.fetch_add(1, Ordering::Relaxed);
                     restarted = true;
                 }
-                Err(e) => error!("Input restart failed ({e}); will retry"),
+                Err(e) => {
+                    error!("Input restart failed ({e}); will retry");
+                    // The old stream is gone: retried as a late side.
+                    self.input_pending = true;
+                }
             }
         }
         if output_needs {
@@ -1220,7 +1256,14 @@ impl VoiceChat {
                     stats.stream_restarts.fetch_add(1, Ordering::Relaxed);
                     restarted = true;
                 }
-                Err(e) => error!("Output restart failed ({e}); will retry"),
+                Err(e) => {
+                    // It never did: the old stream is gone, and the
+                    // checks above only restart one that exists — the
+                    // room stayed silent until the app restarted
+                    // (PRODUCTION-PLAN.md CLI-9). Now a late side.
+                    error!("Output restart failed ({e}); will retry");
+                    self.output_pending = true;
+                }
             }
         }
         restarted
@@ -1302,6 +1345,9 @@ impl VoiceChat {
             }
             Err(e) => {
                 error!("start_input failed: {e}");
+                // `service()` keeps trying (a chosen device that is not
+                // plugged in comes back when it is).
+                self.input_pending = true;
                 Err(e)
             }
         }
@@ -1331,7 +1377,10 @@ impl VoiceChat {
             }
             return Ok(());
         }
-        self.reopen_output()
+        let reopened = self.reopen_output();
+        // As for the input: `service()` keeps trying.
+        self.output_pending = reopened.is_err();
+        reopened
     }
 
     /// Close and reopen playback on the configured output.
@@ -1500,6 +1549,34 @@ mod headless_tests {
         // outgoing_receiver must be a live owned clone usable in select!
         let rx = vc.outgoing_receiver();
         assert!(rx.try_recv().is_err()); // empty, but connected
+    }
+
+    /// A playback that could not open is retried by `service()` — it
+    /// used to be only when the failure was the first start's, never
+    /// after a reopen (a device gone with nothing to replace it yet:
+    /// the room stayed silent until the app restarted). Needs a machine
+    /// with no output device, like CI's; elsewhere it proves nothing
+    /// and says so.
+    #[test]
+    fn a_playback_that_failed_is_retried() {
+        let mut vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
+        if vc.start().is_ok() || vc.output_running() {
+            eprintln!("an output opened here: nothing to retry");
+            return;
+        }
+        assert!(vc.output_pending, "a failed start leaves playback pending");
+        for _ in 0..3 {
+            // The microphone (also missing here) is not what is retried.
+            vc.input_pending = false;
+            let due = Instant::now().checked_sub(RESTART_BACKOFF).unwrap();
+            vc.last_restart_attempt = due;
+            vc.service();
+            assert!(
+                vc.last_restart_attempt > due,
+                "service() did not try the output again"
+            );
+            assert!(vc.output_pending, "still missing: still pending");
+        }
     }
 
     /// The headless path counts packets in the output worker, which only

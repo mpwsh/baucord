@@ -4,10 +4,14 @@
 //!
 //! Shape: one `video/avc` codec in synchronous (poll) mode, output to
 //! byte buffers rather than a Surface, so the frame comes back as YUV
-//! planes that `yuv::to_rgba` turns into the RGBA the client expects.
-//! The hardware decoder does the heavy lifting; the conversion is the
-//! price of staying on the existing `FrameReady → SharedPixelBuffer →
-//! Image` path instead of a native video surface.
+//! planes. Those are copied out (the codec wants its buffer back) and
+//! handed on as they are ([`PictureFormat::Yuv420`]): the frontend
+//! converts the pictures it shows straight into the buffer it draws
+//! from (`yuv::to_rgba_into`). Converting every frame here, on this
+//! thread, was three quarters of a mid-range phone's time per frame
+//! (MOB-18). The hardware decoder does the heavy lifting; the
+//! conversion is the price of staying on the existing `FrameReady →
+//! SharedPixelBuffer → Image` path instead of a native video surface.
 //!
 //! Lifecycle in the client's terms:
 //! - `new()` only checks a decoder exists; the codec is configured on
@@ -25,7 +29,7 @@
 //!   codec at the next keyframe (P-frames until then are dropped and
 //!   the jitter buffer's keyframe request does the rest).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 use ndk::media::{
@@ -38,7 +42,7 @@ use ndk::media::{
 
 use crate::{
     yuv::{self, ColorSpec, Matrix, Range, Yuv420Layout},
-    CodecError, DecodedFrame, EncodedFrame, VideoDecoder,
+    CodecError, DecodeTiming, DecodedFrame, EncodedFrame, PictureFormat, VideoDecoder,
 };
 
 const MIME: &str = "video/avc";
@@ -65,7 +69,6 @@ const OUTPUT_WAIT: Duration = Duration::from_millis(4);
 /// Synthetic presentation timestamps (the client stamps 0; decoders
 /// want them increasing).
 const PTS_STEP_US: u64 = 16_667;
-const POOL_MAX: usize = 4;
 
 /// A configured, started codec and the size it was configured for.
 struct Running {
@@ -90,13 +93,17 @@ pub struct MediaCodecDecoder {
     /// first picture (or after the codec reports a format change).
     layout: Option<Yuv420Layout>,
     color: ColorSpec,
-    pool: Vec<Vec<u8>>,
     frames_in: u64,
     frames_out: u64,
     frames_superseded: u64,
     /// Rebuild the codec at the next keyframe.
     needs_reset: bool,
     waiting_logged: bool,
+    /// Time copying planes out inside the current `decode` call (an
+    /// early collect can copy too), and the split of the last call
+    /// that returned a picture.
+    output_spent: Duration,
+    last_timing: Option<DecodeTiming>,
 }
 
 // SAFETY: `AMediaCodec` has no thread affinity (any thread may call it,
@@ -118,12 +125,13 @@ impl MediaCodecDecoder {
             codec: None,
             layout: None,
             color: ColorSpec::default(),
-            pool: Vec::new(),
             frames_in: 0,
             frames_out: 0,
             frames_superseded: 0,
             needs_reset: false,
             waiting_logged: false,
+            output_spent: Duration::ZERO,
+            last_timing: None,
         })
     }
 
@@ -229,6 +237,8 @@ impl Drop for MediaCodecDecoder {
 
 impl VideoDecoder for MediaCodecDecoder {
     fn decode(&mut self, encoded: &EncodedFrame) -> Result<Option<DecodedFrame>, CodecError> {
+        let started = Instant::now();
+        self.output_spent = Duration::ZERO;
         let size = Self::configured_size(encoded);
         let size_changed = self
             .codec
@@ -269,22 +279,31 @@ impl VideoDecoder for MediaCodecDecoder {
             }
         }
 
-        match self.collect(OUTPUT_WAIT)? {
+        let picture = match self.collect(OUTPUT_WAIT)? {
             Some(frame) => {
                 if let Some(older) = early {
                     self.frames_superseded += 1;
                     self.return_buffer(older.data);
                 }
-                Ok(Some(frame))
+                Some(frame)
             }
-            None => Ok(early),
+            None => early,
+        };
+        if picture.is_some() {
+            self.last_timing = Some(DecodeTiming {
+                codec: started.elapsed().saturating_sub(self.output_spent),
+                output: self.output_spent,
+            });
         }
+        Ok(picture)
+    }
+
+    fn last_timing(&self) -> Option<DecodeTiming> {
+        self.last_timing
     }
 
     fn return_buffer(&mut self, buf: Vec<u8>) {
-        if self.pool.len() < POOL_MAX {
-            self.pool.push(buf);
-        }
+        crate::pool::recycle(buf);
     }
 
     fn flush(&mut self) {
@@ -293,20 +312,20 @@ impl VideoDecoder for MediaCodecDecoder {
 }
 
 impl MediaCodecDecoder {
-    /// Take every finished picture out of the codec, convert the newest
-    /// and release them all. `first_wait` bounds the wait for the
-    /// first; later ones are only taken if already there.
+    /// Take every finished picture out of the codec, copy out the
+    /// newest and release them all. `first_wait` bounds the wait for
+    /// the first; later ones are only taken if already there.
     fn collect(&mut self, first_wait: Duration) -> Result<Option<DecodedFrame>, CodecError> {
         // Split borrows: the output buffers borrow the codec, while the
-        // layout cache, colour spec and pool are written here.
+        // layout cache and colour spec are written here.
         let Self {
             codec,
             layout,
             color,
-            pool,
             frames_out,
             frames_superseded,
             needs_reset,
+            output_spent,
             ..
         } = self;
         let running = codec.as_ref().expect("collect() needs a configured codec");
@@ -350,7 +369,9 @@ impl MediaCodecDecoder {
         let Some(buf) = newest else {
             return Ok(None);
         };
-        let result = convert(&buf, layout, color, pool, hint);
+        let copying = Instant::now();
+        let result = take_planes(&buf, layout, color, hint);
+        *output_spent += copying.elapsed();
         let _ = codec.release_output_buffer(buf, false);
         match result {
             Ok(frame) => {
@@ -371,13 +392,14 @@ impl MediaCodecDecoder {
     }
 }
 
-/// One output buffer → RGBA, reading (and caching) the layout from the
-/// buffer's format the first time.
-fn convert(
+/// One output buffer's picture, copied out as YUV planes (the codec
+/// wants its buffer back), reading (and caching) the layout from the
+/// buffer's format the first time. Only the bytes the layout reads are
+/// copied, into a recycled buffer (`crate::pool`).
+fn take_planes(
     buf: &OutputBuffer<'_>,
     layout: &mut Option<Yuv420Layout>,
     color: &mut ColorSpec,
-    pool: &mut Vec<Vec<u8>>,
     hint: (u32, u32),
 ) -> Result<DecodedFrame, CodecError> {
     let info = buf.info();
@@ -399,14 +421,26 @@ fn convert(
         *color = c;
     }
     let lay = layout.as_ref().expect("set above");
-
-    let mut out = pool.pop().unwrap_or_default();
-    yuv::to_rgba(data, lay, *color, &mut out).map_err(CodecError::ColorConversion)?;
+    let need = lay.required_len();
+    let planes = data.get(..need).ok_or_else(|| {
+        CodecError::Decode(format!(
+            "{}x{} picture needs {need} bytes in its layout, the codec gave {}",
+            lay.width,
+            lay.height,
+            data.len()
+        ))
+    })?;
+    let mut out = crate::pool::take(need);
+    out.extend_from_slice(planes);
     Ok(DecodedFrame {
         data: out,
         width: lay.width,
         height: lay.height,
         timestamp_ms: u64::try_from(info.presentation_time_us() / 1000).unwrap_or(0),
+        format: PictureFormat::Yuv420 {
+            layout: *lay,
+            color: *color,
+        },
     })
 }
 

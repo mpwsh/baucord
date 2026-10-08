@@ -57,8 +57,6 @@ use objc2_video_toolbox::{
 
 use crate::{annexb, yuv, CodecError, DecodedFrame, EncodedFrame, VideoDecoder};
 
-const POOL_MAX: usize = 4;
-
 /// An `OSStatus` for logs: the number, and the name for the ones a
 /// viewer meets.
 fn status_text(status: i32) -> String {
@@ -109,7 +107,7 @@ impl Drop for Session {
 /// decoded. Lives on `decode`'s stack; its address is the frame's
 /// `sourceFrameRefCon`.
 struct Target {
-    /// RGBA, from the pool.
+    /// RGBA, from the shared pool (`crate::pool`).
     rgba: Vec<u8>,
     /// The stream's announced size: the picture is cut to it (decoders
     /// may hand back padded buffers).
@@ -124,7 +122,6 @@ pub struct VideoToolboxDecoder {
     session: Option<Session>,
     /// The AVCC bytes of the current frame (allocation reused).
     avcc: Vec<u8>,
-    pool: Vec<Vec<u8>>,
     /// Rebuild the session at the next keyframe.
     needs_reset: bool,
     waiting_logged: bool,
@@ -148,7 +145,6 @@ impl VideoToolboxDecoder {
         Ok(Self {
             session: None,
             avcc: Vec::new(),
-            pool: Vec::new(),
             needs_reset: false,
             waiting_logged: false,
             frames_in: 0,
@@ -179,7 +175,7 @@ impl VideoToolboxDecoder {
             .expect("decode_sample needs a session");
         let sample = make_sample(&self.avcc, &session.format)?;
         let mut target = Target {
-            rgba: self.pool.pop().unwrap_or_default(),
+            rgba: crate::pool::take(bound.0 as usize * bound.1 as usize * 4),
             bound,
             result: None,
         };
@@ -219,6 +215,7 @@ impl VideoToolboxDecoder {
                     width,
                     height,
                     timestamp_ms,
+                    format: crate::PictureFormat::Rgba,
                 }))
             }
             Some(Err(e)) => {
@@ -234,10 +231,9 @@ impl VideoToolboxDecoder {
         }
     }
 
+    #[allow(clippy::unused_self)] // kept as a method: every exit path calls it
     fn pool_return(&mut self, buf: Vec<u8>) {
-        if self.pool.len() < POOL_MAX {
-            self.pool.push(buf);
-        }
+        crate::pool::recycle(buf);
     }
 }
 

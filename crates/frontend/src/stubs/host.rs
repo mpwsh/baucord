@@ -90,6 +90,28 @@ pub trait Hooks: Send + Sync {
     fn play_chime(&self, _wav: &[u8]) -> bool {
         false
     }
+    /// Put plain text on the system clipboard (Settings → Debug's
+    /// "Copy log", an invite code). Called on the UI thread.
+    ///
+    /// # Errors
+    /// The host's own message; by default, that there is no clipboard.
+    fn copy_text(&self, _text: &str) -> Result<(), String> {
+        Err(NO_CLIPBOARD.to_string())
+    }
+}
+
+const NO_CLIPBOARD: &str = "no clipboard on this host";
+
+/// Put plain text on the host's clipboard (`crate::clipboard`'s phone
+/// twin comes here).
+///
+/// # Errors
+/// As [`Hooks::copy_text`], or no host installed.
+pub fn copy_text(text: &str) -> Result<(), String> {
+    match HOOKS.get() {
+        Some(hooks) => hooks.copy_text(text),
+        None => Err(NO_CLIPBOARD.to_string()),
+    }
 }
 
 /// What the keep-alive notification says (Android's foreground service).

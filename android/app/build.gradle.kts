@@ -85,8 +85,10 @@ android {
         // versionName is the crates' version (spec §11, D39). The
         // release workflow passes both (-PbaucordVersionCode=<run
         // number> -PbaucordVersionName=<tag>, after checking the tag
-        // is that version); local builds take the defaults, which
-        // install over anything (same or lower code).
+        // is that version). Local builds default to 1; run.ps1 passes
+        // the code already installed on the target instead, since an
+        // APK from CI or the website has a higher one and Android
+        // refuses a lower code (INSTALL_FAILED_VERSION_DOWNGRADE).
         versionCode = (project.findProperty("baucordVersionCode") as String?)
             ?.trim()?.toIntOrNull() ?: 1
         versionName = (project.findProperty("baucordVersionName") as String?)

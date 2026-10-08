@@ -199,7 +199,14 @@ What stands between this and "production for strangers":
   speaker for the session** (`audio/src/lib.rs` ~1106, ~1144, ~959;
   `client/src/voice.rs` ~547 ignores `service()`). Pending flags for
   both sides on any failed reopen, a `DeviceLost/Restored` event, the
-  mic button shows it.
+  mic button shows it. 2026-10-08, seen in the field (a Windows log:
+  the playback device vanished, the reopen failed, the room stayed
+  silent for 35 minutes until a restart): the pending flags are done
+  (`output_pending` beside `input_pending`; every failed reopen, the
+  user's own device pick included, is retried every 2 s; a missing
+  output no longer closes and reopens a working microphone each try)
+  and host-tested (`a_playback_that_failed_is_retried`). Still open:
+  the event and the mic button.
 - [ ] **CLI-11 [P0][S] Windows lowers other apps while baucord is in
   voice** (user reports, 1.1.7). The echo canceller's Communications
   streams trigger Windows' "reduce other sounds by 80 %" (AEC-SPEC
@@ -212,6 +219,43 @@ What stands between this and "production for strangers":
   software canceller (AEC-SPEC §8) or Auto keeping speakers off the
   call path — decide then. Meanwhile users: `control mmsys.cpl,,3` →
   "Do nothing".
+- [x] **CLI-12 [P1][S] Windows: cpal kept the native backend from
+  reopening.** Done 2026-10-08 (§7). `AudioOutput::new` and
+  `AudioInput::new` asked cpal for the device and its config before
+  `start()` tried the native WASAPI stream, which needs neither. In the
+  same log, after the device change cpal's default-device activation
+  failed on every retry with "Cannot change thread mode after it is
+  set" (`RPC_E_CHANGED_MODE`) until the app restarted, so the native
+  path was never tried. Now Windows asks cpal only when the native
+  stream will not open (the ring grows then if cpal's rate needs it).
+  Windows-only code, not compiler-checked here. To verify on Windows:
+  in voice, unplug the headset (or disable the playback device in
+  `mmsys.cpl`) and plug it back — sound returns within ~2 s with
+  `Output started late` or a fresh `Native WASAPI render:` line, no
+  restart.
+- [x] **CLI-13 [P1][S] The video bitrate ladder never stepped down on
+  a collapsed uplink.** Done 2026-10-08 (§7). A 1080p60 share (8 Mbit/s)
+  ran two minutes with nearly every group abandoned and the viewer at
+  0.4 fps, and the ladder never moved: QUIC's window had shrunk to 2 KB,
+  so the uplink read ~200 kbit/s, and a step down wants a sample that
+  carried a quarter of the rung — else it is taken for an idle screen.
+  Now the screen thread counts what the encoder offered, and a lossy
+  sample also counts when the offer was a quarter of the rung, or at
+  least 250 kbit/s and twice what went out (`client/src/screen.rs`
+  `LinkSample`; host tests with the field numbers). To verify: a share
+  on a capped uplink logs `bitrate ladder: 100% → 50%` within ~4 s of
+  a `sharing` line with abandoned groups, and `25%` ten seconds later. Not
+  done: the sharer's own voice lost 45 % beside the video in the same
+  session — voice and video share the congested window.
+- [ ] **CLI-14 [P2][S] A stream's own audio output never sheds
+  latency when it resamples.** Found reading `audio/src/stream/output.rs`
+  for MOB-18: on a device that is not at 48 kHz, decoded audio waits in
+  the worker's accumulator while the ring is full and is never
+  trimmed, so a network burst or clock drift adds delay for good (the
+  48 kHz path drops the excess instead). Rare — the output asks for
+  48 kHz first — but it is an A/V drift. The `viewing` line's `audio
+  … ms queued` shows it if it happens; trim to a target like the
+  phones' mix does (`stream::mix`).
 - [ ] **CLI-10 [P2] Smaller client items** *(review)*: auto-reconnect
   gives up after ~60 s (5 tries) — phones on a train need longer;
   server addresses must be IP literals (no DNS — also an App Review
@@ -421,11 +465,13 @@ is not decided yet.
   room, `specialUse` (with its manifest explanation) in the lobby,
   `mediaPlayback` dropped, the wake lock only in a room
   (PLAY-STORE.md §5).
-- [ ] **MOB-12 [P1][M] Stream audio on phones** ignores the chosen
-  output and the echo canceller (`client/src/screen.rs` ~1580 spawns
-  its decoder on the default device; AEC-SPEC E7/E10): a speaker user
-  echoes the stream back. Route stream audio through the voice render
-  mix. (Discussed 2026-10-07 and put on hold by the user.)
+- [x] **MOB-12 [P1][M] Stream audio on phones.** Done 2026-10-08 (§7;
+  ANDROID-SPEC D56, IOS-SPEC D52): on the call path the stream plays
+  through the voice output. To verify on a phone, on speakers: the
+  stream is heard, the volume buttons change it, the log says `Stream
+  audio: playing through the voice output (call path)`; others hear no
+  stream audio from that phone's open microphone; plugging headphones
+  in moves it back to its own output (`back on its own output`).
 - [ ] **MOB-13 [P2] Smaller phone items**: the service notification
   says "Connected" during a reconnect and has no Leave/Mute actions;
   Android does not persist settings on `Stop` (iOS does); iOS build
@@ -453,6 +499,24 @@ is not decided yet.
 - [ ] **MOB-17 [P0][S] Reviewer access.** A long-lived `member` invite
   on the official server, a channel with history, written steps for
   Play's App access section; the server kept up through every review.
+- [ ] **MOB-18 [P1][M] A mid-range phone cannot keep up with a 60 fps
+  stream.** The Galaxy A07 (MediaTek, `c2.mtk.avc.decoder`) decodes
+  ~30 of 60 fps at 1080p: every frame costs ~22–32 ms, the picture
+  drifts behind the audio until the buffer jumps to a keyframe, and
+  repeats. 30 fps keeps up, barely. 2026-10-08: the stream logs said
+  where the time went — codec 7–10 ms, our YUV → RGBA conversion
+  24–30 ms on the decode thread, one core — and that the freezes were
+  the jitter buffer's 90-frame cap (1.5 s at 60 fps) emptying itself
+  inside a 2 s keyframe interval. Fixed the same day, for every phone
+  (§7): the decode thread only copies the planes out; the present
+  thread converts only the newest picture of each stream, on up to
+  four cores, straight into the UI's buffer; the cap is 3 s of frames
+  at the stream's rate, and a picture ≥ 1 s behind live jumps to a
+  buffered keyframe. Next: the A07 again at 60 fps — `viewing …`
+  should read *shown* near *decoded*, *preparing* under 16 ms and
+  *behind live* flat. If the codec alone cannot keep 60, temporal
+  layers and per-viewer dropping on the server. Real A/V sync
+  (timestamps on stream audio) is separate and later.
 
 ## 5. Milestone D — product
 
@@ -565,6 +629,61 @@ is not decided yet.
   a room, Android closes the microphone and iOS mutes it on the voice
   unit (plain streams: closed). The desktop is unchanged. The voice
   thread ticks at 250 ms while no microphone is open.
+- **2026-10-08 — MOB-12, stream audio on phones** (ANDROID-SPEC D56,
+  IOS-SPEC D52): on the call path a watched stream is mixed into the
+  voice output — call volume, call route, inside the echo canceller.
+  Prompted by an Android user who never heard streams (media beside a
+  call). The stream's own output, where it is still used, now reopens
+  after its device goes away.
+- **2026-10-08 — Settings → Debug: Copy log** (ANDROID-SPEC D58,
+  IOS-SPEC D53): the end of the log (512 KB on the desktop, 128 KB on
+  a phone) onto the clipboard, its first line naming the build, the
+  platform, the time and the file it came from — a sharer's log had
+  come from a stale copy in another folder. The phones gained a
+  clipboard on the way (Android's `ClipboardManager`, iOS's
+  pasteboard), so copying an invite code works there too.
+- **2026-10-08 — MOB-18, phones keep up with a stream**: from the first
+  `viewing` lines of a Galaxy A07 — codec 7–10 ms a frame, our colour
+  conversion 24–30 ms, and freezes. (1) *Convert only what is shown*:
+  Android's decoder hands over its YUV planes (`video::PictureFormat`)
+  and the frontend's present thread drains its queue, keeps the newest
+  frame per stream and converts that one — frames it cannot get to are
+  skipped, never converted, so the picture stays live with its sound
+  and the frame rate drops instead. (2) *Cheaper*: `yuv::to_rgba_into`
+  splits a picture into bands of rows over up to four cores (half the
+  device's) with fast paths for I420 and NV12/NV21, writing straight
+  into the `SharedPixelBuffer` the UI draws; each stream reuses a ring
+  of three such buffers and the decoders' buffers go round
+  `video::pool` — no 8 MB allocation, zero-fill and page faults per
+  frame, on the desktop too. (3) *No freezes from the cap*: the jitter
+  buffer holds 3 s of frames at the stream's rate (at least one
+  keyframe interval; it was 90 frames, 1.5 s at 60 fps) and a frame
+  ≥ 1 s behind live jumps to a newer buffered keyframe. The log line
+  reads `codec + output` and `preparing X ms each`.
+- **2026-10-08 — stream logs** (MOB-18): one summary line per stream
+  every 5 s, `viewing …` for each watched stream (in / decoded / shown
+  per second, dropped and lost frames, decoding busy %, codec vs
+  colour-conversion time, how far behind live, ms to screen, stream
+  audio queued) and `sharing …` for our own (captured, encoded,
+  keyframes, encode time, offered vs sent, abandoned groups, path
+  loss, ladder and pace) — warn only when something is wrong — plus a
+  line when a stream falls behind, catches up, freezes or resumes.
+  Gone: `Slow decode` / `Slow frames` / `Slow present` every second,
+  `Requesting keyframe` per request, `seq jumped` per audio gap,
+  `Video frame … dropped` per group, `video uplink` and `link:` every
+  2 s while sharing, `share telemetry` / `viewer telemetry`, and the
+  AMF encoder's two lines per keyframe. `video::timing` is retired.
+- **2026-10-08 — CLI-13, the video ladder**: from a share the Android
+  viewer saw at 0.4 fps — the sharer's uplink was losing ~80 % and the
+  ladder, reading the collapsed send rate as an idle screen, held
+  8 Mbit/s. It now also weighs what the encoder offered.
+- **2026-10-08 — CLI-12, and CLI-9's retries**: a Windows user's log
+  (the phone plugged into the PC for `run.ps1`; Windows' playback
+  device went away twice) showed both: a failed reopen was never
+  retried (the room silent until a restart), and the reopen asked cpal
+  first, whose "Cannot change thread mode after it is set" kept the
+  native backend from being tried. Every side that is not open is now
+  retried every 2 s, and Windows asks cpal only as the fallback.
 - **2026-10-07 — Android release CI** (ANDROID-SPEC D54): the v1.1.7
   run broke in `setup-android@v3` (the obsolete `tools` package is gone
   from Google's repository); now `setup-android@v4` and the other

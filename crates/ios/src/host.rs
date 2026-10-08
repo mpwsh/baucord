@@ -14,6 +14,7 @@
 //!   `UIDocumentInteractionController`; a type it cannot preview gets
 //!   the share sheet instead ("Open in…", Save to Files, `AirDrop`).
 //! - **Links** (`open_url`): `UIApplication openURL:`, i.e. Safari.
+//! - **Copy** (`copy_text`): the general pasteboard.
 //!
 //! Everything `UIKit` runs on the main thread (Slint's), where the hooks
 //! are called from. Photos hands its file over on a background queue;
@@ -46,8 +47,8 @@ use objc2_ui_kit::{
     UIAdaptivePresentationControllerDelegate, UIAlertAction, UIAlertActionStyle, UIAlertController,
     UIAlertControllerStyle, UIApplication, UIDocumentInteractionController,
     UIDocumentInteractionControllerDelegate, UIDocumentPickerDelegate,
-    UIDocumentPickerViewController, UIPresentationController, UIResponder, UIViewController,
-    UIWindowScene,
+    UIDocumentPickerViewController, UIPasteboard, UIPresentationController, UIResponder,
+    UIViewController, UIWindowScene,
 };
 use objc2_uniform_type_identifiers::{UTType, UTTypeItem};
 
@@ -230,6 +231,16 @@ impl Hooks for IosHost {
             return;
         };
         UIApplication::sharedApplication(mtm).setIdleTimerDisabled(on);
+    }
+
+    /// The general pasteboard, as Slint's own text fields use it.
+    fn copy_text(&self, text: &str) -> Result<(), String> {
+        MainThreadMarker::new().ok_or("not on the main thread")?;
+        let pasteboard = UIPasteboard::generalPasteboard();
+        // SAFETY: on the main thread (checked above), where UIKit wants
+        // the pasteboard used; a valid NSString.
+        unsafe { pasteboard.setString(Some(&NSString::from_str(text))) };
+        Ok(())
     }
 }
 

@@ -13,6 +13,12 @@
 //! - No jitter buffer complexity needed — system audio is continuous,
 //!   not bursty like multi-peer voice chat
 //!
+//! The exception is a phone on the voice-call path: there a second,
+//! media output beside the call has the wrong volume, the wrong route and
+//! no echo cancellation, so the stream goes into the voice output's mix
+//! instead (`stream::mix`; the decoder chooses, and keeps volume, mute
+//! and "deafen leaves it alone" the same either way).
+//!
 //! ## No receiver-side voice ducking
 //!
 //! Voice-chat echo in the stream is handled at the *source*: the
@@ -93,6 +99,14 @@ pub struct StreamAudioOutput {
     volume: Arc<AtomicU32>,
     /// Mute stream audio without stopping the pipeline.
     is_muted: Arc<AtomicBool>,
+    /// The device went away or the stream must be rebuilt
+    /// (`DeviceNotAvailable`, `StreamInvalidated`: a reroute, an unplugged
+    /// headset): the stream is dead and the owner reopens it.
+    failed: Arc<AtomicBool>,
+    /// Audio waiting to be played, ms: what the worker holds before
+    /// the ring plus the ring itself (the device's own buffer is not
+    /// counted). For the viewer's log — the audio half of A/V sync.
+    queued_ms: Arc<AtomicU32>,
 }
 
 impl StreamAudioOutput {
@@ -101,6 +115,21 @@ impl StreamAudioOutput {
     /// - `device_name`: output device (or `None` for default)
     /// - `volume`: initial playback volume (0.0–2.0)
     pub fn new(device_name: Option<&str>, volume: f32) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_controls(
+            device_name,
+            Arc::new(AtomicU32::new(volume.clamp(0.0, 2.0).to_bits())),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// As [`Self::new`], with volume (f32 bits, 0.0–2.0) and mute owned
+    /// by the caller: the stream decoder keeps them across the outputs it
+    /// opens and reopens.
+    pub fn with_controls(
+        device_name: Option<&str>,
+        volume: Arc<AtomicU32>,
+        is_muted: Arc<AtomicBool>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
 
         let device = if let Some(name) = device_name {
@@ -151,9 +180,22 @@ impl StreamAudioOutput {
             wake_rx: Some(wake_rx),
             worker_thread: None,
             should_stop: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(AtomicU32::new(volume.clamp(0.0, 2.0).to_bits())),
-            is_muted: Arc::new(AtomicBool::new(false)),
+            volume,
+            is_muted,
+            failed: Arc::new(AtomicBool::new(false)),
+            queued_ms: Arc::new(AtomicU32::new(0)),
         })
+    }
+
+    /// See the `queued_ms` field.
+    #[must_use]
+    pub fn queued_ms(&self) -> u32 {
+        self.queued_ms.load(Ordering::Relaxed)
+    }
+
+    /// Whether the device went away under the stream (see `failed`).
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 
     /// Start the playback pipeline.
@@ -179,6 +221,7 @@ impl StreamAudioOutput {
                 sample_rate,
                 self.volume.clone(),
                 self.is_muted.clone(),
+                self.queued_ms.clone(),
             );
             self.worker_thread = Some(handle);
         }
@@ -259,6 +302,7 @@ impl StreamAudioOutput {
             .ok_or("Ring consumer already taken")?;
         let wake_tx = self.wake_tx.take().ok_or("Wake sender already taken")?;
         let ch = channels as usize;
+        let failed = self.failed.clone();
 
         let stream = self.device.build_output_stream(
             config,
@@ -307,6 +351,16 @@ impl StreamAudioOutput {
                 let _ = wake_tx.try_send(());
             },
             move |err| {
+                // AAudio's "Disconnected" after a reroute, an unplugged
+                // device, a stream the backend says must be rebuilt: this
+                // one will not play again; the decoder opens a new one
+                // (`stream::decoder`).
+                if matches!(
+                    err.kind(),
+                    cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated
+                ) {
+                    failed.store(true, Ordering::Relaxed);
+                }
                 error!("Stream audio output error: {err}");
             },
             None,
@@ -326,6 +380,7 @@ impl StreamAudioOutput {
         device_sample_rate: u32,
         volume: Arc<AtomicU32>,
         is_muted: Arc<AtomicBool>,
+        queued_ms: Arc<AtomicU32>,
     ) -> thread::JoinHandle<()> {
         crate::platform::spawn_named("stream-audio-out", move || {
             // Audio-class scheduling (MMCSS "Pro Audio" on Windows).
@@ -495,6 +550,16 @@ impl StreamAudioOutput {
                         accum_l.drain(..frames);
                         accum_r.drain(..frames);
                     }
+                }
+
+                // What is waiting to play: the 48 kHz accumulator plus
+                // the ring (stereo pairs at the device rate).
+                #[allow(clippy::cast_possible_truncation)] // ms of audio
+                {
+                    let held = accum_l.len() as u64 * 1000 / u64::from(OPUS_SAMPLE_RATE);
+                    let ring = (ring_capacity - ring_producer.slots()) as u64 / 2 * 1000
+                        / u64::from(device_sample_rate.max(1));
+                    queued_ms.store((held + ring) as u32, Ordering::Relaxed);
                 }
 
                 // ── Pace at 5 ms, but wake early when the device drains

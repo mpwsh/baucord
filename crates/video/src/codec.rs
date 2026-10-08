@@ -167,6 +167,11 @@ pub struct FfmpegEncoder {
     /// Last time [`Self::encode`] reopened the session to force an IDR
     /// (rate limiting, capture-timestamp clock).
     last_idr_reopen_ms: Option<u64>,
+    /// The session shape last logged at info (source size, output
+    /// size, scale): a reopen that only buys an IDR — every keyframe on
+    /// AMF — logs at debug, so the log says what changed, not each
+    /// keyframe (the sharer's summary line counts those).
+    logged_session: Option<(u32, u32, u32, u32, u32)>,
     /// Capture timestamp of the last IDR we forced (drives cadence).
     last_keyframe_ms: Option<u64>,
     /// Last PTS handed to the encoder — used to keep PTS strictly increasing.
@@ -244,6 +249,7 @@ impl FfmpegEncoder {
                         force_next_keyframe: false,
                         last_idr_out_ms: None,
                         last_idr_reopen_ms: None,
+                        logged_session: None,
                         last_keyframe_ms: None,
                         last_pts: None,
                         session: None,
@@ -314,7 +320,21 @@ impl FfmpegEncoder {
             frame.height,
             frame.format,
         )?;
-        log::info!(
+        let shape = (
+            frame.width,
+            frame.height,
+            session.out_w,
+            session.out_h,
+            scale,
+        );
+        let level = if self.logged_session == Some(shape) {
+            log::Level::Debug
+        } else {
+            self.logged_session = Some(shape);
+            log::Level::Info
+        };
+        log::log!(
+            level,
             "encoder session: {}x{} → {}x{} ({}), {} kbit/s{}",
             frame.width,
             frame.height,
@@ -370,7 +390,7 @@ impl FfmpegEncoder {
                 None => false,
             };
             if (self.force_next_keyframe || idr_overdue) && !recently_reopened {
-                log::info!(
+                log::debug!(
                     "encoder can't force IDRs — reopening session for one \
                      (viewer_forced={}, cadence_overdue={})",
                     self.force_next_keyframe,
@@ -602,8 +622,8 @@ pub struct FfmpegDecoder {
     scratch_frame: VideoFrame,
     /// Reusable `FFmpeg` frame for RGBA conversion output.
     rgba_frame: Option<VideoFrame>,
-    /// Recycled output buffer (from `return_buffer`). Empty when none.
-    rgba_buf: Vec<u8>,
+    /// The split of the last call that produced a picture.
+    last_timing: Option<crate::DecodeTiming>,
 }
 
 /// The scaler plus the source parameters it was built for.
@@ -635,7 +655,7 @@ impl FfmpegDecoder {
             decoded_frame: VideoFrame::empty(),
             scratch_frame: VideoFrame::empty(),
             rgba_frame: None,
-            rgba_buf: Vec::new(),
+            last_timing: None,
         })
     }
 
@@ -649,6 +669,7 @@ impl FfmpegDecoder {
         if encoded.data.is_empty() {
             return Ok(None);
         }
+        let started = std::time::Instant::now();
 
         let mut pkt = Packet::copy(&encoded.data);
         pkt.set_pts(Some(encoded.timestamp_ms as i64));
@@ -676,6 +697,7 @@ impl FfmpegDecoder {
         if !got_frame {
             return Ok(None);
         }
+        let decoded = started.elapsed();
 
         let w = self.decoded_frame.width();
         let h = self.decoded_frame.height();
@@ -727,8 +749,8 @@ impl FfmpegDecoder {
             .run(&self.decoded_frame, rgba_frame)
             .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
 
-        // Stride-aware copy into the output buffer. Reuses a returned
-        // buffer's allocation when available; rows are appended with
+        // Stride-aware copy into the output buffer. Reuses a recycled
+        // buffer's allocation (`crate::pool`); rows are appended with
         // `extend_from_slice` so the buffer is never redundantly
         // zero-filled first (resize(n, 0) would memset multiple MB per
         // frame just to immediately overwrite every byte).
@@ -737,27 +759,28 @@ impl FfmpegDecoder {
         let row_bytes = w as usize * 4;
         let rgba_size = row_bytes * h as usize;
 
-        let mut data = std::mem::take(&mut self.rgba_buf);
-        data.clear();
-        data.reserve(rgba_size);
+        let mut data = crate::pool::take(rgba_size);
         for row in 0..h as usize {
             let src_start = row * stride;
             data.extend_from_slice(&src[src_start..src_start + row_bytes]);
         }
+        self.last_timing = Some(crate::DecodeTiming {
+            codec: decoded,
+            output: started.elapsed().saturating_sub(decoded),
+        });
 
         Ok(Some(DecodedFrame {
             data,
             width: w,
             height: h,
             timestamp_ms: encoded.timestamp_ms,
+            format: crate::PictureFormat::Rgba,
         }))
     }
 
-    /// Return a previously-decoded RGBA buffer so its allocation can be
-    /// reused by the next `decode()` call.
+    /// Return a previously-decoded buffer for reuse (`crate::pool`).
     pub fn return_buffer(&mut self, buf: Vec<u8>) {
-        // Deliberately not cleared here — decode() clears before writing.
-        self.rgba_buf = buf;
+        crate::pool::recycle(buf);
     }
 }
 
@@ -768,6 +791,10 @@ impl VideoDecoder for FfmpegDecoder {
 
     fn return_buffer(&mut self, buf: Vec<u8>) {
         self.return_buffer(buf);
+    }
+
+    fn last_timing(&self) -> Option<crate::DecodeTiming> {
+        self.last_timing
     }
 
     fn flush(&mut self) {

@@ -31,7 +31,7 @@ use std::{
 
 use audio::{AudioPacket, PayloadType};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
-use log::{info, warn};
+use log::{debug, info, warn};
 use protocol::{
     features, pack_system_audio, pack_video_frame, pack_voice_with_flags, parse_system_audio,
     parse_voice, split_sender, AdminCommand, AdminError, AdminOutcome, AudioSample, Auth,
@@ -465,6 +465,11 @@ pub enum NetworkMessage {
         behind_pct: f32,
         rtt_ms: f32,
         kbps_up: f32,
+        /// The counts behind `behind_pct`, and the transport's packet
+        /// loss over the same window (the sharer's summary line).
+        groups_started: u32,
+        groups_reset: u32,
+        path_loss_pct: f32,
     },
 
     // ── Screen share events ─────────────────────────────────────────
@@ -1057,8 +1062,18 @@ impl NetworkClient {
         let kbps_down =
             (stats.bytes_rx.saturating_sub(base.bytes_rx)) as f64 * 8.0 / 1000.0 / interval;
         let streaming = kbps_up >= LINK_LOG_STREAMING_KBPS;
+        // While our video flows, the sharer's summary line carries the
+        // link (`client::viewlog::Sharing`); this line is for the rest.
+        let started = stats.groups_started.saturating_sub(base.groups_started);
+        let reset = stats.groups_reset.saturating_sub(base.groups_reset);
+        let level = if started > 0 || reset > 0 {
+            log::Level::Debug
+        } else {
+            log::Level::Info
+        };
         if loss_pct >= LINK_LOG_LOSS_PCT || (streaming && loss_pct >= LINK_LOG_LOSS_PCT_STREAMING) {
-            info!(
+            log::log!(
+                level,
                 "link: path loss {loss_pct:.1}%, rtt {rtt_ms:.0} ms, cwnd {} KB, up {kbps_up:.0} kbit/s, down {kbps_down:.0} kbit/s, dgram drops {}",
                 stats.cwnd / 1024,
                 stats.datagram_send_drops - base.datagram_send_drops,
@@ -1094,12 +1109,11 @@ impl NetworkClient {
 
         // The sharer's leg, measured on the video itself: only groups
         // *we* abandoned because our uplink was behind.
-        let started = stats.groups_started.saturating_sub(base.groups_started);
-        let reset = stats.groups_reset.saturating_sub(base.groups_reset);
         if reset > 0 {
             // The evidence for tuning the group deadlines: which rule
-            // abandoned our groups, per 2 s window.
-            info!(
+            // abandoned our groups, per 2 s window (the sharer's summary
+            // line has the totals).
+            debug!(
                 "video uplink: abandoned {reset}/{started} groups (superseded {}, deadline {}, unacked {}), rtt {rtt_ms:.0} ms, path loss {loss_pct:.1}%, up {kbps_up:.0} kbit/s",
                 stats.groups_reset_superseded - base.groups_reset_superseded,
                 stats.groups_reset_deadline - base.groups_reset_deadline,
@@ -1116,6 +1130,9 @@ impl NetworkClient {
                 behind_pct,
                 rtt_ms: rtt_ms as f32,
                 kbps_up: kbps_up as f32,
+                groups_started: u32::try_from(started).unwrap_or(u32::MAX),
+                groups_reset: u32::try_from(reset).unwrap_or(u32::MAX),
+                path_loss_pct: loss_pct as f32,
             });
         }
     }
@@ -2230,7 +2247,8 @@ impl NetworkClient {
         }
         if !self.driver.video_group_open(self.server, OWN_TRACK) {
             if !self.video_no_group {
-                warn!(
+                // Counted in the sharer's summary line (abandoned groups).
+                debug!(
                     "Video frame seq={seq} dropped: the current group was abandoned (uplink behind) — \
                      waiting for the next keyframe"
                 );
@@ -2239,7 +2257,7 @@ impl NetworkClient {
             return;
         }
         if self.video_no_group {
-            info!("Video resumed at keyframe seq={seq}");
+            debug!("Video resumed at keyframe seq={seq}");
             self.video_no_group = false;
         }
 
@@ -3101,11 +3119,17 @@ fn route_message(
             behind_pct,
             rtt_ms,
             kbps_up,
+            groups_started,
+            groups_reset,
+            path_loss_pct,
         } => {
             let _ = screen_tx.try_send(ScreenControl::UplinkStats {
                 loss_pct: behind_pct,
                 rtt_ms,
                 kbps_up,
+                groups_started,
+                groups_reset,
+                path_loss_pct,
             });
         }
 

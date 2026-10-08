@@ -491,11 +491,15 @@ the transport's wording and goes to the log only.
 ### Link feedback
 
 Every 2 s `sample_link_stats` publishes `NetworkStats` (path RTT/loss/
-throughput — UI only), `UplinkVideo { behind_pct }` (screen ladder), and
-logs `video uplink: abandoned N/M groups (superseded/deadline/unacked)`
-whenever it abandoned any. If no receiver report has arrived for 6 s
+throughput — UI only) and `UplinkVideo` (groups started and abandoned,
+path loss, RTT, send rate: the screen ladder and the sharer's summary
+line), and logs `video uplink: abandoned N/M groups
+(superseded/deadline/unacked)` at debug whenever it abandoned any. If no receiver report has arrived for 6 s
 while admitted, it feeds the audio ladder a "bad link" reading so
-silence is not mistaken for a clean link.
+silence is not mistaken for a clean link. The screen ladder weighs each
+sample against what went out *and* what the encoder offered: an uplink
+that collapsed sends little because it is overloaded, not idle
+(CLI-13).
 
 Every 10 s (when negotiated) a `TelemetrySample` goes to the server:
 path numbers from `LinkStats`, plus whatever the voice and screen
@@ -605,7 +609,7 @@ until it comes back.
 
 | | capture/playback | echo cancellation | video decode | screen capture |
 |---|---|---|---|---|
-| Windows | WASAPI, event-driven on an MMCSS thread (`native/wasapi.rs`); cpal enumerates | the Communications category, verified (AEC-SPEC §4) | FFmpeg (static) | DXGI |
+| Windows | WASAPI, event-driven on an MMCSS thread (`native/wasapi.rs`); cpal enumerates, and opens only if that stream will not (CLI-12) | the Communications category, verified (AEC-SPEC §4) | FFmpeg (static) | DXGI |
 | macOS | cpal (CoreAudio) | none yet (VPIO planned, AEC-SPEC §9) | FFmpeg (static) | xcap |
 | Linux | cpal (ALSA/PipeWire) | none | FFmpeg (system) | xcap (X11; Wayland is screenshots) |
 | Android | AAudio voice-call streams (`native/aaudio.rs`, `native/android.rs`) | `AcousticEchoCanceler` on the capture session, read back (E9) | MediaCodec (`video::mediacodec`, `video::yuv`) | — |
@@ -618,11 +622,38 @@ sized from the device's callback (ANDROID-SPEC D24). Whether echo
 cancellation is on is decided from the stream that was opened, never
 assumed from the device, and Settings → Audio says what was found.
 
+`VoiceChat::service()` (the voice thread, every tick) supervises the
+devices: a stream that failed is reopened, the OS default is followed,
+and a side that is not open — it never opened, or its reopen failed
+because the device was gone — is tried again every 2 s until it opens
+(`input_pending`, `output_pending`; PRODUCTION-PLAN.md CLI-9).
+
 The phones open only what their presence needs
 (`VoiceChat::set_presence`, ANDROID-SPEC D53, IOS-SPEC D51): nothing in the lobby on
 Android and a plain output on iOS (to stay alive in the background);
 in a room both sides on the call path; muted, the microphone closed
 (or muted on iOS's voice unit). The desktop keeps both streams open.
+
+A watched stream's audio has an output of its own (stereo, its own
+volume, untouched by deafen) — except on a phone's call path, where it
+is mixed into the voice output instead (`stream::mix`, ANDROID-SPEC
+D56, IOS-SPEC D52), so it shares the call's volume and route and the
+echo canceller removes it. The decoder picks per frame; its own
+output reopens when its device goes away.
+
+A watched stream's video goes: the jitter buffer (3 s of frames at the
+stream's rate, so at least one keyframe interval; a frame ≥ 1 s behind
+live jumps to a newer buffered keyframe) → the screen thread decodes
+(FFmpeg and VideoToolbox to RGBA; MediaCodec hands over its YUV planes
+as they are, `video::PictureFormat`) → `FrameReady` → the frontend's
+present thread (`frontend::present`), which drains its queue, keeps
+the newest frame of each stream and only then converts or copies it,
+straight into one of the stream's three reused `SharedPixelBuffer`s
+(YUV over up to four cores, `yuv::to_rgba_into`) → the UI takes the
+newest prepared frame per stream and sets it as an `Image`. A device
+that cannot keep up shows fewer frames, never older ones: the picture
+stays live with its sound (MOB-18). Frame buffers go round
+`video::pool` instead of being allocated per frame.
 
 ### 7.4 Notifications on the phones
 
@@ -670,8 +701,11 @@ link you want to hurt.
 
 - `link:` and `telemetry:` lines in the server log are the primary
   diagnostic; the readme describes how to read them. The client logs
-  `link:` only at ≥5 % path loss and `video uplink:` only when it
-  abandoned groups, so a quiet client log is a healthy one.
+  `link:` only at ≥5 % path loss (at debug while our video flows: the
+  `sharing` line has it), and one summary line per stream every 5 s
+  (`viewing …`, `sharing …`, `client::viewlog`; SESSION-GUIDE.md §4
+  says how to read them) — at warn only when something is wrong, so a
+  log without warnings is a healthy one.
 - A crash on a client ends `baucord.log` with `PANIC in thread … at
   file:line` — ask for that line first.
 - The server's identity directory is the one thing that must never be

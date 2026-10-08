@@ -66,10 +66,13 @@ use crate::{
 const MUTED_WAIT: Duration = Duration::from_millis(50);
 
 pub struct AudioInput {
-    device: Device,
-    device_config: SupportedStreamConfig,
+    /// cpal's device and the config it opens at. Resolved in `new()`,
+    /// but on Windows, where the native backend finds its device by
+    /// itself and cpal — only its fallback — is asked in `start_cpal`
+    /// (see the same field in `output.rs`; PRODUCTION-PLAN.md CLI-12).
+    cpal: Option<(Device, SupportedStreamConfig)>,
     /// The user's device selection (`None` = follow the OS default), for
-    /// the native backend's own device lookup.
+    /// the native backend's own device lookup (and cpal's, late).
     #[cfg(windows)]
     device_name: Option<String>,
     /// cpal stream, when the cpal backend is in use.
@@ -117,6 +120,8 @@ pub struct AudioInput {
 }
 
 impl AudioInput {
+    // Windows opens nothing here (see the `cpal` field).
+    #[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
     pub fn new(
         device_name: Option<&str>,
         encoder_tx: Sender<PcmFrame>,
@@ -125,33 +130,17 @@ impl AudioInput {
         config: Arc<InputConfig>,
         voice: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let host = cpal::default_host();
-
-        let device = if let Some(name) = device_name {
-            host.input_devices()?
-                .find(|d| crate::device_name(d).as_deref() == Some(name))
-                .ok_or_else(|| format!("Input device '{name}' not found"))?
-        } else {
-            host.default_input_device()
-                .ok_or("No default input device available")?
-        };
-
-        let device_config = crate::device::preferred_input_config(&device)
-            .map_err(|e| format!("Failed to get input config: {e}"))?;
-
-        let sample_rate = device_config.sample_rate();
-        let channels = device_config.channels();
-
-        info!(
-            "Input device: {} @ {}Hz, {}ch, {:?}",
-            crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
-            sample_rate,
-            channels,
-            device_config.sample_format(),
-        );
-
-        let ring_size = ((sample_rate as usize) * 200) / 1000;
-        let (ring_producer, ring_consumer) = RingBuffer::new(ring_size.max(9600));
+        #[cfg(windows)]
+        let cpal: Option<(Device, SupportedStreamConfig)> = None;
+        #[cfg(not(windows))]
+        let cpal = Some(open_cpal(device_name)?);
+        // The native backend captures at 48 kHz (the engine converts);
+        // cpal at the rate it chose — `start_cpal` grows the ring on
+        // Windows if that one needs more.
+        let (ring_producer, ring_consumer) = RingBuffer::new(ring_size_for(
+            cpal.as_ref()
+                .map_or(OPUS_SAMPLE_RATE, |(_, config)| config.sample_rate()),
+        ));
         // Wake latch: the capture callback pings this after pushing samples
         // so the worker wakes on data instead of sleep-polling. (Windows
         // quantizes short sleeps to the system timer — historically up to
@@ -159,8 +148,7 @@ impl AudioInput {
         let (wake_tx, wake_rx) = bounded::<()>(1);
 
         Ok(Self {
-            device,
-            device_config,
+            cpal,
             #[cfg(windows)]
             device_name: device_name.map(String::from),
             stream: None,
@@ -306,9 +294,25 @@ impl AudioInput {
     }
 
     fn start_cpal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let sample_rate = self.device_config.sample_rate();
-        let channels = self.device_config.channels();
-        let format = self.device_config.sample_format();
+        // Windows asks cpal only now, the native backend having failed
+        // (see the `cpal` field) — and its rate can want a bigger ring
+        // than the 48 kHz one `new()` made. Nothing holds the ring yet.
+        #[cfg(windows)]
+        if self.cpal.is_none() {
+            let (device, config) = open_cpal(self.device_name.as_deref())?;
+            let size = ring_size_for(config.sample_rate());
+            let held = self.ring_producer.as_ref().map(|p| p.buffer().capacity());
+            if held.is_some_and(|held| size > held) && self.ring_consumer.is_some() {
+                let (producer, consumer) = RingBuffer::new(size);
+                self.ring_producer = Some(producer);
+                self.ring_consumer = Some(consumer);
+            }
+            self.cpal = Some((device, config));
+        }
+        let config = &self.cpal.as_ref().ok_or("no cpal device")?.1;
+        let sample_rate = config.sample_rate();
+        let channels = config.channels();
+        let format = config.sample_format();
 
         self.start_worker_thread(sample_rate)?;
 
@@ -334,12 +338,13 @@ impl AudioInput {
     where
         T: DaspSample + FromSample<f32> + ToSample<f32> + Send + 'static + cpal::SizedSample,
     {
+        let (device, device_config) = self.cpal.as_ref().ok_or("no cpal device")?;
         let stream_config = StreamConfig {
             channels,
             sample_rate,
             // Capture wants *tolerance*, not a small buffer: see
             // device::capture_buffer_size.
-            buffer_size: crate::device::capture_buffer_size(&self.device, &self.device_config),
+            buffer_size: crate::device::capture_buffer_size(device, device_config),
         };
 
         let mut ring_producer = self
@@ -360,7 +365,7 @@ impl AudioInput {
         // (stats), log at most one per second.
         let mut last_err_log: Option<std::time::Instant> = None;
 
-        let stream = self.device.build_input_stream(
+        let stream = device.build_input_stream(
             stream_config,
             move |data: &[T], _: &_| {
                 if !promoted {
@@ -503,7 +508,7 @@ impl AudioInput {
         if let Some(n) = self.native_voice.as_ref() {
             return Some(n.device_name.clone());
         }
-        crate::device_name(&self.device)
+        crate::device_name(&self.cpal.as_ref()?.0)
     }
 
     pub fn input_level_handle(&self) -> Arc<AtomicU32> {
@@ -689,6 +694,38 @@ fn worker_loop(
             }
         }
     }
+}
+
+/// The ring between the device and the worker: 200 ms at the device
+/// rate, never under 9600 samples.
+fn ring_size_for(sample_rate: u32) -> usize {
+    (sample_rate as usize * 200 / 1000).max(9600)
+}
+
+/// cpal's device for `device_name` (`None` = the default) and the
+/// config it opens at (48 kHz when it can, [`crate::device`]).
+fn open_cpal(
+    device_name: Option<&str>,
+) -> Result<(Device, SupportedStreamConfig), Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+    let device = if let Some(name) = device_name {
+        host.input_devices()?
+            .find(|d| crate::device_name(d).as_deref() == Some(name))
+            .ok_or_else(|| format!("Input device '{name}' not found"))?
+    } else {
+        host.default_input_device()
+            .ok_or("No default input device available")?
+    };
+    let config = crate::device::preferred_input_config(&device)
+        .map_err(|e| format!("Failed to get input config: {e}"))?;
+    info!(
+        "Input device: {} @ {}Hz, {}ch, {:?}",
+        crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
+        config.sample_rate(),
+        config.channels(),
+        config.sample_format(),
+    );
+    Ok((device, config))
 }
 
 impl Drop for AudioInput {

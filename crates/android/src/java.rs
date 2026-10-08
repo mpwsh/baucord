@@ -188,6 +188,26 @@ pub fn keep_screen_on(on: bool) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// `BaucordActivity.copyText(label, text)`: `text` onto the clipboard.
+/// `Ok(false)`: the system refused it.
+///
+/// # Errors
+/// Any JNI failure, as text.
+pub fn copy_text(label: &str, text: &str) -> Result<bool, String> {
+    with_activity(|env, activity| {
+        let jlabel = env.new_string(label)?;
+        let jtext = env.new_string(text)?;
+        env.call_method(
+            activity,
+            jni::jni_str!("copyText"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Z"),
+            &[(&jlabel).into(), (&jtext).into()],
+        )?
+        .z()
+    })
+    .map_err(|e| e.to_string())
+}
+
 // ── Files and links (BaucordActivity, ANDROID-SPEC.md D30) ─────────────
 
 /// `BaucordActivity.nativeFilePicked(String path, String name, String

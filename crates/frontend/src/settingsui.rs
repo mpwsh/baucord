@@ -796,6 +796,15 @@ fn wire(sf: &SettingsSurface<'_>) {
             refresh_log(app);
         });
     });
+    logic.on_copy_log(|| {
+        app::with_current(|app| {
+            let status = copy_log();
+            if let Some(sf) = surface(app) {
+                sf.state().set_debug_status(status.into());
+            }
+            refresh_log(app);
+        });
+    });
     logic.on_clear_log(|| {
         app::with_current(|app| {
             let status = clear_log();
@@ -1482,6 +1491,48 @@ fn send_log(app: &AppState) -> String {
                 app.server_name.clone()
             };
             t!("debug-sent", "server" => server, "size" => size)
+        }
+    }
+}
+
+/// How much of the log "Copy log" takes: enough for a session's
+/// stream and audio lines at info level (a 20-minute share was 143 KB),
+/// small enough to paste into a message. Less on a phone, where the
+/// whole clip crosses one binder transaction on Android (1 MB, the text
+/// as UTF-16).
+const LOG_COPY_BYTES: usize = if cfg!(feature = "desktop") {
+    512 * 1024
+} else {
+    128 * 1024
+};
+
+/// "Copy log": the end of the log onto the clipboard, under a line
+/// naming the build, the platform, when, and the file it came from — a
+/// pasted log then says which machine and which build wrote it.
+fn copy_log() -> String {
+    let Some(path) = logfile::path() else {
+        return t!("debug-no-log-file");
+    };
+    let header = format!(
+        "# baucord {} ({}/{}), copied from Settings → Debug at {}, from {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
+        path.display(),
+    );
+    match logfile::upload_bytes(path, &header, LOG_COPY_BYTES) {
+        Err(e) => t!("debug-read-failed", "error" => e.to_string()),
+        Ok(bytes) if bytes.len() <= header.len() + 1 => t!("debug-copy-empty"),
+        Ok(bytes) => {
+            let size = human_size(bytes.len() as u64);
+            match crate::clipboard::copy_text(&String::from_utf8_lossy(&bytes)) {
+                Ok(()) => {
+                    log::info!("log copied to the clipboard from Settings → Debug ({size})");
+                    t!("debug-copied", "size" => size)
+                }
+                Err(e) => t!("debug-copy-failed", "error" => e),
+            }
         }
     }
 }

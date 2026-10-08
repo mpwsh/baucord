@@ -2,6 +2,8 @@ package dev.baucord;
 
 import android.app.NativeActivity;
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
@@ -161,6 +163,30 @@ public class BaucordActivity extends NativeActivity {
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
         });
+    }
+
+    // ── The clipboard ────────────────────────────────────────────────────
+
+    /**
+     * Rust: put {@code text} on the clipboard (Settings → Debug's "Copy
+     * log", an invite code); {@code false} if the system refused it. Any
+     * thread: the manager posts nothing to the caller's looper, and a
+     * clip is one binder call — which is why Rust keeps the text well
+     * under a binder transaction's 1 MB. Android 13+ confirms the copy
+     * on screen itself.
+     */
+    public boolean copyText(String label, String text) {
+        try {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard == null) {
+                return false;
+            }
+            clipboard.setPrimaryClip(ClipData.newPlainText(label, text));
+            return true;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "copy to the clipboard failed", e);
+            return false;
+        }
     }
 
     // ── Files ────────────────────────────────────────────────────────────

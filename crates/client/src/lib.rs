@@ -16,6 +16,7 @@ pub mod config;
 mod inbound_wake;
 pub mod network;
 pub mod screen;
+mod viewlog;
 pub mod voice;
 
 /// A callback the worker threads invoke to wake the UI event loop.

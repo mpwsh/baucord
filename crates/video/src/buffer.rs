@@ -113,6 +113,18 @@ const PEAK_DECAY_MS_PER_S: f64 = 10.0;
 /// forgets it in 2 s and tracks drift for free.
 const OFFSET_BUCKETS: usize = 4;
 const OFFSET_BUCKET: Duration = Duration::from_millis(500);
+/// The backlog cap, in seconds of stream at the frame rate the buffer
+/// has learned from arrivals. Longer than the sender's keyframe interval
+/// (2 s), so a backlog that reaches it holds a keyframe to jump to: a
+/// cap fixed at 90 frames (3 s at the 30 fps the buffer is created
+/// for) was 1.5 s of a 60 fps stream, and about half the overflows
+/// found no keyframe and froze (2026-10-08, MOB-18).
+const BACKLOG_CAP_SECS: f32 = 3.0;
+/// A frame this far behind live when its turn comes: skip to the
+/// newest buffered keyframe instead of decoding a backlog the viewer
+/// would watch late — well before the cap, so a device that cannot keep
+/// up drops video and stays near its sound.
+const CATCH_UP_BEHIND: Duration = Duration::from_secs(1);
 /// An implied-offset jump larger than this means the sender's clock
 /// restarted (new share): re-anchor instead of holding frames for ages
 /// or treating them all as hopelessly late.
@@ -171,9 +183,6 @@ pub struct VideoJitterBuffer {
     next_seq: Option<u32>,
     /// Whether we've seen the first keyframe (nothing is decodable before it).
     primed: bool,
-    /// Hard cap on buffered packets (~3 s at the nominal fps). Hitting it
-    /// means the consumer stalled; recovery jumps to the freshest keyframe.
-    max_depth: usize,
     /// When the current sequence gap was first observed (reorder window start).
     gap_since: Option<Instant>,
     /// When packets started arriving while unprimed (keyframe-wait timer).
@@ -206,7 +215,6 @@ impl VideoJitterBuffer {
             pending: BTreeMap::new(),
             next_seq: None,
             primed: false,
-            max_depth: (fps as usize * 3).max(8),
             gap_since: None,
             unprimed_since: None,
             want_keyframe: false,
@@ -259,7 +267,7 @@ impl VideoJitterBuffer {
 
         self.pending.insert(packet.seq, packet);
 
-        if self.pending.len() > self.max_depth {
+        if self.pending.len() > self.max_depth() {
             self.recover_from_overflow();
         }
 
@@ -285,6 +293,15 @@ impl VideoJitterBuffer {
         if let Some(packet) = self.pending.get(&next) {
             if now < self.playout_due(packet) {
                 return None;
+            }
+            let far_behind = self
+                .behind_live(packet.timestamp_ms, now)
+                .is_some_and(|behind| behind >= CATCH_UP_BEHIND);
+            if far_behind {
+                if let Some(kf) = self.newest_keyframe_after(next) {
+                    self.jump_to(kf);
+                    return self.pull_next_at(now);
+                }
             }
             if let Some(since) = self.gap_since {
                 // It was missing when we looked earlier and has since
@@ -328,7 +345,9 @@ impl VideoJitterBuffer {
         // Window expired: the packet is lost. Recover.
         self.gap_since = None;
         self.stats.gaps_detected += 1;
-        log::info!(
+        // Counted in the viewer's summary line (`lost`); the when is
+        // only for a debug log.
+        log::debug!(
             "jitter buffer: seq {next} still missing after {} ms (window {} ms) — recovering",
             now.duration_since(since).as_millis(),
             window.as_millis()
@@ -437,6 +456,18 @@ impl VideoJitterBuffer {
         self.primed
     }
 
+    /// How far behind live a frame with this sender timestamp is at
+    /// `at`: how much later than the fastest delivery seen it is being
+    /// handled. The playout delay and network wobble are part of it
+    /// (tens of ms); a decoder slower than the stream makes it grow
+    /// without bound. `None` until the clock has a mapping.
+    #[must_use]
+    pub fn behind_live(&self, timestamp_ms: u32, at: Instant) -> Option<Duration> {
+        self.playout
+            .local_time_of(timestamp_ms)
+            .map(|live| at.saturating_duration_since(live))
+    }
+
     /// Clear all state (e.g. when the peer restarts their share).
     pub fn reset(&mut self) {
         self.pending.clear();
@@ -485,6 +516,36 @@ impl VideoJitterBuffer {
             .map_or(packet.arrival_time, |t| t + self.playout_delay())
     }
 
+    /// The backlog cap: [`BACKLOG_CAP_SECS`] at the learned frame rate.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a frame count
+    fn max_depth(&self) -> usize {
+        let fps = 1000.0 / self.jitter.expected_interval_ms.max(1.0);
+        ((fps * BACKLOG_CAP_SECS).round() as usize).max(8)
+    }
+
+    /// The newest buffered keyframe after `after` (wraparound-aware).
+    fn newest_keyframe_after(&self, after: u32) -> Option<u32> {
+        self.pending
+            .iter()
+            .filter(|(&s, p)| p.is_keyframe && is_seq_after(s, after))
+            .map(|(&s, _)| s)
+            .max_by_key(|&s| s.wrapping_sub(after))
+    }
+
+    /// Catch up: drop everything before keyframe `kf` and go on from it.
+    fn jump_to(&mut self, kf: u32) {
+        let before = self.pending.len();
+        self.pending.retain(|&s, _| s == kf || is_seq_after(s, kf));
+        let dropped = before - self.pending.len();
+        self.stats.packets_dropped_overflow += dropped as u64;
+        self.stats.keyframe_resets += 1;
+        self.stats.current_depth = self.pending.len();
+        self.next_seq = Some(kf);
+        self.gap_since = None;
+        // Counted in the viewer's log (`dropped`, `jumps`).
+        log::debug!("video over {CATCH_UP_BEHIND:?} behind live: jumped to keyframe seq {kf}, dropped {dropped}");
+    }
+
     /// The buffered keyframe closest after `after` (wraparound-aware).
     fn first_keyframe_after(&self, after: u32) -> Option<u32> {
         self.pending
@@ -499,7 +560,7 @@ impl VideoJitterBuffer {
     /// older — it's stale by definition), or clear entirely and request
     /// an IDR if no keyframe is buffered.
     fn recover_from_overflow(&mut self) {
-        log::info!(
+        log::debug!(
             "jitter buffer: overflow at {} pending (consumer slower than stream) — recovering",
             self.pending.len()
         );
@@ -518,8 +579,11 @@ impl VideoJitterBuffer {
             self.stats.keyframe_resets += 1;
             self.next_seq = Some(kf);
             self.gap_since = None;
-            log::warn!(
-                "jitter buffer overflow: jumped to keyframe seq {kf}, dropped {} packet(s)",
+            // Counted in the viewer's log (`dropped`, `jumps`).
+            log::debug!(
+                "video fell {} frames behind (the decoder is slower than the stream): \
+                 jumped to keyframe seq {kf}, dropped {} frame(s)",
+                before,
                 before - self.pending.len(),
             );
         } else {
@@ -533,7 +597,11 @@ impl VideoJitterBuffer {
             self.next_seq = None;
             self.unprimed_since = Some(Instant::now());
             self.want_keyframe = true;
-            log::warn!("jitter buffer overflow with no buffered keyframe: froze, requesting IDR");
+            // The viewer's log names the freeze and counts the frames.
+            log::debug!(
+                "video fell {} frames behind with no keyframe to jump to: froze, asking for one",
+                self.max_depth()
+            );
         }
     }
 
@@ -1038,6 +1106,67 @@ mod tests {
 
         fn ms(n: u64) -> Duration {
             Duration::from_millis(n)
+        }
+
+        #[test]
+        fn behind_live_is_the_lateness_against_the_fastest_path() {
+            // Two frames 33 ms apart that arrived on the fastest path;
+            // the second handled 400 ms after it could have been.
+            let t0 = Instant::now();
+            let mut buf = VideoJitterBuffer::new(30);
+            assert_eq!(buf.behind_live(0, t0), None);
+            buf.push(pkt_at(1, true, t0, 1_000));
+            buf.push(pkt_at(2, false, t0 + ms(33), 1_033));
+            assert_eq!(buf.behind_live(1_033, t0 + ms(33)), Some(Duration::ZERO));
+            assert_eq!(buf.behind_live(1_033, t0 + ms(433)), Some(ms(400)));
+        }
+
+        #[test]
+        fn a_frame_far_behind_live_skips_to_the_newest_keyframe() {
+            // A 30 fps stream that arrived on time, handled 1.5 s late:
+            // the backlog holds keyframes at 10 and 40.
+            let t0 = Instant::now();
+            let mut buf = VideoJitterBuffer::new(30);
+            for seq in 1..=50u32 {
+                let ts = (seq - 1) * 33;
+                let kf = seq == 1 || seq == 10 || seq == 40;
+                buf.push(pkt_at(seq, kf, t0 + ms(u64::from(ts)), ts));
+            }
+            let at = t0 + ms(1_500);
+            assert_eq!(buf.pull_next_at(at).map(|p| p.seq), Some(40));
+            assert_eq!(buf.stats.keyframe_resets, 1);
+            assert_eq!(buf.stats.packets_dropped_overflow, 39);
+        }
+
+        #[test]
+        fn a_frame_a_little_late_is_not_skipped() {
+            let t0 = Instant::now();
+            let mut buf = VideoJitterBuffer::new(30);
+            for seq in 1..=20u32 {
+                let ts = (seq - 1) * 33;
+                buf.push(pkt_at(
+                    seq,
+                    seq == 1 || seq == 10,
+                    t0 + ms(u64::from(ts)),
+                    ts,
+                ));
+            }
+            assert_eq!(buf.pull_next_at(t0 + ms(500)).map(|p| p.seq), Some(1));
+            assert_eq!(buf.stats.keyframe_resets, 0);
+        }
+
+        #[test]
+        fn the_backlog_cap_follows_the_learned_frame_rate() {
+            // Created for 30 fps, fed 60: the cap grows to 3 s of 60.
+            let t0 = Instant::now();
+            let mut buf = VideoJitterBuffer::new(30);
+            assert_eq!(buf.max_depth(), 90);
+            for seq in 1..=300u32 {
+                let ts = (seq - 1) * 1000 / 60;
+                buf.push(pkt_at(seq, seq == 1, t0 + ms(u64::from(ts)), ts));
+                let _ = buf.pull_next_at(t0 + ms(u64::from(ts)) + PLAYOUT_DELAY_MAX);
+            }
+            assert!(buf.max_depth() >= 170, "{}", buf.max_depth());
         }
 
         #[test]

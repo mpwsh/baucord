@@ -52,10 +52,16 @@ const REFILL_MARGIN_MS: usize = 10;
 const CALLBACK_SCRATCH: usize = 8192;
 
 pub struct AudioOutput {
-    device: Device,
-    device_config: SupportedStreamConfig,
+    /// cpal's device and the config it opens at. Resolved in `new()`,
+    /// but on Windows, where the native backend finds its device by
+    /// itself and cpal — only its fallback — is asked in `start_cpal`.
+    /// Asked first, a cpal failure kept the native path from ever being
+    /// tried: after a device change, cpal's default-device activation
+    /// failed on every retry ("Cannot change thread mode after it is
+    /// set") until the app restarted (PRODUCTION-PLAN.md CLI-12).
+    cpal: Option<(Device, SupportedStreamConfig)>,
     /// The user's device selection (`None` = follow the OS default), for
-    /// the native backend's own device lookup.
+    /// the native backend's own device lookup (and cpal's, late).
     #[cfg(windows)]
     device_name: Option<String>,
     /// cpal stream, when the cpal backend is in use.
@@ -68,7 +74,9 @@ pub struct AudioOutput {
     /// canceller and it opened.
     #[cfg(any(target_os = "android", target_os = "ios"))]
     native_voice: Option<crate::native::VoiceRender>,
-    /// Open on the platform's voice-call path (`aec::wants_aec`).
+    /// Open on the platform's voice-call path (`aec::wants_aec`). On a
+    /// phone this output then also plays the watched stream
+    /// (`stream::mix`).
     #[cfg_attr(
         not(any(windows, target_os = "android", target_os = "ios")),
         allow(dead_code)
@@ -108,6 +116,8 @@ pub struct AudioOutput {
 
 impl AudioOutput {
     #[allow(clippy::too_many_arguments)]
+    // Windows opens nothing here (see the `cpal` field).
+    #[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
     pub fn new(
         device_name: Option<&str>,
         packet_rx: Receiver<(AudioPacket, Instant)>,
@@ -119,42 +129,24 @@ impl AudioOutput {
         output_gain: f32,
         voice: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let host = cpal::default_host();
-
-        let device = if let Some(name) = device_name {
-            host.output_devices()?
-                .find(|d| crate::device_name(d).as_deref() == Some(name))
-                .ok_or_else(|| format!("Output device '{name}' not found"))?
-        } else {
-            host.default_output_device()
-                .ok_or("No default output device available")?
-        };
-
-        let device_config = crate::device::preferred_output_config(&device)
-            .map_err(|e| format!("Failed to get output config: {e}"))?;
-
-        let sample_rate = device_config.sample_rate();
-
-        info!(
-            "Output device: {} @ {}Hz, {}ch, {:?}",
-            crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
-            sample_rate,
-            device_config.channels(),
-            device_config.sample_format(),
+        #[cfg(windows)]
+        let cpal: Option<(Device, SupportedStreamConfig)> = None;
+        #[cfg(not(windows))]
+        let cpal = Some(open_cpal(device_name)?);
+        // The native backend runs at 48 kHz (the engine converts); cpal
+        // at the rate it chose — `start_cpal` grows the ring on Windows
+        // if that one needs more.
+        let ring_size = ring_size_for(
+            cpal.as_ref()
+                .map_or(OPUS_SAMPLE_RATE, |(_, config)| config.sample_rate()),
         );
-
-        // Ring buffer: 200ms at device rate, mono
-        let ring_size = ((sample_rate as usize) * 200) / 1000;
-
-        let ring_size = ring_size.max(9600);
         let (ring_producer, ring_consumer) = RingBuffer::new(ring_size);
         // Wake latch: playback callback pings this after draining the ring
         // so the worker refills promptly instead of waiting out its tick.
         let (wake_tx, wake_rx) = bounded::<()>(1);
 
         Ok(Self {
-            device,
-            device_config,
+            cpal,
             #[cfg(windows)]
             device_name: device_name.map(String::from),
             stream: None,
@@ -193,7 +185,7 @@ impl AudioOutput {
         if let Some(n) = self.native_voice.as_ref() {
             return Some(n.device_name.clone());
         }
-        crate::device_name(&self.device)
+        crate::device_name(&self.cpal.as_ref()?.0)
     }
 
     pub fn output_gain_handle(&self) -> Arc<AtomicU32> {
@@ -294,9 +286,28 @@ impl AudioOutput {
     }
 
     fn start_cpal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let sample_rate = self.device_config.sample_rate();
-        let channels = self.device_config.channels();
-        let format = self.device_config.sample_format();
+        // Windows asks cpal only now, the native backend having failed
+        // (see the `cpal` field) — and its rate can want a bigger ring
+        // than the 48 kHz one `new()` made. Nothing holds the ring yet.
+        #[cfg(windows)]
+        if self.cpal.is_none() {
+            let (device, config) = open_cpal(self.device_name.as_deref())?;
+            let size = ring_size_for(config.sample_rate());
+            if size > self.ring_capacity
+                && self.ring_producer.is_some()
+                && self.ring_consumer.is_some()
+            {
+                let (producer, consumer) = RingBuffer::new(size);
+                self.ring_producer = Some(producer);
+                self.ring_consumer = Some(consumer);
+                self.ring_capacity = size;
+            }
+            self.cpal = Some((device, config));
+        }
+        let config = &self.cpal.as_ref().ok_or("no cpal device")?.1;
+        let sample_rate = config.sample_rate();
+        let channels = config.channels();
+        let format = config.sample_format();
 
         self.prime_ring(sample_rate);
         // Start producer worker BEFORE the stream so it's ready when callbacks arrive
@@ -325,6 +336,14 @@ impl AudioOutput {
 
     /// Spawn the mix/decode worker filling the ring at `device_sample_rate`.
     fn spawn_worker_for(&mut self, device_sample_rate: u32) {
+        // Phones, when the call stream itself opened: a stream beside
+        // the call would be media (wrong volume, route, no echo
+        // cancellation) — ANDROID-SPEC.md D56, IOS-SPEC.md D52. The cpal
+        // fallback is media too; the stream keeps its own output then.
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let mix_streams = self.voice && self.native_voice.is_some();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let mix_streams = false;
         if let (
             Some(ring_producer),
             Some(packet_rx),
@@ -353,6 +372,7 @@ impl AudioOutput {
                 device_sample_rate,
                 output_gain: self.output_gain.clone(),
                 deafened: self.deafened.clone(),
+                mix_streams,
             });
             self.worker_thread = Some(handle);
         }
@@ -366,13 +386,14 @@ impl AudioOutput {
     where
         T: DaspSample + FromSample<f32> + ToSample<f32> + Send + 'static + cpal::SizedSample,
     {
+        let (device, device_config) = self.cpal.as_ref().ok_or("no cpal device")?;
         let config = cpal::StreamConfig {
             channels,
             sample_rate,
             // ~10 ms when the device advertises a supported range;
             // untouched (Default) when it doesn't. See platform.rs.
             buffer_size: crate::platform::request_low_latency_buffer(
-                self.device_config.buffer_size(),
+                device_config.buffer_size(),
                 sample_rate,
             ),
         };
@@ -393,7 +414,7 @@ impl AudioOutput {
         let mut promoted = false;
         let mut last_err_log: Option<Instant> = None;
 
-        let stream = self.device.build_output_stream(
+        let stream = device.build_output_stream(
             config,
             move |data: &mut [T], _: &_| {
                 if !promoted {
@@ -503,6 +524,8 @@ struct WorkerParts {
     device_sample_rate: u32,
     output_gain: Arc<AtomicU32>,
     deafened: Arc<AtomicBool>,
+    /// Add the watched streams' audio (`stream::mix`) to every hop.
+    mix_streams: bool,
 }
 
 #[allow(clippy::too_many_lines)] // one straight-line real-time loop
@@ -522,7 +545,14 @@ fn worker_loop(parts: WorkerParts) {
         device_sample_rate,
         output_gain,
         deafened,
+        mix_streams,
     } = parts;
+
+    // While held, stream decoders play into this output (`stream::mix`).
+    let _stream_mixer = mix_streams.then(|| {
+        debug!("Output worker mixes stream audio (call path)");
+        crate::stream::mix::BUS.mixer()
+    });
 
     let mut jitter_buffer =
         AdaptiveJitterBuffer::new(OPUS_SAMPLE_RATE as usize, 10, peer_settings, removed_peers);
@@ -658,6 +688,12 @@ fn worker_loop(parts: WorkerParts) {
                 for s in &mut hop_buf {
                     *s *= gain;
                 }
+            }
+            // A watched stream (phones, call path): after deafen and the
+            // voice volume, which a stream ignores (it has its own), and
+            // before the limiter, which must see the sum.
+            if mix_streams {
+                crate::stream::mix::BUS.mix_into(&mut hop_buf);
             }
             output_limiter.process_samples(&mut hop_buf);
 
@@ -795,6 +831,38 @@ impl Cushion {
             burst_48k: callback * OPUS_SAMPLE_RATE as usize / rate.max(1),
         }
     }
+}
+
+/// The ring between the worker and the device: 200 ms at the device
+/// rate, mono, never under 9600 samples.
+fn ring_size_for(sample_rate: u32) -> usize {
+    (sample_rate as usize * 200 / 1000).max(9600)
+}
+
+/// cpal's device for `device_name` (`None` = the default) and the
+/// config it opens at (48 kHz when it can, [`crate::device`]).
+fn open_cpal(
+    device_name: Option<&str>,
+) -> Result<(Device, SupportedStreamConfig), Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+    let device = if let Some(name) = device_name {
+        host.output_devices()?
+            .find(|d| crate::device_name(d).as_deref() == Some(name))
+            .ok_or_else(|| format!("Output device '{name}' not found"))?
+    } else {
+        host.default_output_device()
+            .ok_or("No default output device available")?
+    };
+    let config = crate::device::preferred_output_config(&device)
+        .map_err(|e| format!("Failed to get output config: {e}"))?;
+    info!(
+        "Output device: {} @ {}Hz, {}ch, {:?}",
+        crate::device_name(&device).unwrap_or_else(|| "Unknown".into()),
+        config.sample_rate(),
+        config.channels(),
+        config.sample_format(),
+    );
+    Ok((device, config))
 }
 
 impl Drop for AudioOutput {

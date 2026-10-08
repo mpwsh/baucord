@@ -2,8 +2,8 @@
 //! `frontend::host::Hooks`): the system picker for attachments, the
 //! avatar and the identity import; received files and saved pictures
 //! into the public Downloads; `ACTION_VIEW` for those files and for
-//! links. The Java halves are `BaucordActivity`'s, reached through
-//! `java.rs`.
+//! links; the clipboard. The Java halves are `BaucordActivity`'s,
+//! reached through `java.rs`.
 
 use std::{
     path::{Path, PathBuf},
@@ -142,6 +142,14 @@ impl Hooks for AndroidHost {
                 log::warn!("chime: {e}");
                 false
             }
+        }
+    }
+
+    fn copy_text(&self, text: &str) -> Result<(), String> {
+        if java::copy_text("baucord", text)? {
+            Ok(())
+        } else {
+            Err("the system refused the copy".to_string())
         }
     }
 

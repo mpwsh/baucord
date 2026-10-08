@@ -47,7 +47,16 @@ use video::{
     CodecError, EncodedFrame, Quality, VideoDecoder, VideoEncoder,
 };
 
-use crate::{network::NetworkControl, WakeFn};
+pub use crate::viewlog::PresentTally;
+use crate::{
+    network::NetworkControl,
+    viewlog::{ShareState, Sharing, Viewing},
+    WakeFn,
+};
+
+/// What the UI did with each watched stream's frames since its last
+/// summary line, by sharer (see [`PresentTally`]).
+pub type PresentTallies = Arc<Mutex<HashMap<u64, PresentTally>>>;
 
 // ── Channel messages ────────────────────────────────────────────────────
 
@@ -125,6 +134,11 @@ pub enum ScreenControl {
         /// Bytes on the wire, kbit/s. Video dominates while sharing,
         /// so this is effectively the encoder's output rate.
         kbps_up: f32,
+        /// Groups started and abandoned in the window, and the
+        /// transport's packet loss (the sharer's summary line).
+        groups_started: u32,
+        groups_reset: u32,
+        path_loss_pct: f32,
     },
     /// Clean shutdown.
     Shutdown,
@@ -138,12 +152,17 @@ pub enum ScreenEvent {
     SharingStopped,
     /// Error during capture or encode.
     Error(String),
-    /// A decoded frame is ready for display.
+    /// A decoded frame is ready for display. `pixels` are laid out as
+    /// `format` says: RGBA from the desktop decoders, the codec's YUV
+    /// planes on Android, converted only if the frame is the one that
+    /// gets shown. They come from `video::pool`: give them back with
+    /// `video::pool::recycle` when done.
     FrameReady {
         client_id: u64,
         width: u32,
         height: u32,
-        rgba: Vec<u8>,
+        pixels: Vec<u8>,
+        format: video::PictureFormat,
         frame_bytes: usize,
         seq: u32,
         is_keyframe: bool,
@@ -197,6 +216,9 @@ pub struct SharedScreenState {
     /// full rate) — stepped down under uplink loss, see
     /// `RATE_LADDER_PCT`.
     pub bitrate_scale_pct: Arc<AtomicU32>,
+    /// Filled by the frontend as it shows watched streams; read by the
+    /// viewer's summary line.
+    pub present: PresentTallies,
 }
 
 impl Default for SharedScreenState {
@@ -220,6 +242,7 @@ impl SharedScreenState {
             stream_viewers: Arc::new(AtomicU32::new(0)),
             fps_scale_pct: Arc::new(AtomicU32::new(100)),
             bitrate_scale_pct: Arc::new(AtomicU32::new(100)),
+            present: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -274,21 +297,37 @@ impl Drop for ScreenThreadHandle {
 
 // ── Capture + encode state ──────────────────────────────────────────────
 
-/// Emit the rolling share telemetry line every 10 s: fresh capture
+/// The sharer's summary line every 5 s (`viewlog::Sharing`), and the
+/// rolling share telemetry for the server every 10 s: fresh capture
 /// rate, skipped (unchanged) tick rate, and encoded output rate. On a
 /// healthy 60 fps share of moving content, fresh and encode both read
 /// ~60/s; fresh well below the target while encode tracks it means the
 /// *source* isn't changing that fast (30 fps video content, display
 /// refresh cap) rather than a pipeline problem.
-fn report_share_telemetry(state: &mut CaptureState, network_tx: &Sender<NetworkControl>) {
+fn report_share_telemetry(
+    state: &mut CaptureState,
+    network_tx: &Sender<NetworkControl>,
+    shared: &SharedScreenState,
+) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
+    let preset = state.quality.to_string();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a percentage
+    let share = ShareState {
+        preset: &preset,
+        bitrate_pct: state.ladder.pct(),
+        fps_pct: (PACE_SCALES[state.pace_idx] * 100.0).round() as u32,
+        viewers: shared.stream_viewers.load(Ordering::Relaxed),
+    };
+    if let Some((level, line)) = state.log.poll(Instant::now(), &share) {
+        log::log!(level, "{line}");
+    }
     let (start, fresh, skipped, encoded, single, multi) = state.telemetry;
     let elapsed = start.elapsed();
     if elapsed < TELEMETRY_INTERVAL {
         return;
     }
     let secs = elapsed.as_secs_f32();
-    info!(
+    log::debug!(
         "share telemetry: {:.1} fresh/s, {:.1} skipped/s, {:.1} encoded/s over {:.0}s (spacing: {:.1} single/s, {:.1} bursty/s)",
         fresh as f32 / secs,
         skipped as f32 / secs,
@@ -352,6 +391,13 @@ struct CaptureState {
     system_audio: Option<SystemAudioCapture>,
     /// Encoder bitrate ladder (see "Sender-side adaptation").
     ladder: BitrateLadder,
+    /// The sharer's summary line (`viewlog`).
+    log: Sharing,
+    /// Encoded bytes handed to the network since `offered_since`: what
+    /// the share asked the uplink to carry, abandoned groups included.
+    /// Read and reset with each uplink sample (`kbps_offered`).
+    offered_bytes: u64,
+    offered_since: Instant,
     /// Most recent uplink sample (groups abandoned, percent). Gates the
     /// fps pacer: keyframe requests while our own uplink is behind are
     /// not viewer distress.
@@ -444,8 +490,35 @@ const RATE_PROBE_BACKOFF_MAX: u32 = 4;
 /// Samples with `up` below this fraction of the rung's bitrate (static
 /// screen, nothing to send) count neither way: loss then isn't ours to
 /// shed, and a clean reading says nothing about whether the rung fits.
+///
+/// For a step down, what the share *offered* counts as well as what
+/// went out: an uplink that collapsed under the rung sends little
+/// because it is overloaded, not because the screen is idle. On
+/// 2026-10-08 a 1080p60 share (8 Mbit/s) sat at full rate for two
+/// minutes with nearly every group abandoned: QUIC's window had shrunk
+/// to 2 KB, `up` read ~200 kbit/s — under a quarter of the rung — and
+/// every sample was taken for an idle screen.
 const RATE_EXERCISED_STEP_DOWN: f32 = 0.25;
 const RATE_EXERCISED_STEP_UP: f32 = 0.5;
+/// Overloaded: the encoder offered at least this many times what the
+/// uplink carried, and at least `RATE_OVERLOAD_MIN_KBPS` — a lossy
+/// sample then counts against the rung whatever its size. (The floor
+/// keeps a static screen's trickle of refresh frames out of it.)
+const RATE_OVERLOAD_RATIO: f32 = 2.0;
+const RATE_OVERLOAD_MIN_KBPS: f32 = 250.0;
+
+/// One uplink sample, as the ladder reads it.
+#[derive(Clone, Copy, Debug)]
+struct LinkSample {
+    /// Video groups abandoned over groups started, percent.
+    loss_pct: f32,
+    rtt_ms: f32,
+    /// What went out on the wire, kbit/s (all traffic).
+    kbps_up: f32,
+    /// What the encoder handed to the network over about the same
+    /// window, kbit/s — abandoned groups included.
+    kbps_offered: f32,
+}
 
 /// Percent of the preset a rung actually runs at: the ladder value,
 /// lifted to `RATE_FLOOR_BPS` when the preset would put it lower.
@@ -517,18 +590,22 @@ impl BitrateLadder {
         self.idx > 0
     }
 
-    /// Apply one uplink sample (loss in percent, RTT in ms, send rate in
-    /// kbit/s) and decide whether the rung changes.
+    /// Apply one uplink sample and decide whether the rung changes.
     #[allow(clippy::cast_precision_loss)] // kbit/s comparisons, exactness irrelevant
-    fn sample(
-        &mut self,
-        now: Instant,
-        loss_pct: f32,
-        rtt_ms: f32,
-        kbps_up: f32,
-    ) -> Option<RungChange> {
+    fn sample(&mut self, now: Instant, link: LinkSample) -> Option<RungChange> {
+        let LinkSample {
+            loss_pct,
+            rtt_ms,
+            kbps_up,
+            kbps_offered,
+        } = link;
         let rung_kbps = self.quality.scaled_bitrate(self.pct()) as f32 / 1000.0;
         let exercised = |fraction: f32| kbps_up >= rung_kbps * fraction;
+        // See `RATE_EXERCISED_STEP_DOWN`.
+        let loaded = exercised(RATE_EXERCISED_STEP_DOWN)
+            || kbps_offered >= rung_kbps * RATE_EXERCISED_STEP_DOWN
+            || (kbps_offered >= RATE_OVERLOAD_MIN_KBPS
+                && kbps_offered >= kbps_up * RATE_OVERLOAD_RATIO);
         let dwelled = self
             .changed
             .is_none_or(|t| now.duration_since(t) >= RATE_DWELL);
@@ -536,7 +613,7 @@ impl BitrateLadder {
 
         if loss_pct >= RATE_LOSS_STEP_DOWN {
             self.good_samples = 0;
-            if !exercised(RATE_EXERCISED_STEP_DOWN) {
+            if !loaded {
                 // Lossy but idle: not our traffic, nothing to shed.
                 self.bad_samples = 0;
                 return None;
@@ -575,7 +652,8 @@ impl BitrateLadder {
                 String::new()
             };
             let why = format!(
-                "uplink loss {loss_pct:.0}%, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s{note}"
+                "uplink loss {loss_pct:.0}%, rtt {rtt_ms:.0} ms, up {kbps_up:.0} kbit/s, \
+                 offered {kbps_offered:.0} kbit/s{note}"
             );
             Some(self.move_to(next, now, why))
         } else if loss_pct < RATE_LOSS_RECOVERED {
@@ -617,14 +695,12 @@ impl BitrateLadder {
 fn adapt_bitrate(
     state: &mut CaptureState,
     now: Instant,
-    loss_pct: f32,
-    rtt_ms: f32,
-    kbps_up: f32,
+    link: LinkSample,
     shared: &SharedScreenState,
 ) {
-    state.uplink_loss_pct = loss_pct;
+    state.uplink_loss_pct = link.loss_pct;
     let from = state.ladder.pct();
-    if let Some(change) = state.ladder.sample(now, loss_pct, rtt_ms, kbps_up) {
+    if let Some(change) = state.ladder.sample(now, link) {
         state.encoder.set_bitrate_scale_pct(change.pct);
         shared
             .bitrate_scale_pct
@@ -764,14 +840,12 @@ struct PeerStream {
     frames_decoded_total: u64,
     frames_dropped_total: u64,
     decode_us_total: u64,
-    /// Rolling 10 s viewer telemetry: (window start, decoded frames).
-    /// Splits "viewer fps is low" into what actually *arrived and
-    /// decoded* vs what the sharer sent (compare against the sharer's
-    /// `share telemetry` line for the same wall-clock window).
-    rx_telemetry: (Instant, u32),
-    /// Once-a-second summary of decodes over budget (was one warning
-    /// per frame, which drowned the log wherever decoding is slow).
-    slow_decodes: video::timing::SlowFrames,
+    /// When the server last got this stream's viewing counters (every
+    /// 10 s, spec §9.1).
+    reported_at: Instant,
+    /// The log: a summary every 5 s and a line when something changes
+    /// (`viewlog`).
+    log: Viewing,
     /// Jitter buffer for this peer's video stream. Holds encoded packets
     /// and releases them in sequence order at a controlled rate.
     jitter_buffer: VideoJitterBuffer,
@@ -861,7 +935,13 @@ fn run_screen_loop(
         // Pull packets from each peer's jitter buffer and decode them.
         // This runs AFTER the channel drain, so all newly arrived packets
         // are in the buffer before we start decoding.
-        drain_and_decode(&mut st.peer_streams, &event_tx, &network_tx, &wake);
+        drain_and_decode(
+            &mut st.peer_streams,
+            &event_tx,
+            &network_tx,
+            &wake,
+            &shared.present,
+        );
 
         if let Some(state) = &mut st.capture
             && Instant::now() >= next_capture
@@ -915,6 +995,7 @@ fn drain_and_decode(
     event_tx: &Sender<ScreenEvent>,
     network_tx: &Sender<NetworkControl>,
     wake: &WakeFn,
+    present: &PresentTallies,
 ) {
     // Cap decode work per pass. An unbounded pass on a backlog spends
     // seconds decoding stale frames inside one loop iteration; bounded,
@@ -922,6 +1003,8 @@ fn drain_and_decode(
     // overflow jump-to-freshest-keyframe — skipping stale video instead
     // of replaying it, which is what a live viewer wants.
     const DECODE_BUDGET: Duration = Duration::from_millis(24);
+    /// The server's viewing counters (spec §9.1).
+    const VIEWING_REPORT_EVERY: Duration = Duration::from_secs(10);
     let mut report_viewing = false;
     for (&client_id, stream) in peer_streams.iter_mut() {
         let pass_start = Instant::now();
@@ -935,6 +1018,7 @@ fn drain_and_decode(
             // after that hold, not the hold itself.
             let enqueued_at = Instant::now();
             let frame_bytes = packet.data.len();
+            let sent_at = packet.timestamp_ms;
 
             if is_keyframe {
                 // Flush decoder state before every keyframe. With the
@@ -963,43 +1047,35 @@ fn drain_and_decode(
             };
 
             let t0 = Instant::now();
-            match stream.decoder.decode(&encoded) {
+            let result = stream.decoder.decode(&encoded);
+            let took = t0.elapsed();
+            stream.log.on_decode_call(took);
+            match result {
                 Ok(Some(decoded)) => {
-                    let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
                     let decoded_at = Instant::now();
-                    stream.rx_telemetry.1 += 1;
                     stream.frames_decoded_total += 1;
-                    stream.decode_us_total +=
-                        u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
-                    let rx_elapsed = stream.rx_telemetry.0.elapsed();
-                    if rx_elapsed.as_secs() >= 10 {
-                        info!(
-                            "viewer telemetry peer {client_id:#x}: {:.1} fps decoded over {:.0}s \
-                             (playout delay {:.0} ms, reorder window {:.0} ms)",
-                            stream.rx_telemetry.1 as f32 / rx_elapsed.as_secs_f32(),
-                            rx_elapsed.as_secs_f32(),
-                            stream.jitter_buffer.playout_delay_ms(),
-                            stream.jitter_buffer.adaptive_target_ms(),
-                        );
-                        stream.rx_telemetry = (decoded_at, 0);
+                    stream.decode_us_total += u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+                    if decoded_at.duration_since(stream.reported_at) >= VIEWING_REPORT_EVERY {
+                        stream.reported_at = decoded_at;
                         report_viewing = true;
                     }
-                    // 1080p keyframes cost 12–15 ms in software decode —
-                    // that's normal and the jitter buffer absorbs it.
-                    // Only flag decodes that actually threaten cadence.
-                    let slow_threshold = if is_keyframe { 33.0 } else { 15.0 };
-                    if let Some(line) = stream
-                        .slow_decodes
-                        .record(decode_ms, decode_ms > slow_threshold)
-                    {
-                        log::warn!("{line}");
+                    let behind = stream.jitter_buffer.behind_live(sent_at, decoded_at);
+                    if let Some((level, line)) = stream.log.on_picture(
+                        decoded_at,
+                        stream.decoder.last_timing(),
+                        took,
+                        behind,
+                        (decoded.width, decoded.height),
+                    ) {
+                        log::log!(level, "{line}");
                     }
                     event_tx
                         .send(ScreenEvent::FrameReady {
                             client_id,
                             width: decoded.width,
                             height: decoded.height,
-                            rgba: decoded.data,
+                            pixels: decoded.data,
+                            format: decoded.format,
                             frame_bytes,
                             seq,
                             is_keyframe,
@@ -1027,10 +1103,21 @@ fn drain_and_decode(
         // when it's been watching undecodable deltas while unprimed.
         // Rate-limited internally, so relaying every signal is safe.
         if stream.jitter_buffer.take_keyframe_request() {
-            info!("Requesting keyframe from peer {client_id}");
+            // Counted (and a freeze named) in the stream's log lines.
+            log::debug!("Requesting keyframe from peer {client_id}");
             let _ = network_tx.try_send(NetworkControl::RequestKeyframe {
                 target_id: client_id,
             });
+        }
+
+        let audio = stream.stream_audio.as_ref().map(StreamDecoder::stats);
+        let lines = stream
+            .log
+            .poll(Instant::now(), &stream.jitter_buffer, audio, || {
+                present.lock().ok()?.remove(&client_id)
+            });
+        for (level, line) in lines {
+            log::log!(level, "{line}");
         }
     }
     if report_viewing {
@@ -1131,6 +1218,9 @@ fn handle_control(
                 keyframes_logged: 0,
                 system_audio,
                 ladder: BitrateLadder::new(quality),
+                log: Sharing::new(Instant::now()),
+                offered_bytes: 0,
+                offered_since: Instant::now(),
                 uplink_loss_pct: 0.0,
                 encoder_name,
                 forced_keyframes: 0,
@@ -1228,8 +1318,8 @@ fn handle_control(
                             frames_decoded_total: 0,
                             frames_dropped_total: 0,
                             decode_us_total: 0,
-                            rx_telemetry: (Instant::now(), 0),
-                            slow_decodes: video::timing::SlowFrames::new("Slow decode"),
+                            reported_at: Instant::now(),
+                            log: Viewing::new(client_id, Instant::now()),
                         });
                     }
                     Err(e) => {
@@ -1396,10 +1486,31 @@ fn handle_control(
             loss_pct,
             rtt_ms,
             kbps_up,
+            groups_started,
+            groups_reset,
+            path_loss_pct,
         } => {
             if let Some(state) = &mut st.capture {
                 let now = Instant::now();
-                adapt_bitrate(state, now, loss_pct, rtt_ms, kbps_up, shared);
+                state
+                    .log
+                    .on_uplink(groups_started, groups_reset, path_loss_pct, rtt_ms, kbps_up);
+                let secs = now.duration_since(state.offered_since).as_secs_f32();
+                #[allow(clippy::cast_precision_loss)] // kbit/s, exactness irrelevant
+                let kbps_offered = if secs > 0.0 {
+                    state.offered_bytes as f32 * 8.0 / 1000.0 / secs
+                } else {
+                    0.0
+                };
+                state.offered_bytes = 0;
+                state.offered_since = now;
+                let link = LinkSample {
+                    loss_pct,
+                    rtt_ms,
+                    kbps_up,
+                    kbps_offered,
+                };
+                adapt_bitrate(state, now, link, shared);
                 recover_pace(state, now, shared);
             }
         }
@@ -1436,7 +1547,12 @@ fn capture_and_encode(
     if status == CaptureStatus::Fresh {
         state.telemetry.1 += 1;
     }
-    report_share_telemetry(state, network_tx);
+    match status {
+        CaptureStatus::Fresh => state.log.on_capture(true),
+        CaptureStatus::Unchanged => state.log.on_capture(false),
+        CaptureStatus::Empty => {}
+    }
+    report_share_telemetry(state, network_tx, shared);
     let repeat = match status {
         CaptureStatus::Fresh => false,
         CaptureStatus::Unchanged => {
@@ -1480,6 +1596,9 @@ fn capture_and_encode(
         }
     };
     let encode_us = t1.elapsed().as_micros() as u32;
+    if !encoded_frames.is_empty() {
+        state.log.on_encode(t1.elapsed());
+    }
     // Output-spacing accounting (see the telemetry field docs): one AU
     // per tick is healthy; 2+ means bursts that viewers will coalesce.
     match encoded_frames.len() {
@@ -1545,6 +1664,8 @@ fn capture_and_encode(
                 );
             }
         }
+        state.offered_bytes += encoded.data.len() as u64;
+        state.log.on_sent(encoded.data.len(), encoded.is_keyframe);
         let _ = network_tx.try_send(NetworkControl::SendVideoFrame {
             seq,
             is_keyframe: encoded.is_keyframe,
@@ -1663,7 +1784,18 @@ mod tests {
         fn carrying(ladder: &mut BitrateLadder, now: Instant, loss: f32) -> Option<u32> {
             #[allow(clippy::cast_precision_loss)]
             let kbps = ladder.quality.scaled_bitrate(ladder.pct()) as f32 / 1000.0;
-            ladder.sample(now, loss, 220.0, kbps).map(|c| c.pct)
+            ladder
+                .sample(now, link(loss, 220.0, kbps, kbps))
+                .map(|c| c.pct)
+        }
+
+        fn link(loss_pct: f32, rtt_ms: f32, kbps_up: f32, kbps_offered: f32) -> LinkSample {
+            LinkSample {
+                loss_pct,
+                rtt_ms,
+                kbps_up,
+                kbps_offered,
+            }
         }
 
         fn at(t0: Instant, secs: u64) -> Instant {
@@ -1701,12 +1833,52 @@ mod tests {
 
         #[test]
         fn ignores_loss_while_the_link_is_idle() {
+            // A static screen: little offered, and what went out was
+            // about that much.
             let t0 = Instant::now();
             let mut l = BitrateLadder::new(Quality::FHD60);
             let steps: Vec<_> = (0..6)
-                .filter_map(|i| l.sample(at(t0, 2 * i), 60.0, 220.0, 500.0))
+                .filter_map(|i| l.sample(at(t0, 2 * i), link(60.0, 220.0, 500.0, 400.0)))
                 .collect();
             assert!(steps.is_empty());
+        }
+
+        #[test]
+        fn a_static_screens_refresh_trickle_is_not_overload() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            let steps: Vec<_> = (0..6)
+                .filter_map(|i| l.sample(at(t0, 2 * i), link(100.0, 45.0, 40.0, 200.0)))
+                .collect();
+            assert!(steps.is_empty());
+        }
+
+        #[test]
+        fn steps_down_when_the_uplink_collapsed_under_the_rung() {
+            // 2026-10-08: 1080p60 at 8 Mbit/s, every group abandoned,
+            // QUIC's window at 2 KB so ~200 kbit/s went out — the old
+            // gate read that as an idle screen and never stepped.
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            assert!(l
+                .sample(at(t0, 0), link(100.0, 45.0, 209.0, 1500.0))
+                .is_none());
+            let first = l.sample(at(t0, 2), link(100.0, 45.0, 223.0, 1500.0));
+            assert_eq!(first.map(|c| c.pct), Some(50));
+            for s in [4, 6, 8, 10] {
+                l.sample(at(t0, s), link(100.0, 45.0, 200.0, 1500.0));
+            }
+            let second = l.sample(at(t0, 12), link(100.0, 45.0, 200.0, 1500.0));
+            assert_eq!(second.map(|c| c.pct), Some(25));
+        }
+
+        #[test]
+        fn offered_load_alone_counts_for_a_step_down() {
+            let t0 = Instant::now();
+            let mut l = BitrateLadder::new(Quality::FHD60);
+            l.sample(at(t0, 0), link(15.0, 60.0, 1800.0, 3000.0));
+            let step = l.sample(at(t0, 2), link(15.0, 60.0, 1800.0, 3000.0));
+            assert_eq!(step.map(|c| c.pct), Some(70));
         }
 
         #[test]
@@ -1767,7 +1939,7 @@ mod tests {
             carrying(&mut l, at(t0, 0), 60.0);
             carrying(&mut l, at(t0, 2), 60.0); // → 50%
             let steps: Vec<_> = (1..=40)
-                .filter_map(|i| l.sample(at(t0, 12 + 2 * i), 0.0, 60.0, 500.0))
+                .filter_map(|i| l.sample(at(t0, 12 + 2 * i), link(0.0, 60.0, 500.0, 500.0)))
                 .collect();
             assert!(steps.is_empty());
         }

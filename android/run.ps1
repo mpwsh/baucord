@@ -5,7 +5,9 @@
 
 .DESCRIPTION
   Default: debug build for the x86_64 emulator, first AVD if none is
-  running. Ctrl+C ends the log tail; the app keeps running.
+  running. Ctrl+C ends the log tail; the app keeps running. The build's
+  versionCode is the one already installed on the target (an APK from
+  CI or the website carries a higher one than a local build's 1).
 
 .EXAMPLE
   .\run.ps1                       # emulator, debug
@@ -63,27 +65,6 @@ if (-not $Abi) { $Abi = if ($Device) { "arm64-v8a" } else { "x86_64" } }
 $variant = if ($Release) { "release" } else { "debug" }
 $features = if ($Hello) { "hello" } else { "" }
 
-# -- Build --------------------------------------------------------------
-if (-not $NoBuild) {
-    $task = if ($Release) { "assembleRelease" } else { "assembleDebug" }
-    Write-Host ">> gradlew $task  (abi $Abi$(if ($features) { ", features $features" }))" -ForegroundColor Cyan
-    Push-Location $here
-    try {
-        & (Join-Path $here "gradlew.bat") $task "-PcargoTargets=$Abi" "-PcargoFeatures=$features"
-        if ($LASTEXITCODE -ne 0) { Fail "build failed" }
-    } finally { Pop-Location }
-}
-
-$apkDir = Join-Path $here "app\build\outputs\apk\$variant"
-$apk = Join-Path $apkDir "app-$variant.apk"
-if (-not (Test-Path $apk)) {
-    $unsigned = Join-Path $apkDir "app-$variant-unsigned.apk"
-    if (Test-Path $unsigned) {
-        Fail "only an unsigned release APK exists ($unsigned); adb refuses those - set the BAUCORD_* signing properties (README section 4) or build debug"
-    }
-    Fail "no APK at $apk - build first (drop -NoBuild)"
-}
-
 # -- Device -------------------------------------------------------------
 function Serials {
     # "emulator-5554\tdevice" lines -> objects; offline/unauthorized excluded.
@@ -113,6 +94,57 @@ if ($Device) {
         $emuArgs = @("-avd", "`"$Avd`"", "-netdelay", "none", "-netspeed", "full", "-allow-host-audio")
         if ($ColdBoot) { $emuArgs += "-no-snapshot-load" }
         Start-Process -FilePath $emulator -ArgumentList $emuArgs | Out-Null
+        # It boots while the build runs; waited for after it.
+    }
+}
+
+# -- Version code -------------------------------------------------------
+# Never below what the target already has: an APK from CI or the website
+# carries its workflow run number, and Android refuses a lower code
+# (INSTALL_FAILED_VERSION_DOWNGRADE). The same code installs over it,
+# and the next CI build (a higher run number) still installs over this
+# one. An emulator started just now has nothing to read: 1.
+function InstalledVersionCode($s) {
+    $codes = @(& $adb -s $s shell "dumpsys package dev.baucord 2>/dev/null" |
+        ForEach-Object { if ("$_" -match 'versionCode=(\d+)') { [int]$Matches[1] } })
+    if ($codes.Count -eq 0) { return 0 }
+    return ($codes | Measure-Object -Maximum).Maximum
+}
+$versionCode = 1
+if ($serial) {
+    $installed = InstalledVersionCode $serial
+    if ($installed -gt $versionCode) { $versionCode = $installed }
+}
+
+# -- Build --------------------------------------------------------------
+if (-not $NoBuild) {
+    $task = if ($Release) { "assembleRelease" } else { "assembleDebug" }
+    Write-Host ">> gradlew $task  (abi $Abi$(if ($features) { ", features $features" }))" -ForegroundColor Cyan
+    Push-Location $here
+    try {
+        $gradleArgs = @($task, "-PcargoTargets=$Abi", "-PcargoFeatures=$features")
+        if ($versionCode -gt 1) {
+            Write-Host ">> versionCode $versionCode (what $serial has installed)" -ForegroundColor Cyan
+            $gradleArgs += "-PbaucordVersionCode=$versionCode"
+        }
+        & (Join-Path $here "gradlew.bat") @gradleArgs
+        if ($LASTEXITCODE -ne 0) { Fail "build failed" }
+    } finally { Pop-Location }
+}
+
+$apkDir = Join-Path $here "app\build\outputs\apk\$variant"
+$apk = Join-Path $apkDir "app-$variant.apk"
+if (-not (Test-Path $apk)) {
+    $unsigned = Join-Path $apkDir "app-$variant-unsigned.apk"
+    if (Test-Path $unsigned) {
+        Fail "only an unsigned release APK exists ($unsigned); adb refuses those - set the BAUCORD_* signing properties (README section 4) or build debug"
+    }
+    Fail "no APK at $apk - build first (drop -NoBuild)"
+}
+
+# -- Wait for the emulator ----------------------------------------------
+if (-not $Device) {
+    if (-not $serial) {
         $deadline = (Get-Date).AddMinutes(3)
         while (-not $serial -and (Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 2
@@ -132,8 +164,23 @@ Write-Host ">> device $serial" -ForegroundColor Cyan
 
 # -- Install + launch ---------------------------------------------------
 Write-Host ">> adb install -r $(Split-Path $apk -Leaf)" -ForegroundColor Cyan
-& $adb -s $serial install -r $apk
-if ($LASTEXITCODE -ne 0) { Fail "install failed (a signature change needs 'adb uninstall dev.baucord' first)" }
+# adb reports the reason on stderr; read it (Continue: under Stop, a
+# native command's stderr through 2>&1 throws in Windows PowerShell).
+$ErrorActionPreference = "Continue"
+$installOut = @(& $adb -s $serial install -r $apk 2>&1 | ForEach-Object { "$_" })
+$installExit = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+$installOut | ForEach-Object { Write-Host $_ }
+if ($installExit -ne 0) {
+    $why = $installOut -join "`n"
+    if ($why -match "INSTALL_FAILED_VERSION_DOWNGRADE") {
+        Fail "$serial has a newer build of dev.baucord. Rebuild (drop -NoBuild): run.ps1 builds with the installed versionCode."
+    }
+    if ($why -match "INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures do not match") {
+        Fail "the installed app is signed with another key (a debug build over a release, or the reverse). 'adb uninstall dev.baucord' first - it deletes the app's data, its identity included (Settings > Identity > Export to keep it)."
+    }
+    Fail "install failed (see above)"
+}
 
 & $adb -s $serial shell am force-stop dev.baucord | Out-Null
 & $adb -s $serial logcat -c

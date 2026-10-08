@@ -207,6 +207,7 @@ export global SettingsLogic {
     // to the connected server, empty it.
     callback refresh-log();
     callback send-log();
+    callback copy-log();
     callback clear-log();
 
     callback save-and-close();
@@ -1053,7 +1054,8 @@ component LogView inherits Rectangle {
 }
 
 /// For reporting a problem: how much is logged, the log's last lines,
-/// and a way to get it to the server's admin (or to empty it).
+/// and a way to get it out — to the server's admin, or onto the
+/// clipboard to paste anywhere — or to empty it.
 component DebugPanel inherits VerticalLayout {
     spacing: Theme.gap-lg;
     // The panel exists only while its tab shows: read the log now; the
@@ -1075,7 +1077,9 @@ component DebugPanel inherits VerticalLayout {
     if !SettingsState.log-file-available : Hint { text: Tr.debug-no-log-file; }
     if SettingsState.log-file-available : VerticalLayout {
         spacing: Theme.gap-sm;
-        HorizontalLayout {
+        // One row on a desktop; on a phone Send gets a row of its own,
+        // so three buttons never crowd a narrow screen.
+        if !State.touch-host : HorizontalLayout {
             spacing: Theme.gap-sm;
             Btn {
                 text: Tr.debug-send-log;
@@ -1084,10 +1088,35 @@ component DebugPanel inherits VerticalLayout {
                 clicked => { SettingsLogic.send-log(); }
             }
             Btn {
+                text: Tr.debug-copy-log;
+                clicked => { SettingsLogic.copy-log(); }
+            }
+            Btn {
                 text: Tr.debug-clear-log;
                 clicked => { SettingsLogic.clear-log(); }
             }
             Rectangle { }   // keep the buttons their natural width
+        }
+        if State.touch-host : HorizontalLayout {
+            Btn {
+                text: Tr.debug-send-log;
+                accent: true;
+                enabled: SettingsState.connected;
+                clicked => { SettingsLogic.send-log(); }
+            }
+            Rectangle { }
+        }
+        if State.touch-host : HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn {
+                text: Tr.debug-copy-log;
+                clicked => { SettingsLogic.copy-log(); }
+            }
+            Btn {
+                text: Tr.debug-clear-log;
+                clicked => { SettingsLogic.clear-log(); }
+            }
+            Rectangle { }
         }
         Hint { text: Tr.debug-send-hint; }
         if SettingsState.debug-status != "" : Text {

@@ -106,37 +106,26 @@ impl AppState {
     /// under a millisecond, which is what lets the UI keep up with
     /// 60 fps streams.
     pub(super) fn present_frame(&mut self, f: crate::present::PreparedFrame) {
-        let present_at = Instant::now();
-        let net_to_decode_ms = f.decoded_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
-        let decode_to_present_ms = present_at.duration_since(f.decoded_at).as_secs_f32() * 1000.0;
-        let total_ms = present_at.duration_since(f.enqueued_at).as_secs_f32() * 1000.0;
-        // Summarised once a second (video::timing), with the split of
-        // the worst frame so the slow stage is still named.
-        if total_ms > 25.0 && total_ms >= self.slow_frame_worst.0 {
-            self.slow_frame_worst = (total_ms, net_to_decode_ms, decode_to_present_ms);
-        }
-        if let Some(line) = self.slow_frames.record(total_ms, total_ms > 25.0) {
-            let (_, net_to_decode, decode_to_present) = self.slow_frame_worst;
-            warn!(
-                "{line}; worst split net→decode {net_to_decode:.1} ms, decode→present {decode_to_present:.1} ms"
-            );
-            self.slow_frame_worst = (0.0, 0.0, 0.0);
-        }
-        if let Some(viewer) = self.viewers.get_mut(&f.client_id) {
-            let set_start = Instant::now();
-            viewer.update_frame(
-                f.buffer,
-                f.width,
-                f.height,
-                f.frame_bytes,
-                f.buffer_depth_ms,
-                f.buffer_target_ms,
-                f.buffer_jitter_ms,
-            );
-            let set_ms = set_start.elapsed().as_secs_f32() * 1000.0;
-            if let Some(line) = self.slow_presents.record(set_ms, set_ms > 5.0) {
-                warn!("{line}");
-            }
+        let Some(viewer) = self.viewers.get_mut(&f.client_id) else {
+            return;
+        };
+        viewer.update_frame(
+            f.buffer,
+            f.width,
+            f.height,
+            f.frame_bytes,
+            f.buffer_depth_ms,
+            f.buffer_target_ms,
+            f.buffer_jitter_ms,
+        );
+        // For the stream's summary line (client::viewlog): decoded →
+        // handed to the UI, this side's whole share of a frame's way.
+        let to_screen = u64::try_from(f.decoded_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if let Ok(mut tallies) = self.screen.shared.present.lock() {
+            let tally = tallies.entry(f.client_id).or_default();
+            tally.shown += 1;
+            tally.to_screen_us = tally.to_screen_us.saturating_add(to_screen);
+            tally.to_screen_max_us = tally.to_screen_max_us.max(to_screen);
         }
     }
 

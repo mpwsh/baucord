@@ -178,7 +178,10 @@ sideload for testing.
 Both also live in `gradle.properties`. Two more the release workflow
 passes: `-PbaucordVersionCode=` (the run number) and
 `-PbaucordVersionName=` (the tag); local builds default to 1 / the
-workspace version. The `std-widgets` style is **fluent on every target,
+workspace version. `run.ps1` builds with the versionCode already
+installed on the target instead: a phone that has the CI or website
+APK (run number N) refuses a lower code, and the same code installs
+over it while the next CI build still installs over this one. The `std-widgets` style is **fluent on every target,
 Android included**: `crates/ui/build.rs` names no style, and the Slint
 compiler then uses fluent (only an explicit `native` would pick material
 for Android). Fluent's scroll views do not pan on a drag, so the app

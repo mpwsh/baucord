@@ -178,12 +178,41 @@ pub fn clipboard_text() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
+thread_local! {
+    /// One clipboard per thread (in practice the UI thread's), kept for
+    /// the life of the app. On Linux the copied data is served by the
+    /// app itself and goes away with the `Clipboard` that set it, unless
+    /// a clipboard manager takes it over: a fresh one dropped right after
+    /// `set_text` could lose the copy. Elsewhere it costs nothing.
+    static CLIPBOARD: std::cell::RefCell<Option<arboard::Clipboard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_clipboard<R>(
+    f: impl FnOnce(&mut arboard::Clipboard) -> Result<R, arboard::Error>,
+) -> Result<R, String> {
+    CLIPBOARD.with_borrow_mut(|slot| {
+        if slot.is_none() {
+            *slot = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+        }
+        let cb = slot.as_mut().expect("set above");
+        f(cb).map_err(|e| e.to_string())
+    })
+}
+
+/// Put plain text on the clipboard, saying whether it worked
+/// (Settings → Debug's "Copy log" tells the user).
+///
+/// # Errors
+/// The system's clipboard refused, as text.
+pub fn copy_text(text: &str) -> Result<(), String> {
+    with_clipboard(|cb| cb.set_text(text))
+}
+
 /// Put plain text on the clipboard (the "Copy message"/"Copy link"
 /// menu actions).
 pub fn set_clipboard_text(text: &str) {
-    if let Ok(mut cb) = arboard::Clipboard::new()
-        && let Err(e) = cb.set_text(text)
-    {
+    if let Err(e) = copy_text(text) {
         log::warn!("Clipboard write failed: {e}");
     }
 }
@@ -206,9 +235,7 @@ pub fn set_clipboard_image(bytes: &[u8]) {
         height,
         bytes: std::borrow::Cow::Owned(decoded.into_raw()),
     };
-    if let Ok(mut cb) = arboard::Clipboard::new()
-        && let Err(e) = cb.set_image(data)
-    {
+    if let Err(e) = with_clipboard(|cb| cb.set_image(data)) {
         log::warn!("Clipboard image write failed: {e}");
     }
 }

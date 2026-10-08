@@ -243,11 +243,12 @@ export global Tr {
     in property <string> text-size: "Text size";
     in property <string> text-size-hint: "Applies everywhere, right away.";
     in property <string> tab-debug: "Debug";
-    in property <string> debug-lead: "What the app has been logging, and a way to get it to the server's admin when something goes wrong.";
+    in property <string> debug-lead: "What the app has been logging, and ways to share it when something goes wrong: copy it, or send it to the server's admin.";
     in property <string> debug-log-header: "Log";
     in property <string> debug-send-log: "Send log to server";
+    in property <string> debug-copy-log: "Copy log";
     in property <string> debug-clear-log: "Clear log";
-    in property <string> debug-send-hint: "Sends the end of the log, up to 2 MB, to the server you're connected to; its admin finds it in the server's logs folder. Once every 10 minutes.";
+    in property <string> debug-send-hint: "Copy puts the end of the log on the clipboard, to paste anywhere. Send gives up to 2 MB of it to the server you're connected to, once every 10 minutes; its admin finds it in the server's logs folder.";
     in property <string> debug-tail-label: "Last 100 lines";
     in property <string> debug-tail-empty: "The log is empty.";
     in property <string> debug-no-log-file: "This build writes its log to the terminal, not to a file.";
