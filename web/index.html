@@ -929,32 +929,31 @@
             <div>
               <h3 x-i18n="step-1-t">Run the server</h3>
               <p x-i18n.html="step-1-d">
-                Unzip and start <code>dedicated-server</code>. It writes a
-                config file on first start; set a room password there and open
-                UDP port 5000.
+                Unzip and start <code>dedicated-server</code>. It writes its
+                config on first start. Open UDP port 51000 to it (on your
+                router too, if it is at home).
               </p>
             </div>
             <div>
-              <h3 x-i18n="step-2-t">Share the invite</h3>
-              <p x-i18n="step-2-d">
-                The server prints an invite at startup: its address plus its
-                identity. Send that to your friends however you like.
+              <h3 x-i18n="step-2-t">Invite people</h3>
+              <p x-i18n.html="step-2-d">
+                The first start prints a one-time admin code: connect with it.
+                Then type <code>/invite</code> in the chat for a code to send
+                your friends with the server's address.
               </p>
             </div>
             <div>
               <h3 x-i18n="step-3-t">Everyone connects</h3>
               <p x-i18n="step-3-d">
-                They paste the invite into baucord once, pick a nickname and
-                connect. The server is remembered from then on.
+                They add the address and their code in baucord once, pick a
+                nickname and connect. From then on their device is their
+                login.
               </p>
             </div>
           </div>
           <p class="host-note" x-i18n.html="host-note">
-            Prefer containers? The repository includes a Dockerfile, a compose
-            file and a setup script for a Linux host. Details are in the
-            <a href="https://github.com/mpwsh/baucord#deploying-a-server"
-              >deployment guide</a
-            >.
+            Docker on a Linux host, configuration, backups and updates: it is
+            all in the <a href="deploy.html">hosting guide</a>.
           </p>
         </div>
       </section>
@@ -1083,6 +1082,7 @@
           x-i18n="foot-issues"
           >Report a problem</a
         >
+        <a href="privacy.html" x-i18n="foot-privacy">Privacy</a>
         <span class="lang">
           <label for="lang-select-footer" x-i18n="lang-label">Language</label>
           <select

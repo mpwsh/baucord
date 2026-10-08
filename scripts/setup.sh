@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # scripts/setup.sh — bootstrap (or re-apply) a baucord relay host.
 #
-# Run from the deploy repo root, as root:
+# Run as root from the folder that holds docker-compose.yaml,
+# config/baucord.yaml and scripts/ (the files from
+# https://baucord.com/deploy/, as the guide lays them out):
 #     sudo scripts/setup.sh
+#
+# config/baucord.yaml is this host's server config, started from
+# https://baucord.com/deploy/baucord.yaml. The guide:
+# https://baucord.com/deploy.html
 #
 # Idempotent — re-run after pulling config changes. It:
 #   1. checks Docker + the compose plugin are present (installs from Ubuntu repos if not)
 #   2. creates ./data/baucord for the server identity key (container runs as uid 10000)
 #   3. tunes the host for UDP fan-out (sysctls, conntrack, NIC ring buffers, RPS)
-#   4. starts / updates the compose stack (one service: baucord)
-#   5. prints the invite string (address + identity fingerprint) from the server log
+#   4. pulls the image and starts / updates the compose stack (one
+#      service: baucord)
+#   5. prints the server's address and identity from its log, and on a
+#      new server the one-time admin invite code
 #   6. installs + enables the network monitor as a systemd service
 #      (baucord-monitor — CSV at /var/log/baucord-net.log, logrotate managed)
 #
@@ -19,7 +27,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-MEDIA_PORT="5000"           # UDP port baucord listens on (server.port in config/baucord.yaml)
+MEDIA_PORT="${MEDIA_PORT:-}" # UDP port baucord listens on; empty = server.port from config/baucord.yaml
 MEDIA_VIA_DOCKER_NAT="true" # true  = baucord uses `ports:` (iptables DNAT -> conntrack required)
 # false = baucord runs network_mode: host (media port can skip conntrack)
 BAUCORD_UID="10000"       # uid:gid the mpwsh/baucord image runs as (user "runner")
@@ -31,10 +39,33 @@ IFACE="${IFACE:-$(ip -o route show default | awk '{print $5; exit}')}"
   echo "run as root: sudo scripts/setup.sh" >&2
   exit 1
 }
-[[ -f docker-compose.yml ]] || {
-  echo "docker-compose.yml not found; run from the deploy repo root" >&2
+COMPOSE_YAML=""
+for f in docker-compose.yaml docker-compose.yml compose.yaml compose.yml; do
+  [[ -f "$f" ]] && { COMPOSE_YAML="$f"; break; }
+done
+[[ -n "$COMPOSE_YAML" ]] || {
+  echo "no docker-compose.yaml here; run from the folder that holds it (see https://baucord.com/deploy.html)" >&2
   exit 1
 }
+CONFIG="config/baucord.yaml"
+if [[ ! -f "$CONFIG" ]]; then
+  if [[ -f config/baucord.example.yaml ]]; then
+    cp config/baucord.example.yaml "$CONFIG"
+    echo "created $CONFIG from config/baucord.example.yaml: set server.public_address in it, then re-run" >&2
+  else
+    echo "no $CONFIG; get the example and edit it:" >&2
+    echo "  curl -fsSL https://baucord.com/deploy/baucord.yaml -o $CONFIG" >&2
+  fi
+  exit 1
+fi
+if grep -q '^ *public_address: *"203\.0\.113\.5' "$CONFIG"; then
+  echo "warning: server.public_address in $CONFIG is still the example's; invites will print it" >&2
+fi
+# server.port: the first `port:` line inside the top-level `server:` block.
+if [[ -z "$MEDIA_PORT" ]]; then
+  MEDIA_PORT="$(awk '/^server:/ { s = 1; next } /^[^ #]/ { s = 0 } s && /^ +port:/ { print $2; exit }' "$CONFIG")"
+  MEDIA_PORT="${MEDIA_PORT:-51000}"
+fi
 [[ -n "$IFACE" ]] || {
   echo "could not detect default interface; set IFACE=" >&2
   exit 1
@@ -206,23 +237,32 @@ sysctl net.core.rmem_max net.core.wmem_max net.core.netdev_max_backlog \
   net.netfilter.nf_conntrack_max 2>/dev/null | sed 's/^/  /'
 
 # ── 4. Stack ──────────────────────────────────────────────────────────────────
-log "Starting / updating the compose stack"
+# Pull first, so a re-run also updates the server to the latest release
+# (a compose file that builds from source instead skips the pull).
+log "Pulling the image and starting / updating the compose stack"
+docker compose pull
 docker compose up -d --remove-orphans
 
-# ── 5. Invite string ──────────────────────────────────────────────────────────
-# The server logs its identity fingerprint at startup; the invite is
-# `<public address>#<fingerprint>`. Clients that paste it verify the
-# server before saying hello; clients without it pin on first use.
-log "Invite string"
+# ── 5. Address, identity and the first admin invite ──────────────────────────
+# At startup the server logs "Address for clients: <address> — identity
+# SHA256:…": what people type, and the key their app pins. While nobody
+# holds the admin role it also logs a one-time admin invite code (1 use,
+# 1 hour): use it from your own app, then make invites in the app.
+log "Address and identity"
+address=""
 for _ in $(seq 1 30); do
-  invite="$(docker compose logs --no-color baucord 2>/dev/null | grep -m1 -oP 'Invite: \K\S+' || true)"
-  [[ -n "$invite" ]] && break
+  address="$(docker compose logs --no-color baucord 2>/dev/null | grep -m1 'Address for clients' || true)"
+  [[ -n "$address" ]] && break
   sleep 1
 done
-if [[ -n "$invite" ]]; then
-  echo "  $invite"
+if [[ -n "$address" ]]; then
+  echo "  ${address#*Address for clients: }"
+  bootstrap="$(docker compose logs --no-color baucord 2>/dev/null | grep 'Bootstrap invite' | tail -1 || true)"
+  if [[ -n "$bootstrap" ]]; then
+    echo "  first admin: ${bootstrap#*Bootstrap invite }"
+  fi
 else
-  echo "  not in the log yet; run: docker compose logs baucord | grep Invite"
+  echo "  not in the log yet; run: docker compose logs baucord | grep -E 'Address for clients|Bootstrap invite'"
 fi
 
 # ── 6. Network monitor service ────────────────────────────────────────────────
@@ -288,5 +328,5 @@ if ss -uln | grep -q ":$MEDIA_PORT "; then
 else
   echo "  WARNING: nothing listening on udp/$MEDIA_PORT — check: docker compose logs baucord"
 fi
-echo "  make sure the cloud firewall allows udp/$MEDIA_PORT, tcp/80 and tcp/443"
+echo "  make sure the firewall allows udp/$MEDIA_PORT (nothing else is needed: no TCP, no TLS certificate)"
 echo "  network monitor: systemctl status baucord-monitor   (log: tail -f /var/log/baucord-net.log)"

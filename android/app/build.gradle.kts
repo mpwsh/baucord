@@ -106,7 +106,10 @@ android {
     //   BAUCORD_KEY_ALIAS=baucord
     //   BAUCORD_KEY_PASSWORD=…
     // Without them the release APK is built unsigned (adb refuses it;
-    // debug builds use the SDK's debug key automatically).
+    // debug builds use the SDK's debug key automatically). CI never sets
+    // them: android-release.yml builds unsigned and signs afterwards,
+    // the APK with this key and the Play bundle with the upload key
+    // (D62).
     val keystorePath = providers.gradleProperty("BAUCORD_KEYSTORE").orNull
     signingConfigs {
         if (keystorePath != null) {
@@ -132,6 +135,15 @@ android {
             isMinifyEnabled = false
             isShrinkResources = false
             signingConfig = signingConfigs.findByName("release")
+            // The library's symbol table (function names), taken before
+            // AGP strips it, goes into the app bundle's metadata: Play
+            // then shows crash and ANR stacks with Rust function names
+            // (D62). Not FULL: the release profile has no DWARF to give.
+            // An APK build leaves it beside the APK instead
+            // (build/outputs/native-debug-symbols/), never inside.
+            ndk {
+                debugSymbolLevel = "SYMBOL_TABLE"
+            }
         }
     }
 

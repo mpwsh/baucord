@@ -647,6 +647,33 @@ mod tests {
         assert_eq!(back.limits.chat.burst, 9);
     }
 
+    /// The template a new Docker host starts from (the website's
+    /// deployment guide): it must load, pass the checks the server
+    /// runs at startup, and say what its comments say. Serde ignores
+    /// unknown keys, so a misspelt one would otherwise go unnoticed.
+    #[test]
+    fn the_example_config_loads_as_documented() {
+        let yaml = include_str!("../../../config/baucord.example.yaml");
+        let config: Config = serde_yaml::from_str(yaml).expect("parse");
+        config.validate_policy().expect("policy");
+        config.validate_channels().expect("channels");
+        assert_eq!(config.server.port, 51000);
+        assert_eq!(config.public_endpoint(), "203.0.113.5:51000");
+        assert_eq!(config.logging.file, "");
+        assert_eq!(config.logging.link_stats_interval_secs, 0);
+        assert_eq!(config.identity.dir, "/app/data");
+        assert!(config.persistence.enabled);
+        assert_eq!(config.persistence.history.retain_days, 90);
+        assert_eq!(config.persistence.files.retain_days, 30);
+        assert_eq!(config.persistence.telemetry.retain_days, 30);
+        let names: Vec<&str> = config.channels.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["General", "Gaming"]);
+        assert!(
+            config.authentication.password.is_none(),
+            "no 1.0 room password"
+        );
+    }
+
     #[test]
     fn a_pre_1_1_config_loads_with_the_new_defaults() {
         let yaml = "server:\n  name: old\nchannels:\n  - name: Lobby\n    default: true\n";

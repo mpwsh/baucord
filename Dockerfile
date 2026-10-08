@@ -44,7 +44,7 @@ FROM gcr.io/distroless/cc-debian12
 COPY --from=builder --chown=10000:10000 /app/target/deploy/server /app/server
 WORKDIR /app
 USER 10000
-EXPOSE 5000/udp
+EXPOSE 51000/udp
 # Docker sends SIGTERM to PID 1; the server closes every session with a
 # reason so clients reconnect in ~2 s instead of waiting out the idle
 # timeout. `stop_grace_period` in compose need not exceed a few seconds.

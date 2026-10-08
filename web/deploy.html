@@ -1,0 +1,790 @@
+<!doctype html>
+<!--
+  The deployment guide (readme.md "Deploying a server" and "Server",
+  for people who will never open the repository). When the server's
+  ports, files, commands or log lines change, change this page with
+  the readme. web.yaml publishes docker-compose.yaml, the two scripts
+  and config/baucord.example.yaml (as baucord.yaml) under /deploy/,
+  and puts the compose file in place of __COMPOSE__ below; a server
+  test keeps the example config loading as documented. No web fonts,
+  like privacy.html.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/x-icon" href="/img/favicon.ico" />
+    <title>baucord — hosting a server</title>
+    <meta
+      name="description"
+      content="Run your own baucord server: from the download on any computer, or with Docker on a Linux host. Configuration, invites, backups, updates and monitoring."
+    />
+    <meta name="theme-color" content="#1a1d21" />
+    <style>
+      /* The site's "workbench" palette (index.html). */
+      :root {
+        --paper: #1a1d21;
+        --mist: #222529;
+        --well: #15171a;
+        --ink: #d1d2d3;
+        --slate: #abadb0;
+        --line: rgba(209, 210, 211, 0.12);
+        --cobalt-text: #1d9bd1;
+        --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        --mono: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+      }
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.6;
+        -webkit-text-size-adjust: 100%;
+      }
+      .wrap {
+        max-width: 780px;
+        margin: 0 auto;
+        padding: 0 16px;
+      }
+      header {
+        border-bottom: 1px solid var(--line);
+        padding: 18px 0;
+      }
+      header .wrap {
+        display: flex;
+        gap: 20px;
+        align-items: baseline;
+        flex-wrap: wrap;
+      }
+      header a {
+        color: var(--ink);
+        text-decoration: none;
+      }
+      header .home {
+        font-weight: 700;
+      }
+      header .crumb {
+        color: var(--slate);
+      }
+      main {
+        padding: 40px 0 64px;
+      }
+      h1 {
+        font-size: 2rem;
+        line-height: 1.2;
+        margin-bottom: 12px;
+      }
+      .lede {
+        color: var(--slate);
+        font-size: 1.1rem;
+        margin-bottom: 24px;
+      }
+      h2 {
+        font-size: 1.35rem;
+        margin: 48px 0 12px;
+        padding-top: 8px;
+        scroll-margin-top: 16px;
+      }
+      h3 {
+        font-size: 1.05rem;
+        margin: 26px 0 8px;
+        scroll-margin-top: 16px;
+      }
+      p,
+      ul,
+      ol {
+        margin-bottom: 12px;
+      }
+      ul,
+      ol {
+        padding-left: 24px;
+      }
+      li {
+        margin-bottom: 6px;
+      }
+      li > ul,
+      li > pre {
+        margin-top: 8px;
+      }
+      a {
+        color: var(--cobalt-text);
+      }
+      code {
+        font-family: var(--mono);
+        font-size: 0.88em;
+        background: var(--mist);
+        padding: 1px 5px;
+        border-radius: 4px;
+        overflow-wrap: anywhere;
+      }
+      pre {
+        background: var(--well);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin: 8px 0 16px;
+        overflow-x: auto;
+        line-height: 1.5;
+      }
+      pre code {
+        background: none;
+        padding: 0;
+        font-size: 0.85rem;
+        overflow-wrap: normal;
+        white-space: pre;
+      }
+      .toc {
+        background: var(--mist);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 16px 20px 8px;
+        margin-bottom: 8px;
+      }
+      .toc strong {
+        display: block;
+        margin-bottom: 6px;
+      }
+      .toc ol {
+        columns: 2;
+        column-gap: 32px;
+      }
+      @media (max-width: 560px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+      .note {
+        border-left: 3px solid var(--cobalt-text);
+        padding: 4px 0 4px 14px;
+        margin: 12px 0 16px;
+        color: var(--slate);
+      }
+      .table-scroll {
+        overflow-x: auto;
+        margin: 8px 0 16px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        min-width: 520px;
+        font-size: 0.95rem;
+      }
+      th,
+      td {
+        text-align: left;
+        vertical-align: top;
+        padding: 9px 10px;
+        border-bottom: 1px solid var(--line);
+      }
+      th {
+        color: var(--slate);
+        font-weight: 600;
+      }
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 20px 0 32px;
+        color: var(--slate);
+        font-size: 0.95rem;
+      }
+      footer a {
+        margin-right: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="wrap">
+        <a class="home" href="/">baucord</a>
+        <span class="crumb">Hosting a server</span>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <h1>Hosting a server</h1>
+      <p class="lede">
+        One person runs the server; everyone else connects to it. It is a
+        single program on one UDP port: no website, no domain name and no
+        certificate to set up.
+      </p>
+
+      <nav class="toc" aria-label="On this page">
+        <strong>On this page</strong>
+        <ol>
+          <li><a href="#need">What you need</a></li>
+          <li><a href="#quick">From the download</a></li>
+          <li><a href="#invites">Becoming admin, inviting people</a></li>
+          <li><a href="#docker">On a Linux host with Docker</a></li>
+          <li><a href="#config">Configuration</a></li>
+          <li><a href="#cli">Managing from the command line</a></li>
+          <li><a href="#backups">The identity key and backups</a></li>
+          <li><a href="#updating">Updating</a></li>
+          <li><a href="#logs">Reading the server log</a></li>
+          <li><a href="#monitoring">Monitoring</a></li>
+          <li><a href="#data">Your server, your data</a></li>
+        </ol>
+      </nav>
+
+      <h2 id="need">What you need</h2>
+      <ul>
+        <li>
+          <strong>A computer your friends can reach</strong>, left on while
+          you talk: a spare PC at home, a small VPS, a homelab box.
+        </li>
+        <li>
+          <strong>UDP port 51000 open to it.</strong> Everything (voice,
+          video, chat, logging in) uses that one port. At home, forward
+          it on your router to that computer; on a VPS, allow it in the
+          provider's firewall.
+        </li>
+        <li>
+          <strong>Its public IP address.</strong> People type the address
+          and port (<code>203.0.113.5:51000</code>); host names are not
+          supported yet.
+        </li>
+      </ul>
+      <p>
+        Every connection is encrypted (QUIC over UDP) and checked against
+        the server's own key, which it makes on first start, so there is
+        no certificate to buy or renew.
+      </p>
+
+      <h2 id="quick">From the download</h2>
+      <p>
+        Every desktop download (Windows, macOS, Linux) contains the app
+        and the server, <code>dedicated-server</code>.
+      </p>
+      <ol>
+        <li>
+          <a href="/#download">Download</a> the zip for the computer that
+          will host, and unzip it into a folder you will keep. The server
+          writes its files into the folder it is started from, so start it
+          from there: on Windows, double-click it; on macOS and Linux,
+          <code>cd</code> into the folder and run
+          <code>./dedicated-server</code>.
+        </li>
+        <li>
+          Start it (on Windows it is <code>dedicated-server.exe</code>;
+          allow it through the firewall when Windows asks). On first start
+          it writes
+          <code>server.yaml</code> with the defaults and creates
+          <code>data/baucord/</code>, where its key and database live.
+        </li>
+        <li>
+          Open UDP port 51000 (see above). To use another port, change
+          <code>port</code> in <code>server.yaml</code> and restart.
+        </li>
+        <li>
+          Look at what it printed. Two lines matter:
+          <pre><code>Address for clients: &lt;public-ip&gt;:51000 — identity SHA256:…
+No admin yet. Bootstrap invite (admin, 1 use, 1 h): code K7FQ-2MX9-ABCD for …</code></pre>
+          Set <code>public_address</code> in <code>server.yaml</code> to
+          your public IP and port, and the first line will show it. The
+          second is your way in; the next section says what to do with it.
+        </li>
+        <li>
+          Keep it running: a terminal window left open is enough, or your
+          system's service manager. Stopping it (Ctrl+C) tells everyone
+          connected that the server is restarting.
+        </li>
+      </ol>
+
+      <h2 id="invites">Becoming admin, inviting people</h2>
+      <p>
+        A device's key is its account: nobody has a password. A device
+        the server does not know yet needs an <strong>invite code</strong>
+        once; after that it just connects.
+      </p>
+      <ol>
+        <li>
+          <strong>You first.</strong> While the server has no admin, it
+          prints a one-time admin code at every start (good for one use,
+          for an hour). In your app: Settings → Servers, add the server's
+          address, paste the code into <em>Invite code</em>, and connect.
+          You are now its admin.
+        </li>
+        <li>
+          <strong>Everyone else.</strong> Type <code>/invite</code> in the
+          chat box, or open the admin panel. The code is copied for you;
+          send it together with the address and port. Options:
+          <code>/invite [guest|member|organizer] [24h|7d] [uses]</code>.
+        </li>
+        <li>
+          <strong>Optional:</strong> the <em>identity</em> in the
+          <code>Address for clients</code> line can go into Settings →
+          Servers too, so the app checks it is talking to your server
+          before it sends anything. Without it, the app learns the
+          identity on the first connection.
+        </li>
+      </ol>
+      <p>
+        Roles go from guest to member, organizer and admin, and you can
+        make your own. A code says which role it gives; change people's
+        roles later from the admin panel.
+      </p>
+
+      <h2 id="docker">On a Linux host with Docker</h2>
+      <p>
+        Docker Compose on a Linux VPS, with the published image
+        <code>mpwsh/baucord:latest</code>, updated with every release. It
+        is distroless and runs as uid <code>10000</code>. Everything you
+        need is on this page: four small files and the image, which
+        Docker downloads by itself.
+      </p>
+      <p class="note">
+        The image, like the Linux download, is for x86-64 machines. ARM
+        hosts (a Raspberry Pi, an ARM VPS) are not supported yet.
+      </p>
+      <pre><code>client ──udp/51000 (QUIC)─▶ baucord   (published directly)</code></pre>
+      <p>
+        One service. Media leaves straight from the container, not
+        through a userspace proxy, which would add copies per packet and
+        hide the real client addresses from the server.
+      </p>
+
+      <h3>The files</h3>
+      <p>
+        Four files, all downloadable from here. Read a script before you
+        run it as root.
+      </p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Goes to</th>
+              <th>What it is</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><a href="deploy/docker-compose.yaml">docker-compose.yaml</a></td>
+              <td><code>docker-compose.yaml</code></td>
+              <td>The one service: image, port, volumes, log rotation</td>
+            </tr>
+            <tr>
+              <td><a href="deploy/baucord.yaml">baucord.yaml</a></td>
+              <td><code>config/baucord.yaml</code></td>
+              <td>The server's configuration, to edit (<a href="#config">Configuration</a>)</td>
+            </tr>
+            <tr>
+              <td><a href="deploy/setup.sh">setup.sh</a></td>
+              <td><code>scripts/setup.sh</code></td>
+              <td>Sets up the host and starts the server; safe to run again</td>
+            </tr>
+            <tr>
+              <td><a href="deploy/monitor-net.sh">monitor-net.sh</a></td>
+              <td><code>scripts/monitor-net.sh</code></td>
+              <td>Logs where UDP packets get dropped (<a href="#monitoring">Monitoring</a>)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The compose file:</p>
+      <pre><code>__COMPOSE__</code></pre>
+      <p>
+        Next to them, the server creates <code>data/baucord/</code>: its
+        identity key, database, shared files and the logs people send.
+        Back it up.
+      </p>
+
+      <h3>Setting up a host</h3>
+      <ol>
+        <li>
+          Allow <code>udp/51000</code> in the provider's firewall. Nothing
+          else: no DNS record, no TCP port, no certificate.
+        </li>
+        <li>
+          Put the files in a folder of their own, for example
+          <code>/opt/baucord</code>:
+          <pre><code>sudo mkdir -p /opt/baucord/config /opt/baucord/scripts
+cd /opt/baucord
+B=https://baucord.com/deploy
+sudo curl -fsSL -o docker-compose.yaml     $B/docker-compose.yaml
+sudo curl -fsSL -o config/baucord.yaml     $B/baucord.yaml
+sudo curl -fsSL -o scripts/setup.sh        $B/setup.sh
+sudo curl -fsSL -o scripts/monitor-net.sh  $B/monitor-net.sh
+sudo chmod +x scripts/*.sh</code></pre>
+        </li>
+        <li>
+          In <code>config/baucord.yaml</code>, set
+          <code>server.public_address</code> to the host's public IP and
+          port, and the server's name and channels to taste
+          (<a href="#config">Configuration</a>).
+        </li>
+        <li>
+          Run the setup script:
+          <pre><code>sudo scripts/setup.sh</code></pre>
+          It is safe to run again after any change. It:
+          <ul>
+            <li>
+              installs Docker and the compose plugin from the
+              distribution's packages, only if they are missing;
+            </li>
+            <li>
+              creates <code>./data/baucord</code> owned by uid 10000, where
+              the server makes its identity key on first start;
+            </li>
+            <li>
+              tunes the host for UDP fan-out: socket buffer limits and the
+              kernel's receive backlog
+              (<code>/etc/sysctl.d/99-baucord-udp.conf</code>), connection
+              tracking sized for Docker's port publishing, NIC ring
+              buffers and RPS at boot, and no cloud-init network hotplug;
+            </li>
+            <li>
+              pulls the image and starts the server
+              (<code>docker compose pull</code>,
+              <code>docker compose up -d</code>);
+            </li>
+            <li>
+              prints the server's address and identity, and on a new
+              server the one-time admin invite code;
+            </li>
+            <li>
+              installs the network monitor as a service
+              (<a href="#monitoring">Monitoring</a>).
+            </li>
+          </ul>
+          The settings at the top of the script (the port, which it reads
+          from your config; <code>MEDIA_VIA_DOCKER_NAT</code>; the uid; the
+          network interface, detected) are the only things you should
+          ever need to touch.
+        </li>
+        <li>
+          Check that it came up:
+          <pre><code>sudo docker compose ps
+sudo docker compose logs -f baucord
+ss -uln | grep :51000</code></pre>
+          The address and the admin code are in the log too:
+          <pre><code>sudo docker compose logs baucord | grep -E 'Address for clients|Bootstrap invite'</code></pre>
+        </li>
+      </ol>
+
+      <h3>Host networking (optional)</h3>
+      <p>
+        For the last bit of headroom, run the service with
+        <code>network_mode: host</code> instead of <code>ports:</code>.
+        That takes Docker's address translation and connection tracking
+        out of the media path. Then set
+        <code>MEDIA_VIA_DOCKER_NAT="false"</code> in
+        <code>scripts/setup.sh</code> and run it again: it adds a
+        <code>notrack</code> rule for the media port, which is only safe
+        without Docker's translation.
+      </p>
+
+      <h2 id="config">Configuration</h2>
+      <p>
+        One YAML file: <code>server.yaml</code> next to the server from
+        the download, <code>config/baucord.yaml</code> with Docker. The
+        parts you will touch:
+      </p>
+      <pre><code>server:
+  name: My baucord server
+  port: 51000                          # UDP
+  public_address: "203.0.113.5:51000"  # printed for people to type
+  greeting_message: Welcome!
+identity:
+  dir: data/baucord                    # the identity key: back it up
+logging:
+  file: server.log                     # "" = stderr only (Docker)
+  link_stats_interval_secs: 0          # per-client link: lines (2 while diagnosing)
+  telemetry: true                      # log clients' telemetry: samples
+persistence:
+  history:   { retain_days: 90 }       # chat and direct messages
+  files:     { retain_days: 30 }       # files nothing uses any more
+  telemetry: { retain_days: 30 }       # clients' 10-second samples
+channels:
+  - name: General
+  - name: Gaming
+    password: "hunter2"                # optional
+    user_limit: 8                      # optional</code></pre>
+      <ul>
+        <li>
+          <strong>Channels</strong> apply as soon as the file is saved,
+          while the server runs; a bad edit is logged and ignored.
+          Everything else needs a restart. Leave out
+          <code>channels</code> for a single open <em>General</em>. The
+          lobby everyone arrives in is added by the server and is not in
+          this list. A channel is known by its name: renaming one moves
+          the people in it to the lobby.
+        </li>
+        <li>
+          A missing file is written with the defaults; a file that does
+          not parse stops the server rather than being replaced.
+        </li>
+        <li>
+          <code>--config</code>, <code>--host</code> and
+          <code>--port</code> on the command line override the file.
+        </li>
+        <li>
+          The <code>authentication</code> section of 1.0 (a shared room
+          password) is ignored since 1.1, with a warning: invites are the
+          only way in.
+        </li>
+      </ul>
+
+      <h2 id="cli">Managing from the command line</h2>
+      <p>
+        Most things are in the app's admin panel. The same tools work from
+        the server's command line, also while it runs (it picks changes up
+        within two seconds). From the download:
+        <code>./dedicated-server &lt;command&gt;</code>. With Docker:
+      </p>
+      <pre><code>cd /opt/baucord
+sudo docker compose exec baucord /app/server &lt;command&gt;</code></pre>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Command</th>
+              <th>What it does</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>invite create --grants member --expires 7d --uses 5</code></td>
+              <td>
+                A new code (role: guest by default; expires: 24h by
+                default, or <code>never</code>; uses: unlimited by default)
+              </td>
+            </tr>
+            <tr>
+              <td><code>invite list</code>, <code>invite revoke CODE</code></td>
+              <td>Every code with its state; stop one admitting anyone else</td>
+            </tr>
+            <tr>
+              <td><code>user list</code></td>
+              <td>Everyone with their roles, keys and when they were last seen</td>
+            </tr>
+            <tr>
+              <td><code>user grant NAME admin</code>, <code>user revoke NAME ROLE</code></td>
+              <td>Add or remove a role (the last admin keeps <code>admin</code>)</td>
+            </tr>
+            <tr>
+              <td>
+                <code>user kick NAME</code>,
+                <code>user ban NAME --for 7d</code>,
+                <code>user mute NAME</code>
+              </td>
+              <td>
+                Kick (they need a new invite), ban (their device keys; a
+                ban from the app also blocks their address while they are
+                online), mute (their voice is dropped); all take
+                <code>--reason</code>
+              </td>
+            </tr>
+            <tr>
+              <td><code>user purge NAME</code></td>
+              <td>Delete a person: account, keys, roles and messages</td>
+            </tr>
+            <tr>
+              <td><code>role list</code>, <code>role create …</code></td>
+              <td>Custom roles: named sets of permissions</td>
+            </tr>
+            <tr>
+              <td><code>backup FILE.tar</code>, <code>restore FILE.tar</code></td>
+              <td>See <a href="#backups">backups</a></td>
+            </tr>
+            <tr>
+              <td><code>rotate-key</code></td>
+              <td>A new identity key (with the server stopped)</td>
+            </tr>
+            <tr>
+              <td><code>db check</code>, <code>db prune</code></td>
+              <td>Check the database; run the retention clean-up now</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><code>--help</code> after any command lists all of its options.</p>
+
+      <h2 id="backups">The identity key and backups</h2>
+      <p>
+        On first start the server makes an identity key in
+        <code>data/baucord/</code>. Everyone's app remembers it: lose it
+        and every app will refuse the server as an impostor. Keep a copy
+        of the whole directory: the key, the database (accounts, roles,
+        invites, messages) and the files people shared.
+      </p>
+      <p>A consistent backup, safe while the server runs:</p>
+      <pre><code># from the download
+./dedicated-server backup baucord-2026-10-08.tar
+# with Docker (the file lands in ./data/baucord)
+sudo docker compose exec baucord /app/server backup /app/data/baucord-2026-10-08.tar</code></pre>
+      <p>
+        To put one back, stop the server and run
+        <code>restore FILE.tar</code> (with Docker:
+        <code>sudo docker compose stop baucord</code>, then
+        <code>sudo docker compose run --rm baucord restore /app/data/FILE.tar</code>).
+        The database it replaces is kept beside it.
+      </p>
+      <p>
+        To change the key (if it may have leaked), stop the server and run
+        <code>rotate-key</code> (with Docker:
+        <code>sudo docker compose stop baucord</code>,
+        <code>sudo docker compose run --rm baucord rotate-key</code>,
+        <code>sudo docker compose start baucord</code>). The new key is vouched
+        for by the old one, so apps move to it on their own.
+      </p>
+
+      <h2 id="updating">Updating</h2>
+      <ul>
+        <li>
+          <strong>From the download:</strong> stop the server, unzip the
+          new version over the old one (your <code>server.yaml</code> and
+          <code>data/</code> stay), start it again.
+        </li>
+        <li>
+          <strong>With Docker:</strong> from the server's folder,
+          <pre><code>sudo docker compose pull
+sudo docker compose up -d</code></pre>
+          or run <code>sudo scripts/setup.sh</code> again, which does
+          both. The compose file and the scripts change rarely; when they
+          do, download them again, and keep your
+          <code>config/baucord.yaml</code>.
+        </li>
+      </ul>
+      <p>
+        A restart is a blink: the server tells every app it is restarting,
+        and they reconnect on their own about two seconds later. Keep the
+        server and the apps on the same version: when the connection
+        format changes, an older app is turned away with a message to
+        update rather than failing halfway through a call.
+      </p>
+
+      <h2 id="logs">Reading the server log</h2>
+      <p>
+        From the download it is <code>server.log</code> (and the
+        terminal); with Docker, <code>sudo docker compose logs baucord</code>
+        in the server's folder.
+        Two periodic lines carry most of what you will ever need:
+      </p>
+      <ul>
+        <li>
+          <code>link: &lt;user&gt;: rtt, cwnd, path loss, tx/rx, mtu, dgram
+          drops, groups behind N/M (cause), voice rx/expected/lost/late</code>:
+          the server's view of one person's connection, every
+          <code>link_stats_interval_secs</code>. <em>Path loss</em> is the
+          transport's own count and only informative; <em>voice lost</em>
+          is what listeners actually missed; <em>groups behind</em> is how
+          often that person's download could not keep up with a screen
+          share, and the cause says which rule gave up.
+        </li>
+        <li>
+          <code>telemetry: &lt;user&gt;: …</code>: the app's own numbers
+          every 10 seconds: connection, audio quality steps, the encoder's
+          step and frame rate while sharing, decoding while watching.
+        </li>
+      </ul>
+      <p>
+        Rising loss with a flat round-trip time is that person's network;
+        a rising round-trip time with little loss is a queue somewhere,
+        the server's or a router's.
+      </p>
+
+      <h2 id="monitoring">Monitoring</h2>
+      <p>
+        A server is a UDP fan-out: a ~177 KB keyframe goes to every viewer
+        at once, and the kernel drops such bursts silently. What you see
+        is abandoned video groups and timeouts, not errors. On a Docker
+        host, <code>setup.sh</code> runs <code>scripts/monitor-net.sh</code>
+        as a service, <code>baucord-monitor</code>, which writes a CSV row
+        every 10 seconds to <code>/var/log/baucord-net.log</code> (rotated
+        weekly, about two months kept):
+      </p>
+      <pre><code>systemctl status baucord-monitor
+tail -f /var/log/baucord-net.log</code></pre>
+      <p>
+        UDP counters are per network namespace, so it samples the host
+        <em>and</em> the <code>baucord</code> container, one row each.
+        Every <code>*_err</code> and <code>*_drop</code> column is the
+        change since the last row, and <code>note</code> names the layer
+        that dropped:
+      </p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>note</th>
+              <th>meaning</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>RCVBUF</code></td>
+              <td>Receive buffer overflow: the server is not draining it, or <code>rmem</code> is small</td>
+            </tr>
+            <tr>
+              <td><code>SNDBUF</code></td>
+              <td>Send buffer overflow: a keyframe burst bigger than <code>wmem</code>, or the link is full</td>
+            </tr>
+            <tr>
+              <td><code>SOFTNET</code></td>
+              <td>Kernel backlog overflow: <code>netdev_max_backlog</code>, or out of CPU</td>
+            </tr>
+            <tr>
+              <td><code>NIC</code></td>
+              <td>The NIC's ring, or the provider's packet or bandwidth allowance: see <code>ethtool -S</code></td>
+            </tr>
+            <tr>
+              <td><code>VETH</code></td>
+              <td>Drops on Docker's bridge</td>
+            </tr>
+            <tr>
+              <td><code>COUNTER_RESET</code></td>
+              <td>The container restarted</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <code>max_txq_bytes</code> creeping towards <code>wmem_max</code>
+        during keyframes means <code>SNDBUF</code> drops are close: pace
+        keyframes rather than raising the cap. <code>softirq_pct</code>
+        above about 30 % for long means packet processing is out of CPU.
+        <code>ct_count</code> nearing <code>ct_max</code> means connection
+        tracking is about to start refusing new people.
+      </p>
+
+      <h2 id="data">Your server, your data</h2>
+      <p>
+        Whoever runs a server holds what people send through it, and
+        answers for it. The server stores accounts, roles, chat and direct
+        messages, shared files and the apps' call-quality samples in
+        <code>data/baucord/</code>, for as long as the
+        <code>persistence</code> settings say; logs people send from
+        their app land in <code>data/baucord/logs/</code>. Its own log
+        records connections with IP addresses and the text of chat
+        messages. Connections are encrypted but not end to end: the server
+        can read what passes through it.
+      </p>
+      <p>
+        Tell the people on your server what you keep and for how long.
+        The <a href="privacy.html">privacy policy</a> of the official
+        server lists everything a server receives and is a fair starting
+        point.
+      </p>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <a href="/">baucord</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="https://github.com/mpwsh/baucord">Source</a>
+      </div>
+    </footer>
+  </body>
+</html>

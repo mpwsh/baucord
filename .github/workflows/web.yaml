@@ -4,6 +4,11 @@ on:
     branches: [main]
     paths:
       - "web/**"
+      # Published under /deploy/ for the hosting guide (web/deploy.html).
+      - "docker-compose.yaml"
+      - "config/baucord.example.yaml"
+      - "scripts/setup.sh"
+      - "scripts/monitor-net.sh"
   workflow_run:
     workflows: ["Build and Release"]
     types: [completed]
@@ -23,13 +28,46 @@ jobs:
         run: |
           VERSION=$(grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           sed -i "s/__VERSION__/$VERSION/g" web/index.html web/i18n/*.json
+      # The hosting guide's files, from the repository as they are: a
+      # Docker host downloads them from baucord.com/deploy/ (the layout
+      # setup.sh expects is in web/deploy.html). The compose file is
+      # also shown in the guide itself, in place of __COMPOSE__.
+      - name: Deploy files for the hosting guide
+        run: |
+          set -eu
+          mkdir -p web/deploy
+          cp docker-compose.yaml scripts/setup.sh scripts/monitor-net.sh web/deploy/
+          cp config/baucord.example.yaml web/deploy/baucord.yaml
+          python3 - <<'PY'
+          import html, pathlib
+          page = pathlib.Path("web/deploy.html")
+          text = page.read_text(encoding="utf-8")
+          if "__COMPOSE__" not in text:
+              raise SystemExit("web/deploy.html has no __COMPOSE__ to fill")
+          compose = pathlib.Path("docker-compose.yaml").read_text(encoding="utf-8")
+          page.write_text(text.replace("__COMPOSE__", html.escape(compose.rstrip("\n"))), encoding="utf-8")
+          PY
+          ls -la web/deploy
       - name: Upload to R2
         uses: jakejarvis/s3-sync-action@v0.5.1
         with:
-          args: --exclude '*.zip' --exclude '*.apk' --exclude 'version'
+          args: --exclude '*.zip' --exclude '*.apk' --exclude 'version' --exclude 'deploy/*'
         env:
           AWS_S3_BUCKET: baucord
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_S3_ENDPOINT: https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com
           SOURCE_DIR: web
+      # As text, so a browser shows them (read a script before running
+      # it as root) and curl saves them as they are.
+      - name: Upload the deploy files to R2
+        uses: jakejarvis/s3-sync-action@v0.5.1
+        with:
+          args: --content-type 'text/plain; charset=utf-8'
+        env:
+          AWS_S3_BUCKET: baucord
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_S3_ENDPOINT: https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com
+          SOURCE_DIR: web/deploy
+          DEST_DIR: deploy

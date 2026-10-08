@@ -220,29 +220,69 @@ API 36 is otherwise never sent the Back key. ANDROID-SPEC.md D29–D30.
 
 There is no push/PR build — day-to-day testing is local. When a GitHub
 Release is **published**, `.github/workflows/android-release.yml`
-builds the signed arm64 release APK, attaches it to the release as
-`baucord-<tag>-android-arm64.apk` (`baucord-v1.1.9-android-arm64.apk`:
-the desktop zips' pattern) and puts the same file on the website's R2
-bucket beside the zips, where the download section links it
-(versionCode = the run number, versionName = the tag without its `v`;
-ANDROID-SPEC.md D55). It needs four repository secrets of its own
-(*Settings → Secrets and variables → Actions*), plus the R2 pair
-`release.yml` already uses (`AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`):
+builds, in one Gradle run (`assembleRelease bundleRelease`, arm64):
+
+- **The APK**, signed with the release key, attached to the release as
+  `baucord-<tag>-android-arm64.apk` (`baucord-v1.1.9-android-arm64.apk`:
+  the desktop zips' pattern) and put on the website's R2 bucket beside
+  the zips, where the download section links it.
+- **The app bundle for Google Play**, `baucord-<tag>-android.aab`,
+  signed with the **upload key**, with the native debug symbols inside
+  (Play shows crash stacks with Rust function names). It is only a
+  workflow artifact: open the run on the Actions tab, download it under
+  *Artifacts* (it comes as the `.aab` itself; unzip it if your browser
+  hands you a `.zip`), and upload it in Play Console (*Test and release
+  → Internal testing → Create new release*). PLAY-STORE.md §4.
+
+Both have versionCode = the run number and versionName = the tag
+without its `v` (ANDROID-SPEC.md D55), so Play and GitHub builds of a
+release are the same version. Gradle builds both unsigned; later steps
+sign them, the APK first (and publish it) and then the bundle, so the
+keys are never in the environment while cargo and the build scripts
+run, and a problem with the upload key never holds back the APK (D62).
+The run prints each signer's SHA-256 in the format Play Console uses. The secrets (*Settings → Secrets and
+variables → Actions*), plus the R2 pair `release.yml` already uses
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`):
 
 | secret | value |
 |---|---|
-| `BAUCORD_KEYSTORE_BASE64` | the keystore as base64: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("$env:USERPROFILE\baucord-release.jks")) \| Set-Clipboard`, then paste |
+| `BAUCORD_KEYSTORE_BASE64` | the release keystore as base64: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("$env:USERPROFILE\baucord-release.jks")) \| Set-Clipboard`, then paste |
 | `BAUCORD_KEYSTORE_PASSWORD` | its password |
 | `BAUCORD_KEY_ALIAS` | `baucord` |
-| `BAUCORD_KEY_PASSWORD` | the key password |
+| `BAUCORD_KEY_PASSWORD` | the key password (empty: the keystore's) |
+| `BAUCORD_UPLOAD_KEYSTORE_BASE64` | the upload keystore, the same way (`baucord-upload.jks`) |
+| `BAUCORD_UPLOAD_KEYSTORE_PASSWORD` | its password |
+| `BAUCORD_UPLOAD_KEY_ALIAS` | `upload` |
+| `BAUCORD_UPLOAD_KEY_PASSWORD` | the key password (empty: the keystore's) |
 
-Without them the job still builds (unsigned) and leaves the APK as a
-workflow artifact but never attaches or publishes it. *Run workflow* on
-the Actions tab with the default input is a dry run of the chosen
-branch: same build, artifact only. With a release tag as the input
-(`v1.1.7`) it rebuilds that release instead — the tag's code, the
-branch's workflow — and attaches the APK to the existing release and
-the website: the fix when a release's
-own run broke on CI (re-running that run uses the workflow as it was at
-the tag, so it breaks again). ANDROID-SPEC.md D54.
+**The upload key**, made once (PowerShell; `keytool` comes with the JDK
+Gradle uses, or Android Studio's `jbr\bin`):
+
+```powershell
+keytool -genkeypair -v -keystore $env:USERPROFILE\baucord-upload.jks `
+  -alias upload -keyalg RSA -keysize 2048 -validity 10000 `
+  -dname "CN=baucord upload"
+# The certificate Play Console asks for when you register the upload key:
+keytool -export -rfc -keystore $env:USERPROFILE\baucord-upload.jks `
+  -alias upload -file upload_certificate.pem
+```
+
+Back it up beside the release keystore. If it is ever lost, Play Console
+can reset it (*Request upload key reset*). The release key cannot be
+reset. Play only takes it as the app signing key if it is RSA of 2048
+bits or more: `keytool -list -v -keystore baucord-release.jks` shows
+*Subject Public Key Algorithm*.
+
+Without the release key the APK stays unsigned, an artifact only, never
+attached or published. Without the upload key the bundle is signed with
+the release key (a warning in the run); Play accepts that only if the
+release key is also the registered upload key. *Run workflow* on the
+Actions tab with the default input is a dry run of the chosen branch:
+same build, artifacts only (signed with the same keys, so the APK
+installs over a release for testing). With a release tag as the input (`v1.1.7`)
+it rebuilds that release instead — the tag's code, the branch's
+workflow — and attaches the APK to the existing release and the
+website: the fix when a release's own run broke on CI (re-running that
+run uses the workflow as it was at the tag, so it breaks again).
+ANDROID-SPEC.md D54. A rebuild gets a new run number, so its bundle can
+go to Play after the first one.

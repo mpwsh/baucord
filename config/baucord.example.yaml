@@ -1,0 +1,47 @@
+# A server's configuration for the Docker setup (docker-compose.yaml
+# mounts config/baucord.yaml as /app/server.yaml). Save this file as
+# config/baucord.yaml next to docker-compose.yaml, then set
+# public_address below. Every key not written here keeps the server's
+# default. The guide: https://baucord.com/deploy.html
+server:
+  name: My baucord server
+  host: 0.0.0.0
+  # UDP. The only port the server uses: open it in the firewall.
+  # docker-compose.yaml publishes the same number.
+  port: 51000
+  # This host's public IP and the port above. Only printed in the
+  # startup line and with invites, so people know what to type.
+  public_address: "203.0.113.5:51000"
+  greeting_message: Welcome!
+logging:
+  level: info
+  # Docker keeps stderr as the log (compose rotates it).
+  file: ""
+  # One `link:` line per client every N seconds; 0 = off. Turn it on
+  # (2) while diagnosing a connection problem.
+  link_stats_interval_secs: 0
+  # Log each client's 10-second `telemetry:` sample.
+  telemetry: true
+identity:
+  # Mounted from ./data/baucord on the host. The server's key is made
+  # here on first start; clients pin it, so back this directory up.
+  # Logs people send from their app land in logs/ underneath.
+  dir: /app/data
+persistence:
+  # How long the server keeps things (days; 0 = forever). Tell the
+  # people on your server what you choose.
+  history:
+    retain_days: 90 # chat and direct messages
+  files:
+    retain_days: 30 # files no message or profile uses any more
+  telemetry:
+    retain_days: 30 # the clients' 10-second samples
+# Voice channels. Omit the key for a single open "General". Edits to
+# this list apply when the file is saved; everything else needs a
+# restart (docker compose restart baucord).
+channels:
+  - name: General
+  - name: Gaming
+    user_limit: 10
+  # - name: Private
+  #   password: "change-me"

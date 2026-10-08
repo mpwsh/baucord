@@ -1,0 +1,458 @@
+<!doctype html>
+<!--
+  The privacy policy Play (and later the App Store) links to: public,
+  not a PDF, naming the app as the listing does (PLAY-STORE.md §3,
+  PRODUCTION-PLAN LEG-5). Written 2026-10-08 from what the code does,
+  not from what it should do. When the code changes what is sent,
+  stored or for how long, change this page and its date. No web fonts
+  here on purpose: a privacy page should not send its readers'
+  addresses to Google.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/x-icon" href="/img/favicon.ico" />
+    <title>baucord — privacy policy</title>
+    <meta
+      name="description"
+      content="What the baucord apps and the official baucord server collect, why, how long it is kept, and how to have it deleted."
+    />
+    <meta name="theme-color" content="#1a1d21" />
+    <style>
+      /* The site's "workbench" palette (index.html). */
+      :root {
+        --paper: #1a1d21;
+        --mist: #222529;
+        --ink: #d1d2d3;
+        --slate: #abadb0;
+        --line: rgba(209, 210, 211, 0.12);
+        --cobalt-text: #1d9bd1;
+        --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.6;
+        -webkit-text-size-adjust: 100%;
+      }
+      .wrap {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 16px;
+      }
+      header {
+        border-bottom: 1px solid var(--line);
+        padding: 18px 0;
+      }
+      header a {
+        color: var(--ink);
+        font-weight: 700;
+        text-decoration: none;
+        letter-spacing: 0.01em;
+      }
+      main {
+        padding: 40px 0 64px;
+      }
+      h1 {
+        font-size: 2rem;
+        line-height: 1.2;
+        margin-bottom: 8px;
+      }
+      .updated {
+        color: var(--slate);
+        margin-bottom: 28px;
+      }
+      h2 {
+        font-size: 1.25rem;
+        margin: 40px 0 12px;
+        padding-top: 8px;
+      }
+      h3 {
+        font-size: 1.02rem;
+        margin: 22px 0 6px;
+      }
+      p,
+      ul {
+        margin-bottom: 12px;
+      }
+      ul {
+        padding-left: 22px;
+      }
+      li {
+        margin-bottom: 6px;
+      }
+      a {
+        color: var(--cobalt-text);
+      }
+      code {
+        font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+        font-size: 0.9em;
+        background: var(--mist);
+        padding: 1px 5px;
+        border-radius: 4px;
+      }
+      .summary {
+        background: var(--mist);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 18px 20px 8px;
+        margin-bottom: 8px;
+      }
+      .summary h2 {
+        margin-top: 0;
+        padding-top: 0;
+      }
+      .table-scroll {
+        overflow-x: auto;
+        margin: 8px 0 16px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        min-width: 520px;
+        font-size: 0.95rem;
+      }
+      th,
+      td {
+        text-align: left;
+        vertical-align: top;
+        padding: 9px 10px;
+        border-bottom: 1px solid var(--line);
+      }
+      th {
+        color: var(--slate);
+        font-weight: 600;
+      }
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 20px 0 32px;
+        color: var(--slate);
+        font-size: 0.95rem;
+      }
+      footer a {
+        margin-right: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="wrap"><a href="/">baucord</a></div>
+    </header>
+
+    <main class="wrap">
+      <h1>Privacy policy</h1>
+      <p class="updated">Last updated 8 October 2026</p>
+
+      <p>
+        baucord is a free, open-source app for voice chat, text chat and
+        screen sharing, made by 0x0 Studios ("we" below). This policy
+        covers the baucord apps for Android, iPhone, Windows, macOS and
+        Linux, and the <strong>official baucord server</strong> that we
+        run, the one the app lists by default.
+      </p>
+      <p>
+        Anyone can run their own baucord server. When you connect to a
+        server someone else runs, that person controls what is stored on
+        it and for how long, and their own policy applies. The app sends
+        the same things to every server, as described below.
+      </p>
+
+      <section class="summary">
+        <h2>In short</h2>
+        <ul>
+          <li>
+            No ads, no analytics or tracking services, no selling of data.
+            Nothing is shared with third parties.
+          </li>
+          <li>
+            Your account is a key the app makes on your device. There is
+            no email, phone number or account password.
+          </li>
+          <li>
+            Messages are stored on the server so that people can read
+            them later, and are deleted automatically after 90 days.
+            Voice and screen shares are never recorded.
+          </li>
+          <li>
+            Connections are encrypted, but not end to end: the server, and
+            whoever runs it, can read messages and see shared media.
+          </li>
+          <li>
+            To have your account and data deleted, write to
+            <a href="mailto:support@mpw.sh">support@mpw.sh</a>.
+          </li>
+        </ul>
+      </section>
+
+      <h2>What stays on your device</h2>
+      <ul>
+        <li>
+          <strong>Your identity key.</strong> On first start the app makes
+          a key that identifies you to servers. Its private part never
+          leaves the device unless you export it yourself (Settings →
+          Identity → Export) to move to another device.
+        </li>
+        <li>
+          <strong>Settings:</strong> your nickname, the servers you added
+          (address, invite code, and any room passwords you saved), your
+          audio devices, and the volume you set for other people.
+        </li>
+        <li>
+          <strong>Pictures:</strong> your avatar and a cache of other
+          people's avatars. Files and pictures from chats are saved only
+          when you choose to save them.
+        </li>
+        <li>
+          <strong>The app's log</strong>, used to diagnose problems. It
+          leaves the device only if you send it (see "Logs you send"
+          below) or copy it yourself. Settings → Debug can clear it.
+        </li>
+      </ul>
+
+      <h2>What the server receives and keeps</h2>
+      <p>
+        These are the things the app sends to a baucord server, and how
+        long the official server keeps each one.
+      </p>
+
+      <h3>Your account</h3>
+      <p>
+        The name you choose; a fingerprint of your device key (not the
+        key itself); the invite code you joined with; when you joined
+        and last connected; your roles; your profile (name colour and
+        avatar); and activity counters (time spent talking, sharing,
+        watching and connected, and how many messages you sent). These
+        are kept until your account is deleted.
+      </p>
+
+      <h3>Messages and files</h3>
+      <p>
+        Messages in the server's chat and direct messages are stored
+        with the files and pictures attached to them, so that you and others can
+        read them later. Messages are deleted automatically
+        <strong>90 days</strong> after they were sent. You can delete
+        your own recent chat messages; deleted messages are hidden at
+        once and erased with the 90-day clean-up. Files attached to
+        messages are not yet removed by that clean-up: they are kept
+        until you or a moderator delete the message they came with, or
+        your account is deleted, and are then erased within 30 days.
+      </p>
+
+      <h3>Voice, screen sharing and shared audio</h3>
+      <p>
+        These are passed on live to the other people in the room and are
+        <strong>never recorded or stored</strong>.
+      </p>
+
+      <h3>Call-quality data</h3>
+      <p>
+        While you are connected, the app sends a short report every 10
+        seconds so problems with calls and screen sharing can be found
+        and fixed. It contains the app version, the type of operating
+        system and processor (for example "android, aarch64"), connection
+        quality (delay, packet loss, speed), the audio and video settings
+        in use, the names of your audio input and output devices, and
+        which stream you are watching. It does not contain your
+        location, contacts, phone model or any message content. The
+        official server keeps these reports for <strong>30 days</strong>.
+      </p>
+
+      <h3>Logs you send</h3>
+      <p>
+        Settings → Debug → Send uploads the end of the app's log to the
+        server, only when you press it. A log can contain the app
+        version, your operating system, the server's address, the names
+        of people in your rooms, your audio device names, error
+        messages, and links to pictures you pasted. It does not contain
+        the text of your messages. Logs are read only to fix problems.
+        They are not yet deleted on a schedule: they are kept until we
+        delete them, and we will on request.
+      </p>
+
+      <h3>Your IP address</h3>
+      <p>
+        Like any internet service, the server sees the IP address you
+        connect from. It is written to the server's log when you connect
+        and is not stored with your account. If a moderator bans you, the
+        address may be stored with the ban for as long as the ban lasts.
+      </p>
+
+      <h3>The server's own log</h3>
+      <p>
+        To run the server and investigate abuse, its log records
+        connections (with names and IP addresses), invite codes used,
+        moderation actions, the text of messages posted in the server's
+        chat, the names of files posted, and who sent a direct message
+        to whom (not its text). Only we can read it, and it is replaced
+        as it grows rather than deleted on a fixed schedule.
+      </p>
+
+      <h3>Moderation</h3>
+      <p>
+        Bans, mutes and kicks are stored with their reason and who made
+        them, and moderators' actions are kept in a record of changes, so
+        that moderation can be reviewed.
+      </p>
+
+      <h2>How the data is used</h2>
+      <p>
+        Only to run the service: to deliver your messages, voice and
+        shares to the people you talk to, show your profile, keep the
+        history of a channel, moderate the server and keep it safe, and
+        find and fix problems. It is not used for advertising or
+        profiling, and it is not sold.
+      </p>
+
+      <h2>Who can see it</h2>
+      <ul>
+        <li>
+          <strong>Other people on the server</strong> see what you share
+          with them: your name and profile, your messages and files, your
+          voice and your screen when you share it.
+        </li>
+        <li>
+          <strong>Moderators and administrators</strong> of the server
+          can also see account details, moderation records and the latest
+          call-quality report of each person.
+        </li>
+        <li>
+          <strong>The hosting provider</strong> that rents us the server
+          stores its data on our behalf and does not use it for anything
+          else.
+        </li>
+        <li>
+          We disclose data to authorities only when the law requires it.
+        </li>
+      </ul>
+      <p>Nothing is given or sold to anyone else.</p>
+
+      <h2>Security</h2>
+      <p>
+        Every connection between the app and a server is encrypted (TLS
+        1.3), and the app checks the server's key so that nobody can
+        impersonate it. The encryption is not end to end: the server
+        handles messages and media unencrypted, so anyone who runs a
+        server can read what passes through it. Data stored on the
+        server is protected by access to the server itself; it is not
+        separately encrypted.
+      </p>
+
+      <h2>How long data is kept</h2>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Data</th>
+              <th>Kept on the official server</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Chat and direct messages</td>
+              <td>90 days</td>
+            </tr>
+            <tr>
+              <td>Files attached to messages</td>
+              <td>
+                Until their message is deleted by you or a moderator, or
+                your account is deleted; then erased within 30 days
+              </td>
+            </tr>
+            <tr>
+              <td>Call-quality reports</td>
+              <td>30 days</td>
+            </tr>
+            <tr>
+              <td>Account, profile, roles, activity counters</td>
+              <td>Until your account is deleted</td>
+            </tr>
+            <tr>
+              <td>Logs you send</td>
+              <td>Until deleted (on request, or by us)</td>
+            </tr>
+            <tr>
+              <td>Bans and their IP address</td>
+              <td>As long as the ban lasts</td>
+            </tr>
+            <tr>
+              <td>Voice, screen shares, shared audio</td>
+              <td>Never stored</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Deleting your account and data</h2>
+      <p>
+        Write to <a href="mailto:support@mpw.sh">support@mpw.sh</a> with your name on the official server. We will
+        delete your account, device keys, profile,
+        roles, the messages you sent and the files you uploaded, your
+        call-quality reports and any logs you sent, within 30 days, and
+        tell you when it is done. A button to do this from the app is
+        coming. Moderation records may keep a note that an account was
+        removed.
+      </p>
+      <p>
+        You can also ask for a copy of what is stored about you, or for
+        something to be corrected, at the same address. For servers run
+        by other people, ask the person who runs them.
+      </p>
+
+      <h2>Other connections the apps make</h2>
+      <ul>
+        <li>
+          <strong>Desktop only:</strong> at start-up the Windows, macOS
+          and Linux apps ask <code>baucord.com</code> whether there is a
+          new version. This can be turned off in Settings. Pasting a link
+          to a picture downloads that picture from the site it points to.
+        </li>
+        <li>
+          The Android and iPhone apps connect only to the servers you
+          add.
+        </li>
+        <li>
+          If you installed the app from Google Play or the App Store,
+          those stores may share anonymous crash reports with us under
+          their own privacy policies.
+        </li>
+      </ul>
+
+      <h2>Children</h2>
+      <p>
+        baucord is meant for adults and is not directed to children. Do
+        not use it if you are under 18. If we learn that an account
+        belongs to a child, we will delete it.
+      </p>
+
+      <h2>Changes</h2>
+      <p>
+        When this policy changes, this page shows the new text and the
+        date at the top changes. Important changes will also be
+        announced in the app.
+      </p>
+
+      <h2>Contact</h2>
+      <p>
+        0x0 Studios, <a href="mailto:support@mpw.sh">support@mpw.sh</a>. The source code
+        is public at
+        <a href="https://github.com/mpwsh/baucord">github.com/mpwsh/baucord</a>,
+        so anyone can check what the apps and the server do.
+      </p>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <a href="/">baucord</a>
+        <a href="https://github.com/mpwsh/baucord">Source</a>
+      </div>
+    </footer>
+  </body>
+</html>

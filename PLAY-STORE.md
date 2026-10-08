@@ -125,12 +125,13 @@ Google, the engineering takes sessions.
 
 In this order; each is a PRODUCTION-PLAN item.
 
-- [ ] **MOB-5 — the store pipeline.** `bundleRelease` beside
-  `assembleRelease`; the AAB signed with the new upload key, the APK
-  for GitHub still with the release key; the AAB as a workflow
-  artifact; native debug symbols in the bundle (Play's crash reports
-  then show Rust frames). Uploads by hand at first; the Play
-  Developer API from CI once the app exists.
+- [x] **MOB-5 — the store pipeline** (done 2026-10-08, ANDROID-SPEC
+  D62). `bundleRelease` runs beside `assembleRelease`. The AAB is
+  signed with the new upload key and the APK for GitHub with the
+  release key, both after the build. The AAB is a workflow artifact,
+  with the native debug symbols inside (Play's crash reports then show
+  Rust frames). Uploads are by hand for now; the Play Developer API
+  from CI can come once the app exists.
 - [ ] **MOB-11 — the foreground service, for Play**: decision 3's
   types, switched as we enter and leave a room; the
   `startForeground`-refused crash fixed; the wake lock only in a room.
@@ -151,7 +152,11 @@ In this order; each is a PRODUCTION-PLAN item.
   server.
 - [ ] **LEG-5 — privacy policy, terms, account deletion pages** on the
   website (`web/`), public, not a PDF, naming the app as the listing
-  does. The assistant drafts; you approve (decision 6).
+  does. The assistant drafts; you approve (decision 6). The privacy
+  policy is written: `web/privacy.html`, linked from the site's
+  footer, signed 0x0 Studios (support@mpw.sh). Its URL is
+  `https://baucord.com/privacy.html` once `web.yaml` deploys it.
+  LEG-6 lists what would let it promise less.
 - [ ] **LEG-2 / LEG-3, phone part**: `AboutSlint` in About; notices
   bundled and shown.
 - [ ] Recommended before testers arrive: MOB-8 (font size change ends
@@ -195,6 +200,31 @@ In this order; each is a PRODUCTION-PLAN item.
   and writes the texts.
 
 ### Step 4 — internal test (both)
+
+An internal test can start before app setup is complete (checked
+2026-10-08): no store listing, no forms, possibly no review. It needs
+the account, an AAB, the signing choice and, because the app asks for
+the microphone, probably a privacy policy URL. The first one, 1.1.9:
+
+1. *Once:* make the upload key and add the four
+   `BAUCORD_UPLOAD_*` secrets (android/README.md §6). Check that the
+   release key is RSA 2048+.
+2. Publish the v1.1.9 GitHub release as usual. The android-release
+   run prints both signers' SHA-256. Download
+   `baucord-v1.1.9-android.aab` from the run's *Artifacts*.
+3. Deploy the site (push `web/` to `main`) so the privacy policy is
+   live.
+4. Play Console: *Create app* (`dev.baucord`, §3 step 3). Before
+   uploading: *Protected with Play → Play Store distribution → Go to
+   Play app signing → Change the app signing key*, and choose to
+   provide a copy of your own key. Play shows the PEPK command; run it
+   on `baucord-release.jks`. Register `upload_certificate.pem` as the
+   upload key. Then compare the SHA-256 Play shows for each key with
+   the ones the run printed.
+5. *App content → Privacy policy*: the URL. *Test and release →
+   Internal testing*: add testers (an email list), create a release,
+   upload the AAB, roll out. The opt-in link can take a few hours the
+   first time, and testers see a temporary name for up to 48 h.
 
 - [ ] Upload the first AAB to the **internal testing** track (up to 100
   testers by email, available within minutes, lighter review). Install
@@ -331,11 +361,13 @@ baucord server and say in the policy who runs it.
 | Play's category | what baucord sends | stored by the server? |
 |---|---|---|
 | Personal info — name | display name, profile | yes |
-| Personal info — user IDs | the device key (public half) | yes |
+| Personal info — user IDs | a SHA-256 of the device key (not the key) | yes |
 | Messages — other in-app messages | chat and DMs | yes (history) |
 | Photos / files and docs | attachments, avatars | yes |
 | Audio — voice | voice to the room | no — relayed in memory, never stored (declare as ephemeral) |
-| App info and performance — diagnostics | telemetry every 10 s; logs when the user sends them | logs yes; telemetry in the server log |
+| App info and performance — diagnostics | telemetry every 10 s (app version, OS family and CPU type, link and codec figures, audio device names); logs when the user sends them | telemetry 30 days in the database (and the server log); logs until deleted (LEG-6) |
+| App activity — other actions | activity counters (time talking, sharing, watching, online; message count) | yes, until the account is deleted |
+| IP address (check Play's guidance on where, if anywhere, it goes; it is not used for location) | seen on every connection | in the server log; with a ban while it lasts |
 | Device or other IDs | none beyond the device key | — |
 
 Also: data encrypted in transit — yes (QUIC/TLS); users can request

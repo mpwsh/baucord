@@ -1,7 +1,18 @@
-# The Android release APK (ANDROID-SPEC.md §11, D55): built and signed
-# when a GitHub Release is published, attached to that release and put
-# on the website's bucket (R2, beside the desktop zips) as
-# baucord-<tag>-android-arm64.apk — the name web/index.html links to.
+# The Android release (ANDROID-SPEC.md §11, D55, D62), built when a
+# GitHub Release is published:
+# - the APK, signed with the release key, attached to that release and
+#   put on the website's bucket (R2, beside the desktop zips) as
+#   baucord-<tag>-android-arm64.apk, the name web/index.html links to;
+# - the app bundle for Google Play, baucord-<tag>-android.aab, signed
+#   with the upload key, with the native debug symbols inside. It is a
+#   workflow artifact only: download it from the run and upload it in
+#   Play Console (PLAY-STORE.md §4).
+# Both come out of one Gradle run, unsigned, and are signed in steps of
+# their own afterwards (the APK first, and published before the bundle
+# is signed), so no key or password is in the environment while cargo
+# and every build.rs run. Same runner, though: a separate signing job
+# is what would put the keys out of a build script's reach entirely
+# (PRODUCTION-PLAN REL-3).
 # Day-to-day builds are local (android/README.md); there is no push/PR
 # build on purpose.
 #
@@ -9,19 +20,23 @@
 #   BAUCORD_KEYSTORE_BASE64   the release keystore, base64 of the .jks
 #   BAUCORD_KEYSTORE_PASSWORD
 #   BAUCORD_KEY_ALIAS         (baucord)
-#   BAUCORD_KEY_PASSWORD
+#   BAUCORD_KEY_PASSWORD      (empty: the keystore password)
+#   BAUCORD_UPLOAD_KEYSTORE_BASE64, BAUCORD_UPLOAD_KEYSTORE_PASSWORD,
+#   BAUCORD_UPLOAD_KEY_ALIAS (upload), BAUCORD_UPLOAD_KEY_PASSWORD
+#                             the Play upload key, the same way
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY   R2, as release.yml uses
-# Gradle reads the keystore ones as project properties through
-# ORG_GRADLE_PROJECT_* (app/build.gradle.kts, signingConfigs). Without
-# them the APK is built unsigned and only uploaded as a workflow
-# artifact, never to a release or the website.
+# Without the release key the APK stays unsigned and is only a workflow
+# artifact, never attached to a release or put on the website. Without
+# the upload key the bundle is signed with the release key, which Play
+# accepts only if that key is also registered as the upload key; with
+# neither key it is unsigned.
 #
 # Run workflow (Actions tab) with a release tag (v1.1.9) rebuilds that
 # release: the tag's code, this branch's workflow, the APK attached to
 # the existing release. That is the way out when a release's own run
 # broke on CI itself — re-running it would not help, because a release
 # run always uses the workflow file as it was at the tag. Any other
-# input is a dry run of the selected branch (a workflow artifact only).
+# input is a dry run of the selected branch (workflow artifacts only).
 name: android-release
 
 on:
@@ -37,18 +52,19 @@ permissions:
   contents: write   # gh release upload
 
 jobs:
-  apk:
+  android:
     # Pinned: `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19; a build
     # this toolchain-heavy should change images on purpose.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
-      # `secrets` cannot be read in a step's `if`; through env it can.
-      KEYSTORE_B64: ${{ secrets.BAUCORD_KEYSTORE_BASE64 }}
     steps:
       - uses: actions/checkout@v7
         with:
+          # The release upload uses GH_TOKEN; nothing needs the token in
+          # .git/config, where every build script could read it.
+          persist-credentials: false
           # A dispatch naming a release tag builds that tag's code; else
           # the event's own commit (the release's tag, the chosen branch).
           ref: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v') && github.event.inputs.tag || '' }}
@@ -119,30 +135,21 @@ jobs:
       - name: cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      - name: Signing key
-        if: ${{ env.KEYSTORE_B64 != '' }}
-        run: |
-          set -eu
-          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/baucord-release.jks"
-          echo "ORG_GRADLE_PROJECT_BAUCORD_KEYSTORE=$RUNNER_TEMP/baucord-release.jks" >> "$GITHUB_ENV"
-          echo "SIGNED=1" >> "$GITHUB_ENV"
-
-      - name: Build the release APK (arm64-v8a)
+      # One Gradle run: the APK for the website and GitHub, the bundle
+      # for Play — the same native library, versionCode and versionName.
+      # No signing properties here: both come out unsigned.
+      - name: Build the release APK and bundle (arm64-v8a)
         working-directory: android
-        env:
-          ORG_GRADLE_PROJECT_BAUCORD_KEYSTORE_PASSWORD: ${{ secrets.BAUCORD_KEYSTORE_PASSWORD }}
-          ORG_GRADLE_PROJECT_BAUCORD_KEY_ALIAS: ${{ secrets.BAUCORD_KEY_ALIAS }}
-          ORG_GRADLE_PROJECT_BAUCORD_KEY_PASSWORD: ${{ secrets.BAUCORD_KEY_PASSWORD }}
         run: |
           set -eux
           # Git on Windows commits scripts without the executable bit.
           chmod +x gradlew
           cargo ndk --version
-          ./gradlew --no-daemon assembleRelease \
+          ./gradlew --no-daemon assembleRelease bundleRelease \
             -PcargoTargets=arm64-v8a \
             -PbaucordVersionCode="${{ github.run_number }}" \
             -PbaucordVersionName="${TAG#v}"
-          ls -la app/build/outputs/apk/release/
+          ls -la app/build/outputs/apk/release/ app/build/outputs/bundle/release/
 
       - name: 16 KB page-size check (spec §11)
         run: |
@@ -155,27 +162,60 @@ jobs:
             echo "a LOAD segment is not 16 KB aligned"; exit 1
           fi
 
-      - name: Name the APK
+      # Signing: each key exists only in its own step, as a file in
+      # RUNNER_TEMP deleted on exit. The APK first, and published before
+      # the bundle is touched, so a problem with the Play upload key
+      # never holds back the website and the GitHub release.
+      #
+      # The APK: page-aligned (16 KB, the uncompressed .so) and signed
+      # with the release key — the key every sideloaded install has, so
+      # they keep updating. Dry runs are signed too, so they install
+      # over a release for testing.
+      - name: Sign the APK
         id: apk
+        env:
+          RELEASE_KS_B64: ${{ secrets.BAUCORD_KEYSTORE_BASE64 }}
+          RELEASE_KS_PASS: ${{ secrets.BAUCORD_KEYSTORE_PASSWORD }}
+          RELEASE_ALIAS: ${{ secrets.BAUCORD_KEY_ALIAS }}
+          RELEASE_KEY_PASS: ${{ secrets.BAUCORD_KEY_PASSWORD }}
         run: |
-          set -eux
-          OUT=android/app/build/outputs/apk/release
-          if [ -f "$OUT/app-release.apk" ]; then
-            SRC="$OUT/app-release.apk"; SUFFIX=""
-          else
-            SRC="$OUT/app-release-unsigned.apk"; SUFFIX="-unsigned"
-          fi
+          set -eu
+          BT="$(printf '%s\n' "$ANDROID_HOME"/build-tools/36.* | sort -V | tail -1)"
+          APK_IN=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          KS="$RUNNER_TEMP/release.jks"
+          trap 'rm -f "$KS"' EXIT
+          # An empty key password: the key shares the keystore's.
+          RELEASE_KEY_PASS="${RELEASE_KEY_PASS:-$RELEASE_KS_PASS}"
+          export RELEASE_KS_PASS RELEASE_KEY_PASS
+          "$BT/zipalign" -P 16 -f 4 "$APK_IN" aligned.apk
           # The desktop zips' pattern (baucord-v1.1.7-win-x64.zip): the
           # website builds this name from its version.
-          NAME="baucord-${TAG}-android-arm64${SUFFIX}.apk"
-          cp "$SRC" "$NAME"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          if [ -n "$RELEASE_KS_B64" ]; then
+            # Whitespace and CRs a pasted secret may carry break base64 -d.
+            printf '%s' "$RELEASE_KS_B64" | tr -d ' \r\n' | base64 -d > "$KS"
+            APK="baucord-${TAG}-android-arm64.apk"
+            "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$RELEASE_ALIAS" \
+              --ks-pass env:RELEASE_KS_PASS --key-pass env:RELEASE_KEY_PASS \
+              --v4-signing-enabled false --out "$APK" aligned.apk
+            # The certificate's SHA-256 the way Play Console prints it.
+            "$BT/apksigner" verify --print-certs "$APK" \
+              | awk '/certificate SHA-256 digest/ { d = toupper($NF); gsub(/../, "&:", d); sub(/:$/, "", d); print "release key SHA-256: " d }'
+            echo "SIGNED=1" >> "$GITHUB_ENV"
+          else
+            APK="baucord-${TAG}-android-arm64-unsigned.apk"
+            cp aligned.apk "$APK"
+            echo "::warning::no release key: the APK is unsigned (artifact only)"
+          fi
+          rm -f aligned.apk
+          "$BT/zipalign" -c -P 16 4 "$APK"
+          echo "name=$APK" >> "$GITHUB_OUTPUT"
 
-      # Dry runs and unsigned builds: an artifact to download.
+      # Dry runs and unsigned builds: an artifact to download. Not
+      # zipped, so it downloads as the .apk itself.
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.apk.outputs.name }}
           path: ${{ steps.apk.outputs.name }}
+          archive: false
           if-no-files-found: error
 
       # A published release (or a rebuild of one) with a signing key: the
@@ -185,7 +225,8 @@ jobs:
         if: ${{ env.SIGNED == '1' && (github.event_name == 'release' || startsWith(env.TAG, 'v')) }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" "${{ steps.apk.outputs.name }}" --clobber --repo "$GITHUB_REPOSITORY"
+          APK: ${{ steps.apk.outputs.name }}
+        run: gh release upload "$TAG" "$APK" --clobber --repo "$GITHUB_REPOSITORY"
 
       # The same APK on the website: R2's bucket root, where release.yml
       # puts the desktop zips and web.yaml the page. Explicit content
@@ -193,10 +234,12 @@ jobs:
       # install.
       - name: Stage for the website
         if: ${{ env.SIGNED == '1' && (github.event_name == 'release' || startsWith(env.TAG, 'v')) }}
+        env:
+          APK: ${{ steps.apk.outputs.name }}
         run: |
           set -eux
           mkdir -p r2-upload
-          cp "${{ steps.apk.outputs.name }}" r2-upload/
+          cp "$APK" r2-upload/
       - name: Upload to R2
         if: ${{ env.SIGNED == '1' && (github.event_name == 'release' || startsWith(env.TAG, 'v')) }}
         uses: jakejarvis/s3-sync-action@v0.5.1
@@ -208,3 +251,65 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_S3_ENDPOINT: https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com
           SOURCE_DIR: r2-upload
+
+      # The bundle for Play: signed with the upload key (jarsigner, as
+      # Play asks); Play signs what it installs with the app signing key
+      # (PLAY-STORE.md §4). Without an upload key, the release key —
+      # which Play takes only if it is also the registered upload key.
+      # The signer's SHA-256 is printed to compare with Play Console.
+      - name: Sign the bundle
+        id: aab
+        env:
+          RELEASE_KS_B64: ${{ secrets.BAUCORD_KEYSTORE_BASE64 }}
+          RELEASE_KS_PASS: ${{ secrets.BAUCORD_KEYSTORE_PASSWORD }}
+          RELEASE_ALIAS: ${{ secrets.BAUCORD_KEY_ALIAS }}
+          RELEASE_KEY_PASS: ${{ secrets.BAUCORD_KEY_PASSWORD }}
+          UPLOAD_KS_B64: ${{ secrets.BAUCORD_UPLOAD_KEYSTORE_BASE64 }}
+          UPLOAD_KS_PASS: ${{ secrets.BAUCORD_UPLOAD_KEYSTORE_PASSWORD }}
+          UPLOAD_ALIAS: ${{ secrets.BAUCORD_UPLOAD_KEY_ALIAS }}
+          UPLOAD_KEY_PASS: ${{ secrets.BAUCORD_UPLOAD_KEY_PASSWORD }}
+        run: |
+          set -eu
+          AAB_IN=android/app/build/outputs/bundle/release/app-release.aab
+          KS="$RUNNER_TEMP/bundle.jks"
+          trap 'rm -f "$KS"' EXIT
+          if [ -n "$UPLOAD_KS_B64" ]; then
+            B64="$UPLOAD_KS_B64"; ALIAS="$UPLOAD_ALIAS"
+            KS_PASS="$UPLOAD_KS_PASS"; KEY_PASS="${UPLOAD_KEY_PASS:-$UPLOAD_KS_PASS}"
+            WHICH="upload key"
+          elif [ -n "$RELEASE_KS_B64" ]; then
+            echo "::warning::no upload key: the bundle is signed with the release key, which Play accepts only if it is also the registered upload key"
+            B64="$RELEASE_KS_B64"; ALIAS="$RELEASE_ALIAS"
+            KS_PASS="$RELEASE_KS_PASS"; KEY_PASS="${RELEASE_KEY_PASS:-$RELEASE_KS_PASS}"
+            WHICH="release key"
+          else
+            B64=""
+          fi
+          if [ -n "$B64" ]; then
+            printf '%s' "$B64" | tr -d ' \r\n' | base64 -d > "$KS"
+            export KS_PASS KEY_PASS
+            AAB="baucord-${TAG}-android.aab"
+            cp "$AAB_IN" "$AAB"
+            jarsigner -keystore "$KS" -storepass:env KS_PASS -keypass:env KEY_PASS \
+              "$AAB" "$ALIAS"
+            jarsigner -verify "$AAB"
+            keytool -printcert -jarfile "$AAB" \
+              | awk -v which="$WHICH" '/SHA256:/ { print which " SHA-256: " $2 }'
+          else
+            AAB="baucord-${TAG}-android-unsigned.aab"
+            cp "$AAB_IN" "$AAB"
+            echo "::warning::no key: the bundle is unsigned (Play refuses it)"
+          fi
+          # The debug symbols Play shows crash frames with.
+          if ! unzip -l "$AAB" | grep -q "BUNDLE-METADATA/com.android.tools.build.debugsymbols/"; then
+            echo "::warning::no native debug symbols in the bundle"
+          fi
+          echo "name=$AAB" >> "$GITHUB_OUTPUT"
+
+      # Always an artifact: it is what gets uploaded to Play by hand.
+      # Not zipped, so it downloads as the .aab itself.
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.aab.outputs.name }}
+          archive: false
+          if-no-files-found: error

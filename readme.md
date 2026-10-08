@@ -237,15 +237,20 @@ feature bits in `Hello`/`Welcome`.
 
 ## Deploying a server
 
-The production layout is Docker Compose on a Linux host.
+The production layout is Docker Compose on a Linux host. The same
+guide, for people who will never open this repository, is on the
+website: [baucord.com/deploy.html](https://baucord.com/deploy.html)
+(`web/deploy.html`). Change the two together.
 
-> **As committed, the deploy files lag this text** (PRODUCTION-PLAN.md
-> OPS-1): `docker-compose.yaml`, `config/baucord.yaml`, the `Dockerfile`
-> and `scripts/setup.sh` still use UDP 5000, and `setup.sh` looks for
-> `docker-compose.yml` and stops. Until that is fixed, rename or edit
-> accordingly, and read the address and the bootstrap code from the log
-> yourself: `docker compose logs baucord | grep -E 'Address for
-> clients|Bootstrap invite'`.
+The compose file runs the published image `mpwsh/baucord:latest`,
+which `docker.yaml` builds from the `Dockerfile` and pushes on every
+release (amd64 only; tagged with the version too). For another
+architecture or unreleased code, replace `image:` with `build: .`.
+`web.yaml` publishes `docker-compose.yaml`, `scripts/setup.sh`,
+`scripts/monitor-net.sh` and `config/baucord.example.yaml` (as
+`baucord.yaml`) to `baucord.com/deploy/` whenever they change, and
+puts the compose file into the guide. A host needs only those four
+files, not a clone.
 
 ```
 client ──udp/51000 (QUIC)─▶ baucord   (relay, published directly)
@@ -261,7 +266,7 @@ The image is distroless and runs as uid `10000`; the identity key is
 kept in `./data/baucord` on the host so `docker compose up` recreates
 keep the identity every client has pinned. Back that directory up. The
 container config sets `logging.file: ""` — Docker captures stderr, and
-that is the log.
+that is the log; compose keeps it to 5 × 10 MB.
 
 ### Layout
 
@@ -269,7 +274,8 @@ that is the log.
 Dockerfile          # cargo-chef build, distroless runtime
 docker-compose.yaml
 config/
-  baucord.yaml      # mounted as /app/server.yaml
+  baucord.example.yaml  # a new host starts here (a server test keeps it loading)
+  baucord.yaml      # this host's config, mounted as /app/server.yaml
 scripts/
   setup.sh          # bootstrap / re-apply host + stack
   monitor-net.sh    # UDP / NIC drop logger
@@ -280,10 +286,14 @@ data/baucord/       # created by setup.sh; identity key, database, blobs, upload
 
 1. Open `udp/51000` in the cloud firewall. (No DNS or TLS certificate
    is needed: the server's own key is its identity.)
-2. Set `server.public_address` in `config/baucord.yaml` to the host's
-   public IP and port (the server prints it in its `Address for
-   clients` line).
-3. Clone this directory onto the host and run:
+2. Put the four files on the host (download them from
+   `baucord.com/deploy/` as the web guide shows, or clone this
+   repository and `cp config/baucord.example.yaml
+   config/baucord.yaml`), and set `server.public_address` there to the
+   host's public IP and port (the server prints it in its `Address for
+   clients` line). `setup.sh` makes the copy itself if the file is
+   missing, and warns while the address is still the example's.
+3. Run:
 
    ```bash
    sudo scripts/setup.sh
@@ -299,13 +309,16 @@ data/baucord/       # created by setup.sh; identity key, database, blobs, upload
      ingress backlog (`/etc/sysctl.d/99-baucord-udp.conf`), conntrack
      sizing for Docker's port publishing, a boot-time service for NIC
      ring buffers / RPS, and disables cloud-init network hotplug
-   - runs `docker compose up -d`
+   - pulls the image and runs `docker compose up -d` (so re-running it
+     also updates the server to the latest release)
    - prints the address and identity line from the log (and, on a new
      server, the bootstrap admin invite — see "Server" above)
+   - installs the network monitor as a service (below)
 
-   The settings block at the top of the script (`MEDIA_PORT`,
-   `MEDIA_VIA_DOCKER_NAT`, `BAUCORD_UID`, interface auto-detection) is
-   the only thing you should need to touch.
+   The settings block at the top of the script (`MEDIA_PORT`, read from
+   the config's `server.port` when empty; `MEDIA_VIA_DOCKER_NAT`;
+   `BAUCORD_UID`; interface auto-detection) is the only thing you should
+   need to touch.
 
 4. Check it came up:
 
@@ -337,11 +350,12 @@ with low loss is a queue somewhere — ours or a router's.
 
 A relay is a UDP fan-out — a ~177 KB keyframe goes to every viewer at
 once — and the kernel drops those bursts silently; you see abandoned
-video groups and idle timeouts, not errors. Run the monitor during load
-(a 200-person test, or just always):
+video groups and idle timeouts, not errors. `setup.sh` installs
+`scripts/monitor-net.sh` as a service, `baucord-monitor`, sampling every
+10 s (with a logrotate rule: weekly, eight kept):
 
 ```bash
-sudo nohup scripts/monitor-net.sh 10 >/dev/null 2>&1 &   # every 10s
+systemctl status baucord-monitor
 tail -f /var/log/baucord-net.log
 ```
 
@@ -366,12 +380,9 @@ Sustained `softirq_pct` above ~30% means packet processing is CPU bound.
 `ct_count` approaching `ct_max` means conntrack is about to start
 dropping new clients.
 
-If you leave it running long-term, add a logrotate rule:
-
-```
-# /etc/logrotate.d/baucord-net
-/var/log/baucord-net.log { daily rotate 7 compress missingok copytruncate }
-```
+On a host set up by hand, run it yourself during load
+(`sudo nohup scripts/monitor-net.sh 10 >/dev/null 2>&1 &`) and add a
+logrotate rule for `/var/log/baucord-net.log`.
 
 ### Moving to host networking (optional)
 

@@ -346,6 +346,33 @@ What stands between this and "production for strangers":
   telemetry every 10 s and (on request) logs. Who the controller is when
   anyone can host a server needs a deliberate answer; the official
   server's retention needs writing down; telemetry may need consent.
+  2026-10-08: `web/privacy.html` drafted from the code, as it behaves
+  today (an inventory of every table, log and upload). It covers the
+  apps and the official server; other servers' operators answer for
+  their own. Signed 0x0 Studios, contact support@mpw.sh. Left: the
+  terms page (MOB-15), the
+  account-deletion page (MOB-14), the Data safety form from §6, and
+  LEG-6, which would let the policy promise less retention.
+- [ ] **LEG-6 [P1][S] What the privacy policy has to admit today.**
+  Found writing it (2026-10-08). Each fix shortens a paragraph of
+  `web/privacy.html`:
+  - The server log writes the text of every chat message
+    (`server.rs` ~1985, `[{username}]: {text}`), the names of files
+    posted (`files.rs` ~238), who sends DMs to whom and invite codes.
+    That is SEC-10; doing it removes a paragraph of the policy.
+  - Uploaded client logs (`<data>/logs/`) are never deleted. Prune them
+    after 30 days, and on purge.
+  - The 90-day message prune (`store.rs` `prune`, `DELETE FROM
+    messages`) does not lower the attachments' `refs`, so their files
+    are kept for good. Release them in the same transaction.
+  - Purge leaves telemetry rows, read markers, DM conversation rows and
+    uploaded logs. The CLI purge also keeps the files.
+  - The in-app note (`privacy-note`) says "Nothing goes anywhere else".
+    On the desktop the update check and pasted image links do; nor does
+    it say that the server keeps messages. Point it at the policy.
+  - The deployed server writes its log to stderr; compose now keeps
+    5 × 10 MB of it (2026-10-08), so its age depends on traffic.
+    Keep it for a fixed time instead.
 - [ ] **REL-1 [P0][S–M] A CI gate.** `ci.yaml` and `pr-check.yaml` are
   `.disabled`; `release.yml` runs `cargo build` only, without
   `--locked`; the versions test (`protocol/tests/versions.rs`) never
@@ -366,6 +393,11 @@ What stands between this and "production for strangers":
   `contents: write` workflow-wide and `checkout` persists the token.
   Build without secrets, sign in a last step, `contents: read`,
   `persist-credentials: false`, upload from a separate job.
+  2026-10-08: Android builds without secrets in its environment,
+  signs in later steps and no longer persists the token (D62). Still
+  on the same runner, so a build script could tamper with the
+  signing tools: a separate signing job finishes it. `contents: write`
+  is still workflow-wide; iOS is unchanged.
 - [ ] **REL-4 [P1][S] Pin and verify build inputs.** Actions by SHA
   (`dtolnay/rust-toolchain@stable` is a branch), top-level
   `permissions: {}`, SHA-256 for the FFmpeg, PipeWire and x264 sources
@@ -388,14 +420,23 @@ What stands between this and "production for strangers":
   the site promises SHA256SUMS that are never produced, "about 40 MB of
   RAM" (100–200 MB on macOS/Linux) and "a desktop app"; Google Fonts are
   loaded from Google (privacy); no crate declares `license`.
-- [ ] **OPS-1 [P1][S] Deployment drift.** `scripts/setup.sh` requires
-  `docker-compose.yml` but the repo has `docker-compose.yaml` (it exits
-  at once); it greps for an `Invite:` line the server never prints;
-  the readme says UDP 51000 while the committed compose and
-  `config/baucord.yaml` use 5000; that config commits a public IP and
-  a 1.0 room password ignored since 1.1. Also: no `HEALTHCHECK`, no
-  log rotation, no `read_only`/`cap_drop`/`no-new-privileges`, base
-  images not pinned by digest, amd64 only.
+- [ ] **OPS-1 [P1][S] Deployment drift.** *2026-10-08, the drift part
+  (§7):* `setup.sh` accepts the compose file as named, prints the
+  `Address for clients` and `Bootstrap invite` lines, and reads the
+  port from the config. Compose and the Dockerfile use 51000, and
+  compose rotates the log (5 × 10 MB). A new host starts from
+  `config/baucord.example.yaml`, which a server test keeps loading as
+  documented. The guide is on the website (`web/deploy.html`). Compose
+  runs the published `mpwsh/baucord:latest`, which setup.sh pulls.
+  `web.yaml` publishes compose, the scripts and the example config to
+  `baucord.com/deploy/`, so a host needs no clone. Left:
+  `config/baucord.yaml` is still the official server's own, committed
+  with its public IP, port 5000 and a 1.0 room password. Take it out
+  of the repo once the host has its own copy (a pull that deletes it
+  would break the bind mount, and a changed channel list applies
+  live). Also: no `HEALTHCHECK`, no
+  `read_only`/`cap_drop`/`no-new-privileges`, base images not pinned
+  by digest, amd64 only.
 - [ ] **OPS-2 [P1][M] Crash reporting.** Release builds abort on panic
   and write the hook's lines to a local log; native crashes (Skia,
   AAudio, JNI, FFmpeg) leave nothing a user can reach; Android symbols
@@ -445,16 +486,16 @@ is not decided yet.
   device key registered by invite. Protocol (a report message, a
   per-user block list), server (a moderator queue in the admin panel)
   and UI.
-- [ ] **MOB-5 [P0][M] Store pipelines.** Play wants an AAB (the workflow
-  builds an APK) and a decision on Play App Signing before the first
-  upload (sideloaded installs cannot update from Play if the key
-  changes): `bundleRelease` beside `assembleRelease`, the AAB signed
-  with a new upload key, our release key given to Play as the app
-  signing key (PLAY-STORE.md §4), native debug symbols in the bundle,
-  one `versionCode` counter for both; upload by hand first, then the
-  Play Developer API from CI. iOS exports Ad Hoc only
-  (`ios-release.yml` ~148, ~231) — add App Store/TestFlight export and
-  symbol upload.
+- [ ] **MOB-5 [P0][M] Store pipelines.** *Android done 2026-10-08
+  (ANDROID-SPEC D62, §7):* `android-release.yml` builds the AAB beside
+  the APK in one Gradle run, with one versionCode. A step after the
+  build signs the APK with the release key and the AAB with the upload
+  key. The native debug symbols are in the bundle, which is a workflow
+  artifact. Left: on Play's side, give it our release key as the app
+  signing key and register the upload key (PLAY-STORE.md §4, the
+  user); later, upload from CI through the Play Developer API. iOS
+  exports Ad Hoc only (`ios-release.yml` ~148, ~231): add the App
+  Store/TestFlight export and the symbol upload.
 - [ ] **MOB-6 [P1][S] Encryption export compliance.** No
   `ITSAppUsesNonExemptEncryption` in the Info.plist; rustls/ring are
   non-Apple cryptography (a BIS self-classification is likely). Play:
@@ -702,6 +743,29 @@ is not decided yet.
   180 ms it plays 1–4 % faster until it is back at 120 ms, ~10 s for
   160 ms over, nothing skipped or repeated; only past 400 ms is
   anything dropped (ANDROID-SPEC D61, IOS-SPEC D55).
+- **2026-10-08 — MOB-5, Android: an app bundle for Play**
+  (ANDROID-SPEC D62): the release workflow makes
+  `baucord-<tag>-android.aab` beside the APK. It is signed with the
+  new upload key (or the release key, with a warning), has the native
+  debug symbols inside, and is a workflow artifact for uploading by
+  hand. Both outputs are signed after the build, so the keys are not
+  in the environment of cargo and the build scripts (REL-3 in part).
+  The APK is published before the bundle is signed. The first upload,
+  1.1.9 to internal testing: PLAY-STORE.md §3 step 4. Also a privacy
+  policy draft for the website, `web/privacy.html` (LEG-5 in part).
+- **2026-10-08 — the hosting guide on the website, OPS-1's drift**:
+  `web/deploy.html`, from the readme's "Server" and "Deploying a
+  server" sections, for people who will never open the repo. It covers
+  the server from the download (any computer) and with Docker on a
+  Linux host, the first admin invite, configuration, the command line,
+  backups and the identity key, updating, the log, monitoring, and
+  what an operator holds. The site's hosting steps lost the 1.0 room
+  password and port 5000 (en, es, pt-BR) and link the guide. The
+  deploy files now match the readme (OPS-1). There is a new
+  `config/baucord.example.yaml` with a server test,
+  `the_example_config_loads_as_documented`. Compose uses the published
+  image. `web.yaml` serves the compose file, the scripts and the example
+  config from `/deploy/` and shows the compose file in the guide.
 - **2026-10-08 — MOB-18, phones keep up with a stream**: from the first
   `viewing` lines of a Galaxy A07 — codec 7–10 ms a frame, our colour
   conversion 24–30 ms, and freezes. (1) *Convert only what is shown*:
