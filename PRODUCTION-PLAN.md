@@ -489,10 +489,10 @@ is not decided yet.
 - [ ] **MOB-5 [P0][M] Store pipelines.** *Android done 2026-10-08
   (ANDROID-SPEC D62, §7):* `android-release.yml` builds the AAB beside
   the APK in one Gradle run, with one versionCode. A step after the
-  build signs the APK with the release key and the AAB with the upload
-  key. The native debug symbols are in the bundle, which is a workflow
-  artifact. Left: on Play's side, give it our release key as the app
-  signing key and register the upload key (PLAY-STORE.md §4, the
+  build signs both the APK and the AAB with the release key, which
+  is also the upload key (one key, by choice). The native debug
+  symbols are in the bundle, which is a workflow artifact. Left: on Play's side, give it our release key as the app
+  signing key, which is also the upload key (PLAY-STORE.md §4, the
   user); later, upload from CI through the Play Developer API. iOS
   exports Ad Hoc only (`ios-release.yml` ~148, ~231): add the App
   Store/TestFlight export and the symbol upload.
@@ -746,7 +746,7 @@ is not decided yet.
 - **2026-10-08 — MOB-5, Android: an app bundle for Play**
   (ANDROID-SPEC D62): the release workflow makes
   `baucord-<tag>-android.aab` beside the APK. It is signed with the
-  new upload key (or the release key, with a warning), has the native
+  release key, which is also the upload key, and has the native
   debug symbols inside, and is a workflow artifact for uploading by
   hand. Both outputs are signed after the build, so the keys are not
   in the environment of cargo and the build scripts (REL-3 in part).

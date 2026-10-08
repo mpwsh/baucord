@@ -12,3 +12,4 @@ fltk-ui
 baucord.db
 baucord.db-shm
 baucord.db-wal
+upload_certificate.pem

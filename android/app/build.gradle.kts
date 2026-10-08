@@ -108,8 +108,7 @@ android {
     // Without them the release APK is built unsigned (adb refuses it;
     // debug builds use the SDK's debug key automatically). CI never sets
     // them: android-release.yml builds unsigned and signs afterwards,
-    // the APK with this key and the Play bundle with the upload key
-    // (D62).
+    // the APK and the Play bundle both with this key (D62).
     val keystorePath = providers.gradleProperty("BAUCORD_KEYSTORE").orNull
     signingConfigs {
         if (keystorePath != null) {
