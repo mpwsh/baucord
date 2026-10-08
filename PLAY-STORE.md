@@ -105,6 +105,9 @@ Google, the engineering takes sessions.
 - [ ] Verify identity (government ID, through the payments profile)
   and the contact email and phone (one-time codes). Organization:
   D-U-N-S first.
+- [ ] Turn on 2-Step Verification for the owning Google account and
+  for anyone else added to the Console. The Play App Signing page asks
+  for it for every Console user.
 - [ ] Personal account: verify access to an Android device with the
   **Play Console mobile app**.
 - [ ] Developer verification (Google's new programme for every app,
@@ -159,7 +162,13 @@ In this order; each is a PRODUCTION-PLAN item.
 ### Step 3 — create the app and fill the forms (you, from drafts)
 
 - [ ] Create the app: name (30 characters max; "baucord"), default
-  language, app (not game), free, no ads.
+  language, app (not game), free, no ads. Package name
+  **`dev.baucord`**: the `applicationId` every APK so far has shipped
+  with (`android/app/build.gradle.kts`), and the iPhone's bundle id.
+  It is permanent on Play: it can never be renamed, and never reused,
+  even if the app is deleted. Keeping it is what lets today's
+  sideloaded installs update from Play (with decision 2's key);
+  another name would be a second app beside the first.
 - [ ] Play App Signing: change the default to **provide your own key**
   (decision 2; Play Console's PEPK tool encrypts it for upload) — it
   must be settled before any release reaches open testing or
@@ -385,3 +394,22 @@ Four to six weeks end to end if the decisions come early.
 - Testing tracks — support.google.com/googleplay/android-developer/answer/9845334
 - August 2026 age-restricted chat categories (a "Preview" page, effective 2026-08-26) — support.google.com/googleplay/android-developer/answer/17036597
 - Age Signals API (not mandated by Play) — support.google.com/googleplay/android-developer/answer/16569691
+
+## 10. Compliance check against six of Google's pages (2026-10-08)
+
+These are the pages the user sent, checked against the app as of 1.1.9
+(`applicationId` `dev.baucord`, decided). **Verdict:** nothing on
+these pages blocks us that is not already a planned item. The open
+ones are the AAB (MOB-5) and the signing setup (§4). The policy
+centre's own requirements are the §3 step 2 list.
+
+| page | what it asks of us | where we stand | to do |
+|---|---|---|---|
+| Developer Program Policy (the index) | It summarises the policy areas. The detailed rules (UGC, account deletion, permissions, foreground services, Data safety) are the pages in §9. | Already mapped in §3: MOB-4 report and block, MOB-14 account deletion (the Data safety "deletion options" date was 2023-12-07), MOB-15 terms, LEG-5 privacy policy, MOB-11 service types. The manifest still declares `microphone\|mediaPlayback` (decision 3). There are no ads, payments or third-party SDKs. Android has no self-updater and downloads no code. | §3 step 2 as written. In the listing, do not name or look like another chat app (impersonation, store listing policy). LEG-2/LEG-3 attributions and notices. |
+| Advance notice to App Review (answer 6320428) | Advance notice is accepted only for 8 cases: third-party IP permission, government, healthcare, Korean gambling, accessibility services, non-profits, law enforcement, regulators. | None of them applies. There is no AccessibilityService in the manifest and no third-party brand assets. | Nothing. Google says other requests may get no reply. |
+| Android App Bundle (developer.android.com) | New apps must publish an AAB. Compressed download ≤ 4 GB. No `.obb` files. Sideloaded split APKs fail on Android 10+. | **Not yet**: CI builds an APK only (MOB-5). Size, `.obb` and dynamic resource tables are non-issues. The release build is not debuggable. | MOB-5: `bundleRelease`. Keep the GitHub APK *universal* (`assembleRelease`): never hand out the split APKs Play generates. |
+| Play App Signing terms | Publishing an AAB means using Play App Signing. You either give Google your key or it generates one. Google keeps a copy indefinitely. A key handed over cannot be retrieved. Google may generate and optimise APKs "for performance, security and/or size" but "will not change the purpose". Terms can change with notice. | Acceptable. We give our own key (§4) and keep our original. Play's APKs will not be byte-identical to our builds. | Accept them in the Console. |
+| Use Play App Signing (answer 9842756) | A new app starts on Google-generated (quantum-ready hybrid) keys. Change to your own **before a release reaches open testing or production**. Own key: **RSA ≥ 2048**. The upload key must be RSA ≥ 2048 and "should be different" from the signing key. 2-Step Verification for every Console user. Register the app-signing fingerprints with any API that checks them. Update `assetlinks.json` for App Links. | Plan matches (§4): our key for both Play and GitHub ("Option 2" on that page), a new upload key. **Unverified:** the release key's algorithm and size. No Google sign-in, Maps or App Links (no `autoVerify` filter), so no fingerprints to register. | `keytool -list -v -keystore baucord-release.jks` must say RSA 2048+. Switch to our key before the first upload (allowed until open testing, but internal testers would have to reinstall). Turn on 2SV. |
+| Export compliance (answer 113770) | US export law may apply to encryption, including open source. You decide; Google blocks embargoed countries. | Standard cryptography only: TLS 1.3 over QUIC (rustls, ring), SHA-2, device keys. A free mass-market app: ECCN 5D992.c under §740.17(b)(1). Since BIS's 2021-03-29 rule this needs no licence and no self-classification report, and an email notification only for *non-standard* crypto. BIS's page still describes that notification for public source code. | Nothing to file for Play. If the source goes public, the BIS/NSA email is a few lines and cheap insurance. Not legal advice. The iOS side stays MOB-6. |
+
+Sources: play.google/developer-content-policy; support.google.com/googleplay/android-developer/answer/6320428, /9842756, /113770; developer.android.com/guide/app-bundle; play.google.com/about/play-app-signing-terms.html; bis.gov/learn-support/encryption-controls/encryption-items-not-subject-to-ear; thompsonhine.com/publications/bis-eliminates-most-mass-market-encryption-reporting-obligations.

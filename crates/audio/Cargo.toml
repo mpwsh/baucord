@@ -41,6 +41,9 @@ rubato = "5.0"
 # audioadapter here would resolve as a second copy with incompatible
 # adapter types at the rubato boundary.
 audioadapter-buffers = "5.2"
+# The phase-aligned stereo → mono downmix for streams on a phone's call
+# output (stream::downmix). Already in the tree through rubato.
+realfft = "3.5"
 
 # Noise suppression (Mozilla RNNoise, pure Rust). Its VAD probability also
 # drives the speaking indicator, so no separate VAD dependency is needed.

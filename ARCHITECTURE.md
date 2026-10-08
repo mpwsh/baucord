@@ -638,7 +638,11 @@ A watched stream's audio has an output of its own (stereo, its own
 volume, untouched by deafen) — except on a phone's call path, where it
 is mixed into the voice output instead (`stream::mix`, ANDROID-SPEC
 D56, IOS-SPEC D52), so it shares the call's volume and route and the
-echo canceller removes it. The decoder picks per frame; its own
+echo canceller removes it. That path is mono: the stereo is mixed per
+frequency at an aligned phase (`stream::downmix`, ANDROID-SPEC D60),
+since a plain `(L + R) / 2` silences out-of-phase sound. A backlog
+there (past 180 ms queued) drains by playing 1–4 % faster rather than
+by a skip (ANDROID-SPEC D61). The decoder picks per frame; its own
 output reopens when its device goes away.
 
 A watched stream's video goes: the jitter buffer (3 s of frames at the

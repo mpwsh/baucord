@@ -254,8 +254,8 @@ What stands between this and "production for strangers":
   trimmed, so a network burst or clock drift adds delay for good (the
   48 kHz path drops the excess instead). Rare — the output asks for
   48 kHz first — but it is an A/V drift. The `viewing` line's `audio
-  … ms queued` shows it if it happens; trim to a target like the
-  phones' mix does (`stream::mix`).
+  … ms queued` shows it if it happens; drain to a target like the
+  phones' mix does (`stream::mix`, by playing slightly faster).
 - [ ] **CLI-15 [P1][S] AMD keyframes too large to send.** On AMF
   (FFmpeg 7.1, which cannot force an IDR, so every requested keyframe
   is a fresh session) the session's first frame ignores the VBV and
@@ -272,6 +272,15 @@ What stands between this and "production for strangers":
   there should be none. If it does not: FFmpeg 8's amfenc forces IDRs
   without a new session, or a 2-byte chunk count in the video format
   (wire v4) lifts the limit.
+- [ ] **CLI-16 [P2][M] Desktop voice latency: what is left.** The
+  2026-10-08 review: native WASAPI cost nothing (event-driven, MMCSS,
+  20 ms render buffer). Our code adds ~74 ms one way; the estimate
+  mouth to ear is 135–175 ms. Nine candidates, ranked, in
+  `LATENCY-SPEC.md`. First: measure (a clap test, and buffer depths
+  in the voice summary). Then LAT-1 (late packets push playback 20 ms
+  later), LAT-2 (share audio waits for the video tick) and LAT-3 (the
+  32 KiB datagram send buffer holds seconds, not ~200 ms). Parked
+  until the Play release is out.
 - [ ] **CLI-10 [P2] Smaller client items** *(review)*: auto-reconnect
   gives up after ~60 s (5 tries) — phones on a train need longer;
   server addresses must be IP literals (no DNS — also an App Review
@@ -448,7 +457,11 @@ is not decided yet.
   symbol upload.
 - [ ] **MOB-6 [P1][S] Encryption export compliance.** No
   `ITSAppUsesNonExemptEncryption` in the Info.plist; rustls/ring are
-  non-Apple cryptography (a BIS self-classification is likely).
+  non-Apple cryptography (a BIS self-classification is likely). Play:
+  nothing to file (checked 2026-10-08, PLAY-STORE.md §10). Standard
+  crypto in a free mass-market app is 5D992.c, and since BIS's
+  2021-03-29 rule it needs no report; the email notification is only
+  for non-standard crypto.
 - [ ] **MOB-7 [P1][S] Android moves the identity key to a new phone**:
   `allowBackup="false"` no longer covers device-to-device transfer for
   apps targeting 31+. Add `dataExtractionRules` excluding everything
@@ -675,7 +688,20 @@ is not decided yet.
   250 Hz, until the sharer stops. The same session's logs, all three
   lined up by Copy log's header: the PC clean (60 fps, 8 Mbit/s, no
   abandoned groups, ladder at 100 %), the iPhone 60/60/60 at 4.4 ms a
-  frame, the A07 ~51 shown. (4) Version 1.1.9 everywhere.
+  frame, the A07 ~51 shown. (4) Version 1.1.9 everywhere. (5) Stereo
+  streams on the phones' call path: `(L + R) / 2` silenced whatever was
+  out of phase between the channels (audiocheck.net's polarity test
+  played nothing on the A07; a game's spatial sound came and went);
+  `stream::downmix` mixes per frequency at an aligned phase instead
+  (ANDROID-SPEC D60, IOS-SPEC D54). The next A07 log, same session as
+  the PC's: ~60 fps shown at 1024x768 and ~58 at 1080p, 106 of 12,420
+  pictures passed over; one AMD frame too large (307 KB), floor 24,
+  none after, relaxed 30 s later. (6) The phones' stream mix no longer
+  drops 150 ms at once when a source passes 300 ms queued (a skip;
+  one burst then left the A07 at 250–290 ms for a minute): past
+  180 ms it plays 1–4 % faster until it is back at 120 ms, ~10 s for
+  160 ms over, nothing skipped or repeated; only past 400 ms is
+  anything dropped (ANDROID-SPEC D61, IOS-SPEC D55).
 - **2026-10-08 — MOB-18, phones keep up with a stream**: from the first
   `viewing` lines of a Galaxy A07 — codec 7–10 ms a frame, our colour
   conversion 24–30 ms, and freezes. (1) *Convert only what is shown*:

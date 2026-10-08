@@ -32,6 +32,7 @@ use opus::{Channels, Decoder};
 
 use crate::{
     stream::{
+        downmix::Downmix,
         mix::{self, MixSource},
         output::{StreamAudioFrame, StreamAudioOutput},
     },
@@ -119,7 +120,9 @@ struct Sink {
     mix: Option<MixSource>,
     /// Last time a voice output was mixing streams.
     last_mixing: Option<Instant>,
-    /// Downmix scratch, reused.
+    /// Stereo → mono for the mix (phase-aligned: out-of-phase sound
+    /// does not cancel), and its output, reused.
+    downmix: Downmix,
     mono: Vec<f32>,
     counters: Arc<Counters>,
 }
@@ -141,7 +144,8 @@ impl Sink {
             open_failures: 0,
             mix: None,
             last_mixing: None,
-            mono: Vec::with_capacity(STREAM_FRAME_SIZE),
+            downmix: Downmix::new(),
+            mono: Vec::with_capacity(2 * STREAM_FRAME_SIZE),
             counters,
         }
     }
@@ -172,10 +176,12 @@ impl Sink {
         self.counters.queued_ms.store(queued_ms, Ordering::Relaxed);
     }
 
-    /// Into the voice output's mix: mono (the call path is), with the
-    /// stream's volume and mute applied here. In the grace after the
-    /// voice output stopped (`mixing` false) nothing is queued: nobody
-    /// reads it, and it would play late when the next output starts.
+    /// Into the voice output's mix: mono (the call path is) through
+    /// [`Downmix`] — a plain `(L + R) / 2` silenced whatever was out of
+    /// phase between the channels — with the stream's volume and mute
+    /// applied here. In the grace after the voice output stopped
+    /// (`mixing` false) nothing is queued: nobody reads it, and it would
+    /// play late when the next output starts.
     fn play_mixed(&mut self, stereo: &[f32], mixing: bool) {
         if self.own.take().is_some() {
             info!("Stream audio: now through the voice output (call path)");
@@ -185,6 +191,8 @@ impl Sink {
             mix::BUS.source()
         });
         if !mixing {
+            // Resumed later, it starts clean, not overlapping this.
+            self.downmix.reset();
             return;
         }
         let gain = if self.is_muted.load(Ordering::Relaxed) {
@@ -193,11 +201,10 @@ impl Sink {
             f32::from_bits(self.volume.load(Ordering::Relaxed))
         };
         self.mono.clear();
-        self.mono.extend(
-            stereo
-                .chunks_exact(2)
-                .map(|pair| ((pair[0] + pair[1]) * 0.5 * gain).clamp(-0.99, 0.99)),
-        );
+        self.downmix.process(stereo, &mut self.mono);
+        for s in &mut self.mono {
+            *s = (*s * gain).clamp(-0.99, 0.99);
+        }
         source.push(&self.mono);
     }
 
