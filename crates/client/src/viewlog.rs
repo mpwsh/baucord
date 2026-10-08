@@ -165,8 +165,6 @@ impl Viewing {
         behind_live: Option<Duration>,
         size: (u32, u32),
     ) -> Option<(Level, String)> {
-        self.pictures += 1;
-        self.size = size;
         match timing {
             Some(t) => {
                 self.codec.push(t.codec);
@@ -174,6 +172,20 @@ impl Viewing {
             }
             None => self.whole.push(took),
         }
+        self.on_held_picture(now, behind_live, size)
+    }
+
+    /// A picture the decoder handed out between frames (`poll`: the
+    /// stream paused with one still waiting). Counted, with how late it
+    /// was; no decode call to time.
+    pub(crate) fn on_held_picture(
+        &mut self,
+        now: Instant,
+        behind_live: Option<Duration>,
+        size: (u32, u32),
+    ) -> Option<(Level, String)> {
+        self.pictures += 1;
+        self.size = size;
         let behind = behind_live?;
         self.behind.push(behind);
         if behind < BEHIND_WARN {
@@ -439,6 +451,9 @@ pub(crate) struct Sharing {
     encoded: u32,
     keyframes: u32,
     bytes: u64,
+    /// Frames dropped as too large to send, and the largest.
+    too_large: u32,
+    largest: usize,
     encode: Samples,
     groups_started: u32,
     groups_reset: u32,
@@ -453,6 +468,8 @@ pub(crate) struct ShareState<'a> {
     pub bitrate_pct: u32,
     pub fps_pct: u32,
     pub viewers: u32,
+    /// The encoder's quantizer floor after frames too large, if any.
+    pub qp_floor: Option<u32>,
 }
 
 impl Sharing {
@@ -464,6 +481,8 @@ impl Sharing {
             encoded: 0,
             keyframes: 0,
             bytes: 0,
+            too_large: 0,
+            largest: 0,
             encode: Samples::default(),
             groups_started: 0,
             groups_reset: 0,
@@ -484,6 +503,12 @@ impl Sharing {
 
     pub(crate) fn on_encode(&mut self, took: Duration) {
         self.encode.push(took);
+    }
+
+    /// An access unit dropped: too large to send.
+    pub(crate) fn on_too_large(&mut self, bytes: usize) {
+        self.too_large += 1;
+        self.largest = self.largest.max(bytes);
     }
 
     /// An access unit handed to the network.
@@ -524,6 +549,14 @@ impl Sharing {
             self.encoded as f32 / secs,
             self.keyframes,
         );
+        if self.too_large > 0 {
+            let _ = write!(
+                line,
+                ", {} too large to send (up to {} KB)",
+                self.too_large,
+                self.largest / 1000
+            );
+        }
         if !self.encode.is_empty() {
             let _ = write!(
                 line,
@@ -549,15 +582,18 @@ impl Sharing {
                 self.rtt_ms
             );
         }
+        let _ = write!(line, " | bitrate {}%", state.bitrate_pct);
+        if let Some(qp) = state.qp_floor {
+            let _ = write!(line, " (QP ≥ {qp})");
+        }
         let _ = write!(
             line,
-            " | bitrate {}%, fps {}%, {} viewer{}",
-            state.bitrate_pct,
+            ", fps {}%, {} viewer{}",
             state.fps_pct,
             state.viewers,
             if state.viewers == 1 { "" } else { "s" }
         );
-        let level = if self.groups_reset > 0 || self.loss_max >= 10.0 {
+        let level = if self.groups_reset > 0 || self.loss_max >= 10.0 || self.too_large > 0 {
             Level::Warn
         } else {
             Level::Info
@@ -721,6 +757,7 @@ mod tests {
             bitrate_pct: 100,
             fps_pct: 100,
             viewers: 1,
+            qp_floor: None,
         };
         assert!(sh.poll(t0 + ms(4_000), &state).is_none());
         let (level, line) = sh.poll(t0 + SUMMARY_EVERY, &state).expect("due");
@@ -739,5 +776,45 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("1 viewer"), "{line}");
+    }
+
+    #[test]
+    fn frames_too_large_make_the_sharer_line_a_warning() {
+        let t0 = Instant::now();
+        let mut sh = Sharing::new(t0);
+        for _ in 0..300 {
+            sh.on_capture(true);
+            sh.on_sent(14_000, false);
+        }
+        sh.on_too_large(425_871);
+        sh.on_too_large(287_331);
+        let state = ShareState {
+            preset: "1080p 60fps",
+            bitrate_pct: 100,
+            fps_pct: 100,
+            viewers: 2,
+            qp_floor: Some(28),
+        };
+        let (level, line) = sh.poll(t0 + SUMMARY_EVERY, &state).expect("due");
+        assert_eq!(level, Level::Warn);
+        assert!(
+            line.contains("0 keyframes, 2 too large to send (up to 425 KB)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("bitrate 100% (QP ≥ 28), fps 100%, 2 viewers"),
+            "{line}"
+        );
+        // The next window starts clean.
+        let (level, _) = sh
+            .poll(
+                t0 + SUMMARY_EVERY * 2,
+                &ShareState {
+                    qp_floor: None,
+                    ..state
+                },
+            )
+            .expect("due");
+        assert_eq!(level, Level::Info);
     }
 }

@@ -1,8 +1,8 @@
 # baucord — iOS (v1) technical spec
 
-> **Status (2026-10-07):** 1.1.8 (Ad Hoc builds on users' iPhones).
+> **Status (2026-10-08):** 1.1.9 (Ad Hoc builds on users' iPhones).
 > §0–§13 are the first draft (decisions D1…D13 in §1); §14 holds every
-> decision since (D14…D52, in order) — **where they disagree, §14 is
+> decision since (D14…D53, in order) — **where they disagree, §14 is
 > right**. What is left:
 > `PRODUCTION-PLAN.md` (the MOB items). Start from `START-HERE.md`.
 

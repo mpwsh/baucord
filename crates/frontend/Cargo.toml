@@ -6,7 +6,7 @@ name = "frontend"
 # no behaviour change; the host-specific modules (tray, hotkeys,
 # clipboard, single instance, updater, share windows) still live here
 # behind the `desktop` feature until the platform trait replaces them.
-version = "1.1.8"
+version = "1.1.9"
 edition = "2024"
 
 [lints]

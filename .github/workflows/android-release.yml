@@ -16,7 +16,7 @@
 # them the APK is built unsigned and only uploaded as a workflow
 # artifact, never to a release or the website.
 #
-# Run workflow (Actions tab) with a release tag (v1.1.8) rebuilds that
+# Run workflow (Actions tab) with a release tag (v1.1.9) rebuilds that
 # release: the tag's code, this branch's workflow, the APK attached to
 # the existing release. That is the way out when a release's own run
 # broke on CI itself — re-running it would not help, because a release
@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "A release tag (v1.1.8) to rebuild and attach to that release; anything else is a dry run (workflow artifact only)"
+        description: "A release tag (v1.1.9) to rebuild and attach to that release; anything else is a dry run (workflow artifact only)"
         default: "manual"
 
 permissions:
@@ -54,8 +54,8 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v') && github.event.inputs.tag || '' }}
 
       # A release tag is the crates' version: every platform ships the
-      # number in its crate (SESSION-GUIDE.md §4), so a v1.1.8 tag on
-      # 1.1.7 crates would label the APK with a version the app itself
+      # number in its crate (SESSION-GUIDE.md §4), so a v1.1.9 tag on
+      # 1.1.8 crates would label the APK with a version the app itself
       # does not report. Manual dry runs (no "v" tag) skip the check.
       - name: Tag matches the crates' version
         if: startsWith(env.TAG, 'v')

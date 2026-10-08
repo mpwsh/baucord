@@ -3,7 +3,7 @@
 baucord is a voice, text and screen-sharing app in Rust: a self-hosted
 relay server (QUIC, no media mixing), a desktop client for Windows,
 macOS and Linux, and clients for Android and iPhone that run the same
-Rust engine and the same Slint UI. It is in daily use: 1.1.8 on every
+Rust engine and the same Slint UI. It is in daily use: 1.1.9 on every
 platform, desktop users on the in-app updater, Android as a sideloaded
 APK, iPhone as an Ad Hoc build, the official server in Docker.
 
@@ -122,9 +122,9 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
 - **The server's identity folder must survive every deploy** — it is
   what every client has pinned.
 
-## 5. Where things stand (2026-10-07)
+## 5. Where things stand (2026-10-08)
 
-- **Version 1.1.8** everywhere; the crate map is SESSION-GUIDE §2.
+- **Version 1.1.9** everywhere; the crate map is SESSION-GUIDE §2.
 - **Desktop**: in production (Windows mostly), self-updating.
 - **Android**: voice with the platform echo canceller, chat, DMs,
   files, stream viewing (MediaCodec), Settings → Debug, notifications

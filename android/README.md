@@ -221,7 +221,7 @@ API 36 is otherwise never sent the Back key. ANDROID-SPEC.md D29–D30.
 There is no push/PR build — day-to-day testing is local. When a GitHub
 Release is **published**, `.github/workflows/android-release.yml`
 builds the signed arm64 release APK, attaches it to the release as
-`baucord-<tag>-android-arm64.apk` (`baucord-v1.1.8-android-arm64.apk`:
+`baucord-<tag>-android-arm64.apk` (`baucord-v1.1.9-android-arm64.apk`:
 the desktop zips' pattern) and puts the same file on the website's R2
 bucket beside the zips, where the download section links it
 (versionCode = the run number, versionName = the tag without its `v`;

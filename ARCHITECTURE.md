@@ -645,7 +645,10 @@ A watched stream's video goes: the jitter buffer (3 s of frames at the
 stream's rate, so at least one keyframe interval; a frame ≥ 1 s behind
 live jumps to a newer buffered keyframe) → the screen thread decodes
 (FFmpeg and VideoToolbox to RGBA; MediaCodec hands over its YUV planes
-as they are, `video::PictureFormat`) → `FrameReady` → the frontend's
+as they are, `video::PictureFormat`, one per frame fed even when the
+codec finishes them in pairs, `video::held`; between frames
+`VideoDecoder::poll` hands out a picture still waiting once the stream
+pauses) → `FrameReady` → the frontend's
 present thread (`frontend::present`), which drains its queue, keeps
 the newest frame of each stream and only then converts or copies it,
 straight into one of the stream's three reused `SharedPixelBuffer`s
@@ -653,7 +656,10 @@ straight into one of the stream's three reused `SharedPixelBuffer`s
 newest prepared frame per stream and sets it as an `Image`. A device
 that cannot keep up shows fewer frames, never older ones: the picture
 stays live with its sound (MOB-18). Frame buffers go round
-`video::pool` instead of being allocated per frame.
+`video::pool` instead of being allocated per frame. Closing a viewer
+drops the stream's decoder, buffer and audio in the screen thread
+(`ScreenControl::StopWatching`); the next viewer starts from a
+keyframe.
 
 ### 7.4 Notifications on the phones
 

@@ -79,7 +79,7 @@ use std::{
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use rtrb::Consumer;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use rtrb::{Producer, RingBuffer};
@@ -1102,17 +1102,20 @@ impl SystemAudioCapture {
                 // stage so volume 0 counts as silence. Seq only advances
                 // on sent packets, so the receiver sees no loss — its
                 // playback ring simply underruns to silence by design.
+                // Debug, not info: a game or a video pauses its sound
+                // every few seconds (29 lines in 9 minutes of a
+                // 2026-10-08 share), and nothing is wrong when it does.
                 if peak < SILENCE_THRESHOLD {
                     silent_frames = silent_frames.saturating_add(1);
                     if silent_frames == SILENCE_HANGOVER_FRAMES {
-                        info!("System audio gate closed (silence)");
+                        debug!("System audio gate closed (silence)");
                     }
                     if silent_frames >= SILENCE_HANGOVER_FRAMES {
                         continue; // hangover elapsed — skip encode + send
                     }
                 } else {
                     if silent_frames >= SILENCE_HANGOVER_FRAMES {
-                        info!("System audio gate opened (audio resumed)");
+                        debug!("System audio gate opened (audio resumed)");
                     }
                     silent_frames = 0;
                 }

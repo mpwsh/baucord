@@ -640,6 +640,9 @@ impl AppState {
                     Ok(viewer) => {
                         viewer.set_self_audio(app.is_muted, app.is_deafened);
                         app.viewers.insert(client_id, viewer);
+                        // The screen thread first, so the stream's
+                        // frames are wanted before the server sends any.
+                        app.screen.tx.send(ScreenControl::Watch { client_id }).ok();
                         app.network
                             .tx
                             .send(NetworkControl::SubscribeScreen {
@@ -662,6 +665,10 @@ impl AppState {
         if let Some(viewer) = self.viewers.remove(&client_id) {
             viewer.close();
         }
+        self.screen
+            .tx
+            .send(ScreenControl::StopWatching { client_id })
+            .ok();
         self.network
             .tx
             .send(NetworkControl::UnsubscribeScreen {

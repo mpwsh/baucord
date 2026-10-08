@@ -256,6 +256,22 @@ What stands between this and "production for strangers":
   48 kHz first — but it is an A/V drift. The `viewing` line's `audio
   … ms queued` shows it if it happens; trim to a target like the
   phones' mix does (`stream::mix`).
+- [ ] **CLI-15 [P1][S] AMD keyframes too large to send.** On AMF
+  (FFmpeg 7.1, which cannot force an IDR, so every requested keyframe
+  is a fresh session) the session's first frame ignores the VBV and
+  `max_au_size`: 287–522 KB against the wire's 275,400 B (255 chunks ×
+  1,080 B), dropped, a new keyframe forced, too large again — a viewer
+  froze ~30 s on detailed 1080p content (2026-10-08 logs; one session
+  opened at 2.1 Mbit/s still made a 425 KB first frame, so the bitrate
+  is not the lever). 2026-10-08, 1.1.9: a frame too large raises a
+  quantizer floor (`qmin` 24 → 28 → 32 → 36) the next session opens
+  with, relaxed one step per 30 s without one; the `sharing` line
+  counts them and shows the floor. Checked with libx264 here (QP
+  15.9 → 36.0 on the first frame); whether AMF honours `MIN_QP` from
+  its first frame is for the next AMD log: after the first drop or two
+  there should be none. If it does not: FFmpeg 8's amfenc forces IDRs
+  without a new session, or a 2-byte chunk count in the video format
+  (wire v4) lifts the limit.
 - [ ] **CLI-10 [P2] Smaller client items** *(review)*: auto-reconnect
   gives up after ~60 s (5 tries) — phones on a train need longer;
   server addresses must be IP literals (no DNS — also an App Review
@@ -512,11 +528,13 @@ is not decided yet.
   thread converts only the newest picture of each stream, on up to
   four cores, straight into the UI's buffer; the cap is 3 s of frames
   at the stream's rate, and a picture ≥ 1 s behind live jumps to a
-  buffered keyframe. Next: the A07 again at 60 fps — `viewing …`
-  should read *shown* near *decoded*, *preparing* under 16 ms and
-  *behind live* flat. If the codec alone cannot keep 60, temporal
-  layers and per-viewer dropping on the server. Real A/V sync
-  (timestamps on stream audio) is separate and later.
+  buffered keyframe. The A07 then showed ~51 of 60 with its decode
+  thread half idle and *preparing* at 3.5 ms: MediaCodec handed over
+  pictures in pairs and the newest-only drain threw 15 % away
+  (3,799 of 25,539). 1.1.9 paces them instead (`video::held`, §7).
+  Next: the A07 at 60 fps once more — *decoded* and *shown* should
+  read ~60. Real A/V sync (timestamps on stream audio) is separate
+  and later.
 
 ## 5. Milestone D — product
 
@@ -642,6 +660,22 @@ is not decided yet.
   come from a stale copy in another folder. The phones gained a
   clipboard on the way (Android's `ClipboardManager`, iOS's
   pasteboard), so copying an invite code works there too.
+- **2026-10-08 — 1.1.9**: (1) MOB-18, the A07's last 15 %: MediaCodec
+  finishes pictures unevenly (none in one call, two in the next) and
+  the drain kept only the newest; now every picture waits in a
+  two-deep queue (`video::held`) and each decode call hands out the
+  oldest, so they leave at the frames' own cadence, and once the
+  stream pauses (a still screen) `VideoDecoder::poll` hands out the
+  last one instead of leaving it for the next frame. (2) CLI-15: a
+  frame too large to send raises the encoder's quantizer floor for
+  the next session. (3) Logs: the system-audio gate's open/close to
+  debug (29 lines in 9 minutes of one share); closing a viewer drops
+  the stream in the screen thread (`ScreenControl::StopWatching`), so
+  it no longer writes an empty `viewing` line every 5 s, nor polls at
+  250 Hz, until the sharer stops. The same session's logs, all three
+  lined up by Copy log's header: the PC clean (60 fps, 8 Mbit/s, no
+  abandoned groups, ladder at 100 %), the iPhone 60/60/60 at 4.4 ms a
+  frame, the A07 ~51 shown. (4) Version 1.1.9 everywhere.
 - **2026-10-08 — MOB-18, phones keep up with a stream**: from the first
   `viewing` lines of a Galaxy A07 — codec 7–10 ms a frame, our colour
   conversion 24–30 ms, and freezes. (1) *Convert only what is shown*:

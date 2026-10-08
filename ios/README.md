@@ -142,7 +142,7 @@ IDs & Profiles):
    base64 -i baucord_Ad_Hoc.mobileprovision | pbcopy  # → IOS_PROFILE_BASE64
    ```
 
-Then publish a release (`v1.1.8`, the crates' version — the workflow
+Then publish a release (`v1.1.9`, the crates' version — the workflow
 checks), or run the workflow by hand to try it; a manual run leaves
 the `.ipa` under the run's *Artifacts*. The first build takes a while
 (the whole engine for iOS); run the workflow once by hand on the
@@ -213,7 +213,7 @@ is what users get, and the one to judge speed and battery by.
 ## 5. The version
 
 The app's version is the crates' — `crates/ios/Cargo.toml`, which moves
-together with every other platform's (1.1.8 now). `run.sh` writes it
+together with every other platform's (1.1.9 now). `run.sh` writes it
 into `Config/Version.xcconfig` on every run, with the commit count as
 the build number; the cargo build phase stops with an error if the two
 ever disagree (a bump, then a build from Xcode's window before

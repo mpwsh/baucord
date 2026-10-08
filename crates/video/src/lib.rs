@@ -33,10 +33,12 @@ pub mod codec;
 
 // Android decodes with the platform's MediaCodec instead (the stub
 // above still provides the encoder, which Android does not have yet),
-// iOS with VideoToolbox. `yuv` is their step to RGBA and `annexb` the
-// re-framing VideoToolbox needs, both platform-free so they are tested
+// iOS with VideoToolbox. `yuv` is their step to RGBA, `annexb` the
+// re-framing VideoToolbox needs and `held` MediaCodec's pacing of the
+// pictures it finishes, all platform-free so they are tested
 // everywhere.
 pub mod annexb;
+pub mod held;
 #[cfg(target_os = "android")]
 pub mod mediacodec;
 pub mod pool;
@@ -440,6 +442,21 @@ pub trait VideoEncoder {
     fn supports_forced_keyframes(&self) -> bool {
         true
     }
+
+    /// The last frame came out too large to send (over
+    /// `protocol::MAX_VIDEO_FRAME_BYTES`) and was dropped: raise the
+    /// minimum quantizer the next session opens with, so the keyframe
+    /// that replaces it is smaller. Returns the new floor, or `None` when
+    /// the backend has none or the highest is already in force. The
+    /// floor relaxes on its own once frames fit again.
+    fn frame_too_large(&mut self) -> Option<u32> {
+        None
+    }
+
+    /// The minimum quantizer [`Self::frame_too_large`] put in force.
+    fn qp_floor(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Where one [`VideoDecoder::decode`] call that produced a picture
@@ -481,6 +498,19 @@ pub trait VideoDecoder {
     /// one step.
     fn last_timing(&self) -> Option<DecodeTiming> {
         None
+    }
+
+    /// A picture finished (or held back) since the last `decode`, handed
+    /// out once frames have stopped coming for a while — the sharer's
+    /// screen went still — so the last picture before a pause does not
+    /// wait for the next frame. The caller asks between frames, as often
+    /// as it likes; `Ok(None)` from backends whose `decode` hands out
+    /// every picture itself.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    fn poll(&mut self) -> Result<Option<DecodedFrame>, CodecError> {
+        Ok(None)
     }
 }
 

@@ -91,6 +91,15 @@ pub enum ScreenControl {
     },
     /// A remote peer stopped sharing — drop their decoder.
     PeerStoppedSharing { client_id: u64 },
+    /// We opened a viewer on a peer's stream: its frames are wanted
+    /// (again, after [`ScreenControl::StopWatching`]).
+    Watch { client_id: u64 },
+    /// We closed the viewer: drop the stream's decoder, buffer and
+    /// audio now, and ignore frames still in flight for it until the
+    /// next [`ScreenControl::Watch`]. Kept, a closed stream went on
+    /// writing an empty summary every 5 s, and its thread polling at
+    /// 250 Hz, until the sharer stopped (2026-10-08, both phones).
+    StopWatching { client_id: u64 },
     /// An encoded system audio packet arrived from the network for a remote peer.
     IncomingSystemAudio {
         client_id: u64,
@@ -317,6 +326,7 @@ fn report_share_telemetry(
         bitrate_pct: state.ladder.pct(),
         fps_pct: (PACE_SCALES[state.pace_idx] * 100.0).round() as u32,
         viewers: shared.stream_viewers.load(Ordering::Relaxed),
+        qp_floor: state.encoder.qp_floor(),
     };
     if let Some((level, line)) = state.log.poll(Instant::now(), &share) {
         log::log!(level, "{line}");
@@ -853,7 +863,25 @@ struct PeerStream {
     /// Lazy-initialized on the first system audio packet.
     /// Owned by the core library — screen.rs just feeds it raw Opus bytes.
     stream_audio: Option<StreamDecoder>,
+    /// The frame last fed to the decoder: what a picture handed out by
+    /// `VideoDecoder::poll` (between frames) is reported as.
+    last_fed: Option<Fed>,
 }
+
+/// One frame as fed to a decoder, for the picture that comes of it.
+#[derive(Clone, Copy)]
+struct Fed {
+    seq: u32,
+    frame_bytes: usize,
+    is_keyframe: bool,
+    /// The sender's capture timestamp (for "behind live").
+    sent_at: u32,
+    /// When the jitter buffer released it.
+    enqueued_at: Instant,
+}
+
+/// The server's viewing counters (spec §9.1).
+const VIEWING_REPORT_EVERY: Duration = Duration::from_secs(10);
 
 // ── Loop state ──────────────────────────────────────────────────────────
 
@@ -867,6 +895,8 @@ struct ScreenState {
     /// Peers whose decoder failed to initialize. Their frames are dropped
     /// (and the error reported once) instead of panicking per frame.
     decoder_failed: HashSet<u64>,
+    /// Peers whose viewer we closed: their late frames are dropped.
+    unwatched: HashSet<u64>,
     running: bool,
 }
 
@@ -883,6 +913,7 @@ fn run_screen_loop(
         capture: None,
         peer_streams: HashMap::new(),
         decoder_failed: HashSet::new(),
+        unwatched: HashSet::new(),
         running: true,
     };
     let mut next_capture = Instant::now();
@@ -984,6 +1015,62 @@ fn run_screen_loop(
     info!("Screen thread stopped");
 }
 
+/// Hand one decoded picture to the frontend, reported as the frame it
+/// came from (`fed`). `took`: the decode call that produced it; `None`
+/// for one handed out between frames by `poll`. True when the stream's
+/// viewing counters are due at the server.
+fn emit_picture(
+    client_id: u64,
+    stream: &mut PeerStream,
+    decoded: video::DecodedFrame,
+    fed: Fed,
+    took: Option<Duration>,
+    event_tx: &Sender<ScreenEvent>,
+    wake: &WakeFn,
+) -> bool {
+    let decoded_at = Instant::now();
+    stream.frames_decoded_total += 1;
+    if let Some(took) = took {
+        stream.decode_us_total += u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+    }
+    let report = decoded_at.duration_since(stream.reported_at) >= VIEWING_REPORT_EVERY;
+    if report {
+        stream.reported_at = decoded_at;
+    }
+    let behind = stream.jitter_buffer.behind_live(fed.sent_at, decoded_at);
+    let size = (decoded.width, decoded.height);
+    let line = match took {
+        Some(took) => {
+            stream
+                .log
+                .on_picture(decoded_at, stream.decoder.last_timing(), took, behind, size)
+        }
+        None => stream.log.on_held_picture(decoded_at, behind, size),
+    };
+    if let Some((level, line)) = line {
+        log::log!(level, "{line}");
+    }
+    event_tx
+        .send(ScreenEvent::FrameReady {
+            client_id,
+            width: decoded.width,
+            height: decoded.height,
+            pixels: decoded.data,
+            format: decoded.format,
+            frame_bytes: fed.frame_bytes,
+            seq: fed.seq,
+            is_keyframe: fed.is_keyframe,
+            enqueued_at: fed.enqueued_at,
+            decoded_at,
+            buffer_depth_ms: stream.jitter_buffer.depth_ms(),
+            buffer_target_ms: stream.jitter_buffer.adaptive_target_ms(),
+            buffer_jitter_ms: stream.jitter_buffer.adaptive_jitter_ms(),
+        })
+        .ok();
+    wake();
+    report
+}
+
 /// Pull packets from each peer's jitter buffer and decode them.
 ///
 /// This is the key change from the old architecture: decoding is now
@@ -1003,12 +1090,12 @@ fn drain_and_decode(
     // overflow jump-to-freshest-keyframe — skipping stale video instead
     // of replaying it, which is what a live viewer wants.
     const DECODE_BUDGET: Duration = Duration::from_millis(24);
-    /// The server's viewing counters (spec §9.1).
-    const VIEWING_REPORT_EVERY: Duration = Duration::from_secs(10);
     let mut report_viewing = false;
     for (&client_id, stream) in peer_streams.iter_mut() {
         let pass_start = Instant::now();
+        let mut fed_any = false;
         while let Some(packet) = stream.jitter_buffer.pull_next() {
+            fed_any = true;
             let seq = packet.seq;
             let is_keyframe = packet.is_keyframe;
             // Stamp the moment the buffer *released* the frame, not its
@@ -1016,9 +1103,14 @@ fn drain_and_decode(
             // (playout pacing, up to ~200 ms), and the app's per-frame
             // latency diagnostic should measure the decode/present path
             // after that hold, not the hold itself.
-            let enqueued_at = Instant::now();
-            let frame_bytes = packet.data.len();
-            let sent_at = packet.timestamp_ms;
+            let fed = Fed {
+                seq,
+                frame_bytes: packet.data.len(),
+                is_keyframe,
+                sent_at: packet.timestamp_ms,
+                enqueued_at: Instant::now(),
+            };
+            stream.last_fed = Some(fed);
 
             if is_keyframe {
                 // Flush decoder state before every keyframe. With the
@@ -1032,8 +1124,9 @@ fn drain_and_decode(
                 stream.width = packet.width;
                 stream.height = packet.height;
                 log::debug!(
-                    "Keyframe #{seq} from peer {client_id}: {frame_bytes} bytes \
+                    "Keyframe #{seq} from peer {client_id}: {} bytes \
                      (buffer depth: {:.0}ms)",
+                    fed.frame_bytes,
                     stream.jitter_buffer.depth_ms()
                 );
             }
@@ -1052,41 +1145,8 @@ fn drain_and_decode(
             stream.log.on_decode_call(took);
             match result {
                 Ok(Some(decoded)) => {
-                    let decoded_at = Instant::now();
-                    stream.frames_decoded_total += 1;
-                    stream.decode_us_total += u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
-                    if decoded_at.duration_since(stream.reported_at) >= VIEWING_REPORT_EVERY {
-                        stream.reported_at = decoded_at;
-                        report_viewing = true;
-                    }
-                    let behind = stream.jitter_buffer.behind_live(sent_at, decoded_at);
-                    if let Some((level, line)) = stream.log.on_picture(
-                        decoded_at,
-                        stream.decoder.last_timing(),
-                        took,
-                        behind,
-                        (decoded.width, decoded.height),
-                    ) {
-                        log::log!(level, "{line}");
-                    }
-                    event_tx
-                        .send(ScreenEvent::FrameReady {
-                            client_id,
-                            width: decoded.width,
-                            height: decoded.height,
-                            pixels: decoded.data,
-                            format: decoded.format,
-                            frame_bytes,
-                            seq,
-                            is_keyframe,
-                            enqueued_at,
-                            decoded_at,
-                            buffer_depth_ms: stream.jitter_buffer.depth_ms(),
-                            buffer_target_ms: stream.jitter_buffer.adaptive_target_ms(),
-                            buffer_jitter_ms: stream.jitter_buffer.adaptive_jitter_ms(),
-                        })
-                        .ok();
-                    wake();
+                    report_viewing |=
+                        emit_picture(client_id, stream, decoded, fed, Some(took), event_tx, wake);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1095,6 +1155,18 @@ fn drain_and_decode(
             }
             if pass_start.elapsed() >= DECODE_BUDGET {
                 break;
+            }
+        }
+        // No frame this pass: a picture the decoder still holds goes out
+        // once the stream has paused (`VideoDecoder::poll`).
+        if !fed_any && let Some(fed) = stream.last_fed {
+            match stream.decoder.poll() {
+                Ok(Some(decoded)) => {
+                    report_viewing |=
+                        emit_picture(client_id, stream, decoded, fed, None, event_tx, wake);
+                }
+                Ok(None) => {}
+                Err(e) => warn!("Decode error for peer {client_id} (between frames): {e}"),
             }
         }
 
@@ -1295,8 +1367,9 @@ fn handle_control(
             data,
         } => {
             // Decoder init already failed for this peer — drop their
-            // frames until they start a new share session.
-            if st.decoder_failed.contains(&client_id) {
+            // frames until they start a new share session. Or we closed
+            // its viewer and these are the last ones on their way.
+            if st.decoder_failed.contains(&client_id) || st.unwatched.contains(&client_id) {
                 return;
             }
 
@@ -1320,6 +1393,7 @@ fn handle_control(
                             decode_us_total: 0,
                             reported_at: Instant::now(),
                             log: Viewing::new(client_id, Instant::now()),
+                            last_fed: None,
                         });
                     }
                     Err(e) => {
@@ -1370,11 +1444,25 @@ fn handle_control(
             wake();
         }
 
+        ScreenControl::Watch { client_id } => {
+            st.unwatched.remove(&client_id);
+        }
+
+        ScreenControl::StopWatching { client_id } => {
+            // As below: the decoder, the buffer and the stream's audio
+            // go; a new viewer starts from the next keyframe.
+            st.unwatched.insert(client_id);
+            if st.peer_streams.remove(&client_id).is_some() {
+                log::debug!("stopped decoding peer {client_id}: viewer closed");
+            }
+        }
+
         ScreenControl::PeerStoppedSharing { client_id } => {
             // Dropping the PeerStream also drops StreamDecoder,
             // which stops the decode thread + playback pipeline.
             st.peer_streams.remove(&client_id);
             st.decoder_failed.remove(&client_id);
+            st.unwatched.remove(&client_id);
             event_tx
                 .send(ScreenEvent::PeerStoppedSharing { client_id })
                 .ok();
@@ -1386,7 +1474,9 @@ fn handle_control(
             seq,
             data,
         } => {
-            decode_incoming_system_audio(client_id, seq, data, &mut st.peer_streams);
+            if !st.unwatched.contains(&client_id) {
+                decode_incoming_system_audio(client_id, seq, data, &mut st.peer_streams);
+            }
         }
 
         ScreenControl::SetStreamVolume { client_id, volume } => {
@@ -1632,14 +1722,26 @@ fn capture_and_encode(
         // A frame the chunker can't carry must not become a silent seq
         // gap: every viewer would freeze and burn a PLI round trip
         // (~700 ms) recovering. Drop it AND restart the GOP on the next
-        // frame — a one-frame hiccup instead. (Rate control also reacts
-        // to the oversized frame, so the retried IDR comes out smaller.)
+        // frame — a one-frame hiccup instead. The retried keyframe is
+        // not smaller by itself: on AMF it is a fresh session's first
+        // frame, which ignores rate control (2026-10-08: 287–522 KB in
+        // a row, 425 KB from a session at 2.1 Mbit/s). So the encoder
+        // raises its quantizer floor first, and the replacement opens
+        // with it.
         if encoded.data.len() > protocol::MAX_VIDEO_FRAME_BYTES {
-            warn!(
-                "Encoded frame seq={seq} too large to send ({} bytes, max {}) — dropping and forcing a fresh keyframe",
-                encoded.data.len(),
-                protocol::MAX_VIDEO_FRAME_BYTES,
-            );
+            state.log.on_too_large(encoded.data.len());
+            match state.encoder.frame_too_large() {
+                Some(qp) => warn!(
+                    "encoded frame seq={seq} too large to send ({} KB, max {} KB): \
+                     keyframes now encode at QP ≥ {qp}",
+                    encoded.data.len() / 1000,
+                    protocol::MAX_VIDEO_FRAME_BYTES / 1000,
+                ),
+                None => log::debug!(
+                    "encoded frame seq={seq} too large to send ({} bytes) — dropped",
+                    encoded.data.len()
+                ),
+            }
             state.forced_keyframes += 1;
             state.encoder.force_keyframe();
             if !state.encoder.supports_forced_keyframes() {

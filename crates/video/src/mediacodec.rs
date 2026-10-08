@@ -18,9 +18,13 @@
 //!   the first keyframe, whose `EncodedFrame` carries the size.
 //! - Every decode queues the Annex-B access unit (SPS/PPS ride in-band
 //!   before each IDR — the encoders make sure of that) and takes back
-//!   whatever pictures are finished, newest wins. Hardware decoders
-//!   finish a frame a few ms after it goes in, so a short wait catches
-//!   most; the rest come out one call later.
+//!   whatever pictures are finished. Hardware decoders finish a frame a
+//!   few ms after it goes in, so a short wait catches most; the rest
+//!   come out one call later, sometimes two at once. They wait in
+//!   [`HeldPictures`] and each call hands out the oldest, so none is
+//!   thrown away for arriving with another (`held`'s docs: 15 % of a
+//!   60 fps stream was); between frames [`VideoDecoder::poll`] hands
+//!   out the last one once the stream pauses.
 //! - `flush()` is a no-op: the client calls it before every IDR as a
 //!   belt-and-braces reset, and an IDR already resets the reference
 //!   state; an `AMediaCodec_flush` there would discard the two or three
@@ -41,6 +45,7 @@ use ndk::media::{
 };
 
 use crate::{
+    held::HeldPictures,
     yuv::{self, ColorSpec, Matrix, Range, Yuv420Layout},
     CodecError, DecodeTiming, DecodedFrame, EncodedFrame, PictureFormat, VideoDecoder,
 };
@@ -62,9 +67,10 @@ const BUFFER_FLAG_CODEC_CONFIG: u32 = 2;
 /// are released, which every decode call does, so waiting longer than
 /// this means the codec is stuck.
 const INPUT_WAIT: Duration = Duration::from_millis(10);
-/// How long to wait for the picture of the frame just queued. Long
-/// enough for a hardware decoder's usual turnaround at 1080p, short
-/// enough that a slow one costs latency, not thread time.
+/// How long to wait for the picture of the frame just queued, when no
+/// earlier one is waiting to be handed out instead. Long enough for a
+/// hardware decoder's usual turnaround at 1080p, short enough that a
+/// slow one costs latency, not thread time.
 const OUTPUT_WAIT: Duration = Duration::from_millis(4);
 /// Synthetic presentation timestamps (the client stamps 0; decoders
 /// want them increasing).
@@ -93,9 +99,10 @@ pub struct MediaCodecDecoder {
     /// first picture (or after the codec reports a format change).
     layout: Option<Yuv420Layout>,
     color: ColorSpec,
+    /// Finished pictures not handed out yet, and the stream's cadence.
+    held: HeldPictures,
     frames_in: u64,
     frames_out: u64,
-    frames_superseded: u64,
     /// Rebuild the codec at the next keyframe.
     needs_reset: bool,
     waiting_logged: bool,
@@ -125,9 +132,9 @@ impl MediaCodecDecoder {
             codec: None,
             layout: None,
             color: ColorSpec::default(),
+            held: HeldPictures::new(),
             frames_in: 0,
             frames_out: 0,
-            frames_superseded: 0,
             needs_reset: false,
             waiting_logged: false,
             output_spent: Duration::ZERO,
@@ -137,9 +144,11 @@ impl MediaCodecDecoder {
 
     /// (Re)build the codec for a stream of `width × height`.
     fn configure(&mut self, width: u32, height: u32) -> Result<(), CodecError> {
-        // Release the old instance before creating the new one.
+        // Release the old instance before creating the new one; its
+        // pictures belong to the stream before the keyframe.
         self.codec = None;
         self.layout = None;
+        self.held.clear();
         let codec = MediaCodec::from_decoder_type(MIME)
             .ok_or_else(|| CodecError::DecoderInit(format!("no {MIME} decoder on this device")))?;
         let mut format = MediaFormat::new();
@@ -228,8 +237,10 @@ impl Drop for MediaCodecDecoder {
     fn drop(&mut self) {
         if self.frames_in > 0 {
             info!(
-                "MediaCodec: {} frames in, {} pictures out, {} superseded before display",
-                self.frames_in, self.frames_out, self.frames_superseded
+                "MediaCodec: {} frames in, {} pictures out, {} passed over for newer ones",
+                self.frames_in,
+                self.frames_out,
+                self.held.passed_over()
             );
         }
     }
@@ -257,12 +268,12 @@ impl VideoDecoder for MediaCodecDecoder {
             self.configure(size.0, size.1)?;
         }
 
+        self.held.on_frame(started);
         // Feed, then collect. A codec with no free input buffer is
         // holding finished pictures: collect those first, then retry.
-        let mut early = None;
         let mut fed = Self::feed(&self.running().codec, encoded, self.frames_in);
         if matches!(fed, Err(FeedError::Busy)) {
-            early = self.collect(Duration::ZERO)?;
+            self.collect(Duration::ZERO)?;
             fed = Self::feed(&self.running().codec, encoded, self.frames_in);
         }
         match fed {
@@ -279,16 +290,15 @@ impl VideoDecoder for MediaCodecDecoder {
             }
         }
 
-        let picture = match self.collect(OUTPUT_WAIT)? {
-            Some(frame) => {
-                if let Some(older) = early {
-                    self.frames_superseded += 1;
-                    self.return_buffer(older.data);
-                }
-                Some(frame)
-            }
-            None => early,
+        // A picture already waiting goes out now; no need to wait for
+        // this frame's, which the next call (or poll) collects.
+        let wait = if self.held.is_empty() {
+            OUTPUT_WAIT
+        } else {
+            Duration::ZERO
         };
+        self.collect(wait)?;
+        let picture = self.held.hand_out();
         if picture.is_some() {
             self.last_timing = Some(DecodeTiming {
                 codec: started.elapsed().saturating_sub(self.output_spent),
@@ -309,21 +319,30 @@ impl VideoDecoder for MediaCodecDecoder {
     fn flush(&mut self) {
         // Deliberately nothing — see the module docs.
     }
+
+    fn poll(&mut self) -> Result<Option<DecodedFrame>, CodecError> {
+        if self.codec.is_none() || self.needs_reset || !self.held.idle(Instant::now()) {
+            return Ok(None);
+        }
+        self.collect(Duration::ZERO)?;
+        Ok(self.held.hand_out())
+    }
 }
 
 impl MediaCodecDecoder {
-    /// Take every finished picture out of the codec, copy out the
-    /// newest and release them all. `first_wait` bounds the wait for
-    /// the first; later ones are only taken if already there.
-    fn collect(&mut self, first_wait: Duration) -> Result<Option<DecodedFrame>, CodecError> {
+    /// Take every finished picture out of the codec, in order: each is
+    /// copied out, its buffer released, and the copy queued in `held`.
+    /// `first_wait` bounds the wait for the first; later ones are only
+    /// taken if already there.
+    fn collect(&mut self, first_wait: Duration) -> Result<(), CodecError> {
         // Split borrows: the output buffers borrow the codec, while the
-        // layout cache and colour spec are written here.
+        // layout cache, colour spec and queue are written here.
         let Self {
             codec,
             layout,
             color,
+            held,
             frames_out,
-            frames_superseded,
             needs_reset,
             output_spent,
             ..
@@ -332,18 +351,38 @@ impl MediaCodecDecoder {
         let codec = &running.codec;
         let hint = (running.width, running.height);
 
-        let mut newest: Option<OutputBuffer<'_>> = None;
         let mut wait = first_wait;
         loop {
             match codec.dequeue_output_buffer(wait) {
                 Ok(DequeuedOutputBufferInfoResult::Buffer(buf)) => {
                     let info = buf.info();
-                    let skip = info.size() <= 0 || info.flags() & BUFFER_FLAG_CODEC_CONFIG != 0;
-                    if skip {
+                    if info.size() <= 0 || info.flags() & BUFFER_FLAG_CODEC_CONFIG != 0 {
                         let _ = codec.release_output_buffer(buf, false);
-                    } else if let Some(prev) = newest.replace(buf) {
-                        *frames_superseded += 1;
-                        let _ = codec.release_output_buffer(prev, false);
+                    } else {
+                        let copying = Instant::now();
+                        let result = take_planes(&buf, layout, color, hint);
+                        *output_spent += copying.elapsed();
+                        let _ = codec.release_output_buffer(buf, false);
+                        match result {
+                            Ok(frame) => {
+                                *frames_out += 1;
+                                if *frames_out == 1 {
+                                    info!(
+                                        "MediaCodec: first picture {}x{}",
+                                        frame.width, frame.height
+                                    );
+                                }
+                                held.push(frame);
+                            }
+                            Err(e) => {
+                                // A layout we can't read won't fix
+                                // itself; let the next keyframe rebuild
+                                // the codec and re-describe.
+                                *layout = None;
+                                *needs_reset = true;
+                                return Err(e);
+                            }
+                        }
                     }
                 }
                 Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
@@ -356,39 +395,13 @@ impl MediaCodecDecoder {
                 Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged) => {}
                 Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => break,
                 Err(e) => {
-                    if let Some(buf) = newest.take() {
-                        let _ = codec.release_output_buffer(buf, false);
-                    }
                     *needs_reset = true;
                     return Err(CodecError::Decode(format!("dequeueOutputBuffer: {e:?}")));
                 }
             }
             wait = Duration::ZERO;
         }
-
-        let Some(buf) = newest else {
-            return Ok(None);
-        };
-        let copying = Instant::now();
-        let result = take_planes(&buf, layout, color, hint);
-        *output_spent += copying.elapsed();
-        let _ = codec.release_output_buffer(buf, false);
-        match result {
-            Ok(frame) => {
-                *frames_out += 1;
-                if *frames_out == 1 {
-                    info!("MediaCodec: first picture {}x{}", frame.width, frame.height);
-                }
-                Ok(Some(frame))
-            }
-            Err(e) => {
-                // A layout we can't read won't fix itself; let the
-                // next keyframe rebuild the codec and re-describe.
-                *layout = None;
-                *needs_reset = true;
-                Err(e)
-            }
-        }
+        Ok(())
     }
 }
 

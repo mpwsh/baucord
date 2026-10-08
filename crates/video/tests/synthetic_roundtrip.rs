@@ -255,3 +255,51 @@ fn avcc_reframing_keeps_every_picture() {
     assert!(keyframes >= 1, "no keyframe in 75 frames");
     assert!(compared >= 70, "only {compared} pictures compared");
 }
+
+/// A frame too large to send raises a quantizer floor that the next
+/// session opens with (`qmin`), and the encoder honours it from the
+/// first frame: the remedy for AMF's oversized first-frame IDRs
+/// (`codec::QP_FLOORS`), checked on whichever encoder this machine has
+/// (libx264 in CI). Content the rate control would spend freely on —
+/// here a gradient, which it encodes at a low QP — comes out far
+/// smaller under the floor. (Content already at a high QP is not
+/// changed: the floor only bounds the top quality.)
+#[test]
+fn a_quantizer_floor_shrinks_the_first_keyframe() {
+    let quality = Quality::HD30;
+    let mut plain = match FfmpegEncoder::new(quality) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("SKIP: no usable H.264 encoder in this environment: {e}");
+            return;
+        }
+    };
+    let (w, h) = (quality.width(), quality.height());
+    let first_keyframe = |enc: &mut FfmpegEncoder| -> usize {
+        for i in 0..10u32 {
+            let out = enc
+                .encode(&synth_frame(w, h, u64::from(i), u64::from(i) * 33))
+                .expect("encode");
+            if let Some(k) = out.iter().find(|f| f.is_keyframe) {
+                return k.data.len();
+            }
+        }
+        panic!("no keyframe in 10 frames");
+    };
+    let unbounded = first_keyframe(&mut plain);
+
+    let mut floored = FfmpegEncoder::new(quality).expect("second encoder");
+    assert_eq!(floored.qp_floor(), None);
+    let mut floor = None;
+    while let Some(q) = floored.frame_too_large() {
+        floor = Some(q);
+    }
+    assert_eq!(floor, Some(36), "steps up to the highest floor, then stops");
+    assert_eq!(floored.qp_floor(), Some(36));
+    let bounded = first_keyframe(&mut floored);
+    eprintln!("keyframe: {unbounded} bytes, {bounded} at QP ≥ 36");
+    assert!(
+        bounded * 2 < unbounded,
+        "QP ≥ 36 keyframe {bounded} bytes, unbounded {unbounded}"
+    );
+}

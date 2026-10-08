@@ -242,6 +242,7 @@ ten-line parity script over the `.ftl` keys is worth re-running.
 | 1.1.6 | the `frontend` split (the UI logic shared by every host; `desktop` is `main.rs`), dropping files from the OS onto the window, the tech-debt cycles (clippy clean at `deny`), drag-to-move and badge fixes |
 | 1.1.7 | the Android client (sideloaded; voice, chat, DMs, files, stream viewing through MediaCodec, the in-window Settings and stream pages), the iPhone client (Ad Hoc; the same, VideoToolbox), echo cancellation (Windows, Android, iOS VPIO), Slint 1.18.1, the battery work (no polling workers, nothing drawn in the background), the stream page (zoom, fill, rotate), Settings → Debug (log upload), the one-row sidebar header, notifications on the phones |
 | 1.1.8 | Windows asks not to lower other apps while in voice (AEC-SPEC E11, the vendored `wasapi`); the phones open the microphone only in a voice room and unmuted (ANDROID-SPEC D53, IOS-SPEC D51); the APK on the website, named like the desktop zips (D55); the Android release workflow on maintained actions, with *Run workflow* able to rebuild a release (D54) |
+| 1.1.9 | phones keep up with a 60 fps stream (MOB-18: only the shown picture is converted, on several cores, into reused buffers; MediaCodec's pictures paced instead of dropped; a jitter buffer that holds a keyframe interval); stream audio through the call path on phones (MOB-12); the `viewing …` / `sharing …` stream logs; Settings → Debug → *Copy log*, and a clipboard on the phones; Windows audio that recovers from a device that came back (CLI-12, CLI-9); the video ladder reading a collapsed uplink (CLI-13); a quantizer floor after AMD keyframes too large to send (CLI-15) |
 
 Memory-mode servers (persistence off) still use the legacy
 `ImageMessage` relay for pictures and refuse files.
@@ -462,7 +463,9 @@ Memory-mode servers (persistence off) still use the legacy
   groups, path loss up to 0%, rtt 45 ms | bitrate 100%, fps 100%, 1
   viewer`: offered far above sent with groups abandoned = the uplink;
   the bitrate ladder should be stepping down (`bitrate ladder:`
-  lines).
+  lines). `N too large to send (up to X KB)` and `bitrate 100% (QP ≥
+  28)`: the encoder made frames over the wire's 275 KB and runs with
+  a quantizer floor until they fit (CLI-15, AMD mostly).
 - The platform-free half of a platform feature goes in its own module
   with host tests (`video::yuv` for MediaCodec's planes → RGBA): it is
   the only part the assistant can run here, and `rustc --test` on the
