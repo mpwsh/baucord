@@ -8,6 +8,7 @@ name = "frontend"
 # behind the `desktop` feature until the platform trait replaces them.
 version = "1.2.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [lints]
 workspace = true
@@ -48,6 +49,9 @@ audio = { path = "../audio", features = ["serde"] }
 video = { path = "../video" }
 app-core = { path = "../app-core" }
 ui = { path = "../ui" }
+# Settings → Open-source licenses reads licenses.json.
+serde.workspace = true
+serde_json = "1.0"
 slint.workspace = true
 # Raw winit window events: the OS invalidates window surfaces on
 # focus/reveal transitions that Slint's damage tracking can't see;

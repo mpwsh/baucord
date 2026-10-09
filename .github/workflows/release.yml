@@ -21,9 +21,22 @@ env:
   # (see the macOS steps) for the same reason — and so released binaries
   # don't require users to have brewed FFmpeg dylibs at all.
   VCPKG_COMMIT: 34823ada10080ddca99b60e85f80f55e18a44eea # ffmpeg 7.1.2
+  # x264 for the Linux and macOS static FFmpeg: the stable-branch commit
+  # the pinned vcpkg builds on Windows (0.164.3108). The desktop builds
+  # are GPL because of it, and their notices (Settings → Licenses,
+  # web/licenses.html; the `x264` entry in scripts/licenses.py) name this
+  # exact source: change both together, and the cache keys below with it.
+  X264_COMMIT: 31e19f92f00c7003fa115047ce50978bc98c3a0d
 
 jobs:
+  # The third-party notices, refreshed from this commit's Cargo.lock
+  # before anything builds; every platform embeds the same list
+  # (licenses.yml).
+  licenses:
+    uses: ./.github/workflows/licenses.yml
+
   build:
+    needs: licenses
     strategy:
       matrix:
         include:
@@ -66,6 +79,13 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
+      # Settings → Licenses as of this commit (the licenses job): the
+      # committed copy may lag behind Cargo.lock.
+      - name: Third-party notices, refreshed
+        uses: actions/download-artifact@v8
+        with:
+          name: licenses
+          path: .
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         # No sudo: the ubuntu:22.04 container runs as root. The bare
@@ -140,7 +160,7 @@ jobs:
           # the 24.04 VM's glibc 2.39 headers — its objects EMBED
           # 2.38+ versioned symbol refs and would re-poison the
           # container build if restored.
-          key: ffmpeg-static-7.1.1-x264-${{ runner.os }}-${{ runner.arch }}-ubuntu2204-container-v4
+          key: ffmpeg-static-7.1.1-x264-${{ env.X264_COMMIT }}-${{ runner.os }}-${{ runner.arch }}-ubuntu2204-container-v4
 
       - name: Build static FFmpeg 7.1.1 + x264 (Linux)
         if: runner.os == 'Linux' && steps.ffmpeg-static-linux-cache.outputs.cache-hit != 'true'
@@ -154,8 +174,9 @@ jobs:
           PREFIX="$HOME/ffmpeg-static"
           mkdir -p "$PREFIX" /tmp/ffbuild
           cd /tmp/ffbuild
-          git clone --depth 1 https://code.videolan.org/videolan/x264.git
+          git clone https://code.videolan.org/videolan/x264.git
           cd x264
+          git checkout "$X264_COMMIT"
           ./configure --prefix="$PREFIX" --enable-static --enable-pic --disable-cli --disable-opencl
           make -j"$(nproc)"
           make install
@@ -199,7 +220,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/ffmpeg-static
-          key: ffmpeg-static-7.1.1-x264-${{ runner.os }}-${{ runner.arch }}-v3
+          key: ffmpeg-static-7.1.1-x264-${{ env.X264_COMMIT }}-${{ runner.os }}-${{ runner.arch }}-v3
 
       # Every macOS compile — x264, FFmpeg, and cargo's own C/ObjC
       # dependencies — targets 11.0. Without it clang defaults to the
@@ -221,8 +242,9 @@ jobs:
           PREFIX="$HOME/ffmpeg-static"
           mkdir -p "$PREFIX" /tmp/ffbuild
           cd /tmp/ffbuild
-          git clone --depth 1 https://code.videolan.org/videolan/x264.git
+          git clone https://code.videolan.org/videolan/x264.git
           cd x264
+          git checkout "$X264_COMMIT"
           ./configure --prefix="$PREFIX" --enable-static --disable-cli --disable-opencl
           make -j"$(sysctl -n hw.ncpu)"
           make install
@@ -416,6 +438,8 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
+          # The builds' zips (not the licenses job's notices).
+          pattern: baucord-v*
           merge-multiple: true
       - name: Guard — release tag must match crate version
         # The R2 `version` file and asset names come from Cargo.toml; a

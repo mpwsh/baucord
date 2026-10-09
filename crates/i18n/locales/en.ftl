@@ -904,3 +904,15 @@ activity-show = Activity
 activity-hide = Back to messages
 activity-empty-title = No activity yet
 activity-empty = Joins, leaves, channel moves and screen shares appear here while you're connected.
+
+# ── Settings → Licenses (1.2) ──────────────────────────────
+tab-licenses = Licenses
+licenses-title = Open-source licenses
+licenses-lead = baucord is free software under the Apache License 2.0, built on the open-source work below. Each part keeps its own license; open one to read it.
+licenses-section-components = Components
+licenses-section-crates = Rust crates ({ $count })
+licenses-crates-count = { $count ->
+    [one] 1 crate
+   *[other] { $count } crates
+}
+licenses-used-by = Used by: { $crates }

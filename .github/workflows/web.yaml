@@ -9,12 +9,28 @@ on:
       - "config/baucord.example.yaml"
       - "scripts/setup.sh"
       - "scripts/monitor-net.sh"
+      # web/licenses.html follows the dependencies (licenses.yml).
+      - "Cargo.lock"
+      - "about.toml"
+      - "licenses/**"
+      - "scripts/licenses.py"
   workflow_run:
     workflows: ["Build and Release"]
     types: [completed]
 
 jobs:
+  # web/licenses.html, refreshed from the same commit's Cargo.lock as
+  # the apps' list (licenses.yml).
+  licenses:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    uses: ./.github/workflows/licenses.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
+
   deploy:
+    needs: licenses
     runs-on: ubuntu-latest
     # Only run if: push to main OR the build workflow succeeded
     if: >-
@@ -24,6 +40,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
+      - name: The licenses page, refreshed
+        uses: actions/download-artifact@v8
+        with:
+          name: licenses
+          path: .
       - name: Stamp version into the page and its translations
         run: |
           VERSION=$(grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')

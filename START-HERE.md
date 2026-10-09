@@ -115,6 +115,11 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
 - **The eight public crates share one version** (`protocol`,
   `transport`, `client`, `server`, `frontend`, `desktop`, `android`,
   `ios`); `cargo test -p protocol --test versions` enforces it.
+- **A new native library** (C code, bundled data, icons, fonts) goes
+  into `COMPONENTS` in `scripts/licenses.py` with its license file in
+  `licenses/native/`. Crates need nothing: CI refreshes the notices
+  (Settings → Licenses, web/licenses.html) before every build and
+  deploy (licenses/README.md).
 - **Every new string** goes into all three Fluent catalogs (en, es-AR,
   pt-BR). A string the Slint side shows is also a name in `tr.slint`
   (no text there): `frontend/build.rs` generates its line of `fill_tr`

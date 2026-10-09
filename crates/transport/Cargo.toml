@@ -2,6 +2,7 @@
 name = "transport"
 version = "1.2.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "Sans-IO QUIC transport for baucord: quinn-proto driven from the existing threads, lane mapping, identity pinning, and an in-process simulation harness."
 
 [lints]

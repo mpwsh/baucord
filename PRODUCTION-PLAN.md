@@ -328,16 +328,27 @@ What stands between this and "production for strangers":
   a source offer. Either way: pin the x264 commit, checksum the FFmpeg
   tarball, configure FFmpeg with `--disable-everything` plus only what
   is used (also less attack surface). Decision: §6, 1.
-- [ ] **LEG-2 [P0][S] Slint's licence terms.** Slint is GPLv3,
-  royalty-free (attribution: the `AboutSlint` widget in an About
-  screen, or the "Made with Slint" badge where the app is downloaded)
-  or commercial. Neither attribution exists (About lists "Slint" as
-  text, `settings.slint` AboutPanel; `web/index.html`). Pick the licence
-  (§6, 1) and add `AboutSlint {}` to the About panel and the badge to
-  the site.
-- [ ] **LEG-3 [P0][S] No third-party notices anywhere.** Generate them
-  (cargo-about, plus FFmpeg/x264/Skia/Opus texts), ship them in every
-  zip, APK and IPA, and show them in About.
+  **Decided 2026-10-09: (b).** baucord stays Apache-2.0; a desktop
+  build as a whole is GPL-3.0, and the notices (LEG-3) say so, carry
+  the GPL texts and name the exact sources; x264 is pinned
+  (`X264_COMMIT`, the commit vcpkg builds on Windows). Left: checksum
+  the FFmpeg tarball, and the `--disable-everything` trim.
+- [x] **LEG-2 [P0][S] Slint's licence terms.** Done 2026-10-09 (1.2):
+  taken under the royalty-free licence 2.0 on every platform (not the
+  GPL, which the iOS build cannot carry), with its condition met by the
+  `AboutSlint` widget in Settings → About (the windows force the
+  style's dark palette so it draws for the dark UI). Decided: baucord
+  stays Apache-2.0.
+- [x] **LEG-3 [P0][S] Third-party notices.** Done 2026-10-09 (1.2):
+  `scripts/licenses.py` (cargo-about over every shipped target, plus
+  `licenses/native/` for Skia and what it bundles, FFmpeg and x264,
+  libopus, the encoder headers, Lucide, Slint) writes them into the
+  apps — Settings → Licenses, every part with its full text — and
+  `web/licenses.html`, linked from every page's footer. The desktop
+  builds are GPL-3.0 as a whole (FFmpeg and x264, GPL-2.0+); the
+  notices say so and name the exact sources (x264 now pinned,
+  `X264_COMMIT`). CI refreshes them (`licenses.yml`) before every
+  release build and site deploy, so they cannot go stale.
 - [ ] **LEG-4 [P1] H.264 patent licensing** for encoding/decoding on the
   desktop — a question for counsel, not code.
 - [ ] **LEG-5 [P0 for stores][S–M] A privacy policy and the stores' data

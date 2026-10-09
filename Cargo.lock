@@ -2148,6 +2148,8 @@ dependencies = [
  "pollster 1.0.1",
  "rfd",
  "self-replace",
+ "serde",
+ "serde_json",
  "slint",
  "sysinfo",
  "transport",

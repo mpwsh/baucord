@@ -2,7 +2,8 @@
 // live loops (8 Hz level meters, keybind capture).
 
 use std::{
-    cell::Cell,
+    cell::{Cell, OnceCell, RefCell},
+    collections::HashSet,
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
@@ -17,8 +18,8 @@ use client::{
 use i18n::t;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use ui::{
-    BlockedRow, KeybindRow, MainWindow, ServerRow, SettingsLogic, SettingsState, SettingsWindow,
-    State,
+    BlockedRow, KeybindRow, LicenseRow, MainWindow, ServerRow, SettingsLogic, SettingsState,
+    SettingsWindow, State,
 };
 
 use crate::app::{self, AppState};
@@ -140,8 +141,8 @@ fn route_label(name: &str) -> String {
 }
 
 /// Nav index of the Servers tab (Profile 0, General 1, Audio 2,
-/// Sounds 3, Keyboard 4, Servers 5, Credits 6, About 7, Debug 8) — the
-/// connect view's pencil jumps here. Mirrors the `NavItem`s in
+/// Sounds 3, Keyboard 4, Servers 5, Credits 6, About 7, Debug 8,
+/// Licenses 9) — the connect view's pencil jumps here. Mirrors the `NavItem`s in
 /// settings.slint.
 pub const TAB_SERVERS: i32 = 5;
 /// Nav index of the Debug tab, whose log view the settings timer
@@ -707,6 +708,7 @@ pub fn populate(app: &mut AppState) {
 
     set_credits(&s);
     set_about(&s);
+    set_licenses(&s);
 }
 
 /// Wire `SettingsLogic` callbacks (once per surface).
@@ -765,6 +767,13 @@ fn wire(sf: &SettingsSurface<'_>) {
             app.profile_dirty = true;
             app.update_user_list();
             app.refresh_own_rows();
+        });
+    });
+    logic.on_license_toggled(|entry| {
+        app::with_current(move |app| {
+            if let (Some(sf), Ok(entry)) = (surface(app), usize::try_from(entry)) {
+                toggle_license(&sf.state(), entry);
+            }
         });
     });
     logic.on_avatar_pick(|| {
@@ -1755,4 +1764,196 @@ fn set_about(s: &ui::SettingsState) {
     .collect();
     s.set_about_head(head.into());
     s.set_about_tech(format!("{}\n{}", t!("about-built-with"), tech.join("\n")).into());
+}
+
+// ── Licenses (1.2) ──────────────────────────────────────────────────────
+
+/// What baucord ships and under which licenses: `scripts/licenses.py`
+/// writes it from Cargo.lock (through cargo-about) and licenses/native,
+/// the same list as web/licenses.html. CI rewrites this file before
+/// every release build (.github/workflows/licenses.yml), so a shipped
+/// app always lists what it was built from.
+const NOTICES: &str = include_str!("../licenses.json");
+
+#[derive(serde::Deserialize)]
+struct Notices {
+    crate_count: usize,
+    components: Vec<NoticeEntry>,
+    crates: Vec<NoticeEntry>,
+    /// Each distinct license text once, as paragraphs.
+    texts: Vec<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct NoticeEntry {
+    name: String,
+    #[serde(default)]
+    license: String,
+    #[serde(default)]
+    count: usize,
+    blocks: Vec<NoticeBlock>,
+}
+
+#[derive(serde::Deserialize)]
+struct NoticeBlock {
+    note: String,
+    text: Option<usize>,
+}
+
+impl Notices {
+    /// Components first, then the license groups: the index a row's
+    /// `entry` carries.
+    fn entry(&self, index: usize) -> Option<(&NoticeEntry, bool)> {
+        self.components.get(index).map(|e| (e, false)).or_else(|| {
+            index
+                .checked_sub(self.components.len())
+                .and_then(|i| self.crates.get(i))
+                .map(|e| (e, true))
+        })
+    }
+}
+
+thread_local! {
+    /// Parsed the first time Settings opens, kept for the run.
+    static NOTICES_DATA: OnceCell<Option<Notices>> = const { OnceCell::new() };
+    /// The entries open in the list, kept across a language change.
+    static LICENSES_OPEN: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+fn with_notices<R>(f: impl FnOnce(&Notices) -> R) -> Option<R> {
+    NOTICES_DATA.with(|cell| {
+        cell.get_or_init(|| {
+            serde_json::from_str(NOTICES)
+                .map_err(|e| log::warn!("licenses.json: {e}"))
+                .ok()
+        })
+        .as_ref()
+        .map(f)
+    })
+}
+
+/// The row for entry `index`, open or not.
+fn license_entry_row(notices: &Notices, index: usize, open: bool) -> Option<LicenseRow> {
+    let (entry, is_crates) = notices.entry(index)?;
+    let detail = if is_crates {
+        t!("licenses-crates-count", "count" => entry.count)
+    } else {
+        entry.license.clone()
+    };
+    Some(LicenseRow {
+        kind: 1,
+        text: entry.name.as_str().into(),
+        detail: detail.into(),
+        open,
+        entry: i32::try_from(index).unwrap_or(-1),
+    })
+}
+
+/// What an open entry shows under it: each block's note (copyright and
+/// source, or the crates), then its text paragraph by paragraph.
+fn license_body_rows(notices: &Notices, index: usize) -> Vec<LicenseRow> {
+    let Some((entry, is_crates)) = notices.entry(index) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for block in &entry.blocks {
+        if !block.note.is_empty() {
+            let note = if is_crates {
+                t!("licenses-used-by", "crates" => block.note.as_str())
+            } else {
+                block.note.clone()
+            };
+            rows.push(LicenseRow {
+                kind: 2,
+                text: note.into(),
+                ..LicenseRow::default()
+            });
+        }
+        if let Some(paragraphs) = block.text.and_then(|i| notices.texts.get(i)) {
+            rows.extend(paragraphs.iter().map(|p| LicenseRow {
+                kind: 3,
+                text: p.as_str().into(),
+                ..LicenseRow::default()
+            }));
+        }
+    }
+    rows
+}
+
+/// The whole list, with the open entries expanded.
+fn set_licenses(s: &ui::SettingsState) {
+    let rows = with_notices(|notices| {
+        LICENSES_OPEN.with(|open| {
+            let open = open.borrow();
+            let mut rows = Vec::new();
+            let mut index = 0;
+            let sections = [
+                (t!("licenses-section-components"), notices.components.len()),
+                (
+                    t!("licenses-section-crates", "count" => notices.crate_count),
+                    notices.crates.len(),
+                ),
+            ];
+            for (title, len) in sections {
+                rows.push(LicenseRow {
+                    kind: 0,
+                    text: title.into(),
+                    ..LicenseRow::default()
+                });
+                for _ in 0..len {
+                    let is_open = open.contains(&index);
+                    rows.extend(license_entry_row(notices, index, is_open));
+                    if is_open {
+                        rows.extend(license_body_rows(notices, index));
+                    }
+                    index += 1;
+                }
+            }
+            rows
+        })
+    })
+    .unwrap_or_default();
+    s.set_licenses(ModelRc::new(VecModel::from(rows)));
+}
+
+/// Open or close one entry in place: rows go in under it or come out,
+/// and the rest of the list stays where it is (a new model would put
+/// the reader back at the top).
+fn toggle_license(s: &ui::SettingsState, index: usize) {
+    let model = s.get_licenses();
+    let Some(rows) = model.as_any().downcast_ref::<VecModel<LicenseRow>>() else {
+        return;
+    };
+    let Ok(wanted) = i32::try_from(index) else {
+        return;
+    };
+    let Some(at) = (0..rows.row_count()).find(|&i| {
+        rows.row_data(i)
+            .is_some_and(|r| r.kind == 1 && r.entry == wanted)
+    }) else {
+        return;
+    };
+    let opening = LICENSES_OPEN.with(|open| {
+        let mut open = open.borrow_mut();
+        if open.remove(&index) {
+            false
+        } else {
+            open.insert(index);
+            true
+        }
+    });
+    if let Some(mut row) = rows.row_data(at) {
+        row.open = opening;
+        rows.set_row_data(at, row);
+    }
+    if opening {
+        let body = with_notices(|notices| license_body_rows(notices, index)).unwrap_or_default();
+        for (i, row) in body.into_iter().enumerate() {
+            rows.insert(at + 1 + i, row);
+        }
+    } else {
+        while rows.row_data(at + 1).is_some_and(|r| r.kind >= 2) {
+            rows.remove(at + 1);
+        }
+    }
 }

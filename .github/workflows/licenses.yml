@@ -1,0 +1,60 @@
+name: licenses
+
+# The third-party notices for the commit being built: what the apps show
+# in Settings → Licenses (crates/frontend/licenses.json) and what the site
+# publishes (web/licenses.html), refreshed from Cargo.lock by
+# scripts/licenses.py and cargo-about (licenses/README.md).
+#
+# Not run on its own: every release workflow (desktop, Android, iOS) and
+# the website deploy call it first, then download the `licenses`
+# artifact over the committed copies before they build or upload. So
+# every platform ships the same list, made from the same lockfile,
+# without anyone running the script by hand. (The committed copies are
+# only what a local build shows; they may lag.)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "What to check out (empty: the triggering ref)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  licenses:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # cargo-about reads the dependency graph through cargo: the
+      # toolchain rust-toolchain.toml pins, minimal (nothing compiles).
+      - name: Install the pinned Rust toolchain
+        run: |
+          CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$CHANNEL" --profile minimal
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+
+      # Online: a crate that left its license file out of its package
+      # gets it from its repository, with its copyright line.
+      - name: Refresh the notices
+        run: python3 scripts/licenses.py
+
+      - name: Hand them to the builds
+        uses: actions/upload-artifact@v7
+        with:
+          name: licenses
+          path: |
+            crates/frontend/licenses.json
+            web/licenses.html
+          if-no-files-found: error
+          retention-days: 7

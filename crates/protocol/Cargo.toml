@@ -2,6 +2,7 @@
 name = "protocol"
 version = "1.2.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "Shared wire protocol types for baucord client and server."
 
 [lints]

@@ -166,6 +166,11 @@ export struct ChatRow {
 
 export struct EmojiRow  { glyph: string, code: string, section: string }
 export struct KeybindRow { action-label: string, bind: string, recording: bool }
+/// A row of Settings → Licenses (1.2): 0 a section title,
+/// 1 a component or a license group (tap opens it; `entry` names it
+/// to the host), 2 its note (copyright, source, the crates), 3 a
+/// paragraph of its license text.
+export struct LicenseRow { kind: int, text: string, detail: string, open: bool, entry: int }
 export struct ServerRow { name: string, address: string, is-default: bool }
 
 // ── State (host → UI) ───────────────────────────────────────────────────

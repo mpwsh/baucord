@@ -902,3 +902,15 @@ activity-show = Atividade
 activity-hide = Voltar às mensagens
 activity-empty-title = Nenhuma atividade ainda
 activity-empty = Entradas, saídas, mudanças de sala e telas compartilhadas aparecem aqui enquanto você está conectado.
+
+# ── Configurações → Licenças de código aberto (1.2) ────────────────────
+tab-licenses = Licenças
+licenses-title = Licenças de código aberto
+licenses-lead = baucord é software livre sob a Apache License 2.0, feito sobre o software de código aberto abaixo. Cada parte mantém sua própria licença; abra uma para lê-la.
+licenses-section-components = Componentes
+licenses-section-crates = Crates do Rust ({ $count })
+licenses-crates-count = { $count ->
+    [one] 1 crate
+   *[other] { $count } crates
+}
+licenses-used-by = Usado por: { $crates }

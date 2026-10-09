@@ -166,6 +166,17 @@ the root `Cargo.toml`), rustfmt at 100 columns with the repo's
 everything but the imports: write new imports the nightly way (one
 `use` per crate, std / external / crate groups) and the user's
 `cargo +nightly fmt --all` settles the rest. Markdown wraps at 80.
+Third-party notices: `scripts/licenses.py` (cargo-about plus
+`licenses/native/`; see licenses/README.md) writes
+`crates/frontend/licenses.json` and `web/licenses.html`. CI runs it
+(`.github/workflows/licenses.yml`) before every release build and site
+deploy, so a Cargo.lock change needs nothing by hand; only a new native
+library needs an entry in its `COMPONENTS`. Slint is taken under its
+royalty-free license (the AboutSlint widget in Settings → About is its
+condition); the desktop builds are GPL-3.0 as a whole because of FFmpeg
+and x264, whose exact sources the notices name (x264 pinned as
+`X264_COMMIT` in release.yml).
+
 Every new string goes into all three Fluent catalogs (en, es-AR, pt-BR).
 A string the Slint side shows is also declared in `tr.slint` — the name
 only, never the English (the .ftl has it; copies there drifted from what
@@ -248,7 +259,7 @@ otherwise).
 | 1.1.7 | the Android client (sideloaded; voice, chat, DMs, files, stream viewing through MediaCodec, the in-window Settings and stream pages), the iPhone client (Ad Hoc; the same, VideoToolbox), echo cancellation (Windows, Android, iOS VPIO), Slint 1.18.1, the battery work (no polling workers, nothing drawn in the background), the stream page (zoom, fill, rotate), Settings → Debug (log upload), the one-row sidebar header, notifications on the phones |
 | 1.1.8 | Windows asks not to lower other apps while in voice (AEC-SPEC E11, the vendored `wasapi`); the phones open the microphone only in a voice room and unmuted (ANDROID-SPEC D53, IOS-SPEC D51); the APK on the website, named like the desktop zips (D55); the Android release workflow on maintained actions, with *Run workflow* able to rebuild a release (D54) |
 | 1.1.9 | phones keep up with a 60 fps stream (MOB-18: only the shown picture is converted, on several cores, into reused buffers; MediaCodec's pictures paced instead of dropped; a jitter buffer that holds a keyframe interval); stream audio through the call path on phones (MOB-12); the `viewing …` / `sharing …` stream logs; Settings → Debug → *Copy log*, and a clipboard on the phones; Windows audio that recovers from a device that came back (CLI-12, CLI-9); the video ladder reading a collapsed uplink (CLI-13); a quantizer floor after AMD keyframes too large to send (CLI-15); a stream's stereo mixed to mono on the phones without cancelling out-of-phase sound (ANDROID-SPEC D60) |
-| 1.2.0 | what the stores require of a chat app (bit `SAFETY` 17; PERSISTENCE-SPEC §12 S1): block (hidden messages and DMs, no voice, DMs refused both ways; Settings → Profile lists them), report a message or a person (the admin channel at once, the panel's Reports tab, `/reports`), delete my account (everything it posted, at once), the terms linked on the connect card ("by connecting you agree"), `Authors` (a lobby poster's name, and the looks of history authors and DM partners offline), the chat's stickiness by input with an "N new messages" pill (ANDROID-SPEC D66, `tools/chat-scroll-sim`), long press for a chat row's menu on the phones; General's **Activity** view behind a header toggle, beside clear-chat (joins, leaves, moves, shares and device notices out of the conversation; memory only, this session, 200 lines — `app/activity.rs`); Android's foreground service `microphone` in a room and `specialUse` in the lobby (ANDROID-SPEC D63); files of a deleted account's DM conversations released; `web/terms.html`, `web/delete-account.html` |
+| 1.2.0 | what the stores require of a chat app (bit `SAFETY` 17; PERSISTENCE-SPEC §12 S1): block (hidden messages and DMs, no voice, DMs refused both ways; Settings → Profile lists them), report a message or a person (the admin channel at once, the panel's Reports tab, `/reports`), delete my account (everything it posted, at once), the terms linked on the connect card ("by connecting you agree"), `Authors` (a lobby poster's name, and the looks of history authors and DM partners offline), the chat's stickiness by input with an "N new messages" pill (ANDROID-SPEC D66, `tools/chat-scroll-sim`), third-party notices (Settings → Licenses, `web/licenses.html`, `scripts/licenses.py`, refreshed by CI before every build and deploy; AboutSlint in About), long press for a chat row's menu on the phones; General's **Activity** view behind a header toggle, beside clear-chat (joins, leaves, moves, shares and device notices out of the conversation; memory only, this session, 200 lines — `app/activity.rs`); Android's foreground service `microphone` in a room and `specialUse` in the lobby (ANDROID-SPEC D63); files of a deleted account's DM conversations released; `web/terms.html`, `web/delete-account.html` |
 
 Memory-mode servers (persistence off) still use the legacy
 `ImageMessage` relay for pictures and refuse files.

@@ -49,7 +49,16 @@ permissions:
   contents: write   # gh release upload
 
 jobs:
+  # The third-party notices, refreshed from this commit's Cargo.lock
+  # before the build; every platform embeds the same list
+  # (licenses.yml).
+  licenses:
+    uses: ./.github/workflows/licenses.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v') && github.event.inputs.tag || '' }}
+
   android:
+    needs: licenses
     # Pinned: `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19; a build
     # this toolchain-heavy should change images on purpose.
     runs-on: ubuntu-24.04
@@ -68,6 +77,14 @@ jobs:
           # A dispatch naming a release tag builds that tag's code; else
           # the event's own commit (the release's tag, the chosen branch).
           ref: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'v') && github.event.inputs.tag || '' }}
+
+      # Settings → Licenses as of this commit (the licenses job): the
+      # committed copy may lag behind Cargo.lock.
+      - name: Third-party notices, refreshed
+        uses: actions/download-artifact@v8
+        with:
+          name: licenses
+          path: .
 
       # A release tag is the crates' version: every platform ships the
       # number in its crate (SESSION-GUIDE.md §4), so a v1.1.9 tag on

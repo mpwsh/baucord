@@ -42,7 +42,14 @@ permissions:
   contents: write   # gh release upload
 
 jobs:
+  # The third-party notices, refreshed from this commit's Cargo.lock
+  # before anything builds; every platform embeds the same list
+  # (licenses.yml).
+  licenses:
+    uses: ./.github/workflows/licenses.yml
+
   ipa:
+    needs: licenses
     # Pinned, with Xcode pinned below: an image or Xcode that moves under
     # a release build should do so on purpose. The runner image lists
     # Xcode 26.0.1–26.6 (default 26.6); 27 is a preview there.
@@ -61,6 +68,13 @@ jobs:
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v7
+      # Settings → Licenses as of this commit (the licenses job): the
+      # committed copy may lag behind Cargo.lock.
+      - name: Third-party notices, refreshed
+        uses: actions/download-artifact@v8
+        with:
+          name: licenses
+          path: .
 
       # A release tag is the crates' version: every platform ships the
       # number in its crate (SESSION-GUIDE.md §4). Manual dry runs (no
