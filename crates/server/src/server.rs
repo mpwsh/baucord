@@ -1522,9 +1522,14 @@ impl ChatServer {
             };
             encoded.push(protocol::Bytes::from(bytes));
         }
-        // Not to whoever blocked the sender.
+        // Not to whoever blocked the sender; and who sent it first,
+        // if the audience was never told (a picture from the lobby).
         let audience = match self.user_of.get(&client_id).copied() {
-            Some(author) => self.audience_of(&author),
+            Some(author) => {
+                let audience = self.audience_of(&author);
+                self.introduce_author(client_id, &author, &audience);
+                audience
+            }
             None => self.clients(),
         };
         for peer in audience {
@@ -2036,7 +2041,9 @@ impl ChatServer {
                             msg: msg.clone(),
                         };
                         let plain = ServerMessage::Chat(msg);
-                        for peer in self.audience_of(&author) {
+                        let audience = self.audience_of(&author);
+                        self.introduce_author(client_id, &author, &audience);
+                        for peer in audience {
                             if self.has_feature(peer, features::SAFETY) {
                                 self.send_msg(peer, &rich);
                             } else {

@@ -129,7 +129,7 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
 
 - **Version 1.2.0** in the crates (released: 1.1.9); the crate map is
   SESSION-GUIDE §2. 1.2 adds what the stores require of a chat app:
-  block, report, delete my account, terms before the first connect
+  block, report, delete my account, the terms on the connect card
   (PERSISTENCE-SPEC §12 S1), and Android's foreground service typed
   for Play (ANDROID-SPEC D63).
 - **Desktop**: in production (Windows mostly), self-updating.

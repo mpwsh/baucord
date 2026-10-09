@@ -411,6 +411,11 @@ export global State {
     in property <int> dm-unread-total: 0;
     /// Messages that landed in General while a DM was open.
     in property <int> general-unread: 0;
+    /// General's two views (1.2): the conversation, or the room's
+    /// activity — who came, went, moved, shared — kept apart so it
+    /// does not bury the messages. In memory only, this session only.
+    /// No "something new" mark on the other view: by design.
+    in property <bool> activity-open: false;
 
     // Profile card (roster rows and chat pictures summon it): which
     // roster row it shows, and where the hovered element sits in
@@ -447,10 +452,9 @@ export global State {
     in-out property <bool> report-block: false;
     in property <bool> report-block-offered: true;
 
-    // The terms of use, asked once before the first connect (1.2).
-    in property <bool> terms-open: false;
+    // The terms of use (1.2): connecting is agreeing; the connect
+    // card says so and links them.
     in property <string> terms-url: "https://baucord.com/terms.html";
-    in property <string> privacy-url: "https://baucord.com/privacy.html";
 
     // Image viewer overlay (chat image tapped) — replaces the old
     // separate gallery window.
@@ -517,6 +521,8 @@ export global Logic {
     callback dm-clicked(int);                  // index into State.dms
     callback dm-closed(int);                   // hide the conversation (nothing is deleted)
     callback general-clicked();                // back to the general chat
+    /// General's header toggle: the conversation (`false`) or the activity.
+    callback general-view(activity: bool);
     /// The Messages header's chevron: fold the section or open it.
     callback messages-toggle();
     /// The sidebar's edge was dragged and let go: keep the width.
@@ -526,9 +532,6 @@ export global Logic {
     /// The report dialog: send what State.report-* says, or not.
     callback report-send();
     callback report-cancel();
-    /// The terms dialog: agree (the connect goes on) or not.
-    callback terms-accept();
-    callback terms-decline();
 
     // Chat
     callback send-message();

@@ -55,7 +55,7 @@ impl AppState {
                         "name" => name.as_deref().unwrap_or(&fallback))
                 }
             };
-            self.push_chat_system(&text);
+            self.push_activity(&text);
         }
 
         if diff.rebuild_input {

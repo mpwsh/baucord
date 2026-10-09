@@ -221,7 +221,9 @@ impl ChatServer {
             from: *from,
             msg: msg.clone(),
         };
-        for session in self.sessions_of(to) {
+        let sessions = self.sessions_of(to);
+        self.introduce_author(sender, from, &sessions);
+        for session in sessions {
             if self.has_feature(session, features::DM) {
                 self.send_msg(session, &direct);
             }
@@ -274,6 +276,7 @@ impl ChatServer {
             return;
         };
         if let Outcome::Answered(Answer::Conversations(dms)) = outcome {
+            self.send_authors(client, dms.iter().map(|d| d.user_id));
             self.send_msg(client, &ServerMessage::Conversations { dms });
         }
     }

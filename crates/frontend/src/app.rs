@@ -62,6 +62,7 @@ use crate::{
     viewers::Viewer,
 };
 
+mod activity;
 mod alerts;
 mod chat;
 mod commands;
@@ -79,11 +80,6 @@ mod session;
 mod stats;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The terms of use this build asks people to accept before they first
-/// connect (`web/terms.html`). Raise it when the terms change in
-/// substance: everyone is asked again.
-pub(crate) const TERMS_VERSION: u32 = 1;
 
 /// Slint's Android backend has one window per process (every `Window`
 /// component is handed the same window adapter), so the auxiliary
@@ -344,6 +340,15 @@ pub struct AppState {
     pub profile_dirty: bool,
     /// Everyone's look, from the server (spec §7.1).
     profiles: HashMap<u64, client::protocol::Profile>,
+    /// Names and looks by account (1.2): whoever the server introduced
+    /// (`Authors`: someone in the lobby, the authors of a history page,
+    /// the other end of a DM) and everyone seen online this session —
+    /// so a picture shows for someone offline, and stays when its
+    /// owner leaves. Memory only, emptied with the session.
+    author_looks: HashMap<client::UserId, profiles::AuthorLook>,
+    /// Lobby sessions the server introduced, by account: a picture
+    /// names only its session.
+    lurkers: HashMap<u64, client::UserId>,
     /// Decoded pictures by hash: the on-disk cache, warmed on demand.
     avatar_images: HashMap<client::protocol::BlobId, slint::Image>,
     /// Blobs asked for and not yet here (no double fetches).
@@ -367,6 +372,11 @@ pub struct AppState {
     // Chat
     history: ChatHistory,
     chat_model: Rc<VecModel<ChatRow>>,
+    /// General's activity view (`activity`): joins, leaves, moves,
+    /// shares, apart from the conversation. Memory only, this session.
+    activity_model: Rc<VecModel<ChatRow>>,
+    /// General shows its activity rather than its conversation.
+    showing_activity: bool,
     /// Image bytes per chat row-id (save / viewer / GIF replay).
     pub images: HashMap<i32, media::ImageEntry>,
     gifs: HashMap<i32, GifPlayer>,
@@ -438,8 +448,6 @@ pub struct AppState {
     /// The server deleted our account: the removal that follows is
     /// that, not a kick.
     account_deleted: bool,
-    /// A connect waiting on the terms dialog, with its nickname.
-    terms_pending: Option<String>,
     viewers: HashMap<u64, Viewer>,
     /// Image-viewer overlay: the chat row shown, and GIF playback
     /// state while that row is an animated GIF.
@@ -694,6 +702,8 @@ pub fn run() {
         profiles: HashMap::new(),
         avatar_images: HashMap::new(),
         avatar_fetches: HashSet::new(),
+        author_looks: HashMap::new(),
+        lurkers: HashMap::new(),
         channel_details: HashMap::new(),
         settings,
         is_muted: false,
@@ -705,6 +715,8 @@ pub fn run() {
         sharer_ids: HashSet::new(),
         history: ChatHistory::new(),
         chat_model,
+        activity_model: Rc::new(VecModel::default()),
+        showing_activity: false,
         images: HashMap::new(),
         gifs: HashMap::new(),
         pending_preview: None,
@@ -731,7 +743,6 @@ pub fn run() {
         report: None,
         session_server: None,
         account_deleted: false,
-        terms_pending: None,
         viewers: HashMap::new(),
         gallery_row: None,
         gallery_gif: None,
@@ -1135,9 +1146,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_report_cancel(move || with_app(&w, AppState::report_cancel));
     let w = Rc::downgrade(state);
-    logic.on_terms_accept(move || with_app(&w, AppState::terms_accept));
-    let w = Rc::downgrade(state);
-    logic.on_terms_decline(move || with_app(&w, AppState::terms_decline));
+    logic.on_general_view(move |activity| with_app(&w, |app| app.set_general_view(activity)));
 
     // ── Chat ────────────────────────────────────────────────────
     let w = Rc::downgrade(state);
@@ -2588,12 +2597,12 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_report_also_block(t!("report-also-block").into());
     tr.set_report_also_block_hint(t!("report-also-block-hint").into());
     tr.set_report_send(t!("report-send").into());
-    tr.set_terms_title(t!("terms-title").into());
-    tr.set_terms_lead(t!("terms-lead").into());
-    tr.set_terms_rules(t!("terms-rules").into());
-    tr.set_terms_read(t!("terms-read").into());
-    tr.set_terms_agree(t!("terms-agree").into());
-    tr.set_privacy_read(t!("privacy-read").into());
+    tr.set_activity_show(t!("activity-show").into());
+    tr.set_activity_hide(t!("activity-hide").into());
+    tr.set_activity_empty_title(t!("activity-empty-title").into());
+    tr.set_activity_empty(t!("activity-empty").into());
+    tr.set_terms_notice(t!("terms-notice").into());
+    tr.set_terms_link(t!("terms-link").into());
     tr.set_blocked_header(t!("blocked-header").into());
     tr.set_blocked_not_connected(t!("blocked-not-connected").into());
     tr.set_blocked_lead(t!("blocked-lead").into());

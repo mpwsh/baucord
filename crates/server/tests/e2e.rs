@@ -912,9 +912,9 @@ fn expired_exhausted_and_revoked_codes_are_told_apart() {
     let code = w.invite(ROLE_GUEST);
     let spoken = format!(
         "{}-{} {}",
-        &code[..4].to_ascii_lowercase(),
+        code[..4].to_ascii_lowercase(),
         &code[4..8],
-        &code[8..].to_ascii_lowercase()
+        code[8..].to_ascii_lowercase()
     );
     assert!(w
         .try_connect("spoken", Auth::Invite { code: spoken })
@@ -4918,6 +4918,99 @@ fn a_blocked_persons_posts_and_edits_never_reach_the_blocker() {
         ServerMessage::ChatFrom { msg, .. } if msg.text == "again" => Some(()),
         _ => None,
     });
+}
+
+/// Who sent it (1.2): a post from someone in the lobby, whose join
+/// nobody saw, comes after an `Authors` naming them, their session and
+/// their look; a room member's post needs none. A history page comes
+/// after the names and looks of its authors, online or not.
+#[test]
+fn a_post_from_the_lobby_and_a_history_page_name_their_authors() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_lobby("bob");
+    let (bob_id, bob_user) = (bob.id, bob.key.user_id());
+    let alice_user = alice.key.user_id();
+    set_profile(&mut bob, &mut w, Some(0x0088_CCFF), None);
+    profile_verdict(&mut bob, &mut w, &mut [&mut alice]).expect("a readable color");
+
+    bob.send(
+        &mut w,
+        &ClientMessage::Chat("hi from the lobby".to_string()),
+    );
+    alice.wait_for(&mut w, &mut [&mut bob], |m| match m {
+        ServerMessage::ChatFrom { msg, .. } if msg.text == "hi from the lobby" => Some(()),
+        _ => None,
+    });
+    let intro = alice
+        .inbox
+        .iter()
+        .position(|m| {
+            matches!(m, ServerMessage::Authors { authors }
+            if authors.iter().any(|a| a.user_id == bob_user))
+        })
+        .expect("bob introduced");
+    let post = alice
+        .inbox
+        .iter()
+        .position(
+            |m| matches!(m, ServerMessage::ChatFrom { msg, .. } if msg.text == "hi from the lobby"),
+        )
+        .expect("the post");
+    assert!(intro < post, "the name comes before the post");
+    let ServerMessage::Authors { authors } = &alice.inbox[intro] else {
+        unreachable!()
+    };
+    assert_eq!(authors.len(), 1);
+    assert_eq!(authors[0].client_id, Some(bob_id));
+    assert_eq!(authors[0].name, "bob");
+    assert_eq!(authors[0].profile.name_color, Some(0x0088_CCFF));
+
+    // Alice is in a room: bob was told about her with the join.
+    alice.send(&mut w, &ClientMessage::Chat("hello lobby".to_string()));
+    bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::ChatFrom { msg, .. } if msg.text == "hello lobby" => Some(()),
+        _ => None,
+    });
+    assert!(
+        !bob.inbox
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Authors { authors }
+            if authors.iter().any(|a| a.user_id == alice_user))),
+        "a room member needs no introduction"
+    );
+
+    // Bob leaves; carol arrives later and reads both posts back.
+    bob.leave(&mut w);
+    let carol = w.connect_member("carol");
+    let carol_user = carol.key.user_id();
+    let page = carol
+        .inbox
+        .iter()
+        .position(|m| matches!(m, ServerMessage::History { .. }))
+        .expect("the replay");
+    let (at, authors) = carol
+        .inbox
+        .iter()
+        .enumerate()
+        .find_map(|(i, m)| match m {
+            ServerMessage::Authors { authors } => Some((i, authors.clone())),
+            _ => None,
+        })
+        .expect("the page's authors");
+    assert!(at < page, "the authors come before the page");
+    let bob_look = authors
+        .iter()
+        .find(|a| a.user_id == bob_user)
+        .expect("bob, offline, is named");
+    assert_eq!(bob_look.client_id, None);
+    assert_eq!(bob_look.name, "bob");
+    assert_eq!(bob_look.profile.name_color, Some(0x0088_CCFF));
+    assert!(authors.iter().any(|a| a.user_id == alice_user));
+    assert!(
+        !authors.iter().any(|a| a.user_id == carol_user),
+        "never the reader"
+    );
 }
 
 #[test]

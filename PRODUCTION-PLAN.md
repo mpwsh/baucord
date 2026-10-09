@@ -567,9 +567,9 @@ is not decided yet.
   Console's account-deletion URL.
 - [x] **MOB-15 [P0][S] Terms before user content.** Done 2026-10-09
   (1.2): `web/terms.html` (18+, what is forbidden everywhere, reporting
-  and blocking, moderation), and a dialog before the first connect with
-  the short version and links, accepted once per device
-  (`settings.terms_version`; raise `TERMS_VERSION` to ask again).
+  and blocking, moderation), linked from the connect card: "By
+  connecting you agree to the terms and conditions", under Settings
+  and Quit (the first-connect dialog of the 1.2 test builds is gone).
   Decided: the terms are the app's, one set for every server; a
   server's own rules go in its greeting.
 - [ ] **MOB-16 [P0][S] The Play listing.** Texts (title ≤ 30, short

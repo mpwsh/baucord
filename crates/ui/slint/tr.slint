@@ -140,13 +140,9 @@ export global Tr {
     in property <string> moderation-duration: "Duration";
     in property <string> moderation-reason: "Reason";
     in property <string> moderation-reason-placeholder: "Optional — shown to them and kept in the log";
-    // Terms of use, before the first connect (1.2)
-    in property <string> terms-title: "Before you connect";
-    in property <string> terms-lead: "By using baucord you agree to its terms of use. On every server:";
-    in property <string> terms-rules: "• You are 18 or older.\n• Nothing illegal, and nothing sexual involving minors.\n• No threats, harassment, hate or spam.\n• Report what breaks the rules, and block anyone you don't want to hear from: right-click a message or a person (on a phone, press and hold a message, or tap a person).\n\nEach server's owner may add rules of their own.";
-    in property <string> terms-read: "Read the terms";
-    in property <string> terms-agree: "I agree";
-    in property <string> privacy-read: "Privacy policy";
+    // The connect card's terms line (1.2): the lead-in, then the link.
+    in property <string> terms-notice: "By connecting you agree to the";
+    in property <string> terms-link: "terms and conditions";
     // Report dialog (1.2)
     in property <string> report-hint: "The server's moderators see this report and the message as it is now. The person is not told who reported them.";
     in property <string> report-reason: "Reason";
@@ -237,6 +233,11 @@ export global Tr {
     in property <string> reset-confirm: "Reset everything";
     in property <string> chat-empty-title: "No messages yet";
     in property <string> chat-empty-general: "Say something to everyone on this server.";
+    // General's activity toggle (1.2)
+    in property <string> activity-show: "Activity";
+    in property <string> activity-hide: "Back to messages";
+    in property <string> activity-empty-title: "No activity yet";
+    in property <string> activity-empty: "Who joins, leaves, moves or shares shows here while you're connected. It is not saved anywhere.";
     in property <string> chat-empty-dm: "Say hello to start the conversation.";
     in property <string> language: "Language";
     in property <string> language-note: "Chat history keeps its language; new labels apply immediately.";

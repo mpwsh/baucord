@@ -26,7 +26,7 @@
 // guards, deferred teardown) is retired by construction.
 
 import { ListView } from "std-widgets.slint";
-import { IconSet, IconDisplay } from "@lucide";
+import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, ChatRow } from "globals.slint";
@@ -988,15 +988,21 @@ component NavBack inherits Rectangle {
     }
 }
 
-// The narrow header's clear-the-view button, at the trailing edge.
-component ClearChatBtn inherits Rectangle {
+// A header's trailing icon button (clear the view; General's
+// activity toggle), centered in the header's height.
+component HeaderBtn inherits Rectangle {
+    in property <Icon> icon;
+    in property <string> tooltip;
+    callback clicked;
     width: 32px;
     IconBtn {
         y: (parent.height - self.height) / 2;
         size: 32px;
         icon-size: 18px;
-        icon: IconSet.BrushCleaning;
-        clicked => { Logic.clear-chat(); }
+        icon: root.icon;
+        tooltip: root.tooltip;
+        tooltip-below: true;
+        clicked => { root.clicked(); }
     }
 }
 
@@ -1124,7 +1130,21 @@ export component ChatPane inherits Rectangle {
                         overflow: elide;
                     }
                 }
-                if root.narrow : ClearChatBtn { }
+                // Clear the view, then flip between what was said and
+                // who came and went (the page; the bubble to go back).
+                HorizontalLayout {
+                    spacing: 2px;
+                    HeaderBtn {
+                        icon: IconSet.BrushCleaning;
+                        tooltip: Tr.chat-clear-tooltip;
+                        clicked => { Logic.clear-chat(); }
+                    }
+                    HeaderBtn {
+                        icon: State.activity-open ? IconSet.MessageCircle : IconSet.FileText;
+                        tooltip: State.activity-open ? Tr.activity-hide : Tr.activity-show;
+                        clicked => { Logic.general-view(!State.activity-open); }
+                    }
+                }
             }
         }
         if State.active-dm >= 0 : Rectangle {
@@ -1166,7 +1186,11 @@ export component ChatPane inherits Rectangle {
                         overflow: elide;
                     }
                 }
-                if root.narrow : ClearChatBtn { }
+                HeaderBtn {
+                    icon: IconSet.BrushCleaning;
+                    tooltip: Tr.chat-clear-tooltip;
+                    clicked => { Logic.clear-chat(); }
+                }
             }
         }
 
@@ -1203,7 +1227,7 @@ export component ChatPane inherits Rectangle {
 
         // "Load earlier": appears once the reader reaches the top and
         // the server said older pages exist; the page is put in front.
-        if State.history-more && list.content-y >= -2px : Rectangle {
+        if State.history-more && !State.activity-open && list.content-y >= -2px : Rectangle {
             height: 28px;
             border-radius: Theme.radius-sm;
             background: le.has-hover && !State.history-loading ? Theme.hover : transparent;
@@ -1326,12 +1350,13 @@ export component ChatPane inherits Rectangle {
                     }
                 }
             }
-            if State.chat.length == 0 && !State.history-more && !State.history-loading : VerticalLayout {
+            if State.chat.length == 0
+                && (State.activity-open || (!State.history-more && !State.history-loading)) : VerticalLayout {
                 alignment: center;
                 padding: Theme.gap-xl;
                 spacing: Theme.gap-xs;
                 Text {
-                    text: Tr.chat-empty-title;
+                    text: State.activity-open ? Tr.activity-empty-title : Tr.chat-empty-title;
                     color: Theme.text-primary;
                     font-size: Theme.font-md;
                     font-weight: 600;
@@ -1339,7 +1364,8 @@ export component ChatPane inherits Rectangle {
                     wrap: word-wrap;
                 }
                 Text {
-                    text: State.active-dm >= 0 ? Tr.chat-empty-dm : Tr.chat-empty-general;
+                    text: State.activity-open ? Tr.activity-empty
+                        : State.active-dm >= 0 ? Tr.chat-empty-dm : Tr.chat-empty-general;
                     color: Theme.text-secondary;
                     font-size: Theme.font-body;
                     horizontal-alignment: center;
@@ -1397,13 +1423,6 @@ export component ChatPane inherits Rectangle {
                 icon: IconSet.Paperclip;
                 tooltip: Tr.chat-attach-tooltip;
                 clicked => { Logic.attach-image(); }
-            }
-            // Narrow: in the header instead — one tap from Attach was one
-            // tap from losing the view, and the field needs the room.
-            if !root.narrow : IconBtn {
-                icon: IconSet.BrushCleaning;
-                tooltip: Tr.chat-clear-tooltip;
-                clicked => { Logic.clear-chat(); }
             }
             // capture-key-pressed runs BEFORE the focused TextInput:
             // Enter sends (Shift+Enter falls through and inserts the

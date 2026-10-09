@@ -182,6 +182,8 @@ impl AppState {
     /// DM with `user`. A DM opens with its history fetched once and
     /// its unread cleared (`MarkRead`).
     pub(super) fn switch_conversation(&mut self, key: Option<client::UserId>) {
+        // Any switch lands on a conversation, not General's activity.
+        self.leave_activity_view();
         if key != self.active_dm {
             self.freeze_chat_gifs();
             self.swap_in(key);
@@ -362,8 +364,11 @@ impl AppState {
                     tile_tint: ui::convert::tint(&name),
                     admin: *user == ADMIN_CHANNEL_KEY,
                 };
+                // Online: their session's look; offline: what the server
+                // said of them with the list (`Authors`).
                 if let Some(image) = client
                     .and_then(|c| self.profiles.get(&c))
+                    .or_else(|| self.author_looks.get(user).map(|l| &l.profile))
                     .and_then(|p| p.avatar)
                     .and_then(|blob| self.avatar_images.get(&blob))
                 {
@@ -596,7 +601,8 @@ impl AppState {
         if row.kind != 1 && row.kind != 4 {
             let own = row.own;
             let name = row.user.to_string();
-            self.apply_profile_look(&name, own, &mut row);
+            let author = self.history.rows()[index].meta().and_then(|m| m.author);
+            self.apply_profile_look(&name, own, author.as_ref(), &mut row);
         }
         // Message rows carrying WhatsApp-style markup (*bold*,
         // _italic_, `code`) get a pre-parsed StyledText; plain

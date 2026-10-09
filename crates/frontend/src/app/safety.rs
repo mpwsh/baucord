@@ -7,10 +7,10 @@
 
 // A child module of `app`: its parent's private items and imports are
 // its own, which is the whole point of the file split.
-use client::protocol::{ReportReason, ReportRefusal, ReportTarget};
-
 #[allow(clippy::wildcard_imports)]
 use super::*;
+
+use client::protocol::{ReportReason, ReportRefusal, ReportTarget};
 
 /// What the report dialog is about while it is open.
 pub(super) struct PendingReport {
@@ -46,9 +46,12 @@ impl AppState {
     }
 
     /// The account behind a session, when the server said
-    /// (`UserDetails`).
+    /// (`UserDetails`, or `Authors` for someone in the lobby).
     pub(super) fn account_of(&self, client_id: u64) -> Option<client::UserId> {
-        self.details.get(&client_id).map(|(user, _)| *user)
+        self.details
+            .get(&client_id)
+            .map(|(user, _)| *user)
+            .or_else(|| self.lurkers.get(&client_id).copied())
     }
 
     /// Whether a session belongs to someone we blocked.
@@ -359,24 +362,6 @@ impl AppState {
                 self.show_toast(ToastKind::Warning, &t!(key));
             }
         }
-    }
-
-    // ── The terms of use ────────────────────────────────────────────
-
-    /// "I agree": remembered, and the connect that asked goes on.
-    pub(super) fn terms_accept(&mut self) {
-        self.main.global::<State>().set_terms_open(false);
-        self.settings.terms_version = TERMS_VERSION;
-        self.settings.save();
-        info!("Terms of use version {TERMS_VERSION} accepted");
-        if let Some(nickname) = self.terms_pending.take() {
-            self.handle_connect(&nickname);
-        }
-    }
-
-    pub(super) fn terms_decline(&mut self) {
-        self.terms_pending = None;
-        self.main.global::<State>().set_terms_open(false);
     }
 
     // ── Deleting the account ────────────────────────────────────────

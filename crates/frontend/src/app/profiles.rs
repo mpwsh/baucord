@@ -8,6 +8,13 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// An account's name and look, kept by account (`author_looks`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AuthorLook {
+    pub name: String,
+    pub profile: client::protocol::Profile,
+}
+
 impl AppState {
     pub fn update_user_list(&mut self) {
         self.main.global::<State>().set_in_lobby(self.in_lobby());
@@ -58,7 +65,8 @@ impl AppState {
     /// powers, plus the tooltip text.
     pub(super) fn decorate_user_row(&self, row: &mut UserRow, user: &roster::RosterRow) {
         use client::permissions as p;
-        self.apply_profile_look(&user.name, user.is_us, row);
+        let account = self.account_of(user.client_id);
+        self.apply_profile_look(&user.name, user.is_us, account.as_ref(), row);
         if user.level > 0 {
             row.level_label = t!("tooltip-level", "level" => u32::from(user.level)).into();
         }
@@ -127,18 +135,23 @@ impl AppState {
             });
     }
 
-    /// The profile look for a name: ours from the settings, everyone
+    /// The profile look for a row: ours from the settings, everyone
     /// else's the defaults until the profile wire (1.1.2) fills them.
     /// `UserRow` and `ChatRow` carry the same fields (`ProfileLook`).
-    pub(super) fn apply_profile_look(&self, name: &str, is_us: bool, row: &mut dyn ProfileLook) {
+    /// `author` is the row's account when known: it finds the look of
+    /// someone offline or in the lobby, and is not fooled by a name
+    /// someone else wears now.
+    pub(super) fn apply_profile_look(
+        &self,
+        name: &str,
+        is_us: bool,
+        author: Option<&client::UserId>,
+        row: &mut dyn ProfileLook,
+    ) {
         // The server's copy when it has one (that is what everyone
         // else sees); our settings before the server answered, or
         // when it does not carry profiles.
-        let from_server = self
-            .users
-            .iter()
-            .find(|(id, u)| (is_us && Some(**id) == self.our_client_id) || u.username == name)
-            .and_then(|(id, _)| self.profiles.get(id));
+        let from_server = self.server_look(name, is_us, author);
         let ours = is_us || name == self.settings.user.nickname;
         let (color, style, avatar) = match from_server {
             Some(p) => (
@@ -171,6 +184,38 @@ impl AppState {
         if let Some(image) = avatar {
             row.set_avatar(image);
         }
+    }
+
+    /// What the server says a row's author looks like: by account (their
+    /// session's look while online, else what `Authors` said), else by
+    /// name among the sessions online, else by name among the accounts
+    /// introduced (a hover card knows only the name).
+    fn server_look(
+        &self,
+        name: &str,
+        is_us: bool,
+        author: Option<&client::UserId>,
+    ) -> Option<&client::protocol::Profile> {
+        if let Some(user) = author {
+            let online = self
+                .details
+                .iter()
+                .find(|(_, (u, _))| u == user)
+                .and_then(|(c, _)| self.profiles.get(c));
+            if let Some(look) = online.or_else(|| self.author_looks.get(user).map(|l| &l.profile)) {
+                return Some(look);
+            }
+        }
+        self.users
+            .iter()
+            .find(|(id, u)| (is_us && Some(**id) == self.our_client_id) || u.username == name)
+            .and_then(|(id, _)| self.profiles.get(id))
+            .or_else(|| {
+                (!is_us)
+                    .then(|| self.author_looks.values().find(|l| l.name == name))
+                    .flatten()
+                    .map(|l| &l.profile)
+            })
     }
 
     /// Our look as the server should have it (spec §7.1): sent right
@@ -236,6 +281,18 @@ impl AppState {
     /// A profile changed: every chat row by that author, in every
     /// conversation, takes the new look (the roster rebuilds anyway).
     pub(super) fn refresh_author_look(&mut self, name: &str) {
+        self.refresh_looks(&|user, _| user == name);
+    }
+
+    /// The same for an account: its rows by account, and by name the
+    /// rows from before the session knew whose they were.
+    pub(super) fn refresh_account_look(&mut self, account: &client::UserId, name: &str) {
+        self.refresh_looks(&|user, author| author == Some(account) || user == name);
+    }
+
+    /// Re-apply the look of every chat row `matches` picks (its author's
+    /// name, its account when known), in every conversation.
+    fn refresh_looks(&mut self, matches: &dyn Fn(&str, Option<&client::UserId>) -> bool) {
         let keys: Vec<Option<client::UserId>> = std::iter::once(self.active_dm)
             .chain(self.parked.keys().copied())
             .collect();
@@ -245,7 +302,17 @@ impl AppState {
                     let Some(mut row) = app.chat_model.row_data(i) else {
                         continue;
                     };
-                    if row.kind == 1 || row.kind == 4 || row.user != name {
+                    if row.kind == 1 || row.kind == 4 {
+                        continue;
+                    }
+                    let author = app
+                        .history
+                        .rows()
+                        .get(i)
+                        .and_then(|r| r.meta())
+                        .and_then(|m| m.author);
+                    let name = row.user.to_string();
+                    if !matches(&name, author.as_ref()) {
                         continue;
                     }
                     // Reset before re-applying: a removed picture or
@@ -255,7 +322,7 @@ impl AppState {
                     row.has_name_color = false;
                     row.name_style = 0;
                     let own = row.own;
-                    app.apply_profile_look(name, own, &mut row);
+                    app.apply_profile_look(&name, own, author.as_ref(), &mut row);
                     app.chat_model.set_row_data(i, row);
                 }
             });
@@ -279,30 +346,86 @@ impl AppState {
         self.network.tx.send(NetworkControl::SetNickname(name)).ok();
     }
 
-    /// A session's look arrived: keep it, fetch a picture we do not
-    /// have (disk cache first), redraw.
+    /// A session's look arrived: keep it (by account too, so it stays
+    /// once they leave), fetch a picture we do not have (disk cache
+    /// first), redraw.
     pub(super) fn take_profile(&mut self, client_id: u64, profile: client::protocol::Profile) {
-        if let Some(blob) = profile.avatar
-            && !self.avatar_images.contains_key(&blob)
-        {
-            let cached = client::config::avatar_cache_dir().join(hex(&blob));
-            match std::fs::read(&cached) {
-                Ok(bytes) => self.take_avatar_bytes(blob, &bytes, false),
-                Err(_) => {
-                    if self.avatar_fetches.insert(blob) {
-                        self.network
-                            .tx
-                            .send(NetworkControl::FetchBlob { blob_id: blob })
-                            .ok();
-                    }
-                }
-            }
+        self.want_avatar(profile.avatar);
+        let name = self.username_of(client_id);
+        let account = self.account_of(client_id);
+        if let Some(user) = account {
+            self.author_looks.insert(
+                user,
+                AuthorLook {
+                    name: name.clone(),
+                    profile: profile.clone(),
+                },
+            );
         }
         self.profiles.insert(client_id, profile);
         self.update_user_list();
         self.rebuild_dms_model();
-        let name = self.username_of(client_id);
-        self.refresh_author_look(&name);
+        match account {
+            Some(user) => self.refresh_account_look(&user, &name),
+            None => self.refresh_author_look(&name),
+        }
+    }
+
+    /// `Authors`: who wrote what is arriving, for authors without a
+    /// roster row. A lobby session's earlier picture (pictures ride
+    /// another stream and can beat this) takes its real name.
+    pub(super) fn take_authors(&mut self, authors: Vec<client::protocol::AuthorInfo>) {
+        for author in authors {
+            if let Some(client_id) = author.client_id {
+                self.lurkers.insert(client_id, author.user_id);
+                let fallback = client::network::fallback_username(client_id);
+                self.rename_author(&fallback, &author.name);
+            }
+            self.take_author_look(author.user_id, author.name, author.profile);
+        }
+    }
+
+    /// An account's look, from `Authors` or a `ProfileUpdated` for
+    /// someone not online: kept, its picture wanted, its rows redrawn
+    /// when anything changed.
+    pub(super) fn take_author_look(
+        &mut self,
+        user: client::UserId,
+        name: String,
+        profile: client::protocol::Profile,
+    ) {
+        self.want_avatar(profile.avatar);
+        let look = AuthorLook { name, profile };
+        if self.author_looks.get(&user) == Some(&look) {
+            return;
+        }
+        let name = look.name.clone();
+        self.author_looks.insert(user, look);
+        self.rebuild_dms_model();
+        self.refresh_account_look(&user, &name);
+    }
+
+    /// A picture someone's look names: decoded from the disk cache, or
+    /// asked of the server once.
+    fn want_avatar(&mut self, avatar: Option<client::protocol::BlobId>) {
+        let Some(blob) = avatar else {
+            return;
+        };
+        if self.avatar_images.contains_key(&blob) {
+            return;
+        }
+        let cached = client::config::avatar_cache_dir().join(hex(&blob));
+        match std::fs::read(&cached) {
+            Ok(bytes) => self.take_avatar_bytes(blob, &bytes, false),
+            Err(_) => {
+                if self.avatar_fetches.insert(blob) {
+                    self.network
+                        .tx
+                        .send(NetworkControl::FetchBlob { blob_id: blob })
+                        .ok();
+                }
+            }
+        }
     }
 
     /// Decode a picture into the image map (and onto the disk cache
@@ -335,15 +458,25 @@ impl AppState {
         }
         self.update_user_list();
         self.rebuild_dms_model();
-        // Whoever's picture this is, their rows can show it now.
-        let authors: Vec<String> = self
+        // Whoever's picture this is, their rows can show it now: by
+        // account (everyone the session has one for), else by name.
+        let online: Vec<String> = self
             .profiles
             .iter()
-            .filter(|(_, p)| p.avatar == Some(blob))
+            .filter(|(c, p)| p.avatar == Some(blob) && self.account_of(**c).is_none())
             .filter_map(|(c, _)| self.users.get(c).map(|u| u.username.clone()))
             .collect();
-        for name in authors {
+        let accounts: Vec<(client::UserId, String)> = self
+            .author_looks
+            .iter()
+            .filter(|(_, l)| l.profile.avatar == Some(blob))
+            .map(|(u, l)| (*u, l.name.clone()))
+            .collect();
+        for name in online {
             self.refresh_author_look(&name);
+        }
+        for (user, name) in accounts {
+            self.refresh_account_look(&user, &name);
         }
     }
 
@@ -399,7 +532,7 @@ impl AppState {
             xp_pct: -1,
             ..UserRow::default()
         };
-        self.apply_profile_look(name, false, &mut row);
+        self.apply_profile_look(name, false, None, &mut row);
         row
     }
 

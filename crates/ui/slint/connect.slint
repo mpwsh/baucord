@@ -2,7 +2,7 @@
 //
 // Nickname + the saved-server dropdown (which server to join, shown by
 // name; the pencil jumps to Settings → Servers), Connect,
-// Settings/Quit, error + device-warning lines — as a centered rounded
+// Settings/Quit, the terms line, error + device-warning lines — as a centered rounded
 // card. Values live in State so they survive failed attempts and
 // reconnects.
 //
@@ -123,8 +123,40 @@ export component ConnectView inherits Rectangle {
                 if State.can-quit : Btn { text: Tr.quit; clicked => { Logic.quit(); } }
             }
 
+            // Connecting is agreeing to the terms (1.2): said once, small,
+            // with the whole line a way to read them.
+            Rectangle {
+                // A little taller than the text: a finger's worth to tap.
+                height: terms-row.preferred-height + 10px;
+                Rectangle {
+                    width: Math.min(terms-row.preferred-width, parent.width);
+                    x: (parent.width - self.width) / 2;
+                    terms-row := HorizontalLayout {
+                        spacing: 3px;
+                        Text {
+                            text: Tr.terms-notice;
+                            color: Theme.text-muted;
+                            font-size: Theme.font-xs;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: Tr.terms-link;
+                            color: terms-touch.has-hover ? Theme.accent-text : Theme.text-secondary;
+                            font-size: Theme.font-xs;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            animate color { duration: 120ms; }
+                        }
+                    }
+                    terms-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { Logic.link-clicked(State.terms-url); }
+                    }
+                }
+            }
+
             // "Saved device isn't connected" — the fix (Settings) sits
-            // right above it, same as before.
+            // just above it, past the terms line.
             Text {
                 text: State.device-warning;
                 color: Theme.warning;

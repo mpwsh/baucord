@@ -15,8 +15,8 @@ use std::{sync::Arc, time::Duration};
 
 use log::{debug, info, warn};
 use protocol::{
-    features, permissions, BlobId, ClientId, Profile, ProfileDenyReason, RenameDenyReason,
-    RestrictionKind, ServerMessage, UploadRejectReason, UserId,
+    features, permissions, AuthorInfo, BlobId, ClientId, Profile, ProfileDenyReason,
+    RenameDenyReason, RestrictionKind, ServerMessage, UploadRejectReason, UserId,
 };
 use sha2::{Digest, Sha256};
 
@@ -79,6 +79,77 @@ impl ChatServer {
                 .get(user)
                 .map(|u| u.profile.clone())
                 .unwrap_or_default(),
+        }
+    }
+
+    // ── Authors (1.2) ───────────────────────────────────────────────
+
+    /// What `Authors` says of an account: its name of record and its
+    /// look. `None` for an account the server no longer has.
+    fn author_info(&self, user: &UserId, client_id: Option<ClientId>) -> Option<AuthorInfo> {
+        let record = self.policy.users.get(user)?;
+        Some(AuthorInfo {
+            user_id: *user,
+            client_id,
+            name: client_id
+                .and_then(|c| self.usernames.get(&c).cloned())
+                .unwrap_or_else(|| record.name.clone()),
+            profile: record.profile.clone(),
+        })
+    }
+
+    /// A post (text, picture, file, DM) by `sender` is about to reach
+    /// `targets`. When nobody was told who that session is — it is in
+    /// the lobby, or gone by the time a stored DM is delivered — its
+    /// name and look go first to the targets that read `Authors`;
+    /// otherwise the post would arrive from "User…".
+    pub(super) fn introduce_author(
+        &mut self,
+        sender: ClientId,
+        author: &UserId,
+        targets: &[ClientId],
+    ) {
+        let announced = self
+            .channel_of
+            .get(&sender)
+            .is_some_and(|c| *c != self.default_channel);
+        if announced {
+            return;
+        }
+        let Some(info) = self.author_info(author, Some(sender)) else {
+            return;
+        };
+        let msg = ServerMessage::Authors {
+            authors: vec![info],
+        };
+        for peer in targets {
+            if *peer != sender {
+                self.send_if(*peer, features::SAFETY, &msg);
+            }
+        }
+    }
+
+    /// Before a history page or a conversation list: the name and look
+    /// of every account in it but the reader's own, for a session that
+    /// reads `Authors` — so a picture shows for someone who is not
+    /// online, or never was while the reader was.
+    pub(super) fn send_authors(
+        &mut self,
+        client: ClientId,
+        users: impl IntoIterator<Item = UserId>,
+    ) {
+        if !self.has_feature(client, features::SAFETY) {
+            return;
+        }
+        let me = self.user_of.get(&client).copied();
+        let mut seen = std::collections::HashSet::new();
+        let authors: Vec<AuthorInfo> = users
+            .into_iter()
+            .filter(|u| Some(*u) != me && seen.insert(*u))
+            .filter_map(|u| self.author_info(&u, None))
+            .collect();
+        if !authors.is_empty() {
+            self.send_msg(client, &ServerMessage::Authors { authors });
         }
     }
 

@@ -10,13 +10,6 @@ use super::*;
 
 impl AppState {
     pub(super) fn handle_connect(&mut self, nickname: &str) {
-        // The terms first (Play's user-content rules): once, and again
-        // when they change in substance.
-        if self.settings.terms_version < TERMS_VERSION {
-            self.terms_pending = Some(nickname.to_string());
-            self.main.global::<State>().set_terms_open(true);
-            return;
-        }
         self.reconnect_timer.stop();
         self.settings.user.nickname = nickname.to_string();
         self.main.global::<State>().set_connect_notice("".into());

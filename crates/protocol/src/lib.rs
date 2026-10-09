@@ -44,7 +44,7 @@ pub use lanes::{
 pub use messages::{
     decode_client_message, decode_server_message, decode_telemetry_event, decode_telemetry_sample,
     encode_client_message, encode_server_message, encode_telemetry_event, encode_telemetry_sample,
-    Attachment, AudioSample, Auth, BlobId, ChannelDenyReason, ChannelInfo, ChannelSpec,
+    Attachment, AudioSample, Auth, AuthorInfo, BlobId, ChannelDenyReason, ChannelInfo, ChannelSpec,
     ChannelUiDenyReason, ChatMessage, ClientId, ClientInfo, ClientKeyProof, ClientMessage, ConvRef,
     DenyReason, DmFailReason, DmSummary, HistoryMessage, InviteDenyReason, InviteInvalidReason,
     NameStyle, NeedInviteReason, PathSample, Profile, ProfileDenyReason, RefusedReason,

@@ -997,6 +997,19 @@ voice unaffected, writes counted as dropped".
     stream, speaking ring and LIVE chip. The blocked person is not
     told. Unblocking shows new messages; the hidden ones come back on
     the next connect. Block changes: 30 a minute per account.
+  - *Authors* (`ServerMessage::Authors`, `AuthorInfo`; `SAFETY`
+    sessions): a session in the lobby is named to nobody, so its post
+    used to arrive from "User…" with no picture, and a history row by
+    someone offline had a name but no look. Now a name and a look go
+    first: before a post, picture, file or DM from a session nobody
+    was told about (in the lobby, or gone before a stored DM is
+    delivered; with its `client_id`, which the client's name table
+    takes), before every history page (its authors but the reader) and
+    before the DM list (the other ends). Nothing about presence. The
+    client keeps looks by account for the session (`author_looks`,
+    everyone seen online included, so a picture outlives its owner's
+    leaving); the pictures themselves were already on disk by hash
+    (`avatar_cache_dir`), fetched once per picture.
   - *Report* a message (General, or a DM the reporter is in — checked
     against the stored conversation, so a guessed id does not expose
     someone else's) or a person, with a reason (`ReportReason`, eight,
@@ -1030,9 +1043,11 @@ voice unaffected, writes counted as dropped".
     purge is not delivered and the purge runs again. The client keeps
     the server entry (a new invite gets back in) and drops its channel
     passwords.
-  - Terms of use are the app's, not a server's: accepted once before
-    the first connect (`settings.terms_version`, `TERMS_VERSION`;
-    `web/terms.html`). A server's own rules go in its greeting.
+  - Terms of use are the app's, not a server's: connecting is
+    agreeing, and the connect card says so under Settings/Quit with a
+    link (`web/terms.html`; `terms-notice`, `terms-link`). Nothing is
+    stored; a settings file with the test builds' `terms_version`
+    still loads. A server's own rules go in its greeting.
 
 - Chat is general + DMs; no per-channel text (schema leaves the door open).
 - Guests: icon + tooltip from `UserJoined { kind }`; the name is never altered.

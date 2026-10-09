@@ -1252,6 +1252,15 @@ pub enum ServerMessage {
         from: UserId,
         msg: ChatMessage,
     },
+    /// Who wrote what this session is about to get, for authors it has
+    /// no roster row for: someone in the lobby (whose join nobody saw)
+    /// right before their post or DM, and whoever wrote a history page
+    /// or is on the other end of a listed DM conversation right before
+    /// that page or list. A name and a look, nothing about presence.
+    /// `SAFETY` sessions (1.2).
+    Authors {
+        authors: Vec<AuthorInfo>,
+    },
 }
 
 /// Why a DM was not sent (spec §6).
@@ -1327,6 +1336,19 @@ pub struct DmSummary {
     pub last_ts: u64,
     /// The newest message's id (the client's paging cursor).
     pub last_msg_id: u64,
+}
+
+/// One author in [`ServerMessage::Authors`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorInfo {
+    pub user_id: UserId,
+    /// Their session, when the post they wrote is arriving live (its
+    /// `client_id` names no one the receiver was told about); `None`
+    /// for history and conversation lists.
+    pub client_id: Option<ClientId>,
+    /// Their name of record now.
+    pub name: String,
+    pub profile: Profile,
 }
 
 /// The SHA-256 of a blob's bytes: its identity everywhere (spec §7).
@@ -2196,6 +2218,26 @@ mod tests {
                     text: "hello".to_string(),
                 },
             },
+            ServerMessage::Authors {
+                authors: vec![
+                    AuthorInfo {
+                        user_id: [7u8; 32],
+                        client_id: Some(11),
+                        name: "lurker".to_string(),
+                        profile: Profile {
+                            name_color: Some(0x00AA_BBCC),
+                            name_style: NameStyle::Bold,
+                            avatar: Some([8u8; 32]),
+                        },
+                    },
+                    AuthorInfo {
+                        user_id: [9u8; 32],
+                        client_id: None,
+                        name: "gone".to_string(),
+                        profile: Profile::default(),
+                    },
+                ],
+            },
         ] {
             assert!(server_roundtrips(&msg), "{msg:?}");
         }
@@ -2238,6 +2280,11 @@ mod tests {
         })
         .unwrap());
         assert_eq!(chat_from, refused + 1);
+        let authors = tag(encode_server_message(&ServerMessage::Authors {
+            authors: Vec::new(),
+        })
+        .unwrap());
+        assert_eq!(authors, chat_from + 1);
     }
 
     #[test]

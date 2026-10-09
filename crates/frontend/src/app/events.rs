@@ -133,7 +133,7 @@ impl AppState {
         match evt {
             ScreenEvent::SharingStarted { quality } => {
                 info!("Screen share started: {quality}");
-                self.push_chat_system(&t!("chat-share-started", "quality" => quality.to_string()));
+                self.push_activity(&t!("chat-share-started", "quality" => quality.to_string()));
                 self.main.global::<State>().set_sharing(true);
                 // Start the 1-second stream stats timer once. It stops
                 // itself when sharing ends; the guard prevents stacking
@@ -167,7 +167,7 @@ impl AppState {
             }
             ScreenEvent::SharingStopped => {
                 info!("Screen share stopped");
-                self.push_chat_system(&t!("chat-share-stopped"));
+                self.push_activity(&t!("chat-share-stopped"));
                 let s = self.main.global::<State>();
                 s.set_sharing(false);
                 // Clear the stats line — it used to keep showing the
@@ -192,14 +192,14 @@ impl AppState {
                 let username = self.username_of(client_id);
                 info!("{username} started sharing ({width}x{height})");
                 if !self.client_blocked(client_id) {
-                    self.push_chat_system(&t!("chat-peer-sharing", "name" => username.as_str()));
+                    self.push_activity(&t!("chat-peer-sharing", "name" => username.as_str()));
                 }
             }
             ScreenEvent::PeerStoppedSharing { client_id } => {
                 let username = self.username_of(client_id);
                 info!("{username} stopped sharing");
                 if !self.client_blocked(client_id) {
-                    self.push_chat_system(
+                    self.push_activity(
                         &t!("chat-peer-stopped-sharing", "name" => username.as_str()),
                     );
                 }
@@ -415,7 +415,7 @@ impl AppState {
                 }
                 self.update_user_list();
                 let line = t!("chat-level-up", "level" => level, "xp" => xp);
-                self.push_chat_system(&line);
+                self.push_activity(&line);
                 self.show_toast(ToastKind::Success, &line);
             }
             NetworkMessage::UserProgress {
@@ -562,7 +562,7 @@ impl AppState {
             }
             NetworkMessage::MovedIdle { after_min } => {
                 let line = t!("chat-moved-idle", "min" => after_min);
-                self.push_chat_system(&line);
+                self.push_activity(&line);
                 self.show_toast(ToastKind::Info, &line);
             }
             NetworkMessage::UserDetails {
@@ -597,7 +597,7 @@ impl AppState {
                         names.join(", ")
                     };
                     let what = t!("chat-your-roles-changed", "roles" => now.as_str());
-                    self.push_chat_system(&what);
+                    self.push_activity(&what);
                     self.show_toast(ToastKind::Info, &what);
                 }
             }
@@ -739,7 +739,7 @@ impl AppState {
                     crate::settingsui::refresh_servers(self);
                     if first_use {
                         info!("Pinned server identity {fingerprint}");
-                        self.push_chat_system(
+                        self.push_activity(
                             &t!("chat-identity-pinned", "fingerprint" => fingerprint.as_str()),
                         );
                     }
@@ -1043,8 +1043,12 @@ impl AppState {
                     .map(|(c, _)| *c);
                 if let Some(client_id) = client {
                     self.take_profile(client_id, profile);
+                } else if let Some(name) = self.author_looks.get(&user_id).map(|l| l.name.clone()) {
+                    // Someone not in the roster whose rows are on screen.
+                    self.take_author_look(user_id, name, profile);
                 }
             }
+            NetworkMessage::Authors { authors } => self.take_authors(authors),
             NetworkMessage::ProfileDenied { reason } => {
                 self.show_toast(ToastKind::Warning, &t!(profile_denied_key(reason)));
             }
@@ -1075,7 +1079,7 @@ impl AppState {
                 // the new name (their look follows: profiles are keyed
                 // by session, and the roster row now carries the name).
                 self.rename_author(&old, &name);
-                self.push_chat_system(&t!(
+                self.push_activity(&t!(
                     "chat-user-renamed",
                     "old" => old.as_str(),
                     "new" => name.as_str()

@@ -363,6 +363,7 @@ impl ChatServer {
             // General: everyone but whoever blocked the poster.
             None => self.audience_of(&from),
         };
+        self.introduce_author(msg.client_id, &from, &targets);
         for peer in targets {
             if self.has_feature(peer, features::FILES) {
                 self.send_msg(peer, &rich);

@@ -624,11 +624,6 @@ pub struct Settings {
     pub logging: LoggingSettings,
     #[serde(default)]
     pub notifications: NotificationSettings,
-    /// The version of the terms of use (baucord.com/terms.html) the
-    /// user accepted; 0 = none yet. The app asks before connecting
-    /// while it is below the one it ships with.
-    #[serde(default)]
-    pub terms_version: u32,
 }
 
 /// How much `baucord.log` records (1.1.5). `RUST_LOG` in the
@@ -704,8 +699,6 @@ struct SettingsDe {
     logging: LoggingSettings,
     #[serde(default)]
     notifications: NotificationSettings,
-    #[serde(default)]
-    terms_version: u32,
 }
 
 #[derive(Deserialize)]
@@ -765,7 +758,6 @@ impl From<SettingsDe> for Settings {
             sounds: de.sounds,
             logging: de.logging,
             notifications: de.notifications,
-            terms_version: de.terms_version,
         };
         settings.normalize_servers();
         settings
@@ -790,7 +782,6 @@ impl Default for Settings {
             sounds: SoundSettings::default(),
             logging: LoggingSettings::default(),
             notifications: NotificationSettings::default(),
-            terms_version: 0,
         }
     }
 }
@@ -1327,14 +1318,15 @@ mod tests {
         );
     }
 
+    /// A 1.2 test build kept which terms had been accepted
+    /// (`terms_version`); the connect card says it now. A file that
+    /// still has the field loads all the same.
     #[test]
-    fn the_accepted_terms_survive_a_save_and_default_to_none() {
-        let s = parse(r#"{ "servers": [ { "name": "x", "address": "1.2.3.4:5" } ] }"#);
-        assert_eq!(s.terms_version, 0, "an older file: never accepted");
-        let mut s = Settings::default();
-        s.terms_version = 3;
-        let json = serde_json::to_string(&s).expect("serialize");
-        assert_eq!(parse(&json).terms_version, 3);
+    fn a_file_from_the_terms_dialog_builds_still_loads() {
+        let s = parse(
+            r#"{ "terms_version": 1, "servers": [ { "name": "x", "address": "1.2.3.4:5" } ] }"#,
+        );
+        assert_eq!(s.servers[0].name, "x");
     }
 
     #[test]

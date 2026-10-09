@@ -608,6 +608,20 @@ pub enum NetworkMessage {
     AccountDeleteRefused {
         reason: protocol::DeleteRefusal,
     },
+    /// Who wrote what is about to arrive, for authors with no roster
+    /// row: someone in the lobby (their session's name is learned here
+    /// too, so the post that follows carries it), or the people behind
+    /// a history page or the DM list.
+    Authors {
+        authors: Vec<protocol::AuthorInfo>,
+    },
+}
+
+/// The name a post gets when its session was never named to us: what
+/// a late introduction (`Authors`) replaces.
+#[must_use]
+pub fn fallback_username(client_id: ClientId) -> String {
+    format!("User{client_id:x}")
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1370,7 +1384,7 @@ impl NetworkClient {
                 let username = self
                     .usernames
                     .remove(&client_id)
-                    .unwrap_or_else(|| format!("User{client_id:x}"));
+                    .unwrap_or_else(|| fallback_username(client_id));
                 self.message_queue.push(NetworkMessage::UserLeft {
                     client_id,
                     username,
@@ -1794,6 +1808,16 @@ impl NetworkClient {
                     text: msg.text,
                     author: Some(from),
                 });
+            }
+            ServerMessage::Authors { authors } => {
+                // A session in the lobby was never in `Init` or a
+                // `UserJoined`: its name comes from here, before its post.
+                for author in &authors {
+                    if let Some(client_id) = author.client_id {
+                        self.usernames.insert(client_id, author.name.clone());
+                    }
+                }
+                self.message_queue.push(NetworkMessage::Authors { authors });
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.
@@ -1806,7 +1830,7 @@ impl NetworkClient {
         self.usernames
             .get(&client_id)
             .cloned()
-            .unwrap_or_else(|| format!("User{client_id:x}"))
+            .unwrap_or_else(|| fallback_username(client_id))
     }
 
     // ── Voice lane ──────────────────────────────────────────────────

@@ -891,14 +891,12 @@ admin-act-report-resolve = handled report
 admin-act-user-delete = deleted, at its owner's request, the account
 chat-admin-reports-header = { $count } reports, newest first
 chat-command-usage-resolve = Usage: /resolve <report number> (see /reports)
-terms-title = Before you connect
-terms-lead = By using baucord you agree to its terms of use. On every server:
-terms-rules = • You are 18 or older.
-    • Nothing illegal, and nothing sexual involving minors.
-    • No threats, harassment, hate or spam.
-    • Report what breaks the rules, and block anyone you don't want to hear from: right-click a message or a person (on a phone, press and hold a message, or tap a person).
+# ── The connect card's terms line (1.2): the lead-in, then the link ──
+terms-notice = By connecting you agree to the
+terms-link = terms and conditions
 
-    Each server's owner may add rules of their own.
-terms-read = Read the terms
-terms-agree = I agree
-privacy-read = Privacy policy
+# ── General's activity view (1.2): the header toggle, the empty state ─
+activity-show = Activity
+activity-hide = Back to messages
+activity-empty-title = No activity yet
+activity-empty = Who joins, leaves, moves or shares shows here while you're connected. It is not saved anywhere.

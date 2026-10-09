@@ -149,12 +149,13 @@ In this order; each is a PRODUCTION-PLAN item.
   posted at once (messages deleted, not anonymized). The web page is
   `https://baucord.com/delete-account.html` (the Console's *Delete
   account URL*), with the email address for the official server.
-- [x] **MOB-15 — terms before user content** (1.2). The app shows the
-  short version with a link to `https://baucord.com/terms.html`
-  (which defines and prohibits objectionable content and says reports
-  are acted on) before the first connect, and records the acceptance
-  on the device. One set for every server; a server's own rules go in
-  its greeting.
+- [x] **MOB-15 — terms before user content** (1.2). Under the connect
+  button the app says "By connecting you agree to the terms and
+  conditions", linking `https://baucord.com/terms.html` (which defines
+  and prohibits objectionable content and says reports are acted on):
+  nobody posts without connecting first. One set for every server; a
+  server's own rules go in its greeting. (A first-connect "I agree"
+  dialog was tried in the 1.2 test builds and dropped for this line.)
 - [x] **LEG-5 — privacy policy, terms, account deletion pages** on the
   website (`web/`), public, not a PDF, naming the app as the listing
   does: `privacy.html`, `terms.html`, `delete-account.html`, linked

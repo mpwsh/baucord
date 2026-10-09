@@ -129,13 +129,13 @@ impl AppState {
 
         if self.lobby {
             let channel = self.channel_name(channel_id);
-            self.push_chat_system(&t!(
+            self.push_activity(&t!(
                 "chat-user-joined-channel",
                 "name" => username.as_str(),
                 "channel" => channel.as_str()
             ));
         } else {
-            self.push_chat_system(&t!("chat-user-joined", "name" => username.as_str()));
+            self.push_activity(&t!("chat-user-joined", "name" => username.as_str()));
         }
         self.rebuild_dms_model();
         // Off screen on a phone, the first voice into empty rooms is
@@ -174,7 +174,7 @@ impl AppState {
             viewer.close();
         }
 
-        self.push_chat_system(&t!("chat-user-left", "name" => username));
+        self.push_activity(&t!("chat-user-left", "name" => username));
         if was_in_our_channel {
             self.play_chime(SoundType::UserLeft);
         }
@@ -228,7 +228,7 @@ impl AppState {
                 return;
             }
             let channel = self.channel_name(channel_id);
-            self.push_chat_system(&t!("chat-you-moved", "channel" => channel.as_str()));
+            self.push_activity(&t!("chat-you-moved", "channel" => channel.as_str()));
             // The streams for the room first (a phone opens them only
             // now, D53), then the ding — on the new output, not the old.
             self.sync_voice_room();
@@ -236,7 +236,7 @@ impl AppState {
         } else {
             let name = self.username_of(client_id);
             let channel = self.channel_name(channel_id);
-            self.push_chat_system(&t!(
+            self.push_activity(&t!(
                 "chat-user-moved",
                 "name" => name.as_str(),
                 "channel" => channel.as_str()
@@ -292,7 +292,7 @@ impl AppState {
             self.channel_password_cancel();
         }
 
-        self.push_chat_system(&format!(
+        self.push_activity(&format!(
             "{}: {}",
             self.server_name,
             t!("chat-channels-updated"),

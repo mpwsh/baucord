@@ -889,14 +889,12 @@ admin-act-report-resolve = tratou a denúncia
 admin-act-user-delete = excluiu, a pedido do dono, a conta
 chat-admin-reports-header = { $count } denúncias, mais recentes primeiro
 chat-command-usage-resolve = Uso: /resolve <número da denúncia> (veja /reports)
-terms-title = Antes de conectar
-terms-lead = Ao usar o baucord você aceita os termos de uso. Em todos os servidores:
-terms-rules = • Você tem 18 anos ou mais.
-    • Nada ilegal, e nada sexual envolvendo menores.
-    • Nada de ameaças, assédio, ódio ou spam.
-    • Denuncie o que quebra as regras e bloqueie quem você não quer ouvir: clique com o botão direito numa mensagem ou numa pessoa (no celular, mantenha pressionada uma mensagem ou toque numa pessoa).
+# ── A linha de termos do cartão de conexão (1.2) ─────────────────────
+terms-notice = Ao conectar, você concorda com os
+terms-link = termos e condições
 
-    O dono de cada servidor pode acrescentar regras próprias.
-terms-read = Ler os termos
-terms-agree = Concordo
-privacy-read = Política de privacidade
+# ── Atividade do Geral (1.2): o botão do cabeçalho, o vazio ──────────
+activity-show = Atividade
+activity-hide = Voltar às mensagens
+activity-empty-title = Nenhuma atividade ainda
+activity-empty = Quem entra, sai, muda de sala ou compartilha a tela aparece aqui enquanto você está conectado. Nada disso é salvo.

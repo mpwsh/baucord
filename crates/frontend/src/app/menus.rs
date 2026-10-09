@@ -671,7 +671,7 @@ impl AppState {
                                 target_id: client_id,
                             })
                             .ok();
-                        app.push_chat_system(&t!("chat-watching", "name" => username.as_str()));
+                        app.push_activity(&t!("chat-watching", "name" => username.as_str()));
                         info!("Viewer open + subscribed to {client_id}");
                     }
                     Err(e) => {
@@ -698,7 +698,7 @@ impl AppState {
             })
             .ok();
         let username = self.username_of(client_id);
-        self.push_chat_system(&t!("chat-stopped-watching", "name" => username.as_str()));
+        self.push_activity(&t!("chat-stopped-watching", "name" => username.as_str()));
     }
 
     pub fn set_stream_volume(&mut self, client_id: u64, volume: f32) {

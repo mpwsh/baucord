@@ -117,6 +117,7 @@ impl ChatServer {
                 m
             })
             .collect();
+        self.send_authors(client, rows.iter().map(|r| r.user_id));
         self.send_history_pages(client, conv, page, more);
         if rich && let Some(attachments) = self.history_attachments(conv, rows) {
             self.send_msg(client, &attachments);

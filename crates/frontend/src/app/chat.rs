@@ -9,10 +9,11 @@
 use super::*;
 
 impl AppState {
-    /// A system line into the general chat, whichever conversation
-    /// is open (notices are about the room).
-    /// A system line into General, stamped with the local time: who
-    /// came, went or moved, and when.
+    /// A system line into General, whichever conversation is open,
+    /// stamped with the local time: what this session needs to see
+    /// where the messages are (a disconnect, a restriction, a refusal).
+    /// Who came, went, moved or shared goes to the activity view
+    /// instead (`push_activity`).
     pub fn push_chat_system(&mut self, text: &str) {
         let now = u64::try_from(chrono::Local::now().timestamp_millis()).unwrap_or(0);
         let line = format!("{}  {text}", format_wall_time(now));
@@ -100,6 +101,9 @@ impl AppState {
     /// look as a file on its way). The server relays `ImageMessage`
     /// back; our own echo replaces the card.
     pub(super) fn send_image_with_card(&mut self, png: Vec<u8>) {
+        if self.activity_shown() {
+            self.set_general_view(false);
+        }
         let client_ref = self.next_client_ref;
         self.next_client_ref = self.next_client_ref.wrapping_add(1).max(1);
         let placeholder = u64::MAX - u64::from(client_ref);
@@ -158,6 +162,9 @@ impl AppState {
     /// Announce a picked file to the server; the answer arrives as
     /// `UploadDone` (→ `file_uploaded`) or `UploadRejected`.
     pub fn begin_file_upload(&mut self, name: String, mime: String, bytes: Vec<u8>) {
+        if self.activity_shown() {
+            self.set_general_view(false);
+        }
         let upload_id = self.next_file_upload_id;
         self.next_file_upload_id = self
             .next_file_upload_id
@@ -585,6 +592,9 @@ impl AppState {
     /// Forget every in-flight chat interaction (a fresh session, or
     /// none): edits, confirms, paging.
     pub(super) fn reset_chat_flow(&mut self) {
+        // The activity belongs to one session: nothing of it survives
+        // a connect or a disconnect.
+        self.clear_activity();
         self.own_texts.clear();
         self.editing = None;
         self.pending_edit = None;
@@ -682,6 +692,11 @@ impl AppState {
     /// (people were reconnecting just to get an empty chat). Also the
     /// bluntest memory-release lever the user has.
     pub fn clear_chat(&mut self) {
+        // The view shown is the one cleared: General's activity too.
+        if self.activity_shown() {
+            self.activity_model.set_vec(Vec::new());
+            return;
+        }
         self.history_mut().clear();
         self.chat_model.set_vec(Vec::new());
         self.images.clear();

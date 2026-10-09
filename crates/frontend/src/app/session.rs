@@ -142,6 +142,8 @@ impl AppState {
         self.telemetry_notes.clear();
         self.moderation = None;
         self.profiles.clear();
+        self.author_looks.clear();
+        self.lurkers.clear();
         self.avatar_fetches.clear();
         self.own_avatar_blob = None;
         self.reset_safety();
@@ -509,6 +511,11 @@ impl AppState {
         }
         if text.is_empty() {
             return;
+        }
+        // Written from General's activity view: what is sent, and any
+        // command's answer, is in the conversation — show it.
+        if self.activity_shown() {
+            self.set_general_view(false);
         }
         if let Some(rest) = text.strip_prefix('/')
             && let Some((command, args)) = split_command(rest)
