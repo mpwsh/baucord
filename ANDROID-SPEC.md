@@ -497,8 +497,9 @@ voice: channel name, mute, deafen, route, leave.
 - Text sizes come from `theme.slint`; nothing below 14 sp.
 - The soft keyboard resizes the window (`adjustResize`); the composer
   stays above it and the chat list keeps its bottom anchor.
-- Every new string goes in all three Fluent catalogs and every `Tr`
-  property is filled in `fill_tr` — the existing rule, unchanged.
+- Every new string goes in all three Fluent catalogs; a `Tr` one is
+  also a name in `tr.slint`, which `frontend/build.rs` turns into its
+  `fill_tr` line (the build fails when a catalog lacks it).
 - Every `.slint` change is checked with `slint-viewer --check` and
   rendered at a phone viewBox (412×915 logical) before hand-over;
   `mobile/main.slint` is added to the guide's check list.

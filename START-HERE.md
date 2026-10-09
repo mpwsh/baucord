@@ -116,7 +116,9 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
   `transport`, `client`, `server`, `frontend`, `desktop`, `android`,
   `ios`); `cargo test -p protocol --test versions` enforces it.
 - **Every new string** goes into all three Fluent catalogs (en, es-AR,
-  pt-BR), and every `Tr` property is filled in `fill_tr`.
+  pt-BR). A string the Slint side shows is also a name in `tr.slint`
+  (no text there): `frontend/build.rs` generates its line of `fill_tr`
+  and fails the build when a catalog lacks it.
 - **Every `.slint` change** is compile-checked and rendered, at phone
   width and at 1000×640.
 - **Phone builds are always `-p android` / `-p ios`**: a workspace build

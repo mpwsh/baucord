@@ -166,9 +166,14 @@ the root `Cargo.toml`), rustfmt at 100 columns with the repo's
 everything but the imports: write new imports the nightly way (one
 `use` per crate, std / external / crate groups) and the user's
 `cargo +nightly fmt --all` settles the rest. Markdown wraps at 80.
-Every new string goes into all three Fluent catalogs (en, es-AR, pt-BR)
-**and** every `Tr` property in `tr.slint` is filled in `fill_tr` — a
-ten-line parity script over the `.ftl` keys is worth re-running.
+Every new string goes into all three Fluent catalogs (en, es-AR, pt-BR).
+A string the Slint side shows is also declared in `tr.slint` — the name
+only, never the English (the .ftl has it; copies there drifted from what
+the app showed, 32 of them by 1.2). `frontend/build.rs` turns the names
+into `fill_tr_from_ftl` and fails the build when a catalog lacks one;
+`fill_tr` adds only the per-platform variants. Renders get the English
+from `en.ftl` as `--load-data` (slint-viewer shows the names empty
+otherwise).
 
 ## 2. Map
 
