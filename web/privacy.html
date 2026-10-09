@@ -149,7 +149,7 @@
 
     <main class="wrap">
       <h1>Privacy policy</h1>
-      <p class="updated">Last updated 8 October 2026</p>
+      <p class="updated">Last updated 9 October 2026</p>
 
       <p>
         baucord is a free, open-source app for voice chat, text chat and
@@ -186,7 +186,8 @@
             whoever runs it, can read messages and see shared media.
           </li>
           <li>
-            To have your account and data deleted, write to
+            You can delete your account, and what you posted, from the
+            app at any time (Settings → Profile), or by writing to
             <a href="mailto:support@mpw.sh">support@mpw.sh</a>.
           </li>
         </ul>
@@ -242,8 +243,9 @@
         your own recent chat messages; deleted messages are hidden at
         once and erased with the 90-day clean-up. Files attached to
         messages are not yet removed by that clean-up: they are kept
-        until you or a moderator delete the message they came with, or
-        your account is deleted, and are then erased within 30 days.
+        until you or a moderator delete the message they came with (then
+        erased within 30 days), or your account is deleted (then erased
+        at once).
       </p>
 
       <h3>Voice, screen sharing and shared audio</h3>
@@ -274,7 +276,27 @@
         messages, and links to pictures you pasted. It does not contain
         the text of your messages. Logs are read only to fix problems.
         They are not yet deleted on a schedule: they are kept until we
-        delete them, and we will on request.
+        delete them, which we do on request and when your account is
+        deleted.
+      </p>
+
+      <h3>Blocks and reports</h3>
+      <p>
+        When you block someone, the server stores that you did, so it
+        can keep their messages, voice and direct messages from you on
+        all your devices. The person is not told. A block is kept until
+        you undo it or either account is deleted.
+      </p>
+      <p>
+        When you report a message or a person, the server stores the
+        report: who made it, who it is about, the reason and note you
+        gave, and a copy of the reported message as it was, so the
+        moderators see what you saw even if it is edited or deleted
+        later. The person reported is not told who reported them. A
+        report is kept until a moderator marks it handled and is deleted
+        90 days after that; a report about you is deleted with your
+        account, and one you made loses your name when your account is
+        deleted.
       </p>
 
       <h3>Your IP address</h3>
@@ -290,8 +312,8 @@
         To run the server and investigate abuse, its log records
         connections (with names and IP addresses), invite codes used,
         moderation actions, the text of messages posted in the server's
-        chat, the names of files posted, and who sent a direct message
-        to whom (not its text). Only we can read it, and it is replaced
+        chat, the names of files posted, who sent a direct message to
+        whom (not its text), and who blocked or reported whom. Only we can read it, and it is replaced
         as it grows rather than deleted on a fixed schedule.
       </p>
 
@@ -320,8 +342,9 @@
         </li>
         <li>
           <strong>Moderators and administrators</strong> of the server
-          can also see account details, moderation records and the latest
-          call-quality report of each person.
+          can also see account details, moderation records, the reports
+          people make (with the reported message and who reported it)
+          and the latest call-quality report of each person.
         </li>
         <li>
           <strong>The hosting provider</strong> that rents us the server
@@ -376,11 +399,19 @@
             </tr>
             <tr>
               <td>Logs you send</td>
-              <td>Until deleted (on request, or by us)</td>
+              <td>Until deleted (on request, with your account, or by us)</td>
             </tr>
             <tr>
               <td>Bans and their IP address</td>
               <td>As long as the ban lasts</td>
+            </tr>
+            <tr>
+              <td>Blocks</td>
+              <td>Until undone, or either account is deleted</td>
+            </tr>
+            <tr>
+              <td>Reports, with a copy of the reported message</td>
+              <td>Until handled by a moderator, then 90 days</td>
             </tr>
             <tr>
               <td>Voice, screen shares, shared audio</td>
@@ -392,13 +423,23 @@
 
       <h2>Deleting your account and data</h2>
       <p>
-        Write to <a href="mailto:support@mpw.sh">support@mpw.sh</a> with your name on the official server. We will
-        delete your account, device keys, profile,
-        roles, the messages you sent and the files you uploaded, your
-        call-quality reports and any logs you sent, within 30 days, and
-        tell you when it is done. A button to do this from the app is
-        coming. Moderation records may keep a note that an account was
-        removed.
+        In the app, connect to the server and choose
+        <strong>Settings → Profile → Delete my account</strong>. Your
+        account is deleted at once, with your device keys, profile,
+        roles, the messages you posted, every direct message
+        conversation you were part of (both people's messages and files),
+        the files you uploaded, your call-quality reports, the logs you
+        sent, your blocks and the reports about you. Reports you made
+        stay without your name until handled, and the moderation record
+        keeps a line that an account was deleted, with no name.
+        <a href="delete-account.html">Delete your account</a> has the
+        details.
+      </p>
+      <p>
+        Without the app, write to
+        <a href="mailto:support@mpw.sh">support@mpw.sh</a> with your
+        name on the official server: we delete the same within 30 days
+        and tell you when it is done.
       </p>
       <p>
         You can also ask for a copy of what is stored about you, or for
@@ -451,6 +492,8 @@
     <footer>
       <div class="wrap">
         <a href="/">baucord</a>
+        <a href="terms.html">Terms</a>
+        <a href="delete-account.html">Delete your account</a>
         <a href="https://github.com/mpwsh/baucord">Source</a>
       </div>
     </footer>

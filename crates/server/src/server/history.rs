@@ -230,7 +230,12 @@ impl ChatServer {
             // Routed by `poll_persistence`; these never land on a
             // history ask.
             Outcome::Answered(
-                Answer::Blob(_) | Answer::Stored | Answer::Conversations(_) | Answer::Audit(_),
+                Answer::Blob(_)
+                | Answer::Stored
+                | Answer::Conversations(_)
+                | Answer::Audit(_)
+                | Answer::ReportedMessage(_)
+                | Answer::Reports(_),
             ) => {
                 log::warn!("unexpected answer on a history ask; ignored");
             }
@@ -331,7 +336,12 @@ impl ChatServer {
             "{} ({client:#x}) edited message {msg_id}",
             self.get_username(client)
         );
-        self.broadcast_msg(&ServerMessage::MessageEdited { msg_id, text });
+        // Not to whoever blocked the author: they never saw the message,
+        // and an edit of one off screen is shown with its text.
+        let edited = ServerMessage::MessageEdited { msg_id, text };
+        for peer in self.audience_of(&user) {
+            self.send_msg(peer, &edited);
+        }
     }
 
     /// Your own recent message removed; `by_admin` skips the ownership
@@ -466,16 +476,53 @@ impl ChatServer {
         }
     }
 
-    /// Delete a person (spec §8): sessions closed, every trace in
-    /// memory gone, the rows queued for deletion, one audit line kept.
+    /// Delete a person (spec §8): an admin's purge.
     pub(super) fn purge_user(&mut self, actor: UserId, user_id: &UserId) {
+        self.erase_user(Some(actor), user_id, "account removed", "user.purge");
+    }
+
+    /// Delete a person, by an admin or by themselves
+    /// (`DeleteAccount`): sessions closed with `reason`, every trace in
+    /// memory gone, their recent messages taken off everyone's screen,
+    /// the rows queued for deletion (`Store::purge_user`), their
+    /// uploaded logs removed, one audit line (`action`) kept.
+    /// A purge took references off files other people uploaded
+    /// (`Notice::RefsReleased`): the counts follow, and a file nothing
+    /// points at any more is deleted now rather than at the next prune
+    /// (it belonged to a conversation that no longer exists).
+    pub(super) fn release_blob_refs(&mut self, released: &[(protocol::BlobId, u32)]) {
+        for (blob, count) in released {
+            self.blob_ref(blob, -i32::try_from(*count).unwrap_or(i32::MAX));
+            if self.policy.blobs.get(blob).is_some_and(|b| b.refs == 0) {
+                self.policy.blobs.remove(blob);
+                self.blob_bytes.remove(blob);
+                self.persist.send(Command::DeleteBlob { blob_id: *blob });
+            }
+        }
+    }
+
+    pub(super) fn erase_user(
+        &mut self,
+        actor: Option<UserId>,
+        user_id: &UserId,
+        reason: &str,
+        action: &str,
+    ) {
+        // The line first, while the actor's name still resolves.
+        self.audit(actor, action, Some(hex(&user_id[..8])), None);
+        let name = self
+            .policy
+            .users
+            .get(user_id)
+            .map(|u| u.name.clone())
+            .unwrap_or_default();
+        let avatar = self
+            .policy
+            .users
+            .get(user_id)
+            .and_then(|u| u.profile.avatar);
         for session in self.sessions_of(user_id) {
-            self.remove_session(
-                session,
-                protocol::RemovedKind::Kicked,
-                "account removed",
-                "server",
-            );
+            self.remove_session(session, protocol::RemovedKind::Kicked, reason, "server");
         }
         self.policy.users.remove(user_id);
         self.policy.keys.retain(|_, k| k.user_id != *user_id);
@@ -483,8 +530,18 @@ impl ChatServer {
             .restrictions
             .retain(|r| r.user_id.as_ref() != Some(user_id));
         self.policy.xp.remove(user_id);
-        // Their files go with them (spec §8): the rows referencing them
-        // are being deleted, and nothing else may point at them.
+        // Their files (spec §8). Files are shared by content: someone
+        // else's post or avatar may be the same one. What nothing points
+        // at goes now; the rest stays, without an uploader, and loses
+        // the references the store's purge removes (their posts, their
+        // DM conversations, their avatar: `Notice::RefsReleased`), which
+        // deletes whatever that leaves unused. Without a store there are
+        // no stored posts, and the avatar is released here.
+        if !self.persist.is_persistent()
+            && let Some(blob) = avatar
+        {
+            self.blob_ref(&blob, -1);
+        }
         let theirs: Vec<protocol::BlobId> = self
             .policy
             .blobs
@@ -493,14 +550,46 @@ impl ChatServer {
             .map(|(id, _)| *id)
             .collect();
         for blob in theirs {
-            self.policy.blobs.remove(&blob);
-            self.blob_bytes.remove(&blob);
-            self.persist.send(Command::DeleteBlob { blob_id: blob });
+            match self.policy.blobs.get_mut(&blob) {
+                Some(meta) if meta.refs > 0 => meta.created_by = None,
+                _ => {
+                    self.policy.blobs.remove(&blob);
+                    self.blob_bytes.remove(&blob);
+                    self.persist.send(Command::DeleteBlob { blob_id: blob });
+                }
+            }
         }
+        // Their recent messages leave everyone's screen now, not at
+        // the next reconnect.
+        let gone: Vec<u64> = self
+            .recent
+            .iter()
+            .filter(|m| m.user_id == *user_id)
+            .map(|m| m.msg_id)
+            .collect();
         self.recent.retain(|m| m.user_id != *user_id);
+        for msg_id in gone {
+            self.broadcast_msg(&ServerMessage::MessageDeleted { msg_id });
+        }
         self.last_telemetry.remove(user_id);
+        self.pending_telemetry.remove(user_id);
+        self.progress.remove(user_id);
+        self.profile_changed_at.remove(user_id);
+        self.uploads_today.remove(user_id);
+        self.report_times.remove(user_id);
+        self.block_times.remove(user_id);
+        self.policy
+            .invites
+            .retain(|_, i| i.created_by != Some(*user_id));
+        // Their blocks go, and blocks on them: whoever comes back with
+        // the same key is a new account.
+        self.policy.blocks.remove(user_id);
+        for set in self.policy.blocks.values_mut() {
+            set.remove(user_id);
+        }
+        self.policy.blocks.retain(|_, set| !set.is_empty());
         self.persist.send(Command::PurgeUser { user_id: *user_id });
-        self.audit(Some(actor), "user.purge", Some(hex(&user_id[..8])), None);
+        self.delete_uploaded_logs(user_id, &name);
         self.refresh_enforcement();
     }
 }

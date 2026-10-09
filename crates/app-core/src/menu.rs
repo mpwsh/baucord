@@ -49,6 +49,16 @@ pub enum Label {
     SaveFile,
     Cut,
     Paste,
+    /// 1.2 (`SAFETY`): stop seeing and hearing someone.
+    Block,
+    Unblock,
+    /// Report a person to the server's moderators.
+    Report,
+    /// Report one message.
+    ReportMessage,
+    /// Block whoever wrote this message (a row's menu: they may be
+    /// gone from the roster).
+    BlockAuthor,
 }
 
 /// What activating an entry does, against the target the shell
@@ -93,6 +103,11 @@ pub enum Action {
     Cut,
     Copy,
     Paste,
+    Block,
+    Unblock,
+    Report,
+    ReportMessage,
+    BlockAuthor,
 }
 
 /// One row of a menu.
@@ -166,6 +181,8 @@ pub struct Session {
     pub dm: bool,
     pub manage_own_channels: bool,
     pub create_channels: bool,
+    /// The server takes blocks and reports (`features::SAFETY`).
+    pub safety: bool,
     /// Our highest rank across our roles; the role submenu offers
     /// roles up to it.
     pub our_rank: u16,
@@ -192,6 +209,9 @@ pub struct UserFacts {
     /// We own their channel (or manage all): send to the default one.
     pub channel_kickable: bool,
     pub channel_id: u16,
+    /// We blocked them: nothing of theirs reaches us, so the audio
+    /// and message entries go and Unblock takes Block's place.
+    pub blocked: bool,
 }
 
 /// A channel header row.
@@ -235,24 +255,41 @@ pub fn user_menu(
     if user.is_us {
         return Vec::new();
     }
-    let mut entries = vec![
-        Entry::new(Label::Volume, Action::Volume),
-        Entry::new(
-            if user.local_muted {
-                Label::UnmuteForMe
-            } else {
-                Label::MuteForMe
-            },
-            Action::MuteForMe,
-        ),
-        Entry::new(Label::ResetAudio, Action::ResetAudio),
-    ];
-    if user.sharing {
-        entries.push(Entry::new(Label::WatchStream, Action::Watch));
+    let mut entries = Vec::new();
+    // A blocked person's voice, stream and messages never reach us:
+    // nothing to adjust, watch or write to.
+    if !user.blocked {
+        entries.extend([
+            Entry::new(Label::Volume, Action::Volume),
+            Entry::new(
+                if user.local_muted {
+                    Label::UnmuteForMe
+                } else {
+                    Label::MuteForMe
+                },
+                Action::MuteForMe,
+            ),
+            Entry::new(Label::ResetAudio, Action::ResetAudio),
+        ]);
+        if user.sharing {
+            entries.push(Entry::new(Label::WatchStream, Action::Watch));
+        }
+        // Direct messages: members to members (spec §6).
+        if session.dm && user.role != Role::Guest {
+            entries.push(Entry::new(Label::Message, Action::Message).with_separator());
+        }
     }
-    // Direct messages: members to members (spec §6).
-    if session.dm && user.role != Role::Guest {
-        entries.push(Entry::new(Label::Message, Action::Message).with_separator());
+    // Blocking and reporting: anyone, about anyone but themselves.
+    if session.safety {
+        entries.push(
+            if user.blocked {
+                Entry::new(Label::Unblock, Action::Unblock)
+            } else {
+                Entry::new(Label::Block, Action::Block)
+            }
+            .with_separator(),
+        );
+        entries.push(Entry::new(Label::Report, Action::Report));
     }
 
     // Moderation, permission- and rank-gated (spec §4.1, §8).
@@ -372,6 +409,10 @@ pub struct MessageFacts {
     pub in_dm: bool,
     /// `RESTRICT`: the session deletes anyone's message.
     pub delete_any: bool,
+    /// Someone else's stored message on a server that takes reports
+    /// (`features::SAFETY`): it may be reported, and its author
+    /// blocked.
+    pub reportable: bool,
 }
 
 /// The menu for a chat row. Empty for a deleted message.
@@ -414,6 +455,10 @@ pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
         }
         entries.extend(editing);
     }
+    if m.reportable {
+        entries.push(Entry::new(Label::ReportMessage, Action::ReportMessage).with_separator());
+        entries.push(Entry::new(Label::BlockAuthor, Action::BlockAuthor));
+    }
     entries
 }
 
@@ -446,7 +491,57 @@ mod tests {
             role_editable: false,
             channel_kickable: false,
             channel_id: 1,
+            blocked: false,
         }
+    }
+
+    #[test]
+    fn block_and_report_need_a_server_that_takes_them() {
+        assert!(
+            !labels(&user_menu(&Session::default(), &member(), &[], &[]))
+                .iter()
+                .any(|l| matches!(l, Label::Block | Label::Report))
+        );
+        let safe = Session {
+            safety: true,
+            dm: true,
+            ..Session::default()
+        };
+        let entries = user_menu(&safe, &member(), &[], &[]);
+        assert_eq!(
+            labels(&entries),
+            [
+                Label::Volume,
+                Label::MuteForMe,
+                Label::ResetAudio,
+                Label::Message,
+                Label::Block,
+                Label::Report
+            ]
+        );
+        assert!(entries[4].separator && !entries[5].separator);
+    }
+
+    #[test]
+    fn a_blocked_person_offers_unblock_and_nothing_to_hear_or_write() {
+        let safe = Session {
+            safety: true,
+            dm: true,
+            disconnect: true,
+            ..Session::default()
+        };
+        let blocked = UserFacts {
+            blocked: true,
+            sharing: true,
+            ..member()
+        };
+        let entries = user_menu(&safe, &blocked, &[], &[]);
+        // Moderation still applies: a block is personal, not a power.
+        assert_eq!(
+            labels(&entries),
+            [Label::Unblock, Label::Report, Label::Disconnect]
+        );
+        assert_eq!(entries[0].action, Action::Unblock);
     }
 
     /// The four built-ins as a table, `held` for `member`.
@@ -711,7 +806,25 @@ mod tests {
             selecting: false,
             in_dm: false,
             delete_any: false,
+            reportable: false,
         }
+    }
+
+    #[test]
+    fn someone_elses_message_is_reported_and_its_author_blocked_in_dms_too() {
+        let theirs = MessageFacts {
+            reportable: true,
+            in_dm: true,
+            ..text_row()
+        };
+        let entries = message_menu(&theirs);
+        assert_eq!(
+            labels(&entries),
+            [Label::CopyMessage, Label::ReportMessage, Label::BlockAuthor]
+        );
+        assert!(entries[1].separator);
+        assert_eq!(entries[1].action, Action::ReportMessage);
+        assert_eq!(entries[2].action, Action::BlockAuthor);
     }
 
     #[test]

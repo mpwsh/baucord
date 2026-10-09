@@ -4,8 +4,10 @@ baucord is a voice, text and screen-sharing app in Rust: a self-hosted
 relay server (QUIC, no media mixing), a desktop client for Windows,
 macOS and Linux, and clients for Android and iPhone that run the same
 Rust engine and the same Slint UI. It is in daily use: 1.1.9 on every
-platform, desktop users on the in-app updater, Android as a sideloaded
-APK, iPhone as an Ad Hoc build, the official server in Docker.
+platform (1.2.0, the Play closed-testing release, is next), desktop
+users on the in-app updater, Android as a sideloaded APK and on Play's
+internal test, iPhone as an Ad Hoc build, the official server in
+Docker.
 
 This file is the way in. Read it first, then follow the reading order
 for the work at hand (§3). Everything else is linked from here.
@@ -123,9 +125,13 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
 - **The server's identity folder must survive every deploy** — it is
   what every client has pinned.
 
-## 5. Where things stand (2026-10-08)
+## 5. Where things stand (2026-10-09)
 
-- **Version 1.1.9** everywhere; the crate map is SESSION-GUIDE §2.
+- **Version 1.2.0** in the crates (released: 1.1.9); the crate map is
+  SESSION-GUIDE §2. 1.2 adds what the stores require of a chat app:
+  block, report, delete my account, terms before the first connect
+  (PERSISTENCE-SPEC §12 S1), and Android's foreground service typed
+  for Play (ANDROID-SPEC D63).
 - **Desktop**: in production (Windows mostly), self-updating.
 - **Android**: voice with the platform echo canceller, chat, DMs,
   files, stream viewing (MediaCodec), Settings → Debug, notifications
@@ -138,6 +144,8 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
   accepts to pin a server up front.
 - **Server**: persistence on (SQLite), invites and device keys,
   roles, the admin panel.
-- **Next**: PRODUCTION-PLAN.md Milestone A (server and client
-  hardening, signed updates), then the licence decisions; in parallel,
-  Google Play (PLAY-STORE.md) — its decisions are pending.
+- **Next**: Google Play's closed test with 1.2.0 (PLAY-STORE.md: the
+  Console's foreground-service declaration changes, the Data safety
+  form, the account-deletion URL); PRODUCTION-PLAN.md Milestone A
+  (server and client hardening, signed updates), then the licence
+  decisions.

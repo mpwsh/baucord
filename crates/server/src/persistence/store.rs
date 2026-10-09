@@ -6,7 +6,7 @@
 //! subcommand — never from the relay tick (spec §0, rule 1).
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs::{self, File},
     io,
     path::{Path, PathBuf},
@@ -19,8 +19,8 @@ use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
 use sha2::Digest;
 
 use super::{
-    AuditRow, BlobRecord, ConvKey, MessageRow, PersistError, ProgressDelta, TelemetryEventRow,
-    TelemetryRow,
+    AuditRow, BlobRecord, ConvKey, MessageRow, PersistError, ProgressDelta, ReportRow,
+    ReportedMessage, TelemetryEventRow, TelemetryRow,
 };
 use crate::{
     clock::WallMs,
@@ -39,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_foundation.sql"),
     include_str!("migrations/0002_message_edits.sql"),
     include_str!("migrations/0003_role_style.sql"),
+    include_str!("migrations/0004_safety.sql"),
 ];
 
 /// The schema version this build produces.
@@ -59,6 +60,8 @@ const COUNTED_TABLES: &[&str] = &[
     "user_progress",
     "telemetry_samples",
     "telemetry_events",
+    "blocks",
+    "reports",
 ];
 
 /// Wait this long on a locked database (a CLI command mid-backup)
@@ -524,6 +527,12 @@ impl Sqlite {
                 "DELETE FROM messages WHERE ts < ?1",
                 params![ordered(cutoff)],
             )?);
+            // Handled reports last as long as the messages they are
+            // about would; open ones wait for a moderator.
+            removed += count(self.conn.execute(
+                "DELETE FROM reports WHERE resolved_at IS NOT NULL AND resolved_at < ?1",
+                params![ordered(cutoff)],
+            )?);
         }
         if let Some(cutoff) = cutoff(now, retention.telemetry_days) {
             removed += count(self.conn.execute(
@@ -571,7 +580,164 @@ impl Sqlite {
         self.load_channels(&mut policy)?;
         self.load_progress(&mut policy)?;
         self.load_blobs(&mut policy)?;
+        self.load_blocks(&mut policy)?;
         Ok(policy)
+    }
+
+    fn load_blocks(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT blocker, blocked FROM blocks")?;
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, [u8; 32]>(1)?))
+        })? {
+            let (blocker, blocked) = row?;
+            policy.blocks.entry(blocker).or_default().insert(blocked);
+        }
+        Ok(())
+    }
+
+    // ── Blocks and reports (protocol::safety, 1.2) ─────────────────────
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_block(
+        &self,
+        blocker: &UserId,
+        blocked: &UserId,
+        ts: WallMs,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO blocks (blocker, blocked, created_at) VALUES (?1, ?2, ?3)",
+            params![blocker, blocked, ordered(ts)],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn delete_block(&self, blocker: &UserId, blocked: &UserId) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM blocks WHERE blocker = ?1 AND blocked = ?2",
+            params![blocker, blocked],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_report(&self, r: &ReportRow) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO reports (ts, reporter, target_user, target_name, msg_id, in_dm, excerpt,
+                                  reason, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                ordered(r.ts),
+                r.reporter,
+                r.target_user,
+                r.target_name,
+                r.msg_id.map(ordered),
+                i64::from(r.in_dm),
+                r.excerpt,
+                r.reason.to_db(),
+                r.note,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn resolve_report(
+        &self,
+        id: u64,
+        by: Option<&UserId>,
+        ts: WallMs,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE reports SET resolved_at = ?2, resolved_by = ?3
+             WHERE id = ?1 AND resolved_at IS NULL",
+            params![ordered(id), ordered(ts), by],
+        )?;
+        Ok(())
+    }
+
+    /// Reports, newest first: the open ones, or every one with
+    /// `resolved`.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn reports(
+        &self,
+        resolved: bool,
+        limit: u16,
+    ) -> Result<Vec<protocol::ReportSummary>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.ts, u.name, r.target_user, r.target_name, r.msg_id, r.in_dm,
+                    r.excerpt, r.reason, r.note, r.resolved_at
+             FROM reports r LEFT JOIN users u ON u.user_id = r.reporter
+             WHERE ?1 OR r.resolved_at IS NULL
+             ORDER BY r.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![resolved, i64::from(limit)], |row| {
+            Ok(protocol::ReportSummary {
+                id: unordered(row.get(0)?),
+                ts: unordered(row.get(1)?),
+                reporter: row.get(2)?,
+                target_user: row.get(3)?,
+                target_name: row.get(4)?,
+                msg_id: row.get::<_, Option<i64>>(5)?.map(unordered),
+                in_dm: row.get::<_, i64>(6)? != 0,
+                excerpt: row.get(7)?,
+                reason: protocol::ReportReason::from_db(row.get(8)?)
+                    .unwrap_or(protocol::ReportReason::Other),
+                note: row.get(9)?,
+                resolved: row.get::<_, Option<i64>>(10)?.is_some(),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// A message to report, with the conversation it is in; `None` if
+    /// there is no such message (or it was deleted).
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn message_for_report(
+        &self,
+        msg_id: u64,
+    ) -> Result<Option<ReportedMessage>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT m.msg_id, m.conv_id, m.ts, m.user_id, m.body, m.edited_at,
+                        COALESCE(u.name, ''), m.blob_id, c.kind, c.user_a, c.user_b
+                 FROM messages m
+                 JOIN conversations c ON c.conv_id = m.conv_id
+                 LEFT JOIN users u ON u.user_id = m.user_id
+                 WHERE m.msg_id = ?1 AND m.deleted_at IS NULL",
+                params![ordered(msg_id)],
+                |row| {
+                    let kind: i64 = row.get(8)?;
+                    let a: Option<[u8; 32]> = row.get(9)?;
+                    let b: Option<[u8; 32]> = row.get(10)?;
+                    let conv = match (kind, a, b) {
+                        (1, Some(a), Some(b)) => ConvKey::Dm(a, b),
+                        _ => ConvKey::General,
+                    };
+                    Ok(ReportedMessage {
+                        row: MessageRow {
+                            msg_id: unordered(row.get(0)?),
+                            conv_id: unordered(row.get(1)?),
+                            ts: unordered(row.get(2)?),
+                            user_id: row.get(3)?,
+                            body: row.get(4)?,
+                            edited: row.get::<_, Option<i64>>(5)?.is_some(),
+                            name: row.get(6)?,
+                            blob_id: row.get(7)?,
+                        },
+                        conv,
+                    })
+                },
+            )
+            .optional()
     }
 
     fn load_channels(&self, policy: &mut Policy) -> Result<(), rusqlite::Error> {
@@ -1151,21 +1317,123 @@ impl Sqlite {
         Ok(())
     }
 
-    /// Delete a person (spec §8): the row cascades to keys, roles,
-    /// restrictions and progress; their messages go too.
+    /// Delete a person (spec §8; an admin's purge, the CLI's, or their
+    /// own `DeleteAccount`): everything the account posted or left
+    /// behind, in one transaction. The user row cascades to keys,
+    /// roles, restrictions, progress and their blocks; besides it go
+    /// their messages, their DM conversations whole (the other side's
+    /// messages in them too) with the read marks, the invites they
+    /// made, their telemetry, the blocks on them, the reports about
+    /// them, and their files (rows and bytes). Reports they filed stay,
+    /// without them. Only the audit keeps a line.
     ///
     /// # Errors
     /// `SQLite` failure.
-    pub fn purge_user(&self, user_id: &[u8; 32]) -> Result<(), rusqlite::Error> {
-        self.conn
-            .execute("DELETE FROM messages WHERE user_id = ?1", params![user_id])?;
-        self.conn.execute(
+    pub fn purge_user(&self, user_id: &[u8; 32]) -> Result<Vec<([u8; 32], u32)>, rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let dm_convs = "SELECT conv_id FROM conversations
+                        WHERE kind = 1 AND (user_a = ?1 OR user_b = ?1)";
+        // References this removes from files: the user's posts, every
+        // file in their DM conversations (the other person's too: the
+        // conversation goes whole), and their avatar. Files are shared
+        // by content, so their own uploads count like anyone's.
+        let mut released: HashMap<[u8; 32], u32> = HashMap::new();
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT blob_id, COUNT(*) FROM messages
+                 WHERE blob_id IS NOT NULL AND (user_id = ?1 OR conv_id IN ({dm_convs}))
+                 GROUP BY blob_id"
+            ))?;
+            let rows = stmt.query_map(params![user_id], |r| {
+                Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (blob, count) = row?;
+                *released.entry(blob).or_default() += u32::try_from(count).unwrap_or(u32::MAX);
+            }
+            let avatar: Option<[u8; 32]> = tx
+                .query_row(
+                    "SELECT avatar_blob FROM users WHERE user_id = ?1",
+                    params![user_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some(blob) = avatar {
+                *released.entry(blob).or_default() += 1;
+            }
+        }
+        for (blob, count) in &released {
+            tx.execute(
+                "UPDATE blobs SET refs = MAX(refs - ?2, 0) WHERE blob_id = ?1",
+                params![blob, i64::from(*count)],
+            )?;
+        }
+        tx.execute(
+            &format!("DELETE FROM messages WHERE conv_id IN ({dm_convs})"),
+            params![user_id],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM message_reads WHERE conv_id IN ({dm_convs})"),
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM conversations WHERE kind = 1 AND (user_a = ?1 OR user_b = ?1)",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM message_reads WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute("DELETE FROM messages WHERE user_id = ?1", params![user_id])?;
+        tx.execute(
             "DELETE FROM invites WHERE created_by = ?1",
             params![user_id],
         )?;
-        self.conn
-            .execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
-        Ok(())
+        tx.execute(
+            "DELETE FROM telemetry_samples WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM telemetry_events WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM blocks WHERE blocker = ?1 OR blocked = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM reports WHERE target_user = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "UPDATE reports SET reporter = NULL WHERE reporter = ?1",
+            params![user_id],
+        )?;
+        // What they did stays in the record, without who did it.
+        tx.execute(
+            "UPDATE audit SET actor_user_id = NULL WHERE actor_user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
+        // Their uploads: gone when nothing points at them any more;
+        // kept, without an uploader, when someone else's post or
+        // avatar is the same file.
+        let gone: Vec<[u8; 32]> = {
+            let mut stmt =
+                tx.prepare("SELECT blob_id FROM blobs WHERE created_by = ?1 AND refs = 0")?;
+            stmt.query_map(params![user_id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        tx.execute(
+            "UPDATE blobs SET created_by = NULL WHERE created_by = ?1",
+            params![user_id],
+        )?;
+        tx.commit()?;
+        for blob in &gone {
+            self.delete_blob(blob)?;
+        }
+        Ok(released.into_iter().collect())
     }
 
     /// Final checkpoint on shutdown so the main file is complete on its
@@ -1863,7 +2131,22 @@ pub fn cli_purge(db_path: &Path, user_id: &[u8; 32]) -> Result<(), PersistError>
         return Err(PersistError::Missing(db_path.to_path_buf()));
     }
     let (db, _) = Sqlite::open(db_path)?;
-    db.purge_user(user_id)?;
+    // Other people's files only their conversations with this user
+    // pointed at go too (the running server does the same on its
+    // `Notice::RefsReleased`).
+    for (blob, _) in db.purge_user(user_id)? {
+        let refs: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT refs FROM blobs WHERE blob_id = ?1",
+                params![blob],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if refs == Some(0) {
+            db.delete_blob(&blob)?;
+        }
+    }
     db.insert_audit(&AuditRow {
         ts: super::wall_now(),
         actor: None,

@@ -239,6 +239,27 @@ fn permission_name_list() -> String {
         .join(", ")
 }
 
+/// One report to store (`protocol::safety`, 1.2).
+#[derive(Debug, Clone)]
+pub struct ReportRow {
+    pub ts: WallMs,
+    pub reporter: UserId,
+    pub target_user: Option<UserId>,
+    pub target_name: String,
+    pub msg_id: Option<u64>,
+    pub in_dm: bool,
+    pub excerpt: String,
+    pub reason: protocol::ReportReason,
+    pub note: String,
+}
+
+/// A stored message found for a report, with its conversation.
+#[derive(Debug, Clone)]
+pub struct ReportedMessage {
+    pub row: MessageRow,
+    pub conv: ConvKey,
+}
+
 /// One audit line (spec §8): who did what to whom.
 #[derive(Debug, Clone)]
 pub struct AuditRow {
@@ -376,6 +397,22 @@ pub enum Command {
         user_id: UserId,
         msg_id: u64,
     },
+    // ── 1.2: blocks and reports (protocol::safety) ───────────────────
+    InsertBlock {
+        blocker: UserId,
+        blocked: UserId,
+        ts: WallMs,
+    },
+    DeleteBlock {
+        blocker: UserId,
+        blocked: UserId,
+    },
+    InsertReport(Box<ReportRow>),
+    ResolveReport {
+        id: u64,
+        by: Option<UserId>,
+        ts: WallMs,
+    },
 }
 
 impl Command {
@@ -418,6 +455,10 @@ pub enum Query {
         before: Option<u64>,
         limit: u16,
     },
+    /// One message, for a report: its text and its conversation.
+    ReportedMessage { msg_id: u64 },
+    /// Reports for the panel, newest first.
+    Reports { resolved: bool, limit: u16 },
 }
 
 /// Which conversation a read or a mark is about (spec §6): the general
@@ -438,6 +479,9 @@ pub enum Answer {
     /// Audit entries with their ids, newest first.
     Audit(Vec<(u64, AuditRow)>),
     Conversations(Vec<protocol::DmSummary>),
+    /// Boxed: a whole message row, where every other answer is small.
+    ReportedMessage(Option<Box<ReportedMessage>>),
+    Reports(Vec<protocol::ReportSummary>),
     /// Persistence is off: there is nothing to read.
     Unavailable,
     Failed(String),
@@ -474,6 +518,11 @@ pub enum Notice {
     /// change queued in the few milliseconds between the reload's read
     /// and the swap is re-read from disk on the next external change.
     Policy(Box<Policy>),
+    /// An account was purged: these files other people uploaded lost
+    /// this many references with it (posts in its DM conversations, its
+    /// avatar). The tick takes them off its counts, and a file nothing
+    /// points at any more goes.
+    RefsReleased(Vec<(protocol::BlobId, u32)>),
 }
 
 /// Handle to a pending read, returned by [`Persist::ask`] and echoed by
@@ -775,6 +824,14 @@ impl Persist {
         StallGuard { _release: release }
     }
 
+    /// Reads asked and not yet collected by [`Self::poll`]. The tests'
+    /// simulated clock waits on the real one while any is out, so a
+    /// busy machine cannot run a read past its deadline in a blink.
+    #[must_use]
+    pub fn reads_in_flight(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Counters for the stats line.
     #[must_use]
     pub fn stats(&self) -> PersistStats {
@@ -917,6 +974,14 @@ impl Worker {
                 Ok(rows) => Answer::Messages(rows),
                 Err(e) => Answer::Failed(e.to_string()),
             },
+            Query::ReportedMessage { msg_id } => match db.message_for_report(*msg_id) {
+                Ok(found) => Answer::ReportedMessage(found.map(Box::new)),
+                Err(e) => Answer::Failed(e.to_string()),
+            },
+            Query::Reports { resolved, limit } => match db.reports(*resolved, *limit) {
+                Ok(list) => Answer::Reports(list),
+                Err(e) => Answer::Failed(e.to_string()),
+            },
         }
     }
 
@@ -980,13 +1045,25 @@ impl Worker {
             Command::UpsertChannel(c) => db.upsert_channel(c),
             Command::DeleteChannel { stable_id } => db.delete_channel(*stable_id),
             Command::AddProgress(p) => db.add_progress(p),
-            Command::PurgeUser { user_id } => db.purge_user(user_id),
+            Command::PurgeUser { user_id } => db.purge_user(user_id).map(|released| {
+                if !released.is_empty() {
+                    let _ = self.notices.send(Notice::RefsReleased(released));
+                }
+            }),
             Command::InsertInvite { code, invite } => db.insert_invite(code, invite),
             Command::UseInvite { code } => db.use_invite(code),
             Command::RevokeInvite { code, ts } => db.revoke_invite(code, *ts),
             Command::InsertRestriction(r) => db.insert_restriction(r),
             Command::DeleteRestriction { id } => db.delete_restriction(*id),
             Command::Audit(row) => db.insert_audit(row),
+            Command::InsertBlock {
+                blocker,
+                blocked,
+                ts,
+            } => db.insert_block(blocker, blocked, *ts),
+            Command::DeleteBlock { blocker, blocked } => db.delete_block(blocker, blocked),
+            Command::InsertReport(row) => db.insert_report(row),
+            Command::ResolveReport { id, by, ts } => db.resolve_report(*id, by.as_ref(), *ts),
         };
         match result {
             Ok(()) => {

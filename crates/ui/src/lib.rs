@@ -107,6 +107,11 @@ pub mod convert {
             A::Copy => (MenuAction::Copy, 0),
             A::Paste => (MenuAction::Paste, 0),
             A::CopyImage => (MenuAction::CopyImage, 0),
+            A::Block => (MenuAction::Block, 0),
+            A::Unblock => (MenuAction::Unblock, 0),
+            A::Report => (MenuAction::Report, 0),
+            A::ReportMessage => (MenuAction::ReportMessage, 0),
+            A::BlockAuthor => (MenuAction::BlockAuthor, 0),
         }
     }
 
@@ -147,6 +152,11 @@ pub mod convert {
             MenuAction::Copy => A::Copy,
             MenuAction::Paste => A::Paste,
             MenuAction::CopyImage => A::CopyImage,
+            MenuAction::Block => A::Block,
+            MenuAction::Unblock => A::Unblock,
+            MenuAction::Report => A::Report,
+            MenuAction::ReportMessage => A::ReportMessage,
+            MenuAction::BlockAuthor => A::BlockAuthor,
         })
     }
 

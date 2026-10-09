@@ -70,6 +70,21 @@ export struct AdminBlobRow {
     refs: int,
 }
 
+/// One report (1.2), as the Reports tab lists it.
+export struct AdminReportRow {
+    id: int,
+    when: string,
+    reporter: string,       // "" once they deleted their account
+    target: string,         // who was reported
+    target-id: string,      // hex; "" once their account is gone
+    what: string,           // "A message in General" / "A direct message" / "The person"
+    reason: string,
+    excerpt: string,        // the message as reported; "" for a person
+    note: string,
+    resolved: bool,
+    msg-deletable: bool,    // a General message: Delete is offered
+}
+
 export struct AdminAuditRow {
     when: string,           // "14:06", or "Sep 6 14:06" on another day
     actor: string,
@@ -116,6 +131,9 @@ export global AdminState {
     in property <float> storage-frac;
     in property <[AdminAuditRow]> audit;
     in property <bool> audit-more: false;
+    // Reports (1.2): open ones, or the handled ones still kept.
+    in property <[AdminReportRow]> reports;
+    in-out property <bool> reports-resolved: false;
     // Server
     in property <string> stat-version;
     in property <string> stat-uptime;
@@ -151,6 +169,10 @@ export global AdminLogic {
     callback channel-delete(id: int);
     callback blob-delete(blob-hex: string);
     callback audit-more();
+    // Reports: handled; the reported message gone; the person banned.
+    callback report-resolve(id: int);
+    callback report-delete-message(id: int);
+    callback report-ban(id: int);
     callback confirm-accept();
     callback confirm-cancel();
     callback close();
@@ -647,6 +669,60 @@ component AuditTab inherits VerticalLayout {
     }
 }
 
+component ReportsTab inherits VerticalLayout {
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-reports; lead: Tr.admin-reports-lead; tab: 8; }
+    CheckRow {
+        text: Tr.admin-reports-show-resolved;
+        checked <=> AdminState.reports-resolved;
+        toggled(on) => { AdminLogic.refresh(8); }
+    }
+    if AdminState.reports.length == 0 && !AdminState.busy : Empty {
+        text: AdminState.reports-resolved ? Tr.admin-none : Tr.admin-reports-none;
+    }
+    VerticalLayout {
+        for r in AdminState.reports : Row {
+            row-height: r.excerpt != "" ? 118px : 84px;
+            VerticalLayout {
+                padding-left: Theme.gap-xs;
+                padding-right: Theme.gap-xs;
+                padding-top: Theme.gap-xs;
+                padding-bottom: Theme.gap-xs;
+                spacing: 2px;
+                HorizontalLayout {
+                    spacing: Theme.gap-sm;
+                    Cell { text: r.target; font-weight: 600; horizontal-stretch: 0; }
+                    Cell { text: r.reason; color: Theme.danger-text; horizontal-stretch: 0; }
+                    Muted { text: r.what; horizontal-stretch: 1; }
+                    Muted { text: r.when; horizontal-stretch: 0; }
+                }
+                if r.excerpt != "" : Text {
+                    text: "“" + r.excerpt + "”";
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    wrap: word-wrap;
+                    overflow: elide;
+                    height: 36px;
+                }
+                Muted {
+                    text: (r.reporter == "" ? Tr.admin-reports-by-gone : Tr.admin-reports-by + " " + r.reporter)
+                        + (r.note == "" ? "" : " — " + r.note);
+                }
+                HorizontalLayout {
+                    spacing: Theme.gap-xs;
+                    if !r.resolved : Chip { text: Tr.admin-reports-resolve;
+                        clicked => { AdminLogic.report-resolve(r.id); } }
+                    if r.msg-deletable : Chip { text: Tr.admin-reports-delete-message; danger: true;
+                        clicked => { AdminLogic.report-delete-message(r.id); } }
+                    if r.target-id != "" : Chip { text: Tr.admin-ban; danger: true;
+                        clicked => { AdminLogic.report-ban(r.id); } }
+                    Rectangle { }
+                }
+            }
+        }
+    }
+}
+
 component StatLine inherits HorizontalLayout {
     in property <string> label;
     in property <string> value;
@@ -685,7 +761,7 @@ export component AdminWindow inherits Window {
     min-height: 520px;
 
     /// 0 users, 1 roles, 2 restrictions, 3 invites, 4 channels,
-    /// 5 files, 6 audit, 7 server.
+    /// 5 files, 6 audit, 7 server, 8 reports.
     in-out property <int> tab: 0;
     in property <bool> repaint-flip;
     Rectangle {
@@ -707,6 +783,7 @@ export component AdminWindow inherits Window {
                 padding: Theme.gap-md;
                 spacing: Theme.gap-xs;
                 NavItem { text: Tr.admin-users;        icon: IconSet.Users;        active: root.tab == 0; clicked => { root.open-tab(0); } }
+                NavItem { text: Tr.admin-reports;      icon: IconSet.Flag;         active: root.tab == 8; clicked => { root.open-tab(8); } }
                 NavItem { text: Tr.admin-roles;        icon: IconSet.Shield;       active: root.tab == 1; clicked => { root.open-tab(1); } }
                 NavItem { text: Tr.admin-restrictions; icon: IconSet.Ban;          active: root.tab == 2; clicked => { root.open-tab(2); } }
                 NavItem { text: Tr.admin-invites;      icon: IconSet.Ticket;       active: root.tab == 3; clicked => { root.open-tab(3); } }
@@ -731,6 +808,7 @@ export component AdminWindow inherits Window {
                     if root.tab == 5 : FilesTab { }
                     if root.tab == 6 : AuditTab { }
                     if root.tab == 7 : ServerTab { }
+                    if root.tab == 8 : ReportsTab { }
                 }
             }
             Rectangle {

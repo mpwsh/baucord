@@ -25,7 +25,7 @@
          an update never has to ask again. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Chat without a microphone is still a use; don't hide the app
@@ -58,12 +58,19 @@
             </intent-filter>
         </activity>
 
-        <!-- Keeps the process (and the microphone) running while a
-             session is connected and the app is off screen (D34). -->
+        <!-- Keeps the process (and, in a voice room, the microphone)
+             running while a session is connected and the app is off
+             screen (D34, D63): `microphone` in a room, `specialUse` in
+             the lobby. The property is what Play reviews for the
+             special use (PLAY-STORE.md §5). -->
         <service
             android:name=".VoiceService"
-            android:foregroundServiceType="microphone|mediaPlayback"
-            android:exported="false" />
+            android:foregroundServiceType="microphone|specialUse"
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the connection to the user's own voice chat server open while they wait in its lobby with no microphone in use, so they are told when someone starts a call or sends them a direct message. baucord servers are self-hosted and have no push service. The notification shows the connection while it is open; disconnecting in the app ends it." />
+        </service>
     </application>
 
 </manifest>

@@ -624,6 +624,11 @@ pub struct Settings {
     pub logging: LoggingSettings,
     #[serde(default)]
     pub notifications: NotificationSettings,
+    /// The version of the terms of use (baucord.com/terms.html) the
+    /// user accepted; 0 = none yet. The app asks before connecting
+    /// while it is below the one it ships with.
+    #[serde(default)]
+    pub terms_version: u32,
 }
 
 /// How much `baucord.log` records (1.1.5). `RUST_LOG` in the
@@ -699,6 +704,8 @@ struct SettingsDe {
     logging: LoggingSettings,
     #[serde(default)]
     notifications: NotificationSettings,
+    #[serde(default)]
+    terms_version: u32,
 }
 
 #[derive(Deserialize)]
@@ -758,6 +765,7 @@ impl From<SettingsDe> for Settings {
             sounds: de.sounds,
             logging: de.logging,
             notifications: de.notifications,
+            terms_version: de.terms_version,
         };
         settings.normalize_servers();
         settings
@@ -782,6 +790,7 @@ impl Default for Settings {
             sounds: SoundSettings::default(),
             logging: LoggingSettings::default(),
             notifications: NotificationSettings::default(),
+            terms_version: 0,
         }
     }
 }
@@ -1316,6 +1325,16 @@ mod tests {
                 .map(String::as_str),
             Some("hunter2")
         );
+    }
+
+    #[test]
+    fn the_accepted_terms_survive_a_save_and_default_to_none() {
+        let s = parse(r#"{ "servers": [ { "name": "x", "address": "1.2.3.4:5" } ] }"#);
+        assert_eq!(s.terms_version, 0, "an older file: never accepted");
+        let mut s = Settings::default();
+        s.terms_version = 3;
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert_eq!(parse(&json).terms_version, 3);
     }
 
     #[test]

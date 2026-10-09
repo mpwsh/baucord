@@ -109,6 +109,11 @@ impl AppState {
     /// 2-second sample by themselves.
     pub(super) fn host_shown(&mut self) {
         self.clear_seen_notices();
+        // Android: a room entered while off screen could not have its
+        // microphone type (a background start); on screen it can.
+        if cfg!(target_os = "android") {
+            self.sync_keep_alive(true);
+        }
         let animating = self.gallery_gif.is_some()
             || self.preview_gif.is_some()
             || self.gifs.values().any(GifPlayer::playing);

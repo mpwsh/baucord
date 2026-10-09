@@ -69,6 +69,7 @@
   "dl-after": "Gratis y de código abierto. La app de escritorio busca actualizaciones al iniciar y se reemplaza sola; el servidor se actualiza descomprimiendo el nuevo encima; en Android, instalá el APK nuevo encima del viejo. Versiones anteriores y checksums en la <a href=\"https://github.com/mpwsh/baucord/releases\">página de releases</a>.",
   "foot-issues": "Reportar un problema",
   "foot-privacy": "Privacidad",
+  "foot-terms": "Términos",
   "lightbox-aria": "captura de pantalla",
   "lightbox-prev": "captura anterior",
   "lightbox-next": "captura siguiente",

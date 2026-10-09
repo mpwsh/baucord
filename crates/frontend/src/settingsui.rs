@@ -16,7 +16,10 @@ use client::{
 };
 use i18n::t;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
-use ui::{KeybindRow, MainWindow, ServerRow, SettingsLogic, SettingsState, SettingsWindow, State};
+use ui::{
+    BlockedRow, KeybindRow, MainWindow, ServerRow, SettingsLogic, SettingsState, SettingsWindow,
+    State,
+};
 
 use crate::app::{self, AppState};
 
@@ -329,6 +332,47 @@ pub fn refresh_role_line(app: &AppState) {
     s.set_role_line(line.into());
 }
 
+/// The Profile tab's server sections (1.2): who this account blocked
+/// on the connected server, and deleting the account there. Shown only
+/// on a server that takes them.
+pub fn refresh_safety(app: &AppState) {
+    let Some(sf) = surface(app) else { return };
+    let s = sf.state();
+    let on = app.connected && app.safety;
+    s.set_safety(on);
+    let mut rows: Vec<BlockedRow> = app
+        .blocked
+        .iter()
+        .map(|(user, name)| BlockedRow {
+            user_id: app::hex(user).into(),
+            name: name.as_str().into(),
+        })
+        .collect();
+    rows.sort_by_key(|r| r.name.to_lowercase());
+    s.set_blocked(ModelRc::new(VecModel::from(rows)));
+    s.set_account_server(
+        if on {
+            t!("account-delete-lead", "server" => app.server_name.as_str())
+        } else {
+            String::new()
+        }
+        .into(),
+    );
+    if !on {
+        s.set_account_delete_armed(false);
+        s.set_account_status("".into());
+    }
+}
+
+/// The line under the delete button: what the server said.
+pub fn set_account_status(app: &AppState, text: &str) {
+    if let Some(sf) = surface(app) {
+        let s = sf.state();
+        s.set_account_delete_armed(false);
+        s.set_account_status(text.into());
+    }
+}
+
 /// The identity line: this device's user id (its key's hash) and
 /// where the key file lives.
 pub fn refresh_identity(app: &AppState) {
@@ -468,7 +512,10 @@ pub fn populate(app: &mut AppState) {
     s.set_language_index(i32::try_from(lang_index).unwrap_or(0));
     s.set_identity_status("".into());
     s.set_identity_regenerate_armed(false);
+    s.set_account_delete_armed(false);
+    s.set_account_status("".into());
     refresh_identity(app);
+    refresh_safety(app);
 
     // General: text size, sounds, where the files are.
     let sizes: Vec<slint::SharedString> = TEXT_SIZES.iter().map(|(k, _)| t!(k).into()).collect();
@@ -1078,6 +1125,35 @@ fn wire(sf: &SettingsSurface<'_>) {
                     refresh_identity(app);
                 }
                 Err(e) => app.show_error(&e),
+            }
+        });
+    });
+    // ── This server (1.2): unblock, delete the account ────────────
+    logic.on_unblock(|hex| {
+        app::with_current(move |app| {
+            if let Some(user) = app::parse_hex_id(&hex) {
+                app.unblock(user);
+            }
+        });
+    });
+    logic.on_account_delete(|| {
+        app::with_current(|app| {
+            let Some(sf) = surface(app) else { return };
+            let s = sf.state();
+            if !s.get_account_delete_armed() {
+                s.set_account_delete_armed(true);
+                s.set_account_status("".into());
+                return;
+            }
+            s.set_account_delete_armed(false);
+            s.set_account_status(t!("account-deleting").into());
+            app.delete_account();
+        });
+    });
+    logic.on_account_delete_disarm(|| {
+        app::with_current(|app| {
+            if let Some(sf) = surface(app) {
+                sf.state().set_account_delete_armed(false);
             }
         });
     });

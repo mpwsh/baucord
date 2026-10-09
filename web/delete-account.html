@@ -1,0 +1,241 @@
+<!doctype html>
+<!--
+  How to delete a baucord account, for the Play Console's account
+  deletion URL (Data safety: an app where people make accounts must
+  link a page that says how, without reinstalling the app, and what is
+  deleted and kept). Written 2026-10-09 from what the server does
+  (`Store::purge_user`, `Server::erase_user`); change it with them.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/x-icon" href="/img/favicon.ico" />
+    <title>baucord — delete your account</title>
+    <meta
+      name="description"
+      content="How to delete your baucord account from the app or by email, and what is deleted and kept."
+    />
+    <meta name="theme-color" content="#1a1d21" />
+    <style>
+      /* The site's "workbench" palette (index.html). */
+      :root {
+        --paper: #1a1d21;
+        --mist: #222529;
+        --ink: #d1d2d3;
+        --slate: #abadb0;
+        --line: rgba(209, 210, 211, 0.12);
+        --cobalt-text: #1d9bd1;
+        --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.6;
+        -webkit-text-size-adjust: 100%;
+      }
+      .wrap {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 16px;
+      }
+      header {
+        border-bottom: 1px solid var(--line);
+        padding: 18px 0;
+      }
+      header a {
+        color: var(--ink);
+        font-weight: 700;
+        text-decoration: none;
+        letter-spacing: 0.01em;
+      }
+      main {
+        padding: 40px 0 64px;
+      }
+      h1 {
+        font-size: 2rem;
+        line-height: 1.2;
+        margin-bottom: 8px;
+      }
+      .updated {
+        color: var(--slate);
+        margin-bottom: 28px;
+      }
+      h2 {
+        font-size: 1.25rem;
+        margin: 40px 0 12px;
+        padding-top: 8px;
+      }
+      h3 {
+        font-size: 1.02rem;
+        margin: 22px 0 6px;
+      }
+      p,
+      ul {
+        margin-bottom: 12px;
+      }
+      ul {
+        padding-left: 22px;
+      }
+      li {
+        margin-bottom: 6px;
+      }
+      a {
+        color: var(--cobalt-text);
+      }
+      code {
+        font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+        font-size: 0.9em;
+        background: var(--mist);
+        padding: 1px 5px;
+        border-radius: 4px;
+      }
+      .summary {
+        background: var(--mist);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 18px 20px 8px;
+        margin-bottom: 8px;
+      }
+      .summary h2 {
+        margin-top: 0;
+        padding-top: 0;
+      }
+      .table-scroll {
+        overflow-x: auto;
+        margin: 8px 0 16px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        min-width: 520px;
+        font-size: 0.95rem;
+      }
+      th,
+      td {
+        text-align: left;
+        vertical-align: top;
+        padding: 9px 10px;
+        border-bottom: 1px solid var(--line);
+      }
+      th {
+        color: var(--slate);
+        font-weight: 600;
+      }
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 20px 0 32px;
+        color: var(--slate);
+        font-size: 0.95rem;
+      }
+      footer a {
+        margin-right: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="wrap"><a href="/">baucord</a></div>
+    </header>
+
+    <main class="wrap">
+      <h1>Delete your baucord account</h1>
+      <p class="updated">Last updated 9 October 2026</p>
+
+      <p>
+        A baucord account belongs to one server: the app makes a key on
+        your device, and each server you join knows you by it. Deleting
+        your account on a server removes you, and what you posted, from
+        that server.
+      </p>
+
+      <h2>From the app</h2>
+      <ol style="padding-left: 22px; margin-bottom: 12px">
+        <li>Connect to the server.</li>
+        <li>Open <strong>Settings → Profile</strong>.</li>
+        <li>
+          Under <strong>Delete your account</strong>, press
+          <strong>Delete my account</strong>, then press it again to
+          confirm.
+        </li>
+      </ol>
+      <p>
+        The account is deleted at once and you are disconnected. Joining
+        that server again needs a new invite. If you are the server's
+        only administrator, make someone else administrator first.
+      </p>
+
+      <h2>Without the app</h2>
+      <p>
+        For the official baucord server, write to
+        <a href="mailto:support@mpw.sh">support@mpw.sh</a> with your name
+        on the server, and, if you can, your user id (Settings → Profile →
+        Identity). We delete the account within 30 days and tell you when
+        it is done. For a server someone else runs, ask its owner, or
+        use the app as above.
+      </p>
+
+      <h2>What is deleted</h2>
+      <ul>
+        <li>
+          Your account: name, device keys, roles, profile and avatar,
+          levels and activity counters.
+        </li>
+        <li>The messages and files you posted in the server's chat.</li>
+        <li>
+          Every direct message conversation you were part of, with both
+          people's messages and files.
+        </li>
+        <li>
+          Your read markers, call-quality reports, the invites you made,
+          the logs you sent from the app, the people you blocked and who
+          blocked you, and reports made about you.
+        </li>
+      </ul>
+
+      <h2>What is kept</h2>
+      <ul>
+        <li>
+          Reports you made about others stay, without your name, until a
+          moderator has handled them; handled reports are deleted after
+          90 days on the official server.
+        </li>
+        <li>
+          The moderation record keeps a line saying an account was
+          deleted at its owner's request, with a shortened id and no
+          name. Earlier lines about things you did there stay, without
+          your name or id.
+        </li>
+        <li>
+          The server's own log, which records connections, is replaced
+          as it grows rather than edited.
+        </li>
+      </ul>
+      <p>
+        Nothing is kept on your device by the server. The app keeps the
+        server in your list and your device key, so you can join again
+        with a new invite; Settings → Servers removes the server.
+      </p>
+      <p>
+        More in the <a href="privacy.html">privacy policy</a>.
+      </p>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <a href="/">baucord</a>
+        <a href="terms.html">Terms</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="delete-account.html">Delete your account</a>
+        <a href="https://github.com/mpwsh/baucord">Source</a>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -828,3 +828,77 @@ host-single-window = Todavía no está disponible en el teléfono — en escrito
 quit-ios = En el iPhone las apps se cierran desde el selector de apps: deslizá hacia arriba desde el borde inferior, esperá un momento y deslizá baucord hacia arriba.
 pick-from-photos = Fotos
 pick-from-files = Archivos
+
+# ── 1.2: bloquear, denunciar, borrar tu cuenta ────────────────────────
+menu-block = Bloquear
+menu-unblock = Desbloquear
+menu-report = Denunciar…
+menu-report-message = Denunciar mensaje…
+menu-block-author = Bloquear a quien lo envió
+dm-failed-unavailable = No podés escribirle a esta persona.
+toast-blocked = Bloqueaste a { $name }. No vas a ver sus mensajes ni escuchar su voz.
+toast-unblocked = Desbloqueaste a { $name }. Sus mensajes nuevos se ven; los anteriores vuelven cuando te reconectes.
+report-title-user = Denunciar a { $name }
+report-title-message = Denunciar un mensaje de { $name }
+report-hint = Los moderadores del servidor ven esta denuncia y el mensaje tal como está ahora. A la persona no se le dice quién la denunció.
+report-reason = Motivo
+report-reason-placeholder = Elegí un motivo
+report-reason-spam = Spam o estafa
+report-reason-harassment = Acoso o bullying
+report-reason-hate = Discurso de odio
+report-reason-sexual = Contenido sexual
+report-reason-violence = Violencia o amenazas
+report-reason-self-harm = Autolesión o suicidio
+report-reason-illegal = Algo ilegal
+report-reason-other = Otra cosa
+report-note = Algo para agregar
+report-note-placeholder = Opcional
+report-also-block = Bloquear también
+report-also-block-hint = Dejar de ver sus mensajes y de escuchar su voz.
+report-send = Enviar denuncia
+report-sent = Denuncia enviada. Gracias — los moderadores la van a revisar.
+report-refused-no-message = Ese mensaje ya no está en el servidor.
+report-refused-no-user = Esa cuenta ya no está en el servidor.
+report-refused-yourself = No te podés denunciar a vos.
+report-refused-too-many = Demasiadas denuncias en poco tiempo. Probá de nuevo en unos minutos.
+blocked-header = Personas bloqueadas
+blocked-not-connected = Conectate a un servidor para ver a quién bloqueaste ahí.
+blocked-lead = No ves sus mensajes ni escuchás su voz, y no te pueden mandar mensajes directos. No se les avisa.
+blocked-none = Nadie
+unblock = Desbloquear
+account-delete-header = Borrar tu cuenta
+account-delete-lead = Tu cuenta en { $server }.
+account-delete-note = Borra tu cuenta en este servidor y todo lo que publicaste ahí: mensajes, archivos, mensajes directos. No se puede deshacer. Para volver a entrar vas a necesitar una invitación nueva.
+account-delete = Borrar mi cuenta
+account-delete-confirm = Borrar todo — ¿seguro?
+account-deleting = Borrando…
+account-delete-last-admin = Sos el único admin de este servidor. Hacé admin a otra persona primero y después borrá tu cuenta.
+account-deleted = Se borró tu cuenta en { $server }, con todo lo que publicaste ahí. Para volver a entrar vas a necesitar una invitación nueva.
+admin-reports = Denuncias
+admin-reports-lead = Lo que la gente denunció a los moderadores, lo más nuevo primero.
+admin-reports-show-resolved = Mostrar denuncias atendidas
+admin-reports-none = No hay denuncias abiertas.
+admin-reports-by = Denunciado por
+admin-reports-by-gone = Denunciado por una cuenta borrada
+admin-reports-resolve = Marcar atendida
+admin-reports-delete-message = Borrar mensaje
+admin-reports-what-general = un mensaje en General
+admin-reports-what-dm = un mensaje directo
+admin-reports-what-person = la persona
+admin-act-report-message = denunció un mensaje de
+admin-act-report-user = denunció a
+admin-act-report-resolve = atendió la denuncia
+admin-act-user-delete = borró, a pedido de su dueño, la cuenta
+chat-admin-reports-header = { $count } denuncias, las más nuevas primero
+chat-command-usage-resolve = Uso: /resolve <número de denuncia> (ver /reports)
+terms-title = Antes de conectarte
+terms-lead = Al usar baucord aceptás sus términos de uso. En todos los servidores:
+terms-rules = • Tenés 18 años o más.
+    • Nada ilegal, y nada sexual que involucre a menores.
+    • Nada de amenazas, acoso, odio ni spam.
+    • Denunciá lo que rompa las reglas y bloqueá a quien no quieras escuchar: clic derecho en un mensaje o una persona (en el teléfono, mantené apretado un mensaje o tocá a la persona).
+
+    Quien administra cada servidor puede sumar reglas propias.
+terms-read = Leer los términos
+terms-agree = Acepto
+privacy-read = Política de privacidad

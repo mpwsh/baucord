@@ -88,8 +88,12 @@ impl Hooks for AndroidHost {
 
     fn keep_alive(&self, notice: Option<&KeepAlive>) {
         match notice {
-            Some(n) => match java::start_voice_service(&n.channel, &n.title, &n.text) {
-                Ok(true) => log::info!("voice service on: {}", n.title),
+            Some(n) => match java::start_voice_service(&n.channel, &n.title, &n.text, n.in_room) {
+                Ok(true) => log::info!(
+                    "voice service on ({}): {}",
+                    if n.in_room { "room" } else { "lobby" },
+                    n.title
+                ),
                 Ok(false) => log::warn!("voice service refused by the system"),
                 Err(e) => log::warn!("voice service: {e}"),
             },

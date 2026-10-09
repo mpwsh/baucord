@@ -108,6 +108,8 @@ export enum MenuAction {
     cut, copy, paste,
     save-file,
     copy-image,
+    // 1.2 — blocks and reports
+    block, unblock, report, report-message, block-author,
 }
 
 /// One row of a context menu, drawn by the overlay in main.slint.
@@ -433,6 +435,23 @@ export global State {
     in-out property <int> moderation-duration: 0;
     in-out property <string> moderation-reason;
 
+    // ── 1.2: reports (the dialog the menus open) ────────────────────
+    in property <bool> report-open: false;
+    in property <string> report-title;          // "Report alice" / "Report this message"
+    /// The reported message, quoted; "" for a report about a person.
+    in property <string> report-excerpt;
+    in property <[string]> report-reasons;      // ReportReason::ALL, localized
+    in-out property <int> report-reason: -1;    // -1 = not picked yet
+    in-out property <string> report-note;
+    /// Also block them once the report is sent.
+    in-out property <bool> report-block: false;
+    in property <bool> report-block-offered: true;
+
+    // The terms of use, asked once before the first connect (1.2).
+    in property <bool> terms-open: false;
+    in property <string> terms-url: "https://baucord.com/terms.html";
+    in property <string> privacy-url: "https://baucord.com/privacy.html";
+
     // Image viewer overlay (chat image tapped) — replaces the old
     // separate gallery window.
     in property <bool> viewer-open: false;
@@ -504,6 +523,12 @@ export global Logic {
     callback sidebar-resized(length);
     callback moderation-confirm();             // reads State.moderation-*
     callback moderation-cancel();
+    /// The report dialog: send what State.report-* says, or not.
+    callback report-send();
+    callback report-cancel();
+    /// The terms dialog: agree (the connect goes on) or not.
+    callback terms-accept();
+    callback terms-decline();
 
     // Chat
     callback send-message();

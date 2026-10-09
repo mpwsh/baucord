@@ -828,3 +828,77 @@ quit-ios = On iPhone, apps close from the app switcher: swipe up from the bottom
 # The attach sheet on iOS: where to pick from.
 pick-from-photos = Photos
 pick-from-files = Files
+
+# ── 1.2: blocking, reporting, deleting your account ───────────────────
+menu-block = Block
+menu-unblock = Unblock
+menu-report = Report…
+menu-report-message = Report message…
+menu-block-author = Block sender
+dm-failed-unavailable = You can't message this person.
+toast-blocked = Blocked { $name }. You won't see their messages or hear them.
+toast-unblocked = Unblocked { $name }. Their new messages show; earlier ones come back when you reconnect.
+report-title-user = Report { $name }
+report-title-message = Report a message from { $name }
+report-hint = The server's moderators see this report and the message as it is now. The person is not told who reported them.
+report-reason = Reason
+report-reason-placeholder = Pick a reason
+report-reason-spam = Spam or scam
+report-reason-harassment = Harassment or bullying
+report-reason-hate = Hate speech
+report-reason-sexual = Sexual content
+report-reason-violence = Violence or threats
+report-reason-self-harm = Self-harm or suicide
+report-reason-illegal = Something illegal
+report-reason-other = Something else
+report-note = Anything to add
+report-note-placeholder = Optional
+report-also-block = Also block them
+report-also-block-hint = Stop seeing their messages and hearing them.
+report-send = Send report
+report-sent = Report sent. Thank you — the moderators will look at it.
+report-refused-no-message = That message isn't on the server anymore.
+report-refused-no-user = That account isn't on the server anymore.
+report-refused-yourself = You can't report yourself.
+report-refused-too-many = Too many reports in a short time. Try again in a few minutes.
+blocked-header = Blocked people
+blocked-not-connected = Connect to a server to see who you blocked there.
+blocked-lead = You don't see their messages or hear them, and they can't send you direct messages. They aren't told.
+blocked-none = Nobody
+unblock = Unblock
+account-delete-header = Delete your account
+account-delete-lead = Your account on { $server }.
+account-delete-note = Removes your account on this server and everything you posted there: messages, files, direct messages. It can't be undone. Joining again needs a new invite.
+account-delete = Delete my account
+account-delete-confirm = Delete everything — are you sure?
+account-deleting = Deleting…
+account-delete-last-admin = You're this server's only admin. Make someone else admin first, then delete your account.
+account-deleted = Your account on { $server } was deleted, with everything you posted there. Joining again needs a new invite.
+admin-reports = Reports
+admin-reports-lead = What people reported to the moderators, newest first.
+admin-reports-show-resolved = Show handled reports
+admin-reports-none = No open reports.
+admin-reports-by = Reported by
+admin-reports-by-gone = Reported by a deleted account
+admin-reports-resolve = Mark handled
+admin-reports-delete-message = Delete message
+admin-reports-what-general = a message in General
+admin-reports-what-dm = a direct message
+admin-reports-what-person = the person
+admin-act-report-message = reported a message by
+admin-act-report-user = reported
+admin-act-report-resolve = handled report
+admin-act-user-delete = deleted, at its owner's request, the account
+chat-admin-reports-header = { $count } reports, newest first
+chat-command-usage-resolve = Usage: /resolve <report number> (see /reports)
+terms-title = Before you connect
+terms-lead = By using baucord you agree to its terms of use. On every server:
+terms-rules = • You are 18 or older.
+    • Nothing illegal, and nothing sexual involving minors.
+    • No threats, harassment, hate or spam.
+    • Report what breaks the rules, and block anyone you don't want to hear from: right-click a message or a person (on a phone, press and hold a message, or tap a person).
+
+    Each server's owner may add rules of their own.
+terms-read = Read the terms
+terms-agree = I agree
+privacy-read = Privacy policy

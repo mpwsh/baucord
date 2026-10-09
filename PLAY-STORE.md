@@ -133,31 +133,34 @@ In this order; each is a PRODUCTION-PLAN item.
   with the native debug symbols inside (Play's crash reports then show
   Rust frames). Uploads are by hand for now; the Play Developer API
   from CI can come once the app exists.
-- [ ] **MOB-11 — the foreground service, for Play**: decision 3's
-  types, switched as we enter and leave a room; the
-  `startForeground`-refused crash fixed; the wake lock only in a room.
-- [ ] **MOB-4 — report and block.** Block: a user's messages and DMs
-  hidden for you, their DMs refused by the server. Report: a message
-  or a user, with a reason, into a queue in the admin panel, where
-  the existing kick/ban/mute act on it.
-- [ ] **MOB-14 — delete my account.** In Settings, "Delete my account
-  on this server": a new protocol message under a new feature bit;
-  the server removes the user's keys, roles, profile, avatar, DMs and
-  files, and deletes or anonymizes their messages (decide which); the
-  device then forgets that server. Plus a web page saying how, with an
-  email address for the official server.
-- [ ] **MOB-15 — terms before user content.** On the first connect to a
-  server, before the first message: "By continuing you accept the
-  rules" with a link to the terms (which define and prohibit
-  objectionable content and say reports are acted on). Recorded per
-  server.
-- [ ] **LEG-5 — privacy policy, terms, account deletion pages** on the
+- [x] **MOB-11 — the foreground service, for Play** (1.2, ANDROID-SPEC
+  D63): `microphone` in a room, `specialUse` in the lobby,
+  `mediaPlayback` gone; the `startForeground`-refused crash fixed; the
+  wake lock only in a room. **The Console's declaration changes with
+  it** (§5): remove *Media playback*, keep *Microphone*, add *Special
+  use*.
+- [x] **MOB-4 — report and block** (1.2). Block: a user's messages,
+  voice and DMs hidden for you, their DMs refused by the server, they
+  are not told. Report: a message or a user, with a reason, to the
+  moderators online at once and into the admin panel's Reports tab
+  (`/reports` on a phone), where kick/ban/delete act on it.
+- [x] **MOB-14 — delete my account** (1.2). Settings → Profile →
+  Delete my account: the server deletes the account and everything it
+  posted at once (messages deleted, not anonymized). The web page is
+  `https://baucord.com/delete-account.html` (the Console's *Delete
+  account URL*), with the email address for the official server.
+- [x] **MOB-15 — terms before user content** (1.2). The app shows the
+  short version with a link to `https://baucord.com/terms.html`
+  (which defines and prohibits objectionable content and says reports
+  are acted on) before the first connect, and records the acceptance
+  on the device. One set for every server; a server's own rules go in
+  its greeting.
+- [x] **LEG-5 — privacy policy, terms, account deletion pages** on the
   website (`web/`), public, not a PDF, naming the app as the listing
-  does. The assistant drafts; you approve (decision 6). The privacy
-  policy is written: `web/privacy.html`, linked from the site's
-  footer, signed 0x0 Studios (support@mpw.sh). Its URL is
-  `https://baucord.com/privacy.html` once `web.yaml` deploys it.
-  LEG-6 lists what would let it promise less.
+  does: `privacy.html`, `terms.html`, `delete-account.html`, linked
+  from the site's footer, signed 0x0 Studios (support@mpw.sh), live
+  once `web.yaml` deploys them. You approve them (decision 6). LEG-6
+  lists what would let the policy promise less.
 - [ ] **LEG-2 / LEG-3, phone part**: `AboutSlint` in About; notices
   bundled and shown.
 - [ ] Recommended before testers arrive: MOB-8 (font size change ends
@@ -189,7 +192,9 @@ In this order; each is a PRODUCTION-PLAN item.
     content, so expect a "Users interact" notice; the age rating
     follows from the answers).
   - Target audience: 18+ (decision 5).
-  - Data safety, with the deletion questions (draft in §6).
+  - Data safety, with the deletion questions (draft in §6). Account
+    deletion: in the app, and the URL
+    `https://baucord.com/delete-account.html`.
   - Foreground service declarations: per type, what it does, what the
     user loses if it is delayed or stopped, and a video link (§5).
   - News, health, financial, government: not applicable.
@@ -314,11 +319,25 @@ asks for each type in the App content page: what it does, what the
 user loses if the system delays or stops it, and a video showing it.
 Types must match what the service does.
 
-| state | today (D34, D53) | for Play |
+| state | until 1.1.9 (D34, D53) | from 1.2 (D63) |
 |---|---|---|
 | in a voice room | `mediaPlayback` + `microphone`, wake lock | `microphone`, wake lock |
 | connected, in the lobby | the same types, no audio open | `specialUse`, no wake lock |
 | disconnected | none | none |
+
+**The Console's declaration for 1.2** (App content → Foreground
+service permissions): untick *Media playback*; keep *Microphone*
+(what it does: "Keeps the microphone working when the user leaves the
+app during a voice call, so the people in the room keep hearing
+them"; if stopped: "the user goes silent in the call as soon as they
+switch apps"); tick *Special use* and paste the manifest's text
+("Keeps the connection to the user's own voice chat server open while
+they wait in its lobby with no microphone in use, so they are told
+when someone starts a call or sends them a direct message. baucord
+servers are self-hosted and have no push service. The notification
+shows the connection while it is open; disconnecting in the app ends
+it."; if stopped: "the user stops hearing about calls and messages
+until they open the app again"). One video per type, as below.
 
 - `specialUse` carries a manifest property explaining itself, which
   Play reviews. ntfy, on Play, uses it for exactly this ("the
@@ -371,7 +390,7 @@ baucord server and say in the policy who runs it.
 |---|---|---|
 | Personal info — name | display name, profile | yes |
 | Personal info — user IDs | a SHA-256 of the device key (not the key) | yes |
-| Messages — other in-app messages | chat and DMs | yes (history) |
+| Messages — other in-app messages | chat and DMs; reports (a copy of the reported message, the reason and note) | yes (history; a report until handled, then 90 days) |
 | Photos / files and docs | attachments, avatars | yes |
 | Audio — voice | voice to the room | no — relayed in memory, never stored (declare as ephemeral) |
 | App info and performance — diagnostics | telemetry every 10 s (app version, OS family and CPU type, link and codec figures, audio device names); logs when the user sends them | telemetry 30 days in the database (and the server log); logs until deleted (LEG-6) |
@@ -380,7 +399,8 @@ baucord server and say in the policy who runs it.
 | Device or other IDs | none beyond the device key | — |
 
 Also: data encrypted in transit — yes (QUIC/TLS); users can request
-deletion — yes, once MOB-14 ships; no data shared with third parties;
+deletion — yes, in the app (1.2, MOB-14) and at
+`https://baucord.com/delete-account.html`; no data shared with third parties;
 no ads, no analytics SDKs. To settle with decision 6: whether
 telemetry needs consent, and the official server's retention.
 
@@ -446,7 +466,7 @@ centre's own requirements are the §3 step 2 list.
 
 | page | what it asks of us | where we stand | to do |
 |---|---|---|---|
-| Developer Program Policy (the index) | It summarises the policy areas. The detailed rules (UGC, account deletion, permissions, foreground services, Data safety) are the pages in §9. | Already mapped in §3: MOB-4 report and block, MOB-14 account deletion (the Data safety "deletion options" date was 2023-12-07), MOB-15 terms, LEG-5 privacy policy, MOB-11 service types. The manifest still declares `microphone\|mediaPlayback` (decision 3). There are no ads, payments or third-party SDKs. Android has no self-updater and downloads no code. | §3 step 2 as written. In the listing, do not name or look like another chat app (impersonation, store listing policy). LEG-2/LEG-3 attributions and notices. |
+| Developer Program Policy (the index) | It summarises the policy areas. The detailed rules (UGC, account deletion, permissions, foreground services, Data safety) are the pages in §9. | Already mapped in §3: MOB-4 report and block, MOB-14 account deletion (the Data safety "deletion options" date was 2023-12-07), MOB-15 terms, LEG-5 privacy policy, MOB-11 service types — all done in 1.2. The manifest declares `microphone\|specialUse` (decision 3, D63). There are no ads, payments or third-party SDKs. Android has no self-updater and downloads no code. | §3 step 2 as written. In the listing, do not name or look like another chat app (impersonation, store listing policy). LEG-2/LEG-3 attributions and notices. |
 | Advance notice to App Review (answer 6320428) | Advance notice is accepted only for 8 cases: third-party IP permission, government, healthcare, Korean gambling, accessibility services, non-profits, law enforcement, regulators. | None of them applies. There is no AccessibilityService in the manifest and no third-party brand assets. | Nothing. Google says other requests may get no reply. |
 | Android App Bundle (developer.android.com) | New apps must publish an AAB. Compressed download ≤ 4 GB. No `.obb` files. Sideloaded split APKs fail on Android 10+. | **Not yet**: CI builds an APK only (MOB-5). Size, `.obb` and dynamic resource tables are non-issues. The release build is not debuggable. | MOB-5: `bundleRelease`. Keep the GitHub APK *universal* (`assembleRelease`): never hand out the split APKs Play generates. |
 | Play App Signing terms | Publishing an AAB means using Play App Signing. You either give Google your key or it generates one. Google keeps a copy indefinitely. A key handed over cannot be retrieved. Google may generate and optimise APKs "for performance, security and/or size" but "will not change the purpose". Terms can change with notice. | Acceptable. We give our own key (§4) and keep our original. Play's APKs will not be byte-identical to our builds. | Accept them in the Console. |

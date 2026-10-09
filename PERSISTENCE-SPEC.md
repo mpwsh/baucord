@@ -976,6 +976,63 @@ voice unaffected, writes counted as dropped".
   through `log::set_max_level` with env_logger's filter left open;
   `RUST_LOG` in the environment overrides the setting entirely. The
   echo-cancellation design is in `AEC-SPEC.md`.
+- **S1. Blocks, reports, deleting one's account (1.2, bit `SAFETY`
+  17; `protocol::safety`, migration 0004, `server/safety.rs`).** What
+  the stores require of an app where people talk to each other
+  (PRODUCTION-PLAN MOB-4, MOB-14).
+  - *Block* is per account, on every device of it, until undone:
+    `Block`/`Unblock { user }` → the whole list back as `Blocks`
+    (also on join, after `RoleList`), at most 1,000. The relay skips
+    the blocked person's voice to the blocker's sessions
+    (`blocked_pairs`, recomputed with the rest of enforcement); DMs
+    and files between the two are refused both ways with
+    `DmFailReason::Unavailable` ("You can't message this person",
+    `NoPermission` for a client without the bit). Their General posts,
+    pictures, files and edits are not sent to the blocker's sessions
+    (`audience_of`). A `SAFETY` session gets General text as
+    `ChatFrom { from, msg }` — the author's account, which a lobby
+    poster's `UserDetails` would not give — and the client hides the
+    rest by account: history pages, their DM conversation, a block
+    made with their rows on screen (rows carry `Meta.author`), their
+    stream, speaking ring and LIVE chip. The blocked person is not
+    told. Unblocking shows new messages; the hidden ones come back on
+    the next connect. Block changes: 30 a minute per account.
+  - *Report* a message (General, or a DM the reporter is in — checked
+    against the stored conversation, so a guessed id does not expose
+    someone else's) or a person, with a reason (`ReportReason`, eight,
+    append-only) and a note ≤ 500 bytes; ten per ten minutes. The
+    server copies the text as it was (≤ 2,000 bytes; a file's name),
+    stores the report, sends the moderators online (`ADMIN_CHANNEL` and
+    `RESTRICT`) an `AuditLine` with a 160-character excerpt, and keeps
+    only the reason in the on-disk audit. `ReportAck` answers the
+    reporter. The panel's Reports tab (`ListReports`, `ResolveReport`;
+    `RESTRICT`) lists them, as many of the newest as fit one control
+    message; `/reports` and `/resolve` are the same on a phone.
+    Resolved reports go with the history window. A report whose store
+    lookup lands after either account was deleted is dropped.
+  - *Delete my account* (`DeleteAccount` → `AccountDeleted`, then the
+    session ends; `AccountDeleteRefused::LastAdmin` for the only admin)
+    is the purge, at once: the user, keys, roles, profile, progress,
+    the messages they posted, their DM conversations whole (both sides,
+    files included), read
+    marks, telemetry, invites, blocks either way, reports about them,
+    uploaded logs (named `<name>-<user id>-<session>-<time>.log` since
+    1.2). Files are shared by content, so the purge counts references:
+    what the account's posts, conversations and avatar held is
+    released (`Notice::RefsReleased` to the running server), a file
+    nothing points at any more goes, and their own upload that someone
+    else's post or avatar is also using stays, without an uploader.
+    Reports they filed stay without the reporter; audit lines they
+    made stay without the actor; restrictions on them go with the
+    account (FK cascade). Left as is: channels they created keep their
+    id as owner, so the same key back with a new invite owns them
+    again. A DM the store accepted after the
+    purge is not delivered and the purge runs again. The client keeps
+    the server entry (a new invite gets back in) and drops its channel
+    passwords.
+  - Terms of use are the app's, not a server's: accepted once before
+    the first connect (`settings.terms_version`, `TERMS_VERSION`;
+    `web/terms.html`). A server's own rules go in its greeting.
 
 - Chat is general + DMs; no per-channel text (schema leaves the door open).
 - Guests: icon + tooltip from `UserJoined { kind }`; the name is never altered.

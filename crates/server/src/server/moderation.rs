@@ -112,6 +112,7 @@ impl ChatServer {
             .map(|(client, _)| *client)
             .collect();
         self.muted = muted;
+        self.blocked_pairs = self.compute_blocked_pairs();
     }
 
     /// Once a second: drop restrictions past their `until`, tell the
@@ -651,7 +652,9 @@ impl ChatServer {
             | AdminCommand::DeleteRole { .. }
             | AdminCommand::ListBlobs
             | AdminCommand::DeleteBlob { .. }
-            | AdminCommand::ServerStats => Err(AdminError::Invalid("unreachable".into())),
+            | AdminCommand::ServerStats
+            | AdminCommand::ListReports { .. }
+            | AdminCommand::ResolveReport { .. } => Err(AdminError::Invalid("unreachable".into())),
         }
     }
 

@@ -120,17 +120,22 @@ pub struct KeepAlive {
     pub channel: String,
     pub title: String,
     pub text: String,
+    /// In a voice room (the microphone open), not the lobby: Android
+    /// types its service by it (D63).
+    pub in_room: bool,
 }
 
-/// Connected to `server` (`Some`) or not any more (`None`): the host
-/// keeps the process alive meanwhile, where it has a way to.
-pub fn keep_alive(server: Option<&str>) {
+/// Connected to `server` (`Some`) — in a voice room or the lobby — or
+/// not any more (`None`): the host keeps the process alive meanwhile,
+/// where it has a way to. Called again whenever `in_room` changes.
+pub fn keep_alive(server: Option<&str>, in_room: bool) {
     let Some(hooks) = HOOKS.get() else { return };
     match server {
         Some(server) => hooks.keep_alive(Some(&KeepAlive {
             channel: t!("notif-channel-voice"),
             title: t!("notif-connected-title", "server" => server),
             text: t!("notif-connected-text"),
+            in_room,
         })),
         None => hooks.keep_alive(None),
     }

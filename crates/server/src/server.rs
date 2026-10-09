@@ -46,6 +46,7 @@ mod files;
 mod history;
 mod moderation;
 mod profiles;
+mod safety;
 
 use crate::{
     clock::{Clock, WallMs},
@@ -244,6 +245,18 @@ pub struct ChatServer {
     /// request id.
     pending_audits: HashMap<AskId, (ClientId, u32)>,
     pending_convs: HashMap<AskId, ClientId>,
+    /// (sender, receiver) sessions the relay keeps voice from: the
+    /// receiver's user blocked the sender's (`protocol::safety`).
+    /// Recomputed with `muted`.
+    blocked_pairs: HashSet<(ClientId, ClientId)>,
+    /// Reports waiting for the store to find their message.
+    pending_reports: HashMap<AskId, safety::PendingReport>,
+    /// Reports-tab reads in flight: who asked, with which request id.
+    pending_report_lists: HashMap<AskId, (ClientId, u32)>,
+    /// When each account last filed reports (rate limit).
+    report_times: HashMap<UserId, VecDeque<Instant>>,
+    /// When each account last changed its blocks, for their limit.
+    block_times: HashMap<UserId, VecDeque<Instant>>,
     /// In-progress log uploads, same shape.
     log_uploads: HashMap<ClientId, IncomingUpload>,
     /// When each client last completed a log upload.
@@ -397,6 +410,11 @@ impl ChatServer {
             pending_dms: HashMap::new(),
             pending_audits: HashMap::new(),
             pending_convs: HashMap::new(),
+            blocked_pairs: HashSet::new(),
+            pending_reports: HashMap::new(),
+            pending_report_lists: HashMap::new(),
+            report_times: HashMap::new(),
+            block_times: HashMap::new(),
             log_uploads: HashMap::new(),
             last_log_upload: HashMap::new(),
             image_bytes_global: Vec::new(),
@@ -784,6 +802,7 @@ impl ChatServer {
                 clients: &clients,
                 deafened: &self.deafened,
                 muted: &self.muted,
+                blocked: &self.blocked_pairs,
                 afk_channel: afk,
                 lobby: self.default_channel,
                 channel_of: &self.channel_of,
@@ -1201,6 +1220,9 @@ impl ChatServer {
             let roles = self.role_list();
             self.send_msg(peer, &roles);
         }
+        // Before any history: the client hides blocked people's
+        // messages from the first replay on.
+        self.send_blocks(peer);
         self.handle_client_connected(peer, username);
     }
 
@@ -1354,6 +1376,10 @@ impl ChatServer {
                 self.resolve_conversations_answer(id, outcome);
             } else if self.is_audit_ask(id) {
                 self.resolve_audit_answer(id, outcome);
+            } else if self.is_report_ask(id) {
+                self.resolve_report_answer(id, outcome);
+            } else if self.is_report_list_ask(id) {
+                self.resolve_report_list_answer(id, outcome);
             } else {
                 self.resolve_history_answer(id, outcome);
             }
@@ -1370,6 +1396,7 @@ impl ChatServer {
                     self.policy = *policy;
                     self.apply_reloaded_policy();
                 }
+                Notice::RefsReleased(released) => self.release_blob_refs(&released),
             }
         }
     }
@@ -1495,7 +1522,12 @@ impl ChatServer {
             };
             encoded.push(protocol::Bytes::from(bytes));
         }
-        for peer in self.clients() {
+        // Not to whoever blocked the sender.
+        let audience = match self.user_of.get(&client_id).copied() {
+            Some(author) => self.audience_of(&author),
+            None => self.clients(),
+        };
+        for peer in audience {
             self.stats.bytes_sent += image.len() as u64;
             if let Err(e) = self
                 .driver
@@ -1617,11 +1649,14 @@ impl ChatServer {
         let stamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let safe: String = username
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        let path = dir.join(format!("{safe}-{client_id:x}-{stamp}.log"));
+        let safe = safety::log_safe_name(&username);
+        // The account's id in the name: its deletion finds them
+        // (`delete_uploaded_logs`).
+        let user = self
+            .user_of
+            .get(&client_id)
+            .map_or_else(|| "0".repeat(16), |u| hex(&u[..8]));
+        let path = dir.join(format!("{safe}-{user}-{client_id:x}-{stamp}.log"));
         match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &log)) {
             Ok(()) => info!(
                 "[{username}] uploaded their log ({} KB) → {}",
@@ -1986,12 +2021,31 @@ impl ChatServer {
                 self.stats.messages_count += 1;
                 self.note_activity(client_id);
                 let (id, ts) = self.stamp();
-                self.broadcast_msg(&ServerMessage::Chat(ChatMessage {
+                let msg = ChatMessage {
                     id,
                     ts,
                     client_id,
                     text: text.clone(),
-                }));
+                };
+                // With its author's account for sessions that can block
+                // and report; nothing to whoever blocked the author.
+                match self.user_of.get(&client_id).copied() {
+                    Some(author) => {
+                        let rich = ServerMessage::ChatFrom {
+                            from: author,
+                            msg: msg.clone(),
+                        };
+                        let plain = ServerMessage::Chat(msg);
+                        for peer in self.audience_of(&author) {
+                            if self.has_feature(peer, features::SAFETY) {
+                                self.send_msg(peer, &rich);
+                            } else {
+                                self.send_msg(peer, &plain);
+                            }
+                        }
+                    }
+                    None => self.broadcast_msg(&ServerMessage::Chat(msg)),
+                }
                 // Delivery never waits for the disk: broadcast first,
                 // then enqueue the insert. Under backpressure this is a
                 // hole in history, never a lost message.
@@ -2224,7 +2278,16 @@ impl ChatServer {
                     self.handle_audit_log(client_id, request_id, before, limit);
                     return;
                 }
-                let result = self.handle_admin(client_id, command);
+                // The reports likewise (1.2).
+                if let AdminCommand::ListReports { resolved } = command {
+                    self.handle_list_reports(client_id, request_id, resolved);
+                    return;
+                }
+                let result = if let AdminCommand::ResolveReport { id } = command {
+                    self.handle_resolve_report(client_id, id)
+                } else {
+                    self.handle_admin(client_id, command)
+                };
                 self.send_msg(
                     client_id,
                     &ServerMessage::AdminResult { request_id, result },
@@ -2293,6 +2356,16 @@ impl ChatServer {
             } => {
                 self.handle_log_chunk(client_id, upload_id, index, count, data);
             }
+
+            // ── Block, report, delete (1.2, protocol::safety) ───────
+            ClientMessage::Block { user } => self.handle_block(client_id, user, true),
+            ClientMessage::Unblock { user } => self.handle_block(client_id, user, false),
+            ClientMessage::Report {
+                target,
+                reason,
+                note,
+            } => self.handle_report(client_id, target, reason, &note),
+            ClientMessage::DeleteAccount => self.handle_delete_account(client_id),
         }
     }
 

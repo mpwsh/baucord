@@ -144,6 +144,7 @@ impl AppState {
         self.profiles.clear();
         self.avatar_fetches.clear();
         self.own_avatar_blob = None;
+        self.reset_safety();
         self.reset_chat_flow();
         self.is_testing_mic = false;
         self.channels.clear();
@@ -233,8 +234,9 @@ impl AppState {
         // The session is over (unless a reconnect is on its way): the
         // host may let the app sleep again.
         if !std::mem::take(&mut self.reconnect_hold) {
-            crate::host::keep_alive(None);
+            crate::host::keep_alive(None, false);
         }
+        self.kept_alive = None;
         let first = !self.startup_done;
         self.startup_done = true;
         let stay_hidden = first && self.settings.startup.start_minimized && cfg!(feature = "tray");
@@ -438,6 +440,7 @@ impl AppState {
         }
         // A test needs the microphone, in the lobby too.
         self.sync_voice_room();
+        self.sync_keep_alive(false);
     }
 
     /// Tell the voice engine whether we are in a voice room (or testing
@@ -445,6 +448,22 @@ impl AppState {
     /// and the call path go with it: nothing records in the lobby
     /// (ANDROID-SPEC.md D53, IOS-SPEC.md D51). The desktop keeps its
     /// streams as they were.
+    /// Tell the host what keeps the session alive off screen, when that
+    /// changes: connected in a voice room (the microphone open) or in
+    /// the lobby (D63). `force` says it again as it is — on a phone
+    /// brought back to the screen, where a room's microphone type that
+    /// was refused in the background can now be granted.
+    pub(super) fn sync_keep_alive(&mut self, force: bool) {
+        if !self.connected || self.our_client_id.is_none() {
+            return;
+        }
+        let in_room = !self.in_lobby() || self.is_testing_mic;
+        if force || self.kept_alive != Some(in_room) {
+            self.kept_alive = Some(in_room);
+            crate::host::keep_alive(Some(&self.server_name), in_room);
+        }
+    }
+
     pub(super) fn sync_voice_room(&mut self) {
         // Disconnected, the engine is on its way out (the deferred
         // Stop) or a microphone test owns it: leave it as it is.

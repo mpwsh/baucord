@@ -33,9 +33,6 @@ impl AppState {
         // sidebar's page, not whichever chat was showing last time.
         s.set_narrow_chat_open(false);
         s.set_phase(Phase::Main);
-        // Connected: stay connected off screen too (Android's foreground
-        // service and its notification, D34; nothing on the desktop).
-        crate::host::keep_alive(Some(server_name));
 
         self.our_client_id = Some(client_id);
         self.server_name = server_name.to_string();
@@ -78,6 +75,11 @@ impl AppState {
                 in_room: self.voice_in_room,
             })
             .ok();
+        // Connected: stay connected off screen too (Android's foreground
+        // service and its notification, D34, typed for the lobby or a
+        // room, D63; nothing on the desktop).
+        self.kept_alive = None;
+        self.sync_keep_alive(false);
         // Join ding, queued behind Start on the same channel so it
         // plays on the freshly started (or still-running) engine.
         self.play_chime(SoundType::UserJoined);

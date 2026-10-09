@@ -72,7 +72,11 @@ Working on the code? Start with [`START-HERE.md`](START-HERE.md).
   identity; an invite code lets a new key in, with the role the invite
   carries. Roles (built-in and custom, with badges), moderation (mute,
   kick, ban, restrictions), and an admin panel for users, roles,
-  invites, channels, files and the audit log
+  invites, channels, files, reports and the audit log
+- **Block, report, delete your account** — block someone to stop
+  seeing and hearing them (and their DMs); report a message or a
+  person to the server's moderators; delete your account on a server,
+  with everything you posted, from Settings
 - **History, DMs and files** — the server keeps General's history and
   replays it, direct messages are delivered when the other side comes
   back, files and pictures travel by content hash

@@ -12,8 +12,10 @@ impl AppState {
     pub fn update_user_list(&mut self) {
         self.main.global::<State>().set_in_lobby(self.in_lobby());
         // Every presence change lands here: a phone's microphone follows
-        // the room (ANDROID-SPEC.md D53).
+        // the room (ANDROID-SPEC.md D53), and so does the type of what
+        // keeps it alive off screen (D63).
         self.sync_voice_room();
+        self.sync_keep_alive(false);
         let items = roster::grouped_rows(
             &self.channels,
             &self.users,
@@ -74,6 +76,14 @@ impl AppState {
         }
         if user.is_us {
             return;
+        }
+        // Blocked: their voice never reaches us and their stream is
+        // not ours to watch, so neither shows; the name is muted.
+        if self.client_blocked(user.client_id) {
+            row.speaking = false;
+            row.sharing = false;
+            row.name_color = slint::Color::from_rgb_u8(0x6B, 0x72, 0x80);
+            row.has_name_color = true;
         }
         let ours = self.our_rank();
         let theirs = self.rank_of_client(user.client_id);

@@ -544,7 +544,10 @@ pub enum ClientMessage {
 
     /// Broadcast our mute/deafen state to other users. The server also
     /// uses `deafened` to stop relaying voice to us entirely.
-    AudioState { muted: bool, deafened: bool },
+    AudioState {
+        muted: bool,
+        deafened: bool,
+    },
 
     // ── Screen share signaling ──────────────────────────────────────
     /// We started sharing our screen. Dimensions are the quality preset
@@ -560,15 +563,21 @@ pub enum ClientMessage {
     ScreenShareStop,
 
     /// Subscribe to another user's screen share stream.
-    SubscribeScreen { target_id: ClientId },
+    SubscribeScreen {
+        target_id: ClientId,
+    },
 
     /// Unsubscribe from another user's screen share stream.
-    UnsubscribeScreen { target_id: ClientId },
+    UnsubscribeScreen {
+        target_id: ClientId,
+    },
 
     /// Request a fresh keyframe from a sharer we are subscribed to
     /// (viewer → server → sharer). Travels on the signal channel so it
     /// can never queue behind chat.
-    RequestKeyframe { target_id: ClientId },
+    RequestKeyframe {
+        target_id: ClientId,
+    },
 
     // ── Chat, continued ─────────────────────────────────────────────
     /// One slice of a chat image upload (PNG/JPEG/GIF, total ≤
@@ -648,20 +657,33 @@ pub enum ClientMessage {
         limit: u16,
     },
     /// Replace the text of your own message.
-    EditMessage { msg_id: u64, text: String },
+    EditMessage {
+        msg_id: u64,
+        text: String,
+    },
     /// Remove your own message.
-    DeleteMessage { msg_id: u64 },
+    DeleteMessage {
+        msg_id: u64,
+    },
 
     // ── 1.1: channels from the UI (feature bit `CHANNELS_UI`) ───────
     /// Create a channel (needs `CREATE_CHANNELS`; spec §5).
     CreateChannel(ChannelSpec),
     /// Edit a channel you own (`MANAGE_OWN_CHANNELS`) or any
     /// (`MANAGE_CHANNELS`). A config channel accepts only a rename.
-    EditChannel { channel_id: u16, spec: ChannelSpec },
+    EditChannel {
+        channel_id: u16,
+        spec: ChannelSpec,
+    },
     /// Delete a channel you own, or any with `MANAGE_CHANNELS`.
-    DeleteChannel { channel_id: u16 },
+    DeleteChannel {
+        channel_id: u16,
+    },
     /// Send a member of your channel back to the default channel.
-    ChannelKick { channel_id: u16, user_id: UserId },
+    ChannelKick {
+        channel_id: u16,
+        user_id: UserId,
+    },
 
     // ── 1.1.2: profiles (feature bit `PROFILES`, spec §7.1) ─────────
     /// How this user's name looks; sent right after `Session` on every
@@ -673,7 +695,9 @@ pub enum ClientMessage {
     /// A new name while connected. Checked like the name at `Hello`;
     /// answered by [`ServerMessage::UserRenamed`] to everyone, or
     /// [`ServerMessage::RenameDenied`].
-    SetNickname { name: String },
+    SetNickname {
+        name: String,
+    },
 
     // ── 1.1.2: blobs (feature bit `BLOBS`, spec §7) ─────────────────
     /// Announce an upload. `sha256` lets a known blob be acknowledged
@@ -697,7 +721,9 @@ pub enum ClientMessage {
     /// Ask for a blob's bytes; they arrive as
     /// [`ServerMessage::BlobChunk`] on a Media stream, or
     /// [`ServerMessage::BlobMissing`].
-    FetchBlob { blob_id: BlobId },
+    FetchBlob {
+        blob_id: BlobId,
+    },
 
     // ── 1.1.1: direct messages (feature bit `DM`, spec §6) ──────────
     /// A message to one user. `client_ref` is the sender's own handle
@@ -710,7 +736,10 @@ pub enum ClientMessage {
     },
     /// Everything up to `msg_id` in `conv` has been seen; the unread
     /// count in [`ServerMessage::Conversations`] starts after it.
-    MarkRead { conv: ConvRef, msg_id: u64 },
+    MarkRead {
+        conv: ConvRef,
+        msg_id: u64,
+    },
 
     // ── 1.1.3: files in conversations (feature bit `FILES`, spec §7) ─
     /// Post an uploaded blob (yours, per [`ClientMessage::UploadBegin`]
@@ -723,6 +752,32 @@ pub enum ClientMessage {
         blob_id: BlobId,
         client_ref: u32,
     },
+
+    // ── 1.2: block, report, delete (feature bit `SAFETY`) ────────────
+    /// Block `user` on this account, on every device, until
+    /// [`ClientMessage::Unblock`]: their messages are hidden here,
+    /// their voice and stream sound are not relayed to this user, and
+    /// DMs between the two are refused. Answered with
+    /// [`ServerMessage::Blocks`].
+    Block {
+        user: UserId,
+    },
+    Unblock {
+        user: UserId,
+    },
+    /// Report a message or a person to the server's moderators.
+    /// `note` is optional free text (at most
+    /// [`crate::safety::MAX_REPORT_NOTE_BYTES`]). Answered with
+    /// [`ServerMessage::ReportAck`].
+    Report {
+        target: crate::safety::ReportTarget,
+        reason: crate::safety::ReportReason,
+        note: String,
+    },
+    /// Delete this account on this server, with everything it posted.
+    /// Answered with [`ServerMessage::AccountDeleted`] (then the
+    /// session ends) or [`ServerMessage::AccountDeleteRefused`].
+    DeleteAccount,
 }
 
 impl ClientMessage {
@@ -1172,6 +1227,31 @@ pub enum ServerMessage {
     RoleList {
         roles: Vec<RoleInfo>,
     },
+
+    // ── 1.2: block, report, delete (feature bit `SAFETY`) ────────────
+    /// Everyone this user has blocked: after `Session` on join, and to
+    /// every session of the user after a `Block` or `Unblock`.
+    Blocks {
+        users: Vec<crate::safety::BlockedUser>,
+    },
+    /// The answer to a `Report`.
+    ReportAck {
+        result: Result<(), crate::safety::ReportRefusal>,
+    },
+    /// This session's account is gone (its own `DeleteAccount`); the
+    /// session ends right after. The client forgets the server.
+    AccountDeleted,
+    AccountDeleteRefused {
+        reason: crate::safety::DeleteRefusal,
+    },
+    /// A general-chat message with its author's account: what a
+    /// `SAFETY` session gets instead of [`ServerMessage::Chat`], so a
+    /// message from someone in the lobby (whose `UserDetails` nobody
+    /// gets) can still be reported and its author blocked.
+    ChatFrom {
+        from: UserId,
+        msg: ChatMessage,
+    },
 }
 
 /// Why a DM was not sent (spec §6).
@@ -1190,6 +1270,10 @@ pub enum DmFailReason {
     /// `SendFile` named a blob the server does not have, or one that
     /// is not yours.
     NoSuchBlob,
+    // 1.2 (only to sessions with `SAFETY`; others get `NoPermission`):
+    /// The recipient cannot take messages from the sender. Said the
+    /// same way whichever side blocked the other.
+    Unavailable,
 }
 
 impl DmFailReason {
@@ -1201,6 +1285,7 @@ impl DmFailReason {
             Self::NoSuchUser => "no such user",
             Self::Store => "the server could not store the message; try again",
             Self::NoSuchBlob => "the file is not on the server",
+            Self::Unavailable => "they cannot get messages from you",
         }
     }
 }
@@ -2027,7 +2112,136 @@ mod tests {
         ));
     }
 
+    /// The 1.2 additions round-trip, and are appended: every older
+    /// variant keeps its tag, so a 1.1 peer still decodes everything it
+    /// knows (and never gets these, the bit gates them).
     #[test]
+    #[allow(clippy::too_many_lines)] // one case per variant
+    fn safety_messages_roundtrip_and_are_appended() {
+        use crate::safety::{
+            BlockedUser, DeleteRefusal, ReportReason, ReportRefusal, ReportSummary, ReportTarget,
+        };
+        let client_roundtrips = |msg: &ClientMessage| {
+            let bytes = encode_client_message(msg).unwrap();
+            let again = decode_client_message(&bytes).expect("decodes");
+            encode_client_message(&again).unwrap() == bytes
+        };
+        let server_roundtrips = |msg: &ServerMessage| {
+            let bytes = encode_server_message(msg).unwrap();
+            let again = decode_server_message(&bytes).expect("decodes");
+            encode_server_message(&again).unwrap() == bytes
+        };
+        for msg in [
+            ClientMessage::Block { user: [3u8; 32] },
+            ClientMessage::Unblock { user: [3u8; 32] },
+            ClientMessage::Report {
+                target: ReportTarget::Message {
+                    conv: ConvRef::Dm([4u8; 32]),
+                    msg_id: 77,
+                },
+                reason: ReportReason::Harassment,
+                note: "keeps doing it".to_string(),
+            },
+            ClientMessage::Report {
+                target: ReportTarget::User { user: [5u8; 32] },
+                reason: ReportReason::Other,
+                note: String::new(),
+            },
+            ClientMessage::DeleteAccount,
+        ] {
+            assert_eq!(msg.lane(), Lane::Control);
+            assert!(client_roundtrips(&msg), "{msg:?}");
+        }
+        for msg in [
+            ServerMessage::Blocks {
+                users: vec![BlockedUser {
+                    user_id: [3u8; 32],
+                    name: "mallory".to_string(),
+                }],
+            },
+            ServerMessage::ReportAck { result: Ok(()) },
+            ServerMessage::ReportAck {
+                result: Err(ReportRefusal::NoSuchMessage),
+            },
+            ServerMessage::AccountDeleted,
+            ServerMessage::AccountDeleteRefused {
+                reason: DeleteRefusal::LastAdmin,
+            },
+            ServerMessage::MessageFailed {
+                client_ref: 1,
+                reason: DmFailReason::Unavailable,
+            },
+            ServerMessage::AdminResult {
+                request_id: 2,
+                result: Ok(AdminOutcome::Reports(vec![ReportSummary {
+                    id: 1,
+                    ts: 2,
+                    reporter: None,
+                    target_user: Some([5u8; 32]),
+                    target_name: "mallory".to_string(),
+                    msg_id: Some(77),
+                    in_dm: true,
+                    excerpt: "hi".to_string(),
+                    reason: ReportReason::Spam,
+                    note: String::new(),
+                    resolved: false,
+                }])),
+            },
+            ServerMessage::ChatFrom {
+                from: [6u8; 32],
+                msg: ChatMessage {
+                    id: 8,
+                    ts: 9,
+                    client_id: 10,
+                    text: "hello".to_string(),
+                },
+            },
+        ] {
+            assert!(server_roundtrips(&msg), "{msg:?}");
+        }
+        assert!(client_roundtrips(&ClientMessage::Admin {
+            request_id: 3,
+            command: AdminCommand::ListReports { resolved: true },
+        }));
+        assert!(client_roundtrips(&ClientMessage::Admin {
+            request_id: 4,
+            command: AdminCommand::ResolveReport { id: 9 },
+        }));
+
+        // Appended: the first new variant's tag follows the last 1.1 one.
+        let tag = |bytes: Vec<u8>| bytes[0];
+        let send_file = tag(encode_client_message(&ClientMessage::SendFile {
+            conv: ConvRef::General,
+            blob_id: [0u8; 32],
+            client_ref: 0,
+        })
+        .unwrap());
+        let block = tag(encode_client_message(&ClientMessage::Block { user: [0u8; 32] }).unwrap());
+        assert_eq!(block, send_file + 1);
+        let role_list =
+            tag(encode_server_message(&ServerMessage::RoleList { roles: Vec::new() }).unwrap());
+        let blocks =
+            tag(encode_server_message(&ServerMessage::Blocks { users: Vec::new() }).unwrap());
+        assert_eq!(blocks, role_list + 1);
+        let refused = tag(encode_server_message(&ServerMessage::AccountDeleteRefused {
+            reason: DeleteRefusal::LastAdmin,
+        })
+        .unwrap());
+        let chat_from = tag(encode_server_message(&ServerMessage::ChatFrom {
+            from: [0u8; 32],
+            msg: ChatMessage {
+                id: 0,
+                ts: 0,
+                client_id: 0,
+                text: String::new(),
+            },
+        })
+        .unwrap());
+        assert_eq!(chat_from, refused + 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one case per variant
     fn admin_messages_roundtrip() {
         use crate::admin::{AdminTarget, KeySummary, UserSummary};
         // The message enums carry floats and skip `PartialEq`; a round

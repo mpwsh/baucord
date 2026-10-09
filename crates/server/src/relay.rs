@@ -41,6 +41,9 @@ pub struct VoiceStats {
     pub packets_dropped_malformed: u64,
     /// Per-recipient sends skipped because the recipient is deafened.
     pub sends_skipped_deafened: u64,
+    /// Per-recipient sends skipped because the recipient blocked the
+    /// speaker (`protocol::safety`).
+    pub sends_skipped_blocked: u64,
     /// Packets dropped because the sender is muted by the server
     /// (spec §4.2): a `voice` restriction, or no `SPEAK`.
     pub packets_dropped_muted: u64,
@@ -66,6 +69,9 @@ pub struct Room<'a> {
     pub clients: &'a [ClientId],
     pub deafened: &'a HashSet<ClientId>,
     pub muted: &'a HashSet<ClientId>,
+    /// (sender, receiver) pairs whose voice is not relayed: the
+    /// receiver blocked the sender (`protocol::safety`).
+    pub blocked: &'a HashSet<(ClientId, ClientId)>,
     /// Voice in the AFK channel goes nowhere (spec §5).
     pub afk_channel: Option<u16>,
     /// Voice from the lobby goes nowhere (spec §12, 1.1.5).
@@ -107,6 +113,7 @@ impl VoiceRelay {
             clients,
             deafened,
             muted,
+            blocked,
             afk_channel,
             lobby,
             channel_of,
@@ -151,6 +158,10 @@ impl VoiceRelay {
                         self.stats.sends_skipped_deafened += 1;
                         continue;
                     }
+                    if !blocked.is_empty() && blocked.contains(&(*sender, *recipient)) {
+                        self.stats.sends_skipped_blocked += 1;
+                        continue;
+                    }
                     if driver.send(now, *recipient, Lane::Voice, &envelope).is_ok() {
                         sent += 1;
                     }
@@ -179,14 +190,16 @@ impl VoiceRelay {
             || self.stats.packets_dropped_muted > 0
             || self.stats.sends_skipped_deafened > 0
             || self.stats.sends_skipped_other_channel > 0
+            || self.stats.sends_skipped_blocked > 0
         {
             info!(
                 "Voice — malformed drops: {}, muted drops: {}, deafened skips: {}, \
-                 other-channel skips: {}",
+                 other-channel skips: {}, blocked skips: {}",
                 self.stats.packets_dropped_malformed,
                 self.stats.packets_dropped_muted,
                 self.stats.sends_skipped_deafened,
                 self.stats.sends_skipped_other_channel,
+                self.stats.sends_skipped_blocked,
             );
         }
     }

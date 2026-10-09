@@ -23,6 +23,12 @@ import { Tr } from "tr.slint";
 import { State, KeybindRow, ServerRow } from "globals.slint";
 import { Btn, IconBtn, Field, FieldLabel, Hint, SectionHeader, Sep, HSlider, VuMeter, GateMeter, Dropdown, CheckRow } from "widgets.slint";
 
+/// Someone this account blocked on the connected server (1.2).
+export struct BlockedRow {
+    user-id: string,        // hex, for Unblock
+    name: string,
+}
+
 export global SettingsState {
     // ── Profile (spec §7.1: kept here, sent to servers in 1.1.2) ──
     in-out property <string> nickname;
@@ -49,6 +55,15 @@ export global SettingsState {
     in property <string> identity-status;
     /// Regenerate asks twice: the first click arms, the second acts.
     in property <bool> identity-regenerate-armed: false;
+    // ── This server (1.2, a server that takes them): who this account
+    // blocked there, and deleting the account there for good.
+    in property <bool> safety: false;
+    in property <[BlockedRow]> blocked;
+    /// The connected server's name, for the delete button's line.
+    in property <string> account-server;
+    /// Delete asks twice, like Regenerate.
+    in property <bool> account-delete-armed: false;
+    in property <string> account-status;    // "" hides the line
 
     // ── General ──
     in property <[string]> languages;         // ["System", "English", …]
@@ -153,6 +168,10 @@ export global SettingsLogic {
     callback identity-import();
     callback identity-regenerate();
     callback identity-regenerate-disarm();
+    // This server (1.2)
+    callback unblock(user-id: string);
+    callback account-delete();
+    callback account-delete-disarm();
 
     // General
     callback language-selected(int);
@@ -514,6 +533,66 @@ component ProfilePanel inherits VerticalLayout {
         color: Theme.text-secondary;
         font-size: Theme.font-sm;
         wrap: word-wrap;
+    }
+
+    // Blocked people, on the server this session is on: what you see
+    // of them comes back the moment you unblock.
+    Sep { }
+    SectionHeader { text: Tr.blocked-header; }
+    if !SettingsState.safety : Hint { text: Tr.blocked-not-connected; }
+    if SettingsState.safety : VerticalLayout {
+        spacing: Theme.gap-xs;
+        Hint { text: Tr.blocked-lead; }
+        if SettingsState.blocked.length == 0 : Text {
+            text: Tr.blocked-none;
+            color: Theme.text-muted;
+            font-size: Theme.font-sm;
+        }
+        for b in SettingsState.blocked : HorizontalLayout {
+            spacing: Theme.gap-sm;
+            height: 36px;
+            Text {
+                text: b.name;
+                color: Theme.text-primary;
+                font-size: Theme.font-body;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Btn {
+                text: Tr.unblock;
+                clicked => { SettingsLogic.unblock(b.user-id); }
+            }
+        }
+    }
+
+    // Leaving a server for good: the account there and everything it
+    // posted. Armed on the first click, done on the second.
+    if SettingsState.safety : VerticalLayout {
+        spacing: Theme.gap-sm;
+        Sep { }
+        SectionHeader { text: Tr.account-delete-header; }
+        Hint { text: SettingsState.account-server; }
+        Hint { text: Tr.account-delete-note; }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn {
+                text: SettingsState.account-delete-armed ? Tr.account-delete-confirm : Tr.account-delete;
+                danger: true;
+                clicked => { SettingsLogic.account-delete(); }
+            }
+            if SettingsState.account-delete-armed : Btn {
+                text: Tr.cancel;
+                clicked => { SettingsLogic.account-delete-disarm(); }
+            }
+            Rectangle { }
+        }
+        if SettingsState.account-status != "" : Text {
+            text: SettingsState.account-status;
+            color: Theme.danger-text;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
     }
     Rectangle { }
 }

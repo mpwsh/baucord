@@ -128,14 +128,20 @@ pub fn request_permissions(names: &[&str]) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-/// `BaucordActivity.startVoiceService(channel, title, text)`: the
-/// foreground service and its notification (D34). `Ok(false)` when the
-/// system refused (asked from the background).
+/// `BaucordActivity.startVoiceService(channel, title, text, inRoom)`: the
+/// foreground service and its notification (D34), typed for a room or
+/// the lobby (D63). `Ok(false)` when the system refused (asked from the
+/// background).
 ///
 /// # Errors
 /// Any JNI failure, as text.
 #[cfg(feature = "app")]
-pub fn start_voice_service(channel: &str, title: &str, text: &str) -> Result<bool, String> {
+pub fn start_voice_service(
+    channel: &str,
+    title: &str,
+    text: &str,
+    in_room: bool,
+) -> Result<bool, String> {
     with_activity(|env, activity| {
         let jchannel = env.new_string(channel)?;
         let jtitle = env.new_string(title)?;
@@ -143,8 +149,13 @@ pub fn start_voice_service(channel: &str, title: &str, text: &str) -> Result<boo
         env.call_method(
             activity,
             jni::jni_str!("startVoiceService"),
-            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z"),
-            &[(&jchannel).into(), (&jtitle).into(), (&jtext).into()],
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)Z"),
+            &[
+                (&jchannel).into(),
+                (&jtitle).into(),
+                (&jtext).into(),
+                JValue::Bool(in_room),
+            ],
         )?
         .z()
     })

@@ -34,6 +34,10 @@ pub struct Meta {
     /// viewer's zone): where the day dividers go.
     pub day: i64,
     pub user: String,
+    /// The author's account (the server's user id), when known: what
+    /// a block hides and a report names. `None` for rows from before
+    /// the session knew it.
+    pub author: Option<[u8; 32]>,
     /// Authored by this session's user: the edit/delete menu appears.
     pub own: bool,
     /// Sent, not yet acknowledged (a DM waiting for the store): drawn
@@ -480,6 +484,44 @@ impl ChatHistory {
         })
     }
 
+    /// Someone was blocked: every row they authored goes, and with it
+    /// any day divider left with nothing under it. Returns the indices
+    /// removed, ascending, in the history as it was: the mirror drops
+    /// the same rows back to front and keeps the rest (and their
+    /// pictures) as they are. Empty when nothing was theirs.
+    pub fn remove_author(&mut self, author: &[u8; 32]) -> Vec<usize> {
+        let mut keep: Vec<bool> = self
+            .rows
+            .iter()
+            .map(|r| r.meta().is_none_or(|m| m.author.as_ref() != Some(author)))
+            .collect();
+        if keep.iter().all(|k| *k) {
+            return Vec::new();
+        }
+        // A divider is redundant when the next row kept is another
+        // divider, or when nothing follows it: back to front.
+        let mut next_is_divider_or_end = true;
+        for (i, row) in self.rows.iter().enumerate().rev() {
+            if !keep[i] {
+                continue;
+            }
+            let divider = matches!(row, ChatItem::DayMarker { .. });
+            if divider && next_is_divider_or_end {
+                keep[i] = false;
+                continue;
+            }
+            next_is_divider_or_end = divider;
+        }
+        let removed: Vec<usize> = (0..keep.len()).filter(|i| !keep[*i]).collect();
+        let mut index = 0;
+        self.rows.retain(|_| {
+            let kept = keep[index];
+            index += 1;
+            kept
+        });
+        removed
+    }
+
     /// The contiguous run of rows that belong to message `id`.
     fn span_of(&self, id: u64) -> Option<(usize, usize)> {
         let start = self.rows.iter().position(|r| r.message_id() == Some(id))?;
@@ -546,9 +588,45 @@ mod tests {
             ts_ms: id.saturating_mul(1_000),
             day: 20_000,
             user: "a".into(),
+            author: Some([1u8; 32]),
             own: false,
             pending: false,
         }
+    }
+
+    #[test]
+    fn a_block_removes_the_authors_rows_and_the_dividers_they_leave() {
+        let mut h = ChatHistory::new();
+        let mut blocked = meta(2);
+        blocked.author = Some([2u8; 32]);
+        blocked.user = "b".into();
+        h.push_day_marker("Monday", 20_000);
+        h.push_message(&meta(1), "hi", false);
+        h.push_message(&blocked, "go away\n```\ncode\n```", false);
+        h.push_day_marker("Tuesday", 20_001);
+        h.push_message(&blocked, "again", false);
+        h.push_system("someone joined");
+        h.push_day_marker("Wednesday", 20_002);
+        h.push_message(&blocked, "still", false);
+        // Rows: 0 Monday, 1 hi, 2-3 the fenced message, 4 Tuesday,
+        // 5 again, 6 system, 7 Wednesday, 8 still.
+        assert_eq!(h.remove_author(&[2u8; 32]), vec![2, 3, 5, 7, 8]);
+        // Monday keeps its message; Tuesday's divider stays over the
+        // system line (the room's, not theirs); Wednesday's is left
+        // with nothing under it and goes.
+        assert_eq!(h.rows().len(), 4, "{:?}", h.rows());
+        assert!(matches!(
+            &h.rows()[0],
+            ChatItem::DayMarker { day: 20_000, .. }
+        ));
+        assert!(matches!(&h.rows()[1], ChatItem::Message { body, .. } if body == "hi"));
+        assert!(matches!(
+            &h.rows()[2],
+            ChatItem::DayMarker { day: 20_001, .. }
+        ));
+        assert!(matches!(&h.rows()[3], ChatItem::System { .. }));
+        // Nobody else's rows: nothing to do.
+        assert!(h.remove_author(&[9u8; 32]).is_empty());
     }
 
     #[test]

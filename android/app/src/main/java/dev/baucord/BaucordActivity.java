@@ -76,15 +76,17 @@ public class BaucordActivity extends NativeActivity {
     // ── The voice connection's foreground service (D34) ────────────────
 
     /**
-     * Rust, on connect: keep the process running in the background — a
-     * foreground service with a notification. Android otherwise freezes
-     * an app soon after it leaves the screen, and the server drops it.
-     * Returns false when the system refused (started from the
+     * Rust, on connect and on entering or leaving a voice room: keep the
+     * process running in the background — a foreground service with a
+     * notification, typed for the room or the lobby. Android otherwise
+     * freezes an app soon after it leaves the screen, and the server
+     * drops it. Returns false when the system refused (started from the
      * background).
      */
-    public boolean startVoiceService(String channelName, String title, String text) {
+    public boolean startVoiceService(String channelName, String title, String text,
+            boolean inRoom) {
         try {
-            VoiceService.start(this, channelName, title, text);
+            VoiceService.start(this, channelName, title, text, inRoom);
             return true;
         } catch (Exception e) {
             Log.w(TAG, "the voice service could not start", e);

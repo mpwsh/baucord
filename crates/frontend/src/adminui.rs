@@ -10,8 +10,8 @@ use client::{network::NetworkControl, AdminCommand, AdminOutcome, AdminTarget};
 use i18n::t;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use ui::{
-    AdminAuditRow, AdminBlobRow, AdminChannelRow, AdminInviteRow, AdminLogic, AdminRestrictionRow,
-    AdminRoleRow, AdminState, AdminUserRow, AdminWindow,
+    AdminAuditRow, AdminBlobRow, AdminChannelRow, AdminInviteRow, AdminLogic, AdminReportRow,
+    AdminRestrictionRow, AdminRoleRow, AdminState, AdminUserRow, AdminWindow,
 };
 
 use crate::app::{self, AppState, PendingAdmin};
@@ -24,6 +24,8 @@ pub const TAB_CHANNELS: i32 = 4;
 pub const TAB_FILES: i32 = 5;
 pub const TAB_AUDIT: i32 = 6;
 pub const TAB_SERVER: i32 = 7;
+/// 1.2: what people reported (`ListReports`).
+pub const TAB_REPORTS: i32 = 8;
 
 /// Audit entries per page.
 const AUDIT_PAGE: u16 = 50;
@@ -42,6 +44,10 @@ pub enum PanelAction {
     DeleteChannel(u16),
     RevokeInvite(String),
     Lift(u64),
+    /// A reported message, deleted for everyone (Reports tab).
+    DeleteMessage(u64),
+    /// Banning a reported person; refreshes the Reports tab.
+    BanReported(AdminTarget),
 }
 
 /// Open the panel (creating it on first use) on `tab`.
@@ -242,6 +248,50 @@ fn wire(win: &AdminWindow) {
             }
         });
     });
+    logic.on_report_resolve(|id| {
+        app::with_current(move |app| {
+            if let Ok(id) = u64::try_from(id) {
+                app.send_admin(
+                    AdminCommand::ResolveReport { id },
+                    PendingAdmin::Panel(TAB_REPORTS),
+                );
+            }
+        });
+    });
+    logic.on_report_delete_message(|id| {
+        app::with_current(move |app| {
+            let Some(msg_id) = report_by_id(app, id).and_then(|r| r.msg_id) else {
+                return;
+            };
+            ask(
+                app,
+                PanelAction::DeleteMessage(msg_id),
+                t!("confirm-delete-message-title"),
+                t!("confirm-delete-message-body-admin"),
+                t!("confirm-delete-message"),
+                false,
+            );
+        });
+    });
+    logic.on_report_ban(|id| {
+        app::with_current(move |app| {
+            let Some(report) = report_by_id(app, id) else {
+                return;
+            };
+            let Some(user) = report.target_user else {
+                return;
+            };
+            let name = report.target_name.clone();
+            ask(
+                app,
+                PanelAction::BanReported(AdminTarget::User(user)),
+                t!("admin-confirm-ban", "name" => name.as_str()),
+                t!("admin-confirm-ban-text"),
+                t!("admin-ban"),
+                true,
+            );
+        });
+    });
     logic.on_confirm_accept(|| app::with_current(confirm_accept));
     logic.on_confirm_cancel(|| {
         app::with_current(|app| {
@@ -319,6 +369,14 @@ pub fn refresh(app: &mut AppState, tab: i32) {
         TAB_SERVER => {
             s.set_busy(true);
             app.send_admin(AdminCommand::ServerStats, PendingAdmin::Panel(tab));
+        }
+        TAB_REPORTS => {
+            s.set_busy(true);
+            let resolved = s.get_reports_resolved();
+            app.send_admin(
+                AdminCommand::ListReports { resolved },
+                PendingAdmin::Panel(tab),
+            );
         }
         _ => {}
     }
@@ -494,8 +552,47 @@ pub fn take_outcome(app: &mut AppState, tab: i32, outcome: AdminOutcome) {
             }
             refresh(app, tab);
         }
+        AdminOutcome::Reports(list) => {
+            let rows: Vec<AdminReportRow> = list.iter().map(report_row).collect();
+            s.set_reports(ModelRc::new(VecModel::from(rows)));
+            app.admin_reports = list;
+        }
         AdminOutcome::Telemetry(_) => {}
     }
+}
+
+/// One report as the Reports tab shows it.
+fn report_row(r: &client::protocol::ReportSummary) -> AdminReportRow {
+    let what = match (r.msg_id, r.in_dm) {
+        (Some(_), false) => t!("admin-reports-what-general"),
+        (Some(_), true) => t!("admin-reports-what-dm"),
+        (None, _) => t!("admin-reports-what-person"),
+    };
+    AdminReportRow {
+        id: i32::try_from(r.id).unwrap_or(-1),
+        when: app::format_wall_stamp(r.ts).into(),
+        reporter: r.reporter.clone().unwrap_or_default().into(),
+        target: r.target_name.as_str().into(),
+        target_id: r
+            .target_user
+            .map(|u| app::hex(&u))
+            .unwrap_or_default()
+            .into(),
+        what: what.into(),
+        reason: crate::app::report_reason_text(r.reason).into(),
+        excerpt: r.excerpt.as_str().into(),
+        note: r.note.as_str().into(),
+        resolved: r.resolved,
+        // A General message can be deleted from here; a DM is the
+        // two people's (the server keeps it, the report quotes it).
+        msg_deletable: r.msg_id.is_some() && !r.in_dm && !r.resolved,
+    }
+}
+
+/// The report behind a row's id, as last fetched.
+fn report_by_id(app: &AppState, id: i32) -> Option<&client::protocol::ReportSummary> {
+    let id = u64::try_from(id).ok()?;
+    app.admin_reports.iter().find(|r| r.id == id)
 }
 
 /// A refusal the panel asked for.
@@ -793,6 +890,18 @@ fn confirm_accept(app: &mut AppState) {
             AdminCommand::Lift { restriction_id },
             PendingAdmin::Panel(TAB_RESTRICTIONS),
         ),
+        PanelAction::DeleteMessage(msg_id) => app.send_admin(
+            AdminCommand::DeleteMessage { msg_id },
+            PendingAdmin::Panel(TAB_REPORTS),
+        ),
+        PanelAction::BanReported(target) => app.send_admin(
+            AdminCommand::Ban {
+                target,
+                duration_secs: None,
+                reason,
+            },
+            PendingAdmin::Panel(TAB_REPORTS),
+        ),
     }
 }
 
@@ -820,6 +929,10 @@ pub(crate) fn audit_action_text(action: &str) -> String {
         "channel.edit" => "admin-act-channel-edit",
         "channel.delete" => "admin-act-channel-delete",
         "blob.delete" => "admin-act-blob-delete",
+        "report.message" => "admin-act-report-message",
+        "report.user" => "admin-act-report-user",
+        "report.resolve" => "admin-act-report-resolve",
+        "user.delete" => "admin-act-user-delete",
         _ => return action.to_string(),
     };
     t!(key)

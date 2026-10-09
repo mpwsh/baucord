@@ -89,6 +89,7 @@ impl AppState {
             dm: has(p::DM),
             manage_own_channels: has(p::MANAGE_OWN_CHANNELS),
             create_channels: has(p::CREATE_CHANNELS),
+            safety: self.safety,
             our_rank: self.our_rank(),
         }
     }
@@ -126,6 +127,9 @@ impl AppState {
                 role_editable: row.role_editable,
                 channel_kickable: row.channel_kickable,
                 channel_id: u16::try_from(row.channel_id).unwrap_or(0),
+                blocked: self
+                    .user_id_at(index)
+                    .is_some_and(|c| self.client_blocked(c)),
             };
             let channels: Vec<menu::ChannelChoice> = self
                 .channels
@@ -205,6 +209,16 @@ impl AppState {
             // System lines and day dividers have no menu.
             _ => return,
         };
+        let msg_id = roster::join_id(row.msg_id_lo, row.msg_id_hi);
+        // Someone else's stored message, in General or a DM (not the
+        // admin channel's lines): reportable, its author blockable.
+        let reportable = self.safety
+            && !row.own
+            && !row.pending
+            && self.active_dm != Some(ADMIN_CHANNEL_KEY)
+            && self
+                .author_of_message(msg_id)
+                .is_some_and(|(author, _)| Some(author) != self.our_user_id);
         let facts = menu::MessageFacts {
             kind,
             own: row.own,
@@ -216,10 +230,11 @@ impl AppState {
                 self.permissions,
                 client::permissions::DELETE_MESSAGES,
             ),
+            reportable,
         };
         let target = MenuTarget::Message {
             row_id: row.row_id,
-            msg_id: roster::join_id(row.msg_id_lo, row.msg_id_hi),
+            msg_id,
             body: row.body.to_string(),
         };
         self.show_menu(menu::message_menu(&facts), target, x, y);
@@ -297,6 +312,10 @@ impl AppState {
                 media::copy_image(self, row_id);
             }
             (MenuTarget::Message { row_id, .. }, A::SaveFile) => self.file_save(row_id),
+            (MenuTarget::Message { msg_id, body, .. }, A::ReportMessage) => {
+                self.report_message(msg_id, &body);
+            }
+            (MenuTarget::Message { msg_id, .. }, A::BlockAuthor) => self.block_author(msg_id),
             (MenuTarget::Composer, A::Cut) => self.main.invoke_composer_cut(),
             (MenuTarget::Composer, A::Copy) => self.main.invoke_composer_copy(),
             (MenuTarget::Composer, A::Paste) => media::paste_into_chat(self),
@@ -327,6 +346,9 @@ impl AppState {
                 }
             }
             A::Message => self.dm_from_roster(index),
+            A::Block => self.block_at(index, true),
+            A::Unblock => self.block_at(index, false),
+            A::Report => self.report_user_at(index),
             A::SetRole(role) => {
                 // One role is the whole set: the built-ins nest, and a
                 // custom role is defined as a complete set.

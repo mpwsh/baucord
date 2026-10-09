@@ -111,7 +111,12 @@ impl ChatServer {
                 .map(|(_, u)| u.name.clone())
         };
         match action {
-            a if a.starts_with("user.") || a == "restrict" || a == "profile.reset" => {
+            a if a.starts_with("user.")
+                || a == "restrict"
+                || a == "profile.reset"
+                || a == "report.user"
+                || a == "report.message" =>
+            {
                 user_named().unwrap_or_else(|| target.to_string())
             }
             a if a.starts_with("role.") => target
@@ -132,6 +137,7 @@ impl ChatServer {
                 .unwrap_or_else(|| format!("channel {target}")),
             "restriction.lift" => format!("restriction #{target}"),
             "message.delete" => format!("message #{target}"),
+            "report.resolve" => format!("report #{target}"),
             _ => target.to_string(),
         }
     }

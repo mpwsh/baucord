@@ -45,6 +45,14 @@ impl AppState {
         if let Some(first) = messages.first() {
             self.oldest_history_id = Some(first.id);
         }
+        // A blocked person's messages stay out of every page; their ids
+        // are kept so later edits and deletions of them say nothing.
+        let hidden: Vec<u64> = messages
+            .iter()
+            .filter(|m| self.is_blocked(&m.user_id))
+            .map(|m| m.id)
+            .collect();
+        self.hidden_messages.extend(hidden);
         if key.is_none() {
             for m in messages {
                 if Some(m.user_id) == self.our_user_id {
@@ -54,6 +62,7 @@ impl AppState {
         }
         let prepared: Vec<(Meta, String, bool)> = messages
             .iter()
+            .filter(|m| !self.is_blocked(&m.user_id))
             .map(|m| {
                 let meta = Meta {
                     id: m.id,
@@ -61,6 +70,7 @@ impl AppState {
                     ts_ms: m.ts,
                     day: local_day(m.ts),
                     user: m.name.clone(),
+                    author: Some(m.user_id),
                     own: Some(m.user_id) == self.our_user_id,
                     pending: false,
                 };
@@ -383,6 +393,12 @@ impl AppState {
         ts: u64,
         body: Incoming<'_>,
     ) {
+        // The server refuses DMs between blocked people both ways; a
+        // stray one (sent just before the block) stays out.
+        if self.is_blocked(&from) {
+            self.hide_message(id);
+            return;
+        }
         // A new message brings a closed conversation back.
         self.set_dm_hidden(from, false);
         let is_open = self.active_dm == Some(from);
@@ -414,6 +430,7 @@ impl AppState {
                 ts_ms: ts,
                 day: local_day(ts),
                 user: username.to_string(),
+                author: Some(from),
                 own: false,
                 pending: false,
             };
@@ -466,6 +483,7 @@ impl AppState {
             ts_ms: now,
             day: local_day(now),
             user: self.settings.user.nickname.clone(),
+            author: self.our_user_id,
             own: true,
             pending: true,
         };

@@ -1,0 +1,311 @@
+<!doctype html>
+<!--
+  The terms the apps ask people to accept before they first connect
+  (Google Play's user-generated content policy: an app where people
+  post must have terms that forbid objectionable content, a way to
+  report it and a way to block people; PLAY-STORE.md, PRODUCTION-PLAN
+  LEG-6). They apply everywhere the apps go; a server's own rules
+  (its greeting, or a page its owner links) add to them. The app
+  stores the version it was shown (client config `terms_version`):
+  when these change in substance, raise TERMS_VERSION in the client so
+  people see them again.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/x-icon" href="/img/favicon.ico" />
+    <title>baucord — terms of use</title>
+    <meta
+      name="description"
+      content="The rules for using baucord and the official baucord server: who may use it, what is not allowed, reporting, blocking and moderation."
+    />
+    <meta name="theme-color" content="#1a1d21" />
+    <style>
+      /* The site's "workbench" palette (index.html). */
+      :root {
+        --paper: #1a1d21;
+        --mist: #222529;
+        --ink: #d1d2d3;
+        --slate: #abadb0;
+        --line: rgba(209, 210, 211, 0.12);
+        --cobalt-text: #1d9bd1;
+        --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: var(--paper);
+        color: var(--ink);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.6;
+        -webkit-text-size-adjust: 100%;
+      }
+      .wrap {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 16px;
+      }
+      header {
+        border-bottom: 1px solid var(--line);
+        padding: 18px 0;
+      }
+      header a {
+        color: var(--ink);
+        font-weight: 700;
+        text-decoration: none;
+        letter-spacing: 0.01em;
+      }
+      main {
+        padding: 40px 0 64px;
+      }
+      h1 {
+        font-size: 2rem;
+        line-height: 1.2;
+        margin-bottom: 8px;
+      }
+      .updated {
+        color: var(--slate);
+        margin-bottom: 28px;
+      }
+      h2 {
+        font-size: 1.25rem;
+        margin: 40px 0 12px;
+        padding-top: 8px;
+      }
+      h3 {
+        font-size: 1.02rem;
+        margin: 22px 0 6px;
+      }
+      p,
+      ul {
+        margin-bottom: 12px;
+      }
+      ul {
+        padding-left: 22px;
+      }
+      li {
+        margin-bottom: 6px;
+      }
+      a {
+        color: var(--cobalt-text);
+      }
+      code {
+        font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+        font-size: 0.9em;
+        background: var(--mist);
+        padding: 1px 5px;
+        border-radius: 4px;
+      }
+      .summary {
+        background: var(--mist);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 18px 20px 8px;
+        margin-bottom: 8px;
+      }
+      .summary h2 {
+        margin-top: 0;
+        padding-top: 0;
+      }
+      .table-scroll {
+        overflow-x: auto;
+        margin: 8px 0 16px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        min-width: 520px;
+        font-size: 0.95rem;
+      }
+      th,
+      td {
+        text-align: left;
+        vertical-align: top;
+        padding: 9px 10px;
+        border-bottom: 1px solid var(--line);
+      }
+      th {
+        color: var(--slate);
+        font-weight: 600;
+      }
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 20px 0 32px;
+        color: var(--slate);
+        font-size: 0.95rem;
+      }
+      footer a {
+        margin-right: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="wrap"><a href="/">baucord</a></div>
+    </header>
+
+    <main class="wrap">
+      <h1>Terms of use</h1>
+      <p class="updated">Last updated 9 October 2026</p>
+
+      <p>
+        baucord is a free, open-source app for voice chat, text chat and
+        screen sharing, made by 0x0 Studios ("we" below). These terms
+        apply to the baucord apps and to the
+        <strong>official baucord server</strong> that we run. By using
+        the apps you agree to them.
+      </p>
+      <p>
+        Anyone can run their own baucord server. A server someone else
+        runs has its owner's rules too, on top of these; its owner
+        moderates it, and we do not control what happens there.
+      </p>
+
+      <section class="summary">
+        <h2>In short</h2>
+        <ul>
+          <li>You must be 18 or older.</li>
+          <li>
+            Nothing illegal, nothing sexual involving minors, no threats,
+            harassment, hate or spam.
+          </li>
+          <li>
+            You can report a message or a person, and block anyone. The
+            moderators of a server act on reports.
+          </li>
+          <li>
+            You can delete your account on a server at any time, from the
+            app.
+          </li>
+        </ul>
+      </section>
+
+      <h2>Who can use baucord</h2>
+      <p>
+        You must be at least 18 years old. Do not use baucord if you are
+        younger. If we learn that an account on the official server
+        belongs to a child, we delete it.
+      </p>
+
+      <h2>What is not allowed</h2>
+      <p>
+        On every server, in chat, direct messages, files, pictures,
+        names, avatars, voice and screen shares:
+      </p>
+      <ul>
+        <li>
+          <strong>Anything that sexualizes minors</strong>, including
+          child sexual abuse material in any form. We remove it, ban the
+          account and report it to the authorities.
+        </li>
+        <li>
+          Content or activity that is illegal where you or the server
+          are, or that helps others break the law.
+        </li>
+        <li>
+          Threats, harassment, bullying, stalking, or encouraging
+          someone to harm themselves.
+        </li>
+        <li>
+          Hate speech: attacking people for their race, ethnicity,
+          religion, nationality, gender, sexual orientation, disability
+          or similar.
+        </li>
+        <li>
+          Sharing someone's private information, or intimate images of
+          someone, without their consent.
+        </li>
+        <li>
+          Spam, scams, malware, and pretending to be someone you are
+          not.
+        </li>
+        <li>
+          Sharing content you do not have the right to share.
+        </li>
+        <li>
+          Getting around a ban or a block, or attacking a server, its
+          software or the people on it.
+        </li>
+      </ul>
+
+      <h2>Reporting and blocking</h2>
+      <p>
+        In the app, right-click a message or a person (on a phone, press
+        and hold a message, or tap the person) and choose
+        <strong>Report</strong>. The report reaches that server's
+        moderators with the message as it was; the person is not told who
+        reported them. Choose <strong>Block</strong> to stop seeing their
+        messages and hearing them; they can no longer send you direct
+        messages, and they are not told. Settings → Profile lists the
+        people you blocked.
+      </p>
+      <p>
+        On the official server we review reports and act on them —
+        removing content, muting, kicking or banning — and contact the
+        authorities when someone is in danger or the law requires it.
+        You can also write to
+        <a href="mailto:support@mpw.sh">support@mpw.sh</a>. On other
+        servers, their moderators decide.
+      </p>
+
+      <h2>Your content</h2>
+      <p>
+        What you post stays yours, and you are responsible for it. You
+        let the server you post to store it and pass it on to the people
+        you send it to, which is what the app is for. You can delete your
+        recent messages, and your whole account (below). The
+        <a href="privacy.html">privacy policy</a> says what a server
+        keeps and for how long.
+      </p>
+
+      <h2>Moderation and ending</h2>
+      <p>
+        The moderators of a server may remove content, mute people, or
+        remove them from the server, for breaking these terms or the
+        server's own rules. We may do the same on the official server and
+        may end any account there that breaks these terms. You can stop
+        using baucord at any time and
+        <a href="delete-account.html">delete your account</a> on a
+        server from the app.
+      </p>
+
+      <h2>The software</h2>
+      <p>
+        The apps and the server are open source under the
+        <a href="https://github.com/mpwsh/baucord/blob/main/LICENSE"
+          >Apache License 2.0</a
+        >. They and the official server are provided as they are,
+        without warranty of any kind; we are not liable for what people
+        post or do with them, or for losses from using them, as far as
+        the law allows.
+      </p>
+
+      <h2>Changes</h2>
+      <p>
+        When these terms change, this page shows the new text and the
+        date at the top changes. The app asks you to accept terms that
+        changed in substance before you connect again.
+      </p>
+
+      <h2>Contact</h2>
+      <p>
+        0x0 Studios, <a href="mailto:support@mpw.sh">support@mpw.sh</a>.
+      </p>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <a href="/">baucord</a>
+        <a href="terms.html">Terms</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="delete-account.html">Delete your account</a>
+        <a href="https://github.com/mpwsh/baucord">Source</a>
+      </div>
+    </footer>
+  </body>
+</html>

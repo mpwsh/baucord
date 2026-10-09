@@ -88,6 +88,15 @@ export global Tr {
     in property <string> admin-audit: "Audit";
     in property <string> admin-audit-lead: "Who did what, newest first.";
     in property <string> admin-audit-more: "Load older";
+    // Reports tab (1.2)
+    in property <string> admin-reports: "Reports";
+    in property <string> admin-reports-lead: "What people reported to the moderators, newest first.";
+    in property <string> admin-reports-show-resolved: "Show handled reports";
+    in property <string> admin-reports-none: "No open reports.";
+    in property <string> admin-reports-by: "Reported by";
+    in property <string> admin-reports-by-gone: "Reported by a deleted account";
+    in property <string> admin-reports-resolve: "Mark handled";
+    in property <string> admin-reports-delete-message: "Delete message";
     in property <string> admin-server: "Server";
     in property <string> admin-server-lead: "The server's counters.";
     in property <string> admin-stat-version: "Version";
@@ -131,6 +140,22 @@ export global Tr {
     in property <string> moderation-duration: "Duration";
     in property <string> moderation-reason: "Reason";
     in property <string> moderation-reason-placeholder: "Optional — shown to them and kept in the log";
+    // Terms of use, before the first connect (1.2)
+    in property <string> terms-title: "Before you connect";
+    in property <string> terms-lead: "By using baucord you agree to its terms of use. On every server:";
+    in property <string> terms-rules: "• You are 18 or older.\n• Nothing illegal, and nothing sexual involving minors.\n• No threats, harassment, hate or spam.\n• Report what breaks the rules, and block anyone you don't want to hear from: right-click a message or a person (on a phone, press and hold a message, or tap a person).\n\nEach server's owner may add rules of their own.";
+    in property <string> terms-read: "Read the terms";
+    in property <string> terms-agree: "I agree";
+    in property <string> privacy-read: "Privacy policy";
+    // Report dialog (1.2)
+    in property <string> report-hint: "The server's moderators see this report and the message as it is now. The person is not told who reported them.";
+    in property <string> report-reason: "Reason";
+    in property <string> report-reason-placeholder: "Pick a reason";
+    in property <string> report-note: "Anything to add";
+    in property <string> report-note-placeholder: "Optional";
+    in property <string> report-also-block: "Also block them";
+    in property <string> report-also-block-hint: "Stop seeing their messages and hearing them.";
+    in property <string> report-send: "Send report";
     in property <string> server-not-persistent-note: "This server does not save changes. Roles, bans and invites last until it restarts.";
 
     // Chat
@@ -232,6 +257,16 @@ export global Tr {
     in property <string> identity-import: "Import";
     in property <string> identity-regenerate: "Regenerate";
     in property <string> identity-regenerate-confirm: "Regenerate — new user, are you sure?";
+    // Blocked people and deleting the account (1.2, per server)
+    in property <string> blocked-header: "Blocked people";
+    in property <string> blocked-not-connected: "Connect to a server to see who you blocked there.";
+    in property <string> blocked-lead: "You don't see their messages or hear them, and they can't send you direct messages.";
+    in property <string> blocked-none: "Nobody";
+    in property <string> unblock: "Unblock";
+    in property <string> account-delete-header: "Delete your account";
+    in property <string> account-delete-note: "Removes your account on this server and everything you posted there: messages, files, direct messages. It can't be undone. Joining again needs a new invite.";
+    in property <string> account-delete: "Delete my account";
+    in property <string> account-delete-confirm: "Delete everything — are you sure?";
     in property <string> profile-lead: "How you appear to others.";
     in property <string> profile-no-name: "No nickname yet";
     in property <string> profile-nickname-hint: "Renames you for everyone while connected.";

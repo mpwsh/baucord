@@ -53,6 +53,11 @@ pub const ADMIN_FEED: u64 = 1 << 15;
 /// behaves this way for every session; the bit tells a client that
 /// it may hide the lobby row and render "joined <channel>".
 pub const LOBBY: u64 = 1 << 16;
+/// Blocking, reporting and deleting one's own account (1.2,
+/// [`crate::safety`]): `Block`/`Unblock`/`Report`/`DeleteAccount`,
+/// `Blocks`/`ReportAck`/`AccountDeleted`/`AccountDeleteRefused`, the
+/// Reports admin commands, and `DmFailReason::Unavailable`.
+pub const SAFETY: u64 = 1 << 17;
 
 /// What a 1.0 client can do.
 pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
@@ -76,7 +81,8 @@ pub const CLIENT_1_1: u64 = CLIENT_1_0
     | FILES
     | ADMIN_PANEL
     | ADMIN_FEED
-    | LOBBY;
+    | LOBBY
+    | SAFETY;
 /// What a 1.1 server offers: keys are the login, invites the door,
 /// roles decide what a session may do, and it keeps history.
 pub const SERVER_1_1: u64 = TELEMETRY
@@ -94,7 +100,8 @@ pub const SERVER_1_1: u64 = TELEMETRY
     | FILES
     | ADMIN_PANEL
     | ADMIN_FEED
-    | LOBBY;
+    | LOBBY
+    | SAFETY;
 
 /// Bits both sides announced.
 #[must_use]
@@ -133,6 +140,13 @@ mod tests {
             DM,
             CHANNELS_UI,
             ADMIN,
+            PROGRESS_ALL,
+            ROLE_LIST,
+            FILES,
+            ADMIN_PANEL,
+            ADMIN_FEED,
+            LOBBY,
+            SAFETY,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);

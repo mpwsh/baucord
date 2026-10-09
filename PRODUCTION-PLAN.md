@@ -349,9 +349,9 @@ What stands between this and "production for strangers":
   2026-10-08: `web/privacy.html` drafted from the code, as it behaves
   today (an inventory of every table, log and upload). It covers the
   apps and the official server; other servers' operators answer for
-  their own. Signed 0x0 Studios, contact support@mpw.sh. Left: the
-  terms page (MOB-15), the
-  account-deletion page (MOB-14), the Data safety form from §6, and
+  their own. Signed 0x0 Studios, contact support@mpw.sh. 2026-10-09:
+  blocks, reports and in-app deletion added, with `web/terms.html` and
+  `web/delete-account.html`. Left: the Data safety form from §6, and
   LEG-6, which would let the policy promise less retention.
 - [ ] **LEG-6 [P1][S] What the privacy policy has to admit today.**
   Found writing it (2026-10-08). Each fix shortens a paragraph of
@@ -365,8 +365,10 @@ What stands between this and "production for strangers":
   - The 90-day message prune (`store.rs` `prune`, `DELETE FROM
     messages`) does not lower the attachments' `refs`, so their files
     are kept for good. Release them in the same transaction.
-  - Purge leaves telemetry rows, read markers, DM conversation rows and
-    uploaded logs. The CLI purge also keeps the files.
+  - ~~Purge leaves telemetry rows, read markers, DM conversation rows and
+    uploaded logs. The CLI purge also keeps the files.~~ Fixed in 1.2
+    (MOB-14): the purge takes all of them, the CLI's too, except that
+    only the running server finds the uploaded logs (by name).
   - The in-app note (`privacy-note`) says "Nothing goes anywhere else".
     On the desktop the update check and pasted image links do; nor does
     it say that the server keeps messages. Point it at the policy.
@@ -480,12 +482,16 @@ is not decided yet.
 - [ ] **MOB-3 [P0][S] The iOS icon keeps its alpha channel**
   (`ios/scripts/render_icon.sh`, on purpose for development); App
   Store Connect rejects it. Flatten onto #1A1D21 for release builds.
-- [ ] **MOB-4 [P0][M–L] Report and block.** Both stores require them
-  for user-generated content (App Store 1.2; Play's UGC policy), and
-  Apple asks for account deletion where accounts are created — here a
-  device key registered by invite. Protocol (a report message, a
-  per-user block list), server (a moderator queue in the admin panel)
-  and UI.
+- [x] **MOB-4 [P0][M–L] Report and block.** Done 2026-10-09 (1.2,
+  bit `SAFETY`; PERSISTENCE-SPEC §12 S1). Block from a person's menu
+  or a message's ("Block sender"): their messages, pictures, files and
+  DMs are hidden, their voice never reaches the blocker, DMs are
+  refused both ways, they are not told; Settings → Profile lists and
+  unblocks. Report a message or a person with a reason and a note:
+  the moderators online see it at once in the admin channel, the
+  panel has a Reports tab (resolve, delete the message, ban), phones
+  have `/reports` and `/resolve`. Chat rows open their menu on a long
+  press on the phones.
 - [ ] **MOB-5 [P0][M] Store pipelines.** *Android done 2026-10-08
   (ANDROID-SPEC D62, §7):* `android-release.yml` builds the AAB beside
   the APK in one Gradle run, with one versionCode. A step after the
@@ -526,15 +532,15 @@ is not decided yet.
   both specs); QUIC migration covers small moves. Keep the audio unit
   running (silence) or a background task while reconnecting; a
   connectivity monitor that reconnects on a new network.
-- [ ] **MOB-11 [P1][S] The Android foreground service.** A refused
-  `startForeground` calls `stopSelf()` (`VoiceService.java`), which on
-  a first start is the system's "did not call startForeground" crash,
-  and on a reconnect stops the service keeping the app alive; a
-  `PARTIAL_WAKE_LOCK` is held all session; Play needs the FGS type
-  declarations (video) for every type. P0 for Play: `microphone` in a
-  room, `specialUse` (with its manifest explanation) in the lobby,
-  `mediaPlayback` dropped, the wake lock only in a room
-  (PLAY-STORE.md §5).
+- [x] **MOB-11 [P1][S] The Android foreground service.** Done
+  2026-10-09 (1.2; ANDROID-SPEC D63): `microphone` in a room,
+  `specialUse` in the lobby (the manifest property says why),
+  `mediaPlayback` gone; the wake lock only in a room. A refused
+  microphone type (a background start) falls back to the lobby's and
+  comes back when the app is shown; a refused promotion no longer stops
+  a running service, and a first start never stops itself. Left for
+  the user: the Play Console's foreground-service declaration (remove
+  media playback, add special use, a video; PLAY-STORE.md §5).
 - [x] **MOB-12 [P1][M] Stream audio on phones.** Done 2026-10-08 (§7;
   ANDROID-SPEC D56, IOS-SPEC D52): on the call path the stream plays
   through the voice output. To verify on a phone, on speakers: the
@@ -551,17 +557,21 @@ is not decided yet.
   keys and settings are plain files (Keystore/Keychain later); the iOS
   log sits in `Documents` (visible in Files, backed up) and holds
   invite codes (SEC-10).
-- [ ] **MOB-14 [P0][M] Delete my account.** Play (and Apple) require an
-  in-app way to delete an account the app created, plus a web page:
-  here a device key admitted by invite. Settings → "Delete my account
-  on this server": a new message under a new feature bit; the server
-  removes keys, roles, profile, avatar, DMs and files, and deletes or
-  anonymizes the user's messages (decide); the client forgets the
-  server. A kick today deletes only keys and roles.
-- [ ] **MOB-15 [P0][S] Terms before user content.** Play's UGC policy:
-  users accept terms that define and prohibit objectionable content
-  before they post. On the first connect to a server, "By continuing
-  you accept the rules" with a link; recorded per server.
+- [x] **MOB-14 [P0][M] Delete my account.** Done 2026-10-09 (1.2;
+  PERSISTENCE-SPEC §12 S1). Settings → Profile → Delete my account
+  (twice, like Regenerate): the account and everything it posted go at
+  once, messages included (decided: deleted, not anonymized), DM
+  conversations whole; the only admin is refused. The client keeps the
+  server entry and drops its channel passwords; the connect card says
+  what happened. The web page is `web/delete-account.html` — the Play
+  Console's account-deletion URL.
+- [x] **MOB-15 [P0][S] Terms before user content.** Done 2026-10-09
+  (1.2): `web/terms.html` (18+, what is forbidden everywhere, reporting
+  and blocking, moderation), and a dialog before the first connect with
+  the short version and links, accepted once per device
+  (`settings.terms_version`; raise `TERMS_VERSION` to ask again).
+  Decided: the terms are the app's, one set for every server; a
+  server's own rules go in its greeting.
 - [ ] **MOB-16 [P0][S] The Play listing.** Texts (title ≤ 30, short
   ≤ 80, full ≤ 4,000 characters) in en, es-AR, pt-BR; icon 512 × 512;
   feature graphic 1024 × 500; 4+ phone screenshots at 1080 × 1920

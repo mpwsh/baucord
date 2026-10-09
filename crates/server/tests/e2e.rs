@@ -110,6 +110,8 @@ struct TestClient {
     key: Arc<ClientKey>,
     inbox: Vec<ServerMessage>,
     events: Vec<Event>,
+    /// What `hello` announces; an older client is this minus a bit.
+    features: u64,
 }
 
 /// Enough for `unwrap_err` on an admission verdict.
@@ -182,6 +184,12 @@ impl World {
     /// One tick: move datagrams, run the server, collect what the
     /// clients received.
     fn pump(&mut self, clients: &mut [&mut TestClient]) {
+        // A store read out: let the real clock move too, or a loaded
+        // machine runs the read's deadline out in simulated time
+        // before the database thread is even scheduled.
+        if self.server().persistence().reads_in_flight() > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         self.net.step(TICK);
         let now = self.net.now();
         self.server().update(now);
@@ -247,6 +255,7 @@ impl World {
             key: Arc::new(ClientKey::generate()),
             inbox: Vec::new(),
             events: Vec::new(),
+            features: features::CLIENT_1_1,
         }
     }
 
@@ -405,7 +414,7 @@ impl TestClient {
                 username: name.to_string(),
                 auth,
                 client_key: Some(proof),
-                features: features::CLIENT_1_1,
+                features: self.features,
                 client_version: protocol::CLIENT_VERSION.to_string(),
             },
         );
@@ -1537,7 +1546,7 @@ fn a_text_restriction_refuses_chat_with_the_reason() {
         !admin
             .inbox
             .iter()
-            .any(|m| matches!(m, ServerMessage::Chat(c) if c.text == "hello?")),
+            .any(|m| matches!(m, ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == "hello?")),
         "a restricted user's chat must not be delivered"
     );
     // Pictures are chat too.
@@ -1780,7 +1789,11 @@ fn history_replays_on_join_and_pages_back_through_the_store() {
     for i in 0..12 {
         alice.send(&mut w, &ClientMessage::Chat(format!("line {i}")));
         alice.wait_for(&mut w, &mut [], |m| match m {
-            ServerMessage::Chat(c) if c.text == format!("line {i}") => Some(()),
+            ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. }
+                if c.text == format!("line {i}") =>
+            {
+                Some(())
+            }
             _ => None,
         });
     }
@@ -1881,7 +1894,9 @@ fn authors_edit_and_delete_their_own_recent_messages() {
     let mut bob = w.connect("bob");
     alice.send(&mut w, &ClientMessage::Chat("typo".to_string()));
     let id = alice.wait_for(&mut w, &mut [&mut bob, &mut admin], |m| match m {
-        ServerMessage::Chat(c) if c.text == "typo" => Some(c.id),
+        ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == "typo" => {
+            Some(c.id)
+        }
         _ => None,
     });
 
@@ -1958,14 +1973,14 @@ fn chat_is_rate_limited_per_session() {
     let delivered = bob
         .inbox
         .iter()
-        .filter(|m| matches!(m, ServerMessage::Chat(c) if c.text.starts_with("burst")))
+        .filter(|m| matches!(m, ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text.starts_with("burst")))
         .count();
     assert_eq!(delivered, 3, "three in the burst, the rest dropped");
     // Tokens come back with time.
     w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(3));
     alice.send(&mut w, &ClientMessage::Chat("later".to_string()));
     bob.wait_for(&mut w, &mut [&mut alice], |m| {
-        matches!(m, ServerMessage::Chat(c) if c.text == "later").then_some(())
+        matches!(m, ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == "later").then_some(())
     });
 }
 
@@ -2712,7 +2727,7 @@ fn a_purge_removes_the_person_and_their_messages() {
     let troll_user = troll.key.user_id();
     troll.send(&mut w, &ClientMessage::Chat("garbage".to_string()));
     admin.wait_for(&mut w, &mut [&mut troll], |m| {
-        matches!(m, ServerMessage::Chat(c) if c.text == "garbage").then_some(())
+        matches!(m, ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == "garbage").then_some(())
     });
 
     admin.admin(
@@ -3617,7 +3632,9 @@ fn hot_reload_rejects_invalid_lists_and_keeps_state() {
     a.join(&mut w, 1, None);
     a.send(&mut w, &ClientMessage::Chat("ping".to_string()));
     let (id, ts) = a.wait_for(&mut w, &mut [], |m| match m {
-        ServerMessage::Chat(c) if c.text == "ping" => Some((c.id, c.ts)),
+        ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == "ping" => {
+            Some((c.id, c.ts))
+        }
         _ => None,
     });
     assert!(id > 0, "chat messages carry a server id");
@@ -3914,7 +3931,7 @@ fn a_stalled_persistence_thread_never_touches_the_media_path() {
     for i in 0..20 {
         let wanted = format!("m{i}");
         b.wait_for(&mut w, &mut [&mut a], |m| {
-            matches!(m, ServerMessage::Chat(c) if c.text == wanted).then_some(())
+            matches!(m, ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == wanted).then_some(())
         });
     }
     let stats = w.server().persistence().stats();
@@ -3978,7 +3995,11 @@ fn message_ids_continue_across_restarts_with_persistence_on() {
         for i in 0..3 {
             a.send(&mut w, &ClientMessage::Chat(format!("first run {i}")));
             last = a.wait_for(&mut w, &mut [], |m| match m {
-                ServerMessage::Chat(c) if c.text == format!("first run {i}") => Some(c.id),
+                ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. }
+                    if c.text == format!("first run {i}") =>
+                {
+                    Some(c.id)
+                }
                 _ => None,
             });
         }
@@ -3996,7 +4017,11 @@ fn message_ids_continue_across_restarts_with_persistence_on() {
     let mut a = w.connect_with_key("alice", Auth::Key, key);
     a.send(&mut w, &ClientMessage::Chat("second run".to_string()));
     let id = a.wait_for(&mut w, &mut [], |m| match m {
-        ServerMessage::Chat(c) if c.text == "second run" => Some(c.id),
+        ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. }
+            if c.text == "second run" =>
+        {
+            Some(c.id)
+        }
         _ => None,
     });
     assert_eq!(id, last_id + 1, "ids continue after a restart");
@@ -4014,7 +4039,7 @@ fn persistence_off_writes_nothing_to_disk() {
     let mut a = w.connect("alice");
     a.send(&mut w, &ClientMessage::Chat("hello".to_string()));
     a.wait_for(&mut w, &mut [], |m| {
-        matches!(m, ServerMessage::Chat(c) if c.text == "hello").then_some(())
+        matches!(m, ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == "hello").then_some(())
     });
     let stats = w.server().persistence().stats();
     assert!(!stats.persistent);
@@ -4700,4 +4725,772 @@ fn a_stalled_store_fails_a_dm_within_the_deadline() {
     drop(stalled);
     drop(w);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Block, report, delete my account (1.2, protocol::safety) ────────────
+
+/// The block list the server last sent this client.
+fn last_blocks(client: &TestClient) -> Option<Vec<UserId>> {
+    client.inbox.iter().rev().find_map(|m| match m {
+        ServerMessage::Blocks { users } => Some(users.iter().map(|u| u.user_id).collect()),
+        _ => None,
+    })
+}
+
+/// Send `Block`/`Unblock` and wait for the list that answers it.
+fn set_block(
+    client: &mut TestClient,
+    w: &mut World,
+    others: &mut [&mut TestClient],
+    user: UserId,
+    block: bool,
+) -> Vec<protocol::BlockedUser> {
+    client
+        .inbox
+        .retain(|m| !matches!(m, ServerMessage::Blocks { .. }));
+    client.send(
+        w,
+        &if block {
+            ClientMessage::Block { user }
+        } else {
+            ClientMessage::Unblock { user }
+        },
+    );
+    client.wait_for(w, others, |m| match m {
+        ServerMessage::Blocks { users } => Some(users.clone()),
+        _ => None,
+    })
+}
+
+/// Send `Report` and wait for its answer.
+fn report(
+    client: &mut TestClient,
+    w: &mut World,
+    others: &mut [&mut TestClient],
+    target: protocol::ReportTarget,
+    reason: protocol::ReportReason,
+) -> Result<(), protocol::ReportRefusal> {
+    client
+        .inbox
+        .retain(|m| !matches!(m, ServerMessage::ReportAck { .. }));
+    client.send(
+        w,
+        &ClientMessage::Report {
+            target,
+            reason,
+            note: "seen it twice".to_string(),
+        },
+    );
+    client.wait_for(w, others, |m| match m {
+        ServerMessage::ReportAck { result } => Some(*result),
+        _ => None,
+    })
+}
+
+/// `stored_rows`, once the persistence thread (real time, not the
+/// simulated clock) has caught up to `want`; the count either way.
+fn rows_become(dir: &std::path::Path, table: &str, filter: &str, user: &UserId, want: i64) -> i64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = stored_rows(dir, table, filter, user);
+        if n == want || Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Count rows in `table` of the database at `dir` matching `filter`.
+fn stored_rows(dir: &std::path::Path, table: &str, filter: &str, user: &UserId) -> i64 {
+    let conn = rusqlite::Connection::open(dir.join("baucord.db")).expect("open db");
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE {filter}"),
+        rusqlite::params![user.as_slice()],
+        |r| r.get(0),
+    )
+    .expect("count")
+}
+
+#[test]
+fn a_block_is_sent_on_join_refuses_dms_both_ways_and_is_undone() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let bob_user = bob.key.user_id();
+    let alice_user = alice.key.user_id();
+    // On join: an empty list, before anything else needs it.
+    assert_eq!(last_blocks(&alice), Some(Vec::new()));
+
+    let list = set_block(&mut alice, &mut w, &mut [&mut bob], bob_user, true);
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].user_id, bob_user);
+    assert_eq!(list[0].name, "bob");
+    // Bob is not told.
+    assert!(!bob
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::Blocks { users } if !users.is_empty())));
+
+    // Neither can write to the other, said the same neutral way.
+    dm(&mut bob, &mut w, alice_user, "hey", 1);
+    assert_eq!(
+        dm_verdict(&mut bob, &mut w, &mut [&mut alice], 1),
+        Err(DmFailReason::Unavailable)
+    );
+    dm(&mut alice, &mut w, bob_user, "go away", 2);
+    assert_eq!(
+        dm_verdict(&mut alice, &mut w, &mut [&mut bob], 2),
+        Err(DmFailReason::Unavailable)
+    );
+    assert!(!alice
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::Direct { .. })));
+
+    // Blocking yourself or nobody changes nothing.
+    assert_eq!(
+        set_block(&mut alice, &mut w, &mut [&mut bob], alice_user, true).len(),
+        1
+    );
+    assert_eq!(
+        set_block(&mut alice, &mut w, &mut [&mut bob], [9u8; 32], true).len(),
+        1
+    );
+
+    assert!(set_block(&mut alice, &mut w, &mut [&mut bob], bob_user, false).is_empty());
+    dm(&mut bob, &mut w, alice_user, "sorry", 3);
+    assert!(dm_verdict(&mut bob, &mut w, &mut [&mut alice], 3).is_ok());
+}
+
+#[test]
+fn a_blocked_persons_posts_and_edits_never_reach_the_blocker() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let mut carol = w.connect_member("carol");
+    let bob_user = bob.key.user_id();
+    set_block(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob, &mut carol],
+        bob_user,
+        true,
+    );
+
+    bob.send(&mut w, &ClientMessage::Chat("hey alice".to_string()));
+    // Carol gets it with Bob's account; Alice gets nothing.
+    let (id, from) = carol.wait_for(&mut w, &mut [&mut alice, &mut bob], |m| match m {
+        ServerMessage::ChatFrom { from, msg } if msg.text == "hey alice" => Some((msg.id, *from)),
+        _ => None,
+    });
+    assert_eq!(from, bob_user);
+    bob.send(
+        &mut w,
+        &ClientMessage::EditMessage {
+            msg_id: id,
+            text: "hey everyone".to_string(),
+        },
+    );
+    carol.wait_for(&mut w, &mut [&mut alice, &mut bob], |m| match m {
+        ServerMessage::MessageEdited { msg_id, .. } if *msg_id == id => Some(()),
+        _ => None,
+    });
+    w.settle(
+        &mut [&mut alice, &mut bob, &mut carol],
+        Duration::from_millis(200),
+    );
+    assert!(
+        !alice.inbox.iter().any(|m| matches!(m,
+            ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.id == id)
+            || matches!(m, ServerMessage::MessageEdited { msg_id, .. } if *msg_id == id)),
+        "the blocker saw the post or its edit"
+    );
+    // Unblocked: the next one arrives.
+    set_block(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob, &mut carol],
+        bob_user,
+        false,
+    );
+    bob.send(&mut w, &ClientMessage::Chat("again".to_string()));
+    alice.wait_for(&mut w, &mut [&mut bob, &mut carol], |m| match m {
+        ServerMessage::ChatFrom { msg, .. } if msg.text == "again" => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn an_older_client_hears_no_permission_instead_of_unavailable() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect_member("alice");
+    let alice_user = alice.key.user_id();
+    // Bob runs a 1.1 client: no `SAFETY`, so no `Unavailable` either.
+    let mut bob = w.open();
+    bob.features = features::CLIENT_1_1 & !features::SAFETY;
+    let code = w.member_code.clone();
+    bob.hello(&mut w, "bob", Auth::Invite { code });
+    bob.wait_for(&mut w, &mut [&mut alice], |m| {
+        matches!(m, ServerMessage::Init { .. }).then_some(())
+    });
+    assert_eq!(last_blocks(&bob), None, "never sent without the bit");
+    let bob_user = bob.key.user_id();
+    set_block(&mut alice, &mut w, &mut [&mut bob], bob_user, true);
+    dm(&mut bob, &mut w, alice_user, "hey", 1);
+    assert_eq!(
+        dm_verdict(&mut bob, &mut w, &mut [&mut alice], 1),
+        Err(DmFailReason::NoPermission)
+    );
+}
+
+#[test]
+fn a_block_keeps_the_blocked_voice_from_the_blocker_only() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let mut carol = w.connect_member("carol");
+    let bob_user = bob.key.user_id();
+
+    // `from` speaks 10 packets; how many reach `to`.
+    let voice = |w: &mut World,
+                 from: &mut TestClient,
+                 to: &mut TestClient,
+                 third: &mut TestClient,
+                 seq0: u32| {
+        for seq in seq0..seq0 + 10 {
+            let pkt = protocol::pack_voice(seq, seq * 20, &[0xAB; 60]).expect("voice");
+            let now = w.net.now();
+            w.net
+                .driver(from.node)
+                .send(now, from.peer, Lane::Voice, &pkt)
+                .expect("send voice");
+            w.settle(&mut [from, to, third], Duration::from_millis(20));
+        }
+        w.settle(&mut [from, to, third], Duration::from_millis(500));
+        let mut got = 0;
+        while w.net.driver(to.node).recv(to.peer, Lane::Voice).is_some() {
+            got += 1;
+        }
+        while w
+            .net
+            .driver(third.node)
+            .recv(third.peer, Lane::Voice)
+            .is_some()
+        {}
+        got
+    };
+    assert_eq!(voice(&mut w, &mut bob, &mut alice, &mut carol, 0), 10);
+
+    set_block(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob, &mut carol],
+        bob_user,
+        true,
+    );
+    assert_eq!(voice(&mut w, &mut bob, &mut alice, &mut carol, 100), 0);
+    // Carol still hears Bob; Bob still hears Alice.
+    assert_eq!(voice(&mut w, &mut bob, &mut carol, &mut alice, 200), 10);
+    assert_eq!(voice(&mut w, &mut alice, &mut bob, &mut carol, 300), 10);
+
+    set_block(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob, &mut carol],
+        bob_user,
+        false,
+    );
+    assert_eq!(voice(&mut w, &mut bob, &mut alice, &mut carol, 400), 10);
+}
+
+#[test]
+fn blocks_are_stored_and_come_back_after_a_restart() {
+    let dir = temp_dir("blocks");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let alice_user = alice.key.user_id();
+    let bob_user = bob.key.user_id();
+    set_block(&mut alice, &mut w, &mut [&mut bob], bob_user, true);
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(500));
+    assert_eq!(
+        rows_become(&dir, "blocks", "blocker = ?1", &alice_user, 1),
+        1
+    );
+    // A restart reads it back with the policy.
+    drop(alice);
+    drop(bob);
+    drop(w);
+    let mut again = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    assert!(again
+        .server()
+        .policy()
+        .blocks
+        .get(&alice_user)
+        .is_some_and(|s| s.contains(&bob_user)));
+}
+
+#[test]
+fn a_report_reaches_the_moderators_and_waits_in_the_reports_tab() {
+    use protocol::{ReportReason, ReportRefusal, ReportTarget};
+    let dir = temp_dir("reports");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let alice_user = alice.key.user_id();
+    let bob_user = bob.key.user_id();
+
+    bob.send(
+        &mut w,
+        &ClientMessage::Chat("you are all idiots".to_string()),
+    );
+    let msg_id = alice.wait_for(&mut w, &mut [&mut admin, &mut bob], |m| match m {
+        ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. }
+            if c.text == "you are all idiots" =>
+        {
+            Some(c.id)
+        }
+        _ => None,
+    });
+    alice.send(&mut w, &ClientMessage::Chat("mine".to_string()));
+    let own_id = alice.wait_for(&mut w, &mut [&mut admin, &mut bob], |m| match m {
+        ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == "mine" => {
+            Some(c.id)
+        }
+        _ => None,
+    });
+
+    assert_eq!(
+        report(
+            &mut alice,
+            &mut w,
+            &mut [&mut admin, &mut bob],
+            ReportTarget::Message {
+                conv: ConvRef::General,
+                msg_id,
+            },
+            ReportReason::Harassment,
+        ),
+        Ok(())
+    );
+    // The moderator online sees it at once, with the text.
+    let line = admin.wait_for(&mut w, &mut [&mut alice, &mut bob], |m| match m {
+        ServerMessage::AuditLine { entry } if entry.action == "report.message" => {
+            Some(entry.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(line.actor.as_deref(), Some("alice"));
+    assert_eq!(line.target.as_deref(), Some("bob"));
+    let detail = line.detail.unwrap_or_default();
+    assert!(
+        detail.contains("harassment") && detail.contains("idiots"),
+        "{detail}"
+    );
+    // Bob is not told.
+    assert!(!bob
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::AuditLine { .. })));
+
+    // Not one's own message, not oneself, not a message that is not there.
+    let own = ReportTarget::Message {
+        conv: ConvRef::General,
+        msg_id: own_id,
+    };
+    assert_eq!(
+        report(
+            &mut alice,
+            &mut w,
+            &mut [&mut admin, &mut bob],
+            own,
+            ReportReason::Spam
+        ),
+        Err(ReportRefusal::Yourself)
+    );
+    assert_eq!(
+        report(
+            &mut alice,
+            &mut w,
+            &mut [&mut admin, &mut bob],
+            ReportTarget::User { user: alice_user },
+            ReportReason::Spam
+        ),
+        Err(ReportRefusal::Yourself)
+    );
+    assert_eq!(
+        report(
+            &mut alice,
+            &mut w,
+            &mut [&mut admin, &mut bob],
+            ReportTarget::Message {
+                conv: ConvRef::General,
+                msg_id: 999_999,
+            },
+            ReportReason::Spam
+        ),
+        Err(ReportRefusal::NoSuchMessage)
+    );
+    assert_eq!(
+        report(
+            &mut alice,
+            &mut w,
+            &mut [&mut admin, &mut bob],
+            ReportTarget::User { user: bob_user },
+            ReportReason::Other
+        ),
+        Ok(())
+    );
+
+    // The Reports tab: both, newest first; members cannot read it.
+    w.settle(
+        &mut [&mut admin, &mut alice, &mut bob],
+        Duration::from_millis(500),
+    );
+    bob.admin(&mut w, 1, AdminCommand::ListReports { resolved: false });
+    assert_eq!(
+        bob.admin_result(&mut w, &mut [&mut admin, &mut alice], 1),
+        Err(AdminError::NoPermission)
+    );
+    admin.admin(&mut w, 2, AdminCommand::ListReports { resolved: false });
+    let Ok(AdminOutcome::Reports(list)) =
+        admin.admin_result(&mut w, &mut [&mut alice, &mut bob], 2)
+    else {
+        panic!("no reports");
+    };
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].msg_id, None);
+    assert_eq!(list[1].msg_id, Some(msg_id));
+    assert_eq!(list[1].excerpt, "you are all idiots");
+    assert_eq!(list[1].reporter.as_deref(), Some("alice"));
+    assert_eq!(list[1].target_user, Some(bob_user));
+    assert_eq!(list[1].note, "seen it twice");
+    assert!(!list[1].in_dm);
+
+    // Handled: out of the open list, still in the full one.
+    admin.admin(&mut w, 3, AdminCommand::ResolveReport { id: list[1].id });
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice, &mut bob], 3),
+        Ok(AdminOutcome::Done)
+    );
+    w.settle(
+        &mut [&mut admin, &mut alice, &mut bob],
+        Duration::from_millis(500),
+    );
+    admin.admin(&mut w, 4, AdminCommand::ListReports { resolved: false });
+    let Ok(AdminOutcome::Reports(open)) =
+        admin.admin_result(&mut w, &mut [&mut alice, &mut bob], 4)
+    else {
+        panic!("no reports");
+    };
+    assert_eq!(open.len(), 1);
+    admin.admin(&mut w, 5, AdminCommand::ListReports { resolved: true });
+    let Ok(AdminOutcome::Reports(all)) = admin.admin_result(&mut w, &mut [&mut alice, &mut bob], 5)
+    else {
+        panic!("no reports");
+    };
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().any(|r| r.resolved && r.msg_id == Some(msg_id)));
+}
+
+#[test]
+fn a_dm_can_only_be_reported_by_someone_in_it() {
+    use protocol::{ReportReason, ReportRefusal, ReportTarget};
+    let dir = temp_dir("report-dm");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let mut carol = w.connect_member("carol");
+    let alice_user = alice.key.user_id();
+    let bob_user = bob.key.user_id();
+
+    dm(&mut alice, &mut w, bob_user, "send me your password", 1);
+    let msg_id = dm_verdict(&mut alice, &mut w, &mut [&mut bob, &mut carol], 1).expect("stored");
+
+    // Carol guesses the id: not her conversation.
+    assert_eq!(
+        report(
+            &mut carol,
+            &mut w,
+            &mut [&mut alice, &mut bob],
+            ReportTarget::Message {
+                conv: ConvRef::Dm(alice_user),
+                msg_id,
+            },
+            ReportReason::Spam
+        ),
+        Err(ReportRefusal::NoSuchMessage)
+    );
+    // Bob is in it.
+    assert_eq!(
+        report(
+            &mut bob,
+            &mut w,
+            &mut [&mut alice, &mut carol],
+            ReportTarget::Message {
+                conv: ConvRef::Dm(alice_user),
+                msg_id,
+            },
+            ReportReason::Illegal
+        ),
+        Ok(())
+    );
+    w.settle(
+        &mut [&mut alice, &mut bob, &mut carol],
+        Duration::from_millis(500),
+    );
+    assert_eq!(
+        rows_become(&dir, "reports", "reporter = ?1", &bob_user, 1),
+        1
+    );
+    let conn = rusqlite::Connection::open(dir.join("baucord.db")).expect("open db");
+    let (excerpt, in_dm): (String, i64) = conn
+        .query_row("SELECT excerpt, in_dm FROM reports", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("one report");
+    assert_eq!(excerpt, "send me your password");
+    assert_eq!(in_dm, 1);
+}
+
+#[test]
+fn deleting_your_account_removes_it_and_everything_it_posted() {
+    use protocol::{ReportReason, ReportTarget};
+    let dir = temp_dir("delete-account");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let alice_user = alice.key.user_id();
+    let bob_user = bob.key.user_id();
+
+    alice.send(&mut w, &ClientMessage::Chat("bye all".to_string()));
+    let general_id = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::Chat(c) | ServerMessage::ChatFrom { msg: c, .. } if c.text == "bye all" => {
+            Some(c.id)
+        }
+        _ => None,
+    });
+    dm(&mut alice, &mut w, bob_user, "between us", 1);
+    dm_verdict(&mut alice, &mut w, &mut [&mut bob], 1).expect("stored");
+    dm(&mut bob, &mut w, alice_user, "sure", 2);
+    dm_verdict(&mut bob, &mut w, &mut [&mut alice], 2).expect("stored");
+    set_block(&mut alice, &mut w, &mut [&mut bob], bob_user, true);
+    report(
+        &mut bob,
+        &mut w,
+        &mut [&mut alice],
+        ReportTarget::User { user: alice_user },
+        ReportReason::Spam,
+    )
+    .expect("filed");
+    report(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob],
+        ReportTarget::User { user: bob_user },
+        ReportReason::Spam,
+    )
+    .expect("filed");
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(500));
+    assert_eq!(
+        rows_become(&dir, "reports", "1 = 1 OR ?1 IS NULL", &alice_user, 2),
+        2
+    );
+    assert!(stored_rows(&dir, "messages", "user_id = ?1", &alice_user) >= 2);
+
+    alice.send(&mut w, &ClientMessage::DeleteAccount);
+    alice.wait_for(&mut w, &mut [&mut bob], |m| {
+        matches!(m, ServerMessage::AccountDeleted).then_some(())
+    });
+    // Her message leaves Bob's screen now.
+    bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::MessageDeleted { msg_id } if *msg_id == general_id => Some(()),
+        _ => None,
+    });
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(1));
+    assert!(!w.server().policy().users.contains_key(&alice_user));
+    assert!(w.server().policy().blocks.is_empty());
+
+    // On disk: nothing of hers, the DM conversation whole, her blocks,
+    // the report about her; Bob's report by her stays, without her.
+    assert_eq!(
+        rows_become(&dir, "users", "user_id = ?1", &alice_user, 0),
+        0
+    );
+    assert_eq!(
+        stored_rows(&dir, "messages", "user_id = ?1", &alice_user),
+        0
+    );
+    assert_eq!(stored_rows(&dir, "messages", "user_id = ?1", &bob_user), 0);
+    assert_eq!(
+        stored_rows(
+            &dir,
+            "conversations",
+            "kind = 1 AND (user_a = ?1 OR user_b = ?1)",
+            &alice_user
+        ),
+        0
+    );
+    assert_eq!(
+        stored_rows(&dir, "blocks", "blocker = ?1 OR blocked = ?1", &alice_user),
+        0
+    );
+    assert_eq!(
+        stored_rows(&dir, "reports", "target_user = ?1", &alice_user),
+        0
+    );
+    assert_eq!(
+        stored_rows(&dir, "reports", "reporter = ?1", &alice_user),
+        0
+    );
+    assert_eq!(
+        stored_rows(&dir, "reports", "target_user = ?1", &bob_user),
+        1
+    );
+    // The record keeps what happened, not who she was.
+    assert_eq!(
+        stored_rows(&dir, "audit", "actor_user_id = ?1", &alice_user),
+        0
+    );
+    assert!(
+        stored_rows(
+            &dir,
+            "audit",
+            "action = 'user.delete' AND ?1 IS NOT NULL",
+            &alice_user
+        ) >= 1
+    );
+
+    // The same device comes back as nobody: it needs a new invite.
+    let again = w.try_connect_with_key("alice", Auth::Key, alice.key.clone());
+    assert!(
+        matches!(again, Err(RefusedReason::NeedInvite { .. })),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn a_deleted_account_takes_the_files_of_its_conversations_with_it() {
+    let dir = temp_dir("delete-account-files");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let alice_user = alice.key.user_id();
+    // Bob posts one file to Alice and another to everyone.
+    let (_, in_dm) = post_file(
+        &mut bob,
+        &mut w,
+        &mut [&mut alice],
+        1,
+        "for-alice.txt",
+        "text/plain",
+        &b"only for alice ".repeat(30),
+        ConvRef::Dm(alice_user),
+    )
+    .expect("posted to the DM");
+    let (_, in_general) = post_file(
+        &mut bob,
+        &mut w,
+        &mut [&mut alice],
+        2,
+        "for-all.txt",
+        "text/plain",
+        &b"for everyone ".repeat(30),
+        ConvRef::General,
+    )
+    .expect("posted to General");
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(500));
+    assert_eq!(rows_become(&dir, "blobs", "blob_id = ?1", &in_dm, 1), 1);
+
+    alice.send(&mut w, &ClientMessage::DeleteAccount);
+    alice.wait_for(&mut w, &mut [&mut bob], |m| {
+        matches!(m, ServerMessage::AccountDeleted).then_some(())
+    });
+    // The conversation went whole, so its file has nothing pointing at
+    // it any more: gone from the server and the disk. Bob's post in
+    // General stays.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().policy().blobs.contains_key(&in_dm) {
+        assert!(Instant::now() < deadline, "the DM's file stayed");
+        w.settle(&mut [&mut bob], Duration::from_millis(100));
+    }
+    assert_eq!(rows_become(&dir, "blobs", "blob_id = ?1", &in_dm, 0), 0);
+    assert!(w.server().policy().blobs.contains_key(&in_general));
+    assert_eq!(stored_rows(&dir, "blobs", "blob_id = ?1", &in_general), 1);
+}
+
+#[test]
+fn a_picture_someone_else_also_uses_outlives_its_uploaders_account() {
+    let dir = temp_dir("delete-account-shared");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let bob_user = bob.key.user_id();
+    let picture = png_blob(7, 6 * 1024);
+    // Alice uploads it first; Bob's identical upload is the same file.
+    let use_as_avatar = |who: &mut TestClient, other: &mut TestClient, w: &mut World| {
+        let blob = who.upload_blob(w, 1, "image/png", &picture);
+        if !who
+            .inbox
+            .iter()
+            .any(|m| matches!(m, ServerMessage::UploadAccept { needed: false, .. }))
+        {
+            who.wait_for(w, &mut [&mut *other], |m| match m {
+                ServerMessage::UploadDone { upload_id: 1, .. } => Some(()),
+                ServerMessage::UploadRejected { reason, .. } => panic!("rejected: {reason:?}"),
+                _ => None,
+            });
+        }
+        set_profile(who, w, None, Some(blob));
+        profile_verdict(who, w, &mut [&mut *other]).expect("avatar set");
+    };
+    use_as_avatar(&mut alice, &mut bob, &mut w);
+    use_as_avatar(&mut bob, &mut alice, &mut w);
+    let blob: [u8; 32] = sha2::Sha256::digest(&picture).into();
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(500));
+
+    alice.send(&mut w, &ClientMessage::DeleteAccount);
+    alice.wait_for(&mut w, &mut [&mut bob], |m| {
+        matches!(m, ServerMessage::AccountDeleted).then_some(())
+    });
+    w.settle(&mut [&mut bob], Duration::from_secs(1));
+    // Bob's avatar is still there, now nobody's upload.
+    let meta = w.server().policy().blobs.get(&blob).cloned().expect("kept");
+    assert_eq!(meta.created_by, None);
+    assert!(meta.refs >= 1);
+    assert_eq!(
+        rows_become(
+            &dir,
+            "blobs",
+            "blob_id = ?1 AND created_by IS NULL",
+            &blob,
+            1
+        ),
+        1
+    );
+    assert_eq!(
+        w.server()
+            .policy()
+            .users
+            .get(&bob_user)
+            .and_then(|u| u.profile.avatar),
+        Some(blob)
+    );
+}
+
+#[test]
+fn the_last_admin_cannot_delete_their_account() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    admin.send(&mut w, &ClientMessage::DeleteAccount);
+    let reason = admin.wait_for(&mut w, &mut [], |m| match m {
+        ServerMessage::AccountDeleteRefused { reason } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, protocol::DeleteRefusal::LastAdmin);
+    let admin_user = admin.key.user_id();
+    assert!(w.server().policy().users.contains_key(&admin_user));
 }

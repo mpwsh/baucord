@@ -74,10 +74,16 @@ mod events;
 mod menus;
 mod presence;
 mod profiles;
+mod safety;
 mod session;
 mod stats;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The terms of use this build asks people to accept before they first
+/// connect (`web/terms.html`). Raise it when the terms change in
+/// substance: everyone is asked again.
+pub(crate) const TERMS_VERSION: u32 = 1;
 
 /// Slint's Android backend has one window per process (every `Window`
 /// component is handed the same window adapter), so the auxiliary
@@ -391,6 +397,9 @@ pub struct AppState {
     /// the microphone). A phone keeps no microphone open otherwise
     /// (`sync_voice_room`).
     voice_in_room: bool,
+    /// What the host was last told keeps the session alive: `Some(in
+    /// a room)` while connected (`sync_keep_alive`, D63).
+    kept_alive: Option<bool>,
     /// The room to go back to after an automatic reconnect: set when
     /// the connection drops, spent by the next `Init`, cleared by a
     /// deliberate connect or disconnect.
@@ -405,6 +414,32 @@ pub struct AppState {
     pub(crate) admin_blob_cap: u64,
     /// The panel's action awaiting its confirmation.
     pub(crate) admin_pending: Option<crate::adminui::PanelAction>,
+    /// The Reports tab's list as last fetched, for its row actions.
+    pub(crate) admin_reports: Vec<client::protocol::ReportSummary>,
+
+    // ── 1.2: blocks, reports, deleting the account (`features::SAFETY`)
+    /// The server takes them (`Connected.safety`): the menus and the
+    /// Settings sections offer them only then.
+    pub(crate) safety: bool,
+    /// Whom this account blocked on this server, by user id, with
+    /// their names: nothing of theirs is shown, their voice never
+    /// arrives (the server's side), DMs are refused both ways.
+    pub(crate) blocked: HashMap<client::UserId, String>,
+    /// The list arrived once this session: later ones are changes.
+    blocks_known: bool,
+    /// Messages kept out of the chat because a blocked person wrote
+    /// them: an edit or a deletion of one says nothing.
+    hidden_messages: HashSet<u64>,
+    /// The report dialog's subject while it is open.
+    report: Option<safety::PendingReport>,
+    /// The server entry this session connected with (its name): what
+    /// an account deletion clears, whatever the default is by then.
+    session_server: Option<String>,
+    /// The server deleted our account: the removal that follows is
+    /// that, not a kick.
+    account_deleted: bool,
+    /// A connect waiting on the terms dialog, with its nickname.
+    terms_pending: Option<String>,
     viewers: HashMap<u64, Viewer>,
     /// Image-viewer overlay: the chat row shown, and GIF playback
     /// state while that row is an animated GIF.
@@ -681,12 +716,22 @@ pub fn run() {
         lobby_name: None,
         last_join_notice: None,
         voice_in_room: true,
+        kept_alive: None,
         rejoin_channel: None,
         settings_win: None,
         admin_win: None,
         admin_audit_oldest: None,
         admin_blob_cap: 0,
         admin_pending: None,
+        admin_reports: Vec::new(),
+        safety: false,
+        blocked: HashMap::new(),
+        blocks_known: false,
+        hidden_messages: HashSet::new(),
+        report: None,
+        session_server: None,
+        account_deleted: false,
+        terms_pending: None,
         viewers: HashMap::new(),
         gallery_row: None,
         gallery_gif: None,
@@ -1085,6 +1130,14 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_moderation_confirm(move || with_app(&w, AppState::confirm_moderation));
     let w = Rc::downgrade(state);
     logic.on_moderation_cancel(move || with_app(&w, AppState::cancel_moderation));
+    let w = Rc::downgrade(state);
+    logic.on_report_send(move || with_app(&w, AppState::report_send));
+    let w = Rc::downgrade(state);
+    logic.on_report_cancel(move || with_app(&w, AppState::report_cancel));
+    let w = Rc::downgrade(state);
+    logic.on_terms_accept(move || with_app(&w, AppState::terms_accept));
+    let w = Rc::downgrade(state);
+    logic.on_terms_decline(move || with_app(&w, AppState::terms_decline));
 
     // ── Chat ────────────────────────────────────────────────────
     let w = Rc::downgrade(state);
@@ -1940,6 +1993,7 @@ fn dm_failed_key(reason: client::DmFailReason) -> &'static str {
         R::NoSuchUser => "dm-failed-no-such-user",
         R::Store => "dm-failed-store",
         R::NoSuchBlob => "dm-failed-no-such-blob",
+        R::Unavailable => "dm-failed-unavailable",
     }
 }
 
@@ -2017,6 +2071,11 @@ fn audit_line_text(e: &client::protocol::AuditEntry) -> String {
     line
 }
 
+/// A report reason in words (the panel's Reports tab, `/reports`).
+pub(crate) fn report_reason_text(reason: client::protocol::ReportReason) -> String {
+    safety::reason_text(reason)
+}
+
 /// Where a rank stands, in words (the panel's Roles tab).
 pub(crate) fn describe_standing(rank: u16) -> String {
     use client::permissions as p;
@@ -2087,6 +2146,11 @@ fn menu_label(label: &menu::Label) -> slint::SharedString {
         L::SaveFile => "menu-save-file",
         L::Cut => "menu-cut",
         L::Paste => "menu-paste",
+        L::Block => "menu-block",
+        L::Unblock => "menu-unblock",
+        L::Report => "menu-report",
+        L::ReportMessage => "menu-report-message",
+        L::BlockAuthor => "menu-block-author",
     };
     t!(key).into()
 }
@@ -2515,6 +2579,38 @@ pub fn fill_tr(tr: &Tr) {
     tr.set_update_continue(t!("update-continue").into());
     tr.set_update_install_restart(t!("update-install-restart").into());
     tr.set_splash_checking(t!("splash-checking").into());
+    // 1.2: reports, blocks, deleting the account
+    tr.set_report_hint(t!("report-hint").into());
+    tr.set_report_reason(t!("report-reason").into());
+    tr.set_report_reason_placeholder(t!("report-reason-placeholder").into());
+    tr.set_report_note(t!("report-note").into());
+    tr.set_report_note_placeholder(t!("report-note-placeholder").into());
+    tr.set_report_also_block(t!("report-also-block").into());
+    tr.set_report_also_block_hint(t!("report-also-block-hint").into());
+    tr.set_report_send(t!("report-send").into());
+    tr.set_terms_title(t!("terms-title").into());
+    tr.set_terms_lead(t!("terms-lead").into());
+    tr.set_terms_rules(t!("terms-rules").into());
+    tr.set_terms_read(t!("terms-read").into());
+    tr.set_terms_agree(t!("terms-agree").into());
+    tr.set_privacy_read(t!("privacy-read").into());
+    tr.set_blocked_header(t!("blocked-header").into());
+    tr.set_blocked_not_connected(t!("blocked-not-connected").into());
+    tr.set_blocked_lead(t!("blocked-lead").into());
+    tr.set_blocked_none(t!("blocked-none").into());
+    tr.set_unblock(t!("unblock").into());
+    tr.set_account_delete_header(t!("account-delete-header").into());
+    tr.set_account_delete_note(t!("account-delete-note").into());
+    tr.set_account_delete(t!("account-delete").into());
+    tr.set_account_delete_confirm(t!("account-delete-confirm").into());
+    tr.set_admin_reports(t!("admin-reports").into());
+    tr.set_admin_reports_lead(t!("admin-reports-lead").into());
+    tr.set_admin_reports_show_resolved(t!("admin-reports-show-resolved").into());
+    tr.set_admin_reports_none(t!("admin-reports-none").into());
+    tr.set_admin_reports_by(t!("admin-reports-by").into());
+    tr.set_admin_reports_by_gone(t!("admin-reports-by-gone").into());
+    tr.set_admin_reports_resolve(t!("admin-reports-resolve").into());
+    tr.set_admin_reports_delete_message(t!("admin-reports-delete-message").into());
 }
 
 #[cfg(feature = "tray")]

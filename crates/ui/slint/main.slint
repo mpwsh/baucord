@@ -1241,4 +1241,165 @@ export component MainWindow inherits Window {
         }
     }
 
+    // ── Terms of use (1.2): asked once, before the first connect ───
+    // The short version in the app, the whole text on the site. Cancel
+    // stays on the connect screen; Escape and Back are Cancel.
+    if State.terms-open : Rectangle {
+        background: #000000AA;
+        TouchArea { }
+        terms-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.terms-decline(); return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: Math.min(420px, root.width - 48px);
+                height: tm.preferred-height;
+                TouchArea { }
+                tm := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: Tr.terms-title;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: Tr.terms-lead;
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-body;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: Tr.terms-rules;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-body;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap-lg;
+                        Text {
+                            text: Tr.terms-read;
+                            color: Theme.accent-text;
+                            font-size: Theme.font-sm;
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { Logic.link-clicked(State.terms-url); }
+                            }
+                        }
+                        Text {
+                            text: Tr.privacy-read;
+                            color: Theme.accent-text;
+                            font-size: Theme.font-sm;
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { Logic.link-clicked(State.privacy-url); }
+                            }
+                        }
+                        Rectangle { }
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn { text: Tr.cancel; clicked => { Logic.terms-decline(); } }
+                        Btn {
+                            text: Tr.terms-agree;
+                            accent: true;
+                            clicked => { Logic.terms-accept(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Report (1.2): a person or a message, to the moderators ─────
+    // A reason is required (Send waits for it); the note is optional,
+    // and "Also block them" is offered while they are not blocked yet.
+    // Escape cancels.
+    if State.report-open : Rectangle {
+        background: #000000AA;
+        TouchArea { clicked => { Logic.report-cancel(); } }
+        report-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.report-cancel(); return accept; }
+                reject
+            }
+            Card {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: Math.min(400px, root.width - 48px);
+                height: rp.preferred-height;
+                TouchArea { }
+                rp := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    Text {
+                        text: State.report-title;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    if State.report-excerpt != "" : Rectangle {
+                        border-radius: Theme.radius-sm;
+                        background: Theme.bg-primary;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: quote.preferred-height + 2 * Theme.gap-sm;
+                        quote := Text {
+                            x: Theme.gap-sm;
+                            width: parent.width - 2 * Theme.gap-sm;
+                            text: State.report-excerpt;
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-sm;
+                            wrap: word-wrap;
+                            overflow: elide;
+                            max-height: 80px;
+                        }
+                    }
+                    Hint { text: Tr.report-hint; }
+                    VerticalLayout {
+                        spacing: Theme.gap-xs;
+                        FieldLabel { text: Tr.report-reason; }
+                        Dropdown {
+                            options: State.report-reasons;
+                            current <=> State.report-reason;
+                            placeholder: Tr.report-reason-placeholder;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: Theme.gap-xs;
+                        FieldLabel { text: Tr.report-note; }
+                        Field {
+                            placeholder: Tr.report-note-placeholder;
+                            text <=> State.report-note;
+                            accepted => { if (State.report-reason >= 0) { Logic.report-send(); } }
+                        }
+                    }
+                    if State.report-block-offered : CheckRow {
+                        text: Tr.report-also-block;
+                        hint: Tr.report-also-block-hint;
+                        checked <=> State.report-block;
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn { text: Tr.cancel; clicked => { Logic.report-cancel(); } }
+                        Btn {
+                            text: Tr.report-send;
+                            accent: true;
+                            enabled: State.report-reason >= 0;
+                            clicked => { Logic.report-send(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }

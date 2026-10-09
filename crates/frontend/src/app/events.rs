@@ -191,14 +191,18 @@ impl AppState {
             } => {
                 let username = self.username_of(client_id);
                 info!("{username} started sharing ({width}x{height})");
-                self.push_chat_system(&t!("chat-peer-sharing", "name" => username.as_str()));
+                if !self.client_blocked(client_id) {
+                    self.push_chat_system(&t!("chat-peer-sharing", "name" => username.as_str()));
+                }
             }
             ScreenEvent::PeerStoppedSharing { client_id } => {
                 let username = self.username_of(client_id);
                 info!("{username} stopped sharing");
-                self.push_chat_system(
-                    &t!("chat-peer-stopped-sharing", "name" => username.as_str()),
-                );
+                if !self.client_blocked(client_id) {
+                    self.push_chat_system(
+                        &t!("chat-peer-stopped-sharing", "name" => username.as_str()),
+                    );
+                }
                 if let Some(viewer) = self.viewers.remove(&client_id) {
                     viewer.close();
                 }
@@ -209,9 +213,11 @@ impl AppState {
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_network_message(&mut self, msg: NetworkMessage) {
         match msg {
-            NetworkMessage::Connected { lobby } => {
+            NetworkMessage::Connected { lobby, safety } => {
                 self.connected = true;
                 self.lobby = lobby;
+                self.safety = safety;
+                self.account_deleted = false;
                 self.reconnect_attempts = 0;
                 self.main.global::<State>().set_error_text("".into());
                 self.clear_connect_verdicts();
@@ -223,6 +229,7 @@ impl AppState {
                     self.settings.save();
                     crate::settingsui::refresh_servers(self);
                 }
+                crate::settingsui::refresh_safety(self);
             }
             NetworkMessage::Session {
                 user_id,
@@ -351,6 +358,10 @@ impl AppState {
                 if self.pending_edit == Some(msg_id) {
                     self.pending_edit = None;
                 }
+                // A blocked person's message: not shown, not narrated.
+                if self.hidden_messages.contains(&msg_id) {
+                    return;
+                }
                 if let Some(own) = self.own_texts.get_mut(&msg_id) {
                     own.clone_from(&text);
                 }
@@ -378,21 +389,20 @@ impl AppState {
                 if self.pending_delete == Some(msg_id) {
                     self.pending_delete = None;
                 }
+                if self.hidden_messages.remove(&msg_id) {
+                    return;
+                }
                 self.own_texts.remove(&msg_id);
                 if self.editing.as_ref().is_some_and(|e| e.msg_id == msg_id) {
                     self.edit_cancel();
                 }
-                let deleted =
-                    self.with_conversation(None, |app| match app.history.delete_message(msg_id) {
-                        Some(delta) => {
-                            app.sync_range(&delta);
-                            true
-                        }
-                        None => false,
-                    });
-                if !deleted {
-                    self.push_chat_system(&t!("chat-message-deleted", "id" => msg_id));
-                }
+                // Off screen (scrolled out, or never shown): nothing to
+                // say — an account's deletion takes up to 200 at once.
+                self.with_conversation(None, |app| {
+                    if let Some(delta) = app.history.delete_message(msg_id) {
+                        app.sync_range(&delta);
+                    }
+                });
             }
             NetworkMessage::ChatRateLimited { retry_ms } => {
                 let secs = retry_ms.div_ceil(1000);
@@ -445,6 +455,10 @@ impl AppState {
                 client_id,
                 attachment,
             } => {
+                if self.is_blocked(&from) {
+                    self.hide_message(id);
+                    return;
+                }
                 let key = match conv {
                     client::ConvRef::General => None,
                     client::ConvRef::Dm(_) => Some(from),
@@ -463,6 +477,7 @@ impl AppState {
                             ts_ms: ts,
                             day: local_day(ts),
                             user: username,
+                            author: Some(from),
                             own: Some(client_id) == self.our_client_id,
                             pending: false,
                         };
@@ -797,6 +812,15 @@ impl AppState {
                     }
                     DisconnectKind::Other => t!("error-lost-generic"),
                 };
+                // The removal after our own account deletion is that,
+                // not a kick: say what happened instead.
+                let what = if std::mem::take(&mut self.account_deleted)
+                    && matches!(kind, DisconnectKind::Removed { .. })
+                {
+                    self.account_deleted_notice()
+                } else {
+                    what
+                };
                 if self.connected {
                     self.push_chat_system(&t!("chat-disconnected", "reason" => what.as_str()));
                     self.teardown_connection();
@@ -859,13 +883,23 @@ impl AppState {
                 ts,
                 username,
                 text,
+                author,
             } => {
+                // The server keeps a blocked person's posts from us;
+                // this is the backstop (an older server, a race with a
+                // block just made).
+                let author = author.or_else(|| self.account_of(client_id));
+                if author.is_some_and(|a| self.is_blocked(&a)) || self.client_blocked(client_id) {
+                    self.hide_message(id);
+                    return;
+                }
                 let meta = Meta {
                     id,
                     ts: format_wall_time(ts),
                     ts_ms: ts,
                     day: local_day(ts),
                     user: username,
+                    author,
                     own: Some(client_id) == self.our_client_id,
                     pending: false,
                 };
@@ -894,12 +928,17 @@ impl AppState {
                 username,
                 data,
             } => {
+                if self.client_blocked(client_id) {
+                    self.hide_message(id);
+                    return;
+                }
                 let meta = Meta {
                     id,
                     ts: format_wall_time(ts),
                     ts_ms: ts,
                     day: local_day(ts),
                     user: username.clone(),
+                    author: self.account_of(client_id),
                     own: Some(client_id) == self.our_client_id,
                     pending: false,
                 };
@@ -1211,6 +1250,9 @@ impl AppState {
                     if dm.unread == 0 && self.dm_hidden(&dm.user_id) {
                         continue;
                     }
+                    // Someone we blocked: out of the list until unblocked
+                    // (`Blocks` came before this, on join).
+                    let blocked = self.is_blocked(&dm.user_id);
                     if dm.unread > 0 {
                         self.set_dm_hidden(dm.user_id, false);
                     }
@@ -1222,10 +1264,12 @@ impl AppState {
                         fetched: false,
                     });
                     meta.name = dm.name;
-                    meta.unread = dm.unread;
+                    meta.unread = if blocked { 0 } else { dm.unread };
                     meta.last_ts = dm.last_ts;
                     meta.last_msg_id = dm.last_msg_id;
-                    self.dm_order.push(dm.user_id);
+                    if !blocked {
+                        self.dm_order.push(dm.user_id);
+                    }
                 }
                 // The admin channel is ours, not the store's: it keeps
                 // its place at the top.
@@ -1233,6 +1277,13 @@ impl AppState {
                     self.dm_order.insert(0, ADMIN_CHANNEL_KEY);
                 }
                 self.rebuild_dms_model();
+            }
+            // ── 1.2: blocks, reports, deleting the account ──────────
+            NetworkMessage::Blocks { users } => self.take_blocks(users),
+            NetworkMessage::ReportAck { result } => self.take_report_ack(result),
+            NetworkMessage::AccountDeleted => self.take_account_deleted(),
+            NetworkMessage::AccountDeleteRefused { reason } => {
+                self.take_account_delete_refused(reason);
             }
             // Hot-path variants routed straight to the voice/screen
             // threads by the network loop. They should never arrive

@@ -188,6 +188,9 @@ pub enum NetworkMessage {
     /// lobby (spec §12, 1.1.5) — hide it and render "joined <room>".
     Connected {
         lobby: bool,
+        /// The server takes blocks, reports and account deletion
+        /// (1.2, `features::SAFETY`): the UI offers them only then.
+        safety: bool,
     },
     /// The server presented `fingerprint`. `first_use` when we had no
     /// pin for this server (trust on first use): the app stores it on
@@ -405,6 +408,9 @@ pub enum NetworkMessage {
         ts: u64,
         username: String,
         text: String,
+        /// The author's account, when the server says (1.2's
+        /// `ChatFrom`): someone in the lobby has no `UserDetails`.
+        author: Option<UserId>,
     },
     /// A chat image from a user (encoded PNG/JPEG/GIF bytes, ≤
     /// `protocol::MAX_CHAT_IMAGE_BYTES`, content hash verified). Same
@@ -585,6 +591,22 @@ pub enum NetworkMessage {
     /// replay on join).
     Conversations {
         dms: Vec<protocol::DmSummary>,
+    },
+
+    // ── 1.2: blocks, reports, deleting one's account ─────────────────
+    /// Everyone we block, whole (on join and after every change, from
+    /// any of our devices).
+    Blocks {
+        users: Vec<protocol::BlockedUser>,
+    },
+    /// The answer to `NetworkControl::Report`.
+    ReportAck {
+        result: Result<(), protocol::ReportRefusal>,
+    },
+    /// Our account is gone; the session ends right after.
+    AccountDeleted,
+    AccountDeleteRefused {
+        reason: protocol::DeleteRefusal,
     },
 }
 
@@ -1261,6 +1283,7 @@ impl NetworkClient {
                 }
                 self.message_queue.push(NetworkMessage::Connected {
                     lobby: features::has(server_features, features::LOBBY),
+                    safety: features::has(server_features, features::SAFETY),
                 });
             }
             ServerMessage::Refused { reason } => {
@@ -1361,6 +1384,7 @@ impl NetworkClient {
                     ts: msg.ts,
                     username,
                     text: msg.text,
+                    author: None,
                 });
             }
             ServerMessage::ChatImageChunk {
@@ -1740,6 +1764,36 @@ impl NetworkClient {
             ServerMessage::Conversations { dms } => {
                 self.message_queue
                     .push(NetworkMessage::Conversations { dms });
+            }
+            ServerMessage::Blocks { users } => {
+                self.message_queue.push(NetworkMessage::Blocks { users });
+            }
+            ServerMessage::ReportAck { result } => {
+                if let Err(refusal) = result {
+                    info!("Report not filed: {refusal:?}");
+                }
+                self.message_queue
+                    .push(NetworkMessage::ReportAck { result });
+            }
+            ServerMessage::AccountDeleted => {
+                info!("The server deleted our account");
+                self.message_queue.push(NetworkMessage::AccountDeleted);
+            }
+            ServerMessage::AccountDeleteRefused { reason } => {
+                info!("Account deletion refused: {reason:?}");
+                self.message_queue
+                    .push(NetworkMessage::AccountDeleteRefused { reason });
+            }
+            ServerMessage::ChatFrom { from, msg } => {
+                let username = self.username_of(msg.client_id);
+                self.message_queue.push(NetworkMessage::TextMessage {
+                    client_id: msg.client_id,
+                    id: msg.id,
+                    ts: msg.ts,
+                    username,
+                    text: msg.text,
+                    author: Some(from),
+                });
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.
@@ -2504,6 +2558,19 @@ pub enum NetworkControl {
         conv: protocol::ConvRef,
         msg_id: u64,
     },
+    // ── 1.2: blocks, reports, deleting one's account ─────────────────
+    /// Answered by `NetworkMessage::Blocks`.
+    Block(UserId),
+    Unblock(UserId),
+    /// Answered by `NetworkMessage::ReportAck`.
+    Report {
+        target: protocol::ReportTarget,
+        reason: protocol::ReportReason,
+        note: String,
+    },
+    /// Answered by `AccountDeleted` (then the session ends) or
+    /// `AccountDeleteRefused`.
+    DeleteAccount,
     Disconnect,
     SendMessage(String),
     /// Send a chat image (encoded PNG; the UI caps it at
@@ -2873,6 +2940,37 @@ fn handle_control(
         NetworkControl::MarkRead { conv, msg_id } => {
             if let Some(c) = client {
                 c.send_control(now, &ClientMessage::MarkRead { conv, msg_id });
+            }
+        }
+        NetworkControl::Block(user) => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::Block { user });
+            }
+        }
+        NetworkControl::Unblock(user) => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::Unblock { user });
+            }
+        }
+        NetworkControl::Report {
+            target,
+            reason,
+            note,
+        } => {
+            if let Some(c) = client {
+                c.send_control(
+                    now,
+                    &ClientMessage::Report {
+                        target,
+                        reason,
+                        note,
+                    },
+                );
+            }
+        }
+        NetworkControl::DeleteAccount => {
+            if let Some(c) = client {
+                c.send_control(now, &ClientMessage::DeleteAccount);
             }
         }
         NetworkControl::SendLog(data) => {

@@ -83,6 +83,29 @@ component Gutter inherits Rectangle {
     }
 }
 
+/// Touch hosts: a finger held still on a row opens its menu, as a
+/// right-click does on the desktop. `pressing` is the row's TouchArea
+/// hover, which on touch means "a finger is down here": Slint sends an
+/// exit after every release, and a scroll taking over sends one too.
+/// `fired` holds until the finger lifts, so a release after the menu
+/// opened does not also count as a tap.
+component LongPress {
+    in property <bool> pressing;
+    out property <bool> fired: false;
+    callback long-pressed();
+    changed pressing => {
+        if (!self.pressing) { self.fired = false; }
+    }
+    Timer {
+        interval: 500ms;
+        running: State.touch-host && root.pressing && !root.fired;
+        triggered => {
+            root.fired = true;
+            root.long-pressed();
+        }
+    }
+}
+
 /// Name and time, on the first row of a run.
 component RowHeader inherits HorizontalLayout {
     in property <ChatRow> data;
@@ -129,6 +152,14 @@ component MessageRow inherits Rectangle {
 
     // Under everything: the read-only body ignores right-clicks, so
     // they land here and open the row's menu.
+    lp := LongPress {
+        pressing: ctx.has-hover;
+        long-pressed => {
+            Logic.row-context(data, root.select-mode,
+                ctx.absolute-position.x + ctx.mouse-x,
+                ctx.absolute-position.y + ctx.mouse-y);
+        }
+    }
     ctx := TouchArea {
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
@@ -310,6 +341,14 @@ component FileRow inherits Rectangle {
     background: ctx.has-hover ? Theme.hover : transparent;
     animate background { duration: 100ms; }
 
+    lp := LongPress {
+        pressing: ctx.has-hover;
+        long-pressed => {
+            Logic.row-context(data, false,
+                ctx.absolute-position.x + ctx.mouse-x,
+                ctx.absolute-position.y + ctx.mouse-y);
+        }
+    }
     ctx := TouchArea {
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
@@ -581,6 +620,14 @@ component CodeRow inherits Rectangle {
     border-radius: Theme.radius-sm;
     background: ctx.has-hover ? Theme.hover : transparent;
     animate background { duration: 100ms; }
+    lp := LongPress {
+        pressing: ctx.has-hover;
+        long-pressed => {
+            Logic.row-context(data, false,
+                ctx.absolute-position.x + ctx.mouse-x,
+                ctx.absolute-position.y + ctx.mouse-y);
+        }
+    }
     ctx := TouchArea {
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
@@ -672,6 +719,14 @@ component ImageRow inherits Rectangle {
     background: ctx.has-hover ? Theme.hover : transparent;
     animate background { duration: 100ms; }
 
+    lp := LongPress {
+        pressing: ctx.has-hover;
+        long-pressed => {
+            Logic.row-context(data, false,
+                ctx.absolute-position.x + ctx.mouse-x,
+                ctx.absolute-position.y + ctx.mouse-y);
+        }
+    }
     ctx := TouchArea {
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
@@ -770,7 +825,8 @@ component ImageRow inherits Rectangle {
                     it := TouchArea {
                         enabled: data.transfer-kind == 0;
                         mouse-cursor: pointer;
-                        clicked => { Logic.row-open-image(data.row-id); }
+                        // Not the release of a long press (its menu is open).
+                        clicked => { if (!lp.fired) { Logic.row-open-image(data.row-id); } }
                         pointer-event(ev) => {
                             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
                                 Logic.row-context(data, false,

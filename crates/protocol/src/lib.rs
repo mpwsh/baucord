@@ -25,6 +25,7 @@ pub mod messages;
 pub mod permissions;
 pub mod progress;
 pub mod relayed;
+pub mod safety;
 pub mod system_audio;
 pub mod username;
 pub mod video;
@@ -56,6 +57,10 @@ pub use messages::{
 pub use permissions::{Rank, RoleId};
 pub use progress::{cost_of_level, level_for_xp, xp_for_level};
 pub use relayed::{split_sender, wrap_sender, RELAY_SENDER_BYTES};
+pub use safety::{
+    BlockedUser, DeleteRefusal, ReportReason, ReportRefusal, ReportSummary, ReportTarget,
+    MAX_REPORT_EXCERPT_BYTES, MAX_REPORT_NOTE_BYTES,
+};
 pub use system_audio::{
     pack_system_audio, parse_system_audio, SystemAudioHeader, SYSTEM_AUDIO_HEADER_SIZE,
     SYSTEM_AUDIO_MTU_BUDGET,

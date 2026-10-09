@@ -11,7 +11,7 @@
 //! over it, so admission decisions are unit-testable without a wire.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     net::IpAddr,
 };
 
@@ -166,6 +166,8 @@ pub struct Policy {
     pub xp: HashMap<UserId, u64>,
     /// Stored blobs by hash (spec §7).
     pub blobs: HashMap<BlobId, BlobMeta>,
+    /// Who each user blocked (`protocol::safety`, 1.2).
+    pub blocks: HashMap<UserId, HashSet<UserId>>,
 }
 
 impl Default for Policy {
@@ -205,6 +207,7 @@ impl Policy {
             next_channel_id: 1,
             xp: HashMap::new(),
             blobs: HashMap::new(),
+            blocks: HashMap::new(),
         }
     }
 

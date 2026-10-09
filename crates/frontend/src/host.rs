@@ -33,7 +33,7 @@ pub fn save_download(_name: &str, _mime: &str, _bytes: &[u8]) -> Option<Result<S
 }
 
 /// A desktop process keeps running in the background by itself.
-pub fn keep_alive(_server: Option<&str>) {}
+pub fn keep_alive(_server: Option<&str>, _in_room: bool) {}
 
 pub use crate::notice::{ChimeRoute, Notice, NoticeKind};
 

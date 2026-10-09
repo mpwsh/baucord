@@ -229,6 +229,18 @@ pub enum AdminCommand {
     },
     /// The server's counters (needs `ADMIN`).
     ServerStats,
+
+    // ── 1.2: reports (feature bit `SAFETY`) ──────────────────────────
+    /// Reports, newest first (needs `RESTRICT`): the open ones, or all
+    /// with `resolved`. Answered with [`AdminOutcome::Reports`]; empty
+    /// without persistence.
+    ListReports {
+        resolved: bool,
+    },
+    /// Mark a report handled (needs `RESTRICT`); it leaves the open list.
+    ResolveReport {
+        id: u64,
+    },
 }
 
 /// One audit line (spec §8), as the panel shows it.
@@ -335,6 +347,8 @@ pub enum AdminOutcome {
     Blobs(Vec<BlobSummary>),
     Stats(StatsSummary),
     RoleCreated(RoleId),
+    // 1.2 (feature bit `SAFETY`):
+    Reports(Vec<crate::safety::ReportSummary>),
 }
 
 /// A user's last telemetry, as the server logs it.

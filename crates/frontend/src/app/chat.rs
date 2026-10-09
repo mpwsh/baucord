@@ -110,6 +110,7 @@ impl AppState {
             ts_ms: now,
             day: local_day(now),
             user: self.settings.user.nickname.clone(),
+            author: self.our_user_id,
             own: true,
             pending: true,
         };
@@ -176,6 +177,7 @@ impl AppState {
             ts_ms: now,
             day: local_day(now),
             user: self.settings.user.nickname.clone(),
+            author: self.our_user_id,
             own: true,
             pending: true,
         };

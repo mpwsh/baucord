@@ -199,6 +199,7 @@ impl ChatServer {
             return;
         };
         let fail = |this: &mut Self, reason: DmFailReason| {
+            let reason = this.dm_refusal_for(client, reason);
             this.send_msg(client, &ServerMessage::MessageFailed { client_ref, reason });
         };
         if !self.has_feature(client, features::FILES) || !self.persist.is_persistent() {
@@ -273,6 +274,10 @@ impl ChatServer {
                     || !permissions::has(self.effective_permissions(&to), permissions::DM)
                 {
                     fail(self, DmFailReason::NoPermission);
+                    return;
+                }
+                if self.blocked_either(&from, &to) {
+                    fail(self, DmFailReason::Unavailable);
                     return;
                 }
                 if !self.chat_allowed_by_rate(client) {
@@ -355,7 +360,8 @@ impl ChatServer {
                 .into_iter()
                 .filter(|s| self.has_feature(*s, features::DM))
                 .collect(),
-            None => self.clients(),
+            // General: everyone but whoever blocked the poster.
+            None => self.audience_of(&from),
         };
         for peer in targets {
             if self.has_feature(peer, features::FILES) {
