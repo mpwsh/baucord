@@ -26,7 +26,7 @@ included.
 ## 2. Run it
 
 ```sh
-ios/run.sh --hello        # first: the M0 smoke test in the simulator
+ios/run.sh --hello        # the smoke test in the simulator (the toolchain alone)
 ios/run.sh                # the client in the simulator
 ios/run.sh --device       # the client on your iPhone
 ios/run.sh --os 18.1      # the client on an iOS 18.1 iPhone simulator
@@ -52,8 +52,9 @@ the newest iOS installed; it prints which (`>> simulator iPhone 16 (iOS
 18.1) …`). `xcrun simctl list devices` lists them all.
 
 In the simulator, a server on this Mac is `127.0.0.1:51000`, and the
-simulator's microphone is the Mac's (macOS asks once). There is no
-echo cancellation on iOS yet: use headphones in voice.
+simulator's microphone is the Mac's (macOS asks once). In voice on the
+loudspeaker the app cancels echo with Apple's voice-processing unit
+(IOS-SPEC D47); with headphones it does not need to.
 
 To try **Attach** in the simulator: Photos comes with Apple's sample
 pictures, and Files starts empty — drag a file from the Mac onto the
@@ -142,7 +143,7 @@ IDs & Profiles):
    base64 -i baucord_Ad_Hoc.mobileprovision | pbcopy  # → IOS_PROFILE_BASE64
    ```
 
-Then publish a release (`v1.1.9`, the crates' version — the workflow
+Then publish a release (`v1.2.0`, the crates' version — the workflow
 checks), or run the workflow by hand to try it; a manual run leaves
 the `.ipa` under the run's *Artifacts*. The first build takes a while
 (the whole engine for iOS); run the workflow once by hand on the
@@ -213,7 +214,7 @@ is what users get, and the one to judge speed and battery by.
 ## 5. The version
 
 The app's version is the crates' — `crates/ios/Cargo.toml`, which moves
-together with every other platform's (1.1.9 now). `run.sh` writes it
+together with every other platform's (1.2.0 now). `run.sh` writes it
 into `Config/Version.xcconfig` on every run, with the commit count as
 the build number; the cargo build phase stops with an error if the two
 ever disagree (a bump, then a build from Xcode's window before

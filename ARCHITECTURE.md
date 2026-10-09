@@ -88,21 +88,23 @@ it there too — the match is exhaustive on purpose.
 
 ### Messages
 
-`ClientMessage`: `Hello`, `Chat`, `Speaking`, `AudioState`,
-`ScreenShareStart/Stop`, `Subscribe/UnsubscribeScreen`,
-`RequestKeyframe`, `ChatImageChunk`, `JoinChannel`, `Telemetry`,
-`TelemetryEvent`, `LogUploadChunk`.
+`ClientMessage` and `ServerMessage` (`protocol::messages`) are the
+list. The 1.0 core is the session (`Hello`, `Welcome`, `Refused`,
+`Init`), presence (`UserJoined/Left`, `Speaking`, `AudioState`,
+`UserMovedChannel`), channels, chat, screen sharing (`ScreenShare*`,
+`Subscribe*`, `KeyframeRequested`, `StreamHealth`), receiver reports
+and telemetry. 1.1 appended accounts, roles, history, DMs, blobs,
+profiles and the admin commands (PERSISTENCE-SPEC §10, §12); 1.2 the
+safety messages — `Block`, `Report`, `DeleteAccount`, `ChatFrom`,
+`Authors` (PERSISTENCE-SPEC §12 S1).
 
-`ServerMessage`: `Welcome`, `Refused`, `Init`, `UserJoined/Left`,
-`Chat`, `Speaking`, `AudioState`, `ScreenShareStarted/Stopped`,
-`ShareDenied`, `SubscribeDenied`, `KeyframeRequested`, `StreamHealth`,
-`ChatImageChunk`, `UserMovedChannel`, `JoinChannelDenied`,
-`ChannelListUpdated`, `VoiceReceiverReport`.
-
-Serialization is bincode-style via `encode_*_message` /
-`decode_*_message`; an undecodable message is skipped, never fatal.
-Chat messages carry a server-assigned `id` and `ts`; relayed images
-carry a SHA-256 of the whole image, verified on completion.
+Serialization is `postcard` (positional, compact varints) via
+`encode_*_message` / `decode_*_message`; an undecodable message is
+skipped, never fatal. Because postcard is positional, a shipped
+struct never gains a field and a new variant is appended under a new
+feature bit. Chat messages carry a server-assigned `id` and `ts`;
+relayed images carry a SHA-256 of the whole image, verified on
+completion.
 
 ### Versioning
 
@@ -110,7 +112,9 @@ carry a SHA-256 of the whole image, verified on completion.
   peers fail the TLS handshake and the client shows `OUTDATED_MESSAGE`.
 - Additive capability → a bit in `protocol::features`, offered in
   `Hello`, announced in `Welcome`, `negotiate()`d to the intersection.
-  Only `TELEMETRY` and `IDENTITY` are defined today.
+  Bits run up to `SAFETY` (17) in 1.2; every appended variant gets a
+  new one, since a client that negotiated an older bit cannot decode
+  it (PERSISTENCE-SPEC §12).
 
 ### Media packing
 
@@ -239,7 +243,7 @@ any number of `DriverHost`s on links with delay, jitter, loss, a
 bandwidth bottleneck with a bounded queue, and address changes, on a
 fake clock. `ChatServer` implements `DriverHost`, so
 `server/tests/e2e.rs` runs a real server against real client drivers
-through the full QUIC stack. The 19 transport scenarios in
+through the full QUIC stack. The 21 transport scenarios in
 `sim/tests.rs` are the acceptance suite for everything above.
 
 ## 5. Server (`crates/server`)
@@ -314,7 +318,7 @@ holding `ADMIN` at startup the server mints a one-shot admin invite
 level (`No admin yet. Bootstrap invite …`). `ChatServer::mint_invite / revoke_invite / restrict /
 lift_restriction / unlink_key` are the single implementations behind
 `ClientMessage::CreateInvite`, the bootstrap code, the tests, and the
-admin commands to come. `server invite create|list|revoke` (persistence
+admin commands. `server invite create|list|revoke` (persistence
 on) writes the database directly; the running server picks the change
 up within 2 s.
 
@@ -360,17 +364,20 @@ card's bar (spec §12). `SetNickname` renames a live session under the
 `Hello` name rules and broadcasts `UserRenamed`.
 
 Blobs (spec §7) are the `UploadBegin/Accept/Chunk/Done/Rejected` and
-`FetchBlob/BlobChunk/BlobMissing` messages, currently admitting only
-avatar-sized images (`persistence.avatars.max_kb`). An announced
+`FetchBlob/BlobChunk/BlobMissing` messages: avatars
+(`persistence.avatars.max_kb`) and, on a persistent server, the files
+and pictures posted in General and DMs (`files.rs`, under
+`persistence.files`' quotas and the transfer budget). An announced
 hash the server already holds is acknowledged without transfer;
 otherwise chunks fold through the same `fold_upload` as images, the
-bytes are hashed, sniffed (PNG/JPEG/WebP) and stored: metadata in
-`policy.blobs`, bytes in `blob_bytes` (the only copy without
-persistence) and, with it, at `blobs/<sha256>` next to the database
-plus a `blobs` row. Fetches are served from memory or read from disk
-through `Query::Blob`, with concurrent fetchers of one hash
-coalesced. Reference counts follow profiles; an unreferenced blob
-leaves memory.
+bytes are hashed, sniffed and stored: metadata in `policy.blobs`,
+bytes in `blob_bytes` (the only copy without persistence) and, with
+it, at `blobs/<sha256>` next to the database plus a `blobs` row.
+Fetches are served from memory or read from disk through
+`Query::Blob`, with concurrent fetchers of one hash coalesced.
+Reference counts follow profiles, messages and DM conversations; an
+unreferenced blob leaves memory, and the hourly prune deletes its
+file after `files.retain_days`.
 
 ### Reports and logs
 
@@ -558,9 +565,9 @@ by concern in child modules under `src/app/` — `events` (the drain
 and `handle_network_message`, which is exhaustive over
 `NetworkMessage`; the compiler will tell you where to add an arm),
 `commands`, `presence`, `session`, `menus`, `devices`,
-`conversations`, `chat`, `profiles`, `stats`, `alerts` — each a child of `app`
-so nothing private had to open up; new methods go in the child that
-owns the concern.
+`conversations`, `chat`, `activity`, `profiles`, `safety`, `stats`,
+`alerts` — each a child of `app` so nothing private had to open up;
+new methods go in the child that owns the concern.
 
 `main.rs` sets up file logging (append-mode `baucord.log`) and a panic
 hook that writes thread, location and backtrace into it — release builds
@@ -696,10 +703,14 @@ service, so a phone whose app is closed or suspended gets nothing
 ```bash
 cargo test --all                # everything; media crates need their system libs
 cargo test -p transport         # 45 tests, the sim scenarios among them
-cargo test -p server            # 49 unit + 76 e2e through the simulator (2026-10-07)
+cargo test -p server            # 51 unit + 88 e2e through the simulator (2026-10-09)
 cargo clippy --all-targets      # all = deny, pedantic = warn
 cargo +nightly fmt --all        # imports_granularity/group_imports are nightly-only
 ```
+
+The chat pane's scrolling has its own harness,
+`tools/chat-scroll-sim` (`cargo run` in it): the real `.slint` pane
+driven headless through 48 cases (ANDROID-SPEC D66).
 
 Adding a server behavior: write it as an `e2e.rs` test first — `World`
 gives you a server node and `TestClient`s that speak the real protocol

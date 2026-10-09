@@ -1,78 +1,69 @@
-# baucord — Android (v1) technical spec
+# baucord — Android technical spec
 
-> **Status (2026-10-08):** shipping as 1.1.9, sideloaded (and on the website, D55). §0–§13 are the
-> first draft (decisions D1…D9 in §1); §14 holds every decision since
-> (D10…D60, the newest at the top of its second table) — **where they disagree, §14 is right**
-> (stream viewing, "not in v1" in §0, arrived with D23). What is left:
-> `PRODUCTION-PLAN.md` (the MOB items). Start from `START-HERE.md`.
-
-Status when written: draft 1, 2026-09-15; M0 written 2026-10-05 (§14). Decisions in
-§1 are taken; the rest is the plan they imply. Read `SESSION-GUIDE.md`
-§1 for how this codebase is worked on; the runtime is in
-`ARCHITECTURE.md`. Every decision made after this draft goes in §14,
-the way `PERSISTENCE-SPEC.md` §12 works.
+> **Status (2026-10-09):** 1.2.0, sideloaded and on the website (D55);
+> Google Play is next (PLAY-STORE.md). §0–§13 describe the client as
+> it is now; §14 holds every decision taken since the first draft
+> (D10…D66, the newest at the top of its second table), each with its
+> reason. What is left: `PRODUCTION-PLAN.md` (the MOB items). Start
+> from `START-HERE.md`.
 
 ## 0. Purpose and scope
 
-An Android client for the existing baucord server: **voice and chat**,
-distributed as a **sideloaded APK**, with a **Slint** UI that keeps
-parity with the desktop client (same widgets, same theme, same strings,
-same behaviour), running the **same Rust engine** the desktop runs. The
-desktop crate is the reference for behaviour; it is not the base of the
-Android app.
+An Android client for the baucord server, running the **same Rust
+engine** and the **same Slint UI** as the desktop: voice with the
+platform's echo cancellation, General and DMs, files, viewing screen
+shares, the Settings page, notifications while connected. It is
+distributed as a **sideloaded APK** (and, next, through Google Play),
+for arm64 phones on Android 10 or later.
 
-In scope for v1: connecting with an invite or a saved server, the
-roster and channels, joining voice with hardware echo cancellation,
-mute/deafen/speaker route, text chat in channels and DMs (send,
-receive, history paging, unread counts, images inline), the settings
-that make sense on a phone, staying in voice with the screen off,
-reconnect on network change, the file log, telemetry.
+Not on Android, by choice or not yet: sharing the phone's screen (no
+encoder; the button is hidden), the admin panel (a desktop window;
+the slash commands and `/reports` stand in), keybinds and
+push-to-talk, an updater (an APK installs over the last one; Play
+will update it), push notifications (PRODUCTION-PLAN PRD-1), tablet
+layouts, 32-bit ARM.
 
-Not in v1: screen sharing (capture *or* viewing), file transfer beyond
-inline images, the admin panel, keybinds/push-to-talk, the updater,
-push notifications, tablets/landscape layouts, 32-bit ARM. Each is a
-later milestone (§12) or a non-goal, noted where it comes up.
-
-## 1. Decisions
+## 1. Decisions of the first draft
 
 | # | decision | why |
 |---|---|---|
 | D1 | UI in Slint via `backend-android-activity-06` | one UI codebase; `frontend` glue shared with desktop; the team's toolkit |
-| D2 | `NativeActivity` (Slint's `native-activity` feature), not `GameActivity` | no Kotlin Activity at all; the platform supplies the Activity class |
-| D3 | v1 = voice + chat | as agreed |
-| D4 | Sideloaded APK, signed with our own key | no Play review; Play's API-36 / 16 KB rules still followed so a store build is a config change later |
-| D5 | Kotlin kept to the irreducible minimum: one foreground `Service`, the manifest, Gradle | everything else is Rust calling the platform over JNI |
+| D2 | `NativeActivity` (Slint's `native-activity` feature), not `GameActivity` — subclassed since D30 (`BaucordActivity`) | no Kotlin Activity at all; the platform supplies the Activity class |
+| D3 | v1 = voice + chat — since grown: stream viewing (D23), files (D30), notifications (D52) | as agreed |
+| D4 | Sideloaded APK, signed with our own key — the same key signs the Play bundle (D62) | no Play review; Play's API-36 / 16 KB rules still followed so a store build is a config change later |
+| D5 | The platform language kept to the irreducible minimum: three Java classes (§10.1), the manifest, Gradle — Java, not Kotlin (D13, D30) | everything else is Rust calling the platform over JNI |
 | D6 | `minSdk 29` (Android 10), `targetSdk 36`, `compileSdk 36` | AAudio's floor is 26; 29 is where permissions and audio behave consistently; 36 is current |
 | D7 | Only `arm64-v8a` on devices, `x86_64` for the emulator | 64-bit phones since Android 10; halves build time |
-| D8 | The Rust engine lives once per process, not per Activity | Android recreates Activities; the connection must not follow them |
-| D9 | The desktop's Slint glue is extracted into a shared `frontend` crate before any Android code depends on it | the only way to get parity without a second 8k-line host |
+| D8 | The Rust engine lives once per process, not per Activity — *not done*: the process ends with the Activity (D11), so whatever destroys the Activity ends the call (MOB-8) | Android recreates Activities; the connection must not follow them |
+| D9 | The desktop's Slint glue is extracted into a shared `frontend` crate before any Android code depends on it — done in 1.1.6 (§5) | the only way to get parity without a second 8k-line host |
 
-Open (decide before M2): the name of the shared glue crate (`frontend`
-below); whether RNNoise stays on by default on Android (§6.4).
+Open: whether RNNoise stays on under the platform's own noise
+suppression (§6.4). It is on, as on the desktop.
 
 ## 2. Where things live
 
 ```
 baucord/
-  Cargo.toml                  workspace (members = ["crates/*"])  — see §2.1
   crates/
-    protocol transport client audio video app-core i18n ui server
-    desktop/                  the desktop host; shrinks in M1 (§5)
-    frontend/                 NEW  Slint-facing controller shared by both hosts
-    android/                  cdylib (M0): lib.rs android_main, java.rs JNI,
-                              logging.rs logcat+file tee, hello.rs smoke test
+    android/                  the cdylib: lib.rs (android_main), java.rs (every
+                              JNI call), host.rs (the frontend's Hooks), logging.rs
+                              (logcat + baucord.log), hello.rs (the smoke test)
+    frontend/                 the UI logic every host runs (§5)
+    audio/src/native/         aaudio.rs, android.rs, pump.rs: the call path (§6)
+    video/src/mediacodec.rs   stream decoding (D23, D57, D59)
   android/                    the Gradle project (no Rust in here)
-    settings.gradle.kts
-    build.gradle.kts          AGP 8.13.0
+    settings.gradle.kts, build.gradle.kts   AGP 8.13.0
     gradle.properties         cargoTargets / cargoFeatures knobs
-    gradle/ gradlew gradlew.bat                      Gradle 8.14.3 wrapper
-    app/
-      build.gradle.kts        runs cargo-ndk before pre<Variant>Build
-      src/main/AndroidManifest.xml
-      src/main/kotlin/dev/baucord/VoiceService.kt     M3 — the one Kotlin file (not yet)
-      src/main/res/                                  theme, strings, placeholder icon
-      src/main/jniLibs/                              written by cargo-ndk, git-ignored
-  .github/workflows/android-release.yml   signed arm64 APK on a published Release (no PR builds)
+    gradle/ gradlew gradlew.bat              Gradle 8.14.3 wrapper
+    app/build.gradle.kts      runs cargo-ndk before pre<Variant>Build; renders the
+                              launcher icon (D36)
+    app/src/main/AndroidManifest.xml
+    app/src/main/java/dev/baucord/   BaucordActivity, VoiceService, Notices (§10.1)
+    app/src/main/res/         theme, strings, the status-bar icon (D52)
+    app/src/main/jniLibs/     written by cargo-ndk, git-ignored
+    run.ps1, run.cmd          build, install, launch, logcat (§11)
+    notification-icon.py      cuts the status-bar silhouette from the icon (D52)
+  .github/workflows/android-release.yml   the signed APK and AAB on a published release (D62)
 ```
 
 The Rust side of Android is a normal workspace member (`crates/android`)
@@ -83,24 +74,18 @@ drops into `jniLibs`.
 
 ### 2.1 Workspace Cargo.toml
 
-Verified in M0 against Slint 1.17.1's manifests and, on 2026-10-05,
-against the real root `Cargo.toml`:
-
-- `members = ["crates/*"]` picks the new crate up; `resolver = "2"` is
+- `members = ["crates/*"]` picks the crate up; `resolver = "2"` is
   set (a virtual workspace without it falls back to resolver 1, which
   activates features for dependencies of every target at once).
 - The `[workspace.dependencies] slint` entry (`default-features =
   false`, `std`, `backend-winit`, `renderer-skia`, `renderer-software`,
-  `compat-1-2`) **stays as it is.** In
-  Slint 1.17 `i-slint-backend-winit` and `i-slint-renderer-femtovg` are
-  `cfg(not(target_os = "android"))` dependencies of the selector and of
-  `slint` itself, so `backend-winit` / `renderer-femtovg` in the
-  workspace entry resolve to nothing on the Android target
-  (`cargo tree -p android --target aarch64-linux-android` shows no
-  winit, no femtovg, no softbuffer). `renderer-software` and
-  `system-tray` are pure Rust and harmless. The Android backend brings
-  the Skia renderer itself; `android` only adds
-  `backend-android-activity-06`.
+  `compat-1-2`) serves Android as it is. `i-slint-backend-winit` and
+  `i-slint-renderer-femtovg` are `cfg(not(target_os = "android"))`
+  dependencies of the selector and of `slint` itself, so they resolve
+  to nothing on the Android target (`cargo tree -p android --target
+  aarch64-linux-android` shows no winit, femtovg, softbuffer or wgpu;
+  D12, D38). The Android backend brings the Skia renderer itself;
+  `android` only adds `backend-android-activity-06`.
 - **Always build the Android crate with `-p android`.** Its `frontend`
   dependency has `default-features = false`; a workspace-wide build
   (`--workspace`, or `-p desktop -p android`) would unify
@@ -125,8 +110,8 @@ and the manifest's `android.app.lib_name` meta-data is
 ## 3. Toolchain: what to install, from where
 
 Everything below is what the Rust engine, Slint's Android backend and
-Gradle need; nothing else. Versions are what is current as of this
-draft — take the newest stable of each.
+Gradle need; nothing else. android/README.md §1 is the same list as a
+checklist for a Windows machine.
 
 | what | where | notes |
 |---|---|---|
@@ -138,8 +123,8 @@ draft — take the newest stable of each.
 | Platform-Tools | SDK Manager → SDK Tools | `adb` for sideloading and `logcat` |
 | Emulator + a **Google APIs x86_64, API 36** system image | SDK Manager → SDK Tools / Virtual Device Manager | optional; the emulator can pass the host microphone through |
 | Rust stable + targets | `rustup target add aarch64-linux-android x86_64-linux-android` | Rust ≥ 1.85 (cpal's MSRV) |
-| `cargo-ndk` | `cargo install cargo-ndk` (<https://github.com/bbqsrc/cargo-ndk>) | 4.x (4.1.2 as of M0); finds the newest NDK under `$ANDROID_HOME/ndk` on its own, sets `CC_*`/`AR_*`/the linker per target, exports the cmake toolchain path |
-| a JDK **21** | Temurin (`winget install EclipseAdoptium.Temurin.21.JDK`), not Android Studio's `jbr` | Gradle 8.14 runs on JDK 17–24 — the JBR shipped with 2026 Studio builds is 25 and fails the Kotlin DSL compile with just the version (`What went wrong: 25.0.3`) as the message (first build, 2026-10-05). Slint's backend `build.rs` needs `javac` and build-tools' `d8`; both fine on 21 with build-tools ≥ 35 |
+| `cargo-ndk` | `cargo install cargo-ndk` (<https://github.com/bbqsrc/cargo-ndk>) | 4.x; finds the newest NDK under `$ANDROID_HOME/ndk` on its own, sets `CC_*`/`AR_*`/the linker per target, exports the cmake toolchain path |
+| a JDK **21** | Temurin (`winget install EclipseAdoptium.Temurin.21.JDK`), not Android Studio's `jbr` | Gradle 8.14 runs on JDK 17–24 — the JBR shipped with 2026 Studio builds is 25 and fails the Kotlin DSL compile with just the version (`What went wrong: 25.0.3`) as the message. Slint's backend `build.rs` needs `javac` and build-tools' `d8`; both fine on 21 with build-tools ≥ 35 |
 | Gradle + AGP | nothing to install: `android/gradlew` fetches Gradle 8.14.3, AGP 8.13.0 comes from Google's Maven | the first `gradlew` run downloads ~200 MB |
 
 Environment (persist them; Gradle, cargo-ndk and Slint's `build.rs`
@@ -158,7 +143,9 @@ CMAKE_GENERATOR   = Ninja                 (only for `cargo ndk` by hand — the 
                                            build's libopus and breaks its cached VS build)
 ANDROID_JAR       = %ANDROID_HOME%\platforms\android-36\android.jar
                                           (only for `cargo ndk` run by hand — the Gradle
-                                           task sets it from compileSdk; see §14, 2026-10-05)
+                                           task sets it from compileSdk: cargo-ndk exports
+                                           ANDROID_PLATFORM=29, which Slint's build script
+                                           would otherwise read as the SDK platform)
 PATH             += %ANDROID_HOME%\platform-tools ; %ANDROID_HOME%\cmake\<ver>\bin
 ```
 
@@ -176,11 +163,9 @@ Verify: `cargo ndk --version`, `adb devices` (phone in developer mode
 with USB debugging), `javac -version`, and `ls $ANDROID_HOME/platforms`
 shows `android-36`.
 
-First-build notes: Slint's Android backend builds on Skia. `skia-bindings`
-downloads a prebuilt Skia for `aarch64-linux-android` on first build
-(network needed; minutes, not seconds); if no prebuilt matches it
-builds Skia from source, which needs the NDK's clang and Python and
-takes long — M0 exists to find out which of the two we get.
+Slint's Android backend draws with Skia: `skia-bindings` downloads a
+prebuilt Skia for the target on the first build (network needed;
+minutes). If it ever builds Skia from source instead, see §13.
 
 ## 4. Runtime architecture on Android
 
@@ -188,378 +173,257 @@ takes long — M0 exists to find out which of the two we get.
 
 - The APK loads `libbaucord_android.so`; `android_main` (in
   `crates/android/src/lib.rs`) runs on the Activity's native thread and
-  is the Slint event loop. It is called every time Android creates the
-  Activity.
-- The engine (`frontend::Host` — the network, voice and config
-  workers, §5) is created once per process in a `OnceLock` and
-  *attached* to whichever Activity is current. A rotated, backgrounded
-  or recreated Activity re-attaches; it never reconnects (D8). The
-  manifest still sets `configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode"`
-  so rotation does not recreate the Activity at all.
-- Voice needs the process alive with the screen off: while the user
-  is in a voice channel, Rust starts `VoiceService` (a foreground
-  service of type `microphone`) through JNI, and stops it on leave or
-  disconnect. Android ≥ 12 only allows that while the app is visible,
-  which it is at the moment of joining. The service shows the
-  persistent "In voice — <channel>" notification (with a Leave
-  action, M3) and holds a partial wake lock.
-- Chat-only sessions do not start the service; the connection lives
-  while the Activity does and the app reconnects on resume (the
-  desktop's reconnect path, with its backoff).
+  is the Slint event loop. It sets up the log and the panic hook (once
+  per process), points `client::config` at the app's private folder,
+  asks for the runtime permissions (§4.4), then runs
+  `frontend::app::run()` — and ends the process when that returns
+  (D11): the engine lives as long as the Activity, not beyond it (D8,
+  MOB-8). The manifest's `configChanges` list keeps rotation, the
+  keyboard, density, locale and the UI mode from recreating it.
+- **Off screen** the process and the connection are kept by
+  `VoiceService`, a foreground service started while connected (D34):
+  of type `microphone` in a voice room and `specialUse` in the lobby
+  (D63), with a partial wake lock in a room only, and a notification
+  that says so. A reconnect pending in the background keeps it.
+- What only feeds the screen — stats lines, GIFs, stream frames, the
+  device poll — stops while the app is off screen and comes back with
+  it (`set_host_visible`, D43).
 
 ### 4.2 Threads
 
 Same as desktop (`ARCHITECTURE.md`): Slint on the main thread, the
-network thread, the voice worker, plus AAudio's own callback threads
-for capture and render. No screen thread on Android (the `video` crate
-stubs already compile there).
-
-One phone-specific change: the network loop's wake floor. If it wakes
-every ≤ 1 ms while idle (verify in `client/src/network.rs`), it must
-instead sleep until the transport's next timer or the next channel
-message — a 1 kHz idle loop is a battery bug on a phone. Voice packets
-wake it every 20 ms anyway when it matters.
+network thread, the voice worker, the screen thread while a stream is
+watched (decoding only), plus AAudio's own callback threads for
+capture and render. The network thread sleeps until a datagram, a
+command or the transport's next timer (a `poll(2)` watcher on the
+socket, D43) — no idle polling. The audio workers run at Android's
+`THREAD_PRIORITY_AUDIO` (D24).
 
 ### 4.3 Lifecycle events
 
 `slint::android::init_with_event_listener` receives the
-`android-activity` poll events. The host handles:
+`android-activity` poll events; `lib.rs` handles:
 
-- `Resume` — re-check permissions (§10.2), rebind the socket if the
-  network changed while paused, resume the UI timers.
-- `Pause`/`Stop` — stop the UI timers; keep everything else.
-- `Destroy` — detach the Activity from the engine; if no voice
-  service is running the OS may kill the process, which is fine.
-- `LowMemory` — drop image caches (app-core already bounds them).
+- `Start` / `Stop` — `frontend::app::set_host_visible(true/false)`
+  (§4.1).
+- `Resume` — re-checks the runtime permissions and logs any still
+  missing.
+- `Destroy` — logged; the process ends after `run()` returns (D11).
+- `Pause`, `LowMemory`, focus and configuration changes — logged.
 
 ### 4.4 Permissions
 
-Runtime: `RECORD_AUDIO` (before the first voice join),
-`POST_NOTIFICATIONS` (before the first foreground service). Requested
-from Rust with `Activity.requestPermissions(String[], int)` over JNI
-(API 23+; no Kotlin) and re-checked with `checkSelfPermission` on every
-`Resume` — NativeActivity does not forward the result callback to
-native code, and re-checking on resume is the same information one
-frame later. Install-time (manifest only): `INTERNET`,
-`FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`, `WAKE_LOCK`,
-`MODIFY_AUDIO_SETTINGS`, `ACCESS_NETWORK_STATE`.
+Runtime: `RECORD_AUDIO`, and `POST_NOTIFICATIONS` from Android 13,
+asked for together at startup (D15) through
+`BaucordActivity.askPermissions` (D33) and re-checked on every
+`Resume`. A grant while connected restarts the service so its type
+and notification apply (D34). Install-time (the manifest): `INTERNET`,
+`ACCESS_NETWORK_STATE`, `MODIFY_AUDIO_SETTINGS`, `WAKE_LOCK`,
+`FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`,
+`FOREGROUND_SERVICE_SPECIAL_USE`.
 
 ## 5. The crate split
 
-`desktop/src/app.rs` is 8.3k lines: `AppState`, `wire_logic`, the
-timers, and a 6k-line `impl AppState` that turns client events into
-Slint model updates and Slint callbacks into client commands. The
-audit shows its desktop-only touch points are few and shallow: the
-tray (36 refs), media/share sources (13), video (10), sysinfo (8),
-settings/admin windows (14), viewers/present (15), updater (3),
-clipboard (3), `open::that` (2). Everything else is `client::` (207
-refs) and `slint::` (70) — portable.
+Done in 1.1.6. `crates/frontend` holds the client's whole UI logic
+(`AppState`, the event pump, the models, Settings, the stream viewer,
+`fill_tr`), shared by every host. What only a desktop has — the tray,
+global hotkeys, the updater, native dialogs, the system clipboard, the
+single instance — is behind its `desktop` feature, with same-API
+twins under `src/stubs/` for the phones; `cargo check -p frontend
+--no-default-features` builds the phones' version. `crates/desktop` is
+`main.rs` alone (ARCHITECTURE §7.1).
 
-### 5.1 `crates/frontend` (new)
+Where a phone needs the platform, the first draft's `Platform` trait
+became `frontend::host::Hooks` (`stubs/host.rs`), which each phone
+host installs at startup: pick a file, save a download, open a file
+or a link, keep alive (the service), keep the screen on, copy text,
+post and cancel notifications, play a chime. Android's implementation
+is `crates/android/src/host.rs` over `java.rs` (§10).
 
-Moves there, unchanged in behaviour: `AppState` and its `impl`, the
-event pump (`wire_logic`, `start_timers`, the wake latch), `fill_tr`,
-the helper structs and formatters at the bottom of `app.rs`, and
-`spawn_workers`. It depends on `client`, `audio`, `app-core`, `i18n`,
-`ui` and `slint` — never on anything desktop.
-
-What it cannot do itself goes behind one trait it is given at startup:
-
-```rust
-pub trait Platform {
-    fn open_url(&self, url: &str);
-    fn clipboard_text(&self) -> Option<String>;
-    fn set_clipboard_text(&self, text: &str);
-    fn config_dir(&self) -> PathBuf;
-    fn on_voice_state(&self, state: VoiceState);   // tray tooltip / foreground service
-    fn notify(&self, kind: Notice, text: &str);   // tray balloon / Android notification
-    fn share_sources(&self) -> Vec<ShareSource> { Vec::new() }   // desktop only
-    fn pick_files(&self) -> Vec<PathBuf> { Vec::new() }          // v2 on Android
-    fn system_stats(&self) -> Option<SystemStats> { None }
-}
-```
-
-Desktop implements all of it with what `app.rs` calls today; Android
-implements the first six with JNI (§10) and takes the defaults for the
-rest. `frontend` gets two cargo features: `desktop-windows` (the
-Settings/Admin/Viewer auxiliary windows and the code that drives them)
-and `share` (share sources, viewers, present). Android enables
-neither.
-
-### 5.2 `crates/desktop` after the split
-
-`main.rs` (env_logger, single instance, config dir, `frontend::run`
-with `DesktopPlatform`), `tray.rs`, `hotkeys.rs`, `clipboard.rs`,
-`instance.rs`, `updater.rs`, `media.rs`, `present.rs`, `viewers.rs`,
-`settingsui.rs`, `adminui.rs`, `resources.rs`. Nothing about chat or
-voice remains here. This is M1's deliverable and it ships to desktop
-users as a no-behaviour-change release before Android depends on it.
-
-### 5.3 `crates/ui`: one root per platform
-
-`ui/build.rs` compiles one root. A cargo feature `mobile` switches it
-from `slint/main.slint` to `slint/mobile/main.slint`. Both roots export
-the **same globals** (`State`, `Logic`, `Tr`) and the **same struct
-and enum names**, so `frontend` compiles against either without
-`cfg`s. The mobile root does not export the auxiliary windows; the
-`frontend` code that uses them is behind `desktop-windows`.
-
-### 5.3a Where the split stands (2026-09-18)
-
-Rounds 1–3 are done: `crates/frontend` holds the UI logic behind a
-`desktop` feature that gates eleven host-only crates; the host-only
-modules (`clipboard`, `hotkeys`, `updater`) have stub twins under
-`src/stubs/`; `host` is the seam for native dialogs and the system
-launcher; `app.rs` is split into ten child modules by concern
-(`events`, `commands`, `presence`, `session`, `menus`, `devices`,
-`conversations`, `chat`, `profiles`, `stats`). `cargo check -p
-frontend --no-default-features` passes on the host. Round 4 is the
-`Platform` trait of §5.1, replacing the stubs where Android needs a
-real implementation, and the `ui` crate's `mobile` feature (§5.3).
-Then M0.
-
-### 5.4 `crates/android` (new)
-
-As written in M0: `lib.rs` — `android_main`: the logging tee
-(`logging.rs`: `android_logger` to logcat *and* `baucord.log` in
-`internal_data_path()`, rolled at 5 MB — the client log has been the
-most useful artefact in every investigation; keep it), the desktop's
-panic hook, `slint::android::init_with_event_listener` (the listener
-narrates the lifecycle into the log and re-checks permissions on
-`Resume`), `client::config::set_config_dir`, the `RECORD_AUDIO`
-request, then `frontend::app::run()` — and `std::process::exit(0)`
-when it returns (§14, D11). `java.rs` — the calls in §10 (named `java`,
-not `jni`, so the module never shadows the crate); permissions only so
-far. `hello.rs` (feature `hello`) — the M0 smoke test. Still to come:
-the `OnceLock` engine of D8 (with the service, M3) and
-`audio_route.rs`. No `.slint` files here; they live in `ui`.
+The draft's separate mobile `.slint` root (a `mobile` feature in `ui`)
+was not needed: the one `main.slint` has a narrow layout and in-window
+pages (§9).
 
 ## 6. Audio on Android
 
 ### 6.1 Backend
 
-M0 finding: **cpal 0.18.2's Android host is AAudio already** (the
-`ndk` crate's `audio` feature plus JNI for the device list; oboe is
-gone), so the existing cpal path compiles and runs on the phone with no
-new C++ — that is what M0–M2 use. It opens streams without a usage or
-input preset, so the platform's AEC does not engage; M3 adds the
-native backend below for that, on the same `ndk::audio` API cpal uses.
+Two paths, chosen per session by the echo-cancellation plan
+(AEC-SPEC E3):
 
-`audio/src/native/aaudio.rs`, a third implementation of the
-`native/mod.rs` contract beside `wasapi.rs`: capture pushes device-rate
-mono `f32` into the `rtrb` ring and pings the wake latch after every
-packet; render pops from its ring and fans out; both count glitches
-into `AudioStats`, set the `*_stream_failed` flags and stop within
-~100 ms. cpal stays out of the hot path on Android exactly as it does
-on Windows; the `ndk` crate (0.9, features `audio`, `api-level-26`)
-gives `AudioStreamBuilder` with everything below.
+- **The call path** — `audio/src/native/aaudio.rs` on `ndk::audio`,
+  when echo cancellation is wanted (the loudspeaker or the earpiece
+  under Automatic, or Always): both streams `Usage::VoiceCommunication`,
+  capture with `InputPreset::VoiceCommunication`, **performance mode
+  None** and an allocated audio session (D46: a low-latency stream
+  without a session takes AAudio's MMAP path, which skips the
+  platform's effects), 48 kHz mono `f32` asked for and read back.
+  Capture and render feed the same rings as every backend
+  (`native/pump.rs`).
+- **The media path** — cpal's own AAudio host, as on the first builds,
+  for headphones under Automatic and for Off.
 
-```
-capture:  direction Input,  usage VoiceCommunication,
-          input_preset VoiceCommunication, performance_mode None,
-          session_id allocated (→ AcousticEchoCanceler on it, D46),
-          sharing Shared, format F32, channels 1, sample_rate unset,
-          data_callback → ring + latch, error_callback → restart (§6.3)
-render:   direction Output, usage VoiceCommunication, performance_mode
-          None, no session; same otherwise
-```
-
-Performance mode **None**, not LowLatency (D46): a low-latency stream
-without a session is what AAudio puts on its MMAP path, which skips
-the platform's effects, the echo canceller among them.
-
-`sample_rate` is left unset and read back from the opened stream; the
-workers already resample (rubato) to 48 kHz when the device rate
-differs. Buffer sizes: ask for `frames_per_data_callback` of 10 ms and
-accept what the device gives; the ring absorbs the difference.
+The playout cushion follows the device's callback size (D24), seeded
+from the render stream's `framesPerBurst` before the first callback
+(D51). In the lobby nothing is open at all, and a muted microphone is
+closed (D53).
 
 ### 6.2 Echo cancellation and the communication mode
 
-baucord has no AEC. On desktop that is fine (headsets); on a phone on
-speaker it is unusable. Android provides AEC, noise suppression and
-AGC in the platform when *both* streams are opened with
-`Usage::VoiceCommunication` and the input preset is
-`VoiceCommunication`, and `AudioManager.setMode(MODE_IN_COMMUNICATION)`
-is set (JNI, on join; back to `MODE_NORMAL` on leave). That is the
-whole AEC story for v1; it is OEM-dependent in quality and the risk
-list (§13) says how it is verified.
+On the call path `native/android.rs` (JNI) sets
+`MODE_IN_COMMUNICATION`, waits until the call is routed to the chosen
+device (D51), and creates an `AcousticEchoCanceler` on the capture
+session, switches it on and reads it back: that, not the device's
+claims, is what Settings → Audio and the log report (D46, AEC-SPEC
+E9). Leaving restores `MODE_NORMAL`.
 
 ### 6.3 Routes and device changes
 
-*Done (D31): the route control is Settings → Audio → Play sound on;
-`audio::route` decides, `native::android` applies.*
-
-There is no device list on Android; routing is the OS's. The settings
-pickers become a **route** control in the voice bar: Speaker /
-Earpiece / Headset (wired or Bluetooth, chosen automatically when
-present). API ≥ 31: `AudioManager.setCommunicationDevice`; below:
-`setSpeakerphoneOn`. Bluetooth headset *microphones* (SCO) are
-selected by the same call on 31+; on 29–30 they are not in v1.
-
-AAudio's error callback fires when the route changes or the stream is
-stolen (call, another app). The backend flags `*_stream_failed`; the
-worker's existing device-loss path reopens both streams (on the
-worker thread, never in the callback) and the UI shows nothing unless
-the reopen fails twice.
+Done (D31): Settings → Audio → *Play sound on* lists the routes
+(Automatic, Speaker, Phone earpiece, headsets by name); `audio::route`
+decides, `native::android` applies it with `setCommunicationDevice`
+(API 31+) or `setSpeakerphoneOn` plus `startBluetoothSco` (29–30). A
+route change re-plans and reopens both streams on the worker thread;
+a failed reopen is retried.
 
 ### 6.4 Processing chain
 
 The desktop chain (RNNoise → VAD → Opus, the bitrate ladder, RED/FEC,
-the jitter buffer) runs unchanged. Open question D-open-2: with the
-platform already suppressing noise, RNNoise on top is double
-processing and CPU; proposal is *off by default on Android*, setting
-retained. The speaking indicator is driven by RNNoise's VAD today;
-with RNNoise off it falls back to the energy VAD the encoder already
-has for that case (verify in M2).
-
-Thread priority: Android has no `SCHED_FIFO` for apps; the AAudio
-callback threads are already real-time. `platform.rs` gets an
-`android` branch that raises the voice worker with
-`libc::setpriority(PRIO_PROCESS, 0, -19)` (what
-`Process.setThreadPriority(THREAD_PRIORITY_URGENT_AUDIO)` does).
+the jitter buffer) runs unchanged. Open: with the platform already
+suppressing noise on the call path, RNNoise on top is double
+processing and CPU; it stays on until a recording says otherwise
+(AEC-SPEC D6 makes the same call on Windows).
 
 ### 6.5 Focus
 
-Request audio focus (`AUDIOFOCUS_GAIN_TRANSIENT`, usage
-`VoiceCommunication`) on join, abandon on leave (JNI). Losing focus to
-a phone call mutes capture and the UI shows "paused — call"; regaining
-it resumes.
+**Not done** (MOB-9): no audio focus and no call-state handling, so a
+cellular call plays over the room and the room hears silence. Planned:
+`AUDIOFOCUS_GAIN_TRANSIENT` (usage `VoiceCommunication`) on join,
+abandoned on leave; losing it mutes capture and the UI says "paused —
+call"; regaining it resumes.
 
 ## 7. Networking on Android
 
 The transport is the transport. `UdpIo` binds `[::]:0`/`0.0.0.0:0`,
-marks EF through `socket2` on the Unix path (allowed for apps; carriers
-strip it, harmless), probes GSO/GRO and falls back. Nothing in
-`transport` is `cfg`'d for Android specifically and nothing needs to
-be.
+marks EF through `socket2` (carriers strip it, harmless), probes
+GSO/GRO and falls back. Nothing in `transport` is `cfg`'d for Android.
+Servers listen on 51000 by default (`SESSION-GUIDE.md` §4, the
+Movistar case).
 
-What is phone-specific:
-
-- **Network change.** Wi-Fi ↔ cellular changes the client's address.
-  QUIC on the server side accepts the migrated path; the client
-  notices through the existing loss/timeout path and reconnects. v1
-  adds one improvement without Kotlin: on `Resume`, compare the
-  socket's local address with the current default route and rebind
-  if it moved. A `ConnectivityManager` callback (needs a Java
-  callback object) is v2.
-- **Keep-alive.** 2 s pings keep NAT bindings on cellular; the
-  foreground service keeps the radio in a usable state during voice.
-  Chat-only in the background is best-effort by design.
-- **Port.** Servers listen on 51000 by default now
-  (`SESSION-GUIDE.md` §4, the Movistar case); the connect screen's
-  placeholder says so.
+**Network change** (Wi-Fi ↔ cellular) changes the client's address:
+QUIC migration covers small moves, and otherwise the existing
+loss/timeout path reconnects with backoff. Not done (MOB-10): noticing
+the change itself — rebinding on `Resume` when the default route
+moved, or a `ConnectivityManager` callback. The 2 s keep-alive holds
+NAT bindings on cellular.
 
 ## 8. Config, identity, logs
 
-- `client::config` gets a directory override (`set_dir_override`)
-  called from `android_main` with `AndroidApp::internal_data_path()`.
-  `settings.json` and the device identity key live there, app-private.
-  `dirs::config_dir()` is not consulted on Android.
-- `android:allowBackup="false"`: the device key is a credential; it
+- `client::config::set_config_dir` points at
+  `AndroidApp::internal_data_path()`: `settings.json` and the device
+  identity key live there, app-private.
+- `android:allowBackup="false"`: the device key is a credential and
   must not travel through cloud backup to another device (the server
-  would see two devices with one key).
-- `baucord.log` in the same directory (same format, same rotation as
-  desktop) *and* logcat via `android_logger` at the same level; `adb
-  logcat -s baucord` is the live view, the file is what users send.
-- Locale: `sys-locale` on Android needs verifying in M1; the fallback
-  is reading `persist.sys.locale` / `Locale.getDefault()` over JNI and
-  handing it to `i18n` as desktop does with the OS locale.
+  would see two devices with one key). Device-to-device transfer is
+  not covered by it for apps targeting 31+; `dataExtractionRules` is
+  MOB-7.
+- `baucord.log` in the same folder (rolled at 5 MB) *and* logcat via
+  `android_logger`; `adb logcat -s baucord` is the live view. Users
+  reach the file through Settings → Debug: *Send log to server*, *Copy
+  log*, the last 100 lines (D47, D58).
+- Locale: `sys-locale` reads the system's on Android (seen on the
+  first phone build).
 
-## 9. The mobile UI
+## 9. The UI on Android
 
-### 9.1 Files
+### 9.1 One root, a narrow layout
 
-`crates/ui/slint/mobile/main.slint` is the root. It imports, unchanged:
-`widgets.slint`, `theme.slint`, `tr.slint`, `globals.slint`, and the
-components of `chat.slint` and `connect.slint` (row rendering, the
-composer, markdown/emoji, the server list). New, mobile-only:
-`mobile/shell.slint` (navigation), `mobile/voicebar.slint`,
-`mobile/channels.slint` (the sidebar as a page), `mobile/members.slint`,
-`mobile/settings.slint` (the phone subset as a page, not a window).
+The same `main.slint` as the desktop. Under 600 px of width (a phone
+upright) `MainWindow` shows the sidebar and the chat as two pages
+(D26); Settings (D22, D28) and the stream viewer (D23) are pages
+inside the one window, because Slint's Android backend has one window
+per process (D16). A separate mobile root (`ui/slint/mobile/`, the
+draft's bottom bar and voice bar) is not needed yet; it is PRD-7, for
+when the shared one stops fitting.
 
-### 9.2 Structure
+### 9.2 Touch
 
-One `Window`. Its content is offset by `safe-area-insets` (a `Window`
-property Slint's Android backend fills from the system bars; edge-to-
-edge is enforced at targetSdk 35+). Pages: **Connect** (server list,
-invite entry), **Channels**, **Chat** (the current channel or DM),
-**Members**, **Settings**. Navigation: a bottom bar with Channels /
-Chat / Members while connected; Settings from the top bar; the
-predictive back gesture pops a page (the backend delivers back as a
-key event). A persistent **voice bar** above the bottom bar while in
-voice: channel name, mute, deafen, route, leave.
+`State.touch-host` turns on what a finger needs: drag-to-pan in every
+scroll view (D27), controls that do not wait for a hover, long press
+for a chat row's menu (D64), and no push-to-talk, screen share or
+Keyboard section (D32). The pages keep inside the safe area and above
+the keyboard (`safe-area-insets`, `virtual-keyboard-*`; D35); Back
+reaches the UI's handlers through the focus chain (D26, D29).
 
 ### 9.3 Rules
 
-- Touch targets ≥ 48×48 dp; row heights from `theme.slint` scaled, not
-  redefined. Hover states are inert on touch; pressed states are what
-  users see.
-- Text sizes come from `theme.slint`; nothing below 14 sp.
-- The soft keyboard resizes the window (`adjustResize`); the composer
-  stays above it and the chat list keeps its bottom anchor.
-- Every new string goes in all three Fluent catalogs; a `Tr` one is
-  also a name in `tr.slint`, which `frontend/build.rs` turns into its
-  `fill_tr` line (the build fails when a catalog lacks it).
-- Every `.slint` change is checked with `slint-viewer --check` and
-  rendered at a phone viewBox (412×915 logical) before hand-over;
-  `mobile/main.slint` is added to the guide's check list.
+Every new string goes in all three Fluent catalogs; a `Tr` one is also
+a name in `tr.slint`, which `frontend/build.rs` turns into its
+`fill_tr` line (the build fails when a catalog lacks it). Every
+`.slint` change is checked with `slint-viewer --check` and rendered at
+a phone's width as well as 1000×640.
 
-### 9.4 Parity table (v1)
+### 9.4 Parity table
 
-| desktop | android v1 |
+| desktop | Android |
 |---|---|
-| sidebar (channels, users, DMs) | Channels + Members pages, DMs in Channels; until the mobile root: the sidebar and the chat as two pages of the narrow layout (D26, done) |
-| chat, history paging, unread, images inline, context menu | same (long-press opens the menu) |
+| sidebar (channels, users, DMs) | the sidebar as a full-width page, the chat as the second (D26) |
+| chat, history paging, unread, images inline, context menu | the same; long press opens a row's menu (D64) |
 | files, GIF picker, drag/paste | attachments of any kind through the system picker (images preview, the rest upload as cards), received files and saved pictures into Downloads, Open and links through the system (D30); no drag/paste |
-| voice: join, mute, deafen, per-user volume, device pickers | same; the output picker is the route control (D31, done); echo cancellation on the loudspeaker (D25); no push-to-talk (D32) |
-| settings window | Settings page — the desktop panel as a full-window page (D22, done), a section list and section pages at a phone's width (D28, done); the phone subset and the route control come with the mobile root |
-| admin panel, slash commands | slash commands only |
-| share, viewers | **viewing** works: the desktop viewer panel as a full-window page, decoded by MediaCodec (D23); sharing from the phone is absent (no encoder; the button is hidden on a touch host, D32) |
-| tray, keybinds, updater, single instance | absent; the foreground notification is the tray (D34, done) |
+| voice: join, mute, deafen, per-user volume, device pickers | the same; the output picker is the route control (D31); echo cancellation on the call path (D46); no push-to-talk (D32) |
+| settings window | the Settings page: a section list and section pages at a phone's width (D22, D28) |
+| admin panel, slash commands | slash commands only; `/reports` and `/resolve` for reports (D64) |
+| share, viewers | **viewing**: the viewer as a full-window page, decoded by MediaCodec (D23); sharing from the phone is absent (no encoder; the button is hidden on a touch host, D32) |
+| tray, keybinds, updater, single instance | absent; the foreground notification is the tray (D34) |
 
-## 10. The JNI surface and the Kotlin that remains
+## 10. The JNI surface and the Java that remains
 
-### 10.1 Kotlin (all of it)
+### 10.1 Java (all of it)
 
-`VoiceService.kt` (~60 lines): `onStartCommand` builds the
-notification (channel `voice`, low importance, ongoing) and calls
-`startForeground(id, notification, FOREGROUND_SERVICE_TYPE_MICROPHONE)`,
-acquires a partial wake lock; `onDestroy` releases it. It has no logic;
-the Leave action sends an intent the Rust side polls (M3).
+`android/app/src/main/java/dev/baucord/`, compiled by Gradle with the
+app; no Kotlin (D13). Their methods are called only from native code,
+so release builds keep R8 off.
 
-`AndroidManifest.xml`: the permissions in §4.4; the activity is
-`dev.baucord.BaucordActivity` (a `NativeActivity` subclass, D30) with
-`android.app.lib_name = baucord_android`, `launchMode="singleTask"`,
-`windowSoftInputMode="adjustResize"`, the `configChanges` list from
-§4.1, `exported="true"` with the launcher intent filter; the service
-`dev.baucord.VoiceService` (Java, D34) with
-`foregroundServiceType="microphone|mediaPlayback"`,
-`exported="false"`; `allowBackup="false"`. Scripts start the app the way
-the launcher does — resolve the LAUNCHER Activity, then start it by
-name — never by a hard-coded class (D37).
+- `BaucordActivity` — the `NativeActivity` subclass (D30): permissions
+  (D33), the file picker and its result (`nativeFilePicked`,
+  registered from Rust), Downloads through MediaStore, opening files
+  and links, the voice service, keeping the screen on (D45), the
+  clipboard (D58), notifications through `Notices`, and the
+  conversation a notification's tap opens.
+- `VoiceService` — the foreground service (D34, D63): its type from
+  the room, the notification, the wake lock in a room.
+- `Notices` — every notification's look, the message and
+  voice-activity notifications, and the ringer / Do Not Disturb check
+  before a chime (D52).
 
-`build.gradle.kts`: `compileSdk 36`, `minSdk 29`, `targetSdk 36`,
-`ndk.abiFilters` `arm64-v8a` (+ `x86_64` in debug), the signing config
-for release, and one `Exec` task that runs `cargo ndk` before
-`preBuild` so `./gradlew assembleRelease` builds the Rust too.
+`AndroidManifest.xml`: the permissions in §4.4; the activity
+`dev.baucord.BaucordActivity` with `android.app.lib_name =
+baucord_android`, `launchMode="singleTask"`, `windowSoftInputMode=
+"adjustResize"`, the `configChanges` list (§4.1),
+`enableOnBackInvokedCallback="false"` (D29), the launcher intent
+filter; the service `dev.baucord.VoiceService` with
+`foregroundServiceType="microphone|specialUse"` and the special-use
+explanation Play reviews (D63), `exported="false"`;
+`allowBackup="false"`. Scripts start the app the way the launcher
+does — resolve the LAUNCHER Activity, then start it by name — never by
+a hard-coded class (D37).
 
-### 10.2 Rust → Java calls (`crates/android/src/jni.rs`)
+`app/build.gradle.kts`: `compileSdk 36`, `minSdk 29`, `targetSdk 36`,
+`ndk.abiFilters` `arm64-v8a` (+ `x86_64` in debug), the Exec task that
+runs `cargo ndk` before `preBuild`, the launcher icon (D36), the
+version from the crates (D39), the native symbol table in release
+bundles (D62).
 
-All through the `jni` crate on the main thread, from
-`AndroidApp::vm_as_ptr()` / `activity_as_ptr()`:
+### 10.2 Rust → Java calls
 
-| call | for |
-|---|---|
-| `Activity.checkSelfPermission` / `requestPermissions` | §4.4 |
-| `Context.startForegroundService(Intent)` / `stopService` | §4.1 |
-| `AudioManager.setMode`, `setCommunicationDevice` / `setSpeakerphoneOn`, `requestAudioFocus` / `abandonAudioFocusRequest` | §6 |
-| `Intent(ACTION_VIEW, uri)` + `startActivity` | `Platform::open_url` (done as `BaucordActivity.openUrl`, D30) |
-| `BaucordActivity.pickFile` / `saveDownload` / `openUri` / `uriExists`, and `nativeFilePicked` back | files (D30) |
-| `ClipboardManager` | via Slint's backend (it already implements the clipboard) — `Platform` delegates |
-| `NotificationManager.notify` | `Platform::notify` (DM received while in voice, M3) |
-| `Locale.getDefault()` | §8 fallback |
-
-Everything else the app does is Rust.
+`crates/android/src/java.rs`, through the `jni` crate on the Activity
+`java::init` holds (D33), not on `ndk-context`'s Application:
+permissions, the voice service, the screen-on flag, the clipboard, the
+file picker, Downloads, opening files and links, notifications and the
+chime check. The audio crate makes its own calls from
+`audio/src/native/android.rs` (`AudioManager`'s mode, routes and
+devices, `AcousticEchoCanceler`) on `ndk-context`'s object, which is
+enough for those. Everything else the app does is Rust.
 
 ## 11. Build and sideload
 
@@ -573,12 +437,11 @@ cd android
 #   → app/build/outputs/apk/release/app-release.apk (signed if the
 #     BAUCORD_KEYSTORE properties are set, else -unsigned)
 
-# M0 smoke test instead of the client (toolchain only):
+# The smoke test instead of the client (the toolchain alone):
 ./gradlew assembleDebug -PcargoTargets=x86_64 -PcargoFeatures=hello
 
 # Only the Rust half, by hand (what the Exec task runs; cargo-ndk 4 syntax).
-# ANDROID_JAR must be set (§3): cargo-ndk's ANDROID_PLATFORM=29 would
-# otherwise send Slint's build.rs looking for platforms/android-29.
+# ANDROID_JAR must be set (§3).
 cargo ndk --target x86_64 --platform 29 \
   --output-dir android/app/src/main/jniLibs build -p android
 
@@ -590,65 +453,61 @@ adb shell run-as dev.baucord cat files/baucord.log   # debug builds only
 
 `android/run.ps1` (or `run.cmd`) chains all of this — build, start the
 AVD if needed, wait for boot, install, launch, `logcat` — with
-`-Device`, `-Release`, `-Hello`, `-Avd`, `-NoBuild` switches: the
-`cargo run` of the Android host.
+`-Device`, `-Release`, `-Hello`, `-Avd`, `-NoBuild`, `-ColdBoot`
+switches: the `cargo run` of the Android host (android/README.md §1b).
 
-`cargoTargets` and `cargoFeatures` default in `android/gradle.properties`.
-Until the permission request lands on the first voice join, a build
-whose dialog was dismissed can be fixed with
-`adb shell pm grant dev.baucord android.permission.RECORD_AUDIO`.
+Emulator: a **Google APIs x86_64, API 36** image. Extended controls →
+Microphone → "Virtual microphone uses host audio input" for voice. The
+Windows host is `10.0.2.2` from inside the emulator, so a local server
+is `10.0.2.2:51000`.
 
-Emulator: a **Google APIs x86_64, API 36** image; for the desktop UI
-that M0–M1 show, a tablet profile (Pixel Tablet) or a phone in
-landscape — the phone layout is M2. Extended controls → Microphone →
-"Virtual microphone uses host audio input" for voice. The Windows host
-is `10.0.2.2` from inside the emulator, so a local server is
-`10.0.2.2:51000`.
 Signing: one keystore generated once (`keytool`), kept out of the repo,
 referenced from `~/.gradle/gradle.properties`; a sideloaded update only
 installs over the previous one if the signature matches, so the key is
 permanent. It is also the key Play signs with and the upload key Play
 checks bundles against (PLAY-STORE.md §4): CI signs the APK and the
-bundle with it, after the build (D62). Versioning: `versionCode` counts up every build,
-`versionName` is the crates' version — `crates/android/Cargo.toml`'s,
-the same number every platform ships (D39).
+bundle with it, after the build (D62). Versioning: `versionCode` counts
+up every build (the run number in CI), `versionName` is the crates'
+version — `crates/android/Cargo.toml`'s, the same number every
+platform ships (D39).
 
 16 KB check before any release: `llvm-readelf -l libbaucord_android.so`
 shows `LOAD` alignment `0x4000`; NDK r28+ does this by default and the
-check is there to catch a regression.
+release workflow checks it.
 
 ## 12. Milestones
 
-| M | deliverable | done when |
+All five of the first draft's are behind us; what they left open is
+in PRODUCTION-PLAN.md.
+
+| M | was | became |
 |---|---|---|
-| M0 ✅ 2026-10-05 | toolchain + hello: `crates/android` shows a Slint page with the theme on the emulator (`ui/mobile` deferred, D14; the workspace `slint` entry needed no change, D12) | done on the x86_64 emulator: hello builds in ~1.5 min, Skia prebuilt downloads; the phone comes with the first `app` build |
-| M1 | the split: `frontend` extracted, `Platform` trait, desktop rebuilt on it | desktop 1.1.5 ships with no behaviour change; `frontend` has no desktop dependency |
-| M2 | connect + chat on Android: Connect, Channels, Chat, Members pages; history, unread, images. *Connecting, the roster and channels already work through the desktop root (2026-10-05); M2 is the phone layout.* | a DM and a channel conversation with desktop users work; `baucord.log` written; locale right |
-| M3 | voice: AAudio backend, AEC, route control, foreground service, focus, permissions | 30 min in voice on speaker with the screen off, no echo reported by the others, telemetry shows the ladder healthy |
-| M4 | resilience + settings: network change rebind, reconnect, Settings page, notifications for DMs in voice | Wi-Fi → cellular mid-call recovers under 10 s |
-| M5 | release: signing, `versionCode`, README section, the guide's Android rules | the three Movistar users run it for a week |
+| M0 | toolchain + hello | done 2026-10-05; `--features hello` (`hello.rs`) is still the smoke test for the pipeline |
+| M1 | the `frontend` split | done in 1.1.6 (§5) |
+| M2 | connect and chat, a phone layout | done with the narrow layout and in-window pages (D22, D26, D28) instead of a mobile root |
+| M3 | voice: AAudio backend, AEC, routes, the service, focus, permissions | done (D25, D31, D34, D46) except audio focus (MOB-9) and asking for the microphone at the first join (D15) |
+| M4 | resilience, Settings, notifications | Settings and notifications done (D22, D52); the network-change rebind is MOB-10 |
+| M5 | release | done: signed APK and AAB in CI (D21, D54, D62), the version from the crates (D39) |
 
-Viewing shares (MediaCodec H.264 decode) was pulled forward at the
-user's request and landed on 2026-10-06 (D23) ahead of M2–M3.
+Later, if wanted: a Leave/Mute action on the notification (MOB-13),
+tablet layouts, an in-app APK update (moot with Play), push-to-talk on
+hardware buttons. An updater for a sideloaded APK is not planned:
+Play updates the app (`frontend/src/stubs/updater.rs` is the
+no-update twin).
 
-Later (v2 candidates, in rough order): file cards with Save, `ConnectivityManager` callback, Leave
-action from the notification, tablet layout, in-app APK update,
-Bluetooth SCO on API 29–30, push-to-talk on hardware buttons.
+## 13. Risks
 
-## 13. Risks, and how each is retired
+| risk | where it stands |
+|---|---|
+| Skia has no prebuilt for our NDK/target and builds from source (30+ min, disk) | retired: the prebuilt downloads for `aarch64-linux-android` and `x86_64-linux-android`. If it ever builds from source, pin `SKIA_BINARIES_URL` |
+| Slint's Android IME: composition, autocorrect, Spanish accents | the composing word is handled (D48); typing works on the phones in use |
+| AEC quality varies by OEM | the canceller is read back on its own session (D46) and confirmed on a Galaxy S24 FE (2026-10-07); more makers as reports come |
+| Android kills the process in voice despite the service (OEM battery managers) | open; the foreground service holds on the phones tested. Document the "unrestricted battery" setting if a report comes |
+| the network loop's wakes on battery | retired (D43): ~10 wakes in a quiet second |
+| GSO on Android kernels | `quinn-udp` probes; no misbehaviour seen. If it ever does, cap `max_gso_segments` to 1 under `cfg(target_os = "android")` |
+| DSCP EF on cellular | expected to be stripped; no effect on correctness |
 
-| risk | when | how |
-|---|---|---|
-| Skia has no prebuilt for our NDK/target and builds from source (30+ min, disk) | M0 | mostly retired on paper: Slint 1.17.1 → skia-safe 0.99 asks for `gl,vulkan,textlayout` on Android, and rust-skia's binaries matrix publishes exactly that for `aarch64-linux-android` and `x86_64-linux-android` (built against API 26). The first `cargo ndk` run confirms; if it ever builds from source, pin `SKIA_BINARIES_URL` |
-| Slint's Android IME: composition, autocorrect, Spanish accents in the composer | M2 | type real text on a real phone in the first chat build |
-| AEC quality varies by OEM; some need `MODE_IN_COMMUNICATION` before the streams open | M3 | open streams after `setMode`; test on ≥ 3 makers |
-| `sys-locale`, `dirs`, `interprocess` or another desktop-shaped crate behind a `frontend` dependency | M1 | `cargo tree -p android --target aarch64-linux-android` must show none of desktop's |
-| the 1 ms network wake floor on battery | M2 | measure with Battery Historian / `dumpsys batterystats` |
-| GSO on Android kernels | M2 | `quinn-udp` probes; if the probe misbehaves, cap `max_gso_segments` to 1 under `cfg(target_os = "android")` |
-| Android kills the process in voice despite the service (OEM battery managers) | M3 | test on the OEMs at hand; document the "unrestricted battery" setting in the README |
-| DSCP EF on cellular | — | expected to be stripped; no effect on correctness |
-
-## 14. Decisions taken after this draft
+## 14. Decisions taken after the first draft
 
 **2026-10-05 — M0 written (awaiting its first build).** The
 `crates/android` cdylib, the `android/` Gradle project and the CI
@@ -668,7 +527,7 @@ cpal 0.18.2 uses it, cargo-ndk 4.1.2, android_logger 0.15.1). Decisions:
 | D11 | **`android_main` ends the process when the Activity is destroyed** (`std::process::exit(0)` after `run()`, as the desktop does) | Slint's platform is set once per process and Android may call `android_main` again in the same process (Back on the root page, then relaunch); a fresh process is correct until the foreground service makes the engine outlive the Activity (D8, M3), when Back must move the task to the background instead of finishing |
 | D12 | The workspace `slint` entry stays unchanged (§2.1) | Slint 1.17 target-gates winit and femtovg; nothing desktop reaches the Android target |
 | D13 | **No Kotlin in M0–M2**: the Gradle module has no Kotlin plugin and no source; `VoiceService.kt` arrives with M3 and the `kotlin-android` plugin with it | one fewer version to pin and one fewer thing to break on the first build |
-| D14 | The `ui` crate's `mobile` feature (§5.3) is deferred to M2 with the mobile root itself | a placeholder root re-exporting the desktop one adds a feature with no behaviour |
+| D14 | The `ui` crate's `mobile` feature is deferred to M2 with the mobile root itself (in the end not needed, §5) | a placeholder root re-exporting the desktop one adds a feature with no behaviour |
 | D15 | `RECORD_AUDIO` is requested at startup for now; M3 moves it to the first voice join (§4.4) | one fewer step to test voice on the emulator |
 | D16 | The auxiliary windows (Settings, admin panel, stream viewer) are refused on Android with a toast (`host-single-window`, in the three catalogs) via `frontend::app::SINGLE_WINDOW_HOST` | the backend hands every `Window` the same adapter; opening a second one would collide with the main window. Settings became a page (D22), the stream viewer too (D23); the toast now covers only the admin panel |
 | D17 | JNI lives in `crates/android/src/java.rs` (not `jni.rs`) | a module named like the crate it uses invites path ambiguity |
@@ -719,133 +578,36 @@ cpal 0.18.2 uses it, cargo-ndk 4.1.2, android_logger 0.15.1). Decisions:
 | D27 | **Touch scrolling** (2026-10-06): `crates/ui` compiles with `slint-build`'s default widget style, which is **fluent on every target, Android included** (the compiler falls back to fluent when no style is given; only an explicit `native` consults the per-target table that would say material) — and fluent's `ScrollView` builds its `Flickable` with `interactive: false`, so a drag never pans: on a phone nothing scrolled except through the 14 px scrollbar. Every `ListView`/`ScrollView` the phone reaches (chat, roster, Messages list, the Settings page) now binds `mouse-drag-pan-enabled: State.touch-host`. Verified headless with Slint's testing backend against 1.17.1 and the same style: without it a 200 px swipe moves the list 0 px; with it the list follows the finger and flings, and a press held past 500 ms before moving does not scroll (it selects text, as before). The desktop keeps panning off, so a mouse drag still selects | material would also pan, but restyles every std widget on the phone (pickers, fields, switches) for one property; this changes nothing else |
 | D26 | **The narrow layout: one page at a time** (2026-10-06): under 600 px of window width (a phone held upright) `MainWindow` shows the sidebar as a full-width list and the chat as a second page; tapping General or a DM (or opening one from a roster menu or `/dm` — `open_dm`) sets `State.narrow-chat-open` and the chat slides in from the right (220 ms push, the list leaves to the left), the chat header's ← (with the unread count of the other conversations on it) or Android's Back slides the list back. Both pages are placed by hand inside one `nav-keys` FocusScope, so `ChatPane` stays a persistent instance; Back is taken in its capture phase, and the scope is focused when the chat page opens or closes — **Back reaches only the focus chain**, so whatever closes a page or overlay must hand focus back (`focus-composer()`, now also called when the Settings and stream pages close) or the next Back finishes the activity. `State.touch-host` (set on a single-window host) makes `focus-composer()` keep the soft keyboard down — it focuses `nav-keys` unless the composer already has focus — and keeps the DM ✕ always visible (no hover on touch). Back also closes the image viewer, the context menu and every dialog, and saves-and-closes the Settings page. A session starts on the list | the parity table's separate Channels/Members/DM pages wait for the mobile root (D14); this gives a phone a usable chat with the same `.slint` and host code, and the width rule means a phone turned sideways, a tablet or a narrow desktop window simply get the layout their width suits |
 | D25 | **Echo cancellation on Android** (2026-10-06, `AEC-SPEC.md` §12 E1–E7): the voice-call streams of §6.1–6.2 exist now — `audio/src/native/aaudio.rs` (usage + preset `VoiceCommunication`, LowLatency, 48 kHz mono f32) and `native/android.rs` (JNI: `MODE_IN_COMMUNICATION` + speakerphone, output device types, `AcousticEchoCanceler.isAvailable`) — but only when the session wants them (`AecMode::Auto` = loudspeaker only; headphones and Off stay on cpal). Settings → Audio has the picker and a live status line. Type-checked on the host against the real `ndk` (its `test` feature compiles the bindings off-device) and `jni` crates; first device run pending. Not yet: the route control of §6.3 (the output is speaker unless a headset is connected), focus (§6.5), the foreground service | the phone on speaker was the worst echo case (§6.2); the media path is kept for headphones so Bluetooth stays A2DP |
-| D24 | **The playback cushion follows the device's callback size** (2026-10-05): `audio::output` keeps max(20 ms, largest callback + 10 ms) queued and tells the jitter buffer the pull burst (floor = callback − 10 ms); the audio workers run at nice −16 on Android. Details in the voice-breakup paragraph after the first-build log | a fixed 20 ms against AAudio's 20–40 ms callbacks was half silence; the formula is the desktop's old value whenever callbacks are ≤ 10 ms |
+| D24 | **The playback cushion follows the device's callback size** (2026-10-05): `audio::output` keeps max(20 ms, largest callback + 10 ms) queued and tells the jitter buffer the pull burst (floor = callback − 10 ms); the audio workers run at nice −16 on Android. Details in the voice-breakup paragraph after this table | a fixed 20 ms against AAudio's 20–40 ms callbacks was half silence; the formula is the desktop's old value whenever callbacks are ≤ 10 ms |
 | D23 | **Stream viewing on Android** (2026-10-06), two halves. *Decoder:* `video::mediacodec::MediaCodecDecoder` (`crates/video/src/mediacodec.rs`, `cfg(target_os = "android")`, `ndk` features `media` + `api-level-29`): one `video/avc` `AMediaCodec` in synchronous mode with **byte-buffer output** (no Surface — the picture stays on the existing `FrameReady → present-prep → Image` path), configured lazily on the first keyframe from the `EncodedFrame` size, fed whole Annex-B access units (in-band SPS/PPS before every IDR is what every encoder emits), drained newest-wins with a 4 ms wait; **`flush()` is a no-op** (the client flushes before every IDR, which already resets reference state — an `AMediaCodec_flush` there would drop the pictures in the pipeline every 2 s); codec errors and a keyframe with a new size rebuild the codec at the next keyframe. The output layout comes from the buffer format's `image-data` (`MediaImage2`, Codec2 and OMX both set it), else `color-format` 19/21 + `stride`/`slice-height`, cropped by `crop`; **`video::yuv`** (platform-free, unit-tested on the host) walks any 4:2:0 layout to RGBA with fixed-point BT.709/601/2020 limited/full picked from `color-standard`/`color-range` (default BT.709 limited — what the sender signals). `client::screen::create_decoder()` is `cfg`-split: FFmpeg on the desktop, MediaCodec on Android. *Viewer:* `viewer.slint`'s body became `StreamViewerPanel` (a `FocusScope`; `StreamViewerWindow` wraps it on the desktop); `MainWindow` shows one under `if State.watch-open`, below the settings page; `State.watch-*` carry name/frame/stats/mute/volume and `Logic.watch-*` the controls (wired once by `viewers::wire_page` from `app::run`); `viewers::Viewer` holds a private `Surface::{Window, Page}` and `handle_watch_peer` unwatches any other peer first on a single-window host (one page, one stream). Back stops watching (`Key.Back` in the panel), a tap wakes the chrome, the fullscreen control hides on the page | hardware decode without FFmpeg, ~6 ms of CPU per 1080p frame for the colour conversion (measured scalar on a 2.1 GHz Xeon; a NEON `yuv` crate is the upgrade if a phone can't keep 60 fps — 2026-10-08, MOB-18: a Galaxy A07 took 24–30 ms on the decode thread, so the planes now go to the present thread as they are and only the frame that will be shown is converted, over up to four cores), and the same `.slint` + host code on both hosts, as D22. A Surface-backed path (`AImageReader` or a native window under the Slint view) would skip the conversion but needs compositing Slint over video — not for v1 |
 
-What the first build will tell us, in order: whether the Skia prebuilt
-downloads (§13), whether cpal's AAudio host opens the emulator's mic,
-and whether the desktop `main.slint` is usable on a tablet AVD. Record
-each in SESSION-GUIDE.md §5 and here.
+**The first builds (2026-10-05).** Four attempts failed before Gradle
+and cargo-ndk agreed, each now a line of §3 or the session guide: a
+JDK 25 `JAVA_HOME` (`What went wrong: 25.0.3`), `ANDROID_HOME`
+pointing at Studio's runtime, cargo-ndk's `ANDROID_PLATFORM=29`
+sending Slint's build script after a `platforms/android-29` nobody
+installs (hence `ANDROID_JAR`), and Kotlin-DSL name collisions in
+`app/build.gradle.kts` (SESSION-GUIDE §4). The fifth built `hello` for
+x86_64 in 1m25s on the Skia prebuilt. Then the whole engine compiled
+first time and the client connected from a Pixel 10 AVD with the
+desktop `main.slint` as it was. The first signed arm64 build on a
+phone connected and chatted (in Portuguese: `sys-locale` works) but
+had no audio either way: the client dropped the whole engine when the
+microphone failed to open. It now keeps playback and retries the input
+every 2 s (SESSION-GUIDE §4).
 
-**First-build log (2026-10-05).** Attempt 1 died before Gradle read
-the project: `What went wrong: 25.0.3` after "Kotlin DSL script
-compilation (Settings/TopLevel/stage1)". That bare version string is
-Gradle's Kotlin compiler choking on an unsupported JVM — `JAVA_HOME`
-was Android Studio's `jbr`, a JDK 25, and Gradle 8.14 runs on 17–24.
-Fix: a Temurin JDK 21 as `JAVA_HOME` (§3), `gradlew --stop`, retry —
-confirmed working the same day. Android Studio needs the same choice
-made in its *Gradle JDK* setting, since it does not read `JAVA_HOME`.
-CI is unaffected (`setup-java` installs Temurin 17). Not taken:
-Gradle 9.1 + AGP 9 to keep JDK 25 — an unverified pair on top of an
-unbuilt project. Attempt 2 got as far as AGP: `Using Android SDK:
-D:\android\jbr` — `ANDROID_HOME` had been set to Studio's runtime
-directory instead of the SDK, and AGP then asked for Build-Tools
-35.0.0 (its default; the installed 36 does not substitute). Fix:
-`ANDROID_HOME`/`ANDROID_SDK_ROOT` to the SDK Manager's location,
-`ANDROID_NDK_HOME`/`ANDROID_NDK` under it, Build-Tools 35.0.0 ticked
-or `sdkmanager --licenses` so Gradle fetches it. Attempt 3 reached
-the Rust build and died in `i-slint-backend-android-activity`'s
-build.rs: "No Android platforms found". **cargo-ndk 4 exports
-`ANDROID_PLATFORM=<--platform>` (29, the NDK API level) to cargo's
-children, and the `android-build` crate reads that same name as the
-SDK platform to compile the Java helper against** — so it wanted
-`platforms/android-29/android.jar`, which nobody installs. It checks
-`ANDROID_JAR` first and cargo-ndk does not touch it: the Gradle Exec
-tasks now set `ANDROID_JAR` to `platforms/android-<compileSdk>/
-android.jar` under the SDK AGP resolves (`pointAtCompileSdkJar`), and
-a hand-run `cargo ndk` needs the variable set (§3). Not chosen:
-installing `platforms;android-29` (compiling the helper against an
-old SDK for no reason) or dropping `--platform` (cargo-ndk's default
-is 21, below minSdk). Attempt 4 tripped on three Kotlin-DSL name
-collisions in `app/build.gradle.kts` (`java` is the Java-plugin
-extension in a script, so `java.util.Properties` needs an import;
-`compileSdkVersion` inside `android { }` is AGP's deprecated String
-property and shadows a script val — now `baucordCompileSdk`).
-**Attempt 5: `BUILD SUCCESSFUL` for `hello` on x86_64 — 1m18s of
-Rust, 1m25s total; the Skia prebuilt downloaded (no "FULL BUILD"),
-so §13's first risk is retired.** AGP warned "Unable to strip the
-following libraries" — it had no `ndkVersion`; the module now sets it
-to the newest NDK under the SDK. **Installed and ran on a Pixel 10
-AVD (API 36.1, x86_64): the page renders, taps count, logcat shows the
-start line, `lifecycle: start/resume` and the `RECORD_AUDIO` check —
-i.e. `java.rs`'s jni 0.22 calls work. M0 is done.** Then the `app`
-build: **the whole engine compiled for x86_64 Android first time and
-the client connected to the official server from the Pixel 10 AVD —
-roster, channels, lobby → room, speaking indicators, voice received,
-41 ms RTT in the status line — with the desktop `main.slint` as is.**
-So M2's "connect" and M3's receive path are demonstrated on cpal's
-AAudio host without an Android-specific line of UI. Not yet tested:
-the microphone (emulator mic not enabled); observed: the chat pane
-overflows a portrait phone (the mobile root is M2's job), and the
-sidebar's memory figure read 1164 MB on the debug build — expected to
-be the unstripped `.so` with DWARF mapped in; re-read on the release
-build before treating it as a sysinfo-on-Android issue. Then the
-**signed arm64 release on a real phone**: connects, chat works, the
-toast is in Portuguese (`sys-locale` works), Mem 321 MB (so the debug
-figure was DWARF) — but **no audio either way**, and Settings / the
-stream viewer show the D16 toast as designed. Two client-side causes
-for the silence found by reading: `client/src/voice.rs` dropped the
-whole engine when `VoiceChat::start()` returned any `Err`, so a
-capture failure (no microphone permission yet) also killed playback —
-the audio crate's own comment warned of exactly this; and
-`VoiceChat::service()` never retried an input that had not opened
-(`input.is_some()` gate). Fixed: the client keeps the engine when
-`output_running()` and toasts "Microphone unavailable"; `service()`
-retries a pending input every 2 s (`input_pending`) and logs "Input
-started late". Whether playback itself also failed on the phone is
-what the next logcat says (`Voice output failed to start` vs `Voice
-input failed to start`).
-
-**Stream viewing on the emulator (2026-10-05, later).** Worked first
-run: `c2.goldfish.h264.decoder`, output layout `1920x1080 Y@0 s1920
-U@2073600 s960 V@2592000 s960` (I420 via `image-data`, BT.709
-limited), 336 pictures from 361 frames in 22 s. The emulator decodes a
-1080p frame in 20–70 ms (the goldfish codec pipes every frame through
-the host, and the dev profile builds the workspace at `opt-level = 1`,
-so the colour conversion runs 3× slower than measured), which is ~16
-fps and tripped the per-frame "Slow decode" / "SLOW FRAME" warnings
-on every frame — 652 of 729 log lines. Those are now once-a-second
-summaries (`video::timing::SlowFrames`, in the client and the
-frontend). The phone's hardware decoder is the real measurement. Same
-log, the voice line read `Underruns 162` in 6 s with `Lost 0` — first
-blamed on the emulator's audio clock; wrong, see the next paragraph.
-
-**Voice breaking up on Android (2026-10-05, D24).** The phone played
-voices but broke up constantly. Cause, in `audio::output`: the playback
-worker kept a fixed **20 ms** queued ahead of the device — two periods
-of a 10 ms desktop device — and AAudio outside low-latency mode asks
-for 20–40 ms per callback (cpal leaves `BufferSize::Default` there, and
-the performance mode at NONE without cpal's `realtime` feature). A
-40 ms callback against 20 ms queued is half silence on every callback;
-the emulator's steady ~25.6 underruns/s with zero loss was exactly one
-per ~39 ms callback. A 20 ms callback has zero margin, so any late
-worker wake is a gap. Fixes: the output callback records the largest
-callback it has served and the worker keeps **max(20 ms, callback +
-10 ms)** queued (`output::Cushion`, unit-tested; unchanged for ≤ 10 ms
-callbacks, so the desktop keeps its latency) and logs it once
-(`Output callbacks of N frames (X ms): keeping Y ms queued, jitter floor
-Z ms`); the jitter buffer learns the pull burst (`set_pull_burst`: floor
-= callback − one hop, 2 ms on desktop) so a low target cannot prime,
-play one hop and re-prime inside every burst (simulation test: 40 ms
-bursts against 20 ms arrivals play clean with the floor); and the audio
-worker threads take Android's `THREAD_PRIORITY_AUDIO` (nice −16,
-`platform::promote_current_thread`, logged per thread) instead of
-the nice −10 every thread of ours inherits from the activity's
-boosted main thread (the same level as the video threads). The AAudio
-callback thread itself is left alone (already audio-class).
-
-*Emulator, after the fix (same evening):* `Output callbacks of 2180
-frames (45.4 ms): keeping 55.4 ms queued, jitter floor 35.4 ms`; workers
-`nice -10 -> -16`; `Underruns` 21 → 178 over 48 s, i.e. ~4/s against
-~25.6/s before — one callback in five instead of every one, while the
-refill after a callback takes well under a millisecond. What is left
-fits back-to-back callbacks from the emulator's host-audio bridge (two
-45 ms requests inside one refill window need 90 ms queued); the phone's
-rate decides whether the cushion should also grow on underruns
-(AAudio's own tuning does: one burst per xrun). Lost 0, PLC 6 in 48 s,
-the emulator microphone sending. Cost: ~55 ms queued + a 35 ms jitter
-floor on a 45 ms-callback device, against ~22 ms on desktop — the price
-of AAudio's default mode until low-latency mode (M3). Next
-step if a device still breaks up: low-latency performance mode +
-`VoiceCommunication` usage, which needs our own AAudio builder (cpal
-exposes neither without its `realtime` feature) — M3's audio work.
+**Voice breaking up (2026-10-05, D24).** The phone played voices but
+broke up constantly. The playback worker kept a fixed 20 ms queued
+ahead of the device — two periods of a 10 ms desktop device — while
+AAudio outside low-latency mode asks for 20–40 ms per callback: a
+40 ms callback against 20 ms queued is half silence every time (the
+emulator's steady ~25.6 underruns/s with no loss was one per ~39 ms
+callback). Now the worker keeps max(20 ms, largest callback + 10 ms)
+queued (`output::Cushion`, unchanged for ≤ 10 ms callbacks, so the
+desktop keeps its latency) and logs it once (`Output callbacks of N
+frames (X ms): keeping Y ms queued, jitter floor Z ms`); the jitter
+buffer learns the pull burst (`set_pull_burst`: floor = callback − one
+hop) so a low target cannot prime, play one hop and re-prime inside
+every burst; and the audio workers take `THREAD_PRIORITY_AUDIO` (nice
+−16). On the emulator underruns fell from ~25.6/s to ~4/s, the rest
+fitting back-to-back callbacks from its host-audio bridge.

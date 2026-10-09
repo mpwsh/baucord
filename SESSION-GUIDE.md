@@ -53,8 +53,8 @@ Check with `which cargo` and `df -h /` first.
   workspace denies `clippy::all`; compare the pedantic warnings with a
   run before the change — new ones are yours), `cargo check -p frontend
   --no-default-features` (the phones' build of it), and the tests:
-  `cargo test -p protocol -p transport -p server` (85, 45 and 49 + 76
-  e2e on 2026-10-07, all green), plus `-p audio`, `-p client`,
+  `cargo test -p protocol -p transport -p server` (86, 45 and 51 + 88
+  e2e on 2026-10-09, all green), plus `-p audio`, `-p client`,
   `-p app-core`, `-p i18n` as touched.
 - **Android, Rust:** `RUSTC_BOOTSTRAP=1 cargo clippy -p audio --target
   aarch64-linux-android -Zbuild-std=std,panic_abort` checks the AAudio
@@ -144,6 +144,10 @@ wheel events dispatched before the frame is taken (§4 has the
 details). Its renders cannot show `transform-rotation` (the software
 renderer ignores it; the phones use Skia, which does not). Read PNGs
 back cropped to the region of interest — a full frame costs tokens.
+One such harness lives in the repository: `tools/chat-scroll-sim`
+(its own workspace; `CARGO_TARGET_DIR` outside the tree), which drives
+the real chat pane through the scrolling cases and writes screenshots
+with `SHOT=<dir>`.
 
 ### Handing over
 
@@ -362,7 +366,8 @@ Memory-mode servers (persistence off) still use the legacy
   handler on the chat ListView stacked into it while scrolling (every
   virtualization refinement is a round, and the `if`-gated delegates
   add a nested one per row). The owed follow is now a bounded 16 ms
-  `Timer` (`follow-ticks` ≤ 60) instead. Rule: no `changed` handler
+  `Timer` (at most 90 ticks; it stops after 8 frames at the end,
+  ANDROID-SPEC D66) instead. Rule: no `changed` handler
   on a property the ListView rewrites while scrolling.
 - **The horizontal scroll, found by bisecting renders:** a
   `ListView` sets its `viewport-width` to the max of its rows'
@@ -659,18 +664,15 @@ Memory-mode servers (persistence off) still use the legacy
   Slint's `DropArea` is for in-app drags on this backend. The hook
   may be set once per window, so new event kinds join the existing
   closure in `repaint_on_reveal`.
-- The DM ✕ does nothing because `dm-t` (the whole-row TouchArea) is
-  declared after the layout holding the button and sits on top of it;
-  the scrollbar collision is the `ScrollView`'s 14 px bar over a row
-  with 4 px right padding.
-- The chat scrollbar "sticks at the bottom": `changed viewport-height
-  => scroll-to-end` while pinned; dragging the thumb near the bottom
-  instantiates virtualized rows, the height refines, the pin snaps
-  back. The fix is a host-driven follow (set on append) rather than a
-  reaction to every geometry change.
-- An XP bar needed a wire change: `UserDetails` carries `level`
-  only, and `ProgressUpdate { xp, level }` goes to the user themself
-  on level-up. `UserProgress` (spec §12) now carries everyone's xp.
+- **The chat keeps to the newest message by the reader's input, never
+  by the scroll position** (ANDROID-SPEC D66). A `ListView` rewrites
+  its own `content-y` whenever its estimate of the rows it has not
+  laid out moves — up as often as down — so a position-based rule
+  lets go on its own. Only the list's `scrolled` and the pane's own
+  scrollbar (the stock one is off: it moved the list without
+  reporting it) count as the reader. Any change to the chat's
+  scrolling runs `tools/chat-scroll-sim` (48 checks against the real
+  pane).
 
 - **A phone's alert chime asks the host first** (ANDROID-SPEC.md D52,
   IOS-SPEC.md D50): the voice call's audio ignores the ringer and the
@@ -730,10 +732,10 @@ the next one) — both clear it now; chat preview textures follow the
 window's scale factor (`preview_max_edge`: 360² on a 1× display,
 720² only at 2×, a quarter of the memory per picture for most
 Windows users); avatars from other clients are clamped to 128² at
-decode (ours already are at pick time). Not done, and why: pooling
-`SharedPixelBuffer`s for the stream viewer needs the buffer back
-from a `slint::Image`, which the API does not give — the one 8 MB
-allocation per 1080p frame stays. Left to measure: the `StyledText`
+decode (ours already are at pick time). Since 1.1.9 the stream
+viewer reuses a ring of three `SharedPixelBuffer`s per stream and the
+decoders' buffers go round `video::pool` (ANDROID-SPEC D57), so the
+8 MB allocation per 1080p frame is gone too. Left to measure: the `StyledText`
 layouts of visible rows and Skia's glyph cache with color emoji,
 both only visible from a heap profile.
 
@@ -841,23 +843,44 @@ is in the repository's git history (the user's clone; uploads leave
 `.git` out); every decision in it is in the specs' decision logs.
 
 **Waiting on the phones** (the next logs should show these; record the
-outcome in the spec's decision log):
+outcome in the spec's decision log, then take the line out):
 
-- iPhone: `safe area: top 20 … (status bar 20)`; `VPIO voice
-  processing on` and `aec: platform (speakers)`, with nobody hearing
-  themselves (IOS-SPEC D46–D47).
+- iPhone: `safe area: top 20 … (status bar 20)` and the main page
+  below the status bar (IOS-SPEC D46); in voice on the loudspeaker
+  `VPIO voice processing on: 48000 Hz mono both ways, route Speaker`,
+  the voice-chat mode in `audio session: mode`, `aec: platform
+  (speakers)` and nobody hearing themselves — with headphones under
+  Automatic, `aec: none (headphones)` (D47); a phone call in the
+  middle, then `voice processing: interruption over; reopening`;
+  `lifecycle: background` and `host: app hidden` on leaving the app,
+  with voice carrying on (D42); whether the half-drawn glyphs come back
+  under `run.sh --renderer skia-software` (D40); on a stream, mute and
+  deafen from its bar, a pinch that follows the fingers (D44) and
+  `screen kept on (watching a stream)` (D45).
 - Android: `call routed to device N after M ms` (ANDROID-SPEC D51);
-  typing a word and sending it without a space (D48). The echo
-  canceller itself is confirmed (`echo canceller on`, a Galaxy S24 FE,
-  2026-10-07; D46).
+  typing a word and sending it without a space (D48); the service's
+  type following the room — `microphone` in it, `specialUse` in the
+  lobby — and a rejoin from the background falling back to the lobby's
+  type until the app is shown (D63). The echo canceller itself is
+  confirmed (`echo canceller on`, a Galaxy S24 FE, 2026-10-07; D46).
 - Both: a DM with the app in the background → a notification with the
   dog icon, a tap opens the conversation; on silent, no chime with the
   app open; someone joining empty rooms → "X joined Y" (ANDROID-SPEC
-  D52, IOS-SPEC D50).
+  D52, IOS-SPEC D50); on iOS, the permission prompt on the first
+  connect of a launch.
 - Both: no microphone indicator in the lobby; in a room it goes off on
-  mute and comes back on unmute, and the first words after unmuting
-  are heard (ANDROID-SPEC D53, IOS-SPEC D51); the battery over an hour
-  in the lobby with the screen off.
+  mute (iOS: `VPIO microphone muted on the unit`) and comes back on
+  unmute, and the first words after unmuting are heard (ANDROID-SPEC
+  D53, IOS-SPEC D51); the battery over an hour in the lobby with the
+  screen off.
+- Both, on speakers: a watched stream is heard and the volume buttons
+  change it (`Stream audio: playing through the voice output (call
+  path)`), the others hear no stream audio through the phone's
+  microphone, and headphones move it back (`back on its own output`;
+  ANDROID-SPEC D56, IOS-SPEC D52).
+- Both: a long press on a chat row opens its menu, and Block, Report
+  and Delete my account work from there and from Settings → Profile
+  (ANDROID-SPEC D64, IOS-SPEC D56).
 
 ## 6. Site screenshots
 

@@ -67,7 +67,9 @@ Working on the code? Start with [`START-HERE.md`](START-HERE.md).
 - **Text chat** — one room for the whole server regardless of voice
   channel, with message history, inline links, images, gifs, and an
   emoji picker. Images are relayed on a paced stream so a 10 MB paste
-  never dents anyone's voice
+  never dents anyone's voice. Joins, leaves and shares go to an
+  Activity view behind General's header instead of between the
+  messages
 - **Accounts without registration** — your device's key is your
   identity; an invite code lets a new key in, with the role the invite
   carries. Roles (built-in and custom, with badges), moderation (mute,
@@ -89,8 +91,9 @@ Working on the code? Start with [`START-HERE.md`](START-HERE.md).
 - **Stays connected** — a dropped session (Wi-Fi roam, ISP hiccup,
   server restart) reconnects on its own with backoff; short blackouts
   under 30 s don't even end the session
-- **Global hotkeys** — toggle mute, deafen, and screen share from any
-  window; rebind with live key capture
+- **Global hotkeys and push-to-talk** — toggle mute, deafen, and
+  screen share from any window, or hold a key to talk; rebind with
+  live key capture (desktop)
 - **Echo cancellation** — the platform's own canceller, verified on the
   stream that was opened (Windows and Android; written for iPhone and
   awaiting confirmation on a device)
@@ -403,8 +406,6 @@ what a user notices:
 
 - No end-to-end encryption: every hop is TLS-encrypted QUIC and the
   server is pinned, but the relay sees all media in the clear
-- Push-to-talk is reserved in the settings format but not implemented
-  yet — voice activation only for now
 - Phones get notifications only while the app stays connected; there is
   no push service yet, so a closed app hears nothing
 - Server addresses are IP:port only (no host names yet)
@@ -420,3 +421,13 @@ what a user notices:
   clearing) the pin in Settings; there is no accept/reject dialog yet
 - Screen sharing on Wayland falls back to slow screenshots; no echo
   cancellation on macOS or Linux yet
+
+## Licence
+
+baucord is Apache-2.0. A desktop build as a whole is distributed under
+the GNU GPL version 3, because it links FFmpeg and x264 statically; the
+phone apps do not. Every third-party part and its licence is listed in
+the apps (Settings → Licenses) and on the website
+([baucord.com/licenses.html](https://baucord.com/licenses.html)),
+refreshed by CI before every build — see
+[`licenses/README.md`](licenses/README.md).

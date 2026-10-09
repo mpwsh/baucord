@@ -1,33 +1,35 @@
 # baucord — Acoustic echo cancellation (AEC) technical spec
 
-Status: draft 1, 2026-09-15; implemented 2026-10-06 (§12) — Windows
-(Communications category), Android (voice-call streams with
-`AcousticEchoCanceler`, E9) and iOS (the VPIO unit, E10) as of 1.1.7.
-macOS, Linux and the stream's own audio are open (PRODUCTION-PLAN.md
-PRD-5, MOB-12). Start from `START-HERE.md`. Decisions in §1 are
-taken; §12 collects the ones taken after this draft, the way
-`PERSISTENCE-SPEC.md` §12 does.
+> **Status (2026-10-09):** in use on Windows (the Communications
+> category, §4), Android (voice-call streams with
+> `AcousticEchoCanceler`, E9) and iOS (the VPIO unit, E10); on the
+> phones a watched stream is cancelled with the voice (E12). Open:
+> macOS and Linux (§9, PRODUCTION-PLAN PRD-5), a software canceller
+> where the platform has none (§8), Windows' ducking on Windows 10
+> (E11, CLI-11). Decisions in §1 are the first draft's; §12 collects
+> the ones taken since, and wins where they differ. Start from
+> `START-HERE.md`.
 
 ## 0. Purpose and scope
 
 People on laptops using the built-in speakers and microphone send
-everyone else their own voices back. baucord has no echo cancellation
-today — not in software, and not from the OS, because of one omission
-(§2). This spec adds AEC with a **platform-first** design: every OS
-ships a tuned canceller that already has the hard part solved — the
-reference signal, i.e. knowing exactly what the speakers played and
-when — so the app asks the platform first and only carries its own
-canceller where the platform has none.
+everyone else their own voices back. Until 1.1.7 baucord had no echo
+cancellation — not in software, and not from the OS, because of one
+omission (§2). The design is **platform-first**: every OS ships a
+tuned canceller that already has the hard part solved — the reference
+signal, i.e. knowing exactly what the speakers played and when — so
+the app asks the platform first and would carry its own canceller
+only where the platform has none (§8).
 
-Windows first (§4), because it is where the users are and where the
-change is smallest. The contract (§3) is what macOS, Linux and Android
-implement later (§9); Android's `VoiceCommunication` path in
-`ANDROID-SPEC.md` §6 is this contract's third implementation.
+Windows came first (§4), because it is where the users are. The
+contract (§3) is what every platform implements: Android's
+`VoiceCommunication` path (`ANDROID-SPEC.md` §6) and iOS's VPIO unit
+(`IOS-SPEC.md` §6.3) are its second and third; macOS and Linux are
+§9.
 
 Out of scope: noise suppression and AGC beyond what the platform chain
-does (RNNoise stays as it is, §3.4), a software canceller in this
-release (§8 says how that decision gets made), any change to the
-encoder ladder.
+does (RNNoise stays as it is, §3.4), any change to the encoder
+ladder.
 
 ## 1. Decisions
 
@@ -41,19 +43,15 @@ encoder ladder.
 | D6 | RNNoise stays on by default; the setting is unchanged | the OEM chain's own NS is device-dependent; removing ours on faith would regress quiet-room users |
 | D7 | The fallback (§8) is chosen after the tier reports from the users' machines, not now | two candidates with different costs; the probe data decides |
 
-## 2. What happens today
+## 2. Why Windows had none
 
-`audio/src/native/wasapi.rs` opens capture and render with
-`initialize_client` and never sets a stream category, so the client is
-`AudioCategory_Other`. Windows applies its voice-processing chain —
-the OEM's APOs (Realtek, Intel, Synaptics, Cirrus ship AEC/NS/AGC on
-nearly every laptop) and, on Windows 11, Microsoft's own where the
-driver opted in — **only to streams in the `Communications` category**.
-So no AEC ever runs on our microphone, whatever the laptop has. Echo
-follows: the far end's voice leaves the speakers, enters the mic, is
-encoded and sent back to them 100–200 ms later.
-
-Headset users never hear this, which is why it has been tolerable.
+Windows applies its voice-processing chain — the OEM's APOs (Realtek,
+Intel, Synaptics, Cirrus ship AEC/NS/AGC on nearly every laptop) and,
+on Windows 11, Microsoft's own where the driver opted in — **only to
+streams in the `Communications` category**. `wasapi.rs` used to open
+its streams without a category (`AudioCategory_Other`), so no
+canceller ever ran on our microphone, whatever the laptop had. Headset
+users never heard the echo, which is why it was tolerable.
 
 ## 3. The contract, in the `audio` crate
 
@@ -86,24 +84,24 @@ of latency and possible ducking for one user, who can pick Off).
 
 ### 3.3 What the backend reports
 
-`AudioStats` gains:
+`AudioStats.aec` (E1):
 
 ```rust
 pub struct AecReport {
-    pub tier: AecTier,               // Platform { vendor }, Software(kind) [later], None
-    pub reference: Option<String>,   // the render endpoint used as reference, if known
+    pub mode: AecMode,
+    pub tier: AecTier,               // Platform, None (a software tier would join it, §8)
     pub output: OutputKind,
-    pub reason: &'static str,        // why this tier: "headphones", "off", "no effect on endpoint", …
+    pub reference: Option<String>,   // the render endpoint used as reference, if known
+    pub reason: &'static str,        // why this tier: `aec::reasons` ("headphones", "off", …)
 }
-pub enum AecVendor { Inbox, Oem, Unknown }
 ```
 
-Filled when the streams open, cleared when they close, refreshed on
-every reopen. `voice.stats_summary()` appends
-`aec: platform(oem) ref=Speakers (Realtek(R) Audio)` /
-`aec: none (headphones)` / `aec: none (no effect on endpoint)` to the
-10-second `audio stats:` line, and the settings page shows the same
-words under the picker so the user can see what they got.
+No vendor: Windows cannot tell an inbox canceller from an OEM one
+(E2). Filled when the streams open, refreshed on every reopen.
+`voice.stats_summary()` appends `aec: platform (speakers)` /
+`aec: none (headphones)` / `aec: none (no canceller on this device)`
+to the 10-second `audio stats:` line, and the settings page shows the
+same words under the picker so the user can see what they got.
 
 ### 3.4 The processing chain
 
@@ -137,10 +135,10 @@ wraps every call below. Verified in its source, not from memory.
      }
      tier = match client.get_audio_effects_manager()
                         .and_then(|m| m.get_audio_effects()) {
-       Ok(Some(effects)) if effects has ACOUSTIC_ECHO_CANCELLATION enabled
-                          => Platform { vendor: Oem | Inbox (§4.4) }
-       Ok(_)              => None ("no effect on endpoint")
-       Err(_)             => Unknown-vendor Platform if the category was set
+       Ok(Some(effects)) if effects has ACOUSTIC_ECHO_CANCELLATION on
+                          => Platform
+       Ok(_)              => None ("no canceller on this device")
+       Err(_)             => Platform, unverified, if the category was set
                              (Windows 10: no effects manager, effects may still run)
      }
 6. proceed as today (capture client, event handle, worker thread)
@@ -177,10 +175,8 @@ tooltip says which one applies.
 
 ### 4.4 Vendor
 
-`AUDIO_EFFECT` carries the effect's CLSID. Microsoft's inbox AEC has
-a known CLSID; anything else is `Oem`. If the effects manager is
-absent (Windows 10) the vendor is `Unknown`. This is reporting only;
-nothing branches on it.
+Dropped (E2): `AUDIO_EFFECT` carries the effect's *type*, not who
+implemented it, so the report says `platform` and nothing more.
 
 ### 4.5 Device and setting changes
 
@@ -237,13 +233,13 @@ changes checked and rendered before hand-over (guide §1).
 In order, each one recorded in the guide with machine and result:
 
 1. Laptop on speakers, one far-end talker: they must not hear
-   themselves. `/audio` shows `aec: platform(...)`.
+   themselves. `/audio` shows `aec: platform (speakers)`.
 2. Same laptop, headphones plugged: `aec: none (headphones)`, no
    ducking of other apps, sound as before.
 3. Plug/unplug during a call: the stats line flips within a second,
    no stream restart audible beyond the device change itself.
 4. A Windows 10 machine with a USB microphone and no OEM effects:
-   expected `aec: none (no effect on endpoint)` — this is the case §8
+   expected `aec: none (no canceller on this device)` — this is the case §8
    exists for; count how many users land here.
 5. Windows 11 22H2+: the log shows the reference endpoint accepted
    (`set_echo_cancellation_render_endpoint` succeeded).
@@ -271,37 +267,39 @@ the pick with the numbers.
 
 ## 9. Other platforms (the same contract)
 
-- **macOS**: `kAudioUnitSubType_VoiceProcessingIO` (VPIO) — AEC, NS
-  and AGC from the OS, needs a native CoreAudio backend beside
-  `wasapi.rs` (cpal's CoreAudio path does not expose the voice unit).
-  `OutputKind` from the output device's transport type / data source.
-- **Linux**: PipeWire's `module-echo-cancel` (WebRTC-based) does the
-  job system-wide when the user enables it; the app's part is the
-  Communications-equivalent stream role (`media.role = Communication`)
-  so PipeWire can apply it, and reporting whether the echo-cancel
-  source is what we opened. Without PipeWire, tier 2's software path.
-- **Android**: `Usage::VoiceCommunication` + `InputPreset::VoiceCommunication`
-  + `MODE_IN_COMMUNICATION`, as in `ANDROID-SPEC.md` §6; `OutputKind`
-  from the current route (speaker vs earpiece/headset). Both streams
-  in performance mode *None* and capture on an audio session of its
-  own, with an `AcousticEchoCanceler` created on that session and read
-  back (E9).
-- **iOS**: the VPIO unit in the `voiceChat` mode (`native::vpio`,
-  `native::avsession`; E10); `OutputKind` from the session route's
-  output ports.
+- **Android** (done, E4, E9): `Usage::VoiceCommunication` +
+  `InputPreset::VoiceCommunication` + `MODE_IN_COMMUNICATION`, as in
+  `ANDROID-SPEC.md` §6; `OutputKind` from the current route (speaker
+  vs earpiece/headset). Both streams in performance mode *None* and
+  capture on an audio session of its own, with an
+  `AcousticEchoCanceler` created on that session and read back.
+- **iOS** (done, E10): the VPIO unit in the `voiceChat` mode
+  (`native::vpio`, `native::avsession`); `OutputKind` from the session
+  route's output ports.
+- **macOS** (open, PRD-5): the same VPIO unit, with the device chosen
+  through `kAudioOutputUnitProperty_CurrentDevice` (E8) — cpal's
+  CoreAudio path does not expose the voice unit. `OutputKind` from the
+  output device's transport type / data source.
+- **Linux** (open, PRD-5): PipeWire's `module-echo-cancel`
+  (WebRTC-based) does the job system-wide when the user enables it;
+  the app's part is the Communications-equivalent stream role
+  (`media.role = Communication`) so PipeWire can apply it, and
+  reporting whether the echo-cancel source is what we opened. Without
+  PipeWire, tier 2's software path.
 
 Each reports through the same `AecReport`, so `/audio` reads the same
 on every OS.
 
-## 10. Files touched (1.1.5)
+## 10. Where it lives
 
-`audio/src/lib.rs` (`AecMode`, `OutputKind`, `AecReport`, `wants_aec`
-+ tests, `AudioStats`), `audio/src/native/wasapi.rs` (§4),
-`client/src/config.rs` (`echo_cancellation`, `logging.level`),
-`client/src/voice.rs` (stats line), `desktop/src/app.rs` +
-`settingsui.rs` (pickers, status, `fill_tr`), `ui/slint/settings.slint`,
-`ui/slint/tr.slint`, the three `.ftl` catalogs, `desktop/src/main.rs`
-(live log level), `README.md` (a paragraph under audio settings).
+`audio/src/aec.rs` (the contract and its tests: `AecMode`,
+`OutputKind`, `wants_aec`, `AecReport`, the output-kind classifiers),
+`audio/src/lib.rs` (`VoiceChat::plan_aec`, the report), the backends
+in `audio/src/native/` (`wasapi.rs`, `aaudio.rs` + `android.rs`,
+`vpio.rs` + `avsession.rs`), `client/src/config.rs`
+(`echo_cancellation`), `client/src/voice.rs` (the stats line),
+`frontend/src/settingsui.rs` and `ui/slint/settings.slint` (the picker
+and its status line).
 
 ## 11. Risks
 

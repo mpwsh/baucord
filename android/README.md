@@ -1,7 +1,7 @@
 # baucord for Android — building it
 
-The design is `../ANDROID-SPEC.md`; this is the checklist for the first
-build on a Windows machine with Android Studio. Nothing in this
+The design is `../ANDROID-SPEC.md`; this is the checklist for building
+it on a Windows machine with Android Studio. Nothing in this
 directory is Rust: `app/build.gradle.kts` runs `cargo ndk` on the
 `android` crate in `../crates/android` and packages what it produces.
 
@@ -20,8 +20,7 @@ directory is Rust: `app/build.gradle.kts` runs `cargo ndk` on the
      directory — `Using Android SDK: D:\android\jbr` in a Gradle
      error means the variable points at Studio's Java runtime.
    - *Virtual Device Manager*: create a device with a **Google APIs,
-     x86_64, API 36** image. For the desktop UI that M0–M1 show, pick a
-     **tablet** profile (Pixel Tablet) or run a phone in landscape.
+     x86_64, API 36** image (any phone profile).
 2. **Rust targets** — from inside the repo, so they land on the pinned
    1.95 toolchain (`rust-toolchain.toml`), not on `stable`:
    ```powershell
@@ -78,7 +77,7 @@ cd android
 .\run.ps1 -Avd "Pixel 10"   # a specific AVD (default: the running one, else the first)
 .\run.ps1 -Device           # the USB phone instead (arm64, debug)
 .\run.ps1 -Device -Release  # the signed release on the phone
-.\run.ps1 -Hello            # the M0 smoke test
+.\run.ps1 -Hello            # the smoke test (the toolchain alone)
 .\run.ps1 -NoBuild          # just reinstall + relaunch
 .\run.ps1 -ColdBoot         # full boot, skipping the AVD's quick-boot snapshot
 ```
@@ -116,9 +115,9 @@ adb shell monkey -p dev.baucord 1          # or tap the icon
 adb logcat -s baucord
 ```
 
-A dark page with "baucord — Android M0" and a button that counts taps
-means NDK, Skia, Java helper, Gradle and the emulator all work. Note
-the build time in the session guide.
+A dark page saying "Android M0 — toolchain hello" with a button that
+counts taps means NDK, Skia, Java helper, Gradle and the emulator all
+work.
 
 ## 3. Second build: the client
 
@@ -128,11 +127,10 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 adb logcat -s baucord
 ```
 
-This builds the whole engine for Android: expect the first compile
-errors of the project here (`crates/android/src/java.rs` is the
-likeliest place — paste the first `error:` with its `-->`). Once it
-runs: the usual connect screen; the emulator reaches a server on the
-Windows host at `10.0.2.2:51000`, and the real server by its invite.
+This builds the whole engine for Android (paste the first `error:`
+with its `-->` if it stops). Once it runs: the usual connect screen;
+the emulator reaches a server on the Windows host at
+`10.0.2.2:51000`, and the real server by its invite.
 Accept the microphone dialog (or `adb shell pm grant dev.baucord
 android.permission.RECORD_AUDIO`) and, in the emulator's *Extended
 controls → Microphone*, enable *Virtual microphone uses host audio
@@ -141,9 +139,9 @@ on a sharing user opens the viewer as a page (hardware H.264 decode
 through MediaCodec — the first `MediaCodec …: decoding video/avc`,
 `output layout` and `first picture` lines in logcat say which decoder
 the device picked and how its frames are laid out; Back or *Stop
-watching* leaves it). The admin panel still says "not available on
-Android yet" — it is a separate window on desktop and becomes a page
-later.
+watching* leaves it). The admin panel is a desktop window ("Not
+available on phones yet"); on a phone the slash commands stand in
+(`/reports` for reports).
 
 The log file is `files/baucord.log` inside the app's private
 directory; on a debug build `adb shell run-as dev.baucord cat
@@ -223,7 +221,7 @@ Release is **published**, `.github/workflows/android-release.yml`
 builds, in one Gradle run (`assembleRelease bundleRelease`, arm64):
 
 - **The APK**, signed with the release key, attached to the release as
-  `baucord-<tag>-android-arm64.apk` (`baucord-v1.1.9-android-arm64.apk`:
+  `baucord-<tag>-android-arm64.apk` (`baucord-v1.2.0-android-arm64.apk`:
   the desktop zips' pattern) and put on the website's R2 bucket beside
   the zips, where the download section links it.
 - **The app bundle for Google Play**, `baucord-<tag>-android.aab`,

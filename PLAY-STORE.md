@@ -14,19 +14,23 @@ before relying on it.
 
 ## 1. Where we stand, in one paragraph
 
-The app is technically close: it targets API 36 (what Play requires of
-new apps and updates since 2026-08-31), is 64-bit, passes the 16 KB
-page-size check in CI, has no self-updater on Android and asks for no
-restricted permission. What it lacks is everything around a *public*
-chat app: Play only accepts an **app bundle (AAB)** signed with an
-upload key (we build an APK), it requires **report and block** and
-**terms of use** for user-generated content, **in-app account
-deletion** plus a web page for it, a **privacy policy** and the
-**Data safety** form, a **declaration (with a video) of every
-foreground-service type**, and — for a new personal developer account —
-a **closed test with at least 12 testers opted in for 14 days in a
-row** before production can even be requested. Realistically four to
-six weeks from today, of which the 14-day test is the fixed part.
+The app side is done (2026-10-09, 1.2.0). It targets API 36 (what Play
+requires of new apps and updates since 2026-08-31), is 64-bit, passes
+the 16 KB page-size check in CI, has no self-updater on Android and
+asks for no restricted permission. CI builds the **app bundle (AAB)**
+beside the APK, both signed with the release key. The app has
+**report and block**, the **terms** on the connect card, **in-app
+account deletion**, the foreground service typed for review
+(`microphone` in a room, `specialUse` in the lobby) and the
+third-party notices with Slint's attribution. The website has the
+**privacy policy**, the terms and the **account-deletion page**. What
+is left is Play Console work: the account and its verification, Play
+App Signing with our key, the **Data safety** form, the
+**foreground-service declaration with a video**, the listing
+(MOB-16), the reviewers' access (MOB-17), and — for a new personal
+developer account — a **closed test with at least 12 testers opted in
+for 14 days in a row** before production can be requested. The 14-day
+test is the fixed part of what remains.
 
 ## 2. Decisions to take first
 
@@ -62,13 +66,11 @@ first two are hard to undo.
      `keytool -list -v -keystore baucord-release.jks` prints the
      algorithm and size (ANDROID-SPEC §11 does not record them).
 3. **Staying connected in the lobby** (§5).
-   - *Recommendation*: a `specialUse` foreground service while
-     connected outside a room — the type ntfy (on Play) uses for the
-     same job — and `microphone` while in a room; drop `mediaPlayback`.
-     Keeps "leave the app open and hear when someone connects" without
-     claiming a microphone it no longer opens (D53). If review objects
-     to `microphone` for calls, the fallback is the `phoneCall` type
-     with Android's Telecom APIs (§5).
+   - *Done in 1.2* (ANDROID-SPEC D63): `specialUse` while connected
+     outside a room — the type ntfy (on Play) uses for the same job —
+     and `microphone` in a room; `mediaPlayback` dropped. If review
+     objects to `microphone` for calls, the fallback is the `phoneCall`
+     type with Android's Telecom APIs (§5).
 4. **Who the reviewers talk to** (§7): the official server with a
    long-lived invite, or a separate review server.
    - *Recommendation*: the official server, a dedicated invite, a
@@ -87,10 +89,9 @@ first two are hard to undo.
    uploaded logs, the 10-second telemetry), and the wording for
    self-hosted servers, whose operators are not you. The privacy
    policy and the Data safety form are written from these answers.
-7. **Licences** (LEG-2, LEG-3), the part that touches the phone: the
-   Android app links Slint, not FFmpeg. Under Slint's royalty-free
-   licence the About panel needs `AboutSlint` (or the listing a "Made
-   with Slint" badge), and the APK/AAB needs third-party notices.
+7. **Licences** — *done in 1.2*: Slint under its royalty-free licence
+   with `AboutSlint` in Settings → About; the third-party notices in
+   Settings → Licenses (the Android app links Slint, not FFmpeg).
 
 ## 3. The path, step by step
 
@@ -124,46 +125,15 @@ Google, the engineering takes sessions.
 
 ### Step 2 — make the app pass review (the assistant; you test)
 
-In this order; each is a PRODUCTION-PLAN item.
+Done in 1.2.0 (PRODUCTION-PLAN §7): the AAB pipeline (MOB-5), the
+foreground service's types (MOB-11), report and block (MOB-4), delete
+my account (MOB-14), the terms on the connect card (MOB-15), the
+privacy, terms and account-deletion pages (LEG-5; live once
+`web.yaml` deploys them, and yours to approve — decision 6), and the
+licences (decision 7). Addresses for the Console: the privacy policy
+`https://baucord.com/privacy.html`, the *Delete account URL*
+`https://baucord.com/delete-account.html`.
 
-- [x] **MOB-5 — the store pipeline** (done 2026-10-08, ANDROID-SPEC
-  D62). `bundleRelease` runs beside `assembleRelease`. The AAB and
-  the APK for GitHub are both signed with the release key, after the
-  build. The AAB is a workflow artifact,
-  with the native debug symbols inside (Play's crash reports then show
-  Rust frames). Uploads are by hand for now; the Play Developer API
-  from CI can come once the app exists.
-- [x] **MOB-11 — the foreground service, for Play** (1.2, ANDROID-SPEC
-  D63): `microphone` in a room, `specialUse` in the lobby,
-  `mediaPlayback` gone; the `startForeground`-refused crash fixed; the
-  wake lock only in a room. **The Console's declaration changes with
-  it** (§5): remove *Media playback*, keep *Microphone*, add *Special
-  use*.
-- [x] **MOB-4 — report and block** (1.2). Block: a user's messages,
-  voice and DMs hidden for you, their DMs refused by the server, they
-  are not told. Report: a message or a user, with a reason, to the
-  moderators online at once and into the admin panel's Reports tab
-  (`/reports` on a phone), where kick/ban/delete act on it.
-- [x] **MOB-14 — delete my account** (1.2). Settings → Profile →
-  Delete my account: the server deletes the account and everything it
-  posted at once (messages deleted, not anonymized). The web page is
-  `https://baucord.com/delete-account.html` (the Console's *Delete
-  account URL*), with the email address for the official server.
-- [x] **MOB-15 — terms before user content** (1.2). Under the connect
-  button the app says "By connecting you agree to the terms and
-  conditions", linking `https://baucord.com/terms.html` (which defines
-  and prohibits objectionable content and says reports are acted on):
-  nobody posts without connecting first. One set for every server; a
-  server's own rules go in its greeting. (A first-connect "I agree"
-  dialog was tried in the 1.2 test builds and dropped for this line.)
-- [x] **LEG-5 — privacy policy, terms, account deletion pages** on the
-  website (`web/`), public, not a PDF, naming the app as the listing
-  does: `privacy.html`, `terms.html`, `delete-account.html`, linked
-  from the site's footer, signed 0x0 Studios (support@mpw.sh), live
-  once `web.yaml` deploys them. You approve them (decision 6). LEG-6
-  lists what would let the policy promise less.
-- [ ] **LEG-2 / LEG-3, phone part**: `AboutSlint` in About; notices
-  bundled and shown.
 - [ ] Recommended before testers arrive: MOB-8 (font size change ends
   the call), MOB-9 (cellular calls, audio focus), MOB-7 (keep the
   identity key out of device transfer). Play's pre-launch report runs
@@ -212,14 +182,14 @@ In this order; each is a PRODUCTION-PLAN item.
 An internal test can start before app setup is complete (checked
 2026-10-08): no store listing, no forms, possibly no review. It needs
 the account, an AAB, the signing choice and, because the app asks for
-the microphone, probably a privacy policy URL. The first one, 1.1.9:
+the microphone, probably a privacy policy URL. The first one:
 
 1. *Once:* check that the release key is RSA 2048+ (`keytool -list
    -v`). The three `BAUCORD_KEY*` secrets the APK already uses sign
    the bundle too; nothing to add.
-2. Publish the v1.1.9 GitHub release as usual. The android-release
-   run prints the key's SHA-256. Download
-   `baucord-v1.1.9-android.aab` from the run's *Artifacts*.
+2. Publish the GitHub release as usual. The android-release run
+   prints the key's SHA-256. Download `baucord-<tag>-android.aab` from
+   the run's *Artifacts*.
 3. Deploy the site (push `web/` to `main`) so the privacy policy is
    live.
 4. Play Console: *Create app* (`dev.baucord`, §3 step 3). Before
@@ -428,12 +398,13 @@ every future review (up to five sets of instructions).
 | | duration | depends on |
 |---|---|---|
 | Account registration and verification | days, sometimes more | Google |
-| Step 2 engineering | several sessions | decisions 2, 3, 6 |
-| Forms, listing, internal test | 2–3 days | Step 2 |
+| Step 2 engineering | done (1.2.0) | — |
+| Forms, listing, internal test | 2–3 days | MOB-16, MOB-17 |
 | Closed test | 14 days minimum | 12+ testers staying opted in |
 | Production review | usually ≤ 7 days | Google |
 
-Four to six weeks end to end if the decisions come early.
+From here, three to four weeks: the account and the forms in days,
+then the closed test's 14 days and the review.
 
 ## 9. Sources (checked 2026-10-07)
 
@@ -460,16 +431,16 @@ Four to six weeks end to end if the decisions come early.
 ## 10. Compliance check against six of Google's pages (2026-10-08)
 
 These are the pages the user sent, checked against the app as of 1.1.9
-(`applicationId` `dev.baucord`, decided). **Verdict:** nothing on
-these pages blocks us that is not already a planned item. The open
-ones are the AAB (MOB-5) and the signing setup (§4). The policy
-centre's own requirements are the §3 step 2 list.
+(`applicationId` `dev.baucord`, decided) and brought up to 1.2.0.
+**Verdict:** nothing on these pages blocks us. The open one is the
+signing setup (§4); the AAB came with MOB-5. The policy centre's own
+requirements were the §3 step 2 list, done in 1.2.
 
 | page | what it asks of us | where we stand | to do |
 |---|---|---|---|
-| Developer Program Policy (the index) | It summarises the policy areas. The detailed rules (UGC, account deletion, permissions, foreground services, Data safety) are the pages in §9. | Already mapped in §3: MOB-4 report and block, MOB-14 account deletion (the Data safety "deletion options" date was 2023-12-07), MOB-15 terms, LEG-5 privacy policy, MOB-11 service types — all done in 1.2. The manifest declares `microphone\|specialUse` (decision 3, D63). There are no ads, payments or third-party SDKs. Android has no self-updater and downloads no code. | §3 step 2 as written. In the listing, do not name or look like another chat app (impersonation, store listing policy). LEG-2/LEG-3 attributions and notices. |
+| Developer Program Policy (the index) | It summarises the policy areas. The detailed rules (UGC, account deletion, permissions, foreground services, Data safety) are the pages in §9. | Already mapped in §3: MOB-4 report and block, MOB-14 account deletion (the Data safety "deletion options" date was 2023-12-07), MOB-15 terms, LEG-5 privacy policy, MOB-11 service types — all done in 1.2. The manifest declares `microphone\|specialUse` (decision 3, D63). There are no ads, payments or third-party SDKs. Android has no self-updater and downloads no code. | In the listing, do not name or look like another chat app (impersonation, store listing policy). |
 | Advance notice to App Review (answer 6320428) | Advance notice is accepted only for 8 cases: third-party IP permission, government, healthcare, Korean gambling, accessibility services, non-profits, law enforcement, regulators. | None of them applies. There is no AccessibilityService in the manifest and no third-party brand assets. | Nothing. Google says other requests may get no reply. |
-| Android App Bundle (developer.android.com) | New apps must publish an AAB. Compressed download ≤ 4 GB. No `.obb` files. Sideloaded split APKs fail on Android 10+. | **Not yet**: CI builds an APK only (MOB-5). Size, `.obb` and dynamic resource tables are non-issues. The release build is not debuggable. | MOB-5: `bundleRelease`. Keep the GitHub APK *universal* (`assembleRelease`): never hand out the split APKs Play generates. |
+| Android App Bundle (developer.android.com) | New apps must publish an AAB. Compressed download ≤ 4 GB. No `.obb` files. Sideloaded split APKs fail on Android 10+. | Done (MOB-5, ANDROID-SPEC D62): CI builds the AAB beside the APK. Size, `.obb` and dynamic resource tables are non-issues. The release build is not debuggable. | Keep the GitHub APK *universal* (`assembleRelease`): never hand out the split APKs Play generates. |
 | Play App Signing terms | Publishing an AAB means using Play App Signing. You either give Google your key or it generates one. Google keeps a copy indefinitely. A key handed over cannot be retrieved. Google may generate and optimise APKs "for performance, security and/or size" but "will not change the purpose". Terms can change with notice. | Acceptable. We give our own key (§4) and keep our original. Play's APKs will not be byte-identical to our builds. | Accept them in the Console. |
 | Use Play App Signing (answer 9842756) | A new app starts on Google-generated (quantum-ready hybrid) keys. Change to your own **before a release reaches open testing or production**. Own key: **RSA ≥ 2048**. The upload key must be RSA ≥ 2048 and "should be different" from the signing key. 2-Step Verification for every Console user. Register the app-signing fingerprints with any API that checks them. Update `assetlinks.json` for App Links. | Plan matches (§4): our key for both Play and GitHub ("Option 2" on that page), also used as the upload key (allowed: Google says "should", not "must"). **Unverified:** the release key's algorithm and size. No Google sign-in, Maps or App Links (no `autoVerify` filter), so no fingerprints to register. | `keytool -list -v -keystore baucord-release.jks` must say RSA 2048+. Switch to our key before the first upload (allowed until open testing, but internal testers would have to reinstall). Turn on 2SV. |
 | Export compliance (answer 113770) | US export law may apply to encryption, including open source. You decide; Google blocks embargoed countries. | Standard cryptography only: TLS 1.3 over QUIC (rustls, ring), SHA-2, device keys. A free mass-market app: ECCN 5D992.c under §740.17(b)(1). Since BIS's 2021-03-29 rule this needs no licence and no self-classification report, and an email notification only for *non-standard* crypto. BIS's page still describes that notification for public source code. | Nothing to file for Play. If the source goes public, the BIS/NSA email is a few lines and cheap insurance. Not legal advice. The iOS side stays MOB-6. |

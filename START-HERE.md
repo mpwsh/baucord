@@ -63,13 +63,16 @@ for the work at hand (§3). Everything else is linked from here.
 - **Docs move with the code:** a decision goes into the matching spec's
   decision log (ANDROID-SPEC §14 D-numbers, IOS-SPEC §14, AEC-SPEC §12,
   PERSISTENCE-SPEC §12); a rule learned goes into SESSION-GUIDE §4; a
-  finished plan item moves to PRODUCTION-PLAN §7.
+  finished plan item leaves its list for one line in PRODUCTION-PLAN
+  §7. When something ships, the text that planned it is brought up to
+  what was built, so no document carries a plan that is already done.
 
 ## 3. The documents, and when to read them
 
 | file | what it is | read it |
 |---|---|---|
 | `START-HERE.md` | this | first, every time |
+| `prompt.md` | the message the user opens a session with | — |
 | `SESSION-GUIDE.md` | the working manual: sandbox setup and checks (§1), the crate map (§2), what shipped (§3), rules learned (§4) | every session; §4 by area |
 | `PRODUCTION-PLAN.md` | the prioritized list of what is left, the decisions waiting on the user, what was done | every session |
 | `PLAY-STORE.md` | the route to Google Play: decisions, account, signing, forms, the closed test, what each step needs | before Play or Android release work |
@@ -78,14 +81,16 @@ for the work at hand (§3). Everything else is linked from here.
 | `PERSISTENCE-SPEC.md` | the 1.1 design (accounts by device key, invites, roles, history, DMs, files, profiles, admin) — all shipped; §12 is every later decision | before touching admission, roles, history, DMs, files |
 | `AEC-SPEC.md` | echo cancellation on every platform; §12 the decisions (E1…) | before audio-path work |
 | `LATENCY-SPEC.md` | the desktop voice latency budget and what could still be cut (LAT-1…9), parked 2026-10-08 | before latency work |
-| `ANDROID-SPEC.md` | the Android client; decisions D1…D9 in §1, D10…D62 in §14 (its second table newest first) | before Android work |
-| `IOS-SPEC.md` | the iPhone client; decisions D1…D13 in §1, D14…D55 in §14 (in order) | before iOS work |
+| `ANDROID-SPEC.md` | the Android client as it is (§0–§13); decisions D1…D9 in §1, D10…D66 in §14 (from D23 on, newest first) | before Android work |
+| `IOS-SPEC.md` | the iPhone client as it is (§0–§13); decisions D1…D13 in §1, D14…D56 in §14 (in order) | before iOS work |
 | `android/README.md`, `ios/README.md` | building, running and releasing each phone app | when the user builds |
+| `licenses/README.md` | the third-party notices: what writes them, what CI does | before adding a native library |
+| `tools/chat-scroll-sim/` | the chat pane's scrolling harness (ANDROID-SPEC D66) | before touching the chat's scrolling |
 
-The specs keep their first draft at the top and a decision log at the
-end. **Where the draft and the log disagree, the log is right** (the
-Android draft's "no stream viewing in v1", for instance, was overtaken
-by D23).
+The specs describe what is built at the top and keep a decision log
+at the end: why each thing is the way it is, in the order it was
+decided. **Where the text and the log disagree, the log is right** —
+and the text is then out of date: fix it.
 
 ### Reading order by task
 
@@ -96,10 +101,10 @@ by D23).
   rules in §4; ARCHITECTURE §7.
 - **Audio** — AEC-SPEC; ARCHITECTURE §7.3; ANDROID-SPEC D24, D46, D51;
   IOS-SPEC D47.
-- **Android** — ANDROID-SPEC §14's second table (newest decision
-  first), then android/README.
-- **iPhone** — IOS-SPEC §14 from its end backwards (newest last), then
-  ios/README.
+- **Android** — ANDROID-SPEC §0–§13, then §14 from its newest
+  decision; android/README.
+- **iPhone** — IOS-SPEC §0–§13, then §14 from its end backwards
+  (newest last); ios/README.
 - **Hardening and release** — PRODUCTION-PLAN §2–§3, `.github/workflows/`,
   readme's "Deploying a server".
 - **Google Play** — PLAY-STORE.md (§2 decisions first), then
@@ -138,10 +143,12 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
 ## 5. Where things stand (2026-10-09)
 
 - **Version 1.2.0** in the crates (released: 1.1.9); the crate map is
-  SESSION-GUIDE §2. 1.2 adds what the stores require of a chat app:
-  block, report, delete my account, the terms on the connect card
-  (PERSISTENCE-SPEC §12 S1), and Android's foreground service typed
-  for Play (ANDROID-SPEC D63).
+  SESSION-GUIDE §2, the list of what it carries SESSION-GUIDE §3. 1.2
+  adds what the stores require of a chat app — block, report, delete
+  my account, the terms on the connect card (PERSISTENCE-SPEC §12 S1),
+  Android's foreground service typed for Play (ANDROID-SPEC D63), the
+  third-party notices (Settings → Licenses) — and the chat's
+  stickiness by input (D66) and General's Activity view (D65).
 - **Desktop**: in production (Windows mostly), self-updating.
 - **Android**: voice with the platform echo canceller, chat, DMs,
   files, stream viewing (MediaCodec), Settings → Debug, notifications
@@ -156,6 +163,5 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
   roles, the admin panel.
 - **Next**: Google Play's closed test with 1.2.0 (PLAY-STORE.md: the
   Console's foreground-service declaration changes, the Data safety
-  form, the account-deletion URL); PRODUCTION-PLAN.md Milestone A
-  (server and client hardening, signed updates), then the licence
-  decisions.
+  form, the account-deletion URL, the listing); then PRODUCTION-PLAN.md
+  Milestone A (server and client hardening, signed updates).
