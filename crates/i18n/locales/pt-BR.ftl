@@ -415,6 +415,10 @@ duration-forever = Até ser removido
 menu-edit-message = Editar mensagem
 menu-delete-message = Apagar mensagem
 chat-editing = Editando sua mensagem — Enter salva, Esc cancela
+chat-new-messages = { $count ->
+    [one] 1 mensagem nova
+   *[other] { $count } mensagens novas
+}
 chat-load-earlier = Carregar mensagens anteriores
 chat-loading = Carregando…
 chat-no-earlier = Não há mensagens anteriores.

@@ -25,10 +25,24 @@ impl AppState {
             let row = self.chat_row_at(i);
             self.chat_model.push(row);
         }
-        if delta.appended > 0 {
-            // A reader at the bottom follows the new rows once the
-            // list has measured them (see `ChatPane.follow-appended`).
-            self.main.invoke_chat_follow_appended();
+        if delta.appended == 0 || self.borrowed_conversation {
+            return;
+        }
+        // A reader at the bottom follows the new rows once the list has
+        // measured them (`ChatPane.follow-appended`); one scrolled up
+        // is told how many messages from others they have not seen.
+        let following = self.main.invoke_chat_follow_appended();
+        let fresh: HashSet<u64> = self.history.rows()[len - delta.appended..]
+            .iter()
+            .filter_map(app_core::chat::ChatItem::meta)
+            .filter(|m| !m.own && !m.pending)
+            .map(|m| m.id)
+            .collect();
+        if !following && !fresh.is_empty() && !self.activity_shown() {
+            let s = self.main.global::<State>();
+            let count = usize::try_from(s.get_chat_new_count()).unwrap_or(0) + fresh.len();
+            s.set_chat_new_count(i32::try_from(count).unwrap_or(i32::MAX));
+            s.set_chat_new_label(t!("chat-new-messages", "count" => count).into());
         }
     }
 
@@ -151,9 +165,11 @@ impl AppState {
             return f(self);
         }
         let active = self.active_dm;
+        let borrowed = std::mem::replace(&mut self.borrowed_conversation, true);
         self.swap_in(key);
         let out = f(self);
         self.swap_in(active);
+        self.borrowed_conversation = borrowed;
         out
     }
 

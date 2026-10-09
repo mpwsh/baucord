@@ -1015,15 +1015,18 @@ export component ChatPane inherits Rectangle {
     public function scroll-to-end() {
         list.content-y = -Math.max(0px, list.content-height - list.visible-height);
     }
-    /// Pin and go to the newest row: after sending, and after a
-    /// conversation switch.
+    /// Stick to the newest row and go there: after sending, a
+    /// conversation switch, the jump button, the new-messages pill.
     public function pin-to-bottom() {
-        root.stick-to-bottom = true;
+        root.hold-bottom();
         root.follow-pending = true;
         root.scroll-to-end();
     }
-    /// True when the user is at (or within ~40px of) the bottom — the
-    /// shell asks before appending, to preserve read position.
+    /// Whether new rows are followed (the reader is at the newest).
+    public pure function following() -> bool { return root.stick-to-bottom; }
+    /// How far the view is from the newest row (0 at the bottom).
+    public pure function bottom-gap() -> length { return list.gap(); }
+    /// True when the user is at (or within ~40px of) the bottom.
     public pure function at-bottom() -> bool {
         return list.content-height <= list.visible-height
             || list.content-y <= -(list.content-height - list.visible-height - 40px);
@@ -1033,43 +1036,104 @@ export component ChatPane inherits Rectangle {
     public function composer-set-cursor(pos: int) { input.set-cursor(pos); }
     public function composer-cut() { input.do-cut(); }
     public function composer-copy() { input.do-copy(); }
-    /// The host appended rows: if the reader was at the bottom, follow
-    /// them — on the layout pass that measures them, not now (a
-    /// scroll-to-end right after a push reads the old height).
-    public function follow-appended() {
+    /// The host appended rows to the conversation on screen. A reader
+    /// stuck to the bottom follows them (on the layout pass that
+    /// measures them: a scroll-to-end right after a push reads the old
+    /// height); `false` means they are scrolled up, and the host counts
+    /// what they have not seen (`State.chat-new-count`).
+    public function follow-appended() -> bool {
         if (root.stick-to-bottom) { root.follow-pending = true; }
+        return root.stick-to-bottom;
     }
 
-    // Maintained by the ListView's changed-handlers below; also drives
-    // the jump-to-latest button.
+    // How the list stays at the newest row, and lets go of it.
+    //
+    // Slint's ListView only estimates the height of rows it has not
+    // laid out (the average of the ones on screen, times the row
+    // count), and it rewrites `content-y` itself whenever that
+    // estimate moves: a picture laid out, a row added, the last rows
+    // reached after a jump. Those rewrites go up as often as down, so
+    // the position alone cannot tell the reader's hand from the list's
+    // bookkeeping. Reading "content-y went up" as "the reader scrolled
+    // up" is what let go of the bottom right after the jump button,
+    // and on new messages, with nobody touching anything.
+    //
+    // So the reader is known by input, not by position: the list's
+    // `scrolled` fires only for a wheel, a drag or a fling, and the
+    // pane draws its own scrollbar, which says so too (the stock one
+    // moved the list on a wheel over it without a word). While
+    // the reader's hand is on the list (`user-scrolling`, until the
+    // position has been still for 200 ms) moving away from the bottom
+    // lets go and coming within 48px of it holds; nothing follows
+    // against them. Otherwise only one thing changes the state: being
+    // at the very bottom holds it. While held, any change in height —
+    // new rows, a picture decoded, a page put in front, an estimate
+    // settling, the keyboard opening — is followed down.
     private property <bool> stick-to-bottom: true;
-    // A follow is owed: appended rows (or a pin) are waiting for the
-    // ListView to measure them. Cleared once the exact bottom is
-    // reached, or the moment the reader scrolls up.
+    private property <bool> user-scrolling: false;
+    private property <length> user-last-y;
+    private property <int> user-still-ticks: 0;
+    // A follow is owed: the list is to be taken to its end until the
+    // end stops moving.
     private property <bool> follow-pending: false;
-    // Nudge to the end once a frame until it lands — a timer, not a
-    // `changed content-height` handler: that one ran on every
-    // virtualization refinement while scrolling and stacked into the
-    // runtime's "long callback/instantiation chain" warning. Bounded,
-    // so a follow that can never land does not tick forever.
-    // The ListView estimates the height of rows it has not drawn yet:
-    // a tall last row (a picture) lands "at the bottom" of an estimate
-    // and grows once it is measured. So the follow is not done at the
-    // first exact bottom — it holds there for a few frames and lets
-    // the measurement settle.
+    // Nudge to the end once a frame until it lands — a timer, not
+    // scrolling from a `changed` handler, which chained with the
+    // ListView's own updates into the runtime's "long callback chain"
+    // warning. The last rows' heights are estimates until they are
+    // laid out, so the follow is not done at the first exact bottom:
+    // it holds there for 8 frames. Bounded, so a follow that can never
+    // land does not tick forever.
     private property <int> follow-ticks: 0;
     private property <int> follow-settled: 0;
+
+    // The reader moved the list: whatever follow was owed is theirs to
+    // decide now.
+    function reader-moves() {
+        root.user-scrolling = true;
+        root.user-still-ticks = 0;
+        root.user-last-y = list.content-y;
+        root.follow-pending = false;
+    }
+    function hold-bottom() {
+        root.stick-to-bottom = true;
+        State.chat-new-count = 0;
+    }
+    function let-go() {
+        root.stick-to-bottom = false;
+        root.follow-pending = false;
+        root.follow-ticks = 0;
+        root.follow-settled = 0;
+    }
+
     Timer {
         interval: 16ms;
-        running: root.follow-pending;
+        running: root.follow-pending && !root.user-scrolling;
         triggered => {
             root.scroll-to-end();
             root.follow-ticks += 1;
-            root.follow-settled = list.at-exact-bottom() ? root.follow-settled + 1 : 0;
+            root.follow-settled = list.gap() <= 2px ? root.follow-settled + 1 : 0;
             if (root.follow-settled >= 8 || root.follow-ticks > 90) {
                 root.follow-pending = false;
                 root.follow-ticks = 0;
                 root.follow-settled = 0;
+            }
+        }
+    }
+    // The reader's hand left the list once the position has been still
+    // for 200 ms (a wheel step animates for 180 ms, a fling longer).
+    // Ending at the bottom holds it; held, the end is followed again.
+    Timer {
+        interval: 50ms;
+        running: root.user-scrolling;
+        triggered => {
+            root.user-still-ticks = Math.abs(list.content-y - root.user-last-y) < 0.5px
+                ? root.user-still-ticks + 1 : 0;
+            root.user-last-y = list.content-y;
+            if (root.user-still-ticks >= 4) {
+                root.user-scrolling = false;
+                root.user-still-ticks = 0;
+                if (list.gap() <= 2px) { root.hold-bottom(); }
+                if (root.stick-to-bottom) { root.follow-pending = true; }
             }
         }
     }
@@ -1259,7 +1323,7 @@ export component ChatPane inherits Rectangle {
 
         // The history, and over an empty one a word on what this place
         // is and what to do (the composer is right below).
-        Rectangle {
+        list-box := Rectangle {
             vertical-stretch: 1;
             list := ListView {
                 width: 100%;
@@ -1269,65 +1333,46 @@ export component ChatPane inherits Rectangle {
                 // (a mouse drag selects). A finger has nothing else to scroll
                 // with, so a touch host turns panning on (ANDROID-SPEC.md D27).
                 mouse-drag-pan-enabled: State.touch-host;
-                // Follow the tail reactively: while the user sits at the
-                // bottom, content growth (new rows, GIF reflow) and window
-                // resizes keep the newest message in view; scrolling up
-                // unpins, scrolling back to within 40px re-pins. These fire
-                // AFTER the layout recomputes, unlike a host-side
-                // scroll-after-push, which reads stale content-height and
-                // lands short (permanently, once an image row overshoots
-                // the 40px slack).
-                // Pin/unpin rules, in priority order:
-                //   1. Landing EXACTLY at the bottom pins — regardless of
-                //      direction, so programmatic scroll-to-end (including
-                //      the upward correction after history-cap shrinks)
-                //      keeps following.
-                //   2. Any other upward movement unpins immediately. The
-                //      slack must NOT keep the pin on the way *up*: a
-                //      virtualized ListView refines its estimated
-                //      content-height while older rows instantiate, and a
-                //      still-pinned state snap-scrolls the user back on
-                //      every wheel notch ("impossible to scroll up").
-                //   3. Arriving *downward* within the slack of the bottom
-                //      pins too. The same estimate refinement means a
-                //      wheel-down that visibly reaches the end can leave the
-                //      viewport a few px short of the exact bottom; without
-                //      this rule nothing pinned and new rows landed out of
-                //      view. The one-time snap the pin causes is what the
-                //      person just asked for.
-                //   4. Anything else keeps the current state, so mid-layout
-                //      geometry never unpins spuriously.
-                //   5. A follow — appended rows, a pin — is owed only until
-                //      the exact bottom is reached, and never against a
-                //      reader who scrolls up. Following on *every* height
-                //      change fought a scrollbar drag: dragging near the
-                //      bottom instantiates rows, the estimate refines, and
-                //      the snap-back held the thumb there.
+                // Stick and let go: see the notes at the top of
+                // ChatPane. `gap` is how far the viewport's bottom is
+                // from the end of the content (0 at the bottom; real
+                // pixels near it, where the last rows are laid out).
                 private property <length> last-content-y;
-                pure function at-exact-bottom() -> bool {
-                    self.content-y <= -(self.content-height - self.visible-height) + 2px
+                pure function gap() -> length {
+                    self.content-height - self.visible-height + self.content-y
                 }
-                pure function near-bottom() -> bool {
-                    self.content-y <= -(self.content-height - self.visible-height) + 48px
-                }
+                // The stock scrollbar moves the list on a wheel or its
+                // arrows without reporting `scrolled`; ours (below)
+                // does.
+                vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                scrolled => { root.reader-moves(); }
                 changed content-y => {
-                    if (self.at-exact-bottom()) {
-                        // Pinned; the follow, if owed, decides for itself
-                        // when it has settled.
-                        root.stick-to-bottom = true;
-                    } else if (self.content-y > self.last-content-y + 0.25px) {
-                        // The reader scrolled up: nothing follows them down.
-                        root.stick-to-bottom = false;
-                        root.follow-pending = false;
-                        root.follow-ticks = 0;
-                        root.follow-settled = 0;
-                    } else if (self.content-y < self.last-content-y - 0.25px && self.near-bottom()) {
-                        root.stick-to-bottom = true;
+                    if (self.gap() <= 2px) {
+                        root.hold-bottom();
+                    } else if (root.user-scrolling) {
+                        if (self.content-y > self.last-content-y + 0.25px) {
+                            root.let-go();
+                        } else if (self.content-y < self.last-content-y - 0.25px
+                            && self.gap() <= 48px) {
+                            // Wheeled down to within a step of the end:
+                            // the last rows' estimate can leave it a few
+                            // px short. Hold; the follow closes the gap.
+                            root.hold-bottom();
+                        }
                     }
+                    // Anything else is the list re-estimating, or our
+                    // own follow: never a reason to let go.
                     self.last-content-y = self.content-y;
                 }
-                // A resize cannot coincide with a drag: keep the tail in view.
-                changed visible-height => { if (root.stick-to-bottom) { root.scroll-to-end(); } }
+                changed content-height => {
+                    if (root.stick-to-bottom && !root.user-scrolling) { root.follow-pending = true; }
+                }
+                changed visible-height => {
+                    if (root.stick-to-bottom && !root.user-scrolling) {
+                        root.scroll-to-end();
+                        root.follow-pending = true;
+                    }
+                }
                 for row[i] in State.chat : Rectangle {
                     // One delegate per row, hosting only the matching kind.
                     // `if`, not `visible`: an invisible instance still
@@ -1347,6 +1392,62 @@ export component ChatPane inherits Rectangle {
                         if row.kind == 3 : CodeRow { data: row; }
                         if row.kind == 4 : DayMarkerRow { data: row; }
                         if row.kind == 5 : FileRow { data: row; }
+                    }
+                }
+            }
+            // The list's scrollbar, in place of the ListView's own:
+            // the stock one's look (a thin thumb that widens under the
+            // pointer), but every move it makes is the reader's. A
+            // wheel over it is not taken here: it falls through to the
+            // list, which scrolls and says so.
+            if list.content-height > list.visible-height + 1px : bar := Rectangle {
+                x: list.x + list.width - self.width;
+                y: list.y;
+                width: 14px;
+                height: list.height;
+                property <length> range: list.content-height - list.visible-height;
+                property <length> track: self.height - 8px;
+                property <length> thumb-h: Math.min(self.track,
+                    Math.max(24px, self.track * (list.visible-height / list.content-height)));
+                property <bool> hot: bar-touch.has-hover || bar-touch.pressed;
+                Rectangle {
+                    width: bar.hot ? 6px : 3px;
+                    height: bar.thumb-h;
+                    x: parent.width - self.width - 4px;
+                    y: 4px + (bar.track - self.height)
+                        * Math.clamp(-list.content-y / Math.max(1px, bar.range), 0, 1);
+                    border-radius: self.width / 2;
+                    background: bar.hot ? Theme.text-muted : Theme.border;
+                    animate width { duration: 150ms; easing: ease-out; }
+                    animate background { duration: 150ms; }
+                }
+                bar-touch := TouchArea {
+                    mouse-cursor: default;
+                    // Where the drag started, re-based when the range
+                    // moves under it (the list re-estimating as rows
+                    // are laid out), like the stock one.
+                    property <length> start-y;
+                    property <length> start-value;
+                    property <length> start-range;
+                    function rebase() {
+                        self.start-y = self.mouse-y;
+                        self.start-value = -list.content-y;
+                        self.start-range = bar.range;
+                    }
+                    pointer-event(e) => {
+                        if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) {
+                            self.rebase();
+                        }
+                    }
+                    moved => {
+                        if (self.pressed) {
+                            if (self.start-range != bar.range) { self.rebase(); }
+                            root.reader-moves();
+                            list.content-y = -Math.clamp(self.start-value
+                                + (self.mouse-y - self.start-y)
+                                    * (bar.range / Math.max(1px, bar.track - bar.thumb-h)),
+                                0px, bar.range);
+                        }
                     }
                 }
             }
@@ -1552,13 +1653,53 @@ export component ChatPane inherits Rectangle {
         }
     }
 
-    // ── Jump to latest (WhatsApp-style) ────────────────────────────
+    // ── Unseen messages, and the way to them ───────────────────────
+    // Scrolled up while messages arrived: how many, centered at the
+    // jump button's height, just above the composer (the host counts them, `State.chat-new-*`;
+    // being back at the bottom zeroes it). Either goes to the newest.
+    if State.chat-new-count > 0 && !root.stick-to-bottom : Rectangle {
+        height: 28px;
+        width: new-row.preferred-width + 2 * Theme.gap-md;
+        x: col.x + list-box.x + (list-box.width - self.width) / 2;
+        y: col.y + list-box.y + list-box.height - Theme.gap-xs - 18px - self.height / 2;
+        border-radius: 14px;
+        background: nt.has-hover ? Theme.accent.brighter(10%) : Theme.accent;
+        drop-shadow-blur: 6px;
+        drop-shadow-color: #00000055;
+        animate background { duration: 150ms; }
+        new-row := HorizontalLayout {
+            alignment: center;
+            spacing: Theme.gap-xs;
+            Rectangle {
+                width: 14px;
+                IconDisplay {
+                    icon: IconSet.ArrowDown;
+                    size: 14px;
+                    stroke: Theme.on-accent;
+                }
+            }
+            Text {
+                text: State.chat-new-label;
+                color: Theme.on-accent;
+                font-size: Theme.font-sm;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+        }
+        nt := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.pin-to-bottom(); }
+        }
+    }
+
     if !root.stick-to-bottom : jump-btn := Rectangle {
         width: 36px;
         height: 36px;
         border-radius: 18px;
-        x: col.x + list.x + list.width - self.width - Theme.gap-sm;
-        y: col.y + list.y + list.height - self.height - Theme.gap-sm;
+        // Over the list's last few px, just above the composer. The
+        // list's own x/y are inside its frame: the frame places it.
+        x: col.x + list-box.x + list-box.width - self.width - Theme.gap-sm;
+        y: col.y + list-box.y + list-box.height - self.height - Theme.gap-xs;
         background: jt.has-hover ? Theme.subtle : Theme.bg-tertiary;
         border-width: 1px;
         border-color: Theme.border;
@@ -1570,7 +1711,9 @@ export component ChatPane inherits Rectangle {
         }
         jt := TouchArea {
             mouse-cursor: pointer;
-            clicked => { root.scroll-to-end(); }
+            // Stuck from here on, and followed until the end stops
+            // moving: one scroll-to-end lands on an estimate.
+            clicked => { root.pin-to-bottom(); }
         }
     }
 

@@ -612,6 +612,7 @@ impl AppState {
         self.general_unread = 0;
         let s = self.main.global::<State>();
         s.set_general_unread(0);
+        s.set_chat_new_count(0);
         s.set_active_dm(-1);
         s.set_conv_name("".into());
         s.set_dm_unread_total(0);

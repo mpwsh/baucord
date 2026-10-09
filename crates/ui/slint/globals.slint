@@ -411,6 +411,12 @@ export global State {
     in property <int> dm-unread-total: 0;
     /// Messages that landed in General while a DM was open.
     in property <int> general-unread: 0;
+    /// Messages from others that landed in the conversation on screen
+    /// while the reader was scrolled up: the chat pane's "N new
+    /// messages" pill. The host adds to it and words the label; the
+    /// pane zeroes it once the reader is back at the bottom.
+    in-out property <int> chat-new-count: 0;
+    in property <string> chat-new-label;
     /// General's two views (1.2): the conversation, or the room's
     /// activity — who came, went, moved, shared — kept apart so it
     /// does not bury the messages. In memory only, this session only.

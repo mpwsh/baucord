@@ -1,0 +1,24 @@
+[package]
+name = "chat-scroll-sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Drives the chat pane's scrolling frame by frame and checks when it sticks to the newest message"
+
+# Not a member of the app's workspace: it builds Slint with the
+# software renderer only, on its own. Run it with
+#   cargo run --manifest-path tools/chat-scroll-sim/Cargo.toml
+[workspace]
+
+[dependencies]
+slint = { version = "=1.18.1", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
+# The pane's icons are SVGs: their loader is behind these.
+i-slint-core = { version = "=1.18.1", features = ["image-decoders", "svg"] }
+
+[build-dependencies]
+slint-build = "=1.18.1"
+lucide-slint = "=1.35.0"
+
+[profile.dev]
+opt-level = 1
+debug = false

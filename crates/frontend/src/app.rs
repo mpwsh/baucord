@@ -298,6 +298,10 @@ pub struct AppState {
     /// parked with theirs.
     active_dm: Option<client::UserId>,
     parked: HashMap<Option<client::UserId>, Conversation>,
+    /// The active fields hold a conversation that is not on screen
+    /// (`with_conversation` borrowed it): what lands there does not
+    /// move the pane or count as unseen.
+    borrowed_conversation: bool,
     /// DM partners as the Messages section lists them, newest first,
     /// and what the list knows about each.
     dm_order: Vec<client::UserId>,
@@ -681,6 +685,7 @@ pub fn run() {
         history_page_pending: None,
         active_dm: None,
         parked: HashMap::new(),
+        borrowed_conversation: false,
         dm_order: Vec::new(),
         dm_meta: HashMap::new(),
         dms_model,

@@ -415,6 +415,10 @@ duration-forever = Until lifted
 menu-edit-message = Edit message
 menu-delete-message = Delete message
 chat-editing = Editing your message — Enter saves, Esc cancels
+chat-new-messages = { $count ->
+    [one] 1 new message
+   *[other] { $count } new messages
+}
 chat-load-earlier = Load earlier messages
 chat-loading = Loading…
 chat-no-earlier = No earlier messages.

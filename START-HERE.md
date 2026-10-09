@@ -120,7 +120,10 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
   (no text there): `frontend/build.rs` generates its line of `fill_tr`
   and fails the build when a catalog lacks it.
 - **Every `.slint` change** is compile-checked and rendered, at phone
-  width and at 1000×640.
+  width and at 1000×640. A change to the chat's scrolling also runs
+  `cargo run --manifest-path tools/chat-scroll-sim/Cargo.toml`
+  (ANDROID-SPEC D66): it drives the real pane and fails on a wrong
+  follow.
 - **Phone builds are always `-p android` / `-p ios`**: a workspace build
   unifies the desktop features back in.
 - **No worker polls on a short timer, no per-frame log lines.**
