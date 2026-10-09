@@ -7,10 +7,10 @@
 
 // A child module of `app`: its parent's private items and imports are
 // its own, which is the whole point of the file split.
+use client::protocol::{ReportReason, ReportRefusal, ReportTarget};
+
 #[allow(clippy::wildcard_imports)]
 use super::*;
-
-use client::protocol::{ReportReason, ReportRefusal, ReportTarget};
 
 /// What the report dialog is about while it is open.
 pub(super) struct PendingReport {
