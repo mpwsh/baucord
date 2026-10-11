@@ -103,11 +103,15 @@ impl ChatServer {
     /// becomes their name, a role or channel id its name, a
     /// restriction or message id gets a `#`. Codes and hashes stay.
     pub(super) fn audit_target_name(&self, action: &str, target: &str) -> String {
+        // The target decoded once and compared as bytes: encoding every
+        // user's id for every row made some 200,000 strings for one
+        // audit page on a server with 1,000 users (review P3-10).
         let user_named = || {
+            let short = short_id(target)?;
             self.policy
                 .users
                 .iter()
-                .find(|(id, _)| hex(&id[..8]) == target)
+                .find(|(id, _)| id[..8] == short)
                 .map(|(_, u)| u.name.clone())
         };
         match action {
@@ -204,8 +208,7 @@ impl ChatServer {
                 AdminOutcome::Blobs(blobs)
             }),
             AdminCommand::DeleteBlob { blob_id } => need(permissions::RESTRICT).map(|()| {
-                if let Some(gone) = self.policy.blobs.remove(blob_id) {
-                    self.blob_bytes.remove(blob_id);
+                if let Some(gone) = self.forget_blob(blob_id) {
                     self.persist.send(Command::DeleteBlob { blob_id: *blob_id });
                     self.audit(
                         Some(actor),
@@ -469,5 +472,36 @@ impl ChatServer {
         for peer in self.clients() {
             self.send_if(peer, features::ROLE_LIST, &roles);
         }
+    }
+}
+
+/// The first 8 bytes of a user id, from the 16 hex digits the audit
+/// log stores as a target; `None` for anything else.
+fn short_id(target: &str) -> Option<[u8; 8]> {
+    let digits = target.as_bytes();
+    if digits.len() != 16 {
+        return None;
+    }
+    let mut out = [0u8; 8];
+    for (byte, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+        let high = char::from(pair[0]).to_digit(16)?;
+        let low = char::from(pair[1]).to_digit(16)?;
+        *byte = u8::try_from(high * 16 + low).ok()?;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod short_id_tests {
+    use super::short_id;
+    use crate::persistence::hex;
+
+    #[test]
+    fn a_short_id_is_what_the_audit_log_wrote() {
+        let id = [0xab, 0x01, 0xff, 0x00, 0x7e, 0x10, 0x9c, 0x33];
+        assert_eq!(short_id(&hex(&id)), Some(id));
+        assert_eq!(short_id("abc"), None);
+        assert_eq!(short_id("zz01ff007e109c33"), None);
+        assert_eq!(short_id("é01ff007e109c33"), None);
     }
 }

@@ -13,6 +13,10 @@
 
 /// History cap — oldest rows are dropped past this.
 pub const MAX_ROWS: usize = 500;
+/// The cap while the reader is above the newest rows
+/// ([`ChatHistory::hold_front`]): room for the pages they loaded and
+/// what arrives while they read, still bounded.
+pub const HELD_MAX_ROWS: usize = 4 * MAX_ROWS;
 
 /// Character cap for an outgoing message (matches the wire check).
 pub const MAX_MESSAGE_CHARS: usize = 400;
@@ -191,6 +195,10 @@ pub struct RangeDelta {
 pub struct ChatHistory {
     rows: Vec<ChatItem>,
     next_row_id: u64,
+    /// The reader is above the newest rows (a page loaded with "load
+    /// earlier", or scrolled up): appends do not trim the front out
+    /// from under them. See [`Self::hold_front`].
+    front_held: bool,
 }
 
 impl ChatHistory {
@@ -206,6 +214,7 @@ impl ChatHistory {
 
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.front_held = false;
     }
 
     /// Monotonic id for image rows (GIF driver / viewer targeting).
@@ -254,13 +263,36 @@ impl ChatHistory {
     }
 
     /// Put assembled rows (oldest first) in front of what is shown
-    /// ("load earlier"). Returns how many went in. Not capped here:
-    /// the reader asked for these; the next append trims from the
-    /// front as usual.
+    /// ("load earlier"). Returns how many went in. Not capped here,
+    /// and the front is held from now on: the reader asked for these,
+    /// and the next live message used to trim them straight back off
+    /// at the cap, leaving a gap in what they were reading (review
+    /// P2-23). The host lets go with [`Self::hold_front`] once the
+    /// reader is back at the newest rows.
     pub fn prepend_rows(&mut self, rows: Vec<ChatItem>) -> usize {
         let inserted = rows.len();
         self.rows.splice(0..0, rows);
+        self.front_held = true;
         inserted
+    }
+
+    /// Keep (or stop keeping) the oldest rows through appends: held
+    /// while the reader is above the newest rows, released when they
+    /// follow again. Held, the list may grow to [`HELD_MAX_ROWS`];
+    /// released, the next append trims it back to [`MAX_ROWS`].
+    pub fn hold_front(&mut self, hold: bool) {
+        self.front_held = hold;
+    }
+
+    /// The id of the oldest confirmed message still in the list: where
+    /// "load earlier" continues from after the front was trimmed.
+    #[must_use]
+    pub fn oldest_message_id(&self) -> Option<u64> {
+        self.rows
+            .iter()
+            .filter_map(ChatItem::meta)
+            .find(|m| !m.pending)
+            .map(|m| m.id)
     }
 
     /// Drop one row (a divider made redundant by a prepended page).
@@ -552,7 +584,12 @@ impl ChatHistory {
     }
 
     fn cap(&mut self, appended: usize) -> HistoryDelta {
-        let dropped = self.rows.len().saturating_sub(MAX_ROWS);
+        let limit = if self.front_held {
+            HELD_MAX_ROWS
+        } else {
+            MAX_ROWS
+        };
+        let dropped = self.rows.len().saturating_sub(limit);
         if dropped > 0 {
             self.rows.drain(..dropped);
         }
@@ -627,6 +664,59 @@ mod tests {
         assert!(matches!(&h.rows()[3], ChatItem::System { .. }));
         // Nobody else's rows: nothing to do.
         assert!(h.remove_author(&[9u8; 32]).is_empty());
+    }
+
+    /// A page the reader loaded stays while they read it (review
+    /// P2-23): live messages do not trim it off, up to the held cap;
+    /// back at the newest rows the list returns to its usual size, and
+    /// paging continues from the oldest message still shown.
+    #[test]
+    fn a_loaded_page_survives_live_messages_until_the_reader_follows_again() {
+        let mut h = ChatHistory::new();
+        for id in 1_000..1_000 + MAX_ROWS as u64 {
+            h.push_message(&meta(id), "live", false);
+        }
+        assert_eq!(h.rows().len(), MAX_ROWS);
+        assert_eq!(h.oldest_message_id(), Some(1_000));
+
+        // "Load earlier": fifty older messages in front.
+        let page: Vec<ChatItem> = (950..1_000)
+            .flat_map(|id| ChatHistory::rows_for(&meta(id), "old", false))
+            .collect();
+        assert_eq!(h.prepend_rows(page), 50);
+        let delta = h.push_message(&meta(2_000), "new", false);
+        assert_eq!(delta.dropped_front, 0, "the page just loaded was trimmed");
+        assert_eq!(h.oldest_message_id(), Some(950));
+
+        // Still bounded while held.
+        for id in 2_001..2_001 + HELD_MAX_ROWS as u64 {
+            h.push_message(&meta(id), "new", false);
+        }
+        assert_eq!(h.rows().len(), HELD_MAX_ROWS);
+
+        // The reader follows again: the next append trims to the cap,
+        // and the oldest message shown is where paging goes on from.
+        h.hold_front(false);
+        let delta = h.push_message(&meta(9_000), "newest", false);
+        assert_eq!(h.rows().len(), MAX_ROWS);
+        assert_eq!(delta.dropped_front, HELD_MAX_ROWS + 1 - MAX_ROWS);
+        let oldest = h.oldest_message_id().expect("a message");
+        assert!(matches!(&h.rows()[0], ChatItem::Message { meta, .. } if meta.id == oldest));
+        assert!(
+            oldest > 2_000,
+            "the trimmed rows are not the cursor: {oldest}"
+        );
+    }
+
+    #[test]
+    fn a_pending_row_is_not_where_paging_continues_from() {
+        let mut h = ChatHistory::new();
+        let mut unsent = meta(u64::MAX - 3);
+        unsent.pending = true;
+        h.push_message(&unsent, "on its way", false);
+        assert_eq!(h.oldest_message_id(), None);
+        h.push_message(&meta(7), "confirmed", false);
+        assert_eq!(h.oldest_message_id(), Some(7));
     }
 
     #[test]

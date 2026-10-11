@@ -233,6 +233,21 @@ impl AudioStats {
     }
 
     /// Estimated send bandwidth in kbps, from what was actually sent:
+    /// How long ago the relay last reported on our voice
+    /// ([`Self::uplink_loss_updated_ms`]); `None` when it never has.
+    /// The stamp is on this struct's own clock, so the age has to be
+    /// taken here: the telemetry line subtracted it from Unix time, got
+    /// decades, and always said "(idle)" (review P2-19).
+    #[must_use]
+    pub fn uplink_report_age_ms(&self) -> Option<u64> {
+        let updated_ms = self.uplink_loss_updated_ms.load(Ordering::Relaxed);
+        if updated_ms == 0 {
+            return None;
+        }
+        let now_ms = u64::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Some(now_ms.saturating_sub(updated_ms))
+    }
+
     /// Opus bytes plus per-packet overhead (16-byte `PacketHeader` +
     /// 28 bytes IPv4/UDP) over the session. DTX pauses therefore lower it,
     /// as they do on the wire — the old estimate assumed 100 packets/s of
@@ -314,5 +329,27 @@ impl AudioStats {
             self.decode_errors.load(Ordering::Relaxed),
             aec,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    use super::AudioStats;
+
+    /// The report's age is measured on the stats' own clock (review
+    /// P2-19): unknown until the relay has reported, small right after.
+    #[test]
+    fn uplink_report_age_is_none_until_reported_then_small() {
+        let stats = AudioStats::new();
+        assert_eq!(stats.uplink_report_age_ms(), None);
+        std::thread::sleep(Duration::from_millis(5));
+        let now_ms = u64::try_from(stats.start_time.elapsed().as_millis()).unwrap();
+        stats
+            .uplink_loss_updated_ms
+            .store(now_ms.max(1), Ordering::Relaxed);
+        let age = stats.uplink_report_age_ms().expect("reported");
+        assert!(age < 1_000, "a report just stamped reads {age} ms old");
     }
 }

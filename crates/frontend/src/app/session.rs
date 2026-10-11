@@ -151,6 +151,8 @@ impl AppState {
         self.avatar_fetches.clear();
         self.own_avatar_blob = None;
         self.reset_safety();
+        // Before the conversations go: their cards are repainted.
+        self.clear_transfers();
         self.reset_chat_flow();
         self.is_testing_mic = false;
         self.channels.clear();
@@ -230,6 +232,25 @@ impl AppState {
         s.set_resource_line(" ".into());
         s.set_users_count_label(t!("users-count", "count" => 0u32).into());
         self.users_model.set_vec(Vec::new());
+    }
+
+    /// Transfers end with the session: nothing more arrives for them.
+    /// Left in place, Save did nothing for that file for the rest of
+    /// the run (it read as already under way), pictures caught in
+    /// flight never loaded after the reconnect, and cards kept a ring
+    /// that would never move (review P2-13).
+    fn clear_transfers(&mut self) {
+        self.pending_downloads.clear();
+        self.pending_uploads.clear();
+        self.pending_files.clear();
+        self.pending_picture_uploads.clear();
+        self.pending_pictures.clear();
+        self.picture_acks.clear();
+        self.image_upload = None;
+        let shown: Vec<(Option<client::UserId>, u64)> = self.transfers.keys().copied().collect();
+        for (conv, msg_id) in shown {
+            self.set_transfer(conv, msg_id, None);
+        }
     }
 
     pub(super) fn handle_disconnect(&mut self) {

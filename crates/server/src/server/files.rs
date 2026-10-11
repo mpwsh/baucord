@@ -162,7 +162,7 @@ impl ChatServer {
             else {
                 return false;
             };
-            if let Some(gone) = self.policy.blobs.remove(&oldest) {
+            if let Some(gone) = self.forget_blob(&oldest) {
                 total -= u64::from(gone.size);
                 info!(
                     "evicted blob {} ({}, {}) for room",
@@ -171,7 +171,6 @@ impl ChatServer {
                     human_size(u64::from(gone.size))
                 );
             }
-            self.blob_bytes.remove(&oldest);
             self.persist.send(Command::DeleteBlob { blob_id: oldest });
         }
         true

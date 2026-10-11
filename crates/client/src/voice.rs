@@ -296,10 +296,7 @@ impl VoiceLoopState {
         info!("audio stats: {}", voice.stats_summary());
         let s = voice.stats();
         let (input_device, output_device) = voice.opened_devices();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        let report_age_ms = now_ms.saturating_sub(s.uplink_loss_updated_ms.load(Relaxed));
+        let report_age_ms = s.uplink_report_age_ms();
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         let sample = protocol::AudioSample {
             bitrate_bps: s.send_bitrate_bps.load(Relaxed),
@@ -310,7 +307,7 @@ impl VoiceLoopState {
             smoothed_loss_pct: s.uplink_loss_pct.load(Relaxed) as f32,
             // A report younger than three intervals means the relay is
             // still telling us about our voice.
-            exercised: report_age_ms < 6_000,
+            exercised: report_age_ms.is_some_and(|age| age < 6_000),
             packets_sent: s.packets_sent.load(Relaxed),
             encode_us: s.last_encode_us.load(Relaxed),
             input_overruns: s.input_overruns.load(Relaxed),

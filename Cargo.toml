@@ -77,22 +77,17 @@ panic = "abort"   # ~10% smaller binary, no unwind overhead
 [profile.deploy]
 inherits = "release"
 strip = "symbols"
-lto = "thin"
-# ── Debug-opt: release speed with debug symbols ────────────────────────
-[profile.debug-opt]
-inherits = "release"
-debug = 2
-debug-assertions = true
-incremental = true
-# override: keep unwind so backtraces work in profiling
-panic = "unwind"
 # ── Dev: fast compile, tolerable runtime ───────────────────────────────
 [profile.dev]
 opt-level = 1
 # Optimize all dependencies even in dev — they don't change often
-# and unoptimized audio/codec code is unusably slow.
+# and unoptimized audio/codec code is unusably slow. Line tables only:
+# a backtrace through a dependency still names file and line, and full
+# debug info for some 800 optimized crates was most of a 15+ GB
+# `target/`.
 [profile.dev.package."*"]
 opt-level = 3
+debug = "line-tables-only"
 # Workspace crates with per-pixel and per-sample loops (the decoder's
 # colour conversion, the voice chain): a Debug build on a phone
 # (`ios/run.sh --device`) logged "Slow decode" at ~20 ms per 1080p

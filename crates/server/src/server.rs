@@ -51,6 +51,7 @@ mod safety;
 use crate::{
     clock::{Clock, WallMs},
     config::{channel_infos_of, validate_channel_list, ChannelSettings, Config},
+    link_stats::VoiceWindow,
     persistence::{
         AskId, AuditRow, Command, MessageRow, Notice, Persist, ProgressDelta, TelemetryEventRow,
         TelemetryRow, GENERAL_CONV,
@@ -179,7 +180,7 @@ pub struct ChatServer {
     pending_telemetry: HashMap<UserId, TelemetryRow>,
     last_telemetry_flush: Instant,
     pending: HashMap<ClientId, PendingPeer>,
-    /// Recent failed admissions per source address.
+    /// Recent failed admissions per source ([`failure_source`]).
     admission_failures: HashMap<IpAddr, VecDeque<Instant>>,
     usernames: HashMap<ClientId, String>,
     /// Negotiated feature bits per admitted client.
@@ -247,8 +248,13 @@ pub struct ChatServer {
     /// Each user's upload volume today (spec §7's daily allowance).
     uploads_today: HashMap<UserId, files::DailyUpload>,
     /// Blob bytes by hash: the only copy without persistence, a cache
-    /// of the disk with it.
+    /// of the disk with it (bounded, least recently used out first:
+    /// `cache_blob`).
     blob_bytes: HashMap<protocol::BlobId, std::sync::Arc<Vec<u8>>>,
+    /// When each cached blob was last stored or served, on
+    /// `blob_clock`.
+    blob_used: HashMap<protocol::BlobId, u64>,
+    blob_clock: u64,
     /// Disk reads in flight: who asked for which blob.
     pending_blobs: HashMap<protocol::BlobId, (AskId, Vec<ClientId>)>,
     /// Profile and rename rate limits (spec §7.1).
@@ -281,8 +287,12 @@ pub struct ChatServer {
     image_bytes_global: Vec<(Instant, usize)>,
     /// Server-assigned chat message ids, unique for this run.
     next_message_id: u64,
-    /// Per-client transport counters at the last `link:` report.
+    /// Per-client transport counters at the client's last `link:`
+    /// line: the line covers everything since, not the last 2 s.
     link_baseline: HashMap<ClientId, LinkStats>,
+    /// Per-client voice counts since that line, summed over the 2 s
+    /// report windows in between.
+    link_voice: HashMap<ClientId, VoiceWindow>,
     last_stats: Instant,
     last_health: Instant,
     last_voice_report: Instant,
@@ -418,6 +428,8 @@ impl ChatServer {
             proven_uploads: HashSet::new(),
             uploads_today: HashMap::new(),
             blob_bytes: HashMap::new(),
+            blob_used: HashMap::new(),
+            blob_clock: 0,
             pending_blobs: HashMap::new(),
             profile_changed_at: HashMap::new(),
             renamed_at: HashMap::new(),
@@ -434,6 +446,7 @@ impl ChatServer {
             image_bytes_global: Vec::new(),
             next_message_id: startup.next_message_id,
             link_baseline: HashMap::new(),
+            link_voice: HashMap::new(),
             last_stats: now,
             last_health: now,
             last_voice_report: now,
@@ -795,6 +808,7 @@ impl ChatServer {
         if now.duration_since(self.last_restriction_sweep) >= RESTRICTION_SWEEP_INTERVAL {
             self.last_restriction_sweep = now;
             self.sweep_restrictions();
+            self.prune_admission_failures();
         }
         if now.duration_since(self.last_progress_minute) >= PROGRESS_INTERVAL {
             self.last_progress_minute = now;
@@ -867,7 +881,7 @@ impl ChatServer {
     /// wakes a few times a second instead of 50 to 1,000.
     #[must_use]
     pub fn next_wake(&mut self) -> Instant {
-        let cap = if self.persist.reads_in_flight() > 0 {
+        let cap = if self.persist.reads_in_flight() > 0 || self.persist.reload_in_flight() {
             ASK_POLL
         } else {
             MAX_IDLE_WAIT
@@ -907,9 +921,13 @@ impl ChatServer {
     /// Close every connection with `reason` (a deploy or operator
     /// stop). Clients treat "server restarting" as transient and come
     /// back on their own in a couple of seconds, instead of discovering
-    /// the restart through the idle timeout. Call `update`/flush a few
-    /// more times afterwards so the close packets leave.
-    pub fn shutdown(&mut self, now: Instant, reason: &str) {
+    /// the restart through the idle timeout. The caller pumps the
+    /// transport so the close packets leave, and only then calls
+    /// [`Self::finish_shutdown`]: the database drain can take seconds,
+    /// and with the close frames queued behind it a slow drain outlasted
+    /// Docker's stop timeout, the process was killed, and every client
+    /// sat out its 30 s idle timeout (review P2-5).
+    pub fn begin_shutdown(&mut self, now: Instant, reason: &str) {
         info!(
             "Shutting down: closing {} connections ({reason})",
             self.driver.peer_count()
@@ -918,7 +936,18 @@ impl ChatServer {
             self.driver.close(now, peer, reason);
         }
         self.flush_telemetry();
+    }
+
+    /// Have the persistence thread write what is queued and stop
+    /// (bounded). The last step of a shutdown.
+    pub fn finish_shutdown(&mut self) {
         self.persist.shutdown();
+    }
+
+    /// Both steps at once, for a caller with no transport to pump.
+    pub fn shutdown(&mut self, now: Instant, reason: &str) {
+        self.begin_shutdown(now, reason);
+        self.finish_shutdown();
     }
 
     /// Admitted clients, in no particular order.
@@ -1047,7 +1076,7 @@ impl ChatServer {
         // Bans before anything else (spec §3.2): by user, key or address.
         if let Some(ban) = self
             .policy
-            .server_ban(known_user.as_ref(), &key_hash, ip, now)
+            .server_ban(known_user.as_ref(), &key_hash, Some(ip), now)
         {
             let reason = RefusedReason::Banned {
                 until: ban.until,
@@ -1322,7 +1351,8 @@ impl ChatServer {
 
     fn recent_failures(&mut self, ip: IpAddr) -> usize {
         let now = self.now;
-        let Some(times) = self.admission_failures.get_mut(&ip) else {
+        let source = failure_source(ip);
+        let Some(times) = self.admission_failures.get_mut(&source) else {
             return 0;
         };
         while times
@@ -1332,17 +1362,34 @@ impl ChatServer {
             times.pop_front();
         }
         if times.is_empty() {
-            self.admission_failures.remove(&ip);
+            self.admission_failures.remove(&source);
             return 0;
         }
         times.len()
+    }
+
+    /// Forget sources whose failures all aged out. An entry used to go
+    /// only when the same address tried again, so every address that
+    /// ever failed once stayed for the life of the process (review
+    /// P2-7).
+    fn prune_admission_failures(&mut self) {
+        let now = self.now;
+        self.admission_failures.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > ADMISSION_FAILURE_WINDOW)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
     }
 
     /// Send `Refused`, then close once it had time to land.
     fn refuse(&mut self, peer: ClientId, ip: IpAddr, reason: RefusedReason, count: bool) {
         if count {
             self.admission_failures
-                .entry(ip)
+                .entry(failure_source(ip))
                 .or_default()
                 .push_back(self.now);
         }
@@ -1423,6 +1470,24 @@ impl ChatServer {
     /// that outlived their deadline resolve here as timed out.
     fn poll_persistence(&mut self) {
         let polled = self.persist.poll(self.now);
+        // Notices first: a reloaded policy was checked against the writes
+        // queued up to this poll, and an answer handled below may queue
+        // another (review P1-22).
+        for notice in polled.notices {
+            match notice {
+                Notice::Policy { policy, .. } => {
+                    info!(
+                        "Policy reloaded from disk: {} users, {} invites, {} restrictions",
+                        policy.users.len(),
+                        policy.invites.len(),
+                        policy.restrictions.len()
+                    );
+                    self.apply_reloaded_policy(*policy);
+                }
+                Notice::RefsReleased(released) => self.release_blob_refs(&released),
+                Notice::FilesPruned(files) => self.forget_pruned_files(&files),
+            }
+        }
         for (id, outcome) in polled.answers {
             if self.is_blob_ask(id) {
                 self.resolve_blob_answer(id, outcome);
@@ -1438,21 +1503,6 @@ impl ChatServer {
                 self.resolve_report_list_answer(id, outcome);
             } else {
                 self.resolve_history_answer(id, outcome);
-            }
-        }
-        for notice in polled.notices {
-            match notice {
-                Notice::Policy(policy) => {
-                    info!(
-                        "Policy reloaded from disk: {} users, {} invites, {} restrictions",
-                        policy.users.len(),
-                        policy.invites.len(),
-                        policy.restrictions.len()
-                    );
-                    self.apply_reloaded_policy(*policy);
-                }
-                Notice::RefsReleased(released) => self.release_blob_refs(&released),
-                Notice::FilesPruned(files) => self.forget_pruned_files(&files),
             }
         }
     }
@@ -1961,6 +2011,21 @@ impl ChatServer {
         self.channel_of.get(&client).copied() == Some(self.default_channel)
     }
 
+    /// Who is told about `subject`'s session: everyone once it is in a
+    /// room, only the session itself while it sits in the lobby, where
+    /// nobody has heard of it. Every broadcast about one session goes
+    /// through here; speaking, audio state, a rename and a role change
+    /// used to reach every client, which told them a lobby session was
+    /// there (review P2-1). What changed meanwhile reaches the others
+    /// with [`Self::announce`], when it joins a room.
+    pub(crate) fn audience_about(&self, subject: ClientId) -> Vec<ClientId> {
+        if self.in_lobby(subject) {
+            vec![subject]
+        } else {
+            self.clients()
+        }
+    }
+
     fn handle_client_disconnected(&mut self, client_id: ClientId, reason: &DisconnectReason) {
         let username = self
             .usernames
@@ -1998,6 +2063,7 @@ impl ChatServer {
         self.log_uploads.remove(&client_id);
         self.last_log_upload.remove(&client_id);
         self.link_baseline.remove(&client_id);
+        self.link_voice.remove(&client_id);
 
         match reason {
             DisconnectReason::ApplicationClosed { .. } | DisconnectReason::LocallyClosed => {
@@ -2211,12 +2277,16 @@ impl ChatServer {
                     self.note_activity(client_id);
                     self.spoke.insert(client_id);
                 }
-                // Broadcast to everyone including the sender: the UI
-                // treats the echo as authoritative for its own tile.
-                self.broadcast_msg(&ServerMessage::Speaking {
+                // To everyone who knows the session, the sender
+                // included: older clients treat the echo as
+                // authoritative for their own tile.
+                let msg = ServerMessage::Speaking {
                     client_id,
                     is_speaking,
-                });
+                };
+                for peer in self.audience_about(client_id) {
+                    self.send_msg(peer, &msg);
+                }
             }
             ClientMessage::AudioState { muted, deafened } => {
                 self.audio_states.insert(client_id, (muted, deafened));
@@ -2225,14 +2295,16 @@ impl ChatServer {
                 } else {
                     self.deafened.remove(&client_id);
                 }
-                self.broadcast_msg_except(
+                let msg = ServerMessage::AudioState {
                     client_id,
-                    &ServerMessage::AudioState {
-                        client_id,
-                        muted,
-                        deafened,
-                    },
-                );
+                    muted,
+                    deafened,
+                };
+                for peer in self.audience_about(client_id) {
+                    if peer != client_id {
+                        self.send_msg(peer, &msg);
+                    }
+                }
             }
 
             // ── Screen share signaling ──────────────────────────────
@@ -2584,6 +2656,18 @@ impl ChatServer {
                 return;
             }
         };
+        // What the next start checks. A file this server would refuse to
+        // boot with (the AFK room taken out of the list while
+        // `user_channels.afk_channel` still names it) must not be half
+        // applied to the running one: it kept working, and the container
+        // crash-looped on its next restart (review P2-4).
+        if let Err(e) = fresh.validate_policy() {
+            warn!(
+                "Config reload: {} would not start a server — keeping current config: {e}",
+                path.display()
+            );
+            return;
+        }
         if fresh.channels == self.config.channels {
             info!(
                 "Config reload: {} changed but the [channels] section did not — \
@@ -3046,12 +3130,19 @@ impl ChatServer {
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn send_voice_reports(&mut self) {
         let link_interval = Duration::from_secs(self.config.logging.link_stats_interval_secs);
-        let log_due = !link_interval.is_zero()
-            && self.now.duration_since(self.last_link_log) >= link_interval;
+        let logging = !link_interval.is_zero();
+        let since_line = self.now.duration_since(self.last_link_log);
+        let log_due = logging && since_line >= link_interval;
         if log_due {
             self.last_link_log = self.now;
         }
-        let interval_secs = VOICE_REPORT_INTERVAL.as_secs_f64();
+        // The line's own interval: its rates and counts cover the time
+        // since the last line. They used to divide by this 2 s report
+        // interval against a baseline moved every report, so a 10 s
+        // line described its last 2 s (review P3-7).
+        let interval_secs = since_line
+            .as_secs_f64()
+            .max(VOICE_REPORT_INTERVAL.as_secs_f64());
 
         for client_id in self.clients() {
             let Some(stats) = self.driver.stats(client_id) else {
@@ -3069,8 +3160,12 @@ impl ChatServer {
                     rtt_ms,
                 },
             );
+            if logging {
+                self.link_voice.entry(client_id).or_default().add(&voice);
+            }
 
             if log_due {
+                let voice = self.link_voice.remove(&client_id).unwrap_or_default();
                 let base = self
                     .link_baseline
                     .get(&client_id)
@@ -3123,8 +3218,8 @@ impl ChatServer {
                         String::new()
                     },
                 );
+                self.link_baseline.insert(client_id, stats);
             }
-            self.link_baseline.insert(client_id, stats);
         }
     }
 
@@ -3460,6 +3555,118 @@ mod wake_tests {
         server.update(Instant::now());
         let wait = server.next_wake().saturating_duration_since(now);
         assert!(wait > ASK_POLL, "the answer was collected: {wait:?}");
+    }
+}
+
+/// What failed admissions are counted under: an IPv4 address as it is,
+/// an IPv6 address by its /64. One subscriber holds a whole /64, so
+/// counting each address apart gave a guesser a fresh allowance per
+/// address and the table one entry per address tried (review P2-7).
+fn failure_source(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+            IpAddr::V4,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod failure_source_tests {
+    use std::net::IpAddr;
+
+    use super::failure_source;
+
+    #[test]
+    fn ipv6_counts_by_its_64_and_ipv4_by_address() {
+        let ip = |s: &str| s.parse::<IpAddr>().expect("address");
+        assert_eq!(
+            failure_source(ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd")),
+            failure_source(ip("2001:db8:1:2::1")),
+        );
+        assert_ne!(
+            failure_source(ip("2001:db8:1:2::1")),
+            failure_source(ip("2001:db8:1:3::1")),
+        );
+        assert_eq!(failure_source(ip("192.0.2.7")), ip("192.0.2.7"));
+        assert_ne!(
+            failure_source(ip("192.0.2.7")),
+            failure_source(ip("192.0.2.8"))
+        );
+        // A v4 client on a dual-stack socket is still that v4 address.
+        assert_eq!(failure_source(ip("::ffff:192.0.2.7")), ip("192.0.2.7"));
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use std::time::{Duration, Instant, SystemTime};
+
+    use transport::ServerIdentity;
+
+    use super::{ChatServer, CONFIG_CHECK_INTERVAL};
+    use crate::config::Config;
+
+    fn yaml(channels: &[&str]) -> String {
+        let mut yaml = String::from(
+            "persistence:\n  enabled: false\nuser_channels:\n  afk_channel: AFK\nchannels:\n",
+        );
+        for name in channels {
+            yaml.push_str("  - name: ");
+            yaml.push_str(name);
+            yaml.push('\n');
+        }
+        yaml
+    }
+
+    fn names(server: &ChatServer) -> Vec<String> {
+        server
+            .config
+            .channels
+            .iter()
+            .map(|ch| ch.name.clone())
+            .collect()
+    }
+
+    /// A saved file the next start would refuse is not applied to the
+    /// running server (review P2-4); a valid one is.
+    #[test]
+    fn a_reload_the_next_start_would_refuse_is_not_applied() {
+        let dir = std::env::temp_dir().join(format!(
+            "baucord-reload-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("server.yaml");
+        std::fs::write(&path, yaml(&["General", "AFK"])).expect("write");
+        let config = Config::from_file(&path).expect("config");
+        let mut server = ChatServer::new(config, &ServerIdentity::generate()).expect("server");
+        server.watch_config_file(path.clone());
+        let mut now = Instant::now();
+        server.update(now);
+        let mut mtime = SystemTime::now();
+        let mut save = |server: &mut ChatServer, channels: &[&str]| {
+            std::fs::write(&path, yaml(channels)).expect("write");
+            // A fresh mtime whatever the filesystem's granularity.
+            mtime += Duration::from_secs(2);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(mtime))
+                .expect("mtime");
+            now += CONFIG_CHECK_INTERVAL + Duration::from_millis(1);
+            server.update(now);
+        };
+
+        // The AFK room removed while `afk_channel` still names it.
+        save(&mut server, &["General", "Games"]);
+        assert_eq!(names(&server), ["General", "AFK"], "kept as it was");
+
+        save(&mut server, &["General", "Games", "AFK"]);
+        assert_eq!(names(&server), ["General", "Games", "AFK"], "applied");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

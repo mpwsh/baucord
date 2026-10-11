@@ -110,7 +110,8 @@ Working on the code? Start with [`START-HERE.md`](START-HERE.md).
 
 ### Prerequisites
 
-- Rust 1.95+ (`rust-toolchain.toml` pins it; workspace uses edition 2024)
+- Rust 1.95+ (`rust-toolchain.toml` pins it; edition 2024, except the
+  `audio` and `video` crates, still on 2021)
 - FFmpeg shared libraries (for screen share encode/decode)
 - Formatting uses nightly-only options: `cargo +nightly fmt --all`
 
@@ -119,14 +120,19 @@ Working on the code? Start with [`START-HERE.md`](START-HERE.md).
 Windows doesn't have a system package manager for FFmpeg, so it's built
 locally via [vcpkg](https://github.com/microsoft/vcpkg) with the codec
 feature set baucord needs (H.264 via x264, plus hardware encode paths
-for NVIDIA/AMD/Intel):
+for NVIDIA and AMD):
 
 ```powershell
 git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
 cd C:\vcpkg
+git checkout 34823ada10080ddca99b60e85f80f55e18a44eea
 .\bootstrap-vcpkg.bat
-.\vcpkg.exe install ffmpeg[x264,gpl,nvcodec,amf,qsv]:x64-windows-static-md
+.\vcpkg.exe install ffmpeg[x264,gpl,nvcodec,amf]:x64-windows-static-md --recurse
 ```
+
+The checkout pins vcpkg to its FFmpeg 7.1.2 port: `ffmpeg-next` 8 does
+not build against the FFmpeg that vcpkg's HEAD ships. `qsv` is left
+out on purpose, as in the release build.
 
 This can take 30+ minutes the first time — it's compiling x264 and the
 hardware codec bindings from source, not just fetching a binary.
@@ -285,7 +291,7 @@ Dockerfile          # cargo-chef build, distroless runtime
 docker-compose.yaml
 config/
   baucord.example.yaml  # a new host starts here (a server test keeps it loading)
-  baucord.yaml      # this host's config, mounted as /app/server.yaml
+  baucord.yaml      # this host's config (the folder is mounted at /app/config)
 scripts/
   setup.sh          # bootstrap / re-apply host + stack
   monitor-net.sh    # UDP / NIC drop logger

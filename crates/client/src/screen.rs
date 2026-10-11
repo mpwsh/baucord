@@ -3,7 +3,7 @@
 // Same architecture as voice.rs: dedicated thread, crossbeam channels,
 // control/event enums, shared state for UI.
 //
-// Sender side: capture → encode → NetworkControl::SendVideoFrame
+// Sender side: capture → encode → MediaOut::VideoFrame
 // Receiver side: incoming H.264 frames → jitter buffer → per-peer VideoDecoder → RGBA for display
 //
 // The jitter buffer decouples packet receipt from decode. Without it,
@@ -49,7 +49,7 @@ use video::{
 
 pub use crate::viewlog::PresentTally;
 use crate::{
-    network::NetworkControl,
+    network::{MediaOut, NetworkControl},
     viewlog::{ShareState, Sharing, Viewing},
 };
 
@@ -287,7 +287,7 @@ impl ScreenThreadHandle {
     /// a phone in the background too (review P1-8). Dropping the handle
     /// stops the thread.
     #[must_use]
-    pub fn spawn(network_tx: Sender<NetworkControl>) -> Self {
+    pub fn spawn(network_tx: Sender<NetworkControl>, media_tx: Sender<MediaOut>) -> Self {
         // 256 slots: at 30fps inbound + outbound control messages, 64 was
         // too tight and caused try_send drops during active streaming.
         let (tx, control_rx) = bounded::<ScreenControl>(256);
@@ -298,7 +298,7 @@ impl ScreenThreadHandle {
         let join_handle = thread::Builder::new()
             .name("screen-share".into())
             .spawn(move || {
-                run_screen_loop(control_rx, event_tx, network_tx, shared_clone);
+                run_screen_loop(control_rx, event_tx, network_tx, media_tx, shared_clone);
             })
             .expect("failed to spawn screen thread");
 
@@ -797,10 +797,10 @@ const KEYFRAME_BURST_MAX: Duration = Duration::from_secs(5);
 /// thread's capture tick and leave in bursts of a frame interval (33 ms
 /// at 30 fps, 67 at the slowest pace), which every viewer had to buffer
 /// on top (PRODUCTION-PLAN.md LAT-2). A full channel drops the packet.
-fn system_audio_sink(network_tx: &Sender<NetworkControl>) -> PacketSink {
-    let network_tx = network_tx.clone();
+fn system_audio_sink(media_tx: &Sender<MediaOut>) -> PacketSink {
+    let media_tx = media_tx.clone();
     Arc::new(move |packet| {
-        let sent = network_tx.try_send(NetworkControl::SendSystemAudio {
+        let sent = media_tx.try_send(MediaOut::SystemAudio {
             seq: packet.seq,
             channels: packet.channels,
             duration_ms: u16::from(packet.duration_ms),
@@ -1010,6 +1010,7 @@ fn run_screen_loop(
     control_rx: Receiver<ScreenControl>,
     event_tx: Sender<ScreenEvent>,
     network_tx: Sender<NetworkControl>,
+    media_tx: Sender<MediaOut>,
     shared: SharedScreenState,
 ) {
     let mut st = ScreenState {
@@ -1039,7 +1040,7 @@ fn run_screen_loop(
                 .map_err(|_| RecvTimeoutError::Disconnected),
         };
         match received {
-            Ok(ctrl) => handle_control(ctrl, &mut st, &event_tx, &network_tx, &shared),
+            Ok(ctrl) => handle_control(ctrl, &mut st, &event_tx, &network_tx, &media_tx, &shared),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -1049,7 +1050,7 @@ fn run_screen_loop(
         // (nanoseconds), so we can drain hundreds of pending packets
         // without blocking.
         while let Ok(ctrl) = control_rx.try_recv() {
-            handle_control(ctrl, &mut st, &event_tx, &network_tx, &shared);
+            handle_control(ctrl, &mut st, &event_tx, &network_tx, &media_tx, &shared);
         }
 
         // ── Drain jitter buffers → decode → emit ────────────────────
@@ -1067,7 +1068,7 @@ fn run_screen_loop(
             && Instant::now() >= next_capture
         {
             let cap_start = Instant::now();
-            capture_and_encode(state, &network_tx, &shared);
+            capture_and_encode(state, &network_tx, &media_tx, &shared);
 
             // Advance from the previous target (not from now) so the
             // capture cadence stays exact instead of drifting. The
@@ -1292,6 +1293,7 @@ fn handle_control(
     st: &mut ScreenState,
     event_tx: &Sender<ScreenEvent>,
     network_tx: &Sender<NetworkControl>,
+    media_tx: &Sender<MediaOut>,
     shared: &SharedScreenState,
 ) {
     match ctrl {
@@ -1336,7 +1338,7 @@ fn handle_control(
             // Start system audio capture (best-effort — non-fatal if unsupported)
             let system_audio = match SystemAudioCapture::new(
                 Arc::new(AudioStats::new()),
-                system_audio_sink(network_tx),
+                system_audio_sink(media_tx),
             ) {
                 Ok(mut cap) => match cap.start() {
                     Ok(()) => {
@@ -1596,7 +1598,7 @@ fn handle_control(
                 // Rebuild — best-effort, non-fatal
                 match SystemAudioCapture::new(
                     Arc::new(AudioStats::new()),
-                    system_audio_sink(network_tx),
+                    system_audio_sink(media_tx),
                 ) {
                     Ok(mut cap) => match cap.start() {
                         Ok(()) => {
@@ -1707,6 +1709,7 @@ fn handle_control(
 fn capture_and_encode(
     state: &mut CaptureState,
     network_tx: &Sender<NetworkControl>,
+    media_tx: &Sender<MediaOut>,
     shared: &SharedScreenState,
 ) {
     // Capture. For the streaming backend this is a non-blocking channel
@@ -1757,7 +1760,7 @@ fn capture_and_encode(
                 // the 1 s refresh (review P1-13).
                 if state.encoder.frames_in_flight() > 0 {
                     match state.encoder.drain() {
-                        Ok(aus) => send_encoded(state, aus, network_tx, shared),
+                        Ok(aus) => send_encoded(state, aus, media_tx, shared),
                         // A broken encoder says so on the next encode.
                         Err(e) => log::debug!("Encoder drain failed: {e}"),
                     }
@@ -1811,7 +1814,7 @@ fn capture_and_encode(
 
     shared.last_capture_us.store(capture_us, Ordering::Relaxed);
     shared.last_encode_us.store(encode_us, Ordering::Relaxed);
-    send_encoded(state, encoded_frames, network_tx, shared);
+    send_encoded(state, encoded_frames, media_tx, shared);
 }
 
 /// Hand the encoder's access units to the network, one sequence number
@@ -1820,7 +1823,7 @@ fn capture_and_encode(
 fn send_encoded(
     state: &mut CaptureState,
     encoded_frames: Vec<EncodedFrame>,
-    network_tx: &Sender<NetworkControl>,
+    media_tx: &Sender<MediaOut>,
     shared: &SharedScreenState,
 ) {
     for encoded in encoded_frames {
@@ -1888,7 +1891,7 @@ fn send_encoded(
         }
         state.offered_bytes += encoded.data.len() as u64;
         state.log.on_sent(encoded.data.len(), encoded.is_keyframe);
-        let _ = network_tx.try_send(NetworkControl::SendVideoFrame {
+        let _ = media_tx.try_send(MediaOut::VideoFrame {
             seq,
             is_keyframe: encoded.is_keyframe,
             width: encoded.width as u16,
@@ -2279,6 +2282,7 @@ mod tests {
             _event_rx: Receiver<ScreenEvent>,
             network_tx: Sender<NetworkControl>,
             network_rx: Receiver<NetworkControl>,
+            media_tx: Sender<MediaOut>,
             shared: SharedScreenState,
         }
 
@@ -2286,6 +2290,7 @@ mod tests {
             fn new() -> Self {
                 let (event_tx, event_rx) = bounded(64);
                 let (network_tx, network_rx) = bounded(64);
+                let (media_tx, _media_rx) = bounded(64);
                 Self {
                     st: ScreenState {
                         capture: None,
@@ -2300,6 +2305,7 @@ mod tests {
                     _event_rx: event_rx,
                     network_tx,
                     network_rx,
+                    media_tx,
                     shared: SharedScreenState::new(),
                 }
             }
@@ -2310,6 +2316,7 @@ mod tests {
                     &mut self.st,
                     &self.event_tx,
                     &self.network_tx,
+                    &self.media_tx,
                     &self.shared,
                 );
             }

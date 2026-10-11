@@ -338,7 +338,8 @@ lift_restriction / unlink_key` are the single implementations behind
 `ClientMessage::CreateInvite`, the bootstrap code, the tests, and the
 admin commands. `server invite create|list|revoke` (persistence
 on) writes the database directly; the running server picks the change
-up within 2 s.
+up within about 3 s (the 2 s `data_version` poll, then the tick's idle
+wait of at most 1 s).
 
 ### Relay
 
@@ -386,8 +387,11 @@ Blobs (spec §7) are the `UploadBegin/Accept/Chunk/Done/Rejected` and
 (`persistence.avatars.max_kb`) and, on a persistent server, the files
 and pictures posted in General and DMs (`files.rs`, under
 `persistence.files`' quotas and the transfer budget). An announced
-hash the server already holds is acknowledged without transfer;
-otherwise chunks fold through the same `fold_upload` as images, the
+hash the server already holds is acknowledged without transfer only
+for the file's uploader, or for someone who has already sent those
+bytes during this run; anyone else is asked for them once, which is
+their proof of holding the file (review P0-4; the proofs are in
+memory and start empty after a restart). Otherwise chunks fold through the same `fold_upload` as images, the
 bytes are hashed, sniffed and stored: metadata in `policy.blobs`,
 bytes in `blob_bytes` (the only copy without persistence) and, with
 it, at `blobs/<sha256>` next to the database plus a `blobs` row.
@@ -432,11 +436,17 @@ WAL, `synchronous=NORMAL`, `data/baucord/baucord.db`); the tick holds a
   hands the tick a `Notice::Policy`, which sends only what changed —
   `UserDetails` to the users whose roles moved, `Session` to sessions
   whose permissions did, `RoleList` if the roles table changed (review
-  P1-22). The CLI's listings open the database read-only, so reading
-  is not a change. Policy writes that are dropped under backpressure are
+  P1-22). Each snapshot says how many of the tick's policy writes the
+  thread had taken when it read the tables; one older than a write the
+  tick has queued since (a ban applied between the read and the swap)
+  is set aside by `Persist::poll`, which asks for a fresh one behind
+  that write, so the swap never drops a change from memory. The CLI's
+  listings open the database read-only, so reading is not a change. Policy writes that are dropped under backpressure are
   logged, not just counted.
-- `persistence.enabled: false` keeps the thread with a memory-only store:
-  writes are discarded, reads answer `Unavailable`, no file is created.
+- `persistence.enabled: false` starts no thread: writes are dropped at
+  the handle, reads answer `Unavailable` on the spot, no file is created.
+- With nothing queued the thread sleeps until its next periodic job
+  (the `data_version` poll, every 2 s).
 
 Migrations are forward-only (`persistence/migrations/`), applied on the
 main thread before the socket binds; a database from a newer build
@@ -447,11 +457,15 @@ fake `Instant` moves wall time too.
 ### Shutdown
 
 SIGTERM/SIGINT (the `ctrlc` crate with `termination`) sets a flag; the
-loop calls `shutdown(now, "server restarting")`, which closes every
-session with that reason, flushes pending telemetry, asks the
-persistence thread to drain its queue (bounded to 5 s) and exit, pumps
-for up to 500 ms so the close frames leave, and exits 0. The reason
-string is a wire contract with the client (`SERVER_RESTART_REASON`).
+loop calls `begin_shutdown(now, "server restarting")`, which closes
+every session with that reason and flushes pending telemetry; pumps
+the transport for up to 500 ms so the close frames leave; then calls
+`finish_shutdown()`, which has the persistence thread write what is
+queued and exit, waiting at most 6 s for it (one deadline for the
+whole wait); and exits 0. The close frames go first so that a slow
+database never holds them past Docker's 10 s stop timeout (review
+P2-5). The reason string is a wire contract with the client
+(`SERVER_RESTART_REASON`).
 
 ## 6. Client (`crates/client`)
 
@@ -486,7 +500,7 @@ non-blocking poll; with no inbound wake it polls the socket every 1 ms.
 
 ### Session lifecycle
 
-`NetworkControl::Connect { addr, nickname, password, fingerprint,
+`NetworkControl::Connect { addr, nickname, invite_code, fingerprint,
 client_key, portable }` → `Driver::connect`. On the transport's
 `Connected` event the client signs the exporter with its key and sends
 `Hello`. `Welcome` → `Admitted`, then `NetworkMessage::ServerIdentity
@@ -499,7 +513,8 @@ Ending a session produces one of:
 - `ConnectionLost { kind: LossKind, detail }` — the app reconnects with
   backoff (2/4/8/16/30 s, five attempts). `Timeout`, `Reset`,
   `Unreachable` (handshake or Hello never got through), `ServerRestart`.
-- `AccessDenied` — wrong password; has its own inline prompt.
+- `NeedInvite { why }` — the server wants a code (first visit, or the
+  one sent was refused); has its own inline prompt.
 - `IdentityChanged { expected, observed }` — refused before any data;
   the user edits or clears the pin.
 
@@ -508,8 +523,18 @@ the transport's wording and goes to the log only.
 
 ### Media on the wire
 
-- Voice: `SendVoicePacket` → `pack_voice_with_flags` → one datagram.
-  Inbound datagrams → `split_sender` → `VoiceData` → voice thread.
+- Voice: the engine's packets reach the network thread on the
+  `VoiceLink` it was handed (`send_voice` → `pack_voice_with_flags` →
+  one datagram). Inbound datagrams → `split_sender` → `VoiceData` →
+  straight into the engine through the link's `IncomingSender`, with
+  no hop through the voice thread (review P1-5).
+- Our share's frames and sound leave the screen thread and the
+  system-audio encoder as `MediaOut` on their own bounded channel
+  (`MEDIA_QUEUE`, `try_send`): a burst drops frames and never queues in
+  front of a command. Commands and state travel on unbounded channels,
+  so neither the UI nor the network thread waits for the other (review
+  P1-16). Each pass handles commands before media, which keeps
+  `ScreenShareStart` ahead of the first frame.
 - Video out: a keyframe opens a group (`video_new_group(OWN_TRACK)`),
   chunks follow on it; a delta frame with no open group (the group was
   abandoned) is dropped until the next keyframe. `send_screen_share_stop`
@@ -548,8 +573,10 @@ immediately as `TelemetryEvent`.
 
 `Settings` persists to `settings.json`, next to the executable when
 writable (portable) else the platform config dir. `ServerEntry { name,
-address, password, fingerprint, channel_passwords }`;
-`ServerEntry::from_invite` parses `host:port#SHA256:…`. Malformed pins
+address, invite_code, fingerprint, channel_passwords }`, plus the 1.0
+`password`, which is only kept so old files load (servers ignore it).
+The connect card splits a typed `host:port#SHA256:…` into address and
+pin. Malformed pins
 are dropped on load rather than trusted. `load_client_key()` creates
 `identity.key` beside the settings file on first use.
 
@@ -768,8 +795,8 @@ service, so a phone whose app is closed or suspended gets nothing
 
 ```bash
 cargo test --all                # everything; media crates need their system libs
-cargo test -p transport         # 45 tests, the sim scenarios among them
-cargo test -p server            # 51 unit + 88 e2e through the simulator (2026-10-09)
+cargo test -p transport         # 54 tests, the sim scenarios among them
+cargo test -p server            # 65 unit + 94 e2e through the simulator (2026-10-11)
 cargo clippy --all-targets      # all = deny, pedantic = warn
 cargo +nightly fmt --all        # imports_granularity/group_imports are nightly-only
 ```

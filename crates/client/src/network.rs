@@ -181,9 +181,11 @@ fn hex_short(bytes: &[u8]) -> String {
 
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
-    /// Outbound image upload progress, 0–100. 100 means the transport
-    /// has taken every byte — the UI hides its indicator on it.
+    /// Progress of one of our uploads, 0–100, named so the UI moves the
+    /// ring on that upload's own card (review P1-17). 100 means the
+    /// transport has taken every byte.
     UploadProgress {
+        upload: UploadKey,
         pct: u8,
     },
     /// Admitted by the server (`Welcome` received).
@@ -651,9 +653,10 @@ struct PendingBlob {
     data: Vec<u8>,
 }
 
-/// An upload as the UI asked for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UploadKey {
+/// An upload as the UI asked for it: the chat image (one at a time, as
+/// the wire carries it), or a blob by the upload id the UI gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UploadKey {
     Image,
     Blob(u32),
 }
@@ -714,14 +717,9 @@ pub(crate) struct NetworkClient {
     /// transport retires them: `CancelUpload` resets that stream and
     /// no other.
     blob_uploads: HashMap<u32, UploadId>,
-    /// The upload the UI asked for last: its ring is on that card, and
-    /// `UploadProgress` carries no id, so only this one's percent goes
-    /// out.
-    newest_upload: Option<UploadKey>,
-    /// That upload on the Media lane once its bytes go; cleared at 100.
-    progress_upload: Option<UploadId>,
-    /// Last percentage reported to the UI (255 = force first emit).
-    upload_last_pct: u8,
+    /// The percent last reported to the UI for each upload in flight:
+    /// every one reports its own, under its key.
+    upload_pct: HashMap<UploadKey, u8>,
     /// Reassembly of relayed images, keyed by (sender, upload id).
     incoming_images: HashMap<(u64, u32), IncomingImage>,
     /// Blobs being fetched, keyed by hash (spec §7).
@@ -829,9 +827,7 @@ impl NetworkClient {
             last_speaking_sent: false,
             image_upload: None,
             blob_uploads: HashMap::new(),
-            newest_upload: None,
-            progress_upload: None,
-            upload_last_pct: 255,
+            upload_pct: HashMap::new(),
             incoming_images: HashMap::new(),
             incoming_blobs: HashMap::new(),
             pending_blobs: HashMap::new(),
@@ -2001,12 +1997,12 @@ impl NetworkClient {
         }) else {
             return;
         };
-        self.newest_upload = Some(UploadKey::Image);
-        self.progress_upload = None;
         match self.driver.send_media(now, self.server, frames) {
             Ok(id) => {
+                // A newer image takes the slot and the card's ring.
+                self.upload_pct.remove(&UploadKey::Image);
                 self.image_upload = Some(id);
-                self.track_progress(id);
+                self.report_upload_progress();
             }
             Err(e) => warn!("Image upload could not start: {e}"),
         }
@@ -2047,48 +2043,42 @@ impl NetworkClient {
         }
     }
 
-    /// Report `id`'s progress from now on: the upload the UI asked for
-    /// last has started.
-    fn track_progress(&mut self, id: UploadId) {
-        self.progress_upload = Some(id);
-        self.upload_last_pct = 255;
-        self.report_upload_progress();
-    }
-
-    /// Report upload progress as the transport takes the bytes, and
-    /// forget uploads the transport retired (acknowledged, reset, or
+    /// Report each upload's progress as the transport takes its bytes,
+    /// and forget uploads the transport retired (acknowledged, reset, or
     /// gone with the connection): a cancel must never reach a stream
     /// that is over, or someone else's.
     fn report_upload_progress(&mut self) {
-        let (driver, server) = (&self.driver, self.server);
-        self.image_upload
-            .take_if(|id| driver.upload_progress(server, *id).is_none());
-        self.blob_uploads
-            .retain(|_, id| driver.upload_progress(server, *id).is_some());
-        let Some(id) = self.progress_upload else {
+        if self.image_upload.is_none() && self.blob_uploads.is_empty() {
             return;
-        };
-        let (pct, done) = match self.driver.upload_progress(self.server, id) {
-            #[allow(clippy::cast_possible_truncation)]
-            Some((written, total)) if total > 0 => {
-                ((written * 100 / total) as u8, written >= total)
+        }
+        let Self {
+            driver,
+            server,
+            image_upload,
+            blob_uploads,
+            upload_pct,
+            message_queue,
+            ..
+        } = self;
+        // Whether the upload is still the transport's.
+        let mut report = |upload: UploadKey, id: UploadId| {
+            let progress = driver.upload_progress(*server, id);
+            let pct = match progress {
+                #[allow(clippy::cast_possible_truncation)]
+                Some((written, total)) if total > 0 => (written * 100 / total) as u8,
+                // Nothing to send, or retired: fully acknowledged.
+                _ => 100,
+            };
+            if upload_pct.insert(upload, pct) != Some(pct) {
+                message_queue.push(NetworkMessage::UploadProgress { upload, pct });
             }
-            // Retired by the transport: fully acknowledged.
-            _ => (100, true),
+            if progress.is_none() {
+                upload_pct.remove(&upload);
+            }
+            progress.is_some()
         };
-        if pct != self.upload_last_pct {
-            self.upload_last_pct = pct;
-            self.message_queue
-                .push(NetworkMessage::UploadProgress { pct });
-        }
-        if done {
-            self.progress_upload = None;
-        }
-    }
-
-    /// An upload was cancelled: its percent stops too.
-    fn untrack_progress(&mut self, id: UploadId) {
-        self.progress_upload.take_if(|p| *p == id);
+        image_upload.take_if(|id| !report(UploadKey::Image, *id));
+        blob_uploads.retain(|upload_id, id| report(UploadKey::Blob(*upload_id), *id));
     }
 
     /// Fold one relayed chunk into its image; `Some(bytes)` when the
@@ -2257,10 +2247,6 @@ impl NetworkClient {
         );
         self.pending_blobs
             .insert(upload_id, PendingBlob { blob_id, data });
-        // The UI's ring moved to this card: an older upload's percent
-        // would land on it.
-        self.newest_upload = Some(UploadKey::Blob(upload_id));
-        self.progress_upload = None;
     }
 
     fn continue_blob_upload(&mut self, now: Instant, upload_id: u32, needed: bool) {
@@ -2292,9 +2278,7 @@ impl NetworkClient {
         match self.driver.send_media(now, self.server, frames) {
             Ok(id) => {
                 self.blob_uploads.insert(upload_id, id);
-                if self.newest_upload == Some(UploadKey::Blob(upload_id)) {
-                    self.track_progress(id);
-                }
+                self.report_upload_progress();
             }
             Err(e) => warn!("Blob upload could not start: {e}"),
         }
@@ -2307,7 +2291,7 @@ impl NetworkClient {
             return;
         }
         if let Some(id) = self.blob_uploads.remove(&upload_id) {
-            self.untrack_progress(id);
+            self.upload_pct.remove(&UploadKey::Blob(upload_id));
             let _ = self.driver.cancel_media(now, self.server, id);
         }
     }
@@ -2315,7 +2299,7 @@ impl NetworkClient {
     /// Stop the image in flight, if any: its stream is reset.
     fn cancel_image(&mut self, now: Instant) {
         if let Some(id) = self.image_upload.take() {
-            self.untrack_progress(id);
+            self.upload_pct.remove(&UploadKey::Image);
             let _ = self.driver.cancel_media(now, self.server, id);
         }
     }
@@ -2703,23 +2687,6 @@ pub enum NetworkControl {
     },
     /// Signal that we stopped sharing.
     ScreenShareStop,
-    /// Send an encoded H.264 frame on the video lane.
-    SendVideoFrame {
-        seq: u32,
-        is_keyframe: bool,
-        width: u16,
-        height: u16,
-        /// Capture time, ms (wraps at u32; viewers unwrap it).
-        timestamp_ms: u32,
-        data: Vec<u8>,
-    },
-    /// Send an Opus stereo system audio packet on the system audio lane.
-    SendSystemAudio {
-        seq: u32,
-        channels: u8,
-        duration_ms: u16,
-        data: Vec<u8>,
-    },
     /// Request a fresh keyframe from the user we're watching
     /// (viewer → server → sharer).
     RequestKeyframe {
@@ -2770,7 +2737,7 @@ impl NetworkThreadHandle {
     /// If the OS refuses to create the thread.
     pub fn spawn(
         tx: Sender<NetworkControl>,
-        control_rx: Receiver<NetworkControl>,
+        inputs: NetworkInputs,
         msg_tx: Sender<NetworkMessage>,
         msg_rx: Receiver<NetworkMessage>,
         voice_tx: Sender<VoiceControl>,
@@ -2780,7 +2747,14 @@ impl NetworkThreadHandle {
         let join_handle = thread::Builder::new()
             .name("client-network".into())
             .spawn(move || {
-                run_network_loop(&control_rx, &msg_tx, &voice_tx, &screen_tx, &wake);
+                run_network_loop(
+                    &inputs.control,
+                    &inputs.media,
+                    &msg_tx,
+                    &voice_tx,
+                    &screen_tx,
+                    &wake,
+                );
             })
             .expect("failed to spawn network thread");
 
@@ -3112,28 +3086,6 @@ fn handle_control(
                 c.send_screen_share_stop(now);
             }
         }
-        NetworkControl::SendVideoFrame {
-            seq,
-            is_keyframe,
-            width,
-            height,
-            timestamp_ms,
-            data,
-        } => {
-            if let Some(c) = client {
-                c.send_video_frame(now, seq, is_keyframe, width, height, timestamp_ms, &data);
-            }
-        }
-        NetworkControl::SendSystemAudio {
-            seq,
-            channels,
-            duration_ms,
-            data,
-        } => {
-            if let Some(c) = client {
-                c.send_system_audio(now, seq, channels, duration_ms, &data);
-            }
-        }
         NetworkControl::RequestKeyframe { target_id } => {
             if let Some(c) = client {
                 c.send_request_keyframe(now, target_id);
@@ -3348,9 +3300,52 @@ fn route_message(
     }
 }
 
+/// Our share's media on its way to the wire: what the screen thread
+/// and the system-audio encoder hand the network thread. It has its
+/// own bounded channel ([`MEDIA_QUEUE`]), filled by `try_send`, so a
+/// burst of frames can drop frames but can never sit in front of the
+/// UI's commands or make a sender wait (review P1-16).
+#[derive(Debug)]
+pub enum MediaOut {
+    /// An encoded H.264 frame for the video lane.
+    VideoFrame {
+        seq: u32,
+        is_keyframe: bool,
+        width: u16,
+        height: u16,
+        /// Capture time, ms (wraps at u32; viewers unwrap it).
+        timestamp_ms: u32,
+        data: Vec<u8>,
+    },
+    /// An Opus stereo system-audio packet for the system audio lane.
+    SystemAudio {
+        seq: u32,
+        channels: u8,
+        duration_ms: u16,
+        data: Vec<u8>,
+    },
+}
+
+/// What the network thread reads besides its socket: the commands, and
+/// our share's media on its own bounded channel.
+pub struct NetworkInputs {
+    pub control: Receiver<NetworkControl>,
+    pub media: Receiver<MediaOut>,
+}
+
+/// Slots in the outbound media channel: about 2 s of a 60 fps share
+/// with its sound. A network thread that far behind is not going to
+/// send those frames in time to matter.
+pub const MEDIA_QUEUE: usize = 256;
+
+/// Media handed to the transport in one loop pass before it flushes.
+const MEDIA_BURST: usize = 64;
+
 /// What woke the network loop.
 enum Woke {
     Control(NetworkControl),
+    /// A frame or a sound packet of our own share.
+    Media(MediaOut),
     /// The voice encoder's next packet, or its channel closing with
     /// the engine.
     Voice(Result<AudioPacket, RecvError>),
@@ -3361,6 +3356,7 @@ enum Woke {
 
 fn run_network_loop(
     control_rx: &Receiver<NetworkControl>,
+    media_rx: &Receiver<MediaOut>,
     msg_tx: &Sender<NetworkMessage>,
     voice_tx: &Sender<VoiceControl>,
     screen_tx: &Sender<ScreenControl>,
@@ -3374,9 +3370,9 @@ fn run_network_loop(
 
     while running {
         LOOP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Block on what can have work for us: a command (video chunks
-        // from the screen thread among them), the voice encoder's next
-        // packet (review P1-5), an arriving datagram through the inbound
+        // Block on what can have work for us: a command, our share's
+        // next frame or sound packet (review P1-16), the voice encoder's
+        // next packet (review P1-5), an arriving datagram through the inbound
         // wake (`inbound_wake.rs`). The timeout is `loop_wait`: until the
         // transport's next deadline or our own periodic stats, so acks,
         // keep-alives, video deadlines and the upload pacer are never
@@ -3387,6 +3383,7 @@ fn run_network_loop(
         let woke = match &mut client {
             Some(c) if c.has_backlog() => match control_rx.try_recv() {
                 Ok(ctrl) => Woke::Control(ctrl),
+                // Media waiting is picked up by the drain below.
                 Err(TryRecvError::Empty) => Woke::Due,
                 Err(TryRecvError::Disconnected) => Woke::Gone,
             },
@@ -3395,6 +3392,7 @@ fn run_network_loop(
                 let ready = c.inbound_ready();
                 crossbeam_channel::select! {
                     recv(control_rx) -> msg => msg.map_or(Woke::Gone, Woke::Control),
+                    recv(media_rx) -> media => media.map_or(Woke::Due, Woke::Media),
                     recv(outgoing) -> packet => Woke::Voice(packet),
                     recv(ready.as_ref().unwrap_or(&no_inbound)) -> rang => {
                         if rang.is_ok() {
@@ -3407,39 +3405,56 @@ fn run_network_loop(
                     default(wait) => Woke::Due,
                 }
             }
+            // No session, nothing to send media on: what the screen
+            // thread still queues is dropped as it comes.
             None => crossbeam_channel::select! {
                 recv(control_rx) -> msg => msg.map_or(Woke::Gone, Woke::Control),
+                recv(media_rx) -> media => media.map_or(Woke::Due, Woke::Media),
                 recv(outgoing) -> packet => Woke::Voice(packet),
             },
         };
 
+        // Commands first, whatever woke the loop: the screen thread
+        // announces a share on the command channel before its first
+        // frame goes on the media one, and that order must hold here.
+        let mut first_media = None;
         match woke {
             Woke::Control(ctrl) => {
                 if !handle_control(ctrl, &mut client, &mut voice, msg_tx, wake) {
                     running = false;
                 }
-                // Drain a bounded burst of whatever else queued up.
-                for _ in 0..63 {
-                    match control_rx.try_recv() {
-                        Ok(ctrl) => {
-                            if !handle_control(ctrl, &mut client, &mut voice, msg_tx, wake) {
-                                running = false;
-                            }
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            running = false;
-                            break;
-                        }
-                    }
-                }
             }
+            Woke::Media(media) => first_media = Some(media),
             Woke::Voice(Ok(packet)) => send_voice(client.as_mut(), voice.as_ref(), &packet),
             // The engine is gone; the voice thread says so too, or
             // hands over the next one.
             Woke::Voice(Err(RecvError)) => voice = None,
             Woke::Due => {}
             Woke::Gone => break,
+        }
+        // Drain a bounded burst of whatever else queued up.
+        for _ in 0..63 {
+            match control_rx.try_recv() {
+                Ok(ctrl) => {
+                    if !handle_control(ctrl, &mut client, &mut voice, msg_tx, wake) {
+                        running = false;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    running = false;
+                    break;
+                }
+            }
+        }
+        let mut sent = 0;
+        while let Some(media) = first_media.take().or_else(|| {
+            (sent < MEDIA_BURST)
+                .then(|| media_rx.try_recv().ok())
+                .flatten()
+        }) {
+            sent += 1;
+            send_media(client.as_mut(), media);
         }
 
         // Whatever else the encoder has queued, before the transport
@@ -3468,6 +3483,31 @@ fn run_network_loop(
                 client = None;
             }
         }
+    }
+}
+
+/// A frame or a sound packet of our share onto its lane; dropped when
+/// there is no session.
+fn send_media(client: Option<&mut NetworkClient>, media: MediaOut) {
+    let Some(c) = client else {
+        return;
+    };
+    let now = Instant::now();
+    match media {
+        MediaOut::VideoFrame {
+            seq,
+            is_keyframe,
+            width,
+            height,
+            timestamp_ms,
+            data,
+        } => c.send_video_frame(now, seq, is_keyframe, width, height, timestamp_ms, &data),
+        MediaOut::SystemAudio {
+            seq,
+            channels,
+            duration_ms,
+            data,
+        } => c.send_system_audio(now, seq, channels, duration_ms, &data),
     }
 }
 

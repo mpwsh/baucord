@@ -28,8 +28,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to configuration file
-    #[arg(short, long, default_value = "server.yaml")]
+    /// Path to configuration file. `BAUCORD_CONFIG` sets it for every
+    /// command run in a container, `docker compose exec` included.
+    #[arg(short, long, env = "BAUCORD_CONFIG", default_value = "server.yaml")]
     config: String,
     /// Override host from config
     #[arg(long)]
@@ -418,9 +419,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let now = Instant::now();
         if stop.load(Ordering::SeqCst) {
-            server.shutdown(now, SHUTDOWN_REASON);
+            server.begin_shutdown(now, SHUTDOWN_REASON);
             // Let the close frames (and their acks) travel: a few ticks
             // is plenty, and a peer that is already gone costs nothing.
+            // They go before the database drain, which can take seconds
+            // (review P2-5).
             let deadline = Instant::now() + SHUTDOWN_GRACE;
             while Instant::now() < deadline && server.driver().peer_count() > 0 {
                 let now = Instant::now();
@@ -431,6 +434,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 thread::sleep(Duration::from_millis(5));
             }
+            server.finish_shutdown();
             info!("Stopped");
             return Ok(());
         }
@@ -1252,8 +1256,18 @@ fn open_log_file(path: &str) -> std::io::Result<File> {
 /// behavior — the log was truncated exactly when you restart to debug
 /// a crash, which is when you needed it).
 fn rotate_log_if_needed(path: &str, log_file: &Arc<Mutex<File>>) {
-    let Ok(meta) = fs::metadata(path) else {
-        return;
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        // Gone: an earlier rotation could not reopen it and the handle
+        // still writes to `.1`. Try again.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let (Ok(new_file), Ok(mut guard)) = (open_log_file(path), log_file.lock()) {
+                let _ = guard.flush();
+                *guard = new_file;
+            }
+            return;
+        }
+        Err(_) => return,
     };
     if meta.len() <= MAX_LOG_BYTES {
         return;
@@ -1268,8 +1282,13 @@ fn rotate_log_if_needed(path: &str, log_file: &Arc<Mutex<File>>) {
         // renamed handle keeps writing to .1 until the swap lands.
         match open_log_file(path) {
             Ok(new_file) => *guard = new_file,
-            Err(_) => {
-                let _ = guard.set_len(0);
+            // The handle now points at `.1`: keep writing there. It
+            // used to be truncated here, which threw away the log that
+            // had just been rotated (review P3-8). The next check
+            // tries the reopen again. Said on stderr: the logger is
+            // this very lock.
+            Err(e) => {
+                eprintln!("log rotation: could not reopen {path} ({e}); logging to {rotated}");
             }
         }
     } else {

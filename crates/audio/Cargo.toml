@@ -48,7 +48,9 @@ realfft = "3.5"
 
 # Noise suppression (Mozilla RNNoise, pure Rust). Its VAD probability also
 # drives the speaking indicator, so no separate VAD dependency is needed.
-nnnoiseless = "0.5"
+# The library alone: its default features are a command-line tool
+# (clap 3, anyhow, hound) and a `dasp` adapter, nothing the engine calls.
+nnnoiseless = { version = "0.5", default-features = false }
 
 serde = { workspace = true, optional = true }
 

@@ -176,15 +176,7 @@ impl ChatServer {
                 let key = self.key_of.get(client)?;
                 let ip = self.driver.remote_address(*client).map(|a| a.ip());
                 self.policy
-                    .restrictions
-                    .iter()
-                    .find(|r| {
-                        r.kind == RestrictionKind::Server
-                            && r.active(now)
-                            && (r.user_id.as_ref() == Some(user)
-                                || r.key_hash.as_ref() == Some(key)
-                                || (ip.is_some() && r.ip == ip))
-                    })
+                    .server_ban(Some(user), key, ip, now)
                     .map(|r| (*client, r.clone()))
             })
             .collect();
@@ -197,14 +189,20 @@ impl ChatServer {
             );
         }
         // A kick from the CLI shows up as the session's key no longer
-        // belonging to its user.
+        // belonging to its user; `server key unlink` as the key being
+        // retired, which is as gone as removed: the session it logged
+        // in used to stay connected until it left on its own (review
+        // P3-11).
         let kicked: Vec<ClientId> = self
             .user_of
             .iter()
             .filter(|(client, user)| {
-                self.key_of
-                    .get(*client)
-                    .is_none_or(|key| self.policy.keys.get(key).map(|k| k.user_id) != Some(**user))
+                self.key_of.get(*client).is_none_or(|key| {
+                    self.policy
+                        .keys
+                        .get(key)
+                        .is_none_or(|k| k.user_id != **user || k.retired_at.is_some())
+                })
             })
             .map(|(client, _)| *client)
             .collect();
@@ -212,18 +210,37 @@ impl ChatServer {
             self.remove_session(client, RemovedKind::Kicked, "access removed", "server");
         }
         self.refresh_enforcement();
-        // The roster lines whose roles or level moved, to everyone.
-        let details: Vec<ServerMessage> = self
+        // An account the other process purged (`server user purge`):
+        // its messages are gone from the database, and must leave the
+        // replay ring and everyone's screen too, not wait for the 200
+        // messages after them (review P2-8).
+        let purged: Vec<u64> = self
+            .recent
+            .iter()
+            .filter(|m| {
+                old.users.contains_key(&m.user_id) && !self.policy.users.contains_key(&m.user_id)
+            })
+            .map(|m| m.msg_id)
+            .collect();
+        if !purged.is_empty() {
+            self.recent.retain(|m| !purged.contains(&m.msg_id));
+            for msg_id in purged {
+                self.broadcast_msg(&ServerMessage::MessageDeleted { msg_id });
+            }
+        }
+        // The roster lines whose roles or level moved, to everyone who
+        // knows the session.
+        let details: Vec<(ClientId, ServerMessage)> = self
             .user_of
             .iter()
             .filter(|(_, u)| {
                 roles_in(&old, u) != roles_in(&self.policy, u)
                     || old.level_of(u) != self.policy.level_of(u)
             })
-            .map(|(c, u)| self.user_details(*c, u))
+            .map(|(c, u)| (*c, self.user_details(*c, u)))
             .collect();
-        for msg in details {
-            for peer in self.clients() {
+        for (subject, msg) in details {
+            for peer in self.audience_about(subject) {
                 self.send_if_roles(peer, &msg);
             }
         }
@@ -426,13 +443,28 @@ impl ChatServer {
                         self.check_target(actor, &user)?;
                         (Some(user), None, None)
                     }
+                    // A key or an address is not a person: it can only
+                    // be kept out of the server, which takes the ban
+                    // permission like any other ban. A mute or a text
+                    // restriction on one would name nobody, skipped the
+                    // rank rule, and showed in no one's session (review
+                    // P2-10).
+                    AdminTarget::Key(_) | AdminTarget::Address(_)
+                        if kind != RestrictionKind::Server =>
+                    {
+                        return Err(AdminError::Invalid(
+                            "a key or an address can only be banned from the server".to_string(),
+                        ));
+                    }
                     AdminTarget::Key(key) => {
+                        need(permissions::BAN)?;
                         if let Some(owner) = self.policy.keys.get(&key).map(|k| k.user_id) {
                             self.check_target(actor, &owner)?;
                         }
                         (None, Some(key), None)
                     }
                     AdminTarget::Address(text) => {
+                        need(permissions::BAN)?;
                         let ip = text.trim().parse().map_err(|_| {
                             AdminError::Invalid(format!("'{text}' is not an address"))
                         })?;
@@ -1008,7 +1040,7 @@ impl ChatServer {
             };
             self.send_if_roles(*client, &session);
             let details = self.user_details(*client, user_id);
-            for peer in self.clients() {
+            for peer in self.audience_about(*client) {
                 self.send_if_roles(peer, &details);
             }
         }

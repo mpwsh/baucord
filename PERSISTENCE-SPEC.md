@@ -27,9 +27,10 @@ the media path.
    never tells the server what it is. There is no client-side field
    that influences a role, a permission, or a display badge.
 3. **Additive wire only.** Every new message is a new enum variant
-   behind a feature bit; 1.0 clients keep working against a 1.1 server
-   (they see no history, no DMs, no roles, and are treated as guests).
-   The ALPN string does not change.
+   behind a feature bit. 1.0 clients, which log in with the shared
+   room password instead of a device key, are the one exception: a 1.1
+   server refuses them with `BadHello` and they are told to update
+   (§3.4). The ALPN string does not change.
 4. **Live state stays in memory.** Channels, memberships, roles and
    restrictions are loaded once at startup and on change; the tick
    consults RAM. The database is the source of truth across restarts,
@@ -549,7 +550,7 @@ special case of it (rendered inline), everything else is a card.
 
 ```rust
 ClientMessage::UploadBegin  { upload_id, name, mime, size, sha256 }  // Signal lane
-ServerMessage::UploadAccept { upload_id, needed: bool }               // false = server already has this hash
+ServerMessage::UploadAccept { upload_id, needed: bool }               // false = the server has it and knows you hold it
 ClientMessage::UploadChunk  { upload_id, index, count, data }         // Media lane, paced (existing path)
 ServerMessage::UploadDone   { upload_id, blob_id } | UploadRejected { upload_id, reason }
 ServerMessage::Message { …, attachment: Some(Attachment { blob_id, name, mime, size }) }
@@ -557,8 +558,14 @@ ClientMessage::FetchBlob    { blob_id }                               // Signal
 ServerMessage::Blob… on a Media stream (existing paced relay), sha verified by the client as today
 ```
 
-- **Dedup by content:** `UploadBegin` carries the hash; a known blob is
-  acknowledged without transfer (`needed: false`), then referenced.
+- **Dedup by content:** `UploadBegin` carries the hash. A known blob is
+  acknowledged without transfer (`needed: false`) for its uploader,
+  and for anyone who has already sent the same bytes during this run
+  of the server; it is then referenced. Anyone else is asked for the
+  bytes once (`needed: true`): sending them is the proof that they
+  hold the file, and only then may they post it. Knowing a hash is not
+  enough to attach someone else's file (review P0-4). The proofs live
+  in memory, so after a restart a second poster uploads once more.
 - **Without persistence** a memory-mode server relays pictures live
   to everyone online through the paced Media path (the 1.0
   `ImageMessage` relay) and refuses other files; nothing is stored.
@@ -731,8 +738,8 @@ persistence off.
 
 Talking and sharing count only with someone else there, so an empty
 room farms nothing. **Level is derived from xp, never stored:** the
-next level costs `250 × level^1.5` xp (levels 1–10 ≈ four hours of
-ordinary use, 20 ≈ a couple of months). Changing the curve later is a
+next level costs `13 × level^1.5` xp (`protocol/src/progress.rs`;
+level 10 ≈ four hours of ordinary use, 20 ≈ a day). Changing the curve later is a
 formula change, not a migration.
 
 Wire: `UserDetails` carries `level`; `ProgressUpdate { xp, level }`

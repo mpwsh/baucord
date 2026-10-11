@@ -19,6 +19,19 @@ impl AppState {
         }
         if delta.dropped_front > 0 {
             self.refresh_grouping(0);
+            // "Load earlier" goes on from the oldest message still
+            // shown, not from where the last page began: with the old
+            // cursor the trimmed rows in between were never fetched
+            // again, a gap in the middle of the history (review P2-23).
+            if let Some(oldest) = self.history.oldest_message_id() {
+                self.oldest_history_id = Some(oldest);
+                if self.server_persistent && !self.history_more {
+                    self.history_more = true;
+                    if !self.borrowed_conversation {
+                        self.main.global::<State>().set_history_more(true);
+                    }
+                }
+            }
         }
         let len = self.history.rows().len();
         for i in (len - delta.appended)..len {
@@ -32,6 +45,9 @@ impl AppState {
         // measured them (`ChatPane.follow-appended`); one scrolled up
         // is told how many messages from others they have not seen.
         let following = self.main.invoke_chat_follow_appended();
+        // Nothing is trimmed above a reader who is not at the newest
+        // rows; back there, the list returns to its cap.
+        self.history.hold_front(!following);
         let fresh: HashSet<u64> = self.history.rows()[len - delta.appended..]
             .iter()
             .filter_map(app_core::chat::ChatItem::meta)

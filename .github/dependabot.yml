@@ -39,11 +39,6 @@ updates:
     # yanked or followed by a fix within the week.
     cooldown:
       default-days: 7
-    ignore:
-      # renet is supplied by the [patch.crates-io] git pin in the root
-      # Cargo.toml. Dependabot must not try to move that rev; the pin is
-      # managed by hand.
-      - dependency-name: "renet"
     commit-message:
       prefix: "deps"
     labels: ["dependencies"]

@@ -1,16 +1,14 @@
 /target
 /backups
-onnxruntime.dll
 diagnostics*.txt
 .DS_Store
 prompt.md
 *.log
-netcode.key
-fltk-ui
-./crates/*.tar.gz
+/crates/*.tar.gz
 /data
+# The config a server run from the repository root writes on first start.
+/server.yaml
 baucord.db
 baucord.db-shm
 baucord.db-wal
-upload_certificate.pem
 /tools/*/target

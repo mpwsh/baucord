@@ -75,3 +75,57 @@ pub use voice::{
     pack_voice, pack_voice_with_flags, parse_voice, VoiceHeader, VOICE_FLAGS_KNOWN, VOICE_FLAG_RED,
     VOICE_HEADER_SIZE, VOICE_MAX_FRAME_SIZE, VOICE_MTU_BUDGET,
 };
+
+/// A full 64-hex-digit id (a user id, a key hash, a blob id) as its 32
+/// bytes; `None` for anything else. The one parser the server's CLI and
+/// the client's commands share. It reads bytes, not `str` slices: the
+/// two copies it replaces sliced by byte offset and panicked on a
+/// 64-byte input holding a multi-byte character (review P2-15).
+#[must_use]
+pub fn parse_hex_id(text: &str) -> Option<[u8; 32]> {
+    let digits = text.trim().as_bytes();
+    if digits.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+        let high = char::from(pair[0]).to_digit(16)?;
+        let low = char::from(pair[1]).to_digit(16)?;
+        *byte = u8::try_from(high * 16 + low).ok()?;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod hex_id_tests {
+    use super::parse_hex_id;
+
+    #[test]
+    fn a_hex_id_is_64_hex_digits_and_nothing_else() {
+        let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let id: [u8; 32] = std::array::from_fn(|i| u8::try_from(i).unwrap());
+        assert_eq!(parse_hex_id(hex), Some(id));
+        assert_eq!(
+            parse_hex_id(&format!("  {}\n", hex.to_uppercase())),
+            Some(id)
+        );
+        assert_eq!(parse_hex_id(&hex[..62]), None);
+        assert_eq!(parse_hex_id(&format!("{}zz", &hex[..62])), None);
+        // `from_str_radix` took a sign; an id has none.
+        assert_eq!(parse_hex_id(&format!("+f{}", &hex[2..])), None);
+    }
+
+    #[test]
+    fn multi_byte_input_is_refused_not_sliced() {
+        // 64 bytes, but not 64 characters: byte-offset slicing landed
+        // inside a character and panicked.
+        let text = format!("é{}", "a".repeat(62));
+        assert_eq!(text.len(), 64);
+        assert_eq!(parse_hex_id(&text), None);
+        let text = format!("{}é", "a".repeat(62));
+        assert_eq!(parse_hex_id(&text), None);
+        let text = "\u{3000}".repeat(21) + "a";
+        assert_eq!(text.len(), 64);
+        assert_eq!(parse_hex_id(&text), None);
+    }
+}

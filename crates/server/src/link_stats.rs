@@ -50,6 +50,15 @@ impl VoiceWindow {
         self.expected.saturating_sub(self.received)
     }
 
+    /// Fold another window into this one: several report windows as
+    /// one longer interval.
+    pub fn add(&mut self, other: &VoiceWindow) {
+        self.received += other.received;
+        self.expected += other.expected;
+        self.late += other.late;
+        self.resyncs += other.resyncs;
+    }
+
     /// Loss as a percentage of `expected`; zero for an empty window.
     #[must_use]
     pub fn loss_pct(&self) -> f64 {

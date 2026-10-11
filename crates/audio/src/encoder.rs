@@ -392,21 +392,19 @@ impl EncoderWorker {
         // Field case, 2026-08-30 00:17: a 38 % reading latched verbatim
         // for two minutes after the transport stopped reporting.
         let uplink: Option<i32> = {
-            let updated_ms = self.stats.uplink_loss_updated_ms.load(Ordering::Relaxed);
-            let now_ms =
-                u64::try_from(self.stats.start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let age_ms = now_ms.saturating_sub(updated_ms);
+            let age_ms = self.stats.uplink_report_age_ms();
             // Stored value is already clamped to 0..=100 by the setter;
             // try_from keeps the cast lint-free without an unwrap.
             let last = i32::try_from(self.stats.uplink_loss_pct.load(Ordering::Relaxed))
                 .unwrap_or(FEC_LOSS_CEIL_PCT);
-            let fresh = updated_ms != 0 && age_ms <= UPLINK_STALE_MS;
+            let fresh = age_ms.is_some_and(|age| age <= UPLINK_STALE_MS);
             // The relay reports every 2 s unconditionally, so a gap after a
             // *bad* reading is the loss delaying the reports, not the link
             // healing: hold the hint a while longer instead of switching
             // FEC off in the middle of the trouble (2026-09-03: 68 flaps
             // 20 % → 5 % → 20 % in 40 minutes at 40 % upstream loss).
-            let held = updated_ms != 0 && last >= UPLINK_HOLD_MIN_PCT && age_ms <= UPLINK_HOLD_MS;
+            let held =
+                last >= UPLINK_HOLD_MIN_PCT && age_ms.is_some_and(|age| age <= UPLINK_HOLD_MS);
             (fresh || held).then_some(last)
         };
 

@@ -1415,7 +1415,10 @@ impl VoiceChat {
         device_name: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!("set_input_device called with: {device_name:?}");
-        self.input.take();
+        // Through `close_input`: if the new device fails to open, the
+        // speaking flag and the meter must not keep what the old one
+        // last said (review P2-20).
+        self.close_input();
         self.config.input_device = device_name.map(String::from);
         if !self.capture_wanted() {
             // A phone with its microphone closed (out of a room, muted):
@@ -1522,14 +1525,18 @@ impl VoiceChat {
         for device in host.input_devices()? {
             if let Some(name) = device_name(&device) {
                 let is_default = default_name.as_deref() == Some(&name);
-                if let Ok(cfg) = device.default_input_config() {
-                    debug!(
-                        "  Input device: \"{name}\" {}Hz {}ch {:?}{}",
-                        cfg.sample_rate(),
-                        cfg.channels(),
-                        cfg.sample_format(),
-                        if is_default { " [DEFAULT]" } else { "" },
-                    );
+                // As for the outputs below: no config round trip unless
+                // the line is written (review P2-36).
+                if log::log_enabled!(log::Level::Debug) {
+                    if let Ok(cfg) = device.default_input_config() {
+                        debug!(
+                            "  Input device: \"{name}\" {}Hz {}ch {:?}{}",
+                            cfg.sample_rate(),
+                            cfg.channels(),
+                            cfg.sample_format(),
+                            if is_default { " [DEFAULT]" } else { "" },
+                        );
+                    }
                 }
                 devices.push((name, is_default));
             }
@@ -1568,14 +1575,20 @@ impl VoiceChat {
         for device in host.output_devices()? {
             if let Some(name) = device_name(&device) {
                 let is_default = default_name.as_deref() == Some(&name);
-                if let Ok(cfg) = device.default_output_config() {
-                    debug!(
-                        "  Output device: \"{name}\" {}Hz {}ch {:?}{}",
-                        cfg.sample_rate(),
-                        cfg.channels(),
-                        cfg.sample_format(),
-                        if is_default { " [DEFAULT]" } else { "" },
-                    );
+                // Opening every device's config only to print it is a
+                // round trip to each driver, on the UI thread, every
+                // 10 s: only when the line will be written (review
+                // P2-36).
+                if log::log_enabled!(log::Level::Debug) {
+                    if let Ok(cfg) = device.default_output_config() {
+                        debug!(
+                            "  Output device: \"{name}\" {}Hz {}ch {:?}{}",
+                            cfg.sample_rate(),
+                            cfg.channels(),
+                            cfg.sample_format(),
+                            if is_default { " [DEFAULT]" } else { "" },
+                        );
+                    }
                 }
                 devices.push((name, is_default));
             }

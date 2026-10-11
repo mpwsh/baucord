@@ -287,20 +287,41 @@ impl Policy {
 
     /// The `server` restriction that blocks this key, user or address
     /// right now, if any. Checked before anything else at admission.
+    ///
+    /// A ban on the user always holds. One that reaches a known user
+    /// only through a key or an address is the fallout of banning
+    /// someone else, and the rank rule (spec §8) applies to it as it
+    /// does when the ban is issued: see [`Self::spared`].
     #[must_use]
     pub fn server_ban(
         &self,
         user: Option<&UserId>,
         key_hash: &KeyHash,
-        ip: IpAddr,
+        ip: Option<IpAddr>,
         now: WallMs,
     ) -> Option<&Restriction> {
         self.restrictions.iter().find(|r| {
-            r.kind == RestrictionKind::Server
-                && r.active(now)
-                && (r.key_hash.as_ref() == Some(key_hash)
-                    || r.ip == Some(ip)
-                    || (user.is_some() && r.user_id.as_ref() == user))
+            if r.kind != RestrictionKind::Server || !r.active(now) {
+                return false;
+            }
+            if user.is_some() && r.user_id.as_ref() == user {
+                return true;
+            }
+            let reaches = r.key_hash.as_ref() == Some(key_hash) || (ip.is_some() && r.ip == ip);
+            reaches && !user.is_some_and(|u| self.spared(r, u))
+        })
+    }
+
+    /// Whether a key or address ban issued by a person passes `user`
+    /// by: never an administrator, never the issuer, never anyone at or
+    /// above the issuer's rank. Without this, someone allowed to ban
+    /// could lock an administrator out by naming their address (review
+    /// P2-10). A ban written by the operator (the CLI, `by` unset)
+    /// spares nobody.
+    fn spared(&self, r: &Restriction, user: &UserId) -> bool {
+        r.by.as_ref().is_some_and(|by| {
+            permissions::has(self.permissions_of(user), permissions::ADMIN)
+                || (self.users.contains_key(by) && self.rank_of(user) >= self.rank_of(by))
         })
     }
 
@@ -453,7 +474,7 @@ pub const fn default_invite_role() -> RoleId {
 
 #[cfg(test)]
 mod tests {
-    use protocol::permissions::{ROLE_ADMIN, ROLE_MEMBER};
+    use protocol::permissions::{ROLE_ADMIN, ROLE_MEMBER, ROLE_ORGANIZER};
 
     use super::*;
 
@@ -553,13 +574,70 @@ mod tests {
         });
         assert_eq!(stored.id, 1);
         let other_ip: IpAddr = "10.0.0.8".parse().unwrap();
-        assert!(p.server_ban(None, &id(9), other_ip, 10).is_some());
-        assert!(p.server_ban(Some(&id(1)), &id(2), other_ip, 10).is_some());
-        assert!(p.server_ban(None, &id(2), ip, 10).is_some());
-        assert!(p.server_ban(None, &id(2), other_ip, 10).is_none());
-        assert!(p.server_ban(None, &id(9), ip, 1_000).is_none(), "expired");
+        assert!(p.server_ban(None, &id(9), Some(other_ip), 10).is_some());
+        assert!(p
+            .server_ban(Some(&id(1)), &id(2), Some(other_ip), 10)
+            .is_some());
+        assert!(p.server_ban(None, &id(2), Some(ip), 10).is_some());
+        assert!(p.server_ban(None, &id(2), Some(other_ip), 10).is_none());
+        assert!(p.server_ban(None, &id(2), None, 10).is_none());
+        assert!(
+            p.server_ban(None, &id(9), Some(ip), 1_000).is_none(),
+            "expired"
+        );
         p.expire_restrictions(1_000);
         assert!(p.restrictions.is_empty());
+    }
+
+    /// The fallout of a key or address ban follows the rank rule at
+    /// admission too (review P2-10).
+    #[test]
+    fn a_key_or_address_ban_by_a_person_spares_admins_and_equal_ranks() {
+        let mut p = Policy::new();
+        let ip: IpAddr = "10.0.0.7".parse().unwrap();
+        for (n, role) in [
+            (1, ROLE_ADMIN),
+            (2, ROLE_ORGANIZER),
+            (3, ROLE_MEMBER),
+            (4, ROLE_ORGANIZER),
+        ] {
+            p.create_user(id(n), "someone", 0, None);
+            p.grant_role(&id(n), role);
+        }
+        let ban = |by| Restriction {
+            id: 0,
+            user_id: None,
+            key_hash: Some(id(50)),
+            ip: Some(ip),
+            kind: RestrictionKind::Server,
+            until: None,
+            reason: String::new(),
+            by,
+            created_at: 0,
+        };
+        // An organizer bans an address.
+        let stored = p.add_restriction(ban(Some(id(2))));
+        let hit = |p: &Policy, user: u8| {
+            p.server_ban(Some(&id(user)), &id(90), Some(ip), 10)
+                .is_some()
+        };
+        assert!(!hit(&p, 1), "an administrator");
+        assert!(!hit(&p, 2), "the one who issued it");
+        assert!(!hit(&p, 4), "an equal rank");
+        assert!(hit(&p, 3), "a lower rank");
+        assert!(
+            p.server_ban(None, &id(90), Some(ip), 10).is_some(),
+            "a stranger"
+        );
+        assert!(
+            p.server_ban(Some(&id(1)), &id(50), None, 10).is_none(),
+            "the key match is fallout too"
+        );
+
+        // The operator's own ban (the CLI) spares nobody.
+        assert!(p.remove_restriction(stored.id));
+        p.add_restriction(ban(None));
+        assert!(hit(&p, 1));
     }
 
     #[test]

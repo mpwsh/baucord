@@ -81,9 +81,13 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
     let (msg_tx, msg_rx) = crossbeam_channel::unbounded();
     let (voice_tx, _voice_rx) = crossbeam_channel::unbounded::<VoiceControl>();
     let (screen_tx, _screen_rx) = crossbeam_channel::unbounded();
+    let (_media_tx, media_rx) = crossbeam_channel::bounded(client::network::MEDIA_QUEUE);
     let mut net = NetworkThreadHandle::spawn(
         tx,
-        control_rx,
+        client::network::NetworkInputs {
+            control: control_rx,
+            media: media_rx,
+        },
         msg_tx,
         msg_rx,
         voice_tx,

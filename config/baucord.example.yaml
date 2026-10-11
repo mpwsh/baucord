@@ -1,5 +1,6 @@
 # A server's configuration for the Docker setup (docker-compose.yaml
-# mounts config/baucord.yaml as /app/server.yaml). Save this file as
+# mounts the config/ folder and points the server at
+# config/baucord.yaml through BAUCORD_CONFIG). Save this file as
 # config/baucord.yaml next to docker-compose.yaml, then set
 # public_address below. Every key not written here keeps the server's
 # default. The guide: https://baucord.com/deploy.html

@@ -49,6 +49,8 @@ USER 10000
 EXPOSE 51000/udp
 # Docker sends SIGTERM to PID 1; the server closes every session with a
 # reason so clients reconnect in ~2 s instead of waiting out the idle
-# timeout. `stop_grace_period` in compose need not exceed a few seconds.
+# timeout. The close frames leave first (up to 0.5 s), then the database
+# queue is written, for at most 6 s: Docker's default 10 s
+# `stop_grace_period` covers it.
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/app/server"]

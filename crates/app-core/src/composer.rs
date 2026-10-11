@@ -44,6 +44,30 @@ pub fn line_edge(text: &str, cursor: usize, to_end: bool) -> usize {
     }
 }
 
+/// What follows the `/` of a typed line, as a command and its
+/// arguments: `kick alice spam` → (`kick`, `alice spam`). `None` when it
+/// is not a command (a bare `/`, a space right after it, a word with
+/// anything but ASCII letters, digits and `-`): the line is then sent as
+/// written.
+///
+/// The word ends at the first whitespace of any kind. The split used to
+/// take the first word's length and slice the line by it from the
+/// start: after a leading non-breaking or full-width space that offset
+/// fell inside a character and the app aborted, and longer words were
+/// cut in the wrong place (review P2-15).
+#[must_use]
+pub fn split_command(rest: &str) -> Option<(&str, &str)> {
+    let (command, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if command.is_empty()
+        || !command
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return None;
+    }
+    Some((command, args.trim_start()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +120,30 @@ mod tests {
         assert_eq!(line_edge(t, 7, false), 4);
         // caret at start of "three"
         assert_eq!(line_edge(t, 8, true), 13);
+    }
+
+    #[test]
+    fn a_command_is_the_word_right_after_the_slash() {
+        assert_eq!(
+            split_command("kick alice spam"),
+            Some(("kick", "alice spam"))
+        );
+        assert_eq!(split_command("help"), Some(("help", "")));
+        assert_eq!(split_command("role-list   x"), Some(("role-list", "x")));
+        assert_eq!(split_command("me\tsays hi"), Some(("me", "says hi")));
+        assert_eq!(split_command(""), None);
+        assert_eq!(split_command(" kick alice"), None);
+        assert_eq!(split_command("ki$ck alice"), None);
+    }
+
+    #[test]
+    fn odd_spaces_split_instead_of_aborting() {
+        // A non-breaking space, then a full-width one, before a short
+        // word: each used to put the slice inside a character.
+        assert_eq!(split_command("\u{a0}me"), None);
+        assert_eq!(split_command("\u{3000}ok"), None);
+        // And as the separator after the command.
+        assert_eq!(split_command("me\u{a0}waves"), Some(("me", "waves")));
+        assert_eq!(split_command("w\u{3000}é"), Some(("w", "é")));
     }
 }

@@ -686,11 +686,16 @@ impl AppState {
                 });
                 self.push_chat_system(&what);
                 // Where to go back to, if the reconnect is automatic.
-                self.rejoin_channel = if self.lobby && !self.in_lobby() {
-                    self.our_channel().map(|c| self.channel_name(c))
-                } else {
-                    None
-                };
+                // Only a live session knows: a retry that failed in turn
+                // is not in any room, and used to overwrite the room
+                // saved when the session was lost (review P2-14).
+                if self.connected {
+                    self.rejoin_channel = if self.lobby && !self.in_lobby() {
+                        self.our_channel().map(|c| self.channel_name(c))
+                    } else {
+                        None
+                    };
+                }
                 self.teardown_connection();
                 // Retrying: the host keeps the process alive meanwhile
                 // (on a phone in the background, the retry could not run
@@ -832,6 +837,15 @@ impl AppState {
                     self.push_chat_system(&t!("chat-disconnected", "reason" => what.as_str()));
                     self.teardown_connection();
                     self.show_connect_phase();
+                } else {
+                    // A retry that ended in a verdict: no reconnect is
+                    // on its way any more, so the host lets go. The
+                    // hold taken for the retry outlived it, and
+                    // Android's "Connected" notification stayed up
+                    // (review P2-14).
+                    self.reconnect_hold = false;
+                    self.kept_alive = None;
+                    crate::host::keep_alive(None, false);
                 }
                 match kind {
                     DisconnectKind::UserRequested => {}
@@ -922,9 +936,18 @@ impl AppState {
                     self.alert_mention(&meta.user, &text);
                 }
             }
-            NetworkMessage::UploadProgress { pct } => {
-                // The card's ring — a file's or an image's.
-                if let Some((conv, id)) = self.uploading {
+            NetworkMessage::UploadProgress { upload, pct } => {
+                // The ring on that upload's own card — a file's or an
+                // image's (review P1-17). One that has no card (the
+                // avatar) or whose card is gone shows nowhere.
+                let card = match upload {
+                    client::network::UploadKey::Image => self.image_upload.map(|id| (None, id)),
+                    client::network::UploadKey::Blob(upload_id) => self
+                        .pending_uploads
+                        .get(&upload_id)
+                        .map(|u| (u.conv, u.placeholder)),
+                };
+                if let Some((conv, id)) = card {
                     self.set_transfer(conv, id, Some((1, i32::from(pct.min(99)))));
                 }
             }
@@ -1118,7 +1141,6 @@ impl AppState {
             NetworkMessage::UploadRejected { upload_id, reason } => {
                 if let Some(upload) = self.pending_uploads.remove(&upload_id) {
                     self.pending_picture_uploads.remove(&upload_id);
-                    self.uploading = None;
                     self.transfers.remove(&(upload.conv, upload.placeholder));
                     self.with_conversation(upload.conv, |app| {
                         if let Some(delta) = app.history.discard_message(upload.placeholder) {

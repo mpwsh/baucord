@@ -260,8 +260,6 @@ pub struct AppState {
     /// kind (1 up, 2 down) and percent. Rows are rebuilt freely, so
     /// `chat_row_at` reads this rather than the row carrying it.
     transfers: HashMap<(Option<client::UserId>, u64), (i32, i32)>,
-    /// The file upload the media lane is busy with, for its percent.
-    uploading: Option<(Option<client::UserId>, u64)>,
     /// An image on its way: the placeholder row's message id, replaced
     /// by our own echo.
     image_upload: Option<u64>,
@@ -516,17 +514,21 @@ fn spawn_workers(
     crossbeam_channel::Receiver<ScreenEvent>,
 ) {
     let wake_fn: client::WakeFn = Arc::new(wake);
-    let (network_tx, network_control_rx) = crossbeam_channel::bounded::<NetworkControl>(256);
-    // Unbounded: the network thread must never wait for the UI (review
-    // P1-16). With both directions bounded at 256 and blocking sends
-    // both ways, a UI 256 messages behind (a join burst on a big server
-    // during a slow drain) blocked the network thread on this send,
-    // while a UI handler sending a control (a `FetchBlob` per avatar)
-    // blocked on the full control channel the network thread no longer
-    // drained: a deadlock that froze the window until the session timed
-    // out. Only state comes this way — media goes to the voice and
-    // screen threads — and the UI drains it every pass.
+    // Both state channels are unbounded: neither the network thread nor
+    // the UI may ever wait for the other (review P1-16). With both
+    // directions bounded at 256 and blocking sends both ways, a UI 256
+    // messages behind (a join burst on a big server during a slow drain)
+    // blocked the network thread on its send, while a UI handler sending
+    // a command (a `FetchBlob` per avatar) blocked on the full command
+    // channel the network thread no longer drained: a deadlock that
+    // froze the window until the session timed out. Only state travels
+    // on these two. Received media goes to the voice and screen threads;
+    // our share's frames and sound go out on `media_tx`, bounded and
+    // filled by `try_send`, so a burst of video drops frames instead of
+    // queueing in front of a command.
+    let (network_tx, network_control_rx) = crossbeam_channel::unbounded::<NetworkControl>();
     let (network_msg_tx, network_msg_rx) = crossbeam_channel::unbounded::<NetworkMessage>();
+    let (media_tx, media_rx) = crossbeam_channel::bounded(client::network::MEDIA_QUEUE);
 
     let voice = VoiceThreadHandle::spawn(
         network_tx.clone(),
@@ -535,7 +537,7 @@ fn spawn_workers(
     );
     // No wake for the screen thread: the present thread below reads its
     // events and wakes the UI (review P1-8).
-    let screen = ScreenThreadHandle::spawn(network_tx.clone());
+    let screen = ScreenThreadHandle::spawn(network_tx.clone(), media_tx);
     crate::present::attach_screen(screen.tx.clone());
     // Present-prep thread: takes over screen.event_rx (the UI drain
     // must not read it), converts or copies the newest frame of each
@@ -552,7 +554,10 @@ fn spawn_workers(
     );
     let network = NetworkThreadHandle::spawn(
         network_tx,
-        network_control_rx,
+        client::network::NetworkInputs {
+            control: network_control_rx,
+            media: media_rx,
+        },
         network_msg_tx,
         network_msg_rx,
         voice.tx.clone(),
@@ -688,7 +693,6 @@ pub fn run() {
         pending_downloads: HashMap::new(),
         next_file_upload_id: FILE_UPLOAD_BASE,
         transfers: HashMap::new(),
-        uploading: None,
         image_upload: None,
         pending_picture_uploads: HashMap::new(),
         pending_pictures: HashMap::new(),
@@ -1867,31 +1871,9 @@ pub(crate) fn format_wall_time(ms: u64) -> String {
     )
 }
 
-/// `/kick alice spam` → (`kick`, `alice spam`); `None` for a bare `/`.
-fn split_command(rest: &str) -> Option<(&str, &str)> {
-    let command = rest.split_whitespace().next()?;
-    if !command
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return None;
-    }
-    let args = rest[command.len()..].trim_start();
-    Some((command, args))
-}
-
-/// A full 64-hex-digit id.
-pub(crate) fn parse_hex_id(text: &str) -> Option<client::UserId> {
-    let text = text.trim();
-    if text.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
+use app_core::composer::split_command;
+/// A full 64-hex-digit id: the parser the server's CLI uses too.
+pub(crate) use client::protocol::parse_hex_id;
 
 /// The Fluent key for "you are restricted" per kind.
 fn restricted_key(kind: client::RestrictionKind) -> &'static str {

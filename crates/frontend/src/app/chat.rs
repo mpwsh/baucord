@@ -119,13 +119,11 @@ impl AppState {
             pending: true,
         };
         self.transfers.insert((None, placeholder), (1, 0));
-        self.uploading = Some((None, placeholder));
         self.image_upload = Some(placeholder);
         let shown =
             self.with_conversation(None, |app| media::push_image_row(app, &meta, png.clone()));
         if !shown {
             self.transfers.remove(&(None, placeholder));
-            self.uploading = None;
             self.image_upload = None;
         }
         self.network.tx.send(NetworkControl::SendImage(png)).ok();
@@ -137,7 +135,6 @@ impl AppState {
         let Some(placeholder) = self.image_upload.take() else {
             return;
         };
-        self.uploading = None;
         self.transfers.remove(&(None, placeholder));
         self.with_conversation(None, |app| {
             let at = app
@@ -195,7 +192,6 @@ impl AppState {
             size,
         };
         self.transfers.insert((conv, placeholder), (1, 0));
-        self.uploading = Some((conv, placeholder));
         self.with_conversation(conv, |app| app.push_file_here(&meta, file));
         self.pending_uploads.insert(
             upload_id,
@@ -229,7 +225,6 @@ impl AppState {
         let client_ref = (u64::MAX - placeholder) as u32;
         // Uploaded: the card knows its blob now (Save works once acked)
         // and the ring goes; the muted look stays until the ack.
-        self.uploading = None;
         self.transfers.remove(&(upload.conv, placeholder));
         self.with_conversation(upload.conv, |app| {
             let at = app
@@ -356,7 +351,6 @@ impl AppState {
                     .map(|(id, u)| (*id, u.conv))
                 {
                     self.pending_uploads.remove(&upload_id);
-                    self.uploading = None;
                     self.transfers.remove(&(conv, msg_id));
                     self.network
                         .tx

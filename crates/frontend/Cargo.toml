@@ -72,7 +72,12 @@ interprocess = { version = "2.4", optional = true }
 # The Downloads folder, for file cards' Save (spec §7).
 dirs = "6"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
-zip = { version = "8.6", optional = true }
+# Deflate only, which is all a release zip uses: the default features
+# add AES, bzip2, lzma, ppmd, xz and C zstd for archives the updater
+# never opens. (`deflate-flate2` alone names no backend.)
+zip = { version = "8.6", optional = true, default-features = false, features = [
+  "deflate-flate2-zlib-rs",
+] }
 self-replace = { version = "1.5", optional = true }
 # Plain-text clipboard read/write. Slint exposes no clipboard API;
 # TextInput's internal Ctrl+V only covers text typed into it — the

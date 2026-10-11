@@ -44,7 +44,7 @@ Check with `which cargo` and `df -h /` first.
   `https://static.crates.io/crates/<name>/<name>-<version>.crate`
   (`crates.io/api/v1/crates/<name>` lists versions; send a
   `User-Agent`). Read the source before writing against it — done for
-  `interprocess`, `device_query`, `quinn-proto`, `jni`, the `objc2`
+  `interprocess`, `quinn-proto`, `quinn-udp`, `jni`, the `objc2`
   framework crates.
 
 ### What can be checked here, per platform
@@ -202,7 +202,8 @@ otherwise).
 - `transport` — the quinn-proto driver (sans-IO), lanes, media pacing,
   identity and pinning, the simulator.
 - `server` — the tick in `server.rs`; child modules `moderation`,
-  `history`, `channels`, `profiles`, `dms`, `files`, `admin`; the
+  `history`, `channels`, `profiles`, `dms`, `files`, `admin`, `safety`
+  (block, report, erase); `relay.rs` (voice and video fan-out); the
   persistence thread in `persistence/` (`store.rs` is SQLite, the CLI
   helpers `cli_*` live there too); `main.rs` is the CLI; migrations
   in `persistence/migrations/`. The CLI is `server rotate-key`,
@@ -210,25 +211,30 @@ otherwise).
   `server db check|db prune`, `server user purge` (`server role --help`
   etc.); the config keys are PERSISTENCE-SPEC §1.
 - `client` — the network thread (`network.rs`), the voice and screen
-  threads, `config.rs` (settings, identity key), `inbound_wake.rs`.
+  threads, `config.rs` (settings, identity key), `inbound_wake.rs`,
+  `viewlog.rs` (the viewer's 5 s summary lines).
 - `audio`, `video` — devices, codecs, the jitter buffers, echo
   cancellation (`aec.rs`), the platform backends (`audio/src/native/`:
   AAudio, VPIO, WASAPI; cpal elsewhere; `video`: FFmpeg on the desktop,
   `mediacodec.rs` on Android, `videotoolbox.rs` on iOS).
 - `app-core` — pure view models with unit tests: `chat.rs`
   (`ChatHistory`, `ChatItem`, `FileMeta`), `roster.rs`, `menu.rs`,
-  `markdown.rs`, `images.rs`, `emoji.rs`, `logfile.rs`.
+  `markdown.rs`, `images.rs`, `gif.rs` (the streaming player),
+  `emoji.rs`, `composer.rs`, `devices.rs`, `update.rs`, `stats.rs`,
+  `fps.rs`, `logfile.rs`.
 - `ui` — the `.slint` files and `convert` glue (`lib.rs`):
   `main.slint` (window, overlays, card, dialogs, the phone pages),
-  `sidebar.slint`, `chat.slint`, `settings.slint`, `admin.slint`,
-  `viewer.slint`, `widgets.slint`, `theme.slint`, `tr.slint`,
+  `connect.slint`, `startup.slint`, `sidebar.slint`, `chat.slint`,
+  `settings.slint`, `admin.slint`, `viewer.slint`, `tray.slint`,
+  `widgets.slint`, `theme.slint`, `tr.slint`,
   `globals.slint` (`State`/`Logic` and every struct the host fills).
 - `i18n` — Fluent bundles (`locales/*.ftl`).
 - `frontend` — the client's UI logic for every host: `app.rs`
   (`AppState`, `run`, the event pump, the timers, `fill_tr`) with its
   methods filed by concern under `src/app/` (`events`, `commands`,
   `presence`, `session`, `menus`, `devices`, `conversations`, `chat`,
-  `profiles`, `stats`, `alerts`), `settingsui`, `adminui`, `media`,
+  `profiles`, `stats`, `alerts`, `activity`, `safety`), `settingsui`,
+  `adminui`, `media`,
   `viewers`, `present`, `resources`, `notice` (what a phone's
   notification is), and the host seams `host`, `clipboard`, `hotkeys`
   and `updater` behind the `desktop` feature, with same-API twins under
@@ -431,8 +437,9 @@ Memory-mode servers (persistence off) still use the legacy
   virtualization refinement is a round, and the `if`-gated delegates
   add a nested one per row). The owed follow is now a bounded 16 ms
   `Timer` (at most 90 ticks; it stops after 8 frames at the end,
-  ANDROID-SPEC D66) instead. Rule: no `changed` handler
-  on a property the ListView rewrites while scrolling.
+  ANDROID-SPEC D66) instead. Rule: never scroll from a `changed`
+  handler (D66's own `changed content-y` only records where the reader
+  is; it does not move the list).
 - **The horizontal scroll, found by bisecting renders:** a
   `ListView` sets its `viewport-width` to the max of its rows'
   *minimum* widths (`listview_layout` returns
@@ -907,9 +914,9 @@ own buckets vs the process figure); on Linux `smaps_rollup`
 `MALLOC_MMAP_THRESHOLD_=131072 ./baucord`; on macOS
 `vmmap --summary`. Expected fix: mimalloc as the global allocator in
 the hosts (one line, returns large blocks eagerly, builds for
-Android). Also check that every stop-watching path *removes* the
-`Viewer` (`close` only hides the window; the last frame lives until
-the struct is dropped).
+Android). Every stop-watching path does remove the `Viewer` (checked
+in the 2026-10-10 review), and a disconnect now sends `StopWatching`
+for each one it drains, so the decoder goes with it (review P0-6).
 
 ## 5. What is left
 

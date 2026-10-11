@@ -129,17 +129,25 @@ impl VoiceRelay {
                 || sender_channel == Some(lobby);
             while let Some(message) = driver.recv(*sender, Lane::Voice) {
                 self.stats.packets_received += 1;
+                // Single source of validation: the shared parser. The
+                // sequence number is noted before any drop decided
+                // here: a packet dropped on purpose (a mute, the AFK
+                // room, the lobby) still arrived, and leaving it out
+                // made the sender's first packets back in a room read
+                // as every one of those lost — up to half the report,
+                // and its audio ladder stepped down hard (review P2-2).
+                let parsed = parse_voice(&message);
+                if let Some((hdr, _)) = &parsed {
+                    self.seq.note(*sender, hdr.seq);
+                }
                 if sender_muted {
                     self.stats.packets_dropped_muted += 1;
                     continue;
                 }
-
-                // Single source of validation: the shared parser.
-                let Some((hdr, _)) = parse_voice(&message) else {
+                if parsed.is_none() {
                     self.stats.packets_dropped_malformed += 1;
                     continue;
-                };
-                self.seq.note(*sender, hdr.seq);
+                }
 
                 // Stamp the authenticated sender once; fan out.
                 let envelope = wrap_sender(*sender, &message);

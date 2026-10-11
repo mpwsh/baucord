@@ -125,15 +125,13 @@ What stands between this and "production for strangers":
   plain, compared in variable time, no attempt limit (`server.rs`
   ~2661); a moderator can lift their own mute/restriction
   (`moderation.rs` ~432); admin replies are cut to one 17 KiB message
-  since 1.2.1 (paging them needs a feature bit)
-  (ListUsers/Blobs/Invites/audit break at a few hundred rows,
-  `messages.rs` ~1440, `server.rs` ~1310); pruning messages never
+  since 1.2.1, so ListUsers, Blobs and Invites show only their first
+  rows past about 140 entries (paging them needs a feature bit;
+  review P0-1); pruning messages never
   decrements blob refs, the telemetry prune scans without an index,
-  audit rows and invites are never pruned; a CLI write reloads the
-  policy and can drop a ban still queued (`persistence/mod.rs` ~1007,
-  `server.rs` ~1363); wall time is anchored once at start
-  (`clock.rs`); shutdown can outlast Docker's 10 s stop timeout;
-  `server restore` joins archive paths without `unpack_in`;
+  audit rows and invites are never pruned; wall time is anchored once
+  at start (`clock.rs`); `server restore` joins archive paths without
+  `unpack_in`;
   `SSLKEYLOGFILE` is honoured (`identity.rs` ~449); look-alike and
   zero-width names pass; creating a channel past the cap stores it
   before failing.
@@ -649,12 +647,62 @@ One line each; the spec decision named holds the detail.
     retirement, by the date in its name (P1-15); `monitor-net.sh`
     writes its rows again (P1-21); CLI listings change nothing, and a
     reload sends only what changed (P1-22).
+- **2026-10-11 — 1.2.1, the review continued** (§2a). What the P1s
+  had left open, and the first P2s and P3s:
+  - *P1s finished.* Commands and state travel on unbounded channels
+    both ways; our share's frames and sound go out on their own bounded
+    `MediaOut` channel, so video can no longer queue in front of a
+    command (P1-16). `UploadProgress` names its upload and each card
+    moves its own ring (P1-17). A policy snapshot read before a write
+    the tick queued afterwards is set aside and asked for again, so a
+    ban is never dropped from memory by a reload (P1-22).
+  - *Server.* Lobby sessions keep their speaking, audio state, renames
+    and role changes to themselves (`audience_about`, P2-1). Voice the
+    relay drops on purpose is still counted, so leaving a mute or the
+    lobby no longer reads as loss (P2-2). A reload the next start would
+    refuse is not applied (P2-4). Close frames leave before the
+    database drain, which has one 6 s deadline (P2-5). Compose mounts
+    the `config/` folder and names the file with `BAUCORD_CONFIG`
+    (P2-6). Failed admissions are pruned and counted per IPv6 /64
+    (P2-7). A CLI purge takes the messages off the live server (P2-8).
+    A read that timed out in the queue is not run later (P2-9). A key
+    or an address can only be banned, with `BAN`, and the fallout
+    spares administrators and equal ranks at admission too (P2-10).
+    The blob cache is bounded and proofs go with their blob (P2-12).
+    The persistence thread sleeps until its next job and is not
+    started without a database (P2-47).
+  - *Server polish.* `link:` lines cover their whole interval (P3-7);
+    a failed reopen after log rotation keeps writing to `.1` (P3-8);
+    audit targets are compared as bytes (P3-10); `server key unlink`
+    drops the live session (P3-11); message ids come from a counter
+    that survives a prune, with indexes on `messages(user_id)` and
+    `conversations(user_b)` — migration 5 (P3-12, part of P3-9).
+  - *Client.* Slash commands split on any whitespace and one
+    `protocol::parse_hex_id` serves client and server (P2-15). Transfer
+    state ends with the session (P2-13). A failed retry keeps the room
+    to rejoin, and a refused one releases the host's keep-alive
+    (P2-14). The voice telemetry's "exercised" is measured on the
+    right clock (P2-19); a failed microphone reopen clears the speaking
+    flag (P2-20); a page loaded with "Load earlier" is kept while it is
+    read, and paging continues from the oldest row shown (P2-23).
+  - *Weight.* `zip` and `nnnoiseless` without their default features
+    (P2-46); dependencies carry line tables only in dev, and the unused
+    `debug-opt` profile is gone (P3-51).
+  - *Still open of P0 and P1*: paging for the admin lists (P0-1, needs
+    a feature bit) and the keybind watcher's event sources (P1-3 step
+    2, one test pass per OS).
 
 ## 8. Facts this plan rests on
 
-- **Tests, 2026-10-09, Linux sandbox**: protocol 86 + the versions
-  test, transport 45, server 51 unit + 88 e2e — all green; the chat
-  pane's 48 scrolling checks (`tools/chat-scroll-sim`) pass.
+- **Tests, 2026-10-11, Linux sandbox**: protocol 91 + the versions
+  test, transport 51, server 65 unit + 94 e2e, client 48, app-core 111,
+  audio 105, video 73 + 5 — all green. Six more need a real machine:
+  that sandbox does not signal UDP readiness, so the socket-wait tests
+  (`transport` `udp::read_waiter_tests`, 3; `client` `inbound_wake`,
+  `network_idle.rs`, `network_uploads.rs`) cannot pass there. The
+  frontend type-checks for the phones and the desktop. The chat
+  pane's 48 scrolling checks (`tools/chat-scroll-sim`) passed on
+  2026-10-09 and were not re-run.
   Windows-only code (`wasapi.rs`, DXGI) is not compiler-checked here.
   Android: the Java compiles against API 33's real `android.jar`, the
   Rust JNI code type-checks in a scratch crate; iOS: the app

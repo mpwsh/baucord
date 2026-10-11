@@ -31,18 +31,10 @@ fn dm_key(user: &client::UserId) -> String {
     format!("dm:{}", hex(user))
 }
 
-/// The user id `hex` spells (64 hex digits), as [`hex`] wrote it.
+/// The user id `hex` spells (64 hex digits), as [`hex`] wrote it: the
+/// one parser the commands and the server's CLI use.
 fn user_id_from_hex(text: &str) -> Option<client::UserId> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, pair) in bytes.chunks_exact(2).enumerate() {
-        let pair = std::str::from_utf8(pair).ok()?;
-        out[i] = u8::from_str_radix(pair, 16).ok()?;
-    }
-    Some(out)
+    client::protocol::parse_hex_id(text)
 }
 
 /// `text` cut to a notification's length, on a char boundary.

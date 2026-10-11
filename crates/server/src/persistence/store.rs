@@ -40,6 +40,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_message_edits.sql"),
     include_str!("migrations/0003_role_style.sql"),
     include_str!("migrations/0004_safety.sql"),
+    include_str!("migrations/0005_message_counter.sql"),
 ];
 
 /// The schema version this build produces.
@@ -75,13 +76,6 @@ pub struct Retention {
     pub telemetry_days: u32,
     /// Unreferenced blobs older than this go (spec §7).
     pub file_days: u32,
-}
-
-/// Where data goes. `Memory` is persistence off: writes are discarded,
-/// reads answer "unavailable", and nothing survives the process.
-pub enum Store {
-    Sqlite(Sqlite),
-    Memory,
 }
 
 /// An open database and the connection-local `data_version` used to
@@ -153,10 +147,17 @@ impl Sqlite {
         )?;
         migrate(&mut conn)?;
         sync_builtin_roles(&conn)?;
-        let watermark: i64 =
-            conn.query_row("SELECT COALESCE(MAX(msg_id), 0) FROM messages", [], |row| {
-                row.get(0)
-            })?;
+        // The counter row, not MAX(msg_id) of what is still stored: the
+        // retention prune can empty the table, and ids must never be
+        // handed out twice (review P3-12). The messages are consulted
+        // too, should the two ever disagree.
+        let watermark: i64 = conn.query_row(
+            "SELECT MAX(
+                 COALESCE((SELECT value FROM counters WHERE name = 'msg_id'), 0),
+                 COALESCE((SELECT MAX(msg_id) FROM messages), 0))",
+            [],
+            |row| row.get(0),
+        )?;
         let next_message_id = u64::try_from(watermark).unwrap_or(0).saturating_add(1);
         let data_version = read_data_version(&conn)?;
         info!(
@@ -365,18 +366,25 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn insert_message(&self, m: &MessageRow) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO messages (msg_id, conv_id, ts, user_id, body, blob_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
+        // Both statements run for every message: prepared once, kept.
+        self.conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO messages (msg_id, conv_id, ts, user_id, body, blob_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![
                 ordered(m.msg_id),
                 ordered(m.conv_id),
                 ordered(m.ts),
                 m.user_id,
                 m.body,
                 m.blob_id
-            ],
-        )?;
+            ])?;
+        // The highest id ever used, kept apart from the rows the prune
+        // removes.
+        self.conn
+            .prepare_cached("UPDATE counters SET value = ?1 WHERE name = 'msg_id' AND value < ?1")?
+            .execute(params![ordered(m.msg_id)])?;
         Ok(())
     }
 
@@ -2000,19 +2008,7 @@ pub fn cli_find_user(db_path: &Path, who: &str) -> Result<([u8; 32], Policy), Pe
     }
 }
 
-/// A full 64-hex-digit id; `None` for anything else.
-#[must_use]
-pub fn parse_hex_id(text: &str) -> Option<[u8; 32]> {
-    let text = text.trim();
-    if text.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
+pub use protocol::parse_hex_id;
 
 /// Hex of a byte slice.
 #[must_use]
@@ -2603,6 +2599,32 @@ mod tests {
     fn open_creates_schema_and_starts_ids_at_one() {
         let (_, next) = Sqlite::open(Path::new(":memory:")).expect("open");
         assert_eq!(next, 1);
+    }
+
+    /// Ids are never handed out twice (review P3-12): with every
+    /// message pruned, a restart used to begin again at 1, under the
+    /// read marks left from before.
+    #[test]
+    fn the_message_counter_survives_an_emptied_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "baucord-counter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.join("baucord.db");
+        {
+            let (db, _) = Sqlite::open(&path).expect("open");
+            db.insert_message(&row(41, "a")).expect("insert");
+            db.insert_message(&row(42, "b")).expect("insert");
+            db.conn.execute("DELETE FROM messages", []).expect("prune");
+            db.close();
+        }
+        let (db, next) = Sqlite::open(&path).expect("reopen");
+        assert_eq!(next, 43);
+        db.close();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

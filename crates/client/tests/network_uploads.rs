@@ -1,5 +1,6 @@
 //! Every upload keeps its own state (review P1-17): two files sent
-//! together both arrive, `CancelImage` still stops a picture after a
+//! together both arrive and each reports its own progress,
+//! `CancelImage` still stops a picture after a
 //! file upload, and cancelling a file stops that file, not the picture
 //! going out beside it.
 //!
@@ -19,7 +20,7 @@ use std::{
 };
 
 use client::{
-    network::{NetworkControl, NetworkThreadHandle},
+    network::{NetworkControl, NetworkMessage, NetworkThreadHandle, UploadKey},
     voice::VoiceControl,
 };
 use protocol::{ClientMessage, Lane, ServerMessage};
@@ -148,9 +149,13 @@ fn uploads_keep_their_own_state() {
     let (msg_tx, msg_rx) = crossbeam_channel::unbounded();
     let (voice_tx, _voice_rx) = crossbeam_channel::unbounded::<VoiceControl>();
     let (screen_tx, _screen_rx) = crossbeam_channel::unbounded();
+    let (_media_tx, media_rx) = crossbeam_channel::bounded(client::network::MEDIA_QUEUE);
     let mut net = NetworkThreadHandle::spawn(
         tx,
-        control_rx,
+        client::network::NetworkInputs {
+            control: control_rx,
+            media: media_rx,
+        },
         msg_tx,
         msg_rx,
         voice_tx,
@@ -184,6 +189,31 @@ fn uploads_keep_their_own_state() {
         (s.blob_chunks(101), s.blob_chunks(102))
     };
     assert!(both, "not both files arrived: {got:?} chunks of 3 each");
+
+    // Each file reported its own progress, under its own id, up to
+    // 100 %. `UploadProgress` used to carry no id, so the UI could only
+    // move one ring and the other card sat at 0 %.
+    let mut last: HashMap<u32, u8> = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && !(last.get(&101) == Some(&100) && last.get(&102) == Some(&100))
+    {
+        for msg in net.msg_rx.try_iter() {
+            if let NetworkMessage::UploadProgress {
+                upload: UploadKey::Blob(upload_id),
+                pct,
+            } = msg
+            {
+                last.insert(upload_id, pct);
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        (last.get(&101), last.get(&102)),
+        (Some(&100), Some(&100)),
+        "each file reports its own progress to 100 %"
+    );
 
     // ── A picture after a file upload can still be cancelled. The
     // file's leftover slot used to make `CancelImage` do nothing, and

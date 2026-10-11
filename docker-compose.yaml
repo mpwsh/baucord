@@ -19,8 +19,14 @@ services:
       # server off another port: publish both while saved addresses
       # catch up, e.g. also "5000:51000/udp".
       - "51000:51000/udp"
+    # The folder, not the file: an editor that saves by writing a new
+    # file and renaming it over the old one (vim, nano with backups,
+    # most GUI editors) leaves a single-file mount pointing at the old
+    # one, and the running server never saw the channel change.
+    environment:
+      BAUCORD_CONFIG: /app/config/baucord.yaml
     volumes:
-      - ./config/baucord.yaml:/app/server.yaml
+      - ./config:/app/config
       - ./data/baucord:/app/data
     # The server logs to stderr here, so this is its log: kept to
     # 5 × 10 MB instead of growing for ever (it names people and IPs).

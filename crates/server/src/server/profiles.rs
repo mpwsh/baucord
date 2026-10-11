@@ -31,6 +31,9 @@ pub(super) const PROFILE_RATE: Duration = Duration::from_secs(30);
 /// How long a blob read from disk may take before the fetcher is told
 /// the blob is missing.
 const BLOB_DEADLINE: Duration = Duration::from_secs(10);
+/// Bytes of disk-backed blobs kept in memory for fetches: avatars and
+/// small pictures, a few hundred at the default 256 KB cap each.
+const BLOB_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// The chat background every name color is checked against (spec
 /// §7.1): `#1a1d21`.
 const CHAT_BG: [u8; 3] = [0x1a, 0x1d, 0x21];
@@ -366,7 +369,9 @@ impl ChatServer {
             client_id: client,
             name,
         };
-        self.broadcast_if_profiles(&msg);
+        for peer in self.audience_about(client) {
+            self.send_if_profiles(peer, &msg);
+        }
     }
 
     // ── Blobs: upload ───────────────────────────────────────────────
@@ -601,8 +606,50 @@ impl ChatServer {
         self.persist.send(Command::StoreBlob(Box::new(record)));
         self.policy.blobs.insert(blob_id, meta);
         if let Some(bytes) = cached {
-            self.blob_bytes.insert(blob_id, bytes);
+            self.cache_blob(blob_id, bytes);
         }
+    }
+
+    /// Keep a blob's bytes in memory. Without persistence this is the
+    /// only copy and stays. With it this is a cache of the disk, held
+    /// to [`BLOB_CACHE_BYTES`]: the least recently served go first. It
+    /// used to keep every small file ever fetched (review P2-12).
+    pub(super) fn cache_blob(&mut self, blob_id: BlobId, bytes: Arc<Vec<u8>>) {
+        self.blob_bytes.insert(blob_id, bytes);
+        self.touch_blob(&blob_id);
+        if !self.persist.is_persistent() {
+            return;
+        }
+        let mut total: usize = self.blob_bytes.values().map(|b| b.len()).sum();
+        while total > BLOB_CACHE_BYTES {
+            let Some(coldest) = self
+                .blob_bytes
+                .keys()
+                .filter(|id| **id != blob_id)
+                .min_by_key(|id| self.blob_used.get(*id).copied().unwrap_or(0))
+                .copied()
+            else {
+                break;
+            };
+            if let Some(gone) = self.blob_bytes.remove(&coldest) {
+                total -= gone.len();
+            }
+            self.blob_used.remove(&coldest);
+        }
+    }
+
+    fn touch_blob(&mut self, blob_id: &BlobId) {
+        self.blob_clock += 1;
+        self.blob_used.insert(*blob_id, self.blob_clock);
+    }
+
+    /// Drop everything held about a blob: its metadata, its cached
+    /// bytes, and who proved they hold it. Returns the metadata.
+    pub(super) fn forget_blob(&mut self, blob_id: &BlobId) -> Option<crate::policy::BlobMeta> {
+        self.blob_bytes.remove(blob_id);
+        self.blob_used.remove(blob_id);
+        self.proven_uploads.retain(|(_, blob)| blob != blob_id);
+        self.policy.blobs.remove(blob_id)
     }
 
     /// A declared MIME type worth keeping: `type/subtype` in printable
@@ -643,9 +690,11 @@ impl ChatServer {
             refs,
         });
         if refs == 0 {
-            self.blob_bytes.remove(blob_id);
-            if !self.persist.is_persistent() {
-                self.policy.blobs.remove(blob_id);
+            if self.persist.is_persistent() {
+                self.blob_bytes.remove(blob_id);
+                self.blob_used.remove(blob_id);
+            } else {
+                self.forget_blob(blob_id);
             }
         }
     }
@@ -671,6 +720,7 @@ impl ChatServer {
     /// through the persistence thread; `BlobMissing` otherwise.
     pub(super) fn handle_fetch_blob(&mut self, client: ClientId, blob_id: BlobId) {
         if let Some(bytes) = self.blob_bytes.get(&blob_id).cloned() {
+            self.touch_blob(&blob_id);
             self.send_blob(client, blob_id, &bytes);
             return;
         }
@@ -714,7 +764,7 @@ impl ChatServer {
                 // Avatars are fetched by everyone and stay cached; a
                 // file is read for one download and not kept.
                 if bytes.len() <= self.avatar_cap() {
-                    self.blob_bytes.insert(blob_id, bytes.clone());
+                    self.cache_blob(blob_id, bytes.clone());
                 }
                 Some(bytes)
             }

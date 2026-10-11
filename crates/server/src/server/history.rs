@@ -476,8 +476,7 @@ impl ChatServer {
         for (blob, count) in released {
             self.blob_ref(blob, -i32::try_from(*count).unwrap_or(i32::MAX));
             if self.policy.blobs.get(blob).is_some_and(|b| b.refs == 0) {
-                self.policy.blobs.remove(blob);
-                self.blob_bytes.remove(blob);
+                self.forget_blob(blob);
                 self.persist.send(Command::DeleteBlob { blob_id: *blob });
             }
         }
@@ -491,10 +490,9 @@ impl ChatServer {
     /// prune's read and this notice has lost its file; say so.
     pub(super) fn forget_pruned_files(&mut self, files: &[protocol::BlobId]) {
         for blob in files {
-            let Some(meta) = self.policy.blobs.remove(blob) else {
+            let Some(meta) = self.forget_blob(blob) else {
                 continue;
             };
-            self.blob_bytes.remove(blob);
             if meta.refs > 0 {
                 log::warn!(
                     "file {} was pruned while {} post(s) took it up again; it must be re-sent",
@@ -557,8 +555,7 @@ impl ChatServer {
             match self.policy.blobs.get_mut(&blob) {
                 Some(meta) if meta.refs > 0 => meta.created_by = None,
                 _ => {
-                    self.policy.blobs.remove(&blob);
-                    self.blob_bytes.remove(&blob);
+                    self.forget_blob(&blob);
                     self.persist.send(Command::DeleteBlob { blob_id: blob });
                 }
             }
@@ -581,6 +578,7 @@ impl ChatServer {
         self.profile_changed_at.remove(user_id);
         self.uploads_today.remove(user_id);
         self.report_times.remove(user_id);
+        self.proven_uploads.retain(|(user, _)| user != user_id);
         self.block_times.remove(user_id);
         self.policy
             .invites
