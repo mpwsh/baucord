@@ -386,6 +386,7 @@ pub enum Command {
     },
     DeleteRole {
         id: u32,
+        ts: WallMs,
     },
     BlobRefs {
         blob_id: protocol::BlobId,
@@ -523,6 +524,10 @@ pub enum Notice {
     /// avatar). The tick takes them off its counts, and a file nothing
     /// points at any more goes.
     RefsReleased(Vec<(protocol::BlobId, u32)>),
+    /// The retention prune deleted these unreferenced files. The tick
+    /// drops their metadata, so a later announce of the same bytes is
+    /// asked to upload them again instead of being told they are here.
+    FilesPruned(Vec<protocol::BlobId>),
 }
 
 /// Handle to a pending read, returned by [`Persist::ask`] and echoed by
@@ -682,6 +687,7 @@ impl Persist {
             // would otherwise never reach the hourly one.
             last_prune: now.checked_sub(PRUNE_INTERVAL).unwrap_or(now),
             last_version_poll: now,
+            stopping: false,
         };
         let handle = thread::Builder::new()
             .name("persistence".to_string())
@@ -893,6 +899,8 @@ struct Worker {
     last_checkpoint: Instant,
     last_prune: Instant,
     last_version_poll: Instant,
+    /// A shutdown came out of the queue outside the loop's own receive.
+    stopping: bool,
 }
 
 enum Step {
@@ -923,6 +931,9 @@ impl Worker {
                 Step::Idle => {}
             }
             self.housekeeping();
+            if self.stopping {
+                break;
+            }
         }
         self.drain();
         match self.store {
@@ -1025,7 +1036,7 @@ impl Worker {
                 icon,
                 color,
             } => db.update_role(*id, name, *permissions, *rank, icon, *color),
-            Command::DeleteRole { id } => db.delete_role(*id),
+            Command::DeleteRole { id, ts } => db.delete_role(*id, *ts),
             Command::MarkRead {
                 conv,
                 user_id,
@@ -1077,29 +1088,14 @@ impl Worker {
     }
 
     fn housekeeping(&mut self) {
-        let Store::Sqlite(db) = &mut self.store else {
-            return;
-        };
         let now = Instant::now();
         if now.duration_since(self.last_version_poll) >= DATA_VERSION_INTERVAL {
             self.last_version_poll = now;
-            match db.changed_externally() {
-                Ok(true) => {
-                    self.counters
-                        .external_changes
-                        .fetch_add(1, Ordering::Relaxed);
-                    info!("Database changed by another process (the CLI, or a hand edit)");
-                    match db.load_policy() {
-                        Ok(policy) => {
-                            let _ = self.notices.send(Notice::Policy(Box::new(policy)));
-                        }
-                        Err(e) => warn!("could not reload the policy tables: {e}"),
-                    }
-                }
-                Ok(false) => {}
-                Err(e) => warn!("data_version poll failed: {e}"),
-            }
+            self.reload_if_changed_externally();
         }
+        let Store::Sqlite(db) = &mut self.store else {
+            return;
+        };
         if now.duration_since(self.last_checkpoint) >= CHECKPOINT_INTERVAL {
             self.last_checkpoint = now;
             if let Err(e) = db.checkpoint() {
@@ -1108,13 +1104,64 @@ impl Worker {
         }
         if now.duration_since(self.last_prune) >= PRUNE_INTERVAL {
             self.last_prune = now;
-            match db.prune(wall_now(), self.retention) {
-                Ok(0) => {}
-                Ok(removed) => {
+            match db.prune_with_files(wall_now(), self.retention) {
+                Ok((0, _)) => {}
+                Ok((removed, files)) => {
                     self.counters.pruned.fetch_add(removed, Ordering::Relaxed);
                     info!("Pruned {removed} rows past their retention window");
+                    if !files.is_empty() {
+                        let _ = self.notices.send(Notice::FilesPruned(files));
+                    }
                 }
                 Err(e) => warn!("retention prune failed: {e}"),
+            }
+        }
+    }
+
+    /// When another process committed to the file, hand the tick the
+    /// policy tables as they now stand.
+    fn reload_if_changed_externally(&mut self) {
+        let Store::Sqlite(db) = &mut self.store else {
+            return;
+        };
+        match db.changed_externally() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                warn!("data_version poll failed: {e}");
+                return;
+            }
+        }
+        self.counters
+            .external_changes
+            .fetch_add(1, Ordering::Relaxed);
+        info!("Database changed by another process (the CLI, or a hand edit)");
+        // The tick applied in memory what it queued here; a snapshot
+        // without those rows would undo it (a ban dropped, SEC-11), so
+        // they land first (review P1-22).
+        self.apply_queued();
+        let Store::Sqlite(db) = &mut self.store else {
+            return;
+        };
+        match db.load_policy() {
+            Ok(policy) => {
+                let _ = self.notices.send(Notice::Policy(Box::new(policy)));
+            }
+            Err(e) => warn!("could not reload the policy tables: {e}"),
+        }
+    }
+
+    /// Apply the writes queued so far (not the ones that keep arriving
+    /// meanwhile). A shutdown met on the way is kept for the loop.
+    fn apply_queued(&mut self) {
+        for _ in 0..self.writes.len() {
+            match self.writes.try_recv() {
+                Ok(Envelope::Write(command)) => self.apply(&command),
+                Ok(Envelope::Shutdown) | Err(TryRecvError::Disconnected) => {
+                    self.stopping = true;
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
             }
         }
     }
@@ -1334,6 +1381,53 @@ mod tests {
         let (db, next) = Sqlite::open(&path).expect("reopen");
         assert_eq!(next, 6);
         db.close();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_reload_includes_the_writes_queued_before_it() {
+        // The tick queued a ban; the CLI wrote meanwhile. The snapshot the
+        // tick swaps in must still hold the ban (review P1-22, SEC-11).
+        let path = temp_db("reload-drain");
+        let path_str = path.to_string_lossy().into_owned();
+        let (mut p, _) = Persist::spawn(&settings(true, &path_str, 16)).expect("spawn");
+        let guard = p.stall();
+        thread::sleep(Duration::from_millis(50));
+        p.send(Command::InsertRestriction(Restriction {
+            id: 7,
+            user_id: None,
+            key_hash: Some([5; 32]),
+            ip: None,
+            kind: crate::policy::RestrictionKind::Server,
+            until: None,
+            reason: "queued on the tick".to_string(),
+            by: None,
+            created_at: 1,
+        }));
+        cli_create_invite(&path, protocol::permissions::ROLE_GUEST, None, None).expect("cli");
+        // Released after the poll is due, the reload is the thread's
+        // next step, ahead of the queued write.
+        thread::sleep(DATA_VERSION_INTERVAL + Duration::from_millis(100));
+        drop(guard);
+        let mut reloaded = None;
+        wait_until(|| {
+            for notice in p.poll(Instant::now()).notices {
+                if let Notice::Policy(policy) = notice {
+                    reloaded = Some(policy);
+                }
+            }
+            reloaded.is_some()
+        });
+        let policy = reloaded.expect("a reload");
+        assert_eq!(policy.invites.len(), 1, "the CLI's invite");
+        assert!(
+            policy.restrictions.iter().any(|r| r.id == 7),
+            "the queued ban: {:?}",
+            policy.restrictions
+        );
+        p.shutdown();
         if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }

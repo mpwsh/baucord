@@ -78,7 +78,7 @@ use std::{
 };
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{debug, error, info, warn};
 use rtrb::Consumer;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
@@ -123,6 +123,12 @@ const SILENCE_HANGOVER_FRAMES: u32 = 25;
 /// only bounds `stop()` latency and the mute-drain cadence. This is an
 /// OS wait — zero CPU while blocked, ≤10 wakes/s during total silence.
 const WORKER_WAIT_CAP: Duration = Duration::from_millis(100);
+
+/// Where encoded packets go: called on the encoder worker as each one
+/// is made; `false` means its consumer is gone, and the worker stops.
+/// A full consumer drops the packet — a 20 ms gap in background sound —
+/// rather than hold the worker.
+pub type PacketSink = Arc<dyn Fn(SystemAudioPacket) -> bool + Send + Sync>;
 
 /// Encoded system audio packet, ready for network transport.
 ///
@@ -541,14 +547,10 @@ mod linux_loopback {
 /// use std::sync::Arc;
 ///
 /// let stats = Arc::new(AudioStats::new());
-/// let mut capture = SystemAudioCapture::new(stats)?;
+/// // Each packet goes out as it is encoded.
+/// let sink: PacketSink = Arc::new(move |packet| network.send_system_audio(packet));
+/// let mut capture = SystemAudioCapture::new(stats, sink)?;
 /// capture.start()?;
-///
-/// // Poll for encoded packets (non-blocking)
-/// while let Some(packet) = capture.try_recv() {
-///     // Send packet over network tagged with SYSTEM_AUDIO_SSRC
-///     network.send_system_audio(packet);
-/// }
 ///
 /// // Stop when screen sharing ends
 /// capture.stop();
@@ -557,8 +559,15 @@ pub struct SystemAudioCapture {
     /// Worker thread that reads from ring buffer, resamples, encodes.
     worker_thread: Option<thread::JoinHandle<()>>,
 
-    /// Encoded packets ready for network transport.
-    packet_rx: Receiver<SystemAudioPacket>,
+    /// Where encoded packets go, as each is made. They used to wait in
+    /// a channel the screen thread drained on its capture tick, so a
+    /// viewer got them in bursts of a frame interval and had to buffer
+    /// a burst more (PRODUCTION-PLAN.md LAT-2).
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
+    sink: PacketSink,
 
     /// Signal to stop worker thread.
     should_stop: Arc<AtomicBool>,
@@ -595,14 +604,13 @@ impl SystemAudioCapture {
     /// Create a new system audio capturer.
     ///
     /// Does not start capturing — call `start()` when screen sharing begins.
-    pub fn new(stats: Arc<AudioStats>) -> Result<Self, Box<dyn std::error::Error>> {
-        // packet_rx is created as a placeholder — start() replaces it
-        // with a real channel connected to the worker thread.
-        let (_dead_tx, packet_rx) = bounded(1);
-
+    pub fn new(
+        stats: Arc<AudioStats>,
+        sink: PacketSink,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             worker_thread: None,
-            packet_rx,
+            sink,
             should_stop: Arc::new(AtomicBool::new(false)),
             is_active: Arc::new(AtomicBool::new(false)),
             is_muted: Arc::new(AtomicBool::new(false)),
@@ -646,10 +654,6 @@ impl SystemAudioCapture {
         let device_sample_rate = backend.sample_rate();
         let device_name = backend.device_name();
 
-        // Create the encoded packet channel
-        let (packet_tx, packet_rx) = bounded(8);
-        self.packet_rx = packet_rx;
-
         // Spawn the encoder worker thread
         let should_stop = self.should_stop.clone();
         let is_muted = self.is_muted.clone();
@@ -659,7 +663,7 @@ impl SystemAudioCapture {
 
         let worker = Self::spawn_worker(
             ring_consumer,
-            packet_tx,
+            self.sink.clone(),
             should_stop,
             is_muted,
             volume,
@@ -784,27 +788,6 @@ impl SystemAudioCapture {
         info!("System audio capture stopped");
     }
 
-    /// Try to receive an encoded system audio packet (non-blocking).
-    ///
-    /// Returns `None` if no packet is ready. The caller should poll
-    /// this in the same loop that handles screen share video frames.
-    #[must_use]
-    pub fn try_recv(&self) -> Option<SystemAudioPacket> {
-        self.packet_rx.try_recv().ok()
-    }
-
-    /// Drain all available encoded packets into a vec.
-    ///
-    /// Useful when the caller wants to batch packets for network send.
-    #[must_use]
-    pub fn drain_packets(&self) -> Vec<SystemAudioPacket> {
-        let mut packets = Vec::new();
-        while let Ok(pkt) = self.packet_rx.try_recv() {
-            packets.push(pkt);
-        }
-        packets
-    }
-
     /// Whether system audio capture is currently active.
     #[must_use]
     pub fn is_active(&self) -> bool {
@@ -842,7 +825,7 @@ impl SystemAudioCapture {
     #[allow(clippy::too_many_arguments)] // matches stream/output.rs precedent
     fn spawn_worker(
         ring_consumer: Consumer<f32>,
-        packet_tx: Sender<SystemAudioPacket>,
+        sink: PacketSink,
         should_stop: Arc<AtomicBool>,
         is_muted: Arc<AtomicBool>,
         volume: Arc<AtomicU32>,
@@ -857,7 +840,7 @@ impl SystemAudioCapture {
             let _rt = crate::platform::promote_current_thread(960, crate::OPUS_SAMPLE_RATE);
             Self::worker_loop(
                 ring_consumer,
-                packet_tx,
+                &*sink,
                 should_stop,
                 is_muted,
                 volume,
@@ -870,7 +853,7 @@ impl SystemAudioCapture {
     #[allow(clippy::too_many_arguments)] // matches stream/output.rs precedent
     fn worker_loop(
         mut ring_consumer: Consumer<f32>,
-        packet_tx: Sender<SystemAudioPacket>,
+        sink: &(dyn Fn(SystemAudioPacket) -> bool + Send + Sync),
         should_stop: Arc<AtomicBool>,
         is_muted: Arc<AtomicBool>,
         volume: Arc<AtomicU32>,
@@ -976,8 +959,11 @@ impl SystemAudioCapture {
                     chunk.commit_all();
                 }
                 // Block until more data lands (or the cap elapses for a
-                // stop check) — replaces a 10 ms polling sleep.
-                crate::platform::wait_for_wake(&wake_rx, WORKER_WAIT_CAP);
+                // stop check) — replaces a 10 ms polling sleep. A dead
+                // latch is a capture that stopped: nothing more comes.
+                if !crate::platform::wait_for_wake(&wake_rx, WORKER_WAIT_CAP) {
+                    break;
+                }
                 accumulator.clear();
                 resampler_accum_l.clear();
                 resampler_accum_r.clear();
@@ -1008,7 +994,9 @@ impl SystemAudioCapture {
                 // wake latch (or the cap elapses for a stop check). This
                 // replaces a 2 ms polling sleep that the 2026-08 audit
                 // predicted at ~500 wakes/s during engine-idle silence.
-                crate::platform::wait_for_wake(&wake_rx, WORKER_WAIT_CAP);
+                if !crate::platform::wait_for_wake(&wake_rx, WORKER_WAIT_CAP) {
+                    break;
+                }
                 continue;
             }
 
@@ -1133,16 +1121,9 @@ impl SystemAudioCapture {
                         };
                         seq = seq.wrapping_add(1);
 
-                        match packet_tx.try_send(packet) {
-                            // Full: the consumer is behind — drop this
-                            // frame. System audio is less critical than
-                            // voice; a dropped frame is a barely audible
-                            // 20 ms gap in background music.
-                            Ok(()) | Err(TrySendError::Full(_)) => {}
-                            Err(TrySendError::Disconnected(_)) => {
-                                info!("System audio packet channel disconnected, stopping worker");
-                                return;
-                            }
+                        if !sink(packet) {
+                            info!("System audio packets have no consumer, stopping worker");
+                            return;
                         }
                     }
                     Err(e) => {

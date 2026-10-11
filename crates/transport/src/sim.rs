@@ -196,6 +196,39 @@ impl SimNet {
     /// timer due in that window. Call with small steps (1–5 ms) for
     /// faithful timing.
     pub fn step(&mut self, dt: Duration) {
+        self.service();
+        self.advance(dt);
+    }
+
+    /// When something next happens on its own: a datagram lands, or a
+    /// node's driver is due ([`Driver::next_deadline`]).
+    pub fn next_event(&mut self) -> Option<Instant> {
+        let arrival = self.in_flight.peek().map(|Reverse(p)| p.arrive_at);
+        self.nodes
+            .iter_mut()
+            .filter_map(|n| n.host.driver().next_deadline())
+            .chain(arrival)
+            .min()
+    }
+
+    /// Move straight to the next event, at most `max` ahead: what a
+    /// loop does that sleeps until its socket is readable or its
+    /// driver's deadline (review P1-2). Returns how far the clock
+    /// moved; a deadline whose work never clears shows up as steps of
+    /// zero.
+    pub fn step_to_next_event(&mut self, max: Duration) -> Duration {
+        self.service();
+        let now = self.now;
+        let dt = self
+            .next_event()
+            .map_or(max, |t| t.saturating_duration_since(now).min(max));
+        self.advance(dt);
+        dt
+    }
+
+    /// Timers and per-tick work at `now`, then every node's transmits
+    /// onto the links.
+    fn service(&mut self) {
         // 1. Timers and per-tick work.
         for node in &mut self.nodes {
             node.host.driver().handle_timeouts(self.now);
@@ -210,6 +243,10 @@ impl SimNet {
                 }
             }
         }
+    }
+
+    /// Move the clock by `dt` and deliver everything due.
+    fn advance(&mut self, dt: Duration) {
         // 3. Deliver everything due.
         self.now += dt;
         while let Some(Reverse(top)) = self.in_flight.peek() {

@@ -94,7 +94,7 @@ impl ChatServer {
         if !self.has_feature(client, features::FILES) || !self.persist.is_persistent() {
             return Err(UploadRejectReason::NoPermission);
         }
-        if !self.allowed(client, permissions::UPLOAD, RestrictionKind::GeneralText) {
+        if !self.allowed(client, permissions::UPLOAD, RestrictionKind::Upload) {
             return Err(UploadRejectReason::NoPermission);
         }
         if size == 0 || usize::try_from(size).is_ok_and(|s| s > self.file_cap()) {
@@ -206,18 +206,21 @@ impl ChatServer {
             fail(self, DmFailReason::NoPermission);
             return;
         }
-        // Your own upload, stored: never someone else's by hash.
+        // Your own upload, stored — or the same bytes you sent yourself
+        // after someone else did: never someone else's by hash alone.
         let Some(attachment) = self
             .policy
             .blobs
             .get(&blob_id)
-            .filter(|b| b.created_by == Some(from))
+            .filter(|b| {
+                b.created_by == Some(from) || self.proven_uploads.contains(&(from, blob_id))
+            })
             .and(self.attachment_of(&blob_id))
         else {
             fail(self, DmFailReason::NoSuchBlob);
             return;
         };
-        if !self.allowed(client, permissions::UPLOAD, RestrictionKind::GeneralText) {
+        if !self.allowed(client, permissions::UPLOAD, RestrictionKind::Upload) {
             fail(self, DmFailReason::NoPermission);
             return;
         }
@@ -373,13 +376,14 @@ impl ChatServer {
         }
     }
 
-    /// The attachments of a history page, for a session with the bit;
-    /// `None` when the page has none.
+    /// The attachments of a history page, for a session with the bit,
+    /// in as many messages as they need (the client merges them); none
+    /// when the page has none.
     pub(super) fn history_attachments(
         &self,
         conv: ConvRef,
         rows: &[MessageRow],
-    ) -> Option<ServerMessage> {
+    ) -> Vec<ServerMessage> {
         let items: Vec<(u64, Attachment)> = rows
             .iter()
             .filter_map(|r| {
@@ -388,7 +392,10 @@ impl ChatServer {
                     .map(|a| (r.msg_id, a))
             })
             .collect();
-        (!items.is_empty()).then_some(ServerMessage::HistoryAttachments { conv, items })
+        protocol::split_to_fit(items, protocol::LIST_ITEMS_BUDGET)
+            .into_iter()
+            .map(|items| ServerMessage::HistoryAttachments { conv, items })
+            .collect()
     }
 
     /// A history row for a session without the bit: the file named in

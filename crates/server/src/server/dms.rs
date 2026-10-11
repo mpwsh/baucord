@@ -275,7 +275,17 @@ impl ChatServer {
         let Some(client) = self.pending_convs.remove(&ask) else {
             return;
         };
-        if let Outcome::Answered(Answer::Conversations(dms)) = outcome {
+        if let Outcome::Answered(Answer::Conversations(mut dms)) = outcome {
+            // The client replaces its list with each one it gets: one
+            // message, the conversations that fit (the store lists the
+            // most recent first).
+            let dropped = protocol::keep_prefix_that_fits(&mut dms, protocol::LIST_ITEMS_BUDGET);
+            if dropped > 0 {
+                log::info!(
+                    "DM list for {client:#x} cut to {} ({dropped} left out)",
+                    dms.len()
+                );
+            }
             self.send_authors(client, dms.iter().map(|d| d.user_id));
             self.send_msg(client, &ServerMessage::Conversations { dms });
         }

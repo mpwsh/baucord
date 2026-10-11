@@ -118,6 +118,8 @@ pub fn set_host_visible(visible: bool) {
         return;
     }
     info!("host: app {}", if visible { "shown" } else { "hidden" });
+    // Stream frames are not even decoded while hidden (review P1-7).
+    crate::present::set_stream_visible(None, visible);
     if visible {
         let _ = slint::invoke_from_event_loop(|| with_current(AppState::host_shown));
     }
@@ -389,6 +391,8 @@ pub struct AppState {
 
     // Roster
     users_model: Rc<VecModel<UserRow>>,
+    /// When `users_model` is rebuilt (review P1-9).
+    roster_sync: profiles::RosterSync,
 
     // Windows
     pub main: MainWindow,
@@ -513,14 +517,26 @@ fn spawn_workers(
 ) {
     let wake_fn: client::WakeFn = Arc::new(wake);
     let (network_tx, network_control_rx) = crossbeam_channel::bounded::<NetworkControl>(256);
-    let (network_msg_tx, network_msg_rx) = crossbeam_channel::bounded::<NetworkMessage>(256);
+    // Unbounded: the network thread must never wait for the UI (review
+    // P1-16). With both directions bounded at 256 and blocking sends
+    // both ways, a UI 256 messages behind (a join burst on a big server
+    // during a slow drain) blocked the network thread on this send,
+    // while a UI handler sending a control (a `FetchBlob` per avatar)
+    // blocked on the full control channel the network thread no longer
+    // drained: a deadlock that froze the window until the session timed
+    // out. Only state comes this way — media goes to the voice and
+    // screen threads — and the UI drains it every pass.
+    let (network_msg_tx, network_msg_rx) = crossbeam_channel::unbounded::<NetworkMessage>();
 
     let voice = VoiceThreadHandle::spawn(
         network_tx.clone(),
         is_testing_mic_shared.clone(),
         wake_fn.clone(),
     );
-    let screen = ScreenThreadHandle::spawn(network_tx.clone(), wake_fn.clone());
+    // No wake for the screen thread: the present thread below reads its
+    // events and wakes the UI (review P1-8).
+    let screen = ScreenThreadHandle::spawn(network_tx.clone());
+    crate::present::attach_screen(screen.tx.clone());
     // Present-prep thread: takes over screen.event_rx (the UI drain
     // must not read it), converts or copies the newest frame of each
     // stream into the UI's pixel buffer off the UI thread, forwards
@@ -726,6 +742,7 @@ pub fn run() {
         gifs: HashMap::new(),
         pending_preview: None,
         users_model,
+        roster_sync: profiles::RosterSync::default(),
         main,
         main_repaint_arm: Rc::new(Cell::new(false)),
         main_placed: Cell::new(false),
@@ -778,7 +795,8 @@ pub fn run() {
     {
         let mut st = state.borrow_mut();
 
-        // Register global hotkeys on the main thread (required by the OS).
+        // Global hotkeys live on the main thread (the OS wants their
+        // registration there); they arm at connect.
         st.hotkeys = Some(HotkeyManager::new(&st.settings, Arc::new(wake)));
 
         st.push_tr();
@@ -828,6 +846,10 @@ pub fn run() {
             if let Some(main) = weak.upgrade() {
                 main.set_repaint_flip(!main.get_repaint_flip());
             }
+            // Shown again: a roster held back while out of sight is
+            // rebuilt now (review P1-9). Deferred: this runs inside
+            // winit's dispatch.
+            let _ = slint::invoke_from_event_loop(|| with_current(AppState::flush_roster));
         });
     }
     {
@@ -1254,6 +1276,14 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, media::paste_into_chat);
     });
     logic.on_link_clicked(|url| {
+        // Web links only, on every host: a message can carry any
+        // destination, and the system opens `tel:`, `file:` or an app's
+        // deep link as readily as a page (review P0-7, CLI-4).
+        if !app_core::markdown::is_web_link(url.as_str()) {
+            let scheme = url.split(':').next().unwrap_or_default();
+            warn!("Refused to open a non-web link ({scheme}:)");
+            return;
+        }
         if let Err(e) = crate::host::open_url(url.as_str()) {
             warn!("Failed to open link: {e}");
         }

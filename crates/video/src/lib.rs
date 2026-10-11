@@ -457,6 +457,31 @@ pub trait VideoEncoder {
     fn qp_floor(&self) -> Option<u32> {
         None
     }
+
+    /// Frames submitted whose access units have not come out yet.
+    fn frames_in_flight(&self) -> usize {
+        0
+    }
+
+    /// The access units that finished since the last call, without
+    /// submitting a frame. Capture is change-driven, so a still screen
+    /// makes no `encode` calls; this is how the frames a hardware
+    /// encoder still holds leave on the next tick instead of with the
+    /// next change or refresh (review P1-13).
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    fn drain(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
+        Ok(Vec::new())
+    }
+
+    /// Whether finished output leaves only with a later submission, so
+    /// that [`Self::drain`] cannot bring out the last frame's access
+    /// unit: the caller then submits the held frame once more after a
+    /// change (`FFmpeg` 7.1's AMF wrapper).
+    fn output_needs_input(&self) -> bool {
+        false
+    }
 }
 
 /// Where one [`VideoDecoder::decode`] call that produced a picture
@@ -511,6 +536,14 @@ pub trait VideoDecoder {
     /// As [`Self::decode`].
     fn poll(&mut self) -> Result<Option<DecodedFrame>, CodecError> {
         Ok(None)
+    }
+
+    /// When a [`Self::poll`] could next hand out a picture, at `now`:
+    /// `None` when none can come without another frame (the default —
+    /// `decode` hands out every picture itself). The caller sleeps until
+    /// then instead of asking on a short timer (review P1-7).
+    fn next_poll(&self, _now: std::time::Instant) -> Option<std::time::Instant> {
+        None
     }
 }
 

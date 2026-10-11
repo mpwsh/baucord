@@ -180,7 +180,13 @@ export component MainWindow inherits Window {
             y: root.inset-top;
             width: root.page-width;
             height: root.page-height;
-            visible: State.phase == Phase.main;
+            // Not under an opaque page either (a phone's stream or
+            // Settings page): the GPU renderers repaint the whole
+            // window every frame, so a 60 fps stream also drew the
+            // chat underneath (review P1-10). Hidden is not removed:
+            // the chat pane keeps its rows and scroll, and a page
+            // closing hands the focus back as before.
+            visible: State.phase == Phase.main && !State.watch-open && !State.settings-open;
             // The chat pane is a persistent instance (the shell drives
             // its scroll and composer at any time), so both pages are
             // placed by hand rather than swapped with `if`.

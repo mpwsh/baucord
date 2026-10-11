@@ -26,7 +26,7 @@ use rubato::{
     Async, FixedAsync, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
-fn sinc_params() -> SincInterpolationParameters {
+pub(crate) fn sinc_params() -> SincInterpolationParameters {
     SincInterpolationParameters {
         sinc_len: 64,
         // rubato 4: Option — None would auto-derive the highest

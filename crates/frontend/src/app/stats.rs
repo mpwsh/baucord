@@ -109,6 +109,8 @@ impl AppState {
     /// 2-second sample by themselves.
     pub(super) fn host_shown(&mut self) {
         self.clear_seen_notices();
+        // The roster changes the background held back (review P1-9).
+        self.flush_roster();
         // Android: a room entered while off screen could not have its
         // microphone type (a background start); on screen it can.
         if cfg!(target_os = "android") {

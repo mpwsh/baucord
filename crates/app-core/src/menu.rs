@@ -188,8 +188,8 @@ pub struct Session {
     pub our_rank: u16,
 }
 
-/// A roster user row, as the menu sees it (the decorated row: the
-/// rank rule against us is already applied).
+/// A roster user row, as the menu sees it, with the rank rule against
+/// us already applied (the host works it out when the menu opens).
 #[expect(
     clippy::struct_excessive_bools,
     reason = "mirrors the roster row's flags one to one"

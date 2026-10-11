@@ -148,7 +148,8 @@ impl ChatServer {
             .filter(|u| Some(*u) != me && seen.insert(*u))
             .filter_map(|u| self.author_info(&u, None))
             .collect();
-        if !authors.is_empty() {
+        // The client merges each batch into what it knows.
+        for authors in protocol::split_to_fit(authors, protocol::LIST_ITEMS_BUDGET) {
             self.send_msg(client, &ServerMessage::Authors { authors });
         }
     }
@@ -382,7 +383,18 @@ impl ChatServer {
         size: u32,
         sha256: BlobId,
     ) {
-        if self.policy.blobs.contains_key(&sha256) {
+        // A known hash is acknowledged without transfer only to whoever
+        // may already post it: its uploader, or someone who sent the
+        // same bytes before. Anyone else sends them once — the proof
+        // that they hold the file — and may then post it too. Answering
+        // "already here" to everyone left a second poster refused by
+        // `SendFile` on every retry (review P0-4).
+        let user = self.user_of.get(&client).copied();
+        if let Some(known) = self.policy.blobs.get(&sha256)
+            && user.is_some_and(|u| {
+                known.created_by == Some(u) || self.proven_uploads.contains(&(u, sha256))
+            })
+        {
             self.send_msg(
                 client,
                 &ServerMessage::UploadAccept {
@@ -508,31 +520,39 @@ impl ChatServer {
             }
         };
         let created_by = self.user_of.get(&client).copied();
-        info!(
-            "[{}] uploaded a {} blob ({} KB)",
-            self.get_username(client),
-            sniffed,
-            bytes.len() / 1024
-        );
         if announced.is_file
             && let Some(user) = created_by
         {
             self.note_upload(user, announced.size);
         }
-        self.store_blob(
-            digest,
-            BlobMeta {
-                mime: sniffed,
-                size: announced.size,
-                name: announced.name,
-                created_by,
-                created_at: self.wall_now(),
-                refs: 0,
-            },
-            Some(announced.mime),
-            bytes,
-            announced.is_file,
-        );
+        if self.policy.blobs.contains_key(&digest) {
+            // The bytes of a file someone else uploaded first: proof of
+            // possession. The record (and its first uploader) stays.
+            if let Some(user) = created_by {
+                self.proven_uploads.insert((user, digest));
+            }
+        } else {
+            info!(
+                "[{}] uploaded a {} blob ({} KB)",
+                self.get_username(client),
+                sniffed,
+                bytes.len() / 1024
+            );
+            self.store_blob(
+                digest,
+                BlobMeta {
+                    mime: sniffed,
+                    size: announced.size,
+                    name: announced.name,
+                    created_by,
+                    created_at: self.wall_now(),
+                    refs: 0,
+                },
+                Some(announced.mime),
+                bytes,
+                announced.is_file,
+            );
+        }
         self.send_msg(
             client,
             &ServerMessage::UploadDone {

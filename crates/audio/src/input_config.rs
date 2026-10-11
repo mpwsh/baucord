@@ -12,7 +12,7 @@
 //! onto a single control panel.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 
@@ -32,6 +32,14 @@ pub struct InputConfig {
     /// Master mute — when true, the cpal callback discards samples
     /// and the worker drains the ring buffer.
     pub muted: AtomicBool,
+
+    /// In a voice room. Out of one (the lobby, the AFK room) the relay
+    /// drops our voice, so the desktop treats it like mute: capture
+    /// stays open (PRODUCTION-PLAN.md §6, item 5) and its samples are
+    /// dropped before anything denoises, encodes or sends them (review
+    /// P1-6). The phones close the microphone instead
+    /// (`VoiceChat::set_presence`).
+    pub in_room: AtomicBool,
 
     /// Enable RNNoise-based noise suppression.
     pub denoise_enabled: AtomicBool,
@@ -72,6 +80,7 @@ impl InputConfig {
     ) -> Self {
         Self {
             muted: AtomicBool::new(false),
+            in_room: AtomicBool::new(true),
             denoise_enabled: AtomicBool::new(noise_suppression),
             compressor_enabled: AtomicBool::new(compressor_enabled),
             agc_enabled: AtomicBool::new(agc_enabled),
@@ -81,6 +90,13 @@ impl InputConfig {
             compressor: Arc::new(compressor::Knobs::default()),
             agc: Arc::new(agc::Knobs::with_target(agc_target_rms)),
         }
+    }
+
+    /// The samples are dropped: muted, or out of a voice room. Read by
+    /// the capture callbacks and the capture worker.
+    #[inline]
+    pub fn silenced(&self) -> bool {
+        self.muted.load(Ordering::Relaxed) || !self.in_room.load(Ordering::Relaxed)
     }
 }
 

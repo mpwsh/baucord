@@ -30,6 +30,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crossbeam_channel::{bounded, Receiver, Sender};
+
 use super::{AudioProcessor, FrameContext};
 
 /// `RNNoise` speech probability at or above which a frame is speech.
@@ -43,8 +45,45 @@ const HOLD_FRAMES: u32 = 8;
 /// long after speech stops. Purely visual.
 const STOP_COOLDOWN: Duration = Duration::from_millis(1500);
 
+/// The speaking light, shared by all that set or read it: the capture
+/// worker's [`SpeakingIndicator`], the engine (mute, presence and a
+/// closed microphone put it out) and the engine's owner. Each change
+/// rings [`Self::new`]'s receiver, so the owner waits for an edge
+/// instead of polling the flag every 20 ms (review P1-5).
+pub struct SpeakingFlag {
+    on: AtomicBool,
+    edges: Sender<()>,
+}
+
+impl SpeakingFlag {
+    /// A flag, out, and the ring its changes sound on. The ring holds
+    /// one token: any number of changes since the last look read as one
+    /// ring, and the flag says where they ended.
+    #[must_use]
+    pub fn new() -> (Arc<Self>, Receiver<()>) {
+        let (edges, ring) = bounded(1);
+        let flag = Self {
+            on: AtomicBool::new(false),
+            edges,
+        };
+        (Arc::new(flag), ring)
+    }
+
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.on.load(Ordering::Relaxed)
+    }
+
+    /// Set the light; a change rings. Never blocks.
+    pub fn set(&self, on: bool) {
+        if self.on.swap(on, Ordering::Relaxed) != on {
+            let _ = self.edges.try_send(());
+        }
+    }
+}
+
 pub struct SpeakingIndicator {
-    is_speaking: Arc<AtomicBool>,
+    is_speaking: Arc<SpeakingFlag>,
     hold_remaining: u32,
     last_transition: Instant,
 }
@@ -56,19 +95,20 @@ impl Default for SpeakingIndicator {
 }
 
 impl SpeakingIndicator {
+    /// An indicator with a flag of its own, which nobody hears ring.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_flag(SpeakingFlag::new().0)
+    }
+
+    /// An indicator that drives `flag`.
+    #[must_use]
+    pub fn with_flag(flag: Arc<SpeakingFlag>) -> Self {
         Self {
-            is_speaking: Arc::new(AtomicBool::new(false)),
+            is_speaking: flag,
             hold_remaining: 0,
             last_transition: Instant::now(),
         }
-    }
-
-    /// Handle to observe speaking state from outside the audio thread.
-    #[must_use]
-    pub fn speaking_handle(&self) -> Arc<AtomicBool> {
-        self.is_speaking.clone()
     }
 
     fn classify(&mut self, gate_open: bool, vad_prob: f32) -> bool {
@@ -86,12 +126,12 @@ impl SpeakingIndicator {
 
     /// Publish the speaking indicator with a slow-fall cooldown for UI.
     fn update_ui_indicator(&mut self, should_speak: bool) {
-        let was_speaking = self.is_speaking.load(Ordering::Relaxed);
+        let was_speaking = self.is_speaking.get();
         if should_speak && !was_speaking {
-            self.is_speaking.store(true, Ordering::Relaxed);
+            self.is_speaking.set(true);
             self.last_transition = Instant::now();
         } else if !should_speak && was_speaking && self.last_transition.elapsed() > STOP_COOLDOWN {
-            self.is_speaking.store(false, Ordering::Relaxed);
+            self.is_speaking.set(false);
             self.last_transition = Instant::now();
         }
     }
@@ -110,7 +150,7 @@ impl AudioProcessor for SpeakingIndicator {
 
     fn reset(&mut self) {
         self.hold_remaining = 0;
-        self.is_speaking.store(false, Ordering::Relaxed);
+        self.is_speaking.set(false);
     }
 }
 
@@ -147,5 +187,34 @@ mod tests {
         }
         s.process(&mut [], &mut ctx);
         assert!(!ctx.is_speech, "hold expired");
+    }
+
+    /// The owner hears each change once, never a set that changed
+    /// nothing, and changes it has not looked at yet read as one ring.
+    #[test]
+    fn the_flag_rings_on_a_change_only() {
+        let (flag, ring) = SpeakingFlag::new();
+        flag.set(false);
+        assert!(ring.try_recv().is_err(), "nothing changed");
+        flag.set(true);
+        assert!(ring.try_recv().is_ok() && flag.get());
+        flag.set(true);
+        assert!(ring.try_recv().is_err(), "still on: no ring");
+        flag.set(false);
+        flag.set(true);
+        flag.set(false);
+        assert!(ring.try_recv().is_ok(), "three changes, one ring");
+        assert!(ring.try_recv().is_err());
+        assert!(!flag.get(), "the flag says where they ended");
+
+        // The indicator drives the shared flag.
+        let mut s = SpeakingIndicator::with_flag(flag.clone());
+        let mut ctx = FrameContext {
+            gate_open: true,
+            rnnoise_vad_prob: 0.9,
+            ..FrameContext::default()
+        };
+        s.process(&mut [], &mut ctx);
+        assert!(flag.get() && ring.try_recv().is_ok());
     }
 }

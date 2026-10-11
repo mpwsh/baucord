@@ -124,7 +124,8 @@ What stands between this and "production for strangers":
 - [ ] **SEC-11 [P2] Smaller server items** *(review)*: channel passwords
   plain, compared in variable time, no attempt limit (`server.rs`
   ~2661); a moderator can lift their own mute/restriction
-  (`moderation.rs` ~432); admin replies over 64 KiB fail silently
+  (`moderation.rs` ~432); admin replies are cut to one 17 KiB message
+  since 1.2.1 (paging them needs a feature bit)
   (ListUsers/Blobs/Invites/audit break at a few hundred rows,
   `messages.rs` ~1440, `server.rs` ~1310); pruning messages never
   decrements blob refs, the telemetry prune scans without an index,
@@ -157,14 +158,6 @@ What stands between this and "production for strangers":
   time cap trusts sender timestamps (`audio/src/transport/
   packet_buffer.rs` ~192–262), on the real-time output worker. Cap ~64
   slots per peer and refuse sequence numbers far ahead of the playhead.
-- [ ] **CLI-4 [P1][S] A message can carry a link of any scheme.** The
-  linkifier puts the raw token into `](<…>)` unescaped
-  (`app-core/src/markdown.rs` ~116–134, ~242), so `>` ends the
-  destination early and a second `[text](file://…)` follows; the click
-  handler opens anything (`frontend/src/app.rs` ~1178 → `host.rs` ~95;
-  `open::that_detached`). Allow only http/https at the click, stop the
-  URL at `<>[]()`, add adversarial tests. (Phones already check the
-  scheme in their hosts.)
 - [ ] **CLI-5 [P1][S] Reconnect unmutes.** `teardown_connection` clears
   mute and deafen (`frontend/src/app/session.rs` ~196) and the
   automatic reconnect puts the user back in the room live. Keep both
@@ -201,23 +194,15 @@ What stands between this and "production for strangers":
   still ducks: the software canceller (AEC-SPEC §8) or Auto keeping
   speakers off the call path — decide then. Meanwhile users:
   `control mmsys.cpl,,3` → "Do nothing".
-- [ ] **CLI-14 [P2][S] A stream's own audio output never sheds
-  latency when it resamples.** Found reading `audio/src/stream/output.rs`
-  for MOB-18: on a device that is not at 48 kHz, decoded audio waits in
-  the worker's accumulator while the ring is full and is never
-  trimmed, so a network burst or clock drift adds delay for good (the
-  48 kHz path drops the excess instead). Rare — the output asks for
-  48 kHz first — but it is an A/V drift. The `viewing` line's `audio
-  … ms queued` shows it if it happens; drain to a target like the
-  phones' mix does (`stream::mix`, by playing slightly faster).
 - [ ] **CLI-16 [P2][M] Desktop voice latency: what is left.** The
   2026-10-08 review: native WASAPI cost nothing (event-driven, MMCSS,
   20 ms render buffer). Our code adds ~74 ms one way; the estimate
   mouth to ear is 135–175 ms. Nine candidates, ranked, in
   `LATENCY-SPEC.md`. First: measure (a clap test, and buffer depths
   in the voice summary). Then LAT-1 (late packets push playback 20 ms
-  later), LAT-2 (share audio waits for the video tick) and LAT-3 (the
-  32 KiB datagram send buffer holds seconds, not ~200 ms). Also seen:
+  later) and LAT-3 (the 32 KiB datagram send buffer holds seconds, not
+  ~200 ms). LAT-2 (share audio waited for the video tick) is done
+  (§7, 1.2.1). Also seen:
   a sharer's own voice lost 45 % beside a collapsed video uplink
   (CLI-13's session, §7) — voice and video share the congested
   window, and LAT-3 is part of the answer. Parked until the Play
@@ -253,6 +238,16 @@ What stands between this and "production for strangers":
   fires on `release: published`, which includes pre-releases, and the
   R2 `version` file moves too (the Docker image no longer moves
   `latest` for one, §7). Guard on `github.event.release.prerelease`.
+
+## 2a. The 2026-10-10 review
+
+A staff-engineer review of the whole repository at `0516add`
+([baucord — staff engineering review](https://claude.ai/code/artifact/8a013ff5-90c8-4a37-8e1f-fe9055a2aa2e)):
+7 P0, 22 P1, 62 P2 and 52 P3 items, a wakeup audit and a dead-code list,
+each with file:line evidence and a fix. Its ids (`P0-1` … `P3-52`, no
+clash with this file's) are the work list for 1.2.1; a finished one gets
+a line in §7 naming its id, an open one stays in the review. Where a
+review item finished an item of this file, that item left its list.
 
 ## 3. Milestone B — release integrity, licensing, operations
 
@@ -527,7 +522,8 @@ Store is not decided yet.
    "notifications only while connected".
 5. **The lobby** (MOB-1) — *decided 2026-10-07*: no microphone in the
    lobby or while muted, on the phones only; the desktop keeps its
-   streams.
+   streams, and since 1.2.1 drops what the microphone hears there
+   (review P1-6). The AFK room counts as out of a room.
 6. **Mute across reconnects and restarts** (CLI-5): assumed yes.
 7. **The default branch**: `chunk` or `main` — the workflows disagree.
 
@@ -598,6 +594,61 @@ One line each; the spec decision named holds the detail.
   offline authors' looks), the chat's stickiness by input with an
   "N new messages" pill (ANDROID-SPEC D66), General's Activity view
   (D65).
+
+- **2026-10-10 — 1.2.1, the review's P0s** (§2a): control messages are
+  17 KiB both ways, as every shipped peer already enforced — history
+  pages, the DM list and admin answers are cut to fit one message
+  (`protocol::keep_prefix_that_fits` and friends) instead of vanishing
+  unread at the client (P0-1); refusing an upload names the upload
+  restriction, not General's text (P0-2); deleting a role revokes its
+  invites and opens its channels in one transaction (P0-3); the prune
+  tells the tick which files it deleted, and someone else's file is
+  sent once in full before it can be posted again (P0-4); the release
+  builds only the desktop and the server (`default-members`, P0-5);
+  teardown stops watching every stream (P0-6); links open only when
+  they are `http`/`https`, on every host, and the linkifier stops a URL
+  at `<`, `>` and `\` — CLI-4 (P0-7).
+- **2026-10-10 — "Install and restart" relaunches.** The new process
+  knocked on the single-instance socket of the one still exiting,
+  heard "already running" and quit, so the app closed and never came
+  back. The updater now passes `BAUCORD_RELAUNCH_AFTER_UPDATE` (and the
+  same arguments, so a `--profile` comes back on its profile) and the
+  child waits for the old instance to leave (`instance::wait_for_previous`).
+  The socket name is now an FNV hash of the config path instead of
+  std's `DefaultHasher`.
+- **2026-10-10 — 1.2.1, the review's P1s** (§2a), mostly wakes nobody
+  needed:
+  - *Loops sleep until there is work.* Both network loops wait on the
+    socket until `Driver::next_deadline()`; the server's idle main
+    thread went from 50–1,000 wakes a second to a few (P1-2), and
+    Windows has the socket wake too (`WSAPoll`, P1-1). Voice packets
+    skip the voice thread, which wakes once a second (P1-5). The audio
+    workers wait on their device latch; a stream's sound is read in its
+    device callback (P1-4, which also closes CLI-14). The screen thread
+    sleeps until a playout slot and no longer wakes the UI; a stream
+    nobody can see is not decoded (P1-7, P1-8). Keybinds are watched
+    only while connected, and only the bound keys — `device_query` is
+    gone (P1-3). The roster is rebuilt once per pass and only on screen
+    (P1-9); the phones' main screen is hidden under their pages (P1-10).
+  - *Work nobody hears.* The desktop drops the microphone outside a
+    voice room (lobby, AFK) instead of encoding what the relay throws
+    away (P1-6).
+  - *Latency.* A gap in a stream's frames is acted on at once (P1-12);
+    NVENC and QSV open without a frame queue and a still screen's last
+    change leaves at once (P1-13); capture and decode reuse pooled
+    buffers (P1-11); share audio leaves as each packet is encoded
+    (LAT-2) and the desktop holds a 60 ms cushion for it.
+  - *Bugs.* GSO turning off no longer loses every batch (P1-14); the
+    UI and the network thread can no longer deadlock (P1-16); two
+    uploads at once keep separate state (P1-17); Windows reopens both
+    sides when the output changes, and "Default" means one device
+    (P1-18, AEC-SPEC E13); stream sound plays on the voice output
+    picked in Settings (P1-19); pictures from the wire decode only as
+    PNG, JPEG or GIF (P1-20).
+  - *Server and scripts.* A retired key vouches for two years from its
+    retirement, by the date in its name (P1-15); `monitor-net.sh`
+    writes its rows again (P1-21); CLI listings change nothing, and a
+    reload sends only what changed (P1-22).
 
 ## 8. Facts this plan rests on
 

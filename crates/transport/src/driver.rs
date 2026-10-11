@@ -306,9 +306,16 @@ impl OutQueue {
         self.pending.is_empty()
     }
 
-    fn age(&self, now: Instant) -> Duration {
-        self.oldest_at
-            .map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
+    /// When the oldest queued byte reaches [`VIDEO_GROUP_DEADLINE`]
+    /// (`None` while nothing is queued).
+    fn due_at(&self) -> Option<Instant> {
+        self.oldest_at.map(|t| t + VIDEO_GROUP_DEADLINE)
+    }
+
+    /// A video group's byte or time bound is passed (§6.2). The same
+    /// instant [`Driver::next_deadline`] wakes the loop for.
+    fn overdue(&self, now: Instant) -> bool {
+        self.bytes > VIDEO_GROUP_MAX_PENDING || self.due_at().is_some_and(|due| now >= due)
     }
 
     fn clear(&mut self) {
@@ -408,6 +415,14 @@ struct FinishingGroup {
     finished_at: Instant,
 }
 
+impl FinishingGroup {
+    /// When an unacknowledged finish goes stale: the group deadline
+    /// plus a couple of RTTs for the acks themselves.
+    fn due_at(&self, rtt: Duration) -> Instant {
+        self.finished_at + VIDEO_GROUP_DEADLINE + 2 * rtt
+    }
+}
+
 #[derive(Debug)]
 struct UploadOut {
     id: UploadId,
@@ -491,14 +506,41 @@ impl Peer {
         }
     }
 
-    /// See [`Driver::wants_tick`].
-    fn wants_tick(&self) -> bool {
-        self.close_at.is_some()
-            || self.control.as_ref().is_some_and(|l| !l.out.is_empty())
-            || self.signal.as_ref().is_some_and(|l| !l.out.is_empty())
-            || !self.video_out.is_empty()
-            || !self.video_finishing.is_empty()
-            || !self.uploads.is_empty()
+    /// See [`Driver::next_deadline`].
+    fn next_deadline(&mut self, media_pace: usize) -> Option<Instant> {
+        let quinn = self.conn.poll_timeout();
+        if !self.connected || self.lost {
+            // Only quinn's own timers (and a deferred close until the
+            // connection is lost): the lanes are not flushed yet, or no
+            // longer.
+            return earliest(quinn, self.close_at.filter(|_| !self.lost));
+        }
+        let mut at = earliest(quinn, self.close_at);
+        // Lane bytes the stream would not take, and a group's bytes in
+        // flight, move when the peer acks or grants credit: a datagram
+        // arrives and its pass flushes them. What runs on a clock of its
+        // own is the deadline of a group's oldest queued byte…
+        for g in self.video_out.values() {
+            at = earliest(at, g.out.due_at());
+        }
+        // …the ack deadline of a finished group…
+        let rtt = self.conn.rtt();
+        for g in &self.video_finishing {
+            at = earliest(at, Some(g.due_at(rtt)));
+        }
+        // …and the pacer's refill, when an upload waits for tokens (one
+        // whose stream is blocked waits for the peer instead, as above).
+        for u in &self.uploads {
+            if let Some(front) = u.out.pending.front() {
+                #[allow(clippy::cast_precision_loss)]
+                let cost = (front.len() - u.out.offset) as f64;
+                at = earliest(
+                    at,
+                    media_refill_at(self.media_tokens, self.media_last_refill, cost, media_pace),
+                );
+            }
+        }
+        at
     }
 
     fn bidi_mut(&mut self, lane: Lane) -> Option<&mut BidiLane> {
@@ -847,33 +889,29 @@ impl Driver {
 
     // ── Timers ──────────────────────────────────────────────────────
 
-    /// Earliest instant any connection needs `handle_timeouts` by.
+    /// The latest instant [`Self::handle_timeouts`] must run by, if no
+    /// datagram arrives first (review P1-2). A loop sleeps until then or
+    /// until the socket is readable, and never ticks on a fixed short
+    /// interval: every datagram is handled the moment it lands, and
+    /// nothing below runs late.
+    ///
+    /// It covers quinn's timers (loss recovery, acks, keep-alive, idle,
+    /// pacing), a deferred close, the video deadlines (a group's oldest
+    /// queued byte, a finished group's acks) and the media pacer's next
+    /// refill. Work that waits on the peer (a blocked stream, a cwnd
+    /// that is full) needs no deadline: the peer's ack or credit is a
+    /// datagram, and the pass that handles it flushes. An idle
+    /// connection, or a share whose bytes are all acknowledged, is due
+    /// only at its next quinn timer.
+    ///
+    /// Poll transmits until `None` before asking: queued transmits are
+    /// not a deadline.
     #[must_use]
-    pub fn next_timeout(&mut self) -> Option<Instant> {
-        let mut earliest: Option<Instant> = None;
-        for p in self.peers.values_mut() {
-            let mut t = p.conn.poll_timeout();
-            if let Some(close_at) = p.close_at {
-                t = Some(t.map_or(close_at, |t| t.min(close_at)));
-            }
-            if let Some(t) = t {
-                earliest = Some(earliest.map_or(t, |e| e.min(t)));
-            }
-        }
-        earliest
-    }
-
-    /// Whether the per-tick work of [`Self::handle_timeouts`] has
-    /// anything to move: lane bytes the stream would not take yet,
-    /// video groups open or waiting for their acks, paced uploads,
-    /// a deferred close, transmits not yet polled. None of these has a
-    /// timer of its own in [`Self::next_timeout`], so a loop that
-    /// sleeps longer than a millisecond between ticks must keep ticking
-    /// while this is true. With it false, an idle connection needs a
-    /// tick only at `next_timeout` or when a datagram arrives.
-    #[must_use]
-    pub fn wants_tick(&self) -> bool {
-        !self.transmits.is_empty() || self.peers.values().any(Peer::wants_tick)
+    pub fn next_deadline(&mut self) -> Option<Instant> {
+        let pace = self.budget.media_pace_bytes_per_sec;
+        self.peers
+            .values_mut()
+            .fold(None, |at, p| earliest(at, p.next_deadline(pace)))
     }
 
     /// Fire every timer at or before `now`, and run the per-tick work
@@ -1099,15 +1137,14 @@ impl Driver {
         Ok(id)
     }
 
-    /// `(bytes handed to the transport, total)` for an upload still in
-    /// progress; `None` once it is fully written and finished (or
-    /// dropped).
-    #[must_use]
     /// Abort a media upload: the stream is reset (the peer's reader sees
     /// it end short and drops the partial) and the queue is freed. `true`
     /// when there was one.
-    pub fn cancel_media(&mut self, peer: PeerId, upload: UploadId) -> bool {
-        let Some(p) = self.peer_mut(peer) else {
+    pub fn cancel_media(&mut self, now: Instant, peer: PeerId, upload: UploadId) -> bool {
+        let Some(handle) = self.ids.get(&peer).copied() else {
+            return false;
+        };
+        let Some(p) = self.peers.get_mut(&handle) else {
             return false;
         };
         let Some(i) = p.uploads.iter().position(|u| u.id == upload) else {
@@ -1116,9 +1153,15 @@ impl Driver {
         let u = p.uploads.remove(i);
         let _ = p.conn.send_stream(u.stream).reset(GROUP_RESET_CODE);
         p.counters.uploads_dropped += 1;
+        // The reset frame goes out now, and the lanes get the send
+        // window it gave back.
+        self.drain_peer(handle, now);
         true
     }
 
+    /// `(bytes handed to the transport, total)` for an upload still in
+    /// progress; `None` once it is fully written and finished (or
+    /// dropped).
     #[must_use]
     pub fn upload_progress(&self, peer: PeerId, upload: UploadId) -> Option<(usize, usize)> {
         let p = self.peer(peer)?;
@@ -1403,7 +1446,7 @@ fn video_send(p: &mut Peer, track: Track, bytes: &[u8], now: Instant) {
     };
     // Byte and time bounds (§6.2): a behind peer loses the group, not
     // its place in the queue.
-    if group.out.bytes > VIDEO_GROUP_MAX_PENDING || group.out.age(now) > VIDEO_GROUP_DEADLINE {
+    if group.out.overdue(now) {
         video_close_current(p, track, now, Some(ResetCause::Deadline));
         return;
     }
@@ -1451,55 +1494,20 @@ fn video_close_current(p: &mut Peer, track: Track, now: Instant, cause: Option<R
 
 /// Per-tick flush of every outgoing queue, in lane priority order.
 fn flush_peer(p: &mut Peer, now: Instant, media_pace: usize) {
-    if let Some(l) = p.signal.as_mut() {
-        l.out.flush(&mut p.conn, l.stream, now);
-    }
-    if let Some(l) = p.control.as_mut() {
-        l.out.flush(&mut p.conn, l.stream, now);
-    }
-    // Current video groups: flush, then apply the deadline to what is
-    // still waiting (a group can fall behind between sends).
-    let mut reset_tracks = Vec::new();
-    for (track, g) in &mut p.video_out {
-        let gone = g.out.flush(&mut p.conn, g.stream, now);
-        if gone
-            || (!g.out.is_empty()
-                && (g.out.bytes > VIDEO_GROUP_MAX_PENDING || g.out.age(now) > VIDEO_GROUP_DEADLINE))
-        {
-            reset_tracks.push(*track);
-        }
-    }
-    for track in reset_tracks {
-        video_close_current(p, track, now, Some(ResetCause::Deadline));
-    }
-    // Finished groups not acknowledged within the deadline (plus a
-    // couple of RTTs for the acks themselves) are stale: reset them so
-    // the transport frees their send-window share for fresh groups.
-    let ack_deadline = VIDEO_GROUP_DEADLINE + 2 * p.conn.rtt();
-    let mut i = 0;
-    while i < p.video_finishing.len() {
-        let g = &p.video_finishing[i];
-        if now.saturating_duration_since(g.finished_at) > ack_deadline {
-            let _ = p.conn.send_stream(g.stream).reset(GROUP_RESET_CODE);
-            p.counters.groups_reset_unacked += 1;
-            p.counters.groups_reset += 1;
-            p.video_finishing.remove(i);
-            continue;
-        }
-        i += 1;
-    }
+    // A reset hands its unsent bytes' share of the send window back at
+    // once, and nothing else would offer it to the lanes flushed before
+    // it until the next datagram or timer: go round again.
+    while flush_lanes(p, now) {}
 
     // Media: paced. Token bucket refilled from the wall clock we are
-    // given; burst capped at two frames so an idle bucket cannot blast a
-    // backlog we were pacing to avoid.
+    // given; burst capped (`media_burst`).
     #[allow(clippy::cast_precision_loss)]
     {
         let dt = now
             .saturating_duration_since(p.media_last_refill)
             .as_secs_f64();
         p.media_last_refill = now;
-        let burst = 2.0 * (protocol::IMAGE_CHUNK_BYTES + frame::PREFIX_BYTES) as f64;
-        p.media_tokens = (p.media_tokens + dt * media_pace as f64).min(burst);
+        p.media_tokens = (p.media_tokens + dt * media_pace as f64).min(media_burst());
     }
     let mut i = 0;
     while i < p.uploads.len() {
@@ -1538,6 +1546,79 @@ fn flush_peer(p: &mut Peer, now: Instant, media_pace: usize) {
             }
         }
         i += 1;
+    }
+}
+
+/// Flush Signal, Control and the current video groups, then apply the
+/// video deadlines. `true` when a group was reset.
+fn flush_lanes(p: &mut Peer, now: Instant) -> bool {
+    if let Some(l) = p.signal.as_mut() {
+        l.out.flush(&mut p.conn, l.stream, now);
+    }
+    if let Some(l) = p.control.as_mut() {
+        l.out.flush(&mut p.conn, l.stream, now);
+    }
+    // Current video groups: flush, then apply the deadline to what is
+    // still waiting (a group can fall behind between sends).
+    let mut reset_tracks = Vec::new();
+    for (track, g) in &mut p.video_out {
+        let gone = g.out.flush(&mut p.conn, g.stream, now);
+        if gone || (!g.out.is_empty() && g.out.overdue(now)) {
+            reset_tracks.push(*track);
+        }
+    }
+    let mut reset = !reset_tracks.is_empty();
+    for track in reset_tracks {
+        video_close_current(p, track, now, Some(ResetCause::Deadline));
+    }
+    // Finished groups not acknowledged within the deadline (plus a
+    // couple of RTTs for the acks themselves) are stale: reset them so
+    // the transport frees their send-window share for fresh groups.
+    let rtt = p.conn.rtt();
+    let mut i = 0;
+    while i < p.video_finishing.len() {
+        let g = &p.video_finishing[i];
+        if now >= g.due_at(rtt) {
+            let _ = p.conn.send_stream(g.stream).reset(GROUP_RESET_CODE);
+            p.counters.groups_reset_unacked += 1;
+            p.counters.groups_reset += 1;
+            p.video_finishing.remove(i);
+            reset = true;
+            continue;
+        }
+        i += 1;
+    }
+    reset
+}
+
+/// The media bucket's cap: two frames, so an idle bucket cannot blast a
+/// backlog we were pacing to avoid.
+fn media_burst() -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    {
+        2.0 * (protocol::IMAGE_CHUNK_BYTES + frame::PREFIX_BYTES) as f64
+    }
+}
+
+/// When the media bucket, holding `tokens` at `last_refill`, will hold
+/// `cost`. `None` when it already does (the upload waits on its stream,
+/// not the pacer) or never will (a frame over the burst, no pace).
+fn media_refill_at(tokens: f64, last_refill: Instant, cost: f64, pace: usize) -> Option<Instant> {
+    if tokens >= cost || pace == 0 || cost > media_burst() {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let wait = Duration::from_secs_f64((cost - tokens) / pace as f64);
+    // A microsecond over, so float rounding never wakes the loop a hair
+    // early to find the bucket still short.
+    Some(last_refill + wait + Duration::from_micros(1))
+}
+
+/// The earlier of two optional instants.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 

@@ -127,6 +127,9 @@ pub(crate) struct Viewing {
     falling: Option<(Instant, Instant)>,
     /// Waiting for a keyframe since, and whether that was said.
     frozen: Option<(Instant, bool)>,
+    /// Frames dropped undecoded because nobody could see the picture
+    /// (a phone in the background, a minimized viewer).
+    unseen: u32,
 }
 
 impl Viewing {
@@ -145,7 +148,28 @@ impl Viewing {
             behind: Samples::default(),
             falling: None,
             frozen: None,
+            unseen: 0,
         }
+    }
+
+    /// A frame dropped before the jitter buffer: nobody can see the
+    /// stream's picture right now (review P1-7).
+    pub(crate) fn on_unseen(&mut self) {
+        self.unseen += 1;
+    }
+
+    /// When [`Self::poll`] next has a line to write: the summary, the end
+    /// of a falling-behind episode, a freeze long enough to name. The
+    /// screen thread sleeps until then at the latest.
+    pub(crate) fn next_due(&self) -> Instant {
+        let mut due = self.window_start + SUMMARY_EVERY;
+        if let Some((_, last_late)) = self.falling {
+            due = due.min(last_late + CAUGHT_UP_AFTER);
+        }
+        if let Some((since, false)) = self.frozen {
+            due = due.min(since + FROZEN_WARN);
+        }
+        due
     }
 
     /// Every `decode` call, picture or not.
@@ -324,6 +348,7 @@ impl Viewing {
         self.audio_base = audio.or(self.audio_base);
         self.busy = Duration::ZERO;
         self.pictures = 0;
+        self.unseen = 0;
         self.codec.clear();
         self.output.clear();
         self.whole.clear();
@@ -344,7 +369,6 @@ impl Viewing {
         let base = &self.buffer_base;
         let arrived = stats.packets_received - base.packets_received;
         let dropped = (stats.packets_dropped_overflow - base.packets_dropped_overflow)
-            + (stats.packets_dropped_late - base.packets_dropped_late)
             + (stats.packets_dropped_broken_reference - base.packets_dropped_broken_reference);
         let jumps = stats.keyframe_resets - base.keyframe_resets;
         let lost = stats.gaps_detected - base.gaps_detected;
@@ -377,6 +401,9 @@ impl Viewing {
         }
         if frozen {
             line.push_str(", frozen waiting for a keyframe");
+        }
+        if self.unseen > 0 {
+            let _ = write!(line, ", {} not decoded (off screen)", self.unseen);
         }
         frozen || dropped > 0 || lost > 0
     }
@@ -713,6 +740,46 @@ mod tests {
                 .any(|(_, l)| l.contains("keeping up with live again")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn the_next_line_is_due_at_the_summary_or_a_freeze_worth_naming() {
+        let t0 = Instant::now();
+        let mut v = Viewing::new(7, t0);
+        assert_eq!(v.next_due(), t0 + SUMMARY_EVERY);
+        // A frame arrived and no keyframe: frozen from the next poll.
+        let mut buffer = VideoJitterBuffer::new(30);
+        buffer.push(video::buffer::BufferedPacket {
+            seq: 3,
+            is_keyframe: false,
+            width: 64,
+            height: 64,
+            data: vec![0; 8],
+            arrival_time: t0,
+            timestamp_ms: 0,
+        });
+        assert!(v.poll(t0, &buffer, None, || None).is_empty());
+        assert_eq!(v.next_due(), t0 + FROZEN_WARN);
+        let lines = v.poll(t0 + FROZEN_WARN, &buffer, None, || None);
+        assert!(lines[0].1.contains("frozen 3 s"), "{lines:?}");
+        // Said once: back to the summary.
+        assert_eq!(v.next_due(), t0 + SUMMARY_EVERY);
+    }
+
+    #[test]
+    fn frames_nobody_could_see_are_counted_not_warned_about() {
+        let t0 = Instant::now();
+        let mut v = Viewing::new(7, t0);
+        for _ in 0..3 {
+            v.on_unseen();
+        }
+        let buffer = VideoJitterBuffer::new(30);
+        let lines = v.poll(t0 + SUMMARY_EVERY, &buffer, None, || None);
+        let (level, line) = &lines[0];
+        assert!(line.contains("3 not decoded (off screen)"), "{line}");
+        assert_eq!(*level, Level::Info);
+        let lines = v.poll(t0 + SUMMARY_EVERY * 2, &buffer, None, || None);
+        assert!(!lines[0].1.contains("off screen"), "a fresh window");
     }
 
     #[test]

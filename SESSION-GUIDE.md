@@ -272,6 +272,66 @@ Memory-mode servers (persistence off) still use the legacy
 
 - `wait_for` closures must not borrow the client being pumped: copy
   `x.id` first. And `wait_for` does not consume the message it found.
+- **A control message is at most 17 KiB, both ways**
+  (`protocol::MAX_CONTROL_MESSAGE_BYTES`): every shipped peer drops a
+  larger one unread, and until 1.2.1 nothing said so — history pages
+  and admin lists vanished (review P0-1). A message carrying a list is
+  fitted with `keep_prefix_that_fits` / `keep_suffix_that_fits` (one
+  message the client replaces or prepends) or `split_to_fit` (only
+  where the client merges batches: `Authors`, `HistoryAttachments`).
+  An oversized send now logs a warning on the server.
+- **The updater's relaunch waits for its parent** (1.2.1): a process
+  started with `BAUCORD_RELAUNCH_AFTER_UPDATE` waits for the exiting
+  instance to stop answering the instance socket before claiming it;
+  without that it was told "already running" and quit.
+- **Whatever the transport does on a clock needs a deadline in
+  `Driver::next_deadline()`** (review P1-2): both loops sleep until a
+  datagram or that deadline, so work without one waits for the next
+  datagram. Poll transmits until `None` before asking. The simulator's
+  `step_to_next_event` tests catch a missing deadline.
+- **Voice packets never pass through the voice thread** (review P1-5):
+  it hands each engine's `VoiceLink` (the `IncomingSender` and the
+  encoder's receiver) to the network thread at start, and wakes on
+  commands, speaking edges (`VoiceChat::speaking_edges`) and once a
+  second for `service()`. The UI reads meters through
+  `SharedAudioState::levels`. A new per-packet duty belongs in the
+  network thread or the engine, not in that loop.
+- **Audio workers wait on their device latch** (review P1-4), with
+  `LATCH_SAFETY_WAIT`; they leave when `wait_for_wake` returns false,
+  and their owner rings the latch on drop (`stop_ring`) so a stop is
+  immediate. A stream's own output has no worker: the decoder writes
+  the ring and the callback reads it through `stream::pace`
+  (`Pacing::own_output`: 60 ms cushion on the desktop).
+- **`sync_voice_room` runs on every platform** (review P1-6): the lobby
+  and the AFK room are out of a room; the desktop drops what the
+  microphone hears there (`InputConfig::in_room`), so its Settings
+  meter is flat unless the microphone test runs.
+- **Windows "Default" is one answer** (`communications_default`, review
+  P1-18): the Communications device unless echo cancellation is Off,
+  for the decision, both streams and the watcher. Never resolve it per
+  call site.
+- **swscale never writes into a tight buffer unless the width is a
+  multiple of 16** (review P1-11): FFmpeg 7.1's SIMD writes whole
+  blocks (8 pixels on x86, 16 on aarch64), past the row's end or short
+  of it. Other widths decode through the padded frame.
+- **FFmpeg 7.1's AMF wrapper returns nothing from a receive without a
+  new frame**, so `drain()` cannot release its last frame; the first
+  still tick re-encodes it once (review P1-13).
+- **The roster is rebuilt once per pass, and only on screen** (review
+  P1-9): `update_user_list` queues `flush_roster`. A new path that
+  brings the main screen back must call `flush_roster`; speaking and
+  audio-state edges use `refresh_voice_row`.
+- **Bytes from the wire decode with `images::decode_received`** (PNG,
+  JPEG, GIF; review P1-20); `decode_bounded` is only for pictures the
+  user picks, pastes or drops.
+- **Keybinds are armed only while connected** (review P1-3):
+  `HotkeyManager::set_connected` at `Connected` and in teardown;
+  keybind and push-to-talk changes go through `refresh_hotkeys`.
+- **Parallel worktrees sharing one `CARGO_TARGET_DIR` reuse each
+  other's workspace-crate artifacts** (same fingerprint, decided by
+  file times): a test can run another tree's code. Give each its own
+  target directory, or `cargo clean -p` the workspace crates before
+  trusting a merged build.
 - **A new wire variant needs a new feature bit** (spec §12): the
   first cut gated `UserProgress` on `PROGRESS`, which a 1.1.0 client
   negotiates too — it would have choked on the variant. Now
@@ -281,9 +341,13 @@ Memory-mode servers (persistence off) still use the legacy
   `cargo test` (debug assertions). `saturating_mul` now.
 - Tests about media connect people with `connect_member`; `connect`
   makes guests, who cannot share, upload, or DM.
-- A CLI change reaches a running server within 2 s (`data_version`
-  poll) and is applied to live sessions (bans close, kicks close,
-  roles refresh).
+- A CLI change reaches a running server within about 3 s
+  (`data_version` poll every 2 s, the tick's socket wait up to 1 s) and
+  is applied to live sessions (bans close, kicks close, roles refresh);
+  only what changed is sent. **Nothing on a CLI read path may commit or
+  restart the WAL** (a TRUNCATE checkpoint, an UPSERT of an unchanged
+  row): the running server's poll counts either as a change and
+  reloads (review P1-22). Listings open the database read-only.
 - `/kick` forgets keys and roles (needs a new invite); `/ban` is the
   restriction; a ban never catches the actor or an equal rank, and
   skips an address someone else is on.
@@ -480,7 +544,9 @@ Memory-mode servers (persistence off) still use the legacy
   against the fastest delivery seen (the playout delay and network
   wobble are part of it: tens of ms); a value that keeps growing is the
   A/V drift, and *audio queued* is the audio's side of it (stream
-  audio has no timestamps yet). `sharing 1080p 60fps: … encoded
+  audio has no timestamps yet). `N not decoded (off screen)` is normal
+  while the app or the viewer is hidden (review P1-7): those frames
+  were dropped before the jitter buffer. `sharing 1080p 60fps: … encoded
   58.4/s … | offered 6.8 Mbit/s, sent 6.5 Mbit/s, abandoned 0/3
   groups, path loss up to 0%, rtt 45 ms | bitrate 100%, fps 100%, 1
   viewer`: offered far above sent with groups abandoned = the uplink;
@@ -615,8 +681,9 @@ Memory-mode servers (persistence off) still use the legacy
   the audio callback's latch, the socket through `ReadWaiter` — with
   a timeout only for timers it really has. The network loop's 1 ms
   poll was a thousand wakes a second for a whole session on a phone.
-  `client/tests/network_idle.rs` counts a quiet connection's wakes
-  (`network::loop_passes`): keep it under 100. And what only feeds
+  `client/tests/network_idle.rs` counts a quiet connection's loop and
+  watcher wakes (`network::loop_passes`, `watcher_wakes`) on every
+  platform: keep the two under 25 (0 + 2 at 1.2.1). And what only feeds
   the screen checks `main_on_screen()` / `host_visible()`: a phone in
   the background shows nothing (D42).
 - **In `build.gradle.kts`, never write `java.awt.…` / `java.io.…`
@@ -658,7 +725,10 @@ Memory-mode servers (persistence off) still use the legacy
   point at a real file — `""` makes the whole model fail to load
   ("Failed to load image from path") — a 1×1 PNG written by the
   fixture script does; `/tmp/fx/main.json` is a full-field roster
-  fixture (admin, sharer, guest, custom badge) worth regenerating.
+  fixture (admin, sharer, guest, custom badge) worth regenerating —
+  without `outranked`, `role-editable`, `channel-kickable`, `owned`
+  and `from-config`, which left `UserRow` in 1.2.1 (the menu works
+  them out when it opens, review P1-9).
 - External drag-and-drop reaches the app only through
   `on_winit_window_event` (`WindowEvent::DroppedFile` and friends);
   Slint's `DropArea` is for in-app drags on this backend. The hook

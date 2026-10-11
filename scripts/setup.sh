@@ -19,7 +19,8 @@
 #   5. prints the server's address and identity from its log, and on a
 #      new server the one-time admin invite code
 #   6. installs + enables the network monitor as a systemd service
-#      (baucord-monitor — CSV at /var/log/baucord-net.log, logrotate managed)
+#      (baucord-monitor — CSV at /var/log/baucord-net.log, logrotate managed),
+#      and checks at the end that it writes data rows
 #
 # Everything in step 3 is host-level: net.core.* sysctls are global and apply inside
 # containers; NIC settings are physical; conntrack backs Docker's port publishing.
@@ -273,8 +274,10 @@ fi
 # root (nsenter into the container netns, ethtool).
 log "Installing baucord-monitor service"
 install -m 0755 scripts/monitor-net.sh /usr/local/bin/baucord-monitor
+MONITOR_INTERVAL=10
+MONITOR_LOG=/var/log/baucord-net.log
 
-cat >/etc/systemd/system/baucord-monitor.service <<'UNIT'
+cat >/etc/systemd/system/baucord-monitor.service <<UNIT
 [Unit]
 Description=baucord network monitor (per-netns UDP/NIC drop counters)
 Documentation=file:///usr/local/bin/baucord-monitor
@@ -285,7 +288,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/baucord-monitor 10 /var/log/baucord-net.log
+ExecStart=/usr/local/bin/baucord-monitor $MONITOR_INTERVAL $MONITOR_LOG
 Restart=always
 RestartSec=5
 # Needs real root (nsenter/ethtool); harden only what can't break it.
@@ -314,6 +317,10 @@ ROT
 
 systemctl daemon-reload
 systemctl enable baucord-monitor >/dev/null
+# Where the log stands before the restart: the status check below looks
+# for a data row after it.
+monitor_lines=0
+[[ -f "$MONITOR_LOG" ]] && monitor_lines="$(wc -l <"$MONITOR_LOG")"
 # restart (not start): re-running setup picks up script changes; the
 # "# start/resume" header line the script writes doubles as a marker of
 # when setup was re-applied.
@@ -329,4 +336,22 @@ else
   echo "  WARNING: nothing listening on udp/$MEDIA_PORT — check: docker compose logs baucord"
 fi
 echo "  make sure the firewall allows udp/$MEDIA_PORT (nothing else is needed: no TCP, no TLS certificate)"
-echo "  network monitor: systemctl status baucord-monitor   (log: tail -f /var/log/baucord-net.log)"
+# The monitor's first sample is a baseline; its first data row comes one
+# interval later. Until 1.2.1 it never wrote one, silently (review
+# P1-21). Not fatal: the relay works without it.
+monitor_row=""
+for _ in $(seq 1 $((2 * MONITOR_INTERVAL + 5))); do
+  [[ -f "$MONITOR_LOG" ]] && (($(wc -l <"$MONITOR_LOG") < monitor_lines)) && monitor_lines=0 # rotated
+  if [[ -f "$MONITOR_LOG" ]] && awk -F, -v skip="$monitor_lines" \
+    'NR > skip && !/^#/ && $1 != "ts" && $3 != "" { found = 1; exit } END { exit !found }' "$MONITOR_LOG"; then
+    monitor_row="yes"
+    break
+  fi
+  sleep 1
+done
+if [[ -n "$monitor_row" ]]; then
+  echo "  network monitor: writing rows (systemctl status baucord-monitor; log: tail -f $MONITOR_LOG)"
+else
+  echo "  WARNING: the network monitor wrote no data row in $((2 * MONITOR_INTERVAL)) s — check:"
+  echo "    systemctl status baucord-monitor; journalctl -u baucord-monitor; tail $MONITOR_LOG"
+fi

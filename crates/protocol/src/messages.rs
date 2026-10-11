@@ -35,15 +35,27 @@ pub type UserId = [u8; 32];
 /// server's logs (the ALPN already gates compatibility).
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Upper bound for a serialized control message. Anything larger is
-/// dropped before deserialization — a cheap guard against hostile length
-/// games, independent of any transport-level buffer bound.
+/// Upper bound for a serialized control message, both ways. Anything
+/// larger is dropped before deserialization — a cheap guard against
+/// hostile length games, independent of any transport-level buffer
+/// bound — and refused at encode, so an oversized message fails where
+/// it was built instead of vanishing at the peer.
 ///
-/// Chat images are the one deliberate exception: their wire size is
-/// governed by [`MAX_IMAGE_MESSAGE_BYTES`] instead, and the codec
-/// enforces per-variant that *only* image messages may exceed this
-/// bound (see [`decode_client_message`] / [`decode_server_message`]).
-pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+/// 17 KiB, the size of one chunk of an upload plus its envelope. Until
+/// 1.2.1 this constant said 64 KiB while both decoders checked the
+/// image bound first, so 17 KiB was the real limit every shipped peer
+/// enforces: a larger message (a history page, an admin list) was
+/// dropped without a trace (review P0-1). Lists are fitted to
+/// [`LIST_ITEMS_BUDGET`] by their senders ([`keep_prefix_that_fits`],
+/// [`keep_suffix_that_fits`], [`split_to_fit`]).
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = MAX_IMAGE_MESSAGE_BYTES;
+
+/// Room a list message keeps for everything but its items: the variant
+/// tag, ids, flags and the length varints.
+pub const LIST_ENVELOPE_BYTES: usize = 1024;
+
+/// How many bytes the items of one list message may take.
+pub const LIST_ITEMS_BUDGET: usize = MAX_CONTROL_MESSAGE_BYTES - LIST_ENVELOPE_BYTES;
 
 /// Maximum payload of a chat image (PNG, JPEG, or animated GIF),
 /// enforced on both ends: the sending client downscales/rejects until
@@ -58,11 +70,10 @@ pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 /// is what breaks calls during uploads.
 pub const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
-/// Upper bound for a serialized chat-image message: the payload cap
-/// plus generous headroom for the envelope (postcard varints + ids are
-/// a handful of bytes). This is the pre-deserialization length guard
-/// for the image path, and the worst transient allocation `decode_*`
-/// can be tricked into.
+/// Upper bound for a serialized upload chunk (a chat image, a log, a
+/// blob): one [`IMAGE_CHUNK_BYTES`] chunk plus headroom for the envelope
+/// (postcard varints and ids are a handful of bytes). The same bound as
+/// [`MAX_CONTROL_MESSAGE_BYTES`]: no message is larger.
 pub const MAX_IMAGE_MESSAGE_BYTES: usize = IMAGE_CHUNK_BYTES + 1024;
 
 /// Payload of one image chunk. Small on purpose: a voice packet that
@@ -1052,7 +1063,9 @@ pub enum ServerMessage {
     /// A page of messages, oldest first. Right after `Init` the last
     /// `history.replay` of the general chat arrive this way; `more`
     /// says an older page exists (`FetchHistory` with `before` = the
-    /// first id here). Pages are at most 64 KiB.
+    /// first id here). A page is one message of at most
+    /// [`MAX_CONTROL_MESSAGE_BYTES`]: the server keeps the newest rows
+    /// that fit and says `more`.
     History {
         conv: ConvRef,
         messages: Vec<HistoryMessage>,
@@ -1524,11 +1537,11 @@ impl ServerMessage {
 // skip malformed input).
 //
 // Length discipline lives here so client and server can't drift:
-// pre-decode, anything over MAX_IMAGE_MESSAGE_BYTES is dropped unread
-// (bounding the worst transient allocation); post-decode, only image
-// variants may exceed MAX_CONTROL_MESSAGE_BYTES, and their payload must
-// fit MAX_CHAT_IMAGE_BYTES. Encode applies the same caps so a buggy
-// caller fails locally instead of poisoning the wire.
+// pre-decode, anything over MAX_CONTROL_MESSAGE_BYTES is dropped unread
+// (bounding the worst transient allocation); post-decode, upload chunks
+// must also carry at most one IMAGE_CHUNK_BYTES chunk. Encode applies
+// the same caps so a buggy caller fails locally instead of poisoning
+// the wire.
 
 /// Does this client message respect the length budget for its variant?
 fn client_message_len_ok(msg: &ClientMessage, wire_len: usize) -> bool {
@@ -1565,7 +1578,7 @@ pub fn encode_client_message(msg: &ClientMessage) -> Option<Vec<u8>> {
 /// Deserialize a [`ClientMessage`] from untrusted bytes.
 #[must_use]
 pub fn decode_client_message(bytes: &[u8]) -> Option<ClientMessage> {
-    if bytes.is_empty() || bytes.len() > MAX_IMAGE_MESSAGE_BYTES {
+    if bytes.is_empty() || bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
         return None;
     }
     let msg: ClientMessage = postcard::from_bytes(bytes).ok()?;
@@ -1583,11 +1596,79 @@ pub fn encode_server_message(msg: &ServerMessage) -> Option<Vec<u8>> {
 /// Deserialize a [`ServerMessage`] from untrusted bytes.
 #[must_use]
 pub fn decode_server_message(bytes: &[u8]) -> Option<ServerMessage> {
-    if bytes.is_empty() || bytes.len() > MAX_IMAGE_MESSAGE_BYTES {
+    if bytes.is_empty() || bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
         return None;
     }
     let msg: ServerMessage = postcard::from_bytes(bytes).ok()?;
     server_message_len_ok(&msg, bytes.len()).then_some(msg)
+}
+
+// ── Fitting lists into one message ──────────────────────────────────
+//
+// A list (a history page, an admin listing, the DM list) is sized item
+// by item: postcard writes a `Vec` as a length varint followed by its
+// items, so the items' own encodings add up to the message's body.
+
+/// The encoded size of one list item; `usize::MAX` if it cannot encode.
+fn item_len<T: Serialize>(item: &T) -> usize {
+    postcard::to_allocvec(item).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// Keep the longest prefix of `items` whose encoding fits `budget`
+/// bytes; returns how many were dropped from the end.
+pub fn keep_prefix_that_fits<T: Serialize>(items: &mut Vec<T>, budget: usize) -> usize {
+    let mut used = 0usize;
+    let keep = items
+        .iter()
+        .take_while(|item| {
+            used = used.saturating_add(item_len(*item));
+            used <= budget
+        })
+        .count();
+    let dropped = items.len() - keep;
+    items.truncate(keep);
+    dropped
+}
+
+/// Keep the longest suffix of `items` (the newest end of a page in
+/// time order) whose encoding fits `budget` bytes; returns how many
+/// were dropped from the front.
+pub fn keep_suffix_that_fits<T: Serialize>(items: &mut Vec<T>, budget: usize) -> usize {
+    let mut used = 0usize;
+    let keep = items
+        .iter()
+        .rev()
+        .take_while(|item| {
+            used = used.saturating_add(item_len(*item));
+            used <= budget
+        })
+        .count();
+    let dropped = items.len() - keep;
+    items.drain(..dropped);
+    dropped
+}
+
+/// Split `items` into runs whose encodings each fit `budget` bytes, in
+/// order. An item larger than the budget on its own gets a run of its
+/// own (its message then fails at encode, and says so).
+#[must_use]
+pub fn split_to_fit<T: Serialize>(items: Vec<T>, budget: usize) -> Vec<Vec<T>> {
+    let mut runs: Vec<Vec<T>> = Vec::new();
+    let mut used = 0usize;
+    for item in items {
+        let len = item_len(&item);
+        match runs.last_mut() {
+            Some(run) if !run.is_empty() && used.saturating_add(len) <= budget => {
+                used += len;
+                run.push(item);
+            }
+            _ => {
+                used = len;
+                runs.push(vec![item]);
+            }
+        }
+    }
+    runs
 }
 
 // ── Telemetry at rest ───────────────────────────────────────────────
@@ -1624,6 +1705,68 @@ pub fn decode_telemetry_event(bytes: &[u8]) -> Option<TelemetryEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_row(id: u64, text_len: usize) -> HistoryMessage {
+        HistoryMessage {
+            id,
+            ts: 1_700_000_000_000 + id,
+            user_id: [7; 32],
+            name: "someone".into(),
+            text: "x".repeat(text_len),
+            edited: false,
+        }
+    }
+
+    #[test]
+    fn a_fitted_history_page_survives_the_wire() {
+        // 50 rows of 400 bytes is ~22 KiB: over what every peer decodes.
+        let mut page: Vec<HistoryMessage> = (1..=50).map(|id| history_row(id, 400)).collect();
+        let whole = ServerMessage::History {
+            conv: ConvRef::General,
+            messages: page.clone(),
+            more: false,
+        };
+        assert!(
+            encode_server_message(&whole).is_none(),
+            "oversized pages fail at encode"
+        );
+        let dropped = keep_suffix_that_fits(&mut page, LIST_ITEMS_BUDGET);
+        assert!(dropped > 0);
+        assert_eq!(page.last().map(|m| m.id), Some(50), "the newest rows stay");
+        let fitted = ServerMessage::History {
+            conv: ConvRef::General,
+            messages: page,
+            more: true,
+        };
+        let bytes = encode_server_message(&fitted).expect("fits");
+        assert!(bytes.len() <= MAX_CONTROL_MESSAGE_BYTES);
+        assert!(decode_server_message(&bytes).is_some());
+    }
+
+    #[test]
+    fn split_runs_each_fit_and_keep_order() {
+        let rows: Vec<HistoryMessage> = (1..=100).map(|id| history_row(id, 300)).collect();
+        let runs = split_to_fit(rows, LIST_ITEMS_BUDGET);
+        assert!(runs.len() > 1);
+        let ids: Vec<u64> = runs.iter().flatten().map(|m| m.id).collect();
+        assert_eq!(ids, (1..=100).collect::<Vec<_>>());
+        for run in runs {
+            let msg = ServerMessage::History {
+                conv: ConvRef::General,
+                messages: run,
+                more: false,
+            };
+            assert!(encode_server_message(&msg).is_some());
+        }
+    }
+
+    #[test]
+    fn keep_prefix_keeps_the_first_rows() {
+        let mut rows: Vec<HistoryMessage> = (1..=100).map(|id| history_row(id, 300)).collect();
+        let dropped = keep_prefix_that_fits(&mut rows, LIST_ITEMS_BUDGET);
+        assert_eq!(rows.first().map(|m| m.id), Some(1));
+        assert_eq!(rows.len() + dropped, 100);
+    }
 
     #[test]
     fn client_message_roundtrips() {

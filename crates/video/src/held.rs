@@ -100,12 +100,22 @@ impl HeldPictures {
     /// for clearly longer than the stream's usual spacing.
     #[must_use]
     pub fn idle(&self, now: Instant) -> bool {
-        let Some(last) = self.last_call else {
-            return false;
-        };
+        self.idle_at().is_some_and(|at| now >= at)
+    }
+
+    /// When the stream counts as paused ([`Self::idle`]) if no frame
+    /// comes before; `None` before the first frame.
+    #[must_use]
+    pub fn idle_at(&self) -> Option<Instant> {
+        let last = self.last_call?;
         let spacing = self.spacing.unwrap_or(FIRST_SPACING);
-        let after = spacing.mul_f32(IDLE_SPACINGS).clamp(IDLE_MIN, IDLE_MAX);
-        now.saturating_duration_since(last) >= after
+        Some(last + spacing.mul_f32(IDLE_SPACINGS).clamp(IDLE_MIN, IDLE_MAX))
+    }
+
+    /// When the last frame was fed.
+    #[must_use]
+    pub fn last_frame(&self) -> Option<Instant> {
+        self.last_call
     }
 
     #[must_use]
@@ -197,6 +207,20 @@ mod tests {
         // A long pause does not stretch the spacing it is judged by.
         held.on_frame(last + ms(5_000));
         assert!(held.idle(last + ms(5_000) + ms(50)));
+    }
+
+    #[test]
+    fn idle_at_is_when_a_pause_begins() {
+        let mut held = HeldPictures::new();
+        let t0 = Instant::now();
+        assert_eq!(held.idle_at(), None);
+        for i in 0..20 {
+            held.on_frame(t0 + ms(i * 33));
+        }
+        let at = held.idle_at().expect("frames were fed");
+        assert!(!held.idle(at.checked_sub(Duration::from_micros(1)).unwrap()));
+        assert!(held.idle(at));
+        assert_eq!(held.last_frame(), Some(t0 + ms(19 * 33)));
     }
 
     #[test]

@@ -351,6 +351,25 @@ pub enum AdminOutcome {
     Reports(Vec<crate::safety::ReportSummary>),
 }
 
+impl AdminOutcome {
+    /// Cut a listing to what one message carries (the first rows the
+    /// server put in order); returns how many rows were left out. A
+    /// shipped client dropped a larger answer unread, so the panel came
+    /// back empty (review P0-1).
+    pub fn fit_to(&mut self, budget: usize) -> usize {
+        use crate::messages::keep_prefix_that_fits as fit;
+        match self {
+            Self::Users(rows) => fit(rows, budget),
+            Self::Restrictions(rows) => fit(rows, budget),
+            Self::Invites(rows) => fit(rows, budget),
+            Self::Audit(rows) => fit(rows, budget),
+            Self::Blobs(rows) => fit(rows, budget),
+            Self::Reports(rows) => fit(rows, budget),
+            Self::Done | Self::Telemetry(_) | Self::Stats(_) | Self::RoleCreated(_) => 0,
+        }
+    }
+}
+
 /// A user's last telemetry, as the server logs it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetrySummary {

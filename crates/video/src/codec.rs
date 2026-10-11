@@ -57,6 +57,8 @@ extern crate ffmpeg_next as ffmpeg;
 
 use std::{
     collections::VecDeque,
+    ffi::c_int,
+    ptr,
     time::{Duration, Instant},
 };
 
@@ -213,8 +215,6 @@ struct EncSession {
     bitrate_scale_pct: u32,
     /// The quantizer floor it was opened with (`qmin`), if any.
     qp_floor: Option<u32>,
-    /// Reusable `FFmpeg` frame for RGBA input (source resolution).
-    rgba_frame: VideoFrame,
     /// Reusable `FFmpeg` frame for YUV420P — fed to the encoder.
     yuv_frame: VideoFrame,
     /// Reusable packet for receiving encoder output.
@@ -475,18 +475,16 @@ impl FfmpegEncoder {
 
         let session = self.session.as_mut().expect("ensure_session sets this");
 
-        fill_rgba_frame(
-            &mut session.rgba_frame,
+        // RGBA/BGRA (src) → YUV (out) via swscale, resize and colorspace
+        // in one pass, read straight from the captured frame (review
+        // P1-11: it was copied into an AVFrame first, 8 MB a 1080p frame).
+        scale_packed(
+            &mut session.sws,
             &frame.data,
             frame.width,
             frame.height,
+            &mut session.yuv_frame,
         )?;
-
-        // RGBA(src) → YUV420P(out) via swscale: resize + colorspace in one pass
-        session
-            .sws
-            .run(&session.rgba_frame, &mut session.yuv_frame)
-            .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
 
         session.yuv_frame.set_pts(Some(pts));
         if make_keyframe {
@@ -533,6 +531,41 @@ impl FfmpegEncoder {
             self.last_idr_out_ms = Some(frame.timestamp_ms);
         }
         Ok(out)
+    }
+
+    /// See [`VideoEncoder::frames_in_flight`].
+    #[must_use]
+    pub fn frames_in_flight(&self) -> usize {
+        self.session.as_ref().map_or(0, |s| s.pending_ts.len())
+    }
+
+    /// See [`VideoEncoder::drain`].
+    ///
+    /// # Errors
+    /// When the encoder fails while handing its output out.
+    pub fn drain(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
+        let mut out = Vec::new();
+        let Some(session) = self.session.as_mut() else {
+            return Ok(out);
+        };
+        if session.pending_ts.is_empty() {
+            return Ok(out);
+        }
+        drain_packets(session, &mut out)?;
+        if let Some(keyframe) = out.iter().find(|f| f.is_keyframe) {
+            // Ground truth for the reopen-for-IDR backstop, as in encode.
+            self.last_idr_out_ms = Some(keyframe.timestamp_ms);
+        }
+        Ok(out)
+    }
+
+    /// See [`VideoEncoder::output_needs_input`]: `FFmpeg` 7.1's AMF
+    /// wrapper (`ff_amf_receive_packet`) returns at once, without asking
+    /// AMF for output, when no new frame is queued — so a drain hands
+    /// out only what an earlier submission already collected.
+    #[must_use]
+    pub fn output_needs_input(&self) -> bool {
+        self.enc_name == "h264_amf"
     }
 
     /// Force the next encoded frame to be an IDR keyframe.
@@ -648,6 +681,18 @@ impl VideoEncoder for FfmpegEncoder {
     fn qp_floor(&self) -> Option<u32> {
         self.qp_floor()
     }
+
+    fn frames_in_flight(&self) -> usize {
+        self.frames_in_flight()
+    }
+
+    fn drain(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
+        self.drain()
+    }
+
+    fn output_needs_input(&self) -> bool {
+        self.output_needs_input()
+    }
 }
 
 /// The floor index after a frame too large: the first, the next, or
@@ -696,11 +741,21 @@ pub struct FfmpegDecoder {
     /// frame right before we convert it. So we receive here and swap on
     /// success; the terminating EAGAIN only ever clears the scratch.
     scratch_frame: VideoFrame,
-    /// Reusable `FFmpeg` frame for RGBA conversion output.
+    /// RGBA conversion output for widths that cannot be converted
+    /// straight into a tight buffer (see [`DIRECT_WIDTH_MULTIPLE`]);
+    /// made when first needed.
     rgba_frame: Option<VideoFrame>,
     /// The split of the last call that produced a picture.
     last_timing: Option<crate::DecodeTiming>,
 }
+
+/// Decoded widths that are a multiple of this convert straight into the
+/// pooled buffer: every swscale path writes such a row exactly. Its
+/// SIMD writes whole blocks — 8 pixels on x86, 16 on aarch64 — and on
+/// other widths runs past the row's end, or (x86's unscaled YUV → RGB,
+/// when the stride leaves no room) stops short of it. Checked against
+/// `FFmpeg` 7.1's `libswscale` sources.
+const DIRECT_WIDTH_MULTIPLE: u32 = 16;
 
 /// The scaler plus the source parameters it was built for.
 struct DecoderSws {
@@ -815,31 +870,37 @@ impl FfmpegDecoder {
                 color_space,
                 color_range,
             });
-            self.rgba_frame = Some(VideoFrame::new(Pixel::RGBA, w, h));
+            self.rgba_frame = None;
         }
 
-        let rgba_frame = self.rgba_frame.as_mut().expect("built above");
         let sws = self.sws.as_mut().expect("built above");
-
-        sws.ctx
-            .run(&self.decoded_frame, rgba_frame)
-            .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
-
-        // Stride-aware copy into the output buffer. Reuses a recycled
-        // buffer's allocation (`crate::pool`); rows are appended with
-        // `extend_from_slice` so the buffer is never redundantly
-        // zero-filled first (resize(n, 0) would memset multiple MB per
-        // frame just to immediately overwrite every byte).
-        let stride = rgba_frame.stride(0);
-        let src = rgba_frame.data(0);
-        let row_bytes = w as usize * 4;
-        let rgba_size = row_bytes * h as usize;
-
-        let mut data = crate::pool::take(rgba_size);
-        for row in 0..h as usize {
-            let src_start = row * stride;
-            data.extend_from_slice(&src[src_start..src_start + row_bytes]);
-        }
+        let data = if w.is_multiple_of(DIRECT_WIDTH_MULTIPLE) {
+            // Straight into the buffer that goes to the present thread
+            // (review P1-11: a scratch frame and a row copy before).
+            convert_into_pool(&mut sws.ctx, &self.decoded_frame, w, h)?
+        } else {
+            // swscale's SIMD paths write whole blocks of pixels: past the
+            // end of a row (and of a tight buffer) or short of it (the
+            // x86 one, when the stride does not leave room). An AVFrame's
+            // rows are padded for it; a width like 1366 takes this path.
+            let rgba_frame = self
+                .rgba_frame
+                .get_or_insert_with(|| VideoFrame::new(Pixel::RGBA, w, h));
+            sws.ctx
+                .run(&self.decoded_frame, rgba_frame)
+                .map_err(|e| CodecError::ColorConversion(e.to_string()))?;
+            // Reuses a recycled buffer's allocation (`crate::pool`); rows
+            // are appended, so nothing is zero-filled first.
+            let stride = rgba_frame.stride(0);
+            let src = rgba_frame.data(0);
+            let row_bytes = w as usize * 4;
+            let mut data = crate::pool::take(row_bytes * h as usize);
+            for row in 0..h as usize {
+                let src_start = row * stride;
+                data.extend_from_slice(&src[src_start..src_start + row_bytes]);
+            }
+            data
+        };
         self.last_timing = Some(crate::DecodeTiming {
             codec: decoded,
             output: started.elapsed().saturating_sub(decoded),
@@ -1033,7 +1094,6 @@ fn open_session(
         0, // YUV output is limited range
     );
 
-    let rgba_frame = VideoFrame::new(in_pix, src_w, src_h);
     let mut yuv_frame = VideoFrame::new(pix_fmt, out_w, out_h);
     // Tag the frames we hand to the encoder with the same colorimetry.
     unsafe {
@@ -1054,7 +1114,6 @@ fn open_session(
         out_h,
         bitrate_scale_pct,
         qp_floor,
-        rgba_frame,
         yuv_frame,
         pkt: Packet::empty(),
         pending_ts: VecDeque::new(),
@@ -1155,12 +1214,23 @@ fn codec_options(name: &str, rc: RateControl) -> Dictionary<'static> {
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
             opts.set("forced-idr", "1");
+            // Hand each access unit out on the call that submitted its
+            // frame. The default holds output back until that many
+            // frames are queued (`delay`, stored as `async_depth`: INT_MAX,
+            // capped at the surface count − 1, in FFmpeg 7.1's
+            // nvenc_h264.c / nvenc.c `output_ready`), so a still screen's
+            // last change waited for the next refresh (review P1-13).
+            opts.set("delay", "0");
         }
         "h264_qsv" => {
             opts.set("preset", "veryfast");
             opts.set("low_power", "1");
             opts.set("maxrate", &format!("{maxrate}"));
             opts.set("bufsize", &format!("{vbv_bufsize}"));
+            // A packet leaves only once `async_depth` frames are queued
+            // (default 4; FFmpeg 7.1's qsvenc.h / `ff_qsv_encode`): 1 hands
+            // each out on the call that submitted its frame (review P1-13).
+            opts.set("async_depth", "1");
             // No-op on FFmpeg <= 7.1 (the option doesn't exist there;
             // unknown dict keys are silently ignored) but honored by
             // FFmpeg 8's rewritten amfenc — kept so an ffmpeg upgrade
@@ -1260,30 +1330,94 @@ fn set_sws_colorspace(sws: &mut SwsContext, coeffs: *const i32, src_range: i32, 
     }
 }
 
-/// Copy RGBA pixel data into an ffmpeg `VideoFrame` (stride-aware).
-fn fill_rgba_frame(
-    frame: &mut VideoFrame,
-    rgba: &[u8],
+/// Convert a decoded `w × h` picture to tightly packed RGBA straight into
+/// a buffer from `crate::pool` (rows `w × 4` bytes apart). Only for
+/// widths that are a multiple of [`DIRECT_WIDTH_MULTIPLE`].
+fn convert_into_pool(
+    sws: &mut SwsContext,
+    src: &VideoFrame,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>, CodecError> {
+    let row_bytes = w as usize * 4;
+    let len = row_bytes * h as usize;
+    let mut data = crate::pool::take(len);
+    let planes: [*mut u8; 4] = [
+        data.as_mut_ptr(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+    ];
+    let strides: [c_int; 4] = [row_bytes as c_int, 0, 0, 0];
+    // SAFETY: the scaler was built for `src`'s format and size with a
+    // `w × h` RGBA output (`decode` rebuilds it when either changes);
+    // `src` is a decoded frame whose planes FFmpeg owns, and `data` has
+    // room for `h` rows of `row_bytes`, which is exactly what a width
+    // that is a multiple of `DIRECT_WIDTH_MULTIPLE` makes it write.
+    let rows = unsafe {
+        let input = src.as_ptr();
+        ffmpeg::ffi::sws_scale(
+            sws.as_mut_ptr(),
+            (*input).data.as_ptr().cast(),
+            (*input).linesize.as_ptr(),
+            0,
+            h as c_int,
+            planes.as_ptr(),
+            strides.as_ptr(),
+        )
+    };
+    if rows != h as c_int {
+        crate::pool::recycle(data);
+        return Err(CodecError::ColorConversion(format!(
+            "sws_scale wrote {rows} of {h} rows"
+        )));
+    }
+    // SAFETY: every one of the `h` rows of `row_bytes` was written
+    // (checked above), so the first `len` bytes are initialised.
+    unsafe { data.set_len(len) };
+    Ok(data)
+}
+
+/// Run the encoder's scaler on a tightly packed 4-byte-per-pixel frame
+/// (`width × height`, the size the scaler was built for) into `dst`.
+fn scale_packed(
+    sws: &mut SwsContext,
+    src: &[u8],
     width: u32,
     height: u32,
+    dst: &mut VideoFrame,
 ) -> Result<(), CodecError> {
     let row_bytes = width as usize * 4;
     let needed = row_bytes * height as usize;
-    if rgba.len() < needed {
+    if src.len() < needed {
         return Err(CodecError::Encode(format!(
-            "frame data too small: {} bytes for {width}x{height} RGBA (need {needed})",
-            rgba.len()
+            "frame data too small: {} bytes for {width}x{height} (need {needed})",
+            src.len()
         )));
     }
-
-    let stride = frame.stride(0);
-    let dst = frame.data_mut(0);
-
-    for row in 0..height as usize {
-        let src_start = row * row_bytes;
-        let dst_start = row * stride;
-        dst[dst_start..dst_start + row_bytes]
-            .copy_from_slice(&rgba[src_start..src_start + row_bytes]);
+    let planes: [*const u8; 4] = [src.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+    let strides: [c_int; 4] = [row_bytes as c_int, 0, 0, 0];
+    // SAFETY: the scaler was built for a `width × height` packed input
+    // (`open_session`) and `src` holds that many rows of `row_bytes`
+    // (checked above); `dst` is the session's own frame, allocated by
+    // `VideoFrame::new` at the scaler's output size and format, so its
+    // planes and line sizes are what `sws_scale` writes through.
+    let rows = unsafe {
+        let out = dst.as_mut_ptr();
+        ffmpeg::ffi::sws_scale(
+            sws.as_mut_ptr(),
+            planes.as_ptr(),
+            strides.as_ptr(),
+            0,
+            height as c_int,
+            (*out).data.as_ptr(),
+            (*out).linesize.as_ptr(),
+        )
+    };
+    if rows <= 0 {
+        return Err(CodecError::ColorConversion(format!(
+            "sws_scale wrote no rows ({rows})"
+        )));
     }
     Ok(())
 }

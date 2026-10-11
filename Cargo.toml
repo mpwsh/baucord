@@ -1,5 +1,22 @@
 [workspace]
 members = ["crates/*"]
+# A bare `cargo build` / `cargo test` at the root builds the desktop, the
+# server and the libraries. The phone hosts build only with `-p android`
+# / `-p ios` (their own targets and features); the iOS crate's off-iOS
+# stub binary is also named `baucord` and would collide with the desktop's.
+default-members = [
+  "crates/protocol",
+  "crates/transport",
+  "crates/server",
+  "crates/client",
+  "crates/app-core",
+  "crates/frontend",
+  "crates/desktop",
+  "crates/ui",
+  "crates/i18n",
+  "crates/audio",
+  "crates/video",
+]
 # Vendored dependencies (`[patch.crates-io]` below) are not members: no
 # fmt or clippy of upstream code, and nothing Windows-only built
 # elsewhere.

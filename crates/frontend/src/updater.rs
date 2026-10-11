@@ -317,7 +317,17 @@ pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
     // spawn() returning Ok means the OS has created the process — the
     // child runs the freshly-replaced binary from the same path and
     // does not need this parent alive. Exit immediately.
+    //
+    // The child must not mistake this exiting process for a running
+    // instance: until our exit completes, the single-instance socket
+    // still answers, and a child that knocked on it was told "already
+    // running" and quit — the app closed and never came back (1.2.0).
+    // The variable tells it to wait for us to go first (`instance`).
+    // The same arguments carry over, so a `--profile` run comes back
+    // on its own profile.
     std::process::Command::new(&current_exe)
+        .args(std::env::args_os().skip(1))
+        .env(crate::instance::RELAUNCH_ENV, "1")
         .spawn()
         .map_err(|e| format!("Failed to relaunch: {e}"))?;
 

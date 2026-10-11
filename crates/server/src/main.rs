@@ -404,15 +404,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))?;
     }
 
-    // ── Adaptive poll loop ──────────────────────────────────────────
+    // ── The loop ────────────────────────────────────────────────────
     //
-    // Voice packets need sub-millisecond relay turnaround, so the loop
-    // runs at 1 ms while media is flowing. But a voice server is idle
-    // most of its life; the server tells us how fast the next tick
-    // needs to come (1 ms hot, 5 ms quiet, 20 ms empty), and the
-    // transport's next timer caps the sleep so acks, keep-alives and
-    // idle timeouts fire on time.
+    // Voice packets need sub-millisecond relay turnaround, and a voice
+    // server is idle most of its life. The loop sleeps on its socket
+    // (it is its only reader) until a datagram arrives — relayed the
+    // moment it lands — or the next tick is due: the transport's next
+    // deadline, the server's periodic jobs, a database answer it waits
+    // for, at most a second (review P1-2). It used to tick every 1, 5 or
+    // 20 ms whatever happened.
     let mut last_rotate_check = Instant::now();
+    let mut wait_failed = false;
     loop {
         let now = Instant::now();
         if stop.load(Ordering::SeqCst) {
@@ -432,6 +434,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             info!("Stopped");
             return Ok(());
         }
+        // The socket can give up on GSO at any send (review P1-14).
+        server.driver().set_max_gso_segments(udp.max_gso_segments());
         let drained = match udp.recv_batch(|d| server.driver().handle_datagram(now, d)) {
             Ok(outcome) => outcome.drained,
             Err(e) => {
@@ -456,12 +460,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !drained {
             continue;
         }
-        let mut sleep = server.suggested_sleep();
-        if let Some(deadline) = server.driver().next_timeout() {
-            sleep = sleep.min(deadline.saturating_duration_since(Instant::now()));
+        let due = server
+            .next_wake()
+            .min(last_rotate_check + LOG_ROTATE_CHECK_INTERVAL);
+        let wait = due.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            continue;
         }
-        if !sleep.is_zero() {
-            thread::sleep(sleep);
+        if let Err(e) = udp.wait_readable(wait) {
+            // Cannot happen on a socket we own; if it does, poll as the
+            // loop always did rather than spin.
+            if !std::mem::replace(&mut wait_failed, true) {
+                warn!("waiting on the UDP socket failed ({e}); polling every millisecond");
+            }
+            thread::sleep(wait.min(Duration::from_millis(1)));
         }
     }
 }
@@ -481,12 +493,77 @@ fn rotate_key(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     drop(current);
     let rotated = ServerIdentity::rotate(&dir)?;
     println!("Rotated server identity in {}", dir.display());
-    println!("  old: {old} (retired, still vouching for the new key)");
+    println!("  old: {old} (retired)");
     println!("  new: {}", rotated.fingerprint());
-    println!(
-        "Restart the server to serve the new certificate; pinned clients migrate automatically."
-    );
+    // What the new certificate actually carries, not what should be
+    // there (review P1-15): until 1.2.1 an old key's retirement counted
+    // from its creation, and this said "still vouching" regardless.
+    let vouching = rotated.retired_fingerprints();
+    let retired = ServerIdentity::retired_keys(&dir);
+    if vouching.is_empty() {
+        println!("No retired key vouches for the new key: every app will ask about the identity.");
+    } else {
+        println!("Vouching for the new key (apps pinned to these move to it on their own):");
+        for fp in &vouching {
+            match retired.iter().find(|r| r.fingerprint == *fp) {
+                Some(r) => println!(
+                    "  {fp}  retired {}, until {}",
+                    describe_retirement(r),
+                    describe_day(r.vouches_until())
+                ),
+                None => println!("  {fp}"),
+            }
+        }
+    }
+    let lapsed: Vec<_> = retired.iter().filter(|r| !r.vouching).collect();
+    if !lapsed.is_empty() {
+        println!(
+            "Retired more than two years ago, no longer vouching (apps still pinned to these \
+             will ask about the identity):"
+        );
+        for r in lapsed {
+            println!("  {}  retired {}", r.fingerprint, describe_retirement(r));
+        }
+    }
+    if retired.iter().any(|r| r.from_mtime) {
+        println!(
+            "A \"file date\" is from a key retired before 1.2.1, which kept the key's creation \
+             date. If you know when it was retired, rename its file in {} to \
+             <name>.<unix-seconds>.key; the server reads the time from the name when it starts.",
+            dir.join("retired").display()
+        );
+    }
+    if vouching.contains(&old) {
+        println!(
+            "Restart the server to serve the new certificate; apps pinned to the old key move \
+             to the new one on their own."
+        );
+    } else {
+        println!(
+            "Restart the server to serve the new certificate. The old key does NOT vouch for \
+             it: apps pinned to it will ask about the identity."
+        );
+    }
     Ok(())
+}
+
+/// "2026-10-10", or "2026-10-10 (file date)" when the retirement time is
+/// the file's mtime from a build before 1.2.1.
+fn describe_retirement(key: &transport::identity::RetiredKey) -> String {
+    let day = describe_day(key.retired_at);
+    if key.from_mtime {
+        format!("{day} (file date)")
+    } else {
+        day
+    }
+}
+
+/// A day in UTC from seconds since the Unix epoch.
+fn describe_day(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .map_or_else(|| "?".to_string(), |t| t.format("%Y-%m-%d").to_string())
 }
 
 /// `server backup <file.tar>`.

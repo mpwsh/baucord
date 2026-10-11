@@ -21,9 +21,6 @@ use crate::persistence::{
     Answer, AskId, Command, ConvKey, MessageRow, Outcome, ProgressDelta, Query, RECENT_RING,
 };
 
-/// A history page stays under this many bytes of text (spec §10:
-/// pages ≤ 64 KiB).
-const HISTORY_PAGE_BYTES: usize = 60 * 1024;
 /// How long a history read may take before the client is told to retry.
 const HISTORY_DEADLINE: Duration = Duration::from_secs(2);
 const HISTORY_RETRY_SECS: u16 = 5;
@@ -107,7 +104,7 @@ impl ChatServer {
         more: bool,
     ) {
         let rich = self.has_feature(client, features::FILES);
-        let page: Vec<HistoryMessage> = rows
+        let mut page: Vec<HistoryMessage> = rows
             .iter()
             .map(|r| {
                 let mut m = to_wire(r);
@@ -117,10 +114,27 @@ impl ChatServer {
                 m
             })
             .collect();
+        // One `History` per page, cut to fit one message: every shipped
+        // client takes exactly one per request (it prepends a page and
+        // appends the replay), so a page split in two came out in the
+        // wrong order, and anything over 17 KiB was dropped unread
+        // (review P0-1). The newest rows stay; the rest come back with
+        // the next "Load earlier".
+        let dropped = protocol::keep_suffix_that_fits(&mut page, protocol::LIST_ITEMS_BUDGET);
+        let rows = &rows[dropped..];
         self.send_authors(client, rows.iter().map(|r| r.user_id));
-        self.send_history_pages(client, conv, page, more);
-        if rich && let Some(attachments) = self.history_attachments(conv, rows) {
-            self.send_msg(client, &attachments);
+        self.send_msg(
+            client,
+            &ServerMessage::History {
+                conv,
+                messages: page,
+                more: more || dropped > 0,
+            },
+        );
+        if rich {
+            for attachments in self.history_attachments(conv, rows) {
+                self.send_msg(client, &attachments);
+            }
         }
     }
 
@@ -259,39 +273,6 @@ impl ChatServer {
                     },
                 );
             }
-        }
-    }
-
-    /// Split a page so no single message exceeds the size budget;
-    /// every batch but the last says `more: true`.
-    fn send_history_pages(
-        &mut self,
-        client: protocol::ClientId,
-        conv: ConvRef,
-        page: Vec<HistoryMessage>,
-        more: bool,
-    ) {
-        let mut batches: Vec<Vec<HistoryMessage>> = vec![Vec::new()];
-        let mut bytes = 0usize;
-        for m in page {
-            let size = m.text.len() + m.name.len() + 64;
-            if bytes + size > HISTORY_PAGE_BYTES && !batches.last().is_some_and(Vec::is_empty) {
-                batches.push(Vec::new());
-                bytes = 0;
-            }
-            bytes += size;
-            batches.last_mut().expect("one batch").push(m);
-        }
-        let last = batches.len() - 1;
-        for (i, messages) in batches.into_iter().enumerate() {
-            self.send_msg(
-                client,
-                &ServerMessage::History {
-                    conv,
-                    messages,
-                    more: more || i < last,
-                },
-            );
         }
     }
 
@@ -498,6 +479,28 @@ impl ChatServer {
                 self.policy.blobs.remove(blob);
                 self.blob_bytes.remove(blob);
                 self.persist.send(Command::DeleteBlob { blob_id: *blob });
+            }
+        }
+    }
+
+    /// The retention prune deleted these files (`Notice::FilesPruned`).
+    /// An unreferenced file's metadata stays here on purpose — a
+    /// re-announce of the same bytes is answered "already here" — so it
+    /// must go with the file, or the next post of it points at nothing
+    /// (review P0-4). One referenced again in the moment between the
+    /// prune's read and this notice has lost its file; say so.
+    pub(super) fn forget_pruned_files(&mut self, files: &[protocol::BlobId]) {
+        for blob in files {
+            let Some(meta) = self.policy.blobs.remove(blob) else {
+                continue;
+            };
+            self.blob_bytes.remove(blob);
+            if meta.refs > 0 {
+                log::warn!(
+                    "file {} was pruned while {} post(s) took it up again; it must be re-sent",
+                    hex(&blob[..8]),
+                    meta.refs
+                );
             }
         }
     }

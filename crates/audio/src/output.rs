@@ -51,6 +51,13 @@ const REFILL_MARGIN_MS: usize = 10;
 /// device period, but cpal does not promise one).
 const CALLBACK_SCRATCH: usize = 8192;
 
+/// The jitter buffer's bookkeeping cadence: `adapt()` is tuned for one
+/// call per 10 ms of wall time.
+const ADAPT_TICK: Duration = Duration::from_millis(10);
+/// Ticks one wake may catch up: the safety wait's worth. Past that (a
+/// device that stopped calling back for longer) the cadence restarts.
+const MAX_CATCH_UP_TICKS: u32 = 20;
+
 pub struct AudioOutput {
     /// cpal's device and the config it opens at. Resolved in `new()`,
     /// but on Windows, where the native backend finds its device by
@@ -64,6 +71,11 @@ pub struct AudioOutput {
     /// the native backend's own device lookup (and cpal's, late).
     #[cfg(windows)]
     device_name: Option<String>,
+    /// Windows: no device picked means the Default Communications
+    /// Device (`communications_default` in lib.rs), else the console
+    /// default.
+    #[cfg(windows)]
+    communications_default: bool,
     /// cpal stream, when the cpal backend is in use.
     stream: Option<Stream>,
     /// Native backend stream, when it opened successfully (Windows).
@@ -93,6 +105,9 @@ pub struct AudioOutput {
     /// Wake latch: playback callback → worker ("ring space freed").
     wake_tx: Option<Sender<()>>,
     wake_rx: Option<Receiver<()>>,
+    /// Our own ring of the latch, as in `AudioInput`: a stop wakes the
+    /// worker at once, and the latch never goes dead under it.
+    stop_ring: Option<Sender<()>>,
     /// Largest playback callback seen, in device frames (0 = none yet,
     /// or a backend that does not report — the native WASAPI render).
     /// The worker sizes its ring fill and the jitter floor from it.
@@ -141,14 +156,16 @@ impl AudioOutput {
                 .map_or(OPUS_SAMPLE_RATE, |(_, config)| config.sample_rate()),
         );
         let (ring_producer, ring_consumer) = RingBuffer::new(ring_size);
-        // Wake latch: playback callback pings this after draining the ring
-        // so the worker refills promptly instead of waiting out its tick.
+        // Wake latch: playback callback pings this after draining the ring;
+        // the worker refills on it and on nothing else (review P1-4).
         let (wake_tx, wake_rx) = bounded::<()>(1);
 
         Ok(Self {
             cpal,
             #[cfg(windows)]
             device_name: device_name.map(String::from),
+            #[cfg(windows)]
+            communications_default: false,
             stream: None,
             #[cfg(windows)]
             native: None,
@@ -158,6 +175,7 @@ impl AudioOutput {
             ring_producer: Some(ring_producer),
             ring_consumer: Some(ring_consumer),
             ring_capacity: ring_size,
+            stop_ring: Some(wake_tx.clone()),
             wake_tx: Some(wake_tx),
             wake_rx: Some(wake_rx),
             callback_frames: Arc::new(AtomicUsize::new(0)),
@@ -186,6 +204,13 @@ impl AudioOutput {
             return Some(n.device_name.clone());
         }
         crate::device_name(&self.cpal.as_ref()?.0)
+    }
+
+    /// Windows: what "Default" means for this stream (call before
+    /// `start`).
+    #[cfg(windows)]
+    pub fn set_communications_default(&mut self, on: bool) {
+        self.communications_default = on;
     }
 
     pub fn output_gain_handle(&self) -> Arc<AtomicU32> {
@@ -266,6 +291,7 @@ impl AudioOutput {
         match crate::native::wasapi::NativeRender::start(
             self.device_name.as_deref(),
             self.voice,
+            self.communications_default,
             consumer,
             wake_tx,
             self.stats.clone(),
@@ -617,10 +643,10 @@ fn worker_loop(parts: WorkerParts) {
         }
 
         // Fill the ring up to a target level, not just one hop.
-        // The cpal callback drains the ring at the device's hardware
-        // clock rate, which may be slightly faster than our 10ms tick.
-        // By filling multiple hops per tick when the ring is low, we
-        // absorb OS scheduler jitter and clock drift without underruns.
+        // The device callback drains the ring at its hardware clock
+        // rate and wakes us after each drain. By filling multiple hops
+        // per wake when the ring is low, we absorb OS scheduler jitter
+        // and clock drift without underruns.
         //
         // The target follows the device's callback size: 20 ms (two
         // desktop periods) while callbacks are ≤ 10 ms, one callback +
@@ -750,12 +776,12 @@ fn worker_loop(parts: WorkerParts) {
             .last_decode_us
             .store(t_hop.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-        // ── Tick-gated bookkeeping (strict 10 ms cadence) ───
-        // The worker may wake *more* often than every 10 ms (the
-        // playback callback pings the latch as it drains the ring —
-        // extra wakes are harmless because production is gated on ring
-        // fill above). adapt() is tuned for a 10 ms cadence, so it stays
-        // on the tick, not on wakeups.
+        // ── Bookkeeping per 10 ms of wall time ───
+        // The worker wakes on the device's callbacks (10 ms on the
+        // desktop, up to 40 ms on Android) and on nothing else but the
+        // safety wait: no timer of its own (review P1-4). adapt() is
+        // tuned for a 10 ms cadence, so each wake runs it once for every
+        // 10 ms that went by since the last.
         let now = Instant::now();
         if now >= next_tick {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -783,21 +809,23 @@ fn worker_loop(parts: WorkerParts) {
             if js.red > 0 {
                 stats.red_recoveries.fetch_add(js.red, Ordering::Relaxed);
             }
-            jitter_buffer.adapt();
-
-            next_tick += Duration::from_millis(10);
+            let mut ticks = 0;
+            while next_tick <= now && ticks < MAX_CATCH_UP_TICKS {
+                jitter_buffer.adapt();
+                next_tick += ADAPT_TICK;
+                ticks += 1;
+            }
             if next_tick <= now {
-                // Fell behind (scheduler stall) — resynchronize.
-                next_tick = now + Duration::from_millis(10);
+                // A longer stall (no callbacks): restart the cadence
+                // rather than replay it.
+                next_tick = now + ADAPT_TICK;
             }
         }
 
-        // Wait for the device to consume audio, or for the tick —
-        // whichever comes first. This replaces a bare sleep that
-        // Windows could stretch to 15+ ms.
-        let wait = next_tick.saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
-            crate::platform::wait_for_wake(&wake_rx, wait);
+        // Wait for the device to consume audio: its callback rings the
+        // latch after every drain, and a stop rings it too.
+        if !crate::platform::wait_for_wake(&wake_rx, crate::platform::LATCH_SAFETY_WAIT) {
+            break;
         }
     }
 
@@ -868,6 +896,9 @@ fn open_cpal(
 impl Drop for AudioOutput {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Relaxed);
+        if let Some(ring) = &self.stop_ring {
+            let _ = ring.try_send(());
+        }
         // Drop the cpal stream FIRST — stops platform audio callbacks so
         // they can't deadlock pulling from the ring buffer while the
         // worker thread is being joined.
@@ -876,6 +907,8 @@ impl Drop for AudioOutput {
         self.native.take();
         #[cfg(any(target_os = "android", target_os = "ios"))]
         self.native_voice.take();
+        // The latch is dead now (see `AudioInput`'s drop).
+        self.stop_ring.take();
         if let Some(thread) = self.worker_thread.take() {
             let _ = thread.join();
         }

@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "android"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "android_logger",
  "chrono",
@@ -553,7 +553,7 @@ dependencies = [
  "rubato",
  "serde",
  "wasapi",
- "windows 0.62.2",
+ "windows",
 ]
 
 [[package]]
@@ -997,7 +997,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "audio",
  "crossbeam-channel",
@@ -1227,7 +1227,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "web-sys",
- "windows 0.62.2",
+ "windows",
  "windows-core",
 ]
 
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "client",
  "env_logger",
@@ -1566,20 +1566,6 @@ dependencies = [
  "log",
  "slint",
  "winresource",
-]
-
-[[package]]
-name = "device_query"
-version = "4.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7331225604b9b097b41872d550134933d4be83465d70a2c4a132b929f99aaca"
-dependencies = [
- "macos-accessibility-client",
- "pkg-config",
- "readkey",
- "readmouse",
- "windows 0.48.0",
- "x11",
 ]
 
 [[package]]
@@ -2085,7 +2071,7 @@ dependencies = [
  "read-fonts",
  "roxmltree",
  "smallvec",
- "windows 0.62.2",
+ "windows",
  "windows-core",
  "yeslogic-fontconfig-sys",
 ]
@@ -2128,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "frontend"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "app-core",
  "arboard",
@@ -2136,7 +2122,6 @@ dependencies = [
  "chrono",
  "client",
  "crossbeam-channel",
- "device_query",
  "dirs",
  "global-hotkey",
  "i-slint-backend-winit",
@@ -2156,6 +2141,7 @@ dependencies = [
  "ui",
  "ureq",
  "video",
+ "x11rb",
  "zip",
 ]
 
@@ -2485,7 +2471,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.19",
- "windows 0.62.2",
+ "windows",
 ]
 
 [[package]]
@@ -2781,7 +2767,7 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "webbrowser",
- "windows 0.62.2",
+ "windows",
  "winit",
  "zbus",
 ]
@@ -2888,7 +2874,7 @@ dependencies = [
  "web-sys",
  "web-time",
  "wgpu",
- "windows 0.62.2",
+ "windows",
 ]
 
 [[package]]
@@ -2936,7 +2922,7 @@ dependencies = [
  "vtable",
  "wgpu",
  "wgpu-hal",
- "windows 0.62.2",
+ "windows",
  "windows-core",
  "write-fonts",
 ]
@@ -3318,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "ios"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -3836,16 +3822,6 @@ name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
-
-[[package]]
-name = "macos-accessibility-client"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edf7710fbff50c24124331760978fb9086d6de6288dcdb38b25a97f8b1bdebbb"
-dependencies = [
- "core-foundation",
- "core-foundation-sys",
-]
 
 [[package]]
 name = "memchr"
@@ -5171,7 +5147,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "protocol"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bytes",
  "log",
@@ -5370,18 +5346,6 @@ dependencies = [
  "font-types",
  "once_cell",
 ]
-
-[[package]]
-name = "readkey"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a36870cefdfcff57edbc0fa62165f42dfd4e5a0d8965117c1ea84c5700e4450"
-
-[[package]]
-name = "readmouse"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be105c72a1e6a5a1198acee3d5b506a15676b74a02ecd78060042a447f408d94"
 
 [[package]]
 name = "realfft"
@@ -5877,7 +5841,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "clap 4.6.5",
@@ -6002,7 +5966,7 @@ checksum = "c61cb643dac43067f3eb76c866635a74377ac0abca0ff2590674e1e295514c3d"
 dependencies = [
  "bitflags 2.13.1",
  "skia-bindings",
- "windows 0.62.2",
+ "windows",
 ]
 
 [[package]]
@@ -6373,7 +6337,7 @@ dependencies = [
  "ntapi",
  "objc2-core-foundation",
  "objc2-io-kit",
- "windows 0.62.2",
+ "windows",
 ]
 
 [[package]]
@@ -6722,7 +6686,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "base64",
  "bytes",
@@ -7054,7 +7018,7 @@ dependencies = [
  "objc2-core-video",
  "objc2-video-toolbox",
  "thiserror 2.0.19",
- "windows 0.62.2",
+ "windows",
  "xcap",
 ]
 
@@ -7109,7 +7073,7 @@ dependencies = [
  "log",
  "num-integer",
  "thiserror 2.0.19",
- "windows 0.62.2",
+ "windows",
  "windows-core",
 ]
 
@@ -7476,7 +7440,7 @@ dependencies = [
  "thiserror 2.0.19",
  "wgpu-naga-bridge",
  "wgpu-types",
- "windows 0.62.2",
+ "windows",
  "windows-core",
 ]
 
@@ -7548,15 +7512,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90628d739333b7c5d2ee0b70210b97b8cddc38440c682c96fd9e2c24c2db5f3a"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "windows"
-version = "0.48.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e686886bc078bc1b0b600cac0147aadb815089b6e4da64016cbd754b6342700f"
-dependencies = [
- "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -8007,16 +7962,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
-name = "x11"
-version = "2.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "502da5464ccd04011667b11c435cb992822c2c0dbde1770c988480d312a0db2e"
-dependencies = [
- "libc",
- "pkg-config",
-]
-
-[[package]]
 name = "x11-dl"
 version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8102,7 +8047,7 @@ dependencies = [
  "thiserror 2.0.19",
  "url",
  "widestring",
- "windows 0.62.2",
+ "windows",
  "xcb",
  "zbus",
 ]

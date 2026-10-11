@@ -9,7 +9,7 @@
 //! control messages and cached only where the media path needs it
 //! (the relay's `muted` set).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use log::info;
 use protocol::{
@@ -24,8 +24,9 @@ use protocol::{
 
 use super::{hex, ChatServer};
 use crate::{
+    clock::WallMs,
     persistence::Command,
-    policy::{KeyRecord, Restriction},
+    policy::{KeyRecord, Policy, Restriction},
 };
 
 /// What a restriction of each kind subtracts (spec §4.2).
@@ -41,20 +42,35 @@ fn permission_removed_by(kind: RestrictionKind) -> u64 {
     }
 }
 
+/// A user's roles unioned, minus what active restrictions take away
+/// (spec §4.2).
+fn effective_in(policy: &Policy, user: &UserId, now: WallMs) -> u64 {
+    let mut perms = policy.permissions_of(user);
+    for r in &policy.restrictions {
+        if r.active(now) && r.user_id.as_ref() == Some(user) {
+            perms &= !permission_removed_by(r.kind);
+        }
+    }
+    perms
+}
+
+/// The role ids a user's `UserDetails` carries; none and an empty set
+/// read the same.
+fn roles_in<'a>(policy: &'a Policy, user: &UserId) -> Option<&'a BTreeSet<RoleId>> {
+    policy
+        .users
+        .get(user)
+        .map(|u| &u.roles)
+        .filter(|roles| !roles.is_empty())
+}
+
 impl ChatServer {
     // ── Enforcement ─────────────────────────────────────────────────
 
     /// A user's roles unioned, minus what active restrictions take
     /// away (spec §4.2).
     pub(super) fn effective_permissions(&self, user: &UserId) -> u64 {
-        let now = self.wall_now();
-        let mut perms = self.policy.permissions_of(user);
-        for r in &self.policy.restrictions {
-            if r.active(now) && r.user_id.as_ref() == Some(user) {
-                perms &= !permission_removed_by(r.kind);
-            }
-        }
-        perms
+        effective_in(&self.policy, user, self.wall_now())
     }
 
     /// Whether the session holds `bit` right now.
@@ -145,10 +161,13 @@ impl ChatServer {
         self.refresh_enforcement();
     }
 
-    /// After the persistence thread handed over a policy another
-    /// process changed: bans land on live sessions, mutes take effect,
-    /// roles refresh in every roster.
-    pub(super) fn apply_reloaded_policy(&mut self) {
+    /// Swap in a policy the persistence thread reloaded after another
+    /// process changed the file: bans land on live sessions, mutes take
+    /// effect, and what changed reaches the clients. Only what changed:
+    /// every reload used to send each session's `UserDetails` to every
+    /// session, about 66,000 messages at 256 sessions (review P1-22).
+    pub(super) fn apply_reloaded_policy(&mut self, policy: Policy) {
+        let old = std::mem::replace(&mut self.policy, policy);
         let now = self.wall_now();
         let hit: Vec<(ClientId, Restriction)> = self
             .user_of
@@ -193,9 +212,14 @@ impl ChatServer {
             self.remove_session(client, RemovedKind::Kicked, "access removed", "server");
         }
         self.refresh_enforcement();
+        // The roster lines whose roles or level moved, to everyone.
         let details: Vec<ServerMessage> = self
             .user_of
             .iter()
+            .filter(|(_, u)| {
+                roles_in(&old, u) != roles_in(&self.policy, u)
+                    || old.level_of(u) != self.policy.level_of(u)
+            })
             .map(|(c, u)| self.user_details(*c, u))
             .collect();
         for msg in details {
@@ -203,30 +227,33 @@ impl ChatServer {
                 self.send_if_roles(peer, &msg);
             }
         }
-        // Each session's own permission set, so its gates follow a
-        // `server user grant` without a reconnect.
+        // A session whose own permission set moved hears it, so its
+        // gates follow a `server user grant` without a reconnect.
         let persistent = self.persist.is_persistent();
         let sessions: Vec<(ClientId, ServerMessage)> = self
             .user_of
             .iter()
-            .map(|(c, u)| {
-                (
+            .filter_map(|(c, u)| {
+                let permissions = effective_in(&self.policy, u, now);
+                (permissions != effective_in(&old, u, now)).then_some((
                     *c,
                     ServerMessage::Session {
                         user_id: *u,
-                        permissions: self.effective_permissions(u),
+                        permissions,
                         persistent,
                     },
-                )
+                ))
             })
             .collect();
         for (client, session) in sessions {
             self.send_if_roles(client, &session);
         }
-        // The table itself may have changed (`server role`).
-        let roles = self.role_list();
-        for peer in self.clients() {
-            self.send_if(peer, features::ROLE_LIST, &roles);
+        // The table itself, when it changed (`server role`).
+        if old.roles != self.policy.roles {
+            let roles = self.role_list();
+            for peer in self.clients() {
+                self.send_if(peer, features::ROLE_LIST, &roles);
+            }
         }
     }
 

@@ -222,7 +222,7 @@ pub fn set_clipboard_text(text: &str) {
 /// (a GIF's first frame), then handed to the OS as RGBA. Bounded by
 /// the same decoder that renders chat images.
 pub fn set_clipboard_image(bytes: &[u8]) {
-    let decoded = match app_core::images::decode_bounded(bytes) {
+    let decoded = match app_core::images::decode_received(bytes) {
         Ok(img) => img.to_rgba8(),
         Err(e) => {
             log::warn!("Copy image: decode failed: {e:?}");

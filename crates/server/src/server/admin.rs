@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use log::info;
+use log::{info, warn};
 use protocol::{
     features, permissions, AdminCommand, AdminError, AdminOutcome, AuditEntry, BlobSummary,
     ClientId, ServerMessage, StatsSummary, UserId,
@@ -96,7 +96,7 @@ impl ChatServer {
                 "the audit log did not answer in time".into(),
             )),
         };
-        self.send_msg(client, &ServerMessage::AdminResult { request_id, result });
+        self.send_admin_result(client, request_id, result);
     }
 
     /// An audit target as the panel should read it: a user's short id
@@ -418,7 +418,24 @@ impl ChatServer {
             }
         }
         self.policy.roles.remove(&id);
-        self.persist.send(Command::DeleteRole { id });
+        // The store revokes the invites that grant it and opens the
+        // channels gated on it in the same transaction; mirror that, so
+        // a live invite cannot admit someone into a role that is gone.
+        let now = self.wall_now();
+        for invite in self.policy.invites.values_mut() {
+            if invite.grants_role == id {
+                invite.revoked_at.get_or_insert(now);
+                invite.grants_role = protocol::permissions::ROLE_GUEST;
+            }
+        }
+        let mut gated = false;
+        for channel in &mut self.policy.channels {
+            if channel.min_role == Some(id) {
+                channel.min_role = None;
+                gated = true;
+            }
+        }
+        self.persist.send(Command::DeleteRole { id, ts: now });
         self.audit(
             Some(actor),
             "role.delete",
@@ -426,6 +443,9 @@ impl ChatServer {
             Some(role.name.clone()),
         );
         info!("role {} ({id}) deleted from the panel", role.name);
+        if gated && let Err(e) = self.rebuild_channel_list() {
+            warn!("channel list rebuild after a role delete failed: {e}");
+        }
         self.broadcast_roles();
         for user in holders {
             self.roles_changed(&user);

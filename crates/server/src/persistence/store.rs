@@ -15,7 +15,7 @@ use std::{
 
 use log::{info, warn};
 use protocol::{permissions::BUILTIN_ROLES, UserId};
-use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, MAIN_DB};
 use sha2::Digest;
 
 use super::{
@@ -92,6 +92,39 @@ pub struct Sqlite {
     /// Where blob bytes live: `blobs/` next to the database (spec §2),
     /// a per-process temp dir for an in-memory database.
     blobs: PathBuf,
+    /// Opened with `SQLITE_OPEN_READ_ONLY` ([`Sqlite::open_read_only`]):
+    /// no checkpoint on close.
+    read_only: bool,
+    /// Declared after `conn`, so it runs once the connection is closed.
+    _tidy: Option<WalTidy>,
+}
+
+/// Removes the `-wal` and `-shm` a read-only connection leaves behind
+/// on a stopped server: it cannot delete them itself, and `db prune` and
+/// `restore` take a `-wal` file for a running server. A read-write
+/// connection that reads once and closes last makes `SQLite` remove
+/// them; while a server holds the file it is not last, and nothing is
+/// written either way.
+struct WalTidy {
+    db_path: PathBuf,
+}
+
+impl Drop for WalTidy {
+    fn drop(&mut self) {
+        let mut wal = self.db_path.clone().into_os_string();
+        wal.push("-wal");
+        // A running server's log usually holds frames; an empty one is
+        // what a read-only open of a closed database creates.
+        if !fs::metadata(&wal).is_ok_and(|m| m.len() == 0) {
+            return;
+        }
+        if let Ok(conn) = Connection::open(&self.db_path) {
+            let _ = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| {
+                r.get::<_, i64>(0)
+            });
+            let _ = conn.close();
+        }
+    }
 }
 
 impl Sqlite {
@@ -140,9 +173,62 @@ impl Sqlite {
                 conn,
                 data_version,
                 blobs,
+                read_only: false,
+                _tidy: None,
             },
             next_message_id,
         ))
+    }
+
+    /// Open an existing database for reading only: no migration, no
+    /// built-in role sync, no checkpoint on close. The CLI's listings
+    /// use it, so a running server's `data_version` poll sees nothing:
+    /// `server user list` used to reload every table and message every
+    /// client (review P1-22). A database older than this build is opened
+    /// with [`Sqlite::open`], which migrates it, as the CLI always did.
+    ///
+    /// # Errors
+    /// `SQLite` failure, or a database newer than this build.
+    pub fn open_read_only(path: &Path) -> Result<Self, PersistError> {
+        // Before `conn`: locals drop in reverse, so it runs after the
+        // connection closed on every early return too.
+        let tidy = WalTidy {
+            db_path: path.to_path_buf(),
+        };
+        let conn = connect_read_only(path)?;
+        // No table reads as version 0: an empty file, which the writing
+        // open turns into a database.
+        let has_version: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        let version: u32 = if has_version == 0 {
+            0
+        } else {
+            conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                .optional()?
+                .unwrap_or(0)
+        };
+        if version > SCHEMA_VERSION {
+            return Err(PersistError::Downgrade {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if version < SCHEMA_VERSION {
+            drop(conn);
+            drop(tidy);
+            return Ok(Self::open(path)?.0);
+        }
+        let data_version = read_data_version(&conn)?;
+        Ok(Self {
+            conn,
+            data_version,
+            blobs: blobs_dir(path),
+            read_only: true,
+            _tidy: Some(tidy),
+        })
     }
 
     // ── Profiles and blobs (spec §7) ─────────────────────────────────
@@ -521,7 +607,24 @@ impl Sqlite {
     }
 
     pub fn prune(&self, now: WallMs, retention: Retention) -> Result<u64, rusqlite::Error> {
+        self.prune_with_files(now, retention)
+            .map(|(removed, _)| removed)
+    }
+
+    /// [`Self::prune`], also naming the files it deleted, so the tick can
+    /// forget them: it keeps an unreferenced file's metadata to answer
+    /// a re-announce with "already here", which for a deleted file left
+    /// the poster's picture missing for good (review P0-4).
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn prune_with_files(
+        &self,
+        now: WallMs,
+        retention: Retention,
+    ) -> Result<(u64, Vec<[u8; 32]>), rusqlite::Error> {
         let mut removed = 0u64;
+        let mut files = Vec::new();
         if let Some(cutoff) = cutoff(now, retention.history_days) {
             removed += count(self.conn.execute(
                 "DELETE FROM messages WHERE ts < ?1",
@@ -545,9 +648,10 @@ impl Sqlite {
             )?);
         }
         if let Some(cut) = cutoff(now, retention.file_days) {
-            removed += self.prune_blobs(cut)?.len() as u64;
+            files = self.prune_blobs(cut)?;
+            removed += files.len() as u64;
         }
-        Ok(removed)
+        Ok((removed, files))
     }
 
     /// Whether another connection committed to the database since the
@@ -1079,16 +1183,32 @@ impl Sqlite {
     }
 
     /// Remove a custom role; `user_roles` rows cascade, so whoever
-    /// held it simply loses it.
+    /// held it simply loses it. Invites and channels reference roles
+    /// without a cascade, so in the same transaction the invites that
+    /// grant it are revoked (and point at guest, the column being NOT
+    /// NULL) and the channels gated on it open up. Without that the
+    /// delete failed on the foreign keys whenever any invite — revoked
+    /// and expired ones too — or channel named the role, and the role
+    /// came back with every holder at the next load (review P0-3).
     ///
     /// # Errors
     /// `SQLite` failure.
-    pub fn delete_role(&self, role_id: u32) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
+    pub fn delete_role(&self, role_id: u32, now: WallMs) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE invites SET revoked_at = COALESCE(revoked_at, ?2), grants_role = ?3
+             WHERE grants_role = ?1",
+            params![role_id, ordered(now), protocol::permissions::ROLE_GUEST],
+        )?;
+        tx.execute(
+            "UPDATE channels SET min_role = NULL WHERE min_role = ?1",
+            params![role_id],
+        )?;
+        tx.execute(
             "DELETE FROM roles WHERE role_id = ?1 AND builtin = 0",
             params![role_id],
         )?;
-        Ok(())
+        tx.commit()
     }
 
     /// # Errors
@@ -1438,9 +1558,13 @@ impl Sqlite {
 
     /// Final checkpoint on shutdown so the main file is complete on its
     /// own (a restore from a plain file copy then has nothing to
-    /// recover).
+    /// recover). A read-only connection cannot, and must not: the
+    /// truncate restarts the log, which a running server's
+    /// `data_version` counts as a change (review P1-22).
     pub fn close(self) {
-        if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        if !self.read_only
+            && let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        {
             log::warn!("Final WAL checkpoint failed: {e}");
         }
         if let Err((_, e)) = self.conn.close() {
@@ -1453,6 +1577,18 @@ impl Sqlite {
 /// tests; it has no directory to create.
 fn is_memory_path(path: &Path) -> bool {
     path.to_str() == Some(":memory:")
+}
+
+/// A connection that cannot write: the CLI's listings (review P1-22).
+fn connect_read_only(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(conn)
 }
 
 fn read_data_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
@@ -1491,7 +1627,10 @@ fn migrate(conn: &mut Connection) -> Result<(), PersistError> {
 
 /// Write the built-in roles' current permission sets and ranks. Run at
 /// every startup so a permission added in code reaches an existing
-/// database without a migration; custom roles are untouched.
+/// database without a migration; custom roles are untouched. A row
+/// that already matches is left alone: an unchanged row rewritten is
+/// still a commit, which a running server's `data_version` poll took for
+/// a CLI change on every CLI open (review P1-22).
 fn sync_builtin_roles(conn: &Connection) -> Result<(), rusqlite::Error> {
     let mut stmt = conn.prepare(
         "INSERT INTO roles (role_id, name, permissions, rank, builtin)
@@ -1500,7 +1639,11 @@ fn sync_builtin_roles(conn: &Connection) -> Result<(), rusqlite::Error> {
              name = excluded.name,
              permissions = excluded.permissions,
              rank = excluded.rank,
-             builtin = 1",
+             builtin = 1
+         WHERE roles.name IS NOT excluded.name
+            OR roles.permissions IS NOT excluded.permissions
+            OR roles.rank IS NOT excluded.rank
+            OR roles.builtin IS NOT 1",
     )?;
     for role in BUILTIN_ROLES {
         stmt.execute(params![
@@ -1778,7 +1921,8 @@ pub fn cli_create_invite(
     Ok((code, invite))
 }
 
-/// `server user list` and friends: the policy tables as they stand.
+/// `server user list` and friends: the policy tables as they stand,
+/// read without writing.
 ///
 /// # Errors
 /// No database at `db_path`, or a `SQLite` failure.
@@ -1786,7 +1930,7 @@ pub fn cli_load_policy(db_path: &Path) -> Result<Policy, PersistError> {
     if !db_path.is_file() {
         return Err(PersistError::Missing(db_path.to_path_buf()));
     }
-    let (db, _) = Sqlite::open(db_path)?;
+    let db = Sqlite::open_read_only(db_path)?;
     let policy = db.load_policy()?;
     db.close();
     Ok(policy)
@@ -2081,7 +2225,7 @@ pub fn cli_role_delete(db_path: &Path, who: &str) -> Result<(u32, String), Persi
         return Err(PersistError::BuiltinRole(role.name.clone()));
     }
     let name = role.name.clone();
-    db.delete_role(id)?;
+    db.delete_role(id, super::wall_now())?;
     db.insert_audit(&AuditRow {
         ts: super::wall_now(),
         actor: None,
@@ -2185,7 +2329,7 @@ pub fn cli_telemetry(
     if !db_path.is_file() {
         return Err(PersistError::Missing(db_path.to_path_buf()));
     }
-    let (db, _) = Sqlite::open(db_path)?;
+    let db = Sqlite::open_read_only(db_path)?;
     let mut stmt = db.conn.prepare(
         "SELECT ts, rtt_ms, path_loss, voice_loss, groups_behind, rung, input_device,
                 output_device
@@ -2325,7 +2469,7 @@ pub fn cli_list_invites(db_path: &Path) -> Result<Vec<(String, InviteRecord)>, P
     if !db_path.is_file() {
         return Err(PersistError::Missing(db_path.to_path_buf()));
     }
-    let (db, _) = Sqlite::open(db_path)?;
+    let db = Sqlite::open_read_only(db_path)?;
     let policy = db.load_policy()?;
     db.close();
     let mut invites: Vec<(String, InviteRecord)> = policy.invites.into_iter().collect();
@@ -2366,7 +2510,7 @@ pub fn cli_revoke_invite(db_path: &Path, code: &str) -> Result<bool, PersistErro
 }
 
 /// `server db check`: integrity, schema version and row counts. Opens
-/// the file as-is — no migration is applied.
+/// the file as-is and read-only — no migration is applied.
 ///
 /// # Errors
 /// No database at `db_path`, or a `SQLite` failure.
@@ -2374,8 +2518,11 @@ pub fn check(db_path: &Path) -> Result<CheckReport, PersistError> {
     if !db_path.is_file() {
         return Err(PersistError::Missing(db_path.to_path_buf()));
     }
-    let conn = Connection::open(db_path)?;
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // Before `conn`, so it runs after the connection closed.
+    let _tidy = WalTidy {
+        db_path: db_path.to_path_buf(),
+    };
+    let conn = connect_read_only(db_path)?;
     let mut integrity_stmt = conn.prepare("PRAGMA integrity_check")?;
     let integrity: Vec<String> = integrity_stmt
         .query_map([], |row| row.get(0))?
@@ -2574,10 +2721,220 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_role_releases_its_invites_and_channels() {
+        // Review P0-3: an invite (even a revoked one) or a channel naming
+        // the role made the delete fail on the foreign keys, and the role
+        // came back with its holders at the next load.
+        let db = memory();
+        let user = [3u8; 32];
+        db.conn
+            .execute(
+                "INSERT INTO users (user_id, name, created_at, last_seen) VALUES (?1, 'ana', 0, 0)",
+                params![user],
+            )
+            .expect("user");
+        db.insert_role(100, "helpers", 0, 5, "", 0).expect("role");
+        db.grant_role(&user, 100, None, 1).expect("grant");
+        for (code, revoked_at) in [("LIVE", None), ("OLD", Some(5))] {
+            db.insert_invite(
+                code,
+                &InviteRecord {
+                    created_by: None,
+                    created_at: 1,
+                    expires_at: None,
+                    max_uses: None,
+                    uses: 0,
+                    grants_role: 100,
+                    revoked_at,
+                },
+            )
+            .expect("invite");
+        }
+        db.conn
+            .execute(
+                "INSERT INTO channels (channel_id, name, min_role, source, created_at)
+                 VALUES (1, 'staff', 100, 1, 0)",
+                [],
+            )
+            .expect("channel");
+
+        db.delete_role(100, 9).expect("delete");
+
+        let roles: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM roles WHERE role_id = 100", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(roles, 0);
+        let holders: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_roles WHERE role_id = 100",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(holders, 0);
+        let live: (i64, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT grants_role, revoked_at FROM invites WHERE code = 'LIVE'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("invite");
+        assert_eq!(
+            live,
+            (i64::from(protocol::permissions::ROLE_GUEST), Some(9))
+        );
+        let old_revoked: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT revoked_at FROM invites WHERE code = 'OLD'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("invite");
+        assert_eq!(old_revoked, Some(5), "an earlier revocation keeps its time");
+        let gate: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT min_role FROM channels WHERE channel_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("channel");
+        assert_eq!(gate, None);
+    }
+
+    #[test]
     fn own_writes_do_not_count_as_external_changes() {
         let mut db = memory();
         db.insert_message(&row(1, "x")).expect("insert");
         assert!(!db.changed_externally().expect("poll"));
+    }
+
+    /// `<tmp>/baucord-store-<tag>-…/baucord.db`, not created yet.
+    fn scratch_db(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "baucord-store-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let path = dir.join("baucord.db");
+        (dir, path)
+    }
+
+    fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    #[test]
+    fn a_second_open_with_nothing_to_sync_is_not_an_external_change() {
+        // Every CLI open re-synced the built-in roles, and the rewrite of
+        // unchanged rows made the server reload everything (review P1-22).
+        let (dir, path) = scratch_db("sync");
+        let (mut server, _) = Sqlite::open(&path).expect("server");
+        let _ = server.changed_externally().expect("poll");
+        let (cli, _) = Sqlite::open(&path).expect("cli");
+        assert!(!server.changed_externally().expect("poll"));
+        drop(cli);
+        assert!(!server.changed_externally().expect("poll"));
+
+        // A built-in that drifted is still put back, and that is a change.
+        let hand = Connection::open(&path).expect("sqlite3");
+        hand.execute(
+            "UPDATE roles SET permissions = 0 WHERE role_id = ?1",
+            params![protocol::permissions::ROLE_MEMBER],
+        )
+        .expect("edit");
+        drop(hand);
+        assert!(server.changed_externally().expect("poll"));
+        let (cli, _) = Sqlite::open(&path).expect("cli");
+        assert!(server.changed_externally().expect("poll"));
+        assert_eq!(
+            cli.load_policy().expect("policy").roles[&protocol::permissions::ROLE_MEMBER]
+                .permissions,
+            protocol::permissions::MEMBER_PERMISSIONS
+        );
+        drop(cli);
+        server.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cli_listings_never_count_as_external_changes() {
+        let (dir, path) = scratch_db("listings");
+        let (mut server, _) = Sqlite::open(&path).expect("server");
+        server
+            .insert_invite(
+                "CODE",
+                &InviteRecord {
+                    created_by: None,
+                    created_at: 1,
+                    expires_at: None,
+                    max_uses: None,
+                    uses: 0,
+                    grants_role: protocol::permissions::ROLE_GUEST,
+                    revoked_at: None,
+                },
+            )
+            .expect("invite");
+        let _ = server.changed_externally().expect("poll");
+
+        let policy = cli_load_policy(&path).expect("user list");
+        assert_eq!(policy.invites.len(), 1);
+        assert_eq!(cli_list_invites(&path).expect("invite list").len(), 1);
+        assert!(cli_telemetry(&path, &[1; 32], 0, 10)
+            .expect("telemetry")
+            .is_empty());
+        assert!(check(&path).expect("db check").is_ok());
+        assert!(!server.changed_externally().expect("poll"));
+        server.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listing_of_a_stopped_server_leaves_no_wal_behind() {
+        // `db prune` and `restore` read a `-wal` file as a running server.
+        let (dir, path) = scratch_db("tidy");
+        let (db, _) = Sqlite::open(&path).expect("create");
+        db.close();
+        assert!(!sidecar(&path, "-wal").exists());
+        cli_load_policy(&path).expect("user list");
+        check(&path).expect("db check");
+        assert!(!sidecar(&path, "-wal").exists());
+        assert!(!sidecar(&path, "-shm").exists());
+        cli_prune(
+            &path,
+            Retention {
+                history_days: 1,
+                telemetry_days: 1,
+                file_days: 1,
+            },
+        )
+        .expect("prune runs on a stopped server");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_only_open_refuses_a_newer_schema() {
+        let (dir, path) = scratch_db("ro-newer");
+        let (db, _) = Sqlite::open(&path).expect("open");
+        db.conn
+            .execute("UPDATE schema_version SET version = 999", [])
+            .expect("bump");
+        db.close();
+        assert!(matches!(
+            Sqlite::open_read_only(&path),
+            Err(PersistError::Downgrade { found: 999, .. })
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

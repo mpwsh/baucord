@@ -68,6 +68,7 @@ impl AppState {
         if diff.rebuild_output && !SINGLE_WINDOW_HOST {
             self.settings.audio.output.device = None;
             self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
+            self.sync_stream_output();
             // WASAPI loopback captures from the default output device,
             // so when that device changes the capture stream dies too.
             // Restart it if a screen share is currently active.
@@ -125,23 +126,27 @@ impl AppState {
             .tx
             .send(VoiceControl::SetOutputDevice(device))
             .ok();
+        self.sync_stream_output();
         self.refresh_device_warning();
+    }
+
+    /// Stream audio plays on the voice output picked here, and moves
+    /// with it (review P1-19): the screen thread's decoders read this.
+    /// A phone's pick is a call route the decoders ignore.
+    pub(super) fn sync_stream_output(&self) {
+        self.screen
+            .shared
+            .stream_output
+            .set(self.settings.audio.output.device.as_deref());
     }
 
     pub fn voice_tx(&self) -> &crossbeam_channel::Sender<VoiceControl> {
         &self.voice.tx
     }
 
-    pub fn voice_levels(
-        &self,
-    ) -> (
-        Arc<std::sync::atomic::AtomicU32>,
-        Arc<std::sync::atomic::AtomicU32>,
-    ) {
-        (
-            self.voice.shared.output_level.clone(),
-            self.voice.shared.denoised_level.clone(),
-        )
+    /// The voice engine's meters, for the Settings meter loop.
+    pub fn voice_levels(&self) -> client::voice::SharedAudioState {
+        self.voice.shared.clone()
     }
 
     /// What echo cancellation the voice session got (`None` = none
@@ -176,6 +181,7 @@ impl AppState {
             .ok();
         self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
         self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
+        self.sync_stream_output();
         if let Some(hotkeys) = &mut self.hotkeys {
             hotkeys.update(&self.settings);
         }
@@ -197,6 +203,12 @@ impl AppState {
 
     pub fn set_keybind(&mut self, action: BindableAction, bind: String) {
         self.settings.set_bind(action, bind);
+        self.refresh_hotkeys();
+    }
+
+    /// The keybinds or push-to-talk changed: the push-to-talk key is
+    /// watched only while push-to-talk is on (review P1-3).
+    pub fn refresh_hotkeys(&mut self) {
         if let Some(hotkeys) = &mut self.hotkeys {
             hotkeys.update(&self.settings);
         }

@@ -24,13 +24,16 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use audio::{AudioPacket, PayloadType};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use audio::{AudioPacket, IncomingSender, PayloadType};
+use crossbeam_channel::{Receiver, RecvError, Sender, TryRecvError};
 use log::{debug, info, warn};
 use protocol::{
     features, pack_system_audio, pack_video_frame, pack_voice_with_flags, parse_system_audio,
@@ -50,16 +53,9 @@ use transport::{
 
 use crate::{inbound_wake::InboundWake, screen::ScreenControl, voice::VoiceControl, WakeFn};
 
-/// The loop's tick while the transport has per-tick work queued (paced
-/// uploads, video groups, lane bytes the stream would not take yet), or
-/// where nothing announces a datagram and the socket must be polled.
+/// The loop's tick where nothing announces a datagram (the inbound
+/// wake could not start) and the socket must be polled.
 const BUSY_TICK: Duration = Duration::from_millis(1);
-
-/// The loop's longest sleep on a quiet connection with the inbound
-/// wake: datagrams and commands wake it at once, the transport's timers
-/// cap it, and only the 2 s link stats and the telemetry wait for it.
-/// A thousand wakes a second became about ten (IOS-SPEC.md §14 D41).
-const QUIET_TICK: Duration = Duration::from_millis(100);
 
 /// Passes of the network loop since the process started: each is one
 /// wake of the thread. For the battery tests and diagnostics.
@@ -69,6 +65,13 @@ static LOOP_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 #[must_use]
 pub fn loop_passes() -> u64 {
     LOOP_PASSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many times the inbound watcher threads (`inbound_wake`) have
+/// woken so far: the rest of a quiet session's wakes.
+#[must_use]
+pub fn watcher_wakes() -> u64 {
+    crate::inbound_wake::wakes()
 }
 
 /// How often to sample link statistics for the UI and the screen
@@ -644,9 +647,15 @@ struct IncomingImage {
 
 /// An announced blob upload waiting for the server's `UploadAccept`.
 struct PendingBlob {
-    upload_id: u32,
     blob_id: [u8; 32],
     data: Vec<u8>,
+}
+
+/// An upload as the UI asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadKey {
+    Image,
+    Blob(u32),
 }
 
 /// What we say once the transport is up.
@@ -697,19 +706,29 @@ pub(crate) struct NetworkClient {
     reassembler: VideoReassembler,
     // Speaking status dedupe (only send on change)
     last_speaking_sent: bool,
-    /// In-flight image upload, as the transport tracks it.
-    upload: Option<UploadId>,
+    /// The chat image on the Media lane, as the transport tracks it,
+    /// until the transport retires it: what `CancelImage` resets. Its
+    /// own slot, so a blob upload never hides it (review P1-17).
+    image_upload: Option<UploadId>,
+    /// Blob uploads on the Media lane, by our upload id, until the
+    /// transport retires them: `CancelUpload` resets that stream and
+    /// no other.
+    blob_uploads: HashMap<u32, UploadId>,
+    /// The upload the UI asked for last: its ring is on that card, and
+    /// `UploadProgress` carries no id, so only this one's percent goes
+    /// out.
+    newest_upload: Option<UploadKey>,
+    /// That upload on the Media lane once its bytes go; cleared at 100.
+    progress_upload: Option<UploadId>,
     /// Last percentage reported to the UI (255 = force first emit).
     upload_last_pct: u8,
     /// Reassembly of relayed images, keyed by (sender, upload id).
     incoming_images: HashMap<(u64, u32), IncomingImage>,
     /// Blobs being fetched, keyed by hash (spec §7).
     incoming_blobs: HashMap<[u8; 32], IncomingImage>,
-    /// The blob we announced and may still have to send.
-    pending_blob: Option<PendingBlob>,
-    /// The upload id the media lane is busy with (`upload` is the
-    /// driver's handle for the same send), for a cancel.
-    upload_for: Option<u32>,
+    /// Blobs announced and waiting for the server's `UploadAccept`, by
+    /// upload id: two files dropped together both go.
+    pending_blobs: HashMap<u32, PendingBlob>,
     /// Blobs whose fetch was cancelled: chunks still arriving are
     /// dropped until the blob is asked for again.
     ignored_blobs: HashSet<[u8; 32]>,
@@ -808,12 +827,14 @@ impl NetworkClient {
             message_queue: Vec::new(),
             reassembler: VideoReassembler::new(),
             last_speaking_sent: false,
-            upload: None,
+            image_upload: None,
+            blob_uploads: HashMap::new(),
+            newest_upload: None,
+            progress_upload: None,
             upload_last_pct: 255,
             incoming_images: HashMap::new(),
             incoming_blobs: HashMap::new(),
-            pending_blob: None,
-            upload_for: None,
+            pending_blobs: HashMap::new(),
             ignored_blobs: HashSet::new(),
             last_stats_check: now,
             stats_baseline: None,
@@ -840,6 +861,9 @@ impl NetworkClient {
             return;
         }
         let now = Instant::now();
+        // The socket can give up on GSO at any send (review P1-14).
+        self.driver
+            .set_max_gso_segments(self.udp.max_gso_segments());
         match self.udp.recv_batch(|d| self.driver.handle_datagram(now, d)) {
             Ok(outcome) => {
                 self.backlog = !outcome.drained;
@@ -886,22 +910,26 @@ impl NetworkClient {
     }
 
     /// How long the loop may sleep before the next tick, unless a
-    /// command or (with the inbound wake) a datagram comes first.
-    ///
-    /// [`BUSY_TICK`] while anything needs the per-tick work — the
-    /// transport's paced queues, or the socket itself when nothing
-    /// rings on arrival; otherwise [`QUIET_TICK`], which only the
-    /// 2-second stats and the telemetry ride on. Never past the
-    /// transport's next timer (acks, keep-alive, loss recovery).
+    /// command or (with the inbound wake) a datagram comes first: until
+    /// the transport's next deadline (its timers, the video deadlines,
+    /// the upload pacer) or our own 2 s link stats and 10 s telemetry,
+    /// whichever is first (review P1-2). A quiet connection wakes a few
+    /// times a second, a share or an upload only when something is due.
+    /// Without the inbound wake nothing announces a datagram, and the
+    /// socket is polled every [`BUSY_TICK`].
     pub fn loop_wait(&mut self, now: Instant) -> Duration {
-        let tick = if self.inbound.is_some() && !self.driver.wants_tick() {
-            QUIET_TICK
+        let mut due = self.last_stats_check + NETWORK_STATS_INTERVAL;
+        if self.telemetry_enabled && self.phase == Phase::Admitted {
+            due = due.min(self.last_telemetry + TELEMETRY_INTERVAL);
+        }
+        if let Some(deadline) = self.driver.next_deadline() {
+            due = due.min(deadline);
+        }
+        let wait = due.saturating_duration_since(now);
+        if self.inbound.is_some() {
+            wait
         } else {
-            BUSY_TICK
-        };
-        match self.driver.next_timeout() {
-            Some(deadline) => tick.min(deadline.saturating_duration_since(now)),
-            None => tick,
+            wait.min(BUSY_TICK)
         }
     }
 
@@ -1251,6 +1279,12 @@ impl NetworkClient {
         for lane in [Lane::Control, Lane::Signal, Lane::Media] {
             while let Some(message) = self.driver.recv(self.server, lane) {
                 let Some(msg) = protocol::decode_server_message(&message) else {
+                    // A newer server's variant, or one over the size bound:
+                    // skipped, but never silently (review P0-1).
+                    debug!(
+                        "skipped an undecodable {lane} message ({} bytes)",
+                        message.len()
+                    );
                     continue;
                 };
                 self.handle_server_message(now, msg);
@@ -1736,7 +1770,8 @@ impl NetworkClient {
             }
             ServerMessage::UploadRejected { upload_id, reason } => {
                 info!("Upload {upload_id} rejected: {}", reason.describe());
-                self.pending_blob.take_if(|p| p.upload_id == upload_id);
+                // The server drops whatever else comes for it.
+                self.cancel_blob_upload(now, upload_id);
                 self.message_queue
                     .push(NetworkMessage::UploadRejected { upload_id, reason });
             }
@@ -1948,9 +1983,9 @@ impl NetworkClient {
     /// Queue a chat image for a *paced* upload: split into
     /// [`protocol::IMAGE_CHUNK_BYTES`] chunks on one Media stream, which
     /// the transport trickles out at [`protocol::MEDIA_UPLOAD_PACE`] so
-    /// the router queue voice shares never backs up behind bulk. A new
-    /// image replaces any upload still in flight (matching the UI,
-    /// which sends one at a time).
+    /// the router queue voice shares never backs up behind bulk. The
+    /// image slot (what `CancelImage` stops) follows the newest image,
+    /// as the UI's card does: it sends one at a time.
     pub fn send_image(&mut self, now: Instant, data: &[u8]) {
         if data.len() > protocol::MAX_CHAT_IMAGE_BYTES {
             warn!("Refusing oversized image ({} KB)", data.len() / 1024);
@@ -1966,11 +2001,12 @@ impl NetworkClient {
         }) else {
             return;
         };
+        self.newest_upload = Some(UploadKey::Image);
+        self.progress_upload = None;
         match self.driver.send_media(now, self.server, frames) {
             Ok(id) => {
-                self.upload = Some(id);
-                self.upload_last_pct = 255;
-                self.report_upload_progress();
+                self.image_upload = Some(id);
+                self.track_progress(id);
             }
             Err(e) => warn!("Image upload could not start: {e}"),
         }
@@ -2011,9 +2047,25 @@ impl NetworkClient {
         }
     }
 
-    /// Report image upload progress as the transport takes the bytes.
+    /// Report `id`'s progress from now on: the upload the UI asked for
+    /// last has started.
+    fn track_progress(&mut self, id: UploadId) {
+        self.progress_upload = Some(id);
+        self.upload_last_pct = 255;
+        self.report_upload_progress();
+    }
+
+    /// Report upload progress as the transport takes the bytes, and
+    /// forget uploads the transport retired (acknowledged, reset, or
+    /// gone with the connection): a cancel must never reach a stream
+    /// that is over, or someone else's.
     fn report_upload_progress(&mut self) {
-        let Some(id) = self.upload else {
+        let (driver, server) = (&self.driver, self.server);
+        self.image_upload
+            .take_if(|id| driver.upload_progress(server, *id).is_none());
+        self.blob_uploads
+            .retain(|_, id| driver.upload_progress(server, *id).is_some());
+        let Some(id) = self.progress_upload else {
             return;
         };
         let (pct, done) = match self.driver.upload_progress(self.server, id) {
@@ -2030,8 +2082,13 @@ impl NetworkClient {
                 .push(NetworkMessage::UploadProgress { pct });
         }
         if done {
-            self.upload = None;
+            self.progress_upload = None;
         }
+    }
+
+    /// An upload was cancelled: its percent stops too.
+    fn untrack_progress(&mut self, id: UploadId) {
+        self.progress_upload.take_if(|p| *p == id);
     }
 
     /// Fold one relayed chunk into its image; `Some(bytes)` when the
@@ -2198,15 +2255,16 @@ impl NetworkClient {
                 sha256: blob_id,
             },
         );
-        self.pending_blob = Some(PendingBlob {
-            upload_id,
-            blob_id,
-            data,
-        });
+        self.pending_blobs
+            .insert(upload_id, PendingBlob { blob_id, data });
+        // The UI's ring moved to this card: an older upload's percent
+        // would land on it.
+        self.newest_upload = Some(UploadKey::Blob(upload_id));
+        self.progress_upload = None;
     }
 
     fn continue_blob_upload(&mut self, now: Instant, upload_id: u32, needed: bool) {
-        let Some(pending) = self.pending_blob.take_if(|p| p.upload_id == upload_id) else {
+        let Some(pending) = self.pending_blobs.remove(&upload_id) else {
             return;
         };
         if !needed {
@@ -2233,33 +2291,32 @@ impl NetworkClient {
         };
         match self.driver.send_media(now, self.server, frames) {
             Ok(id) => {
-                // The same tracker as an image send: one media upload
-                // at a time, its percent to the UI as the bytes go.
-                self.upload = Some(id);
-                self.upload_for = Some(upload_id);
-                self.upload_last_pct = 255;
-                self.report_upload_progress();
+                self.blob_uploads.insert(upload_id, id);
+                if self.newest_upload == Some(UploadKey::Blob(upload_id)) {
+                    self.track_progress(id);
+                }
             }
             Err(e) => warn!("Blob upload could not start: {e}"),
         }
     }
 
     /// Stop a blob upload: not yet accepted → forgotten; in flight →
-    /// the media stream is reset, so the server drops the partial.
-    fn cancel_blob_upload(&mut self, upload_id: u32) {
-        if self
-            .pending_blob
-            .as_ref()
-            .is_some_and(|p| p.upload_id == upload_id)
-        {
-            self.pending_blob = None;
+    /// its media stream is reset, so the server drops the partial.
+    fn cancel_blob_upload(&mut self, now: Instant, upload_id: u32) {
+        if self.pending_blobs.remove(&upload_id).is_some() {
             return;
         }
-        if self.upload_for == Some(upload_id)
-            && let Some(id) = self.upload.take()
-        {
-            self.upload_for = None;
-            let _ = self.driver.cancel_media(self.server, id);
+        if let Some(id) = self.blob_uploads.remove(&upload_id) {
+            self.untrack_progress(id);
+            let _ = self.driver.cancel_media(now, self.server, id);
+        }
+    }
+
+    /// Stop the image in flight, if any: its stream is reset.
+    fn cancel_image(&mut self, now: Instant) {
+        if let Some(id) = self.image_upload.take() {
+            self.untrack_progress(id);
+            let _ = self.driver.cancel_media(now, self.server, id);
         }
     }
 
@@ -2484,6 +2541,23 @@ fn chunk_upload(
 //  Network control messages (UI thread → network thread)
 // ════════════════════════════════════════════════════════════════════════
 
+/// The running voice engine's packet handles, which the voice thread
+/// hands over at each start (review P1-5): received voice goes straight
+/// into the engine, stamped at the socket read, and the encoder's
+/// packets straight out — no hop through the voice thread either way.
+pub struct VoiceLink {
+    pub incoming: IncomingSender,
+    pub outgoing: Receiver<AudioPacket>,
+    /// A microphone test: our packets are dropped, not sent.
+    pub testing: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for VoiceLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceLink").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub enum NetworkControl {
     Connect {
@@ -2602,7 +2676,8 @@ pub enum NetworkControl {
     SendImage(Vec<u8>),
     /// Upload our log to the server (the tail, ≤ 2 MiB).
     SendLog(Vec<u8>),
-    SendVoicePacket(AudioPacket),
+    /// The voice engine started (`Some`) or stopped (`None`).
+    VoiceLink(Option<VoiceLink>),
     SendSpeakingStatus(bool),
     /// Broadcast mute/deafen state to other users.
     SendAudioState {
@@ -2688,7 +2763,8 @@ impl NetworkThreadHandle {
     ///
     /// The caller creates channels externally so that `network_tx` can be
     /// shared with the voice thread before the network thread starts
-    /// (resolving the circular dependency).
+    /// (resolving the circular dependency). `msg_tx` must be unbounded:
+    /// the network thread never waits for the UI (review P1-16).
     ///
     /// # Panics
     /// If the OS refuses to create the thread.
@@ -2737,6 +2813,7 @@ impl Drop for NetworkThreadHandle {
 fn handle_control(
     ctrl: NetworkControl,
     client: &mut Option<NetworkClient>,
+    voice: &mut Option<VoiceLink>,
     msg_tx: &Sender<NetworkMessage>,
     wake: &WakeFn,
 ) -> bool {
@@ -2904,15 +2981,12 @@ fn handle_control(
         }
         NetworkControl::CancelUpload { upload_id } => {
             if let Some(c) = client {
-                c.cancel_blob_upload(upload_id);
+                c.cancel_blob_upload(now, upload_id);
             }
         }
         NetworkControl::CancelImage => {
-            if let Some(c) = client
-                && c.upload_for.is_none()
-                && let Some(id) = c.upload.take()
-            {
-                let _ = c.driver.cancel_media(c.server, id);
+            if let Some(c) = client {
+                c.cancel_image(now);
             }
         }
         NetworkControl::CancelFetch { blob_id } => {
@@ -3002,23 +3076,7 @@ fn handle_control(
                 c.send_log(now, &data);
             }
         }
-        NetworkControl::SendVoicePacket(packet) => {
-            if let Some(c) = client {
-                // The packet's ssrc is not sent — the server stamps the
-                // authenticated sender id on relay.
-                let flags = match packet.header.payload_type {
-                    PayloadType::Red => VOICE_FLAG_RED,
-                    PayloadType::Opus => 0,
-                };
-                c.send_voice_frame(
-                    now,
-                    packet.header.seq,
-                    packet.header.timestamp,
-                    flags,
-                    &packet.opus_data,
-                );
-            }
-        }
+        NetworkControl::VoiceLink(link) => *voice = link,
         NetworkControl::SendSpeakingStatus(speaking) => {
             if let Some(c) = client {
                 c.send_speaking_status(now, speaking);
@@ -3130,12 +3188,14 @@ fn handle_control(
 fn route_message(
     msg: NetworkMessage,
     msg_tx: &Sender<NetworkMessage>,
+    voice: Option<&VoiceLink>,
     voice_tx: &Sender<VoiceControl>,
     screen_tx: &Sender<ScreenControl>,
     wake: &WakeFn,
 ) {
     match msg {
-        // Voice → voice thread
+        // Voice → the engine, stamped here at the socket read (review
+        // P1-5). No engine (it is starting, or stopped): dropped.
         NetworkMessage::VoiceData {
             client_id,
             seq,
@@ -3148,8 +3208,10 @@ fn route_message(
             } else {
                 PayloadType::Opus
             };
-            let packet = AudioPacket::new_typed(seq, timestamp, client_id, payload_type, data);
-            let _ = voice_tx.try_send(VoiceControl::IncomingVoicePacket(packet));
+            if let Some(link) = voice {
+                let packet = AudioPacket::new_typed(seq, timestamp, client_id, payload_type, data);
+                let _ = link.incoming.send(packet);
+            }
         }
 
         // Video → screen thread
@@ -3276,13 +3338,25 @@ fn route_message(
 
         // Everything else → app. These carry state (join / leave, init,
         // chat, mute states, denials, identity) — losing one desyncs
-        // the UI until reconnect, so use a blocking send. The app
-        // drains this channel every event-loop pass.
+        // the UI until reconnect, so never `try_send`. The app's channel
+        // is unbounded (review P1-16), so this never blocks the network
+        // thread either; the app drains it every event-loop pass.
         other => {
             let _ = msg_tx.send(other);
             wake();
         }
     }
+}
+
+/// What woke the network loop.
+enum Woke {
+    Control(NetworkControl),
+    /// The voice encoder's next packet, or its channel closing with
+    /// the engine.
+    Voice(Result<AudioPacket, RecvError>),
+    /// A datagram rang, a deadline came, or there was no waiting.
+    Due,
+    Gone,
 }
 
 fn run_network_loop(
@@ -3293,60 +3367,62 @@ fn run_network_loop(
     wake: &WakeFn,
 ) {
     let mut client: Option<NetworkClient> = None;
+    let mut voice: Option<VoiceLink> = None;
+    let no_voice = crossbeam_channel::never::<AudioPacket>();
+    let no_inbound = crossbeam_channel::never::<()>();
     let mut running = true;
 
     while running {
         LOOP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Block on the control channel. Outbound work (voice frames
-        // from the voice thread, video chunks from the screen thread)
-        // wakes this loop *immediately*; so does an arriving datagram
-        // where the inbound wake runs (`inbound_wake.rs`). The timeout
-        // is `loop_wait`: 1 ms while the transport has per-tick work
-        // (or nothing announces datagrams and the socket must be
-        // polled), up to 100 ms on a quiet connection — always capped
-        // by the transport's next timer so acks and keep-alives are
-        // never late. Disconnected there is nothing to poll, so block
-        // outright.
-        let recv_result = match &mut client {
-            Some(c) if c.has_backlog() => control_rx.try_recv().map_err(|e| match e {
-                TryRecvError::Empty => RecvTimeoutError::Timeout,
-                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
-            }),
+        // Block on what can have work for us: a command (video chunks
+        // from the screen thread among them), the voice encoder's next
+        // packet (review P1-5), an arriving datagram through the inbound
+        // wake (`inbound_wake.rs`). The timeout is `loop_wait`: until the
+        // transport's next deadline or our own periodic stats, so acks,
+        // keep-alives, video deadlines and the upload pacer are never
+        // late and nothing ticks for nothing (review P1-2); 1 ms only
+        // when nothing announces datagrams and the socket must be
+        // polled. Disconnected there is no deadline, so no timeout.
+        let outgoing = voice.as_ref().map_or(&no_voice, |v| &v.outgoing);
+        let woke = match &mut client {
+            Some(c) if c.has_backlog() => match control_rx.try_recv() {
+                Ok(ctrl) => Woke::Control(ctrl),
+                Err(TryRecvError::Empty) => Woke::Due,
+                Err(TryRecvError::Disconnected) => Woke::Gone,
+            },
             Some(c) => {
                 let wait = c.loop_wait(Instant::now());
-                match c.inbound_ready() {
-                    Some(ready) => crossbeam_channel::select! {
-                        recv(control_rx) -> msg => {
-                            msg.map_err(|_| RecvTimeoutError::Disconnected)
+                let ready = c.inbound_ready();
+                crossbeam_channel::select! {
+                    recv(control_rx) -> msg => msg.map_or(Woke::Gone, Woke::Control),
+                    recv(outgoing) -> packet => Woke::Voice(packet),
+                    recv(ready.as_ref().unwrap_or(&no_inbound)) -> rang => {
+                        if rang.is_ok() {
+                            c.took_inbound();
+                        } else {
+                            c.lost_inbound();
                         }
-                        recv(ready) -> rang => {
-                            if rang.is_ok() {
-                                c.took_inbound();
-                            } else {
-                                c.lost_inbound();
-                            }
-                            Err(RecvTimeoutError::Timeout)
-                        }
-                        default(wait) => Err(RecvTimeoutError::Timeout),
+                        Woke::Due
                     },
-                    None => control_rx.recv_timeout(wait),
+                    default(wait) => Woke::Due,
                 }
             }
-            None => control_rx
-                .recv()
-                .map_err(|_| RecvTimeoutError::Disconnected),
+            None => crossbeam_channel::select! {
+                recv(control_rx) -> msg => msg.map_or(Woke::Gone, Woke::Control),
+                recv(outgoing) -> packet => Woke::Voice(packet),
+            },
         };
 
-        match recv_result {
-            Ok(ctrl) => {
-                if !handle_control(ctrl, &mut client, msg_tx, wake) {
+        match woke {
+            Woke::Control(ctrl) => {
+                if !handle_control(ctrl, &mut client, &mut voice, msg_tx, wake) {
                     running = false;
                 }
                 // Drain a bounded burst of whatever else queued up.
                 for _ in 0..63 {
                     match control_rx.try_recv() {
                         Ok(ctrl) => {
-                            if !handle_control(ctrl, &mut client, msg_tx, wake) {
+                            if !handle_control(ctrl, &mut client, &mut voice, msg_tx, wake) {
                                 running = false;
                             }
                         }
@@ -3358,15 +3434,34 @@ fn run_network_loop(
                     }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Woke::Voice(Ok(packet)) => send_voice(client.as_mut(), voice.as_ref(), &packet),
+            // The engine is gone; the voice thread says so too, or
+            // hands over the next one.
+            Woke::Voice(Err(RecvError)) => voice = None,
+            Woke::Due => {}
+            Woke::Gone => break,
+        }
+
+        // Whatever else the encoder has queued, before the transport
+        // flushes.
+        if let Some(link) = &voice {
+            loop {
+                match link.outgoing.try_recv() {
+                    Ok(packet) => send_voice(client.as_mut(), Some(link), &packet),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        voice = None;
+                        break;
+                    }
+                }
+            }
         }
 
         // Poll network
         if let Some(c) = &mut client {
             c.update();
             for msg in c.poll_messages() {
-                route_message(msg, msg_tx, voice_tx, screen_tx, wake);
+                route_message(msg, msg_tx, voice.as_ref(), voice_tx, screen_tx, wake);
             }
             if c.is_closed() {
                 // The reason was already reported by the session.
@@ -3374,4 +3469,27 @@ fn run_network_loop(
             }
         }
     }
+}
+
+/// One of our voice packets onto the wire, unless a microphone test
+/// owns the engine or there is no session. The packet's ssrc is not
+/// sent: the server stamps the authenticated sender id on relay.
+fn send_voice(client: Option<&mut NetworkClient>, link: Option<&VoiceLink>, packet: &AudioPacket) {
+    let (Some(c), Some(link)) = (client, link) else {
+        return;
+    };
+    if link.testing.load(Ordering::Relaxed) {
+        return;
+    }
+    let flags = match packet.header.payload_type {
+        PayloadType::Red => VOICE_FLAG_RED,
+        PayloadType::Opus => 0,
+    };
+    c.send_voice_frame(
+        Instant::now(),
+        packet.header.seq,
+        packet.header.timestamp,
+        flags,
+        &packet.opus_data,
+    );
 }

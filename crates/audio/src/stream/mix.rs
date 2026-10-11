@@ -17,63 +17,31 @@
 //! stream keeps its own stereo output (`stream::output`).
 //!
 //! One SPSC ring per source, all held by [`BUS`]; the voice worker is the
-//! only reader. A source primes to [`PREBUFFER`] before it plays (and
-//! again after running dry). Above [`CATCH_UP_START`] queued — a burst
-//! from the network, the sender's clock running ahead of the phone's, a
-//! voice output that stopped reading for a moment — it plays a little
-//! faster (1–4 %, [`MAX_SPEEDUP`]) until it is back to
-//! [`CATCH_UP_STOP`]: some seconds slightly quick instead of the
-//! 150 ms jump the old trim made, heard as a skip (2026-10-08, the
-//! A07 sat at 250–290 ms queued for a minute after one burst). Only a
-//! backlog past [`MAX_FILL`] is still dropped at once. A source whose
-//! decoder let go is dropped at once: a stream that stopped stops.
+//! only reader. Each source is read at a steady pace (`stream::pace`):
+//! it primes to 100 ms before it plays (and again after running dry), a
+//! backlog drains by playing 1–4 % faster instead of the 150 ms jump the
+//! old trim made, heard as a skip, and only one past 400 ms is still
+//! dropped at once. A source whose decoder let go is dropped at once: a
+//! stream that stopped stops.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex, PoisonError, TryLockError,
 };
 
-use rtrb::{Consumer, Producer, RingBuffer};
+use rtrb::{Producer, RingBuffer};
+
+use crate::stream::pace::{PacedReader, Pacing};
 
 /// What one source may hold: 500 ms at 48 kHz mono.
 const CAPACITY: usize = 24_000;
-/// Fill a source waits for before it plays, and after running dry:
-/// 100 ms — network jitter plus one Android playback callback, which the
-/// voice worker refills in one pass (up to 40 ms, ANDROID-SPEC.md D24).
-pub(crate) const PREBUFFER: usize = 4_800;
-/// Past this much queued (180 ms) a source plays faster…
-pub(crate) const CATCH_UP_START: usize = 8_640;
-/// …until it is back down to this (120 ms: the cushion and a burst).
-pub(crate) const CATCH_UP_STOP: usize = 5_760;
-/// How much faster: in proportion to the excess over the stop level
-/// (1 % per 40 ms), between these — 4 % is about two-thirds of a
-/// semitone for a second or two, 1 % a sixth of one — so it eases in
-/// and out. 160 ms over takes ~10 s to drain.
-const SPEEDUP_PER_SECOND: f32 = 0.25;
-const MIN_SPEEDUP: f32 = 0.01;
-pub(crate) const MAX_SPEEDUP: f32 = 0.04;
-/// Past this much queued (400 ms) the oldest audio is dropped at once…
-pub(crate) const MAX_FILL: usize = 19_200;
-/// …down to this (200 ms), and the catch-up does the rest.
-pub(crate) const TRIM_TO: usize = 9_600;
 
 /// The process's bus: stream decoders write, the phone's voice output
 /// reads.
 pub(crate) static BUS: MixBus = MixBus::new();
 
-struct Source {
-    consumer: Consumer<f32>,
-    /// Playing (prebuffered); false until [`PREBUFFER`] is queued.
-    primed: bool,
-    /// Playing faster to bring the queue back down (see the module docs).
-    catching_up: bool,
-    /// The last sample consumed, and where past it the next one played
-    /// sits (0 < `phase` ≤ 1 of a sample; 1 is the first one queued, as
-    /// in plain reading): the faster reading interpolates between
-    /// samples.
-    prev: f32,
-    phase: f32,
-}
+/// A stream's ring, read at a steady pace (`stream::pace`).
+type Source = PacedReader<1>;
 
 /// Stream sources and the voice outputs mixing them.
 pub(crate) struct MixBus {
@@ -102,20 +70,17 @@ impl MixBus {
         Mixer(self)
     }
 
-    /// A new source; it plays once its first [`PREBUFFER`] is queued and
+    /// A new source; it plays once its first cushion is queued and
     /// leaves the bus when dropped.
     pub(crate) fn source(&self) -> MixSource {
         let (producer, consumer) = RingBuffer::new(CAPACITY);
         self.sources
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(Source {
+            .push(Source::new(
                 consumer,
-                primed: false,
-                catching_up: false,
-                prev: 0.0,
-                phase: 1.0,
-            });
+                Pacing::at_rate(crate::OPUS_SAMPLE_RATE),
+            ));
         MixSource { producer }
     }
 
@@ -131,9 +96,9 @@ impl MixBus {
         // A decoder that let go (the viewer closed, the stream moved to an
         // output of its own) is done: its tail would only play late — a
         // source left unprimed would never even drain.
-        sources.retain(|s| !s.consumer.is_abandoned());
+        sources.retain(|s| !s.is_abandoned());
         for source in sources.iter_mut() {
-            source.mix_into(out);
+            source.add_to(out);
         }
     }
 
@@ -143,106 +108,6 @@ impl MixBus {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
-    }
-}
-
-impl Source {
-    /// This source's next hop, added to `out`.
-    fn mix_into(&mut self, out: &mut [f32]) {
-        let queued = self.consumer.slots();
-        if queued > MAX_FILL {
-            if let Ok(chunk) = self.consumer.read_chunk(queued - TRIM_TO) {
-                chunk.commit_all();
-            }
-            self.phase = 1.0;
-        }
-        let queued = self.consumer.slots();
-        if !self.primed {
-            if queued < PREBUFFER {
-                return;
-            }
-            self.primed = true;
-        }
-        if queued > CATCH_UP_START {
-            self.catching_up = true;
-        }
-        #[allow(clippy::cast_precision_loss)] // a hop
-        let len = out.len() as f32;
-        if self.catching_up {
-            if queued > CATCH_UP_STOP {
-                #[allow(clippy::cast_precision_loss)] // samples, < 2^24
-                let excess = (queued - CATCH_UP_STOP) as f32 / crate::OPUS_SAMPLE_RATE as f32;
-                let speedup = (excess * SPEEDUP_PER_SECOND).clamp(MIN_SPEEDUP, MAX_SPEEDUP);
-                self.read_faster(out, self.phase + len * (1.0 + speedup), queued);
-                return;
-            }
-            // Back down. This last hop ends on a whole sample (it is at
-            // most 1/480 faster), so the plain reading below carries on
-            // from exactly there.
-            self.catching_up = false;
-            if self.phase < 1.0 && queued > out.len() + 1 {
-                self.read_faster(out, (self.phase + len).ceil(), queued);
-                return;
-            }
-        }
-        self.phase = 1.0;
-        let n = queued.min(out.len());
-        if let Ok(chunk) = self.consumer.read_chunk(n) {
-            let (first, second) = chunk.as_slices();
-            for (slot, &sample) in out.iter_mut().zip(first.iter().chain(second)) {
-                *slot += sample;
-            }
-            if let Some(&last) = second.last().or(first.last()) {
-                self.prev = last;
-            }
-            chunk.commit_all();
-        }
-        if n < out.len() {
-            // Ran dry: wait for a cushion again rather than play
-            // every arriving packet as a click.
-            self.primed = false;
-        }
-    }
-
-    /// One hop played from positions `phase` up to (not including)
-    /// `end`, evenly spaced, by linear interpolation between the
-    /// samples: `prev` is position 0, the queue's samples 1, 2, ….
-    /// Afterwards the sample just before `end` is the new `prev`. Only
-    /// while far more is queued than a hop needs (above
-    /// [`CATCH_UP_STOP`]), so it does not run dry here.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )] // positions within one hop
-    fn read_faster(&mut self, out: &mut [f32], end: f32, queued: usize) {
-        let step = (end - self.phase) / out.len() as f32;
-        // Consumed: every sample before `end`.
-        let used = (end.ceil() as usize).saturating_sub(1).min(queued);
-        // Interpolating up to `end` reads one sample further.
-        let peek = (used + 1).min(queued);
-        let Ok(chunk) = self.consumer.read_chunk(peek) else {
-            return;
-        };
-        let (first, second) = chunk.as_slices();
-        let sample = |i: usize| -> f32 {
-            match i {
-                0 => self.prev,
-                i if i - 1 < first.len() => first[i - 1],
-                i => second.get(i - 1 - first.len()).copied().unwrap_or(0.0),
-            }
-        };
-        for (i, slot) in out.iter_mut().enumerate() {
-            let pos = self.phase + i as f32 * step;
-            let k = pos.floor();
-            let frac = pos - k;
-            let k = k as usize;
-            *slot += sample(k) * (1.0 - frac) + sample((k + 1).min(peek)) * frac;
-        }
-        let prev = sample(used);
-        chunk.commit(used);
-        self.prev = prev;
-        self.phase = end - used as f32;
     }
 }
 
@@ -276,6 +141,12 @@ impl MixSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The levels at 48 kHz (`pace`'s tests pin them).
+    const PREBUFFER: usize = 4_800;
+    const CATCH_UP_STOP: usize = 5_760;
+    const MAX_FILL: usize = 19_200;
+    const TRIM_TO: usize = 9_600;
 
     fn hop() -> Vec<f32> {
         vec![0.0; 480]
@@ -323,13 +194,13 @@ mod tests {
         source.push(&vec![0.1; MAX_FILL + 2_000]);
         let mut out = hop();
         bus.mix_into(&mut out);
-        let left = bus.sources.lock().unwrap()[0].consumer.slots();
+        let left = bus.sources.lock().unwrap()[0].queued();
         // Trimmed, then one hop read a little faster than it plays.
         assert!((TRIM_TO - 500..TRIM_TO - 480).contains(&left), "{left}");
     }
 
     fn queued(bus: &MixBus) -> usize {
-        bus.sources.lock().unwrap()[0].consumer.slots()
+        bus.sources.lock().unwrap()[0].queued()
     }
 
     /// The A07's case: one burst left 280 ms queued. It comes back down
@@ -381,7 +252,7 @@ mod tests {
             check(&out, hops);
         }
         feed(&mut source, 13_440 - PREBUFFER); // the burst: 280 ms now
-        let catching_up = |bus: &MixBus| bus.sources.lock().unwrap()[0].catching_up;
+        let catching_up = |bus: &MixBus| bus.sources.lock().unwrap()[0].catching_up();
         let mut hops = 0;
         loop {
             feed(&mut source, 480); // the stream keeps coming, 10 ms a hop

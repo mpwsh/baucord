@@ -95,9 +95,11 @@ impl AppState {
     }
 
     /// A roster row asked for its menu (a right-click, or a left-click
-    /// on a user row). The decorated row already carries the rank
-    /// rule and the channel powers.
+    /// on a user row). The rank rule (spec §8) and the channel powers
+    /// are worked out here, from the session, rather than carried on
+    /// every row (review P1-9).
     pub(super) fn open_user_menu(&mut self, index: i32, x: f32, y: f32) {
+        use client::permissions as p;
         let Some(row) = usize::try_from(index)
             .ok()
             .and_then(|i| self.users_model.row_data(i))
@@ -106,27 +108,46 @@ impl AppState {
         };
         let session = self.menu_session();
         if row.is_channel {
-            let Ok(id) = u16::try_from(row.channel_id) else {
+            let Some(channel) = u16::try_from(row.channel_id)
+                .ok()
+                .and_then(|id| self.channels.iter().find(|c| c.id == id))
+            else {
                 return;
             };
             let facts = menu::ChannelFacts {
-                id,
-                owned: row.owned,
-                from_config: row.from_config,
+                id: channel.id,
+                owned: channel.owned,
+                from_config: channel.from_config,
             };
             let entries = menu::channel_menu(&session, &facts);
-            self.show_menu(entries, MenuTarget::Channel(id), x, y);
+            self.show_menu(entries, MenuTarget::Channel(facts.id), x, y);
         } else {
+            let channel_id = u16::try_from(row.channel_id).unwrap_or(0);
+            // Nothing applies to ourselves.
+            let (outranked, role_editable, channel_kickable) = if row.is_us {
+                (false, false, false)
+            } else {
+                let theirs =
+                    self.rank_of_client(roster::join_id(row.client_id_lo, row.client_id_hi));
+                let owns_their_channel =
+                    self.channels.iter().any(|c| c.id == channel_id && c.owned);
+                (
+                    theirs < session.our_rank,
+                    theirs <= session.our_rank,
+                    p::has(self.permissions, p::MANAGE_CHANNELS)
+                        || (owns_their_channel && p::has(self.permissions, p::MANAGE_OWN_CHANNELS)),
+                )
+            };
             let facts = menu::UserFacts {
                 is_us: row.is_us,
                 role: Role::from_int(row.role).unwrap_or_default(),
                 sharing: row.sharing,
                 local_muted: row.local_muted,
-                outranked: row.outranked,
+                outranked,
                 is_admin: row.role == 4,
-                role_editable: row.role_editable,
-                channel_kickable: row.channel_kickable,
-                channel_id: u16::try_from(row.channel_id).unwrap_or(0),
+                role_editable,
+                channel_kickable,
+                channel_id,
                 blocked: self
                     .user_id_at(index)
                     .is_some_and(|c| self.client_blocked(c)),

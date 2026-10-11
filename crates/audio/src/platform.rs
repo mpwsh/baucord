@@ -285,18 +285,26 @@ pub fn request_low_latency_buffer(supported: &SupportedBufferSize, sample_rate: 
 
 // ── Worker wakeups ──────────────────────────────────────────────────────
 
+/// How long a worker blocked on its device latch waits before looking
+/// again on its own. Only a safety net: every backend rings the latch
+/// on each callback, and a stop rings it too, so this is not a tick
+/// (review P1-4: the 5 and 10 ms timers beside the latch woke the
+/// voice workers 100–200 times a second for no audio).
+pub(crate) const LATCH_SAFETY_WAIT: Duration = Duration::from_millis(200);
+
 /// Block until the audio callback pings the wake latch, or until
 /// `timeout` elapses — whichever comes first.
 ///
-/// If the signaling side is gone (stream torn down while the worker is
-/// still running, e.g. a failed device start), fall back to a plain sleep
-/// so the loop degrades to the old polling behavior instead of busy-
-/// spinning on a disconnected channel.
-pub fn wait_for_wake(wake_rx: &Receiver<()>, timeout: Duration) {
-    match wake_rx.recv_timeout(timeout) {
-        Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-        Err(RecvTimeoutError::Disconnected) => std::thread::sleep(timeout),
-    }
+/// `false` once the latch is gone: every sender was dropped (the stream
+/// and its owner), so nothing will ring it again. That returns at once,
+/// so a stop never waits out the timeout; the caller leaves its loop
+/// rather than spin on the dead channel.
+#[must_use]
+pub fn wait_for_wake(wake_rx: &Receiver<()>, timeout: Duration) -> bool {
+    !matches!(
+        wake_rx.recv_timeout(timeout),
+        Err(RecvTimeoutError::Disconnected)
+    )
 }
 
 /// `thread::spawn` with a name.

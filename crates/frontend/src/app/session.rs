@@ -130,6 +130,10 @@ impl AppState {
     /// disconnects.
     pub(super) fn teardown_connection(&mut self) {
         self.connected = false;
+        // No session, no keybinds: the key watcher stops (review P1-3).
+        if let Some(hotkeys) = &mut self.hotkeys {
+            hotkeys.set_connected(false);
+        }
         self.permissions = 0;
         self.our_user_id = None;
         self.server_persistent = true;
@@ -188,8 +192,16 @@ impl AppState {
         }
         self.active_sharers.clear();
         self.sharer_ids.clear();
-        for (_, viewer) in self.viewers.drain() {
+        // Closing a viewer only hides it: the screen thread must be told
+        // too, or it keeps the stream's decoder, buffers and audio for
+        // the rest of the process — the sharer's id is gone with the
+        // session, so nothing else would ever end it.
+        for (client_id, viewer) in self.viewers.drain() {
             viewer.close();
+            self.screen
+                .tx
+                .send(ScreenControl::StopWatching { client_id })
+                .ok();
         }
         crate::viewers::close_gallery(self);
         self.gifs.clear();
@@ -445,11 +457,6 @@ impl AppState {
         self.sync_keep_alive(false);
     }
 
-    /// Tell the voice engine whether we are in a voice room (or testing
-    /// the microphone), when that changes. On a phone the microphone
-    /// and the call path go with it: nothing records in the lobby
-    /// (ANDROID-SPEC.md D53, IOS-SPEC.md D51). The desktop keeps its
-    /// streams as they were.
     /// Tell the host what keeps the session alive off screen, when that
     /// changes: connected in a voice room (the microphone open) or in
     /// the lobby (D63). `force` says it again as it is — on a phone
@@ -466,13 +473,19 @@ impl AppState {
         }
     }
 
+    /// Tell the voice engine whether we are in a voice room (or testing
+    /// the microphone), when that changes. On a phone the microphone
+    /// and the call path go with it: nothing records in the lobby
+    /// (ANDROID-SPEC.md D53, IOS-SPEC.md D51). The desktop keeps its
+    /// streams and drops what the microphone hears, so nothing is
+    /// encoded and sent for the relay to throw away (review P1-6).
     pub(super) fn sync_voice_room(&mut self) {
         // Disconnected, the engine is on its way out (the deferred
         // Stop) or a microphone test owns it: leave it as it is.
-        if !audio::RELEASES_MIC || (!self.connected && !self.is_testing_mic) {
+        if !self.connected && !self.is_testing_mic {
             return;
         }
-        let in_room = !self.in_lobby() || self.is_testing_mic;
+        let in_room = self.voice_room_wanted();
         if in_room != self.voice_in_room {
             self.voice_in_room = in_room;
             self.voice.tx.send(VoiceControl::SetInRoom(in_room)).ok();

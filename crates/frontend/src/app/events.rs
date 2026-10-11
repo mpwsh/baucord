@@ -88,13 +88,15 @@ impl AppState {
                 info!("Voice engine ready");
             }
             VoiceEvent::Error(e) => self.show_error(&e),
+            // Our own speech shows from this local edge, at once; the
+            // server's echo of it is ignored (`UserSpeaking`).
             VoiceEvent::SpeakingChanged(speaking) => {
-                if let Some(id) = self.our_client_id
-                    && let Some(user) = self.users.get_mut(&id)
-                {
-                    user.is_speaking = speaking;
+                if let Some(id) = self.our_client_id {
+                    if let Some(user) = self.users.get_mut(&id) {
+                        user.is_speaking = speaking;
+                    }
+                    self.refresh_voice_row(id);
                 }
-                self.update_user_list();
             }
         }
     }
@@ -215,6 +217,11 @@ impl AppState {
         match msg {
             NetworkMessage::Connected { lobby, safety } => {
                 self.connected = true;
+                // Keybinds act only in a session: watched from here to
+                // `teardown_connection` (review P1-3).
+                if let Some(hotkeys) = &mut self.hotkeys {
+                    hotkeys.set_connected(true);
+                }
                 self.lobby = lobby;
                 self.safety = safety;
                 self.account_deleted = false;
@@ -953,14 +960,20 @@ impl AppState {
                     );
                 }
             }
+            // Speaking and audio state touch one row, never the whole
+            // roster (review P1-9).
             NetworkMessage::UserSpeaking {
                 client_id,
                 is_speaking,
             } => {
-                if let Some(user) = self.users.get_mut(&client_id) {
-                    user.is_speaking = is_speaking;
+                // Ours is the local edge's (`SpeakingChanged`): handling
+                // the echo too updated our row twice per edge.
+                if Some(client_id) != self.our_client_id {
+                    if let Some(user) = self.users.get_mut(&client_id) {
+                        user.is_speaking = is_speaking;
+                    }
+                    self.refresh_voice_row(client_id);
                 }
-                self.update_user_list();
             }
             NetworkMessage::UserAudioState {
                 client_id,
@@ -971,7 +984,7 @@ impl AppState {
                     user.is_self_muted = muted;
                     user.is_self_deafened = deafened;
                 }
-                self.update_user_list();
+                self.refresh_voice_row(client_id);
             }
             NetworkMessage::NetworkStats {
                 rtt_ms,
@@ -983,7 +996,7 @@ impl AppState {
                 // the tray or minimized). Labels refresh at the next 2 s
                 // sample once visible again.
                 if self.main_on_screen() {
-                    let audio_ms = self.voice.shared.jitter_buffer_ms.load(Ordering::Relaxed);
+                    let audio_ms = self.voice.shared.jitter_buffer_ms();
                     self.update_latency(rtt_ms, loss_pct, Some(audio_ms), kbps_up, kbps_down);
                 }
             }

@@ -13,10 +13,12 @@
 //! TLS handshake, before a password could ever be sent.
 //!
 //! Rotation (`baucord-server rotate-key`) moves the current key to
-//! `retired/` and issues the new certificate with, for each retired key
-//! still within [`RETIRED_KEY_RETENTION`], `(retired_spki, signature by
-//! the retired key over the new spki)`. A client pinned to a retired key
-//! re-pins silently.
+//! `retired/<stem>.<unix-secs>.key` and issues the new certificate with,
+//! for each retired key still within [`RETIRED_KEY_RETENTION`],
+//! `(retired_spki, signature by the retired key over the new spki)`. A
+//! client pinned to a retired key re-pins silently. Retention counts from
+//! the time in the file name, which survives copies and restores; a
+//! `<stem>.key` retired by an older build falls back to the file's mtime.
 
 use std::{
     fmt, fs,
@@ -47,8 +49,8 @@ use crate::der;
 pub const SUCCESSOR_EXTENSION_OID: &[u64] = &[2, 25, 3_276_867_917_789_066_850];
 
 /// How long a retired key keeps vouching for its successor **[default:
-/// 2 years]**. A client that hasn't connected in longer than this gets
-/// the identity prompt.
+/// 2 years]**, counted from its retirement. A client that hasn't
+/// connected in longer than this gets the identity prompt.
 pub const RETIRED_KEY_RETENTION: Duration = Duration::from_hours(2 * 365 * 24);
 
 /// Certificate validity **[default: 20 years]**. Cosmetic — the client
@@ -304,6 +306,30 @@ pub enum IdentityError {
     Tls(rustls::Error),
 }
 
+/// A key under `retired/`: when it was retired and whether it still
+/// vouches for the current key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredKey {
+    pub fingerprint: Fingerprint,
+    /// Seconds since the Unix epoch.
+    pub retired_at: u64,
+    /// The time is the file's mtime, not a recorded one: builds before
+    /// 1.2.1 named the file `<stem>.key`, and their rename kept the key's
+    /// creation time there (review P1-15).
+    pub from_mtime: bool,
+    /// Within [`RETIRED_KEY_RETENTION`] of `retired_at`.
+    pub vouching: bool,
+}
+
+impl RetiredKey {
+    /// When it stops vouching, in seconds since the Unix epoch.
+    #[must_use]
+    pub fn vouches_until(&self) -> u64 {
+        self.retired_at
+            .saturating_add(RETIRED_KEY_RETENTION.as_secs())
+    }
+}
+
 /// The server's key, its current certificate, and the retired keys that
 /// vouch for it.
 pub struct ServerIdentity {
@@ -386,9 +412,25 @@ impl ServerIdentity {
         let staged = dir.join("identity.key.new");
         write_private(&staged, new_key.serialize_pem().as_bytes())?;
 
-        let retired_path = retired_dir.join(format!("{}.key", current.fingerprint.file_stem()));
+        // Retention counts from the retirement, so record it: a rename
+        // keeps the key's creation time as the mtime, and a key retired
+        // after two years never vouched (review P1-15). The name survives
+        // copies and restores; the mtime is set too for an older build.
+        let now = SystemTime::now();
+        let retired_path = retired_dir.join(format!(
+            "{}.{}.key",
+            current.fingerprint.file_stem(),
+            unix_secs(now)
+        ));
         fs::rename(&key_path, &retired_path)
             .map_err(|e| IdentityError::Io(retired_path.clone(), e))?;
+        if let Err(e) = fs::File::options()
+            .write(true)
+            .open(&retired_path)
+            .and_then(|f| f.set_modified(now))
+        {
+            warn!("Could not set the date of {}: {e}", retired_path.display());
+        }
         fs::rename(&staged, &key_path).map_err(|e| IdentityError::Io(key_path.clone(), e))?;
         info!(
             "Rotated server identity: {} retired to {}",
@@ -426,6 +468,16 @@ impl ServerIdentity {
         self.retired
             .iter()
             .map(|k| Fingerprint::of_spki(&k.subject_public_key_info()))
+            .collect()
+    }
+
+    /// Every readable key under `<dir>/retired/`, newest retirement
+    /// first, vouching or not: what `rotate-key` reports.
+    #[must_use]
+    pub fn retired_keys(dir: &Path) -> Vec<RetiredKey> {
+        read_retired(&dir.join(RETIRED_DIR), SystemTime::now())
+            .into_iter()
+            .map(|(info, _)| info)
             .collect()
     }
 
@@ -499,7 +551,26 @@ fn load_key(path: &Path) -> Result<KeyPair, IdentityError> {
     Ok(key)
 }
 
+/// The retired keys still within retention.
 fn load_retired(dir: &Path) -> Vec<KeyPair> {
+    read_retired(dir, SystemTime::now())
+        .into_iter()
+        .filter_map(|(info, key)| {
+            if !info.vouching {
+                info!(
+                    "Retired key {} was retired more than the retention window ago; no longer \
+                     vouching",
+                    info.fingerprint
+                );
+            }
+            info.vouching.then_some(key)
+        })
+        .collect()
+}
+
+/// Every readable `*.key` in `dir` with its retirement time, newest
+/// first, one entry per key.
+fn read_retired(dir: &Path, now: SystemTime) -> Vec<(RetiredKey, KeyPair)> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -509,25 +580,51 @@ fn load_retired(dir: &Path) -> Vec<KeyPair> {
         if path.extension().and_then(|e| e.to_str()) != Some("key") {
             continue;
         }
-        let age = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| SystemTime::now().duration_since(t).ok())
-            .unwrap_or(Duration::ZERO);
-        if age > RETIRED_KEY_RETENTION {
-            info!(
-                "Retired key {} is older than the retention window; no longer vouching",
-                path.display()
-            );
-            continue;
-        }
-        match load_key(&path) {
-            Ok(key) => keys.push(key),
-            Err(e) => warn!("Skipping unreadable retired key: {e}"),
-        }
+        let recorded = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(retired_at_from_name);
+        let (retired_at, from_mtime) = recorded.map_or_else(
+            || {
+                let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+                (mtime.map_or_else(|| unix_secs(now), unix_secs), true)
+            },
+            |secs| (secs, false),
+        );
+        let key = match load_key(&path) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!("Skipping unreadable retired key: {e}");
+                continue;
+            }
+        };
+        let age = unix_secs(now).saturating_sub(retired_at);
+        let info = RetiredKey {
+            fingerprint: Fingerprint::of_spki(&key.subject_public_key_info()),
+            retired_at,
+            from_mtime,
+            vouching: age <= RETIRED_KEY_RETENTION.as_secs(),
+        };
+        keys.push((info, key));
     }
+    // A key retired twice (an old identity restored, then rotated again)
+    // vouches once, from its latest retirement.
+    keys.sort_by_key(|(info, _)| std::cmp::Reverse(info.retired_at));
+    let mut seen = std::collections::HashSet::new();
+    keys.retain(|(info, _)| seen.insert(info.fingerprint));
     keys
+}
+
+/// The retirement time in `<stem>.<unix-secs>.key`; `None` for an older
+/// build's `<stem>.key` (the stem is URL-safe base64, never a dot).
+fn retired_at_from_name(name: &str) -> Option<u64> {
+    let (_, secs) = name.strip_suffix(".key")?.rsplit_once('.')?;
+    secs.parse().ok()
+}
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), IdentityError> {
@@ -908,6 +1005,120 @@ mod tests {
         ));
         assert!(dir.join("identity.pem").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    const THREE_YEARS: Duration = Duration::from_hours(3 * 365 * 24);
+
+    fn scratch_identity_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("baucord-{tag}-{}", rand::random::<u64>()))
+    }
+
+    fn set_mtime_ago(path: &Path, ago: Duration) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(SystemTime::now() - ago))
+            .expect("set mtime");
+    }
+
+    fn only_retired_file(dir: &Path) -> PathBuf {
+        let files: Vec<PathBuf> = fs::read_dir(dir.join(RETIRED_DIR))
+            .expect("retired dir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        files[0].clone()
+    }
+
+    #[test]
+    fn a_key_made_years_ago_vouches_after_its_rotation() {
+        // Operators rotate old keys; the rename used to keep the key's
+        // creation time, and retention read that (review P1-15).
+        let dir = scratch_identity_dir("id-old");
+        let (first, _) = ServerIdentity::load_or_create(&dir).expect("create");
+        set_mtime_ago(&dir.join(KEY_FILE), THREE_YEARS);
+
+        let rotated = ServerIdentity::rotate(&dir).expect("rotate");
+        assert_eq!(rotated.retired_fingerprints(), vec![first.fingerprint()]);
+        let listed = ServerIdentity::retired_keys(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].fingerprint, first.fingerprint());
+        assert!(!listed[0].from_mtime);
+        assert!(listed[0].vouching);
+
+        // A copy or restore that loses the date changes nothing: the
+        // name carries it.
+        set_mtime_ago(&only_retired_file(&dir), THREE_YEARS);
+        let (again, created) = ServerIdentity::load_or_create(&dir).expect("reload");
+        assert!(!created);
+        assert_eq!(again.retired_fingerprints(), vec![first.fingerprint()]);
+        let v = PinnedVerifier::new(Some(first.fingerprint()));
+        assert!(matches!(
+            v.decide(again.cert_der()),
+            Some(Observation::Accepted {
+                trust: Trust::Successor { .. },
+                ..
+            })
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_counts_from_the_recorded_retirement() {
+        let dir = scratch_identity_dir("id-expired");
+        let (first, _) = ServerIdentity::load_or_create(&dir).expect("create");
+        fs::create_dir_all(dir.join(RETIRED_DIR)).expect("retired dir");
+        // Retired three years ago by its name; the fresh mtime is ignored.
+        let then = unix_secs(SystemTime::now() - THREE_YEARS);
+        let name = format!("{}.{then}.key", first.fingerprint().file_stem());
+        fs::rename(dir.join(KEY_FILE), dir.join(RETIRED_DIR).join(name)).expect("retire");
+
+        let (second, created) = ServerIdentity::load_or_create(&dir).expect("new key");
+        assert!(created);
+        assert!(second.retired_fingerprints().is_empty());
+        assert_eq!(
+            ServerIdentity::retired_keys(&dir),
+            vec![RetiredKey {
+                fingerprint: first.fingerprint(),
+                retired_at: then,
+                from_mtime: false,
+                vouching: false,
+            }]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_builds_retired_key_falls_back_to_its_mtime() {
+        let dir = scratch_identity_dir("id-legacy");
+        let (first, _) = ServerIdentity::load_or_create(&dir).expect("create");
+        fs::create_dir_all(dir.join(RETIRED_DIR)).expect("retired dir");
+        let legacy = dir
+            .join(RETIRED_DIR)
+            .join(format!("{}.key", first.fingerprint().file_stem()));
+        fs::rename(dir.join(KEY_FILE), &legacy).expect("retire");
+
+        let (second, _) = ServerIdentity::load_or_create(&dir).expect("new key");
+        assert_eq!(second.retired_fingerprints(), vec![first.fingerprint()]);
+        let listed = ServerIdentity::retired_keys(&dir);
+        assert!(listed[0].from_mtime && listed[0].vouching);
+
+        set_mtime_ago(&legacy, THREE_YEARS);
+        let (third, _) = ServerIdentity::load_or_create(&dir).expect("reload");
+        assert!(third.retired_fingerprints().is_empty());
+        assert!(!ServerIdentity::retired_keys(&dir)[0].vouching);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_retirement_time_is_read_only_from_the_new_names() {
+        assert_eq!(
+            retired_at_from_name("ab_-XY.1700000000.key"),
+            Some(1_700_000_000)
+        );
+        assert_eq!(retired_at_from_name("ab_-XY.key"), None);
+        assert_eq!(retired_at_from_name("ab.soon.key"), None);
+        assert_eq!(retired_at_from_name("ab.1700000000.pem"), None);
     }
 
     #[test]

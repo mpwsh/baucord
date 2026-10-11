@@ -32,7 +32,7 @@ impl CapturePump {
     /// One callback's worth of interleaved `f32` (`channels` per frame)
     /// → mono into the ring, then ping the worker.
     pub fn push(&mut self, data: &[f32], channels: usize) {
-        if self.config.muted.load(Ordering::Relaxed) {
+        if self.config.silenced() {
             self.input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
             return;
         }

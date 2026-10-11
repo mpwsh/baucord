@@ -38,7 +38,7 @@ ladder.
 | D1 | Platform AEC first; software AEC only as a measured fallback | the platform has the reference signal and the tuning; we have neither |
 | D2 | One setting, `audio.echo_cancellation`: **Auto** (default) / Always / Off | Auto = only when the output is speakers; nobody on headphones sees any change |
 | D3 | In AEC mode the streams are opened in Windows' **Communications** category; otherwise the category stays as today (`Other`) | that category is what turns the OS voice chain on — and what triggers Windows' "reduce other sounds" ducking, which headphone users must not get |
-| D4 | In AEC mode "Default" resolves to the **Default Communications Device**; otherwise the console default, as today | it is the device Windows users assign to calls; Discord and Teams follow it |
+| D4 | In AEC mode "Default" resolves to the **Default Communications Device**; otherwise the console default, as today (since 1.2.1 the Communications default unless the setting is Off, for the decision too: E13) | it is the device Windows users assign to calls; Discord and Teams follow it |
 | D5 | The active tier is *verified*, not assumed, and reported in `/audio`, the log and telemetry | an AEC that isn't there is the next bug report; the report is what tells tier 2 apart from "works" |
 | D6 | RNNoise stays on by default; the setting is unchanged | the OEM chain's own NS is device-dependent; removing ours on faith would regress quiet-room users |
 | D7 | The fallback (§8) is chosen after the tier reports from the users' machines, not now | two candidates with different costs; the probe data decides |
@@ -168,10 +168,12 @@ already follows.
 
 ### 4.3 Default devices
 
-`wants_aec` → `Role::Communications`; otherwise `Role::Console` as
-today. The Sound panel shows these as two separate "Default" entries;
-the settings page's device list keeps one "Default" row and the
-tooltip says which one applies.
+Since 1.2.1 (E13): the Communications default unless echo cancellation
+is Off, then the Console one (`communications_default`). That one
+answer is used for the Automatic decision, for both streams on or off
+the call path, and for the device watcher. The Sound panel shows these
+as two separate "Default" entries; the settings page's device list
+keeps one "Default" row and the tooltip says which one applies.
 
 ### 4.4 Vendor
 
@@ -183,11 +185,9 @@ implemented it, so the report says `platform` and nothing more.
 The existing default-device and device-loss paths reopen the streams;
 the open sequence re-evaluates `wants_aec` from the *new* render
 endpoint every time, so plugging in headphones drops out of AEC mode
-and unplugging them re-enters it, with the stats line saying so. When
-only the render device changes, the capture client's reference
-endpoint is updated with `set_echo_cancellation_render_endpoint`
-without reopening capture (the call is valid any time after
-`Initialize`); if that fails, reopen.
+and unplugging them re-enters it, with the stats line saying so. An
+output change that moves the plan or the reference reopens both sides
+(`restart_all`, E13); there is no in-place reference update.
 
 ### 4.6 Ducking
 
@@ -331,3 +331,4 @@ Windows in substance.
 | E10 | **iOS VPIO shipped (2026-10-07)**, as E8 planned: `native/vpio.rs` — one `VoiceProcessingIO` unit, bus 1 the processed microphone, bus 0 the speaker (the reference), 48 kHz mono `f32` client format both ways, max 4096 frames per slice (the locked screen), bypass 0 and read back after `initialize` (the verdict), advanced ducking at its minimum. Both sides must be on the unit or neither (its playback is the canceller's reference), so `plan_aec` opens it before either side starts and holds it for the plan (`vpio::prepare`); if it will not open, both sides take plain streams and the report says `none (voice-call path refused)`. The sides still open on their own and attach to the running unit (a process-wide `Weak`): each hands its ring through a one-slot mailbox the callback takes with `try_lock`, a dropped side flags its half off, and a half the callback lets go of goes back through a channel to be freed off the I/O thread — so either side can be reopened alone. `native/avsession.rs`: the session's mode (`voiceChat` on the call path, `default` otherwise, set in `plan_aec` with both streams closed), 48 kHz / 10 ms preferences, the route's output ports → `OutputKind` (`aec::ios_output_kind`, host-tested), the loudspeaker kept if the mode change moved the call to the earpiece, and the interruption-ended / media-services-reset notifications → both stream-failed flags → `service()` reopens **both** sides (`SHARED_VOICE_UNIT`). Not wanted (headphones under Automatic, or Off) → cpal's `RemoteIO` as before. The capture and render halves are shared with Android's backend (`native/pump.rs`). The default-device poll is skipped on iOS as on Android (routing is the session's). Known gaps: a watched stream's sound plays through its own `RemoteIO` (`StreamAudioOutput`), outside the unit's reference — not cancelled, and ducked a little (Android's E7 limit, the same shape); an interruption that never posts *ended* leaves voice stopped until the next reopen; the verdict reads back the bypass property, which says processing is on, not that it is cancelling | the iPhone's "aec: none (not on this platform yet)" was accurate until now |
 | E11 | **Asking Windows not to duck other apps** (2026-10-07; `native/wasapi.rs` `ask_not_to_duck`, `third_party/wasapi`). Users on 1.1.7 reported every other app much quieter while baucord was up: §4.6's accepted side effect, Windows' default "reduce other sounds by 80 %" on any Communications stream, was not acceptable in practice. Now each voice-path stream, after `Initialize` and before `Start`, asks for `AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS` through `IAudioClientDuckingControl` (Windows 10 build 20348+ / Windows 11), and the stream's open line says what Windows answered: `do-not-duck=requested`, `unavailable` (no such service: older Windows, or a capture stream if Windows offers it for render only) or `refused`. `wasapi` 0.24/0.25 keep the `IAudioClient` private, so the crate is vendored with one accessor (`AudioClient::as_iaudioclient`, BAUCORD-PATCH.md there) behind `[patch.crates-io]`. Not yet known: whether it stops ducking caused by the capture stream — Microsoft documents it for render streams, and `IAudioSessionControl2::SetDuckingPreference` is no help (it protects the app being lowered, not the one lowering; a calling app that sets it still ducks others). Windows 10 keeps ducking either way. If Windows 11 still ducks with `requested` on both lines, the remaining fixes are the software canceller (§8: no Communications stream at all) or Auto leaving speakers off the call path; the user's own fix is Sound settings → Communications → "Do nothing" (`control mmsys.cpl,,3`) | the reports came from people who keep a game or music playing beside the call — the case §4.6 underrated |
 | E12 | **A watched stream on a phone's call path is part of the reference** (2026-10-08; ANDROID-SPEC.md D56, IOS-SPEC.md D52): it is mixed into the voice output, so the platform canceller removes it from the microphone like the voice — E7's "screen-share audio is a media stream outside the voice path" no longer holds there. The desktop keeps the stream on its own output (Windows' canceller references the whole endpoint) |
+| E13 | **The output and "Default" move both sides** (2026-10-10, 1.2.1, review P1-18; `audio/src/lib.rs` `set_output_device`, `communications_default`, `native/wasapi.rs`). A new output only reopened playback, so capture kept the old reference and the old plan: picking headphones left the canceller on (and the speakers' reference), picking speakers after headphones left it off. Now an output change reopens both sides when the plan goes stale or the reference changes, and a capture with no output picked passes no reference, so Windows follows the Communications default itself. "Default" is resolved once from the setting: the Communications device unless echo cancellation is Off, for Automatic's decision, both streams and the device watcher alike; the report names a reference only when the reference control took it (D5); the fallback default poll is skipped while "Default" means the Communications device (it reopened the streams every 2 s); switching the setting to or from Off restarts the streams that follow a default. **Not compiled here** (Windows code) | reading only the decision from the Communications default would have opened the plain streams on the Console one — with a headset as the Communications default and speakers as the Console one, Automatic says headphones and everyone gets echo. The cost: someone whose two defaults differ now hears voice on the Communications device under Automatic and Always |

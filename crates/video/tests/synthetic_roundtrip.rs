@@ -180,6 +180,90 @@ fn synthetic_roundtrip() {
     }
 }
 
+/// Decoded pictures are tight RGBA whatever the width, every pixel
+/// written, the right edge included: a width that is a multiple of 16 is
+/// converted straight into the pooled buffer, others (a 1366-wide laptop
+/// screen, a portrait window) through a padded frame first (review
+/// P1-11, `codec::DIRECT_WIDTH_MULTIPLE`). Decoded buffers go back to the
+/// pool between sizes, so a pixel left unwritten would show an older
+/// picture's bytes.
+#[test]
+fn every_width_decodes_to_a_whole_tight_picture() {
+    let rgb = [60u8, 200, 60];
+    for (w, h) in [(1360u32, 768u32), (1366, 768), (404, 720), (1360, 768)] {
+        let mut encoder = match FfmpegEncoder::new(Quality::FHD30) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP: no usable H.264 encoder in this environment: {e}");
+                return;
+            }
+        };
+        let mut decoder = FfmpegDecoder::new().expect("decoder init");
+        let mut last = None;
+        for j in 0..5u64 {
+            for ef in encoder
+                .encode(&solid_frame(w, h, rgb, j * 33))
+                .expect("encode")
+            {
+                assert_eq!((ef.width, ef.height), (w, h));
+                if let Some(d) = decoder.decode(&ef).expect("decode") {
+                    if let Some(old) = last.replace(d.data) {
+                        video::pool::recycle(old);
+                    }
+                }
+            }
+        }
+        let data = last.expect("decoded at least one frame");
+        assert_eq!(data.len(), (w * h * 4) as usize, "{w}x{h}: tight RGBA");
+        for row in [0, h / 2, h - 1] {
+            for col in [0, w / 2, w - 8, w - 2, w - 1] {
+                let o = ((row * w + col) * 4) as usize;
+                for c in 0..3 {
+                    let (got, want) = (i32::from(data[o + c]), i32::from(rgb[c]));
+                    assert!(
+                        (got - want).abs() <= 12,
+                        "{w}x{h} pixel ({col}, {row}) channel {c}: {got}, want {want}"
+                    );
+                }
+            }
+        }
+        video::pool::recycle(data);
+    }
+}
+
+/// A still screen makes no `encode` calls, so `drain` is how what a
+/// hardware encoder still holds gets out (review P1-13). Whatever this
+/// machine's encoder is, the frames it reports in flight are exactly
+/// those submitted and not yet handed out, and a drain hands out no
+/// more than those.
+#[test]
+fn frames_in_flight_and_drain_agree() {
+    let mut encoder = match FfmpegEncoder::new(Quality::HD30) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("SKIP: no usable H.264 encoder in this environment: {e}");
+            return;
+        }
+    };
+    let (mut sent, mut out) = (0usize, 0usize);
+    for i in 0..10u64 {
+        out += encoder
+            .encode(&synth_frame(640, 360, i, i * 33))
+            .expect("encode")
+            .len();
+        sent += 1;
+        assert_eq!(encoder.frames_in_flight(), sent - out);
+    }
+    let drained = encoder.drain().expect("drain").len();
+    assert!(drained <= sent - out);
+    out += drained;
+    assert_eq!(encoder.frames_in_flight(), sent - out);
+    assert!(
+        encoder.encoder_name() == "h264_amf" || !encoder.output_needs_input(),
+        "only AMF keeps its output until the next frame"
+    );
+}
+
 /// What iOS's decoder receives (IOS-SPEC.md §14 D30): the real encoder's
 /// access units, re-framed by `annexb::split` into parameter sets plus
 /// length-prefixed NAL units. Rebuilt into Annex-B and decoded, they must

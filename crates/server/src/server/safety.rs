@@ -649,25 +649,9 @@ impl ChatServer {
 /// The newest reports that fit one control message: each can carry a
 /// 2,000-byte excerpt and a 500-byte note, and a list past the cap is
 /// not sent at all. The rest show as these are handled.
-fn fit_reports(list: Vec<protocol::ReportSummary>) -> Vec<protocol::ReportSummary> {
-    // Room for the envelope and the per-row ids, flags and lengths.
-    const ROW_OVERHEAD: usize = 128;
-    let budget = protocol::MAX_CONTROL_MESSAGE_BYTES - 4 * 1024;
-    let mut used = 0;
-    let mut out = Vec::new();
-    for report in list {
-        let size = ROW_OVERHEAD
-            + report.excerpt.len()
-            + report.note.len()
-            + report.target_name.len()
-            + report.reporter.as_ref().map_or(0, String::len);
-        if used + size > budget {
-            break;
-        }
-        used += size;
-        out.push(report);
-    }
-    out
+fn fit_reports(mut list: Vec<protocol::ReportSummary>) -> Vec<protocol::ReportSummary> {
+    protocol::keep_prefix_that_fits(&mut list, protocol::LIST_ITEMS_BUDGET);
+    list
 }
 
 /// A name as it appears in an uploaded log's file name: letters and
@@ -702,7 +686,10 @@ mod tests {
             })
             .collect();
         let fitted = fit_reports(list);
-        assert!(fitted.len() >= 20, "{}", fitted.len());
+        // Worst case, ~2.6 KB a report: a 17 KiB message (what every
+        // shipped client decodes) holds six; the rest show as these are
+        // handled.
+        assert!(fitted.len() >= 6, "{}", fitted.len());
         assert_eq!(fitted[0].id, 0, "newest first, kept in order");
         let msg = ServerMessage::AdminResult {
             request_id: 1,

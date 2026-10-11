@@ -15,14 +15,54 @@ pub(super) struct AuthorLook {
     pub profile: client::protocol::Profile,
 }
 
+/// The roster model against `users` (review P1-9): rebuilt at most once
+/// per pass of the event loop, however many presence changes the pass
+/// brought (a big room's join burst is about four per person), and
+/// only while the main screen shows it. A speaking or audio-state edge
+/// rewrites its one row instead.
+#[derive(Default)]
+pub(super) struct RosterSync {
+    /// The rows are behind `users`: a rebuild is owed.
+    dirty: bool,
+    /// A [`AppState::flush_roster`] is queued on the event loop.
+    queued: bool,
+    /// Each user's index in `users_model` as of the last rebuild.
+    rows: HashMap<u64, usize>,
+}
+
 impl AppState {
+    /// Something about who is here changed: the room-dependent state
+    /// follows now, the rows at the end of this pass of the event loop.
     pub fn update_user_list(&mut self) {
         self.main.global::<State>().set_in_lobby(self.in_lobby());
         // Every presence change lands here: a phone's microphone follows
         // the room (ANDROID-SPEC.md D53), and so does the type of what
-        // keeps it alive off screen (D63).
+        // keeps it alive off screen (D63). Both at once, never deferred.
         self.sync_voice_room();
         self.sync_keep_alive(false);
+        self.roster_sync.dirty = true;
+        if self.roster_sync.queued {
+            return;
+        }
+        if slint::invoke_from_event_loop(|| with_current(AppState::flush_roster)).is_ok() {
+            self.roster_sync.queued = true;
+        } else {
+            self.flush_roster();
+        }
+    }
+
+    /// Rebuild the roster if it is behind and on screen. Called once per
+    /// pass after any `update_user_list`, and when the main screen comes
+    /// back (`host_shown` on a phone, the window revealed on a desktop).
+    pub(crate) fn flush_roster(&mut self) {
+        self.roster_sync.queued = false;
+        if self.roster_sync.dirty && self.main_on_screen() {
+            self.rebuild_roster();
+        }
+    }
+
+    fn rebuild_roster(&mut self) {
+        self.roster_sync.dirty = false;
         let items = roster::grouped_rows(
             &self.channels,
             &self.users,
@@ -31,28 +71,37 @@ impl AppState {
             self.is_muted,
             self.is_deafened,
         );
+        // Each account's session, once per rebuild: the look of every
+        // row is found by account, and scanning `details` per row made
+        // the rebuild quadratic.
+        let sessions: HashMap<client::UserId, u64> = self
+            .details
+            .iter()
+            .map(|(client, (user, _))| (*user, *client))
+            .collect();
+        self.roster_sync.rows.clear();
         // In-place update: write rows positionally, growing/shrinking
         // only when membership changed — preserves the ListView's
         // scroll offset exactly like the FLTK incremental path.
-        let converted: Vec<UserRow> = items
-            .iter()
-            .map(|item| {
-                let mut row = ui::convert::roster_item(item);
-                if let roster::RosterItem::User(user) = item {
-                    self.decorate_user_row(&mut row, user);
-                }
-                row
-            })
-            .collect();
+        let mut converted: Vec<UserRow> = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let mut row = ui::convert::roster_item(item);
+            if let roster::RosterItem::User(user) = item {
+                self.decorate_user_row(&mut row, user, &sessions);
+                self.roster_sync.rows.insert(user.client_id, i);
+            }
+            converted.push(row);
+        }
         let current = self.users_model.row_count();
-        for (i, row) in converted.iter().enumerate() {
+        let wanted = converted.len();
+        for (i, row) in converted.into_iter().enumerate() {
             if i < current {
-                self.users_model.set_row_data(i, row.clone());
+                self.users_model.set_row_data(i, row);
             } else {
-                self.users_model.push(row.clone());
+                self.users_model.push(row);
             }
         }
-        for i in (converted.len()..current).rev() {
+        for i in (wanted..current).rev() {
             self.users_model.remove(i);
         }
         self.main
@@ -60,13 +109,65 @@ impl AppState {
             .set_users_count_label(t!("users-count", "count" => self.users.len()).into());
     }
 
-    /// What the roster menu and tooltip need beyond the view model:
-    /// the rank rule against us (spec §8) and the session's channel
-    /// powers, plus the tooltip text.
-    pub(super) fn decorate_user_row(&self, row: &mut UserRow, user: &roster::RosterRow) {
-        use client::permissions as p;
+    /// A speaking or audio-state edge: rewrite that one row, no re-sort
+    /// and no re-localizing (review P1-9). A rebuild already owed, or
+    /// the main screen out of sight, leaves it to the next rebuild.
+    pub(super) fn refresh_voice_row(&mut self, client_id: u64) {
+        if self.roster_sync.dirty {
+            return;
+        }
+        if !self.main_on_screen() {
+            self.roster_sync.dirty = true;
+            return;
+        }
+        let Some(user) = self.users.get(&client_id) else {
+            return;
+        };
+        let Some(&index) = self.roster_sync.rows.get(&client_id) else {
+            return;
+        };
+        let Some(mut row) = self.users_model.row_data(index) else {
+            return;
+        };
+        if row.is_channel || roster::join_id(row.client_id_lo, row.client_id_hi) != client_id {
+            return;
+        }
+        // As `grouped_rows` and `decorate_user_row` have it: our own
+        // mute and deafen are the local ones, and someone blocked never
+        // shows as speaking.
+        let speaking = user.is_speaking && (row.is_us || !self.client_blocked(client_id));
+        let (muted, deafened) = if row.is_us {
+            (self.is_muted, self.is_deafened)
+        } else {
+            (user.is_self_muted, user.is_self_deafened)
+        };
+        if (row.speaking, row.self_muted, row.self_deafened) == (speaking, muted, deafened) {
+            return;
+        }
+        row.speaking = speaking;
+        row.self_muted = muted;
+        row.self_deafened = deafened;
+        self.users_model.set_row_data(index, row);
+    }
+
+    /// What the row and its card show beyond the view model: the look,
+    /// the role, the level and the tooltip text. (The rank rule and the
+    /// channel powers the menu needs are worked out when it opens.)
+    /// `sessions` is each account's session, from `details`.
+    pub(super) fn decorate_user_row(
+        &self,
+        row: &mut UserRow,
+        user: &roster::RosterRow,
+        sessions: &HashMap<client::UserId, u64>,
+    ) {
         let account = self.account_of(user.client_id);
-        self.apply_profile_look(&user.name, user.is_us, account.as_ref(), row);
+        self.apply_look(
+            &user.name,
+            user.is_us,
+            account.as_ref(),
+            Some(sessions),
+            row,
+        );
         if user.level > 0 {
             row.level_label = t!("tooltip-level", "level" => u32::from(user.level)).into();
         }
@@ -93,16 +194,6 @@ impl AppState {
             row.name_color = slint::Color::from_rgb_u8(0x6B, 0x72, 0x80);
             row.has_name_color = true;
         }
-        let ours = self.our_rank();
-        let theirs = self.rank_of_client(user.client_id);
-        row.outranked = theirs < ours;
-        row.role_editable = theirs <= ours;
-        let owns_their_channel = self
-            .channels
-            .iter()
-            .any(|c| c.id == user.channel_id && c.owned);
-        row.channel_kickable = p::has(self.permissions, p::MANAGE_CHANNELS)
-            || (owns_their_channel && p::has(self.permissions, p::MANAGE_OWN_CHANNELS));
         row.telemetry = self.user_telemetry(user).into();
     }
 
@@ -148,10 +239,24 @@ impl AppState {
         author: Option<&client::UserId>,
         row: &mut dyn ProfileLook,
     ) {
+        self.apply_look(name, is_us, author, None, row);
+    }
+
+    /// [`Self::apply_profile_look`], with each account's session looked
+    /// up in `sessions` when the caller built that index (the roster
+    /// rebuild), instead of a scan of `details`.
+    fn apply_look(
+        &self,
+        name: &str,
+        is_us: bool,
+        author: Option<&client::UserId>,
+        sessions: Option<&HashMap<client::UserId, u64>>,
+        row: &mut dyn ProfileLook,
+    ) {
         // The server's copy when it has one (that is what everyone
         // else sees); our settings before the server answered, or
         // when it does not carry profiles.
-        let from_server = self.server_look(name, is_us, author);
+        let from_server = self.server_look(name, is_us, author, sessions);
         let ours = is_us || name == self.settings.user.nickname;
         let (color, style, avatar) = match from_server {
             Some(p) => (
@@ -195,13 +300,18 @@ impl AppState {
         name: &str,
         is_us: bool,
         author: Option<&client::UserId>,
+        sessions: Option<&HashMap<client::UserId, u64>>,
     ) -> Option<&client::protocol::Profile> {
         if let Some(user) = author {
-            let online = self
-                .details
-                .iter()
-                .find(|(_, (u, _))| u == user)
-                .and_then(|(c, _)| self.profiles.get(c));
+            let session = match sessions {
+                Some(sessions) => sessions.get(user).copied(),
+                None => self
+                    .details
+                    .iter()
+                    .find(|(_, (u, _))| u == user)
+                    .map(|(c, _)| *c),
+            };
+            let online = session.and_then(|c| self.profiles.get(&c));
             if let Some(look) = online.or_else(|| self.author_looks.get(user).map(|l| &l.profile)) {
                 return Some(look);
             }
@@ -436,7 +546,8 @@ impl AppState {
         bytes: &[u8],
         cache: bool,
     ) {
-        let Ok(decoded) = app_core::images::decode_bounded(bytes) else {
+        // Someone else's bytes: PNG, JPEG or GIF only (review P1-20).
+        let Ok(decoded) = app_core::images::decode_received(bytes) else {
             return;
         };
         // Ours are 128² at pick time; a picture from another client is

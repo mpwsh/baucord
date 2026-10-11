@@ -221,7 +221,11 @@ jobs:
           RUSTC_WRAPPER: ${{ runner.os == 'Windows' && 'C:\rustc-shim.exe' || 'sccache' }}
           RUSTFLAGS: ${{ matrix.rustflags }}
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --profile deploy --target ${{ matrix.target }} --features tray
+        # Only what ships: the desktop app and the server. Every member
+        # used to build, and the iOS crate's stub binary is also named
+        # `baucord` — both landed on the same path and the zip got
+        # whichever linked last (review P0-5).
+        run: cargo build --profile deploy --target ${{ matrix.target }} -p desktop -p server --features desktop/tray
 
       - name: Verify FFmpeg statically linked + glibc floor (Linux)
         if: runner.os == 'Linux'

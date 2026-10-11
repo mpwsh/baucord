@@ -1,11 +1,10 @@
 //! The network thread sleeps on a quiet connection and still hears a
-//! datagram at once (IOS-SPEC.md §14 D41).
+//! datagram at once (IOS-SPEC.md §14 D41), on every platform: Windows
+//! has its own socket wait since review P1-1.
 //!
 //! A bare QUIC endpoint on loopback stands in for the server: enough
 //! for the handshake, the client's `Hello`, and voice datagrams back.
 //! The client is the real network thread, driven through its channels.
-
-#![cfg(unix)]
 
 use std::{
     net::SocketAddr,
@@ -17,8 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use audio::{VoiceChat, VoiceChatConfig};
 use client::{
-    network::{self, NetworkControl, NetworkThreadHandle},
+    network::{self, NetworkControl, NetworkThreadHandle, VoiceLink},
     voice::VoiceControl,
 };
 use protocol::Lane;
@@ -79,7 +79,7 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
     // ── The client's network thread ────────────────────────────────
     let (tx, control_rx) = crossbeam_channel::unbounded();
     let (msg_tx, msg_rx) = crossbeam_channel::unbounded();
-    let (voice_tx, voice_rx) = crossbeam_channel::unbounded::<VoiceControl>();
+    let (voice_tx, _voice_rx) = crossbeam_channel::unbounded::<VoiceControl>();
     let (screen_tx, _screen_rx) = crossbeam_channel::unbounded();
     let mut net = NetworkThreadHandle::spawn(
         tx,
@@ -90,6 +90,17 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
         screen_tx,
         Arc::new(|| {}),
     );
+    // A headless engine, linked the way the voice thread links one
+    // (review P1-5): received voice goes straight into it.
+    let engine = VoiceChat::new(VoiceChatConfig::default()).expect("engine");
+    let received = Arc::clone(engine.stats());
+    net.tx
+        .send(NetworkControl::VoiceLink(Some(VoiceLink {
+            incoming: engine.incoming_sender(),
+            outgoing: engine.outgoing_receiver(),
+            testing: Arc::new(AtomicBool::new(false)),
+        })))
+        .expect("link");
     net.tx
         .send(NetworkControl::Connect {
             addr,
@@ -110,22 +121,26 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
     // Let the handshake's tail (acks, lane tags) settle.
     thread::sleep(Duration::from_millis(500));
 
-    // ── Asleep: a quiet connection wakes about ten times a second
-    // (the 100 ms quiet tick, plus the 2 s keep-alive and its ack).
-    // Polling the socket, as before, was a thousand.
-    let before = network::loop_passes();
+    // ── Asleep: a quiet connection wakes only when something is due —
+    // the 2 s keep-alive and its ack, the 2 s link stats — plus the
+    // inbound watcher's two looks a second (review P1-2). The 100 ms
+    // quiet tick made it about twelve; polling the socket, as Windows
+    // did until review P1-1, a thousand.
+    let (passes_before, watcher_before) = (network::loop_passes(), network::watcher_wakes());
     thread::sleep(Duration::from_secs(1));
-    let passes = network::loop_passes() - before;
-    eprintln!("network loop: {passes} wakes in a quiet second");
+    let passes = network::loop_passes() - passes_before;
+    let watcher = network::watcher_wakes() - watcher_before;
+    eprintln!("network loop: {passes} wakes and {watcher} watcher wakes in a quiet second");
     assert!(
-        passes < 100,
-        "{passes} wakes in a quiet second (the socket is being polled)"
+        passes + watcher < 25,
+        "{passes} loop and {watcher} watcher wakes in a quiet second (something polls)"
     );
 
-    // ── Awake on arrival: a voice datagram reaches the voice thread
-    // well inside the quiet tick.
+    // ── Awake on arrival: a voice datagram reaches the engine at once,
+    // not at the next deadline.
     let mut delays = Vec::new();
     for seq in 0..8u32 {
+        let before = received.packets_received.load(Ordering::Relaxed);
         let packet = protocol::pack_voice_with_flags(seq, seq * 960, 0, &[0xF8, 0xFF, 0xFE])
             .expect("voice packet");
         let wrapped = protocol::wrap_sender(42, &packet);
@@ -134,10 +149,10 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
             .unwrap()
             .outbox
             .push((wrapped, Instant::now()));
-        match voice_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(VoiceControl::IncomingVoicePacket(_)) => {}
-            Ok(_) => panic!("unexpected voice control"),
-            Err(e) => panic!("no voice packet: {e}"),
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while received.packets_received.load(Ordering::Relaxed) == before {
+            assert!(Instant::now() < deadline, "no voice packet");
+            thread::yield_now();
         }
         let sent = *shared.lock().unwrap().sent_at.last().expect("sent");
         delays.push(sent.elapsed());
@@ -145,7 +160,7 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
     }
     delays.sort();
     let median = delays[delays.len() / 2];
-    eprintln!("datagram → voice thread: median {median:?}, all {delays:?}");
+    eprintln!("datagram → engine: median {median:?}, all {delays:?}");
     assert!(
         median < Duration::from_millis(30),
         "a datagram took {median:?} (median) to wake the loop; delays {delays:?}"

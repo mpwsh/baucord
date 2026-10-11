@@ -67,6 +67,8 @@ impl AppState {
         // Start voice engine. With the lobby we arrive in it, and a
         // phone opens no microphone there (ANDROID-SPEC.md D53).
         self.voice_in_room = !self.lobby || self.is_testing_mic;
+        // Streams play on the voice output (review P1-19).
+        self.sync_stream_output();
         self.voice
             .tx
             .send(VoiceControl::Start {
@@ -188,6 +190,17 @@ impl AppState {
                 .our_channel()
                 .map(|c| self.channel_name(c))
                 .is_some_and(|name| Some(name) == self.lobby_name)
+    }
+
+    /// Where voice is wanted: a voice room — not the lobby, not the AFK
+    /// room, where the relay drops it (review P1-6) — or a microphone
+    /// test, which needs it anywhere.
+    pub(super) fn voice_room_wanted(&self) -> bool {
+        let afk = self.our_channel().is_some_and(|id| {
+            self.channel_details.get(&id).is_some_and(|f| f.is_afk)
+                || self.channels.iter().any(|c| c.id == id && c.is_afk)
+        });
+        self.is_testing_mic || !(self.in_lobby() || afk)
     }
 
     /// The channel we are currently in, per server echo.

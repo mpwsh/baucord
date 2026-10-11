@@ -114,7 +114,14 @@ fn find_close(chars: &[char], open: usize, tok: char) -> Option<usize> {
 /// trailing sentence punctuation is not part of the link, and a bare
 /// scheme with nothing behind it doesn't count.
 fn match_url(chars: &[char]) -> Option<(String, usize)> {
-    let piece: String = chars.iter().take_while(|c| !c.is_whitespace()).collect();
+    // The destination is emitted as `](<url>)`: a `<` or `>` would end
+    // it early and a backslash could escape the closer, letting the
+    // rest of the message add a second link of any scheme
+    // (PRODUCTION-PLAN CLI-4). The URL stops at them.
+    let piece: String = chars
+        .iter()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '<' | '>' | '\\'))
+        .collect();
     let lower = piece.to_ascii_lowercase();
     let is_url = lower.starts_with("http://") || lower.starts_with("https://");
     let is_www = !is_url && lower.starts_with("www.") && piece.len() > 4;
@@ -131,6 +138,19 @@ fn match_url(chars: &[char]) -> Option<(String, usize)> {
         trimmed.to_string()
     };
     Some((dest, trimmed.chars().count()))
+}
+
+/// Whether a clicked link may be handed to the system: `http` and
+/// `https` only. A message's markdown can carry any destination, and
+/// the system would open `tel:`, `sms:`, `file:`, an app's deep link
+/// or `itms-services:` as readily as a web page.
+#[must_use]
+pub fn is_web_link(url: &str) -> bool {
+    let url = url.trim();
+    url.split_once("://").is_some_and(|(scheme, rest)| {
+        (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+            && !rest.is_empty()
+    })
 }
 
 /// Escape one char into CommonMark-inert output.
@@ -416,5 +436,47 @@ mod tests {
     fn emphasis_does_not_cross_lines() {
         let (_, styled) = to_commonmark_none("*top\nbottom*");
         assert!(!styled);
+    }
+
+    #[test]
+    fn link_destination_cannot_be_closed_early() {
+        // CLI-4: a `>` used to end the destination and let the rest of
+        // the token add a second link of any scheme.
+        for text in [
+            "https://x.example/a>)[tap](tel:123)",
+            "https://x.example/a\\>)[tap](file:///etc/passwd)",
+            "https://x.example/<b>[tap](sms:1)",
+        ] {
+            let (cm, _) = to_commonmark_none(text);
+            for scheme in [
+                "](tel:", "](file:", "](sms:", "](<tel:", "](<file:", "](<sms:",
+            ] {
+                assert!(!cm.contains(scheme), "{text} → {cm}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_web_links_open() {
+        for url in [
+            "https://example.com",
+            "HTTP://EXAMPLE.COM/x",
+            " https://a.b ",
+        ] {
+            assert!(is_web_link(url), "{url}");
+        }
+        for url in [
+            "tel:123",
+            "sms:1",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "itms-services://?action=download-manifest",
+            "market://details?id=x",
+            "https://",
+            "",
+            "ftp://x",
+        ] {
+            assert!(!is_web_link(url), "{url}");
+        }
     }
 }

@@ -155,7 +155,7 @@ network thread, the voice worker, the screen thread while a stream is
 watched, plus CoreAudio's own real-time I/O thread for the audio
 callbacks — already time-constraint scheduled, so not promoted (D16).
 The network thread sleeps until a datagram, a command or the
-transport's next timer (D41).
+transport's next deadline (D41, D57).
 
 UIKit is main-thread only. Hooks are called from Slint callbacks (the
 main thread); anything a worker needs from UIKit goes through
@@ -335,7 +335,8 @@ buffer). RNNoise under VPIO: the open question of §1.
 - The transport is the transport: quinn over std UDP sockets; GSO is
   not offered on iOS and `quinn-udp`'s probe handles that.
 - **Wakes**: the network thread sleeps until a datagram, a command or
-  the transport's next timer (D41) — 10 wakes in a quiet second.
+  the transport's next deadline (D41, D57) — none in a quiet second
+  beyond the socket watcher's two.
 - **App Transport Security** governs `URLSession` only. The QUIC
   transport and `ureq` (rustls) — the link-image previews in
   `frontend/src/media.rs` — open their own sockets and are not
@@ -664,3 +665,4 @@ fix was installed, so still with portrait insets):
 | D54 | **A stream's stereo becomes mono without cancelling** (2026-10-08, 1.1.9; ANDROID-SPEC.md D60). The VPIO path mixes a watched stream into the voice output (D52) through the same phase-aligned downmix (`stream::downmix`): out-of-phase sound, which `(L + R) / 2` silenced, plays at its level | shared code; the iPhone has the same mono call path |
 | D55 | **A stream backlog drains by playing faster, not by a skip** (2026-10-08, 1.1.9; ANDROID-SPEC.md D61). The VPIO path's stream mix (D52) shares `stream::mix` with Android: past 180 ms queued a source plays 1–4 % faster until it is back at 120 ms, instead of dropping 150 ms at once past 300 ms; only past 400 ms is anything dropped | as ANDROID-SPEC.md D61 |
 | D56 | **Blocks, reports, deleting the account, and the terms** (2026-10-09, 1.2, shared; ANDROID-SPEC.md D64; PERSISTENCE-SPEC §12 S1). The same shared UI as on Android: Block/Report in a person's and a message's menu, the report dialog, Settings → Profile's blocked list and Delete my account, the terms line on the connect card, and a long press on a chat row for its menu (UIKit's own long press is not involved: the row's `Timer` reads the touch). `keep_alive` takes `in_room` now; iOS ignores it (the audio background mode is what keeps a call running, D13) | the App Store's guideline 1.2 asks the same as Play's user-content policy |
+| D57 | **The 1.2.1 review: what changed under the phone** (2026-10-10, 1.2.1, shared; ANDROID-SPEC.md D67, which has the detail; amends D41, D42, D51, D55). D41's `QUIET_TICK`, `Driver::wants_tick`, "Windows keeps the 1 ms poll" and "10 wakes" are history: every loop waits for a datagram, a command or `Driver::next_deadline()`, and Windows has its socket wake too (review P1-1, P1-2) — a quiet second is 0 loop wakes plus the watcher's 2. Voice packets skip the voice thread, which wakes once a second (P1-5); the audio workers wait on their device's latch (P1-4). D42 changes: in the background a watched stream is no longer decoded — its frames are dropped before the jitter buffer, its sound plays on, and on return it waits for a keyframe and asks for one (P1-7). D51: the AFK room counts as out of a room — the microphone closes there too (P1-6). D55: the pacing lives in `stream::pace`, levels unchanged | as ANDROID-SPEC.md D67 |

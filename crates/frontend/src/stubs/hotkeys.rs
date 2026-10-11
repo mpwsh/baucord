@@ -15,6 +15,8 @@ impl HotkeyManager {
 
     pub fn update(&mut self, _settings: &Settings) {}
 
+    pub fn set_connected(&mut self, _connected: bool) {}
+
     #[must_use]
     pub fn poll(&self) -> Option<(BindableAction, bool)> {
         None

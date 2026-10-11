@@ -74,9 +74,20 @@ const STREAM_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 /// How often each client gets its voice receiver report (spec §6.1).
 const VOICE_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// A tick is considered "media-active" for sleep scheduling if any
-/// voice/video/system-audio packet arrived within this window.
-const MEDIA_ACTIVE_WINDOW: Duration = Duration::from_millis(500);
+/// How often restrictions are checked for expiry.
+const RESTRICTION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+/// How often idle members are moved to the AFK channel.
+const CHANNEL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// How often accrued progress is flushed (spec §9.1).
+const PROGRESS_INTERVAL: Duration = Duration::from_mins(1);
+
+/// The main loop's longest sleep with nothing due (review P1-2): a stop
+/// request and the persistence thread's notices (a CLI change, a prune)
+/// wait at most this long. Datagrams wake the loop at once.
+const MAX_IDLE_WAIT: Duration = Duration::from_secs(1);
+/// The main loop's longest sleep while a database read is out: its
+/// answer comes on a channel the socket wait cannot see.
+const ASK_POLL: Duration = Duration::from_millis(2);
 
 /// How often to stat the config file for hot reload. A stat every few
 /// seconds is free; anything file-watcher-fancier buys nothing here.
@@ -229,6 +240,10 @@ pub struct ChatServer {
     /// Blob uploads in flight (spec §7), announced first.
     blob_uploads: HashMap<ClientId, IncomingUpload>,
     announced_uploads: HashMap<ClientId, AnnouncedUpload>,
+    /// Files someone other than their first uploader sent in full this
+    /// run: proof they hold the bytes, so they may post them too
+    /// (review P0-4). Known by hash alone is never enough.
+    proven_uploads: HashSet<(UserId, protocol::BlobId)>,
     /// Each user's upload volume today (spec §7's daily allowance).
     uploads_today: HashMap<UserId, files::DailyUpload>,
     /// Blob bytes by hash: the only copy without persistence, a cache
@@ -273,8 +288,6 @@ pub struct ChatServer {
     last_voice_report: Instant,
     /// Last per-client `link:` log line (see `logging.link_stats_interval_secs`).
     last_link_log: Instant,
-    /// Last instant any media packet arrived (drives adaptive sleep).
-    last_media: Instant,
     stats: ServerStats,
     voice: VoiceRelay,
     video: VideoRelay,
@@ -402,6 +415,7 @@ impl ChatServer {
             uploads: HashMap::new(),
             blob_uploads: HashMap::new(),
             announced_uploads: HashMap::new(),
+            proven_uploads: HashSet::new(),
             uploads_today: HashMap::new(),
             blob_bytes: HashMap::new(),
             pending_blobs: HashMap::new(),
@@ -424,7 +438,6 @@ impl ChatServer {
             last_health: now,
             last_voice_report: now,
             last_link_log: now,
-            last_media: now,
             stats: ServerStats::default(),
             voice: VoiceRelay::new(),
             video: VideoRelay::new(),
@@ -779,21 +792,20 @@ impl ChatServer {
         self.process_control_messages();
         self.expire_pending();
         self.poll_persistence();
-        if now.duration_since(self.last_restriction_sweep) >= Duration::from_secs(1) {
+        if now.duration_since(self.last_restriction_sweep) >= RESTRICTION_SWEEP_INTERVAL {
             self.last_restriction_sweep = now;
             self.sweep_restrictions();
         }
-        if now.duration_since(self.last_progress_minute) >= Duration::from_mins(1) {
+        if now.duration_since(self.last_progress_minute) >= PROGRESS_INTERVAL {
             self.last_progress_minute = now;
             self.flush_progress();
         }
-        if now.duration_since(self.last_channel_sweep) >= Duration::from_secs(30) {
+        if now.duration_since(self.last_channel_sweep) >= CHANNEL_SWEEP_INTERVAL {
             self.last_channel_sweep = now;
             self.sweep_channels();
         }
 
         let clients = self.clients();
-        let media_before = self.media_packet_count();
         let afk = self.afk_channel();
         self.voice.process(
             &mut self.driver,
@@ -811,9 +823,6 @@ impl ChatServer {
         self.video.process(&mut self.driver, now, &clients);
         self.video
             .process_system_audio(&mut self.driver, now, &clients);
-        if self.media_packet_count() != media_before {
-            self.last_media = now;
-        }
 
         if now.duration_since(self.last_health) >= STREAM_HEALTH_INTERVAL {
             self.send_stream_health();
@@ -849,24 +858,50 @@ impl ChatServer {
         }
     }
 
-    /// Sleep the main loop should take before the next tick.
-    ///
-    /// - Empty server: 20 ms (nothing to relay to anyone).
-    /// - Media in the last 500 ms: 1 ms (sub-millisecond relay matters).
-    /// - Clients connected but quiet: 5 ms — adds at most 5 ms to the
-    ///   *first* packet of a talk burst, then the loop runs hot again;
-    ///   inaudible next to the jitter buffer, and it cuts idle CPU ~5×.
-    ///
-    /// The caller additionally wakes for the transport's next timer.
+    /// When the next tick is due if no datagram comes first (review
+    /// P1-2): the transport's next deadline, a Hello's deadline, the
+    /// periodic jobs of [`Self::update`], at most [`MAX_IDLE_WAIT`] away
+    /// — [`ASK_POLL`] while a database read is out. The main loop waits
+    /// on its socket until then, so a datagram is relayed the moment it
+    /// lands instead of after a 1, 5 or 20 ms sleep, and an idle server
+    /// wakes a few times a second instead of 50 to 1,000.
     #[must_use]
-    pub fn suggested_sleep(&self) -> Duration {
-        if self.driver.peer_count() == 0 {
-            Duration::from_millis(20)
-        } else if self.now.duration_since(self.last_media) < MEDIA_ACTIVE_WINDOW {
-            Duration::from_millis(1)
+    pub fn next_wake(&mut self) -> Instant {
+        let cap = if self.persist.reads_in_flight() > 0 {
+            ASK_POLL
         } else {
-            Duration::from_millis(5)
+            MAX_IDLE_WAIT
+        };
+        let mut due = [
+            self.now + cap,
+            self.last_restriction_sweep + RESTRICTION_SWEEP_INTERVAL,
+            self.last_progress_minute + PROGRESS_INTERVAL,
+            self.last_channel_sweep + CHANNEL_SWEEP_INTERVAL,
+            self.last_health + STREAM_HEALTH_INTERVAL,
+            self.last_voice_report + VOICE_REPORT_INTERVAL,
+            self.last_telemetry_flush + TELEMETRY_FLUSH_INTERVAL,
+            self.last_config_check + CONFIG_CHECK_INTERVAL,
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(self.now);
+        // A zero interval prints on every tick; it is no deadline.
+        let stats = Duration::from_secs(self.config.logging.stats_interval_secs);
+        if !stats.is_zero() {
+            due = due.min(self.last_stats + stats);
         }
+        if let Some(hello) = self
+            .pending
+            .values()
+            .map(|p| p.since + HELLO_DEADLINE)
+            .min()
+        {
+            due = due.min(hello);
+        }
+        if let Some(deadline) = self.driver.next_deadline() {
+            due = due.min(deadline);
+        }
+        due
     }
 
     /// Close every connection with `reason` (a deploy or operator
@@ -890,12 +925,6 @@ impl ChatServer {
     #[must_use]
     pub fn clients(&self) -> Vec<ClientId> {
         self.usernames.keys().copied().collect()
-    }
-
-    fn media_packet_count(&self) -> u64 {
-        self.voice.stats.packets_received
-            + self.video.stats.chunks_received
-            + self.video.stats.sys_audio_received
     }
 
     // ── Transport events ────────────────────────────────────────────
@@ -1334,7 +1363,34 @@ impl ChatServer {
             if let Err(e) = self.driver.send(self.now, client_id, msg.lane(), &encoded) {
                 debug!("send to {client_id:#x} on {} failed: {e}", msg.lane());
             }
+        } else {
+            // Too large for the wire (or unencodable): say so here — the
+            // client would have dropped it without a word.
+            warn!(
+                "a {} message for {client_id:#x} exceeds {} bytes and was not sent",
+                msg.lane(),
+                protocol::MAX_CONTROL_MESSAGE_BYTES
+            );
         }
+    }
+
+    /// An admin answer, its listing cut to one message (review P0-1).
+    pub(super) fn send_admin_result(
+        &mut self,
+        client_id: ClientId,
+        request_id: u32,
+        mut result: Result<protocol::AdminOutcome, protocol::AdminError>,
+    ) {
+        if let Ok(outcome) = &mut result {
+            let dropped = outcome.fit_to(protocol::LIST_ITEMS_BUDGET);
+            if dropped > 0 {
+                info!("admin answer for {client_id:#x} cut to fit one message ({dropped} rows left out)");
+            }
+        }
+        self.send_msg(
+            client_id,
+            &ServerMessage::AdminResult { request_id, result },
+        );
     }
 
     fn broadcast_msg(&mut self, msg: &ServerMessage) {
@@ -1393,10 +1449,10 @@ impl ChatServer {
                         policy.invites.len(),
                         policy.restrictions.len()
                     );
-                    self.policy = *policy;
-                    self.apply_reloaded_policy();
+                    self.apply_reloaded_policy(*policy);
                 }
                 Notice::RefsReleased(released) => self.release_blob_refs(&released),
+                Notice::FilesPruned(files) => self.forget_pruned_files(&files),
             }
         }
     }
@@ -2295,10 +2351,7 @@ impl ChatServer {
                 } else {
                     self.handle_admin(client_id, command)
                 };
-                self.send_msg(
-                    client_id,
-                    &ServerMessage::AdminResult { request_id, result },
-                );
+                self.send_admin_result(client_id, request_id, result);
             }
 
             // ── Telemetry ───────────────────────────────────────────
@@ -3368,6 +3421,46 @@ fn hex(bytes: &[u8]) -> String {
 /// NIC drain; past 64 MiB, per-connection pacing spreads the rest.
 fn send_buffer_target(max_clients: usize) -> usize {
     (max_clients * protocol::MAX_CHAT_IMAGE_BYTES).clamp(8 * 1024 * 1024, 64 * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use std::time::{Duration, Instant};
+
+    use transport::ServerIdentity;
+
+    use super::{ChatServer, ASK_POLL, MAX_IDLE_WAIT};
+    use crate::{config::Config, persistence::Query};
+
+    /// An idle server sleeps until its next periodic job, not on a
+    /// millisecond tick; a database read out shortens the sleep to the
+    /// poll that picks its answer up (review P1-2).
+    #[test]
+    fn an_idle_server_sleeps_until_its_next_job() {
+        let mut config = Config::default();
+        config.persistence.enabled = false;
+        let mut server = ChatServer::new(config, &ServerIdentity::generate()).expect("server");
+        let now = Instant::now();
+        server.update(now);
+        let wait = server.next_wake().saturating_duration_since(now);
+        assert!(
+            wait >= Duration::from_millis(500) && wait <= MAX_IDLE_WAIT,
+            "an idle server wakes in {wait:?}"
+        );
+
+        let _ = server.persistence_mut().ask(
+            Query::Audit {
+                before: None,
+                limit: 1,
+            },
+            now + Duration::from_secs(5),
+        );
+        let wait = server.next_wake().saturating_duration_since(now);
+        assert!(wait <= ASK_POLL, "with a read out it wakes in {wait:?}");
+        server.update(Instant::now());
+        let wait = server.next_wake().saturating_duration_since(now);
+        assert!(wait > ASK_POLL, "the answer was collected: {wait:?}");
+    }
 }
 
 #[cfg(test)]

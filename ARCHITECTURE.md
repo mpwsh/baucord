@@ -138,7 +138,17 @@ udp.recv_batch(|d| driver.handle_datagram(now, d));   // in
 driver.handle_timeouts(now);                           // timers
 /* application work: driver.recv(...), driver.send(...) */
 while let Some(t) = driver.poll_transmit() { udp.send(&t); }   // out
+udp.wait_readable(driver.next_deadline());             // sleep
 ```
+
+The loop sleeps until a datagram lands or `next_deadline()` comes
+(review P1-2): quinn's timers, a deferred close, a video group's oldest
+queued byte (+500 ms) or ack deadline, the upload pacer's refill.
+Anything the driver does on a clock needs a deadline there, or it waits
+for the next datagram; the simulator's `step_to_next_event` tests catch
+a missing one. `wait_readable` is `ppoll` on Linux and Android, `poll`
+or `WSAPoll` elsewhere; the client waits on a `ReadWaiter` thread
+instead (§6), which exists on every platform since review P1-1.
 
 Application-facing API, per peer: `send(now, peer, lane, bytes)`,
 `recv(peer, lane)`, `send_video` / `video_new_group` / `video_finish_group`
@@ -211,7 +221,10 @@ call sites.
 
 - `ServerIdentity` — an Ed25519 key in `identity.key`, a self-signed
   certificate regenerated at load (the key is the identity; the cert is
-  a container), and `retired/` keys that vouch for a successor.
+  a container), and `retired/` keys that vouch for a successor: each
+  is `retired/<stem>.<unix-secs>.key`, and vouches for two years from
+  the retirement in its name (a `<stem>.key` from before 1.2.1 counts
+  from its file date; review P1-15).
   `rotate()` signs the new key with the old one and stores the proof
   in a custom X.509 extension (OID `2.25.3276867917789066850` — never
   change it).
@@ -234,7 +247,9 @@ call sites.
 when it hit its per-call budget — both loops **never sleep while a
 backlog remains**. This matters: macOS and Windows return one datagram
 per `recv`, and a loop that took one per tick built a second of queue
-on a LAN.
+on a LAN. Both loops re-read the GSO segment count every pass, and once
+quinn-udp turns GSO off, `send` splits a batch into its datagrams and
+resends the one whose failure turned it off (review P1-14).
 
 ### Simulator
 
@@ -243,7 +258,7 @@ any number of `DriverHost`s on links with delay, jitter, loss, a
 bandwidth bottleneck with a bounded queue, and address changes, on a
 fake clock. `ChatServer` implements `DriverHost`, so
 `server/tests/e2e.rs` runs a real server against real client drivers
-through the full QUIC stack. The 21 transport scenarios in
+through the full QUIC stack. The 24 transport scenarios in
 `sim/tests.rs` are the acceptance suite for everything above.
 
 ## 5. Server (`crates/server`)
@@ -257,9 +272,12 @@ policy.
 `ChatServer::update(now)`: transport timers → events → control messages
 → expire pending Hellos → voice relay → video relay → system audio →
 periodic reports (stream health 1 s, voice receiver reports 2 s, config
-watch 3 s, stats). `suggested_sleep()` is 1 ms with media flowing,
-5 ms quiet, 20 ms empty; the loop also wakes for the transport's next
-timer and skips sleeping on a socket backlog.
+watch 3 s, stats). The loop then waits on its socket until
+`next_wake()`: the transport's next deadline, a Hello's, the next
+periodic job, at most 1 s — 2 ms while a database read is out, whose
+answer comes on a channel the socket wait cannot see (review P1-2). A
+datagram is relayed the moment it lands; an idle server wakes a few
+times a second. The loop never sleeps on a socket backlog.
 
 ### Admission (`server.rs`, `policy.rs`)
 
@@ -410,8 +428,12 @@ WAL, `synchronous=NORMAL`, `data/baucord/baucord.db`); the tick holds a
 - The thread checkpoints the WAL every 60 s, prunes retention windows
   hourly, and polls `PRAGMA data_version` every 2 s to notice another
   process (the CLI, `sqlite3`) writing to the file; when it does, it
-  reloads the policy tables and hands the tick a `Notice::Policy` to
-  swap in. Policy writes that are dropped under backpressure are
+  applies the writes already queued, reloads the policy tables and
+  hands the tick a `Notice::Policy`, which sends only what changed —
+  `UserDetails` to the users whose roles moved, `Session` to sessions
+  whose permissions did, `RoleList` if the roles table changed (review
+  P1-22). The CLI's listings open the database read-only, so reading
+  is not a change. Policy writes that are dropped under backpressure are
   logged, not just counted.
 - `persistence.enabled: false` keeps the thread with a memory-only store:
   writes are discarded, reads answer `Unavailable`, no file is created.
@@ -438,21 +460,29 @@ string is a wire contract with the client (`SERVER_RESTART_REASON`).
 - **network** (`network.rs`) — owns `Driver` + `UdpIo` + the session
   state machine (`Connecting → AwaitingWelcome → Admitted → Closed`).
   Input: `NetworkControl` from the UI/voice/screen threads. Output:
-  `NetworkMessage`, routed in `route_message`: media and link feedback
-  go straight to the voice/screen threads (hot path, `try_send`), state
-  goes to the app (blocking send + a wake of the Slint event loop).
-- **voice** (`voice.rs`) — the audio engine; `VoiceControl` in,
-  `VoiceEvent` out. Receives `SetUplinkLoss` / `SetLinkRtt` from
-  receiver reports.
+  `NetworkMessage`, routed in `route_message`: received voice goes
+  straight into the engine through the `VoiceLink` the voice thread
+  handed over (stamped at the socket read), video and link feedback to
+  the screen and voice threads (`try_send`), state to the app (an
+  unbounded channel, so this thread never waits for the UI — review
+  P1-16 — and a wake of the Slint event loop).
+- **voice** (`voice.rs`) — owns the audio engine; `VoiceControl` in,
+  `VoiceEvent` out. At each start it hands the engine's packet handles
+  to the network thread (`NetworkControl::VoiceLink`), so packets never
+  pass through it (review P1-5); it wakes on commands and the speaking
+  light's edges, and once a second for device supervision. Receives
+  `SetUplinkLoss` / `SetLinkRtt` from receiver reports.
 - **screen** (`screen.rs`) — capture/encode when sharing, jitter
   buffer/decode per watched stream; `ScreenControl` in, `ScreenEvent`
   out. Receives `UplinkStats` (the share of groups the transport
   abandoned) for its bitrate ladder and `StreamHealth` for display.
 
-The loop in `run_network_loop` blocks on the control channel with a
-timeout of 1 ms (capped by the transport's next timer) while a session
-exists, or indefinitely otherwise; a socket backlog switches it to a
-non-blocking poll.
+The loop in `run_network_loop` selects on the control channel, the
+voice encoder's packets and the inbound wake (a `ReadWaiter` thread
+blocked on the socket that rings when a datagram lands), with a timeout
+of the transport's next deadline or the 2 s stats (review P1-2) while a
+session exists, and none otherwise. A socket backlog switches it to a
+non-blocking poll; with no inbound wake it polls the socket every 1 ms.
 
 ### Session lifecycle
 
@@ -569,6 +599,15 @@ and `handle_network_message`, which is exhaustive over
 `alerts` — each a child of `app` so nothing private had to open up;
 new methods go in the child that owns the concern.
 
+Some of that work is held to what can be seen or used. The roster model
+is rebuilt at most once per event-loop pass and only while the main
+screen is on screen (`flush_roster`); a speaking or audio-state edge
+rewrites its one row (`refresh_voice_row`, review P1-9). Global
+keybinds are watched only between `Connected` and teardown, and only
+the bound keys (`HotkeyManager::set_connected`, review P1-3). Pictures
+from the wire decode only as PNG, JPEG or GIF
+(`images::decode_received`, review P1-20).
+
 `main.rs` sets up file logging (append-mode `baucord.log`) and a panic
 hook that writes thread, location and backtrace into it — release builds
 abort on panic and a GUI process has no stderr, so without the hook a
@@ -629,8 +668,8 @@ sized from the device's callback (ANDROID-SPEC D24). Whether echo
 cancellation is on is decided from the stream that was opened, never
 assumed from the device, and Settings → Audio says what was found.
 
-`VoiceChat::service()` (the voice thread, every tick) supervises the
-devices: a stream that failed is reopened, the OS default is followed,
+`VoiceChat::service()` (the voice thread, at least once a second)
+supervises the devices: a stream that failed is reopened, the OS default is followed,
 and a side that is not open — it never opened, or its reopen failed
 because the device was gone — is tried again every 2 s until it opens
 (`input_pending`, `output_pending`; PRODUCTION-PLAN.md CLI-9).
@@ -639,7 +678,20 @@ The phones open only what their presence needs
 (`VoiceChat::set_presence`, ANDROID-SPEC D53, IOS-SPEC D51): nothing in the lobby on
 Android and a plain output on iOS (to stay alive in the background);
 in a room both sides on the call path; muted, the microphone closed
-(or muted on iOS's voice unit). The desktop keeps both streams open.
+(or muted on iOS's voice unit). The AFK room counts as out of a room
+(review P1-6). The desktop keeps both streams open and, muted or out
+of a room, drops what the microphone hears before anything processes
+it (`InputConfig::in_room`).
+
+The audio workers wait on their device's latch — the callback rings it
+— with a 200 ms safety wait, and their owner rings it on drop so a stop
+is immediate (review P1-4). Muted, the capture worker sleeps; the chain
+resets once, on the unmute edge.
+
+Windows' "Default" device means the Communications default unless echo
+cancellation is Off, for the AEC decision, both streams and the device
+watcher alike (`communications_default`, review P1-18); an output change
+that moves the plan or the reference reopens both sides.
 
 A watched stream's audio has an output of its own (stereo, its own
 volume, untouched by deafen) — except on a phone's call path, where it
@@ -649,17 +701,24 @@ echo canceller removes it. That path is mono: the stereo is mixed per
 frequency at an aligned phase (`stream::downmix`, ANDROID-SPEC D60),
 since a plain `(L + R) / 2` silences out-of-phase sound. A backlog
 there (past 180 ms queued) drains by playing 1–4 % faster rather than
-by a skip (ANDROID-SPEC D61). The decoder picks per frame; its own
-output reopens when its device goes away.
+by a skip (ANDROID-SPEC D61). Its own output plays on the voice output
+picked in Settings, or where voice opened (review P1-19), and its device
+callback reads the ring through the same pacing (`stream::pace`): 60 ms
+cushion on the desktop, the phones' 100 ms there. The decoder picks per
+frame; its own output reopens when its device goes away or the pick
+changes. A sharer sends each 20 ms packet of its sound as it is encoded
+(PRODUCTION-PLAN LAT-2).
 
 A watched stream's video goes: the jitter buffer (3 s of frames at the
 stream's rate, so at least one keyframe interval; a frame ≥ 1 s behind
-live jumps to a newer buffered keyframe) → the screen thread decodes
+live jumps to a newer buffered keyframe; a gap jumps to a buffered
+keyframe or asks for one the moment a later frame lands, review P1-12)
+→ the screen thread decodes
 (FFmpeg and VideoToolbox to RGBA; MediaCodec hands over its YUV planes
 as they are, `video::PictureFormat`, one per frame fed even when the
 codec finishes them in pairs, `video::held`; between frames
 `VideoDecoder::poll` hands out a picture still waiting once the stream
-pauses) → `FrameReady` → the frontend's
+pauses, at the time `next_poll` asks for) → `FrameReady` → the frontend's
 present thread (`frontend::present`), which drains its queue, keeps
 the newest frame of each stream and only then converts or copies it,
 straight into one of the stream's three reused `SharedPixelBuffer`s
@@ -667,10 +726,17 @@ straight into one of the stream's three reused `SharedPixelBuffer`s
 newest prepared frame per stream and sets it as an `Image`. A device
 that cannot keep up shows fewer frames, never older ones: the picture
 stays live with its sound (MOB-18). Frame buffers go round
-`video::pool` instead of being allocated per frame. Closing a viewer
-drops the stream's decoder, buffer and audio in the screen thread
-(`ScreenControl::StopWatching`); the next viewer starts from a
-keyframe.
+`video::pool` instead of being allocated per frame — DXGI's captures
+too, and FFmpeg decodes straight into one when the width is a multiple
+of 16 (review P1-11). Closing a viewer drops the stream's decoder,
+buffer and audio in the screen thread (`ScreenControl::StopWatching`);
+the next viewer starts from a keyframe. The screen thread sleeps until
+a capture tick, a frame's playout slot, a decoder poll or a log line
+(review P1-7), and reaches the UI only through the present thread,
+which wakes it. A stream nobody can see (the phone in the background, a
+minimized viewer: `ScreenControl::SetVisible`) is not decoded; its
+sound plays on, and seen again it waits for a keyframe and asks for
+one.
 
 ### 7.4 Notifications on the phones
 

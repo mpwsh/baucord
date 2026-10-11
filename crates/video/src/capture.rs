@@ -396,7 +396,7 @@ impl StreamCapturer {
                     );
                 }
                 self.stream_drought_since = None;
-                self.last = Some(Frame {
+                self.hold(Frame {
                     data: cf.data,
                     width: cf.width,
                     height: cf.height,
@@ -503,7 +503,7 @@ impl StreamCapturer {
              delivering a probe frame",
             self.last_rx.elapsed().as_secs_f32()
         );
-        self.last = Some(Frame {
+        self.hold(Frame {
             data,
             width,
             height,
@@ -523,6 +523,15 @@ impl StreamCapturer {
             }
         }
         self.last.as_ref()
+    }
+
+    /// Hold `frame` as the latest, giving the one it replaces back to
+    /// `crate::pool`, where the capture worker takes its next buffer
+    /// from (review P1-11).
+    fn hold(&mut self, frame: Frame) {
+        if let Some(old) = self.last.replace(frame) {
+            crate::pool::recycle(old.data);
+        }
     }
 
     #[must_use]

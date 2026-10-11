@@ -75,6 +75,12 @@ const OUTPUT_WAIT: Duration = Duration::from_millis(4);
 /// Synthetic presentation timestamps (the client stamps 0; decoders
 /// want them increasing).
 const PTS_STEP_US: u64 = 16_667;
+/// After the last frame of a burst, how long pictures still inside the
+/// codec are looked for between frames, and how often (`next_poll`).
+/// A hardware decoder finishes one within a few ms of a pause; the
+/// window only ends the search for one it dropped.
+const POLL_WINDOW: Duration = Duration::from_millis(100);
+const POLL_STEP: Duration = Duration::from_millis(4);
 
 /// A configured, started codec and the size it was configured for.
 struct Running {
@@ -326,6 +332,25 @@ impl VideoDecoder for MediaCodecDecoder {
         }
         self.collect(Duration::ZERO)?;
         Ok(self.held.hand_out())
+    }
+
+    fn next_poll(&self, now: Instant) -> Option<Instant> {
+        if self.codec.is_none() || self.needs_reset {
+            return None;
+        }
+        let idle_at = self.held.idle_at()?;
+        // A picture waiting goes out once the stream has paused.
+        if !self.held.is_empty() {
+            return Some(idle_at);
+        }
+        // Pictures still inside the codec come out a few ms after the
+        // last frame; look for them every POLL_STEP until POLL_WINDOW
+        // after it (a frame the codec dropped never comes out).
+        let last = self.held.last_frame()?;
+        if self.frames_out >= self.frames_in || now >= last + POLL_WINDOW {
+            return None;
+        }
+        Some(idle_at.max(now + POLL_STEP))
     }
 }
 

@@ -199,14 +199,9 @@ pub mod convert {
             name_color: slint::Color::default(),
             has_name_color: false,
             name_style: 0,
-            outranked: false,
-            role_editable: false,
-            channel_kickable: false,
             members_only: false,
             temporary: false,
             is_afk: false,
-            owned: false,
-            from_config: false,
         }
     }
 
@@ -250,14 +245,9 @@ pub mod convert {
             name_color: slint::Color::default(),
             has_name_color: false,
             name_style: 0,
-            outranked: false,
-            role_editable: false,
-            channel_kickable: false,
             members_only: c.members_only,
             temporary: c.temporary,
             is_afk: c.is_afk,
-            owned: c.owned,
-            from_config: c.from_config,
         }
     }
 
@@ -389,12 +379,15 @@ pub mod convert {
         slint::Image::from_rgba8(buf)
     }
 
-    /// Decode PNG/GIF-first-frame bytes → `slint::Image` + dimensions.
-    /// Uses app-core's bounded decoder (bomb limits included).
+    /// Decode PNG/JPEG/GIF-first-frame bytes → `slint::Image` +
+    /// dimensions. Wire bytes only — a received picture, or one of ours
+    /// already through `load_image_bytes` — so it takes app-core's
+    /// received-picture decoder: bomb limits, and no other format
+    /// (review P1-20).
     pub fn decode_to_image(
         bytes: &[u8],
     ) -> Result<(slint::Image, u32, u32), app_core::images::ImageError> {
-        let decoded = app_core::images::decode_bounded(bytes)?;
+        let decoded = app_core::images::decode_received(bytes)?;
         let rgba = decoded.to_rgba8();
         let (w, h) = (rgba.width(), rgba.height());
         Ok((rgba_image(rgba.as_raw(), w, h), w, h))
@@ -422,12 +415,13 @@ pub mod convert {
     /// [`preview_max_edge`]) — a 1280² PNG is 6.5 MB of RGBA that
     /// would otherwise stay resident for the row's whole life just to
     /// be drawn at 360 px. The full-resolution decode happens only
-    /// while the gallery viewer is open.
+    /// while the gallery viewer is open. PNG, JPEG and GIF only, as
+    /// [`decode_to_image`].
     pub fn decode_to_preview(
         bytes: &[u8],
         max_edge: u32,
     ) -> Result<(slint::Image, u32, u32), app_core::images::ImageError> {
-        let decoded = app_core::images::decode_bounded(bytes)?;
+        let decoded = app_core::images::decode_received(bytes)?;
         let (w, h) = (decoded.width(), decoded.height());
         let rgba = if w.max(h) > max_edge {
             decoded.thumbnail(max_edge, max_edge).to_rgba8()

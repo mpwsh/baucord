@@ -85,9 +85,17 @@ not the other restores to dangling references; `server restore`,
 **CLI against a running server** (persistence on only — with
 persistence off there is no CLI; administration is over the wire,
 §8): the CLI writes SQLite; the persistence thread polls `PRAGMA
-data_version` every 2 s and, on an external change, reloads the policy
-tables and hands the tick a fresh snapshot behind an `Arc` swap. This
-also covers an operator editing the database by hand.
+data_version` every 2 s and, on an external change, applies the writes
+already queued, reloads the policy tables and hands the tick a fresh
+snapshot, which it diffs against the old one: only users whose roles
+changed get a `UserDetails`, only sessions whose permissions changed a
+`Session`, and `RoleList` goes out only if the roles table changed. This
+also covers an operator editing the database by hand. The CLI's
+listings (users, roles, restrictions, invites, telemetry, the `<who>`
+lookup, `db check`) open the database read-only, and the built-in role
+sync skips rows that already match, so reading is not a change (1.2.1,
+review P1-22). With the server's socket wait capped at 1 s (review
+P1-2), a change reaches live sessions within about 3 s.
 Migrations are forward-only, recorded in `schema_version`; a downgrade
 refuses to start rather than guess.
 
@@ -741,8 +749,9 @@ existing structs.** So nothing here adds a field: everything is a
 `UserJoined` and as a batch after `Init`; `ChannelDetails { stable id,
 min_role, owner, permanent, afk_after_min }` after `Init` and
 `ChannelListUpdated`; `Removed`, `Restricted`, `ProfileUpdated`,
-`ProgressUpdate`, `MessageEdited`, `MessageDeleted`, `History` (paged
-in ≤64 KiB batches, `more: true`), and so on. Where earlier sections
+`ProgressUpdate`, `MessageEdited`, `MessageDeleted`, `History` (one
+message per page, cut to the newest rows that fit the 17 KiB message
+bound, `more: true` when anything was left out — 1.2.1), and so on. Where earlier sections
 wrote `Welcome.permissions` or `ChannelInfo.channel_id`, read them as
 these variants.
 

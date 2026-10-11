@@ -2291,6 +2291,40 @@ fn files_are_posted_as_cards_and_replayed() {
     });
     assert_eq!(reason, DmFailReason::NoSuchBlob);
 
+    // …but the same bytes, sent in full, may be posted by anyone: the
+    // server asks for the transfer (proof of possession) instead of
+    // answering "already here" and then refusing the post (review P0-4).
+    bob.send(
+        &mut w,
+        &ClientMessage::UploadBegin {
+            upload_id: 40,
+            name: "notes.txt".into(),
+            mime: "text/plain".into(),
+            size: u32::try_from(notes.len()).unwrap(),
+            sha256: blob,
+        },
+    );
+    let needed = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::UploadAccept {
+            upload_id: 40,
+            needed,
+        } => Some(*needed),
+        _ => None,
+    });
+    assert!(needed, "someone else's file is sent in full once");
+    let (_, reposted) = post_file(
+        &mut bob,
+        &mut w,
+        &mut [&mut alice],
+        41,
+        "notes.txt",
+        "text/plain",
+        &notes,
+        ConvRef::General,
+    )
+    .expect("the second poster may post it");
+    assert_eq!(reposted, blob);
+
     // Guests do not upload files.
     let mut guest = w.connect("guest");
     guest.send(
@@ -2311,6 +2345,23 @@ fn files_are_posted_as_cards_and_replayed() {
         _ => None,
     });
     assert_eq!(reason, UploadRejectReason::NoPermission);
+    // The refusal names the upload restriction. It used to say
+    // General's text kind, and the client then locked the guest's
+    // chat until a reconnect (review P0-2).
+    assert!(guest.inbox.iter().any(|m| matches!(
+        m,
+        ServerMessage::Restricted {
+            kind: RestrictionKind::Upload,
+            ..
+        }
+    )));
+    assert!(!guest.inbox.iter().any(|m| matches!(
+        m,
+        ServerMessage::Restricted {
+            kind: RestrictionKind::GeneralText,
+            ..
+        }
+    )));
 
     // Over the per-file cap: refused at announce.
     alice.send(
@@ -2358,7 +2409,8 @@ fn files_are_posted_as_cards_and_replayed() {
         ServerMessage::History { messages, .. }
             if messages.iter().any(|h| h.id == msg_id && h.text.is_empty()))));
 
-    // Deleting the message lets go of the blob's reference.
+    // Deleting the message lets go of its reference to the blob (bob's
+    // repost of the same bytes still holds one).
     alice.send(&mut w, &ClientMessage::DeleteMessage { msg_id });
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -2367,7 +2419,7 @@ fn files_are_posted_as_cards_and_replayed() {
             .policy()
             .blobs
             .get(&blob)
-            .is_some_and(|b| b.refs == 0)
+            .is_some_and(|b| b.refs == 1)
         {
             break;
         }
@@ -5586,4 +5638,121 @@ fn the_last_admin_cannot_delete_their_account() {
     assert_eq!(reason, protocol::DeleteRefusal::LastAdmin);
     let admin_user = admin.key.user_id();
     assert!(w.server().policy().users.contains_key(&admin_user));
+}
+
+/// Wait until the persistence thread has written everything queued, so
+/// the CLI finds the rows.
+fn wait_for_rows(w: &mut World) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "rows never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// What a policy reload sends a client: the roster lines (whose), and
+/// how many `Session` and `RoleList` messages.
+fn reload_messages(c: &TestClient) -> (Vec<ClientId>, usize, usize) {
+    let mut details = Vec::new();
+    let (mut sessions, mut role_lists) = (0, 0);
+    for m in &c.inbox {
+        match m {
+            ServerMessage::UserDetails { client_id, .. } => details.push(*client_id),
+            ServerMessage::Session { .. } => sessions += 1,
+            ServerMessage::RoleList { .. } => role_lists += 1,
+            _ => {}
+        }
+    }
+    (details, sessions, role_lists)
+}
+
+#[test]
+fn cli_listings_reload_nothing_and_message_nobody() {
+    // Every CLI open re-synced the built-in roles and truncated the WAL
+    // on close, so `server user list` read as a change: the server
+    // reloaded every table and sent N² messages (review P1-22).
+    let dir = temp_dir("cli-listings");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect("alice");
+    let mut bob = w.connect("bob");
+    // Bob's arrival still on its way to alice.
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(500));
+    wait_for_rows(&mut w);
+    let before = w.server().persistence().stats().external_changes;
+    alice.inbox.clear();
+    bob.inbox.clear();
+
+    let db = dir.join("baucord.db");
+    let (found, policy) = server::persistence::cli_find_user(&db, "alice").expect("by name");
+    assert_eq!(found, alice.key.user_id());
+    assert_eq!(policy.users.len(), 2);
+    server::persistence::cli_load_policy(&db).expect("user list");
+    assert!(!server::persistence::cli_list_invites(&db)
+        .expect("invite list")
+        .is_empty());
+    server::persistence::cli_telemetry(&db, &found, 0, 10).expect("telemetry");
+    assert!(server::persistence::check(&db).expect("db check").is_ok());
+
+    // Past the 2 s poll, twice.
+    let until = Instant::now() + Duration::from_millis(4500);
+    while Instant::now() < until {
+        w.pump(&mut [&mut alice, &mut bob]);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(w.server().persistence().stats().external_changes, before);
+    for c in [&alice, &bob] {
+        assert_eq!(reload_messages(c), (Vec::new(), 0, 0), "{:?}", c.inbox);
+    }
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_cli_grant_messages_only_what_changed() {
+    let dir = temp_dir("cli-grant-diff");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect("alice");
+    let mut bob = w.connect("bob");
+    let mut carol = w.connect("carol");
+    // The arrivals still on their way to the others.
+    w.settle(
+        &mut [&mut alice, &mut bob, &mut carol],
+        Duration::from_millis(500),
+    );
+    wait_for_rows(&mut w);
+    for c in [&mut alice, &mut bob, &mut carol] {
+        c.inbox.clear();
+    }
+
+    let db = dir.join("baucord.db");
+    let alice_user = alice.key.user_id();
+    server::persistence::cli_set_roles(&db, &alice_user, &[ROLE_MEMBER]).expect("grant");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        w.pump(&mut [&mut alice, &mut bob, &mut carol]);
+        if alice.inbox.iter().any(|m| {
+            matches!(m, ServerMessage::Session { permissions, .. }
+                if *permissions == permissions::MEMBER_PERMISSIONS)
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the grant never reached the session"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    w.settle(
+        &mut [&mut alice, &mut bob, &mut carol],
+        Duration::from_millis(200),
+    );
+
+    // Alice's roster line to everyone, her own permission set to her,
+    // and the role table to nobody: it did not change.
+    let alice_id = alice.id;
+    assert_eq!(reload_messages(&alice), (vec![alice_id], 1, 0));
+    assert_eq!(reload_messages(&bob), (vec![alice_id], 0, 0));
+    assert_eq!(reload_messages(&carol), (vec![alice_id], 0, 0));
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
 }

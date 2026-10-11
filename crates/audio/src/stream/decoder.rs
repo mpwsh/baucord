@@ -8,20 +8,21 @@
 //! ## Architecture
 //!
 //! ```text
-//! network → StreamAudioPacket → [decoder thread] → Sink ─→ StreamAudioOutput → cpal
+//! network → StreamAudioPacket → [decoder thread] → Sink ─→ StreamAudioOutput's ring → its device callback
 //!                                                        └→ stream::mix → voice output
 //! ```
 //!
 //! The sink is chosen per frame, so a stream follows the voice path as
 //! it changes (headphones in, a re-plan): into the mix while a call-path
 //! voice output runs, on its own output otherwise. Its own output lives
-//! on this thread, opens on the first frame and reopens when its device
-//! goes away (an Android reroute reports "Disconnected").
+//! on this thread, opens on the first frame on the voice output picked
+//! in Settings ([`OutputSelection`]), and reopens when that pick changes
+//! or its device goes away (an Android reroute reports "Disconnected").
 
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, PoisonError,
     },
     time::{Duration, Instant},
 };
@@ -34,7 +35,7 @@ use crate::{
     stream::{
         downmix::Downmix,
         mix::{self, MixSource},
-        output::{StreamAudioFrame, StreamAudioOutput},
+        output::StreamAudioOutput,
     },
     OPUS_SAMPLE_RATE,
 };
@@ -100,15 +101,99 @@ pub struct StreamAudioStats {
     pub queued_ms: u32,
 }
 
+// ── Which output a stream plays on ──────────────────────────────────────
+
+/// The output a watched stream's own output opens on: the voice output
+/// the user picked in Settings, so a stream plays where the room does.
+/// It was always the system default, so with a headset picked and
+/// speakers as the default every stream played on the speakers — and
+/// Automatic, seeing a headset, opened no canceller, so the room heard
+/// it back (review P1-19).
+///
+/// One selection is shared by whoever knows the pick and every stream
+/// decoder; a decoder looks at it with each frame and moves its output
+/// when it changed. With no pick ("Default") a stream follows the device
+/// the voice output opened ([`VOICE_OUTPUT`]): on Windows "Default" can
+/// mean the communications device for voice and the console one for
+/// cpal (`communications_default` in lib.rs). The phones ignore both:
+/// their pick is a route for the call (`route`), not a device, and a
+/// stream follows the call's route by itself.
+#[derive(Clone, Default)]
+pub struct OutputSelection(Arc<Selection>);
+
+impl OutputSelection {
+    /// Pick `name` (`None` = the default). A change moves every stream
+    /// decoder's output with its next frame.
+    pub fn set(&self, name: Option<&str>) {
+        self.0.set(name);
+    }
+}
+
+/// A device name and a generation bumped by every change, so a decoder
+/// notices with one load.
+#[derive(Default)]
+pub(crate) struct Selection {
+    generation: AtomicU64,
+    name: Mutex<Option<String>>,
+}
+
+impl Selection {
+    const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            name: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set(&self, name: Option<&str>) {
+        let mut slot = self.name.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.as_deref() != name {
+            *slot = name.map(String::from);
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        self.name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+/// The device the voice output opened, as its backend names it (the
+/// endpoint's friendly name, which cpal uses too); set by `VoiceChat`
+/// on the desktop each time playback opens.
+pub(crate) static VOICE_OUTPUT: Selection = Selection::new();
+
+/// Where a stream's own output should open, and the generations of the
+/// pick and of the voice output that say so.
+fn wanted_output(pick: &OutputSelection) -> ((u64, u64), Option<String>) {
+    let seen = (pick.0.generation(), VOICE_OUTPUT.generation());
+    // A phone's pick is a call route, not a device (see above).
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        return (seen, None);
+    }
+    (seen, pick.0.get().or_else(|| VOICE_OUTPUT.get()))
+}
+
 // ── Where decoded audio goes ────────────────────────────────────────────
 
 /// The stream's playback: its own output, or the voice output's mix.
 struct Sink {
-    device_name: Option<String>,
+    /// The Settings pick, the device the own output is for, and the
+    /// generations (pick, voice output) it was worked out from.
+    output: OutputSelection,
+    device: Option<String>,
+    output_seen: (u64, u64),
     volume: Arc<AtomicU32>,
     is_muted: Arc<AtomicBool>,
-    /// The stream's own output and the sender into it.
-    own: Option<(StreamAudioOutput, Sender<StreamAudioFrame>)>,
+    /// The stream's own output.
+    own: Option<StreamAudioOutput>,
     /// When the own output last opened (a device lost right after an
     /// open counts as a failed open: back off).
     opened_at: Option<Instant>,
@@ -129,13 +214,16 @@ struct Sink {
 
 impl Sink {
     fn new(
-        device_name: Option<String>,
+        output: OutputSelection,
         volume: Arc<AtomicU32>,
         is_muted: Arc<AtomicBool>,
         counters: Arc<Counters>,
     ) -> Self {
+        let (output_seen, device) = wanted_output(&output);
         Self {
-            device_name,
+            output,
+            device,
+            output_seen,
             volume,
             is_muted,
             own: None,
@@ -151,7 +239,7 @@ impl Sink {
     }
 
     /// Play one decoded frame (interleaved stereo, 48 kHz).
-    fn play(&mut self, stereo: &[f32], seq: u32) {
+    fn play(&mut self, stereo: &[f32]) {
         let now = Instant::now();
         let mixing = mix::BUS.is_mixing();
         if mixing {
@@ -163,15 +251,13 @@ impl Sink {
         if into_mix {
             self.play_mixed(stereo, mixing);
         } else {
-            self.play_own(stereo, seq, now);
+            self.play_own(stereo, now);
         }
         #[allow(clippy::cast_possible_truncation)] // ms of audio
         let queued_ms = if let Some(source) = &self.mix {
             (source.queued() as u64 * 1000 / u64::from(OPUS_SAMPLE_RATE)) as u32
         } else {
-            self.own
-                .as_ref()
-                .map_or(0, |(output, _)| output.queued_ms())
+            self.own.as_ref().map_or(0, StreamAudioOutput::queued_ms)
         };
         self.counters.queued_ms.store(queued_ms, Ordering::Relaxed);
     }
@@ -210,11 +296,27 @@ impl Sink {
 
     /// On the stream's own stereo output, opening or reopening it as
     /// needed.
-    fn play_own(&mut self, stereo: &[f32], seq: u32, now: Instant) {
+    fn play_own(&mut self, stereo: &[f32], now: Instant) {
         if self.mix.take().is_some() {
             info!("Stream audio: back on its own output");
         }
-        if self.own.as_ref().is_some_and(|(output, _)| output.failed()) {
+        // Another output picked in Settings, or (no pick) the voice
+        // output moved: follow it now, without the backoff a lost
+        // device would get.
+        let seen = (self.output.0.generation(), VOICE_OUTPUT.generation());
+        if seen != self.output_seen {
+            let (seen, device) = wanted_output(&self.output);
+            self.output_seen = seen;
+            if device != self.device {
+                self.device = device;
+                if self.own.take().is_some() {
+                    info!("Stream audio: moving to the voice output");
+                }
+                self.next_open = None;
+                self.open_failures = 0;
+            }
+        }
+        if self.own.as_ref().is_some_and(StreamAudioOutput::failed) {
             self.own = None;
             // Lost right after opening: the device is coming and going —
             // a failed open, with its backoff and its quieter log.
@@ -251,25 +353,30 @@ impl Sink {
                 }
             }
         }
-        if let Some((_, tx)) = &self.own {
-            let _ = tx.try_send(StreamAudioFrame {
-                samples: stereo.to_vec(),
-                seq,
-            });
+        if let Some(output) = &mut self.own {
+            output.push(stereo);
         }
     }
 
-    fn open_own(
-        &self,
-    ) -> Result<(StreamAudioOutput, Sender<StreamAudioFrame>), Box<dyn std::error::Error>> {
-        let mut output = StreamAudioOutput::with_controls(
-            self.device_name.as_deref(),
-            self.volume.clone(),
-            self.is_muted.clone(),
-        )?;
-        let tx = output.frame_sender();
-        output.start()?;
-        Ok((output, tx))
+    fn open_own(&self) -> Result<StreamAudioOutput, Box<dyn std::error::Error>> {
+        let open = |device: Option<&str>| -> Result<_, Box<dyn std::error::Error>> {
+            let mut output = StreamAudioOutput::with_controls(
+                device,
+                self.volume.clone(),
+                self.is_muted.clone(),
+            )?;
+            output.start()?;
+            Ok(output)
+        };
+        match open(self.device.as_deref()) {
+            // No pick, and cpal will not open the voice output's device
+            // by that name: the default still plays.
+            Err(e) if self.device.is_some() && self.output.0.get().is_none() => {
+                debug!("stream audio on the voice output's device: {e}; the default instead");
+                open(None)
+            }
+            opened => opened,
+        }
     }
 }
 
@@ -326,7 +433,7 @@ impl StreamDecoderWorker {
                     {
                         Ok(n) => {
                             let total = n * STREAM_CHANNELS;
-                            self.sink.play(&self.frame_buffer[..total], 0);
+                            self.sink.play(&self.frame_buffer[..total]);
                         }
                         Err(e) => {
                             warn!("Stream PLC decode failed: {e}");
@@ -353,7 +460,7 @@ impl StreamDecoderWorker {
         {
             Ok(samples_per_channel) => {
                 let total = samples_per_channel * STREAM_CHANNELS;
-                self.sink.play(&self.frame_buffer[..total], curr);
+                self.sink.play(&self.frame_buffer[..total]);
                 self.last_seq = Some(curr);
             }
             Err(e) => {
@@ -364,7 +471,7 @@ impl StreamDecoderWorker {
                     .decode_float(&[], &mut self.frame_buffer, false)
                 {
                     let total = n * STREAM_CHANNELS;
-                    self.sink.play(&self.frame_buffer[..total], curr);
+                    self.sink.play(&self.frame_buffer[..total]);
                 }
 
                 self.last_seq = Some(curr);
@@ -447,15 +554,15 @@ impl Drop for StreamDecoder {
 
 /// Create and start a stream audio decoder + playback pipeline.
 ///
-/// - `device_name`: output device for the stream's own output (or `None`
-///   for the system default)
+/// - `output`: where the stream's own output opens — the voice output
+///   picked in Settings; followed when it changes
 /// - `volume`: initial playback volume (0.0–2.0)
 ///
 /// # Errors
 /// The Opus decoder could not be created. (Playback opens with the
 /// first frame and retries on its own.)
 pub fn spawn(
-    device_name: Option<&str>,
+    output: OutputSelection,
     volume: f32,
 ) -> Result<StreamDecoder, Box<dyn std::error::Error>> {
     let decoder = Decoder::new(OPUS_SAMPLE_RATE, Channels::Stereo)?;
@@ -466,7 +573,6 @@ pub fn spawn(
     let should_stop = Arc::new(AtomicBool::new(false));
 
     let stop = should_stop.clone();
-    let device_name = device_name.map(String::from);
     let (sink_volume, sink_muted) = (volume.clone(), is_muted.clone());
     let counters = Arc::new(Counters::default());
     let sink_counters = counters.clone();
@@ -476,7 +582,7 @@ pub fn spawn(
         StreamDecoderWorker {
             decoder,
             rx: packet_rx,
-            sink: Sink::new(device_name, sink_volume, sink_muted, sink_counters),
+            sink: Sink::new(output, sink_volume, sink_muted, sink_counters),
             should_stop: stop,
             last_seq: None,
             frame_buffer: vec![0.0f32; DECODE_BUF_SIZE],
@@ -492,4 +598,44 @@ pub fn spawn(
         decoder_thread: Some(decoder_thread),
         counters,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_pick_is_noticed_and_the_same_one_is_not() {
+        let selection = OutputSelection::default();
+        let shared = selection.clone();
+        let seen = shared.0.generation();
+        selection.set(None);
+        assert_eq!(shared.0.generation(), seen, "the default again");
+        selection.set(Some("Headset"));
+        assert_ne!(shared.0.generation(), seen);
+        assert_eq!(shared.0.get().as_deref(), Some("Headset"));
+        let seen = shared.0.generation();
+        selection.set(Some("Headset"));
+        assert_eq!(shared.0.generation(), seen, "the same pick again");
+    }
+
+    /// A pick wins; with none, the stream goes where the voice output
+    /// opened (on Windows the communications default, which cpal's
+    /// default need not be).
+    #[test]
+    fn the_pick_wins_and_default_follows_the_voice_output() {
+        let pick = OutputSelection::default();
+        VOICE_OUTPUT.set(Some("Speakers (Realtek)"));
+        assert_eq!(
+            wanted_output(&pick).1.as_deref(),
+            Some("Speakers (Realtek)")
+        );
+        pick.set(Some("Headset"));
+        let (seen, device) = wanted_output(&pick);
+        assert_eq!(device.as_deref(), Some("Headset"));
+        VOICE_OUTPUT.set(Some("Headset"));
+        assert_ne!(wanted_output(&pick).0, seen, "noticed");
+        assert_eq!(wanted_output(&pick).1.as_deref(), Some("Headset"));
+        VOICE_OUTPUT.set(None);
+    }
 }

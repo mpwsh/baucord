@@ -4,7 +4,6 @@
 use std::{
     cell::{Cell, OnceCell, RefCell},
     collections::HashSet,
-    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -926,6 +925,7 @@ fn wire(sf: &SettingsSurface<'_>) {
         app::with_current(move |app| {
             app.settings.audio.push_to_talk = index == 1 && !app::SINGLE_WINDOW_HOST;
             app.apply_push_to_talk();
+            app.refresh_hotkeys();
         });
     });
     logic.on_aec_selected(|index| {
@@ -1472,7 +1472,7 @@ fn populate_binds_only(app: &mut AppState) {
 /// 8 Hz meter loop while the window is open (the FLTK build's
 /// `MeterUpdate` tick); every 2 s of it, the Debug tab's log view.
 fn start_meter_timer(app: &mut AppState) {
-    let (output_level, denoised_level) = app.voice_levels();
+    let levels = app.voice_levels();
     let aec = app.voice_aec();
     let mut ticks = 0u32;
     app.meter_timer.start(
@@ -1487,8 +1487,7 @@ fn start_meter_timer(app: &mut AppState) {
                     }
                 });
             }
-            let mic = f32::from_bits(denoised_level.load(Ordering::Relaxed));
-            let out = f32::from_bits(output_level.load(Ordering::Relaxed));
+            let (mic, out) = levels.levels();
             // Reopening the streams (a headset plugged in, the setting
             // changed) changes this; property sets of an equal string
             // cost nothing visible.

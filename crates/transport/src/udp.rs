@@ -1,7 +1,9 @@
 //! The real socket. A thin, synchronous wrapper over `quinn-udp` so the
 //! existing threads can pump a [`Driver`](crate::Driver) without a
 //! runtime: receive everything that is ready, hand it to the driver,
-//! send whatever the driver produced, sleep until its next timer.
+//! send whatever the driver produced, then wait until a datagram
+//! arrives or the driver's next deadline ([`UdpIo::wait_readable`],
+//! [`ReadWaiter`]).
 //!
 //! GSO/GRO, ECN and socket buffer sizing come from `quinn-udp`; failures
 //! to send (`WouldBlock`, `ENOBUFS`) are treated as a dropped datagram —
@@ -10,6 +12,7 @@
 use std::{
     io::{self, IoSliceMut},
     net::{SocketAddr, UdpSocket},
+    time::Duration,
 };
 
 use bytes::BytesMut;
@@ -131,7 +134,10 @@ impl UdpIo {
         self.socket.local_addr()
     }
 
-    /// Segments one transmit may carry with GSO (1 without).
+    /// Segments one transmit may carry with GSO (1 without). It can
+    /// drop to 1 at any send: `quinn-udp` gives up on GSO when the
+    /// device refuses it, so a loop hands it to the driver every pass
+    /// (review P1-14).
     #[must_use]
     pub fn max_gso_segments(&self) -> usize {
         self.state.max_gso_segments()
@@ -220,21 +226,71 @@ impl UdpIo {
     /// A second handle on this socket that can block until a datagram
     /// is waiting, for a thread that should sleep instead of polling
     /// the socket on a timer ([`ReadWaiter`]). The handle shares the
-    /// socket (a `dup`): reading still happens here, through
-    /// [`Self::recv_batch`].
+    /// socket (a `dup`, `WSADuplicateSocket` on Windows): reading still
+    /// happens here, through [`Self::recv_batch`].
     ///
     /// # Errors
-    /// The descriptor could not be duplicated.
-    #[cfg(unix)]
+    /// The handle could not be duplicated, or the platform has no way
+    /// to wait on a socket.
     pub fn read_waiter(&self) -> io::Result<ReadWaiter> {
+        if cfg!(not(any(unix, windows))) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no socket wait on this platform",
+            ));
+        }
         Ok(ReadWaiter {
             socket: self.socket.try_clone()?,
         })
     }
 
+    /// Block until a datagram is waiting or `timeout` passes, for the
+    /// socket's only reader (the server's loop): `Ok(true)` when one is
+    /// there, `Ok(false)` on timeout or a signal. A wait that times out
+    /// lasts at least `timeout`, so a loop that sleeps until its
+    /// driver's deadline wakes at or after it, never just before.
+    ///
+    /// # Errors
+    /// The wait itself failed (the socket is gone).
+    pub fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        wait_readable(&self.socket, timeout)
+    }
+
     /// Send one transmit (a GSO batch if `segment_size` is set). A
     /// kernel refusal is counted and swallowed.
+    ///
+    /// A device that refuses segmentation offload makes `quinn-udp`
+    /// halt GSO and report the failed batch as sent (review P1-14).
+    /// That batch, and any batch built before the driver learned the
+    /// new segment count, goes out one datagram at a time instead.
     pub fn send(&mut self, t: &Transmit) {
+        let batch = t
+            .segment_size
+            .filter(|&size| size > 0 && t.contents.len() > size);
+        if let Some(size) = batch
+            && self.state.max_gso_segments() <= 1
+        {
+            self.send_segments(t, size);
+            return;
+        }
+        let gso_before = self.state.max_gso_segments();
+        self.send_one(t, &t.contents, t.segment_size);
+        if let Some(size) = batch
+            && gso_before > 1
+            && self.state.max_gso_segments() <= 1
+        {
+            self.send_segments(t, size);
+        }
+    }
+
+    /// `t`'s contents one datagram per `size` bytes.
+    fn send_segments(&mut self, t: &Transmit, size: usize) {
+        for segment in t.contents.chunks(size) {
+            self.send_one(t, segment, None);
+        }
+    }
+
+    fn send_one(&mut self, t: &Transmit, contents: &[u8], segment_size: Option<usize>) {
         let transmit = quinn_udp::Transmit {
             destination: t.destination,
             ecn: t.ecn.map(|e| match e {
@@ -242,8 +298,8 @@ impl UdpIo {
                 quinn_proto::EcnCodepoint::Ect1 => quinn_udp::EcnCodepoint::Ect1,
                 quinn_proto::EcnCodepoint::Ce => quinn_udp::EcnCodepoint::Ce,
             }),
-            contents: &t.contents,
-            segment_size: t.segment_size,
+            contents,
+            segment_size,
             src_ip: t.src_ip,
         };
         if let Err(e) = self.state.send(UdpSockRef::from(&self.socket), &transmit) {
@@ -264,44 +320,126 @@ impl UdpIo {
 /// [`UdpIo`] does, and must drain the socket before waiting again —
 /// readiness is level-triggered, so a datagram left queued makes the
 /// next [`Self::wait`] return at once.
-#[cfg(unix)]
 pub struct ReadWaiter {
     socket: UdpSocket,
 }
 
-#[cfg(unix)]
 impl ReadWaiter {
     /// Wait up to `timeout` for a readable datagram: `Ok(true)` when
     /// one is there, `Ok(false)` on timeout or a signal.
     ///
     /// # Errors
-    /// `poll` failed (the descriptor is gone).
-    pub fn wait(&self, timeout: std::time::Duration) -> io::Result<bool> {
-        use std::os::fd::AsRawFd;
-        let mut fd = libc::pollfd {
-            fd: self.socket.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
-        // SAFETY: one valid `pollfd` for the call's duration; the
-        // descriptor is ours (a dup) and open while `self` lives.
-        let n = unsafe { libc::poll(&raw mut fd, 1, ms) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            return if err.kind() == io::ErrorKind::Interrupted {
-                Ok(false)
-            } else {
-                Err(err)
-            };
-        }
-        if n > 0 && fd.revents & libc::POLLNVAL != 0 {
-            return Err(io::Error::from_raw_os_error(libc::EBADF));
-        }
-        // An error or hang-up condition counts as readable: the owner's
-        // next receive reports it.
-        Ok(n > 0)
+    /// The wait failed (the handle is gone).
+    pub fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        wait_readable(&self.socket, timeout)
     }
+}
+
+/// `poll(2)` for `POLLIN`. Linux and Android use `ppoll` for its
+/// nanosecond timeout: the server's loop sleeps until the transport's
+/// next timer (pacing among them) and must not round it to a whole
+/// millisecond. Elsewhere the timeout is rounded *up*, so a wait never
+/// ends just short of its deadline and spins on a zero wait after it.
+#[cfg(unix)]
+fn wait_readable(socket: &UdpSocket, timeout: Duration) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let n = {
+        // SAFETY: an all-zero `timespec` is valid; zeroing also covers
+        // the padding some 32-bit targets add.
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        ts.tv_sec = libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX);
+        // `tv_nsec`'s type differs by target; below 10^9 it fits all.
+        #[allow(clippy::cast_lossless)]
+        {
+            ts.tv_nsec = timeout.subsec_nanos() as _;
+        }
+        // SAFETY: one valid `pollfd` and `timespec` for the call's
+        // duration; no signal mask. The descriptor is open while
+        // `socket` is borrowed.
+        unsafe { libc::ppoll(&raw mut fd, 1, &raw const ts, std::ptr::null()) }
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let n = {
+        let ms = libc::c_int::try_from(round_up_ms(timeout)).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one valid `pollfd` for the call's duration; the
+        // descriptor is open while `socket` is borrowed.
+        unsafe { libc::poll(&raw mut fd, 1, ms) }
+    };
+    if n < 0 {
+        let err = io::Error::last_os_error();
+        return if err.kind() == io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(err)
+        };
+    }
+    if n > 0 && fd.revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    // An error or hang-up condition counts as readable: the owner's
+    // next receive reports it.
+    Ok(n > 0)
+}
+
+/// `WSAPoll` for `POLLRDNORM` (a datagram queued), the Winsock twin of
+/// `poll(2)` (review P1-1). Its timeout is whole milliseconds, rounded
+/// up for the same reason as above; the voice engine's 1 ms timer
+/// resolution keeps it that precise while connected.
+#[cfg(windows)]
+fn wait_readable(socket: &UdpSocket, timeout: Duration) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAGetLastError, WSAPoll, POLLNVAL, POLLRDNORM, SOCKET, SOCKET_ERROR, WSAEINTR,
+        WSAENOTSOCK, WSAPOLLFD,
+    };
+
+    let mut fd = WSAPOLLFD {
+        fd: socket.as_raw_socket() as SOCKET,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    let ms = i32::try_from(round_up_ms(timeout)).unwrap_or(i32::MAX);
+    // SAFETY: one valid `WSAPOLLFD` for the call's duration; the socket
+    // is open while `socket` is borrowed, and Winsock was started when
+    // std created it.
+    let n = unsafe { WSAPoll(&raw mut fd, 1, ms) };
+    if n == SOCKET_ERROR {
+        // SAFETY: plain FFI, reads this thread's last Winsock error.
+        let code = unsafe { WSAGetLastError() };
+        return if code == WSAEINTR {
+            Ok(false)
+        } else {
+            Err(io::Error::from_raw_os_error(code))
+        };
+    }
+    if n > 0 && fd.revents & POLLNVAL != 0 {
+        return Err(io::Error::from_raw_os_error(WSAENOTSOCK));
+    }
+    // POLLERR / POLLHUP count as readable: the owner's next receive
+    // reports them.
+    Ok(n > 0)
+}
+
+/// No way to wait on a socket here: report "maybe readable" after at
+/// most a millisecond, which makes the caller poll as it always did.
+#[cfg(not(any(unix, windows)))]
+fn wait_readable(socket: &UdpSocket, timeout: Duration) -> io::Result<bool> {
+    let _ = socket;
+    std::thread::sleep(timeout.min(Duration::from_millis(1)));
+    Ok(true)
+}
+
+/// `timeout` in whole milliseconds, never less than it.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn round_up_ms(timeout: Duration) -> u128 {
+    timeout.as_nanos().div_ceil(1_000_000)
 }
 
 #[cfg(windows)]
@@ -459,9 +597,34 @@ mod tests {
         assert_eq!(got.len(), N);
         assert!(got.iter().all(|len| *len == 100));
     }
+
+    /// A batch reaches the peer as its datagrams, whether the socket
+    /// segments it (GSO) or `send` splits it (no GSO, or GSO halted).
+    #[test]
+    fn a_segmented_transmit_arrives_as_its_datagrams() {
+        let mut rx = UdpIo::bind("127.0.0.1:0".parse().unwrap(), 1 << 20).expect("bind rx");
+        let mut tx = UdpIo::bind("127.0.0.1:0".parse().unwrap(), 1 << 20).expect("bind tx");
+        let mut contents = vec![1u8; 300];
+        contents.extend_from_slice(&[2u8; 120]);
+        tx.send(&Transmit {
+            destination: rx.local_addr().expect("addr"),
+            ecn: None,
+            contents: bytes::Bytes::from(contents),
+            segment_size: Some(300),
+            src_ip: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = Vec::new();
+        while got.len() < 2 && Instant::now() < deadline {
+            rx.recv_batch(|d| got.push(d.data.to_vec())).expect("recv");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(got, vec![vec![1u8; 300], vec![2u8; 120]]);
+        assert_eq!(tx.send_drops(), 0);
+    }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod read_waiter_tests {
     use std::time::{Duration, Instant};
 
@@ -510,6 +673,30 @@ mod read_waiter_tests {
         assert!(ready);
         assert!(took < Duration::from_secs(2), "woke after {took:?}");
         drop(rx);
+    }
+
+    /// The owner's own wait: a timeout is slept in full (never cut a
+    /// little short, which would make a deadline loop spin), an arrival
+    /// ends it at once.
+    #[test]
+    fn wait_readable_sleeps_its_timeout_or_wakes_on_arrival() {
+        let mut rx = UdpIo::bind("127.0.0.1:0".parse().unwrap(), 1 << 20).expect("bind rx");
+        for timeout in [Duration::from_micros(300), Duration::from_millis(30)] {
+            let start = Instant::now();
+            assert!(!rx.wait_readable(timeout).expect("wait"));
+            assert!(start.elapsed() >= timeout, "{timeout:?} ended early");
+        }
+
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind tx");
+        tx.send_to(&[3u8; 8], rx.local_addr().expect("addr"))
+            .expect("send");
+        let start = Instant::now();
+        assert!(rx.wait_readable(Duration::from_secs(5)).expect("wait"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let mut got = 0;
+        rx.recv_batch(|_| got += 1).expect("recv");
+        assert_eq!(got, 1);
+        assert!(!rx.wait_readable(Duration::ZERO).expect("wait"));
     }
 }
 

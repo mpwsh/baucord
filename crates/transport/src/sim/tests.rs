@@ -12,7 +12,7 @@ use rcgen::PublicKeyData;
 use super::{LinkSpec, NodeId, SimNet};
 use crate::{
     config::Budget,
-    driver::{DisconnectReason, Driver, Event, PeerId, VideoItem},
+    driver::{DisconnectReason, Driver, Event, PeerId, VideoItem, OWN_TRACK, VIDEO_GROUP_DEADLINE},
     identity::{Fingerprint, Observation, ServerIdentity, Trust},
 };
 
@@ -906,19 +906,73 @@ fn stats_track_traffic() {
     let _ = Instant::now(); // keep the import honest for future timing asserts
 }
 
-/// What lets a client's network thread sleep between datagrams
-/// (`Driver::wants_tick`): an idle connection has no per-tick work; a
-/// paced upload has, until it is acknowledged and retired.
+/// Run on the loops' schedule (review P1-2): straight from one event to
+/// the next — a datagram landing, a driver's deadline — never on a fixed
+/// tick, until `done` or `timeout` of simulated time. Returns whether
+/// `done` hit, and the wakes it took. A deadline whose work never
+/// clears spins on zero-length steps, and fails here.
+fn run_on_events(
+    net: &mut SimNet,
+    timeout: Duration,
+    mut done: impl FnMut(&mut SimNet) -> bool,
+) -> (bool, u64) {
+    let end = net.now() + timeout;
+    let mut wakes = 0;
+    let mut zero_steps = 0;
+    while net.now() < end {
+        if done(net) {
+            return (true, wakes);
+        }
+        let dt = net.step_to_next_event(end - net.now());
+        wakes += 1;
+        zero_steps = if dt.is_zero() { zero_steps + 1 } else { 0 };
+        assert!(
+            zero_steps < 50,
+            "spinning on a deadline nothing clears, at {:?}",
+            net.now()
+        );
+    }
+    (done(net), wakes)
+}
+
+/// What lets the loops sleep (review P1-2): an idle connection is due
+/// only at its next quinn timer — the client's keep-alive, the server's
+/// idle timeout — never a millisecond away.
 #[test]
-fn an_idle_connection_wants_no_tick_and_a_paced_upload_does() {
+fn an_idle_connection_is_due_only_at_its_next_timer() {
     let mut p = pair(23, LinkSpec::clean(Duration::from_millis(10)));
-    let (server_peer, _) = connect(&mut p);
-    let client = p.client;
+    connect(&mut p);
+    let (server, client) = (p.server, p.client);
     p.net.run_for(Duration::from_millis(300), TICK);
-    assert!(
-        !p.net.driver(client).wants_tick(),
-        "an idle connection asks for ticks"
-    );
+    let now = p.net.now();
+    for (who, node) in [("client", client), ("server", server)] {
+        let due = p
+            .net
+            .driver(node)
+            .next_deadline()
+            .expect("a live connection has timers");
+        assert!(
+            due >= now + Duration::from_millis(100),
+            "the idle {who} is due in {:?}",
+            due.saturating_duration_since(now)
+        );
+    }
+    // On the loops' schedule two quiet seconds are a handful of wakes:
+    // a keep-alive and its ack.
+    let (_, wakes) = run_on_events(&mut p.net, Duration::from_secs(2), |_| false);
+    assert!(wakes <= 20, "{wakes} wakes in two idle seconds");
+}
+
+/// The pacer's refill is a deadline: a loop that only wakes for events
+/// still moves a paced upload, with about one wake per chunk beyond the
+/// datagrams themselves, and the connection is idle again once the
+/// upload is acknowledged and retired.
+#[test]
+fn a_paced_upload_completes_on_the_loops_schedule() {
+    let mut p = pair(24, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, client_peer) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+    p.net.run_for(Duration::from_millis(300), TICK);
 
     let frames: Vec<Bytes> = (0..20u8)
         .map(|i| Bytes::from(vec![i; protocol::IMAGE_CHUNK_BYTES]))
@@ -927,17 +981,148 @@ fn an_idle_connection_wants_no_tick_and_a_paced_upload_does() {
     let upload = p
         .net
         .driver(client)
-        .send_media(now, server_peer, frames)
+        .send_media(now, server_peer, frames.clone())
         .expect("upload");
-    assert!(p.net.driver(client).wants_tick(), "an upload needs ticks");
-    let settled = p.net.run_until(Duration::from_secs(10), TICK, |net| {
+    let delivered_before = p.net.delivered;
+    let mut got = Vec::new();
+    let (retired, wakes) = run_on_events(&mut p.net, Duration::from_secs(10), |net| {
+        while let Some(f) = net.driver(server).recv(client_peer, Lane::Media) {
+            got.push(f);
+        }
         net.driver(client)
             .upload_progress(server_peer, upload)
             .is_none()
     });
-    assert!(settled, "the upload was never retired");
+    assert!(retired, "the upload stalled after {} frames", got.len());
+    assert_eq!(got, frames);
+    // 320 KiB at 512 KiB/s is ~600 ms: a 1 ms tick was 600 wakes on top
+    // of the datagrams.
+    let arrivals = p.net.delivered - delivered_before;
+    let timer_wakes = wakes.saturating_sub(arrivals);
     assert!(
-        !p.net.driver(client).wants_tick(),
-        "ticks still wanted after the upload"
+        timer_wakes < 100,
+        "{timer_wakes} wakes besides {arrivals} arrivals"
+    );
+    let now = p.net.now();
+    let due = p.net.driver(client).next_deadline().expect("timers");
+    assert!(
+        due >= now + Duration::from_millis(100),
+        "still due in {:?} after the upload",
+        due.saturating_duration_since(now)
+    );
+}
+
+/// A sharer whose bytes are all acknowledged costs no ticks: an open
+/// group with nothing queued has no deadline (the network thread used
+/// to run at 1 kHz for the whole length of a share).
+#[test]
+fn an_open_group_with_nothing_queued_is_not_due() {
+    let mut p = pair(25, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, client_peer) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+    let now = p.net.now();
+    p.net
+        .driver(client)
+        .video_new_group(now, server_peer, OWN_TRACK);
+    for i in 0..5u8 {
+        p.net
+            .driver(client)
+            .send(now, server_peer, Lane::Video, &[i; 1000])
+            .expect("chunk");
+    }
+    let mut items = 0;
+    let (got, _) = run_on_events(&mut p.net, Duration::from_secs(2), |net| {
+        while net.driver(server).recv_video(client_peer).is_some() {
+            items += 1;
+        }
+        items == 6
+    });
+    assert!(got, "{items} video items arrived");
+    run_on_events(&mut p.net, Duration::from_millis(300), |_| false);
+    assert!(p
+        .net
+        .driver(client)
+        .video_group_open(server_peer, OWN_TRACK));
+    let now = p.net.now();
+    let due = p.net.driver(client).next_deadline().expect("timers");
+    assert!(
+        due >= now + Duration::from_millis(100),
+        "an idle open group is due in {:?}",
+        due.saturating_duration_since(now)
+    );
+}
+
+/// With the link dark — no ack, no new frame, nothing else happening —
+/// the video deadlines alone wake the loop: a group's queued bytes are
+/// abandoned 500 ms after they queued, an unacknowledged finish 500 ms
+/// plus two RTTs after it.
+#[test]
+fn stalled_groups_are_reset_at_their_deadlines_on_the_loops_schedule() {
+    let mut p = pair(26, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, _) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+    p.net.set_link(
+        server,
+        client,
+        LinkSpec::clean(Duration::from_millis(10)).with_loss(1.0),
+    );
+    let start = p.net.now();
+    // Track 1: a small group, written and finished at once.
+    p.net.driver(client).video_new_group(start, server_peer, 1);
+    p.net
+        .driver(client)
+        .send_video(start, server_peer, 1, &[1; 1000])
+        .expect("chunk");
+    p.net
+        .driver(client)
+        .video_finish_group(start, server_peer, 1);
+    // Track 0: more than the 512 KiB send window, so the rest waits in
+    // the driver with its timestamp.
+    p.net
+        .driver(client)
+        .video_new_group(start, server_peer, OWN_TRACK);
+    for _ in 0..700 {
+        p.net
+            .driver(client)
+            .send(start, server_peer, Lane::Video, &[7; 1000])
+            .expect("chunk");
+    }
+
+    // The reset happens in the wake at the last instant `done` said no.
+    let mut woke_at = start;
+    let (reset, _) = run_on_events(&mut p.net, Duration::from_secs(2), |net| {
+        let hit = net
+            .driver(client)
+            .stats(server_peer)
+            .is_some_and(|s| s.groups_reset_deadline > 0);
+        if !hit {
+            woke_at = net.now();
+        }
+        hit
+    });
+    let took = woke_at - start;
+    assert!(reset, "the queued group was never abandoned");
+    assert!(
+        took >= VIDEO_GROUP_DEADLINE && took < VIDEO_GROUP_DEADLINE + Duration::from_millis(5),
+        "abandoned after {took:?}"
+    );
+
+    let (reset, _) = run_on_events(&mut p.net, Duration::from_secs(2), |net| {
+        let hit = net
+            .driver(client)
+            .stats(server_peer)
+            .is_some_and(|s| s.groups_reset_unacked > 0);
+        if !hit {
+            woke_at = net.now();
+        }
+        hit
+    });
+    let took = woke_at - start;
+    let rtt = p.net.driver(client).stats(server_peer).expect("stats").rtt;
+    assert!(reset, "the unacknowledged group was never abandoned");
+    let due = VIDEO_GROUP_DEADLINE + 2 * rtt;
+    assert!(
+        took >= due && took < due + Duration::from_millis(5),
+        "abandoned after {took:?}, due at {due:?}"
     );
 }

@@ -15,8 +15,9 @@
 //!   mode changes, fullscreen transitions, UAC), with backoff.
 //! - **One CPU pass per frame instead of three.** The staging texture
 //!   is created once and reused; rows are copied out honoring
-//!   `RowPitch` and delivered as **BGRA** exactly as the desktop stores
-//!   them — no BGRA→RGBA swizzle (swscale takes BGRA directly) and no
+//!   `RowPitch` into a recycled buffer (`crate::pool`) and delivered as
+//!   **BGRA** exactly as the desktop stores them — no BGRA→RGBA swizzle
+//!   (swscale takes BGRA directly, straight from this buffer) and no
 //!   redundant clone.
 //! - **Latest-frame slot instead of a rendezvous channel.** The worker
 //!   never blocks on the consumer; the consumer takes the newest frame
@@ -413,14 +414,18 @@ unsafe fn grab_frame(
         )
     }?;
 
-    let mut data = vec![0u8; (width as usize) * (height as usize) * 4];
+    // A buffer from the frame pool, appended to row by row: a fresh
+    // zero-filled one per frame was 8 MB at 1080p and 33 MB at 4K, every
+    // page faulted in, at the capture rate (review P1-11). The consumer
+    // gives back the frame this one replaces.
     let row_bytes = (width as usize) * 4;
+    let mut data = crate::pool::take(row_bytes * height as usize);
     let src_ptr = mapped.pData as *const u8;
     for row in 0..height as usize {
         let src = unsafe {
             std::slice::from_raw_parts(src_ptr.add(row * mapped.RowPitch as usize), row_bytes)
         };
-        data[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(src);
+        data.extend_from_slice(src);
     }
 
     unsafe { context.Unmap(Some(&staging_res), 0) };

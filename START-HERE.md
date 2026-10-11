@@ -142,7 +142,8 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
 
 ## 5. Where things stand (2026-10-09)
 
-- **Version 1.2.0** in the crates (released: 1.1.9); the crate map is
+- **Version 1.2.1** in the crates (released: 1.1.9; 1.2.1 carries the
+  fixes of the 2026-10-10 review, PRODUCTION-PLAN.md §2a); the crate map is
   SESSION-GUIDE §2, the list of what it carries SESSION-GUIDE §3. 1.2
   adds what the stores require of a chat app — block, report, delete
   my account, the terms on the connect card (PERSISTENCE-SPEC §12 S1),

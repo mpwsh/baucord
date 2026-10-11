@@ -184,18 +184,61 @@ pub fn encode_bounded_jpeg(buf: &image::RgbImage, max_bytes: usize) -> Result<Ve
 /// bomb that compresses to nothing) can't allocate gigabytes before
 /// any of our dimension checks run.
 ///
+/// Every compiled format is tried: this is for what the user picks,
+/// pastes or drops. Bytes from the wire go through [`decode_received`].
+///
 /// # Errors
 /// [`ImageError::Codec`] on unreadable/oversized input.
 pub fn decode_bounded(bytes: &[u8]) -> Result<image::DynamicImage, ImageError> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| ImageError::Codec(e.to_string()))?;
+    reader.limits(decode_limits());
+    reader
+        .decode()
+        .map_err(|e| ImageError::Codec(e.to_string()))
+}
+
+fn decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
     limits.max_alloc = Some(512 * 1024 * 1024);
+    limits
+}
 
-    let mut reader = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| ImageError::Codec(e.to_string()))?;
-    reader.limits(limits);
+/// The format of a picture that came over the wire, by its magic
+/// bytes: PNG, JPEG or GIF, the only ones a sender produces
+/// ([`load_image_bytes`] passes those through and re-encodes the rest).
+/// `None` for anything else.
+#[must_use]
+pub fn received_format(bytes: &[u8]) -> Option<image::ImageFormat> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(image::ImageFormat::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(image::ImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(image::ImageFormat::Gif)
+    } else {
+        None
+    }
+}
+
+/// [`decode_bounded`] for bytes someone else sent: chat pictures,
+/// avatars, the gallery. Only PNG, JPEG and GIF reach a decoder, and
+/// the one their magic names (review P1-20). A crafted WebP, BMP or
+/// TIFF would otherwise reach those decoders on every receiver, and
+/// history replays it to newcomers; with `panic = "abort"`, one
+/// decoder panic would end every client that shows the picture.
+///
+/// # Errors
+/// [`ImageError::Codec`] for another format, or as [`decode_bounded`].
+pub fn decode_received(bytes: &[u8]) -> Result<image::DynamicImage, ImageError> {
+    let Some(format) = received_format(bytes) else {
+        return Err(ImageError::Codec("not a PNG, JPEG or GIF picture".into()));
+    };
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(decode_limits());
     reader
         .decode()
         .map_err(|e| ImageError::Codec(e.to_string()))
@@ -404,6 +447,55 @@ mod tests {
         g.extend_from_slice(&[0x01, 0x00, 0x00]); // one data sub-block + terminator
         g.push(0x3B); // trailer
         assert!(!gif_is_animated(&g));
+    }
+
+    /// A 2×2 picture encoded as `format`.
+    fn encoded(format: image::ImageFormat) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, format)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn received_format_reads_only_png_jpeg_and_gif_magic() {
+        use image::ImageFormat::{Gif, Jpeg, Png};
+        assert_eq!(received_format(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"), Some(Png));
+        assert_eq!(received_format(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(Jpeg));
+        assert_eq!(received_format(b"GIF87a\x01\0\x01\0"), Some(Gif));
+        assert_eq!(received_format(b"GIF89a\x01\0\x01\0"), Some(Gif));
+        // WebP, BMP, both TIFF byte orders, and cut-short headers.
+        for other in [
+            &b"RIFF\x1a\0\0\0WEBPVP8L"[..],
+            b"BM\x3a\0\0\0\0\0",
+            b"II*\0\x08\0\0\0",
+            b"MM\0*\0\0\0\x08",
+            b"\x89PNG",
+            &[0xFF, 0xD8],
+            b"GIF8",
+            b"",
+        ] {
+            assert_eq!(received_format(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn received_pictures_decode_only_as_png_jpeg_or_gif() {
+        use image::ImageFormat::{Bmp, Gif, Jpeg, Png, Tiff, WebP};
+        for format in [Png, Jpeg, Gif] {
+            assert!(decode_received(&encoded(format)).is_ok(), "{format:?}");
+        }
+        for format in [WebP, Bmp, Tiff] {
+            let bytes = encoded(format);
+            // Still fine for a picture the user pastes or attaches…
+            assert!(decode_bounded(&bytes).is_ok(), "{format:?}");
+            // …never from the wire.
+            assert!(decode_received(&bytes).is_err(), "{format:?}");
+        }
+        // The right magic on a broken body is an error, not a panic.
+        assert!(decode_received(b"\x89PNG\r\n\x1a\n\0\0\0\0garbage").is_err());
     }
 
     #[test]

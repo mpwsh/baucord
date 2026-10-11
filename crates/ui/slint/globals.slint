@@ -62,14 +62,12 @@ export struct UserRow {
     name-color: color,
     has-name-color: bool,   // false = the theme's default name color
     name-style: int,        // 0 normal, 1 bold, 2 italic
-    outranked: bool,        // users: rank strictly below ours — mute/disconnect/kick/ban apply
-    role-editable: bool,    // users: rank at or below ours — the role submenu applies
-    channel-kickable: bool, // users: we own their channel (or manage all) — send to default
     members-only: bool,     // channels: a min-role gate exists
     temporary: bool,        // channels: evaporates when left empty
     is-afk: bool,           // channels: the server's AFK room
-    owned: bool,            // channels: this session created it
-    from-config: bool,      // channels: the server's file owns it (no delete/rename)
+    // What only the menu needs (the rank rule, channel powers, who
+    // owns a channel) is not here: the host works it out when the
+    // menu opens (review P1-9).
 }
 
 /// A channel as the "Move to" submenu lists it (visible ones only).

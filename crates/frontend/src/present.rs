@@ -37,12 +37,12 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use client::{
-    screen::{PresentTallies, ScreenEvent},
+    screen::{PresentTallies, ScreenControl, ScreenEvent},
     WakeFn,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -50,6 +50,30 @@ use log::{error, info};
 use video::PictureFormat;
 
 type Pixels = slint::SharedPixelBuffer<slint::Rgba8Pixel>;
+
+/// The screen thread's control channel, for telling it who can see a
+/// stream: the host's visibility comes from any thread
+/// (`app::set_host_visible`), a viewer window's from its own hooks.
+static SCREEN_TX: OnceLock<Sender<ScreenControl>> = OnceLock::new();
+
+/// Called once, with the screen thread's sender, when the workers start.
+/// The thread starts out decoding; a background reached before this
+/// only costs what it always did (decoded frames the code below drops).
+pub(crate) fn attach_screen(tx: Sender<ScreenControl>) {
+    let _ = SCREEN_TX.set(tx);
+}
+
+/// Tell the screen thread whether a stream's picture can be seen:
+/// `None` for the whole app (a phone's background), a peer for its
+/// viewer window (minimized). Unseen frames are not decoded at all; a
+/// stream seen again asks for a keyframe (review P1-7). A blocking
+/// send: a lost "visible" would leave the picture frozen, and the
+/// screen thread drains its channel constantly.
+pub(crate) fn set_stream_visible(client_id: Option<u64>, visible: bool) {
+    if let Some(tx) = SCREEN_TX.get() {
+        let _ = tx.send(ScreenControl::SetVisible { client_id, visible });
+    }
+}
 
 /// Pixel buffers kept per stream. The UI holds the one it shows and
 /// the slot may hold the next, so the oldest of three is normally free
@@ -274,8 +298,9 @@ impl Prep {
             buffer_jitter_ms,
         } = frame;
         // A phone app in the background shows nothing: no conversion,
-        // no redraw. The decoder keeps going (its pictures depend on
-        // each other), so the next frame after the return is current.
+        // no redraw. The screen thread stops decoding once it hears
+        // (`set_stream_visible`); this catches what was already on its
+        // way.
         if !crate::app::host_visible() {
             video::pool::recycle(pixels);
             return false;

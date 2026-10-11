@@ -99,19 +99,23 @@ while :; do
       cpu_snap
     fi
 
-    if [[ -v P[$c,in] ]]; then
+    # Keys are one word (`host_in`): bash keeps a space in a key, so the
+    # `P[$c, in]` written and the `P[$c,in]` checked were two keys, the
+    # check never matched, and no data row was ever written (review
+    # P1-21). A one-word key leaves a formatter nothing to split.
+    if [[ -v P[${c}_in] ]]; then
       note=""
-      ((IN < P[$c, in])) && note+="COUNTER_RESET(container restarted?) "
-      d_in=$(clamp $(((IN - P[$c, in]) / INTERVAL))) d_out=$(clamp $(((OUT - P[$c, out]) / INTERVAL)))
-      d_ierr=$(clamp $((IERR - P[$c, ierr]))) d_rerr=$(clamp $((RERR - P[$c, rerr]))) d_serr=$(clamp $((SERR - P[$c, serr])))
+      ((IN < P[${c}_in])) && note+="COUNTER_RESET(container restarted?) "
+      d_in=$(clamp $(((IN - P[${c}_in]) / INTERVAL))) d_out=$(clamp $(((OUT - P[${c}_out]) / INTERVAL)))
+      d_ierr=$(clamp $((IERR - P[${c}_ierr]))) d_rerr=$(clamp $((RERR - P[${c}_rerr]))) d_serr=$(clamp $((SERR - P[${c}_serr])))
       ((d_rerr > 0)) && note+="RCVBUF(app not draining or rmem too small) "
       ((d_serr > 0)) && note+="SNDBUF(wmem too small or link saturated) "
       ((d_ierr > d_rerr)) && note+="INERR(csum/other) "
       if [[ $c == host ]]; then
-        d_sn=$(clamp $((SN - P[host, sn]))) d_nic=$(clamp $((NIC - P[host, nic]))) d_ve=$(clamp $((VE - P[host, ve])))
-        dt=$((CPU_TOT - P[host, tot]))
+        d_sn=$(clamp $((SN - P[host_sn]))) d_nic=$(clamp $((NIC - P[host_nic]))) d_ve=$(clamp $((VE - P[host_ve])))
+        dt=$((CPU_TOT - P[host_tot]))
         sirq=0
-        ((dt > 0)) && sirq=$(((CPU_SIRQ - P[host, sirq]) * 100 / dt))
+        ((dt > 0)) && sirq=$(((CPU_SIRQ - P[host_sirq]) * 100 / dt))
         ((d_sn > 0)) && note+="SOFTNET(netdev_max_backlog/CPU) "
         ((d_nic > 0)) && note+="NIC(ring buffer or cloud pps/bw limit - ethtool -S) "
         ((d_ve > 0)) && note+="VETH(docker bridge/veth drops) "
@@ -121,9 +125,9 @@ while :; do
         "$(date -Is)" "$c" "$d_in" "$d_out" "$d_ierr" "$d_rerr" "$d_serr" "$Q" "$MEM" "$hostcols" "${note% }" >>"$LOG"
     fi
 
-    P[$c, in]=$IN P[$c, out]=$OUT P[$c, ierr]=$IERR P[$c, rerr]=$RERR P[$c, serr]=$SERR
+    P[${c}_in]=$IN P[${c}_out]=$OUT P[${c}_ierr]=$IERR P[${c}_rerr]=$RERR P[${c}_serr]=$SERR
     if [[ $c == host ]]; then
-      P[host, sn]=$SN P[host, nic]=$NIC P[host, ve]=$VE P[host, tot]=$CPU_TOT P[host, sirq]=$CPU_SIRQ
+      P[host_sn]=$SN P[host_nic]=$NIC P[host_ve]=$VE P[host_tot]=$CPU_TOT P[host_sirq]=$CPU_SIRQ
     fi
   done
   sleep "$INTERVAL"

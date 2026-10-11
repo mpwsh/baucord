@@ -9,32 +9,37 @@
 //! in a quiet voice channel or a chat-only session alike. On a phone
 //! that alone keeps a CPU core from ever reaching its deep idle states.
 //!
-//! Here a small thread blocks in `poll(2)` on a duplicate of the
-//! socket's descriptor and rings a channel the loop selects on, then
-//! waits to be re-armed: the loop re-arms it once it has drained the
-//! socket, so a datagram is announced once, never again while it waits
-//! to be read (readiness is level-triggered). Unix only; Windows keeps
-//! the 1 ms poll (`start` returns `None`), as does any platform where
-//! the duplicate cannot be made.
+//! Here a small thread blocks on a duplicate of the socket
+//! (`transport::ReadWaiter`: `poll(2)`, `WSAPoll` on Windows since
+//! review P1-1) and rings a channel the loop selects on, then waits to
+//! be re-armed: the loop re-arms it once it has drained the socket, so
+//! a datagram is announced once, never again while it waits to be read
+//! (readiness is level-triggered). Where the duplicate cannot be made,
+//! `start` returns `None` and the loop polls the socket every
+//! millisecond.
 
-#[cfg(unix)]
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
-use crossbeam_channel::Receiver;
-#[cfg(unix)]
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use transport::UdpIo;
 
 /// How long the watcher sleeps in `poll` before checking whether its
 /// session ended (it also ends when the loop drops the re-arm side).
-#[cfg(unix)]
 const WATCH_SLICE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Returns from the watchers' waits since the process started: their
+/// share of the thread wakes a quiet session costs.
+static WATCH_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// How many times a watcher thread has woken so far.
+pub(crate) fn wakes() -> u64 {
+    WATCH_WAKES.load(Ordering::Relaxed)
+}
+
 /// The loop's side of the watcher.
-#[cfg(unix)]
 pub(crate) struct InboundWake {
     ready_rx: Receiver<()>,
     rearm_tx: Sender<()>,
@@ -43,7 +48,6 @@ pub(crate) struct InboundWake {
     owed: bool,
 }
 
-#[cfg(unix)]
 impl InboundWake {
     /// Start watching `udp`. `None` where this cannot be done: the
     /// caller polls on a short timer instead.
@@ -65,7 +69,9 @@ impl InboundWake {
                 if stop_watch.load(Ordering::Relaxed) {
                     return;
                 }
-                match waiter.wait(WATCH_SLICE) {
+                let waited = waiter.wait(WATCH_SLICE);
+                WATCH_WAKES.fetch_add(1, Ordering::Relaxed);
+                match waited {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(e) => {
@@ -109,7 +115,6 @@ impl InboundWake {
     }
 }
 
-#[cfg(unix)]
 impl Drop for InboundWake {
     fn drop(&mut self) {
         // The watcher leaves at its next look (≤ WATCH_SLICE), or at
@@ -118,31 +123,7 @@ impl Drop for InboundWake {
     }
 }
 
-/// Off Unix there is no watcher: the type has no values, `start` says
-/// so, and the loop polls the socket every millisecond as before.
-#[cfg(not(unix))]
-pub(crate) enum InboundWake {}
-
-#[cfg(not(unix))]
-impl InboundWake {
-    pub(crate) fn start(_udp: &UdpIo) -> Option<Self> {
-        None
-    }
-
-    pub(crate) fn ready(&self) -> &Receiver<()> {
-        match *self {}
-    }
-
-    pub(crate) fn took(&mut self) {
-        match *self {}
-    }
-
-    pub(crate) fn drained(&mut self) {
-        match *self {}
-    }
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -158,7 +139,7 @@ mod tests {
     #[test]
     fn rings_once_per_drain() {
         let mut rx = socket();
-        let mut wake = InboundWake::start(&rx).expect("unix");
+        let mut wake = InboundWake::start(&rx).expect("a watcher");
         assert!(wake
             .ready()
             .recv_timeout(Duration::from_millis(60))
@@ -200,7 +181,7 @@ mod tests {
     #[test]
     fn the_watcher_ends_with_the_session() {
         let rx = socket();
-        let wake = InboundWake::start(&rx).expect("unix");
+        let wake = InboundWake::start(&rx).expect("a watcher");
         let ready = wake.ready().clone();
         drop(wake);
         drop(rx);

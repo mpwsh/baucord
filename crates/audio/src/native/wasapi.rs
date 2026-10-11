@@ -35,11 +35,13 @@
 //! **Echo cancellation** (`AEC-SPEC.md` §4): when the session wants the
 //! voice-call path, both streams open in the `Communications` stream
 //! category — the one Windows runs the endpoint's voice chain (the OEM
-//! or inbox AEC effect) on — and "default" means the Default
-//! Communications Device. Capture then points the canceller at our
-//! render endpoint (Windows 11 22H2+) and reads the effect list back to
-//! report whether an AEC effect is actually on (D5). The output's form
-//! factor ([`output_kind`]) is what Auto decides by.
+//! or inbox AEC effect) on. Unless the setting is Off, "default" means
+//! the Default Communications Device, for the form factor Auto decides
+//! by ([`output_kind`]) as for the streams (review P1-18). Capture then
+//! points the canceller at the output the user picked, or, none picked,
+//! has Windows follow the communications default itself (Windows 11
+//! 22H2+), and reads the effect list back to report whether an AEC
+//! effect is actually on (D5).
 
 use std::{
     sync::{
@@ -333,9 +335,10 @@ fn open_with_fallback(
     }
 }
 
-/// The role "default" means for this session.
-fn role_for(voice: bool) -> Role {
-    if voice {
+/// The role "default" means for this session: the Communications one
+/// unless echo cancellation is Off (`communications_default` in lib.rs).
+fn role_for(communications: bool) -> Role {
+    if communications {
         Role::Communications
     } else {
         Role::Console
@@ -387,35 +390,54 @@ fn ask_not_to_duck(client: &AudioClient, what: &str) -> &'static str {
 
 /// After capture opened in the `Communications` category: point the
 /// canceller at our render endpoint and say whether one is running
-/// (AEC-SPEC.md §4.1 step 5).
+/// (AEC-SPEC.md §4.1 step 5), and whether the reference was set.
 fn engage_platform_aec(
     client: &AudioClient,
     enumerator: &DeviceEnumerator,
     reference: Option<&str>,
-) -> Result<(), &'static str> {
-    // Windows 11 22H2+: the reference is ours to name. Elsewhere (and
-    // when this fails) the effect picks its own, usually the default
-    // communications render device — which is what we opened.
+) -> (Result<(), &'static str>, bool) {
+    // Windows 11 22H2+: the reference is ours to name. A picked output
+    // by its id; none picked, `None` has Windows follow the Default
+    // Communications Device itself — the one render opened — also when
+    // that default changes later, which an id looked up here would not
+    // (review P1-18). Elsewhere (and when this fails) the effect picks
+    // its own, usually the default communications render device.
+    let mut named = false;
     match client.get_aec_control() {
         Ok(control) => {
-            let id = find_device(
-                enumerator,
-                Direction::Render,
-                reference,
-                Role::Communications,
-            )
-            .and_then(|d| d.get_id().map_err(|e| e.to_string()))
-            .ok();
-            match control.set_echo_cancellation_render_endpoint(id.clone()) {
-                Ok(()) => info!(
-                    "AEC reference endpoint set ({})",
-                    id.as_deref().unwrap_or("auto")
-                ),
-                Err(e) => debug!("AEC reference endpoint not set: {e}"),
+            let id = match reference {
+                None => Ok(None),
+                Some(name) => find_device(
+                    enumerator,
+                    Direction::Render,
+                    Some(name),
+                    Role::Communications,
+                )
+                .and_then(|d| d.get_id().map_err(|e| e.to_string()))
+                .map(Some),
+            };
+            match id {
+                Ok(id) => match control.set_echo_cancellation_render_endpoint(id.clone()) {
+                    Ok(()) => {
+                        named = true;
+                        info!(
+                            "AEC reference endpoint set ({})",
+                            id.as_deref()
+                                .unwrap_or("follows the communications default")
+                        );
+                    }
+                    Err(e) => debug!("AEC reference endpoint not set: {e}"),
+                },
+                Err(e) => debug!("AEC reference endpoint not found: {e}"),
             }
         }
         Err(e) => debug!("AEC control unavailable ({e}); the effect picks its reference"),
     }
+    (verified_aec(client), named)
+}
+
+/// Whether an AEC effect runs on the capture stream (D5).
+fn verified_aec(client: &AudioClient) -> Result<(), &'static str> {
     // Verified, not assumed (D5). No effects manager (Windows 10): the
     // category is set and the OEM chain may still cancel — say on.
     match client
@@ -442,11 +464,13 @@ fn engage_platform_aec(
 }
 
 /// The render endpoint's form factor as an [`OutputKind`]
-/// (AEC-SPEC.md §4.2): `name`, or the console default. Runs on a
+/// (AEC-SPEC.md §4.2): `name`, or the default playback opens — the
+/// communications one when `communications`, the console one otherwise
+/// (the same device the streams then open, review P1-18). Runs on a
 /// short-lived thread of its own so COM is initialised wherever the
 /// caller is. `Unknown` when anything fails.
 #[must_use]
-pub fn output_kind(name: Option<&str>) -> OutputKind {
+pub fn output_kind(name: Option<&str>, communications: bool) -> OutputKind {
     let name = name.map(String::from);
     let worker = crate::platform::spawn_named("output-kind", move || {
         if wasapi::initialize_mta().ok().is_err() {
@@ -458,7 +482,7 @@ pub fn output_kind(name: Option<&str>) -> OutputKind {
                 &enumerator,
                 Direction::Render,
                 name.as_deref(),
-                Role::Console,
+                role_for(communications),
             )?;
             let id = device.get_id().map_err(|e| e.to_string())?;
             form_factor(&id).map_err(|e| e.to_string())
@@ -522,11 +546,15 @@ pub struct NativeCapture {
     /// On the voice-call path: whether an AEC effect is running on the
     /// endpoint (`Err` = why not). `None` = a plain stream.
     pub aec_verdict: Option<Result<(), &'static str>>,
+    /// On the voice-call path: the canceller's reference was set (to
+    /// the picked output, or to follow the communications default).
+    pub aec_reference_named: bool,
 }
 
 /// What the capture thread reports once the device is open: rate,
-/// endpoint name, and the AEC verdict (voice-call path only).
-type CaptureSetup = (u32, String, Option<Result<(), &'static str>>);
+/// endpoint name, the AEC verdict (voice-call path only) and whether
+/// the reference was set.
+type CaptureSetup = (u32, String, Option<Result<(), &'static str>>, bool);
 
 struct CaptureParts {
     producer: Producer<f32>,
@@ -539,12 +567,14 @@ struct CaptureParts {
 type SetupReport<T> = Result<T, String>;
 
 impl NativeCapture {
-    /// Open `device_name` (or the default capture endpoint) on a new
-    /// MMCSS thread and start pumping into `producer`.
+    /// Open `device_name` (or the default capture endpoint: the
+    /// communications one when `communications`) on a new MMCSS thread
+    /// and start pumping into `producer`.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         device_name: Option<&str>,
         voice: Option<Option<String>>,
+        communications: bool,
         producer: Producer<f32>,
         wake_tx: Sender<()>,
         stats: Arc<AudioStats>,
@@ -560,11 +590,18 @@ impl NativeCapture {
         let stop = should_stop.clone();
 
         let thread = crate::platform::spawn_named("voice-capture-wasapi", move || {
-            capture_thread(name.as_deref(), voice.as_ref(), &setup_tx, &parts_rx, &stop);
+            capture_thread(
+                name.as_deref(),
+                voice.as_ref(),
+                communications,
+                &setup_tx,
+                &parts_rx,
+                &stop,
+            );
         });
 
         match setup_rx.recv() {
-            Ok(Ok((sample_rate, device_name, aec_verdict))) => {
+            Ok(Ok((sample_rate, device_name, aec_verdict, aec_reference_named))) => {
                 let parts = CaptureParts {
                     producer,
                     wake_tx,
@@ -590,6 +627,7 @@ impl NativeCapture {
                     sample_rate,
                     device_name,
                     aec_verdict,
+                    aec_reference_named,
                 })
             }
             other => {
@@ -619,10 +657,12 @@ impl Drop for NativeCapture {
 
 /// `voice`: `Some(reference)` = open on the voice-call path with the
 /// AEC reference set to the render endpoint `reference` (`None` inside
-/// = the default communications device); `None` = a plain stream.
+/// = follow the default communications device); `None` = a plain
+/// stream. `communications`: what "default" means ([`role_for`]).
 fn capture_thread(
     device_name: Option<&str>,
     voice: Option<&Option<String>>,
+    communications: bool,
     setup_tx: &Sender<SetupReport<CaptureSetup>>,
     parts_rx: &crossbeam_channel::Receiver<CaptureParts>,
     should_stop: &AtomicBool,
@@ -636,6 +676,7 @@ fn capture_thread(
     let _rt = crate::platform::promote_current_thread(480, OPUS_SAMPLE_RATE);
 
     let mut aec_verdict = None;
+    let mut aec_reference_named = false;
     let mut ducking = "n/a";
     let opened =
         (|| -> Result<(AudioClient, AudioCaptureClient, Handle, Negotiated, String), String> {
@@ -644,7 +685,7 @@ fn capture_thread(
                 &enumerator,
                 Direction::Capture,
                 device_name,
-                role_for(voice.is_some()),
+                role_for(communications),
             )?;
             let friendly = device.get_friendlyname().unwrap_or_else(|_| "?".into());
             let (client, negotiated) = open_with_fallback(
@@ -655,11 +696,10 @@ fn capture_thread(
                 voice.is_some(),
             )?;
             if let Some(reference) = voice {
-                aec_verdict = Some(engage_platform_aec(
-                    &client,
-                    &enumerator,
-                    reference.as_deref(),
-                ));
+                let (verdict, named) =
+                    engage_platform_aec(&client, &enumerator, reference.as_deref());
+                aec_verdict = Some(verdict);
+                aec_reference_named = named;
                 ducking = ask_not_to_duck(&client, "capture");
             }
             let event = client
@@ -683,7 +723,12 @@ fn capture_thread(
         }
     };
     if setup_tx
-        .send(Ok((negotiated.sample_rate, friendly.clone(), aec_verdict)))
+        .send(Ok((
+            negotiated.sample_rate,
+            friendly.clone(),
+            aec_verdict,
+            aec_reference_named,
+        )))
         .is_err()
     {
         wasapi::deinitialize();
@@ -796,7 +841,7 @@ fn run_capture(
                 }
             }
 
-            if config.muted.load(Ordering::Relaxed) {
+            if config.silenced() {
                 input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
                 continue;
             }
@@ -861,9 +906,13 @@ struct RenderParts {
 }
 
 impl NativeRender {
+    /// Open `device_name` (or the default render endpoint: the
+    /// communications one when `communications`) on a new MMCSS thread
+    /// and start playing from `consumer`.
     pub fn start(
         device_name: Option<&str>,
         voice: bool,
+        communications: bool,
         consumer: Consumer<f32>,
         wake_tx: Sender<()>,
         stats: Arc<AudioStats>,
@@ -875,7 +924,14 @@ impl NativeRender {
         let stop = should_stop.clone();
 
         let thread = crate::platform::spawn_named("voice-render-wasapi", move || {
-            render_thread(name.as_deref(), voice, &setup_tx, &parts_rx, &stop);
+            render_thread(
+                name.as_deref(),
+                voice,
+                communications,
+                &setup_tx,
+                &parts_rx,
+                &stop,
+            );
         });
 
         match setup_rx.recv() {
@@ -930,6 +986,7 @@ impl Drop for NativeRender {
 fn render_thread(
     device_name: Option<&str>,
     voice: bool,
+    communications: bool,
     setup_tx: &Sender<SetupReport<(u32, String)>>,
     parts_rx: &crossbeam_channel::Receiver<RenderParts>,
     should_stop: &AtomicBool,
@@ -944,7 +1001,12 @@ fn render_thread(
     let opened =
         (|| -> Result<(AudioClient, AudioRenderClient, Handle, Negotiated, String), String> {
             let enumerator = DeviceEnumerator::new().map_err(|e| format!("enumerator: {e}"))?;
-            let device = find_device(&enumerator, Direction::Render, device_name, role_for(voice))?;
+            let device = find_device(
+                &enumerator,
+                Direction::Render,
+                device_name,
+                role_for(communications),
+            )?;
             let friendly = device.get_friendlyname().unwrap_or_else(|_| "?".into());
             let (client, negotiated) = open_with_fallback(
                 &device,
@@ -1103,7 +1165,7 @@ fn run_render(
             }
         }
 
-        // Ring space freed — refill promptly rather than on the tick.
+        // Ring space freed — the worker refills on this ring alone.
         let _ = wake_tx.try_send(());
     }
 }
@@ -1122,9 +1184,10 @@ pub struct DeviceWatcher {
 }
 
 impl DeviceWatcher {
-    /// `communications`: the session is on the voice-call path, so the
-    /// default that matters is the Default Communications Device
-    /// (AEC-SPEC.md §4.5); otherwise Console/Multimedia, as ever.
+    /// `communications`: "default" means the Default Communications
+    /// Device for the open streams (echo cancellation not Off,
+    /// AEC-SPEC.md §4.5, review P1-18); otherwise Console/Multimedia,
+    /// as ever.
     pub fn start(stats: Arc<AudioStats>, communications: Arc<AtomicBool>) -> Result<Self, String> {
         let (stop_tx, stop_rx) = bounded::<()>(1);
         let (setup_tx, setup_rx) = bounded::<Result<(), String>>(1);
@@ -1186,8 +1249,8 @@ fn register(
         let communications = communications.clone();
         callbacks.set_default_device_callback(move |direction, role, id| {
             // Console/Multimedia are what "default device" means for apps;
-            // Communications is a separate user setting — the one that
-            // applies while we are on the voice-call path.
+            // Communications is a separate user setting — the one our
+            // streams follow unless echo cancellation is Off.
             let relevant = if communications.load(Ordering::Relaxed) {
                 matches!(role, Role::Communications)
             } else {

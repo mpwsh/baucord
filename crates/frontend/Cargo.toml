@@ -6,7 +6,7 @@ name = "frontend"
 # no behaviour change; the host-specific modules (tray, hotkeys,
 # clipboard, single instance, updater, share windows) still live here
 # behind the `desktop` feature until the platform trait replaces them.
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -26,7 +26,7 @@ desktop = [
   "dep:i-slint-backend-winit",
   "dep:arboard",
   "dep:global-hotkey",
-  "dep:device_query",
+  "dep:x11rb",
   "dep:interprocess",
   "dep:zip",
   "dep:self-replace",
@@ -71,9 +71,6 @@ global-hotkey = { version = "0.8", optional = true }
 interprocess = { version = "2.4", optional = true }
 # The Downloads folder, for file cards' Save (spec §7).
 dirs = "6"
-# Push-to-talk watches the key state instead of registering a global
-# hotkey, so the key still types everywhere else. See hotkeys.rs.
-device_query = { version = "4", optional = true }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 zip = { version = "8.6", optional = true }
 self-replace = { version = "1.5", optional = true }
@@ -95,6 +92,14 @@ arboard = { version = "3", default-features = false, optional = true, features =
 # `tokio` on, the tray panicked at startup ("no reactor running").
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"], optional = true }
 pollster = { version = "1.0", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Keybinds watch the key state instead of registering a global hotkey,
+# so the key still types everywhere else (hotkeys.rs). On X11 that is
+# one `QueryKeymap` per pass; x11rb is already in the tree (arboard,
+# global-hotkey, winit), and pure Rust. Windows and macOS declare their
+# two or three calls by hand.
+x11rb = { version = "0.13", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Native NSPasteboard access for what the toolkit clipboard layer can't
