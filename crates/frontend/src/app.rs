@@ -492,8 +492,18 @@ pub struct AppState {
     hotkeys: Option<HotkeyManager>,
     pub keybind_recording: Option<usize>,
 
-    // Timers — held so they keep firing.
-    timers: Vec<slint::Timer>,
+    // Timers. Each is a field, started and stopped with what it
+    // serves: a timer nobody can name is a timer nobody stops (review
+    // P2-38).
+    /// Audio device poll, 2.5 s, for the app's lifetime.
+    device_timer: slint::Timer,
+    /// Resource line sampler, 2 s, for the app's lifetime.
+    resource_timer: slint::Timer,
+    /// The sharer's stats line, 1 s, only while sharing.
+    stream_stats_timer: slint::Timer,
+    /// The update download's progress bar, 200 ms, only while it
+    /// downloads.
+    pub update_progress_timer: slint::Timer,
     error_timer: slint::Timer,
     /// Backoff before an automatic reconnect after a transient loss.
     reconnect_timer: slint::Timer,
@@ -504,7 +514,6 @@ pub struct AppState {
     /// end of the session: the host's keep-alive (Android's foreground
     /// service) stays on through it (D34).
     reconnect_hold: bool,
-    stream_stats_timer_active: Arc<AtomicBool>,
     pub meter_timer: slint::Timer,
     /// The single animation ticker driving every playing GIF (chat
     /// rows + the viewer overlay). Runs only while something plays.
@@ -790,12 +799,14 @@ pub fn run() {
         pid: sysinfo::get_current_pid().ok(),
         hotkeys: None,
         keybind_recording: None,
-        timers: Vec::new(),
+        device_timer: slint::Timer::default(),
+        resource_timer: slint::Timer::default(),
+        stream_stats_timer: slint::Timer::default(),
+        update_progress_timer: slint::Timer::default(),
         error_timer: slint::Timer::default(),
         reconnect_hold: false,
         reconnect_timer: slint::Timer::default(),
         reconnect_attempts: 0,
-        stream_stats_timer_active: Arc::new(AtomicBool::new(false)),
         meter_timer: slint::Timer::default(),
         gif_ticker: slint::Timer::default(),
     }));
@@ -856,10 +867,9 @@ pub fn run() {
             if let Some(main) = weak.upgrade() {
                 main.set_repaint_flip(!main.get_repaint_flip());
             }
-            // Shown again: a roster held back while out of sight is
-            // rebuilt now (review P1-9). Deferred: this runs inside
-            // winit's dispatch.
-            let _ = slint::invoke_from_event_loop(|| with_current(AppState::flush_roster));
+            // Shown again: what waited for that (the roster, playing
+            // GIFs). Deferred: this runs inside winit's dispatch.
+            let _ = slint::invoke_from_event_loop(|| with_current(AppState::main_revealed));
         });
     }
     {
@@ -1601,13 +1611,12 @@ fn set_drop_hover(on: bool) {
 // ── Timers ──────────────────────────────────────────────────────────────
 
 fn start_timers(state: &Rc<RefCell<AppState>>) {
-    let mut timers = Vec::new();
+    let app = state.borrow();
 
     // Device poll — 2.5 s. Enumeration is cheap; all diffing logic
     // lives in app-core's reducer.
     let w = Rc::downgrade(state);
-    let t = slint::Timer::default();
-    t.start(
+    app.device_timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(2500),
         move || {
@@ -1622,24 +1631,19 @@ fn start_timers(state: &Rc<RefCell<AppState>>) {
             with_app(&w, |app| app.handle_devices_changed(input, output));
         },
     );
-    timers.push(t);
 
     // Resource sampler — 2 s cadence, matching NetworkStats. The
     // handler skips the sampling entirely while the main screen isn't
     // on screen (tray/minimized/connect view) so the idle cost is one
     // no-op closure per tick.
     let w = Rc::downgrade(state);
-    let t = slint::Timer::default();
-    t.start(
+    app.resource_timer.start(
         slint::TimerMode::Repeated,
         Duration::from_secs(2),
         move || {
             with_app(&w, AppState::sample_resources);
         },
     );
-    timers.push(t);
-
-    state.borrow_mut().timers = timers;
 }
 
 // ── The drain (worker → UI) ─────────────────────────────────────────────

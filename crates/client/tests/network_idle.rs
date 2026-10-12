@@ -96,7 +96,7 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
     );
     // A headless engine, linked the way the voice thread links one
     // (review P1-5): received voice goes straight into it.
-    let engine = VoiceChat::new(VoiceChatConfig::default()).expect("engine");
+    let engine = VoiceChat::new(VoiceChatConfig::default());
     let received = Arc::clone(engine.stats());
     net.tx
         .send(NetworkControl::VoiceLink(Some(VoiceLink {

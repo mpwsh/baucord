@@ -9,10 +9,9 @@ use std::sync::{
     Arc,
 };
 
-use crossbeam_channel::Sender;
 use rtrb::{Consumer, Producer};
 
-use crate::{input_config::InputConfig, stats::AudioStats};
+use crate::{input_config::InputConfig, latch::Ring, stats::AudioStats};
 
 /// Largest render callback served in one piece from the scratch
 /// buffer; bigger ones are served in pieces.
@@ -22,7 +21,7 @@ const RENDER_SCRATCH: usize = 8192;
 /// its wake latch.
 pub struct CapturePump {
     pub producer: Producer<f32>,
-    pub wake_tx: Sender<()>,
+    pub wake_tx: Ring,
     pub stats: Arc<AudioStats>,
     pub config: Arc<InputConfig>,
 }
@@ -51,7 +50,7 @@ impl CapturePump {
                 .map(|frame| frame.iter().sum::<f32>() / ch as f32);
             chunk.fill_from_iter(&mut it);
         }
-        let _ = self.wake_tx.try_send(());
+        self.wake_tx.ring();
     }
 }
 
@@ -60,7 +59,7 @@ impl CapturePump {
 /// worker keeps one callback + margin queued, D24).
 pub struct RenderPump {
     consumer: Consumer<f32>,
-    wake_tx: Sender<()>,
+    wake_tx: Ring,
     stats: Arc<AudioStats>,
     callback_frames: Arc<AtomicUsize>,
     largest_callback: usize,
@@ -73,7 +72,7 @@ impl RenderPump {
     /// knows its burst seeds it), so it only ever grows.
     pub fn new(
         consumer: Consumer<f32>,
-        wake_tx: Sender<()>,
+        wake_tx: Ring,
         stats: Arc<AudioStats>,
         callback_frames: Arc<AtomicUsize>,
     ) -> Self {
@@ -124,6 +123,6 @@ impl RenderPump {
                 .output_level
                 .store((rms * 3.0).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
-        let _ = self.wake_tx.try_send(());
+        self.wake_tx.ring();
     }
 }

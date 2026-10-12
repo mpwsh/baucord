@@ -192,6 +192,9 @@ pub struct FfmpegEncoder {
     logged_session: Option<(u32, u32, u32, u32, u32)>,
     /// Capture timestamp of the last IDR we forced (drives cadence).
     last_keyframe_ms: Option<u64>,
+    /// Capture timestamp of the last frame submitted: what a repeated
+    /// frame's still time is measured from ([`Self::encode_repeat`]).
+    last_frame_ms: Option<u64>,
     /// Last PTS handed to the encoder — used to keep PTS strictly increasing.
     last_pts: Option<i64>,
     /// Index into [`QP_FLOORS`] once a frame came out too large to send,
@@ -274,6 +277,7 @@ impl FfmpegEncoder {
                         last_idr_reopen_ms: None,
                         logged_session: None,
                         last_keyframe_ms: None,
+                        last_frame_ms: None,
                         last_pts: None,
                         qp_floor: None,
                         qp_floor_moved: None,
@@ -394,7 +398,39 @@ impl FfmpegEncoder {
     /// Encode one RGBA frame. See [`VideoEncoder::encode`] for the output
     /// contract (zero or more access units, one `EncodedFrame` each).
     pub fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        self.encode_frame(frame, false)
+    }
+
+    /// See [`VideoEncoder::encode_repeat`]: the time since the last
+    /// frame was spent on a still picture and does not count towards
+    /// the next keyframe. A still share used to send a full IDR every
+    /// [`KEYFRAME_INTERVAL_MS`] — every second refresh — and on AMF
+    /// reopened its session for one every two intervals (review P2-41).
+    /// A viewer who needs a keyframe asks, and
+    /// [`Self::force_keyframe`] still gets one out at once.
+    pub fn encode_repeat(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        self.encode_frame(frame, true)
+    }
+
+    fn encode_frame(
+        &mut self,
+        frame: &Frame,
+        still: bool,
+    ) -> Result<Vec<EncodedFrame>, CodecError> {
         let mut out = Vec::new();
+
+        if still {
+            let since_last = self
+                .last_frame_ms
+                .map_or(0, |last| frame.timestamp_ms.saturating_sub(last));
+            for at in [&mut self.last_keyframe_ms, &mut self.last_idr_out_ms]
+                .into_iter()
+                .flatten()
+            {
+                *at += since_last;
+            }
+        }
+        self.last_frame_ms = Some(frame.timestamp_ms);
 
         // Reopen-for-IDR backstop. Some encoders (FFmpeg's AMF wrapper
         // <= 7.1) cannot force an IDR: frame-level pict_type is ignored
@@ -637,6 +673,10 @@ impl FfmpegEncoder {
 impl VideoEncoder for FfmpegEncoder {
     fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
         self.encode(frame)
+    }
+
+    fn encode_repeat(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        self.encode_repeat(frame)
     }
 
     fn force_keyframe(&mut self) {

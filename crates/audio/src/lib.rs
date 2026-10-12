@@ -64,6 +64,7 @@ mod device;
 mod encoder;
 mod input;
 mod input_config;
+mod latch;
 mod native;
 mod output;
 mod platform;
@@ -92,6 +93,7 @@ pub use config::{PeerAudioSettings, VoiceChatConfig};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use log::{debug, error, info};
+pub use platform::TimerResolutionGuard;
 pub use sounds::SoundType;
 pub use stats::AudioStats;
 pub use transport::packet::{AudioPacket, PayloadType};
@@ -169,24 +171,7 @@ pub const RELEASES_MIC: bool = cfg!(any(target_os = "android", target_os = "ios"
 fn platform_output_kind(_output_device: Option<&str>, _mode: aec::AecMode) -> aec::OutputKind {
     #[cfg(target_os = "android")]
     {
-        // The route the call will take (the picker's choice, else a
-        // headset, else the loudspeaker), not merely what is plugged in
-        // — with media-only Bluetooth counted as headphones.
-        let types = native::android::output_device_types().unwrap_or_else(|e| {
-            debug!("output devices: {e}");
-            Vec::new()
-        });
-        match native::android::communication_devices() {
-            Ok(devices) => route::effective_output_kind(
-                route::explicit(_output_device, &devices),
-                &devices,
-                &types,
-            ),
-            Err(e) => {
-                debug!("communication devices: {e}");
-                aec::android_output_kind(&types)
-            }
-        }
+        android_output_kind(_output_device, android_devices().as_deref())
     }
     #[cfg(windows)]
     {
@@ -215,25 +200,61 @@ fn communications_default(mode: aec::AecMode) -> bool {
     cfg!(windows) && mode != aec::AecMode::Off
 }
 
+/// Android: the devices a call can use, listed once for a whole plan
+/// — the output's kind, then the route. Each used to list them itself,
+/// so the 2 s plan check asked Android three times (review P3-25).
+/// `None` when Android will not say.
+#[cfg(target_os = "android")]
+fn android_devices() -> Option<Vec<route::RouteDevice>> {
+    match native::android::communication_devices() {
+        Ok(devices) => Some(devices),
+        Err(e) => {
+            debug!("communication devices: {e}");
+            None
+        }
+    }
+}
+
+/// Android: the route the call will take (the picker's choice, else a
+/// headset, else the loudspeaker), not merely what is plugged in — with
+/// media-only Bluetooth counted as headphones.
+#[cfg(target_os = "android")]
+fn android_output_kind(
+    selection: Option<&str>,
+    devices: Option<&[route::RouteDevice]>,
+) -> aec::OutputKind {
+    let types = native::android::output_device_types().unwrap_or_else(|e| {
+        debug!("output devices: {e}");
+        Vec::new()
+    });
+    match devices {
+        Some(devices) => {
+            route::effective_output_kind(route::explicit(selection, devices), devices, &types)
+        }
+        None => aec::android_output_kind(&types),
+    }
+}
+
 /// Android: does this plan need communication mode, and on which route
 /// (`route::label`)? The call path needs it (`wanted`); so does a
 /// picked device, even with echo cancellation off — the earpiece, or
 /// the loudspeaker over a connected headset, are reachable only in that
 /// mode (plain streams are then routed with it as media).
 #[cfg(target_os = "android")]
-fn android_comm_plan(selection: Option<&str>, wanted: bool) -> (bool, Option<String>) {
-    match native::android::communication_devices() {
-        Ok(devices) => {
-            let need = wanted || route::explicit(selection, &devices).is_some();
+fn android_comm_plan(
+    selection: Option<&str>,
+    wanted: bool,
+    devices: Option<&[route::RouteDevice]>,
+) -> (bool, Option<String>) {
+    match devices {
+        Some(devices) => {
+            let need = wanted || route::explicit(selection, devices).is_some();
             let label = need
-                .then(|| route::choose(selection, &devices).map(|i| route::label(&devices[i])))
+                .then(|| route::choose(selection, devices).map(|i| route::label(&devices[i])))
                 .flatten();
             (need, label)
         }
-        Err(e) => {
-            debug!("communication devices: {e}");
-            (wanted, None)
-        }
+        None => (wanted, None),
     }
 }
 
@@ -375,11 +396,42 @@ pub struct VoiceChat {
 
     config: VoiceChatConfig,
     /// Holds the OS timer at 1 ms resolution for the session (Windows).
-    _timer_guard: platform::TimerResolutionGuard,
+    /// Held in a voice room ([`Self::sync_timer`]).
+    timer_guard: Option<platform::TimerResolutionGuard>,
+}
+
+/// What [`VoiceChat::start`] opened. Not a `Result`: with playback up
+/// and no microphone the engine is worth keeping, and an `Err` for that
+/// case had every caller checking `output_running()` before deciding
+/// (the ones that did not, dropped the engine and silenced the room —
+/// review P3-24).
+#[derive(Debug)]
+#[must_use = "a start that opened no playback has nothing to keep"]
+pub enum StartOutcome {
+    /// Everything this session wanted.
+    Started,
+    /// Playback runs, the microphone did not open (none there, or the
+    /// permission not given yet). Keep the engine: the room is audible
+    /// and [`VoiceChat::service`] retries the microphone.
+    NoMicrophone(String),
+    /// Playback did not open. Nothing can be heard; a caller that keeps
+    /// the engine anyway gets it retried by [`VoiceChat::service`].
+    NoPlayback(String),
+}
+
+impl StartOutcome {
+    /// Playback is up: the engine is worth keeping.
+    #[must_use]
+    pub fn audible(&self) -> bool {
+        !matches!(self, Self::NoPlayback(_))
+    }
 }
 
 impl VoiceChat {
-    pub fn new(config: VoiceChatConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Build the engine and start its encoder thread. Opens no device
+    /// ([`Self::start`] does) and cannot fail.
+    #[must_use]
+    pub fn new(config: VoiceChatConfig) -> Self {
         let max_peers = DEFAULT_MAX_PEERS;
 
         // ── Build channels ──────────────────────────────────────────
@@ -415,7 +467,7 @@ impl VoiceChat {
         let aec_communications = Arc::new(AtomicBool::new(false));
         let (is_speaking, speaking_edges) = processor::speaking::SpeakingFlag::new();
 
-        Ok(Self {
+        Self {
             input: None,
             output: None,
             audio_to_encoder_tx,
@@ -472,15 +524,33 @@ impl VoiceChat {
             output_gain,
             deafened,
             config,
-            _timer_guard: platform::TimerResolutionGuard::acquire(),
-        })
+            timer_guard: None,
+        }
     }
 
-    /// Start the audio pipeline (capture + playback).
+    /// Windows: the 1 ms system timer, for as long as we are in a voice
+    /// room. It was held from connecting to leaving — the lobby
+    /// included, hours of it for someone who only reads the chat — and
+    /// a 1 ms timer keeps the whole machine from its deeper idle states
+    /// (review P2-35). The short waits that needed it out of a room are
+    /// gone (P1-1, P1-4); a share or a watched stream holds its own
+    /// (`client::screen`).
+    fn sync_timer(&mut self) {
+        if self.started && self.in_room {
+            self.timer_guard
+                .get_or_insert_with(platform::TimerResolutionGuard::acquire);
+        } else {
+            self.timer_guard = None;
+        }
+    }
+
+    /// Start the audio pipeline (capture + playback) and say what
+    /// opened. A side that did not is retried by [`Self::service`].
     ///
     /// The encoder thread is already running from `new()`.
-    pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn start(&mut self) -> StartOutcome {
         self.started = true;
+        self.sync_timer();
         // Decide the voice-call path before anything opens: on Android
         // the phone's mode has to be set first.
         self.plan_aec();
@@ -520,12 +590,11 @@ impl VoiceChat {
             self.input_pending = true;
         }
 
-        // Report the first failure, but note: callers that get an Err while
-        // output started successfully can keep this instance alive and hear
-        // peers — dropping it on input failure silences everything.
-        output_result?;
-        input_result?;
-        Ok(())
+        match (output_result, input_result) {
+            (Err(e), _) => StartOutcome::NoPlayback(e.to_string()),
+            (Ok(()), Err(e)) => StartOutcome::NoMicrophone(e.to_string()),
+            (Ok(()), Ok(())) => StartOutcome::Started,
+        }
     }
 
     fn start_input(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -663,6 +732,11 @@ impl VoiceChat {
     /// put the platform in the matching state. Call with both streams
     /// closed.
     fn plan_aec(&mut self) {
+        #[cfg(target_os = "android")]
+        let devices = android_devices();
+        #[cfg(target_os = "android")]
+        let output = android_output_kind(self.config.output_device.as_deref(), devices.as_deref());
+        #[cfg(not(target_os = "android"))]
         let output = platform_output_kind(
             self.config.output_device.as_deref(),
             self.config.echo_cancellation,
@@ -713,7 +787,11 @@ impl VoiceChat {
             self.comm_mode = None;
             // Out of a voice room there is no call to route at all.
             let (need, label) = if self.call_path_wanted() {
-                android_comm_plan(self.config.output_device.as_deref(), wanted)
+                android_comm_plan(
+                    self.config.output_device.as_deref(),
+                    wanted,
+                    devices.as_deref(),
+                )
             } else {
                 (false, None)
             };
@@ -747,6 +825,18 @@ impl VoiceChat {
         if !PLATFORM_VOICE_PATH {
             return false;
         }
+        // A phone out of the voice rooms wants no plan and opened its
+        // streams without one: nothing can have gone stale, and the
+        // platform is not asked — three device lists on Android, the
+        // route on iOS, every 2 s in the lobby (review P3-25).
+        if !self.call_path_wanted() && !self.aec_wanted {
+            return false;
+        }
+        #[cfg(target_os = "android")]
+        let devices = android_devices();
+        #[cfg(target_os = "android")]
+        let output = android_output_kind(self.config.output_device.as_deref(), devices.as_deref());
+        #[cfg(not(target_os = "android"))]
         let output = platform_output_kind(
             self.config.output_device.as_deref(),
             self.config.echo_cancellation,
@@ -763,7 +853,11 @@ impl VoiceChat {
         // communication mode on its own.
         #[cfg(target_os = "android")]
         if self.call_path_wanted() {
-            let (need, label) = android_comm_plan(self.config.output_device.as_deref(), wanted);
+            let (need, label) = android_comm_plan(
+                self.config.output_device.as_deref(),
+                wanted,
+                devices.as_deref(),
+            );
             if need != self.aec_comm || (need && label != self.aec_route) {
                 return true;
             }
@@ -824,8 +918,10 @@ impl VoiceChat {
     ///   iOS's plain streams (headphones without echo cancellation) it
     ///   is closed like Android's.
     pub fn set_presence(&mut self, in_room: bool, mic_wanted: bool) {
+        self.stats.in_room.store(in_room, Ordering::Relaxed);
         if !RELEASES_MIC {
             self.in_room = in_room;
+            self.sync_timer();
             self.input_config.in_room.store(in_room, Ordering::Relaxed);
             if !in_room {
                 self.is_speaking.set(false);
@@ -1581,7 +1677,7 @@ mod headless_tests {
     /// the public API must register in stats without blocking.
     #[test]
     fn receive_path_processes_packets_headless() {
-        let vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
+        let vc = VoiceChat::new(VoiceChatConfig::default());
         let incoming = vc.incoming_sender();
 
         // Real Opus payloads (the decoder rejects garbage)
@@ -1619,8 +1715,8 @@ mod headless_tests {
     /// and says so.
     #[test]
     fn a_playback_that_failed_is_retried() {
-        let mut vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
-        if vc.start().is_ok() || vc.output_running() {
+        let mut vc = VoiceChat::new(VoiceChatConfig::default());
+        if vc.start().audible() {
             eprintln!("an output opened here: nothing to retry");
             return;
         }
@@ -1645,7 +1741,7 @@ mod headless_tests {
     #[test]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn the_desktop_out_of_a_room_drops_the_microphone_not_the_streams() {
-        let mut vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
+        let mut vc = VoiceChat::new(VoiceChatConfig::default());
         vc.is_speaking.set(true);
         vc.set_presence(false, true);
         assert!(vc.input_config.silenced());
@@ -1665,7 +1761,7 @@ mod headless_tests {
     /// inbound queue must still accept packets without blocking or panicking.
     #[test]
     fn incoming_sender_never_blocks_without_output() {
-        let vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
+        let vc = VoiceChat::new(VoiceChatConfig::default());
         let tx = vc.incoming_sender();
         for seq in 0..1000u32 {
             let _ = tx.send(AudioPacket::new(
@@ -1694,7 +1790,7 @@ mod network_side {
         let (handles_tx, handles_rx) = crossbeam_channel::bounded(1);
         let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
         let engine = std::thread::spawn(move || {
-            let vc = VoiceChat::new(VoiceChatConfig::default()).expect("new");
+            let vc = VoiceChat::new(VoiceChatConfig::default());
             handles_tx
                 .send((
                     vc.incoming_sender(),

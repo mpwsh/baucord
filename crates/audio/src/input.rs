@@ -37,7 +37,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig,
 };
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{Sender, TrySendError};
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
 use log::{error, info};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -45,6 +45,7 @@ use rubato::{Async, Resampler};
 
 use crate::{
     input_config::InputConfig,
+    latch::{Ring, Wait},
     processor::{
         agc::AutoGainControl,
         clamp::ClampStage,
@@ -109,13 +110,13 @@ pub struct AudioInput {
     ring_consumer: Option<Consumer<f32>>,
 
     /// Wake latch: capture callback → worker ("data available").
-    wake_tx: Option<Sender<()>>,
-    wake_rx: Option<Receiver<()>>,
+    wake_tx: Option<Ring>,
+    wake_rx: Option<Wait>,
     /// Our own ring of the latch: a stop wakes the worker at once
     /// instead of after its safety wait. Held for the input's life, it
     /// also keeps the latch from going dead under a running worker (a
     /// stream that stopped by itself), which would have it spin.
-    stop_ring: Option<Sender<()>>,
+    stop_ring: Option<Ring>,
 
     worker_thread: Option<thread::JoinHandle<()>>,
     should_stop: Arc<AtomicBool>,
@@ -157,7 +158,7 @@ impl AudioInput {
         // so the worker wakes on data instead of sleep-polling. (Windows
         // quantizes short sleeps to the system timer — historically up to
         // ~15.6 ms — so polling with sleep(1ms) was a hidden latency tax.)
-        let (wake_tx, wake_rx) = bounded::<()>(1);
+        let (wake_tx, wake_rx) = crate::latch::latch();
 
         Ok(Self {
             cpal,
@@ -449,7 +450,7 @@ impl AudioInput {
                 }
 
                 // Data available — wake the worker (lock-free latch).
-                let _ = wake_tx.try_send(());
+                wake_tx.ring();
             },
             move |err| {
                 if matches!(err.kind(), cpal::ErrorKind::DeviceNotAvailable) {
@@ -547,7 +548,7 @@ fn build_chain(config: &InputConfig, is_speaking: Arc<SpeakingFlag>) -> Processo
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one straight-line real-time loop
 fn worker_loop(
     mut ring_consumer: Consumer<f32>,
-    wake_rx: Receiver<()>,
+    wake_rx: Wait,
     should_stop: Arc<AtomicBool>,
     stats: Arc<AudioStats>,
     encoder_tx: Sender<PcmFrame>,
@@ -621,7 +622,7 @@ fn worker_loop(
             // waits out the safety timeout: five wakes a second, nothing
             // processed. Unmuting costs nothing — the callback's next
             // (unmuted) buffer rings at once — and a stop rings too.
-            if !crate::platform::wait_for_wake(&wake_rx, crate::platform::LATCH_SAFETY_WAIT) {
+            if !wake_rx.wait(crate::platform::LATCH_SAFETY_WAIT) {
                 break;
             }
             continue;
@@ -649,7 +650,7 @@ fn worker_loop(
             // Block until the capture callback delivers more audio. The
             // callback rings on every buffer, so the timeout is only a
             // safety net, not a tick (review P1-4).
-            if !crate::platform::wait_for_wake(&wake_rx, crate::platform::LATCH_SAFETY_WAIT) {
+            if !wake_rx.wait(crate::platform::LATCH_SAFETY_WAIT) {
                 break;
             }
             continue;
@@ -777,7 +778,7 @@ impl Drop for AudioInput {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Relaxed);
         if let Some(ring) = &self.stop_ring {
-            let _ = ring.try_send(());
+            ring.ring();
         }
         self.stream.take();
         #[cfg(windows)]
@@ -798,13 +799,15 @@ impl Drop for AudioInput {
 mod tests {
     use std::time::Instant;
 
+    use crossbeam_channel::{bounded, Receiver};
+
     use super::*;
 
     /// The capture worker on a ring and latch of our own, fed the way a
     /// backend feeds it.
     struct Rig {
         producer: Producer<f32>,
-        wake: Option<Sender<()>>,
+        wake: Option<Ring>,
         frames: Receiver<PcmFrame>,
         config: Arc<InputConfig>,
         stop: Arc<AtomicBool>,
@@ -813,7 +816,7 @@ mod tests {
 
     fn rig() -> Rig {
         let (producer, consumer) = RingBuffer::new(ring_size_for(OPUS_SAMPLE_RATE));
-        let (wake, wake_rx) = bounded(1);
+        let (wake, wake_rx) = crate::latch::latch();
         let (encoder_tx, frames) = bounded(64);
         let (loopback_tx, _) = bounded(8);
         let config = Arc::new(InputConfig::default());
@@ -856,7 +859,7 @@ mod tests {
                 let _ = self.producer.push(s);
             }
             if let Some(wake) = &self.wake {
-                let _ = wake.try_send(());
+                wake.ring();
             }
         }
 
@@ -867,7 +870,7 @@ mod tests {
             let started = Instant::now();
             if ring {
                 if let Some(wake) = &self.wake {
-                    let _ = wake.try_send(());
+                    wake.ring();
                 }
             } else {
                 self.wake.take();

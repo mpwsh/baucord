@@ -73,9 +73,6 @@ use std::{
 };
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
-use crossbeam_channel::Receiver;
-#[cfg(target_os = "windows")]
-use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info, warn};
 use rtrb::Consumer;
 #[cfg(target_os = "windows")]
@@ -85,7 +82,9 @@ use rubato::{
     WindowFunction,
 };
 
-use crate::{stats::AudioStats, OPUS_SAMPLE_RATE};
+#[cfg(target_os = "windows")]
+use crate::latch::Ring;
+use crate::{latch::Wait, stats::AudioStats, OPUS_SAMPLE_RATE};
 
 /// Opus bitrate for system audio (bits/s).
 /// 128 kbps stereo gives excellent quality for music/game audio.
@@ -170,6 +169,10 @@ pub(crate) trait SystemAudioBackend {
 
     /// Human-readable name of the capture source.
     fn device_name(&self) -> String;
+
+    /// The capture stopped by itself (its device went, the audio engine
+    /// kept failing) and will deliver nothing more.
+    fn failed(&self) -> bool;
 }
 
 /// A started backend paired with the ring consumer the worker drains.
@@ -270,9 +273,9 @@ impl SystemAudioCapture {
         }
 
         // Wake latch: capture backends ping it after pushing samples so
-        // the worker blocks instead of polling an empty ring. bounded(1)
-        // coalesces pings — a pending token makes further sends no-ops.
-        let (wake_tx, wake_rx) = bounded::<()>(1);
+        // the worker blocks instead of polling an empty ring. Pings
+        // the worker has not seen yet collapse into one (`latch`).
+        let (wake_tx, wake_rx) = crate::latch::latch();
 
         let (backend, ring_consumer) = Self::create_started_backend(&self.stats, &wake_tx)?;
 
@@ -317,7 +320,7 @@ impl SystemAudioCapture {
     #[cfg(target_os = "windows")]
     fn create_started_backend(
         stats: &Arc<AudioStats>,
-        wake_tx: &Sender<()>,
+        wake_tx: &Ring,
     ) -> Result<StartedBackend, Box<dyn std::error::Error>> {
         let (ring_producer, ring_consumer) = Self::new_ring();
         let mut backend = super::process_loopback::ProcessLoopback::new(
@@ -334,6 +337,25 @@ impl SystemAudioCapture {
     }
 
     /// Stop capturing system audio and release all resources.
+    /// The capture stopped by itself and will deliver nothing more: the
+    /// share has no sound until it is started again. A process loopback
+    /// that gave up used to say so in the log and nowhere else (review
+    /// P2-22).
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.backend
+                .as_ref()
+                .is_some_and(|backend| backend.failed())
+        }
+        // No backend elsewhere: nothing started, nothing to fail.
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+
     pub fn stop(&mut self) {
         self.should_stop.store(true, Ordering::Release);
 
@@ -360,7 +382,7 @@ impl SystemAudioCapture {
         sink: PacketSink,
         should_stop: Arc<AtomicBool>,
         device_sample_rate: u32,
-        wake_rx: Receiver<()>,
+        wake_rx: Wait,
     ) -> thread::JoinHandle<()> {
         crate::platform::spawn_named("sysaudio-encode", move || {
             // Audio-class scheduling (MMCSS "Pro Audio" on Windows).
@@ -383,7 +405,7 @@ impl SystemAudioCapture {
         sink: &(dyn Fn(SystemAudioPacket) -> bool + Send + Sync),
         should_stop: &AtomicBool,
         device_sample_rate: u32,
-        wake_rx: Receiver<()>,
+        wake_rx: Wait,
     ) {
         // ── Opus encoder (stereo, music-optimized) ──────────────────────
         let mut encoder = match opus::Encoder::new(
@@ -501,7 +523,7 @@ impl SystemAudioCapture {
                 // wake latch (or the cap elapses for a stop check). This
                 // replaces a 2 ms polling sleep that the 2026-08 audit
                 // predicted at ~500 wakes/s during engine-idle silence.
-                if !crate::platform::wait_for_wake(&wake_rx, WORKER_WAIT_CAP) {
+                if !wake_rx.wait(WORKER_WAIT_CAP) {
                     break;
                 }
                 continue;

@@ -39,6 +39,7 @@ use std::{
         Arc, Mutex,
     },
     thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use windows::{
@@ -46,7 +47,7 @@ use windows::{
     Win32::{
         Foundation::{HMODULE, LPARAM, RECT},
         Graphics::{
-            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN},
             Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
                 ID3D11Texture2D, D3D11_BOX, D3D11_CPU_ACCESS_READ,
@@ -55,9 +56,9 @@ use windows::{
                 D3D11_USAGE_STAGING,
             },
             Dxgi::{
-                Common::DXGI_FORMAT_B8G8R8A8_UNORM, IDXGIDevice, IDXGIOutput1,
-                IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT,
-                DXGI_OUTDUPL_FRAME_INFO,
+                Common::DXGI_FORMAT_B8G8R8A8_UNORM, CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice,
+                IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+                DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
             },
             Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
         },
@@ -97,6 +98,8 @@ pub struct CapturedFrame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// When it was read back from the desktop.
+    pub at: Instant,
 }
 
 /// Worker health as published for the consumer.
@@ -182,10 +185,30 @@ impl DxgiDuplicator {
         })
     }
 
-    /// Take the oldest buffered frame, if any arrived since last call.
+    /// Take a buffered frame, if any arrived since the last call: the
+    /// oldest — unless the desktop makes pictures well faster than one
+    /// every `every` (the caller's own pace), when the older of two is
+    /// a picture nobody needs and the newer goes out instead. A 30 fps
+    /// share of a 60 Hz desktop found the queue full at every tick and
+    /// always took the older one: a frame interval of the screen, 17 to
+    /// 33 ms, late for nothing (review P3-28). At matched rates the
+    /// oldest still goes first: that is what the second slot is for
+    /// ([`FRAME_QUEUE_DEPTH`]).
     #[must_use]
-    pub fn take_frame(&self) -> Option<CapturedFrame> {
-        self.shared.slot.lock().unwrap().pop_front()
+    pub fn take_frame(&self, every: Duration) -> Option<CapturedFrame> {
+        let mut queue = self.shared.slot.lock().unwrap();
+        let surplus = match (queue.front(), queue.back()) {
+            (Some(older), Some(newer)) if queue.len() > 1 => {
+                crate::capture::source_outpaces(newer.at.duration_since(older.at), every)
+            }
+            _ => false,
+        };
+        if surplus {
+            if let Some(stale) = queue.pop_front() {
+                crate::pool::recycle(stale.data);
+            }
+        }
+        queue.pop_front()
     }
 
     /// Current worker health.
@@ -434,6 +457,7 @@ unsafe fn grab_frame(
         data,
         width,
         height,
+        at: Instant::now(),
     }))
 }
 
@@ -477,18 +501,39 @@ fn open_duplication(
 ) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication), CaptureError> {
     let werr = |what: &str, e: windows::core::Error| CaptureError::Capture(format!("{what}: {e}"));
     unsafe {
+        // The adapter that drives this monitor. On a machine with two
+        // GPUs — a laptop's panel on the integrated one, a second
+        // monitor on the other card — it need not be the default
+        // adapter, whose outputs then do not include the monitor: the
+        // share fell back to GDI screenshots (review P2-26).
+        let found = find_output(h_monitor_raw);
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED;
         let mut device = None;
-        D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED,
-            None,
-            D3D11_SDK_VERSION,
-            Some(&raw mut device),
-            None,
-            None,
-        )
+        match &found {
+            // A device on a named adapter takes no driver type.
+            Some((adapter, _)) => D3D11CreateDevice(
+                adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                flags,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&raw mut device),
+                None,
+                None,
+            ),
+            None => D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                flags,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&raw mut device),
+                None,
+                None,
+            ),
+        }
         .map_err(|e| werr("D3D11CreateDevice", e))?;
         let device: ID3D11Device =
             device.ok_or_else(|| CaptureError::Capture("D3D11CreateDevice: no device".into()))?;
@@ -497,28 +542,55 @@ fn open_duplication(
             .GetImmediateContext()
             .map_err(|e| werr("GetImmediateContext", e))?;
         let dxgi_device: IDXGIDevice = device.cast().map_err(|e| werr("cast IDXGIDevice", e))?;
-        let adapter = dxgi_device
-            .GetAdapter()
-            .map_err(|e| werr("GetAdapter", e))?;
 
-        let mut output_index = 0u32;
-        loop {
-            let output = adapter
-                .EnumOutputs(output_index)
-                .map_err(|e| werr("monitor's DXGI output not found", e))?;
-            output_index += 1;
-
-            let desc = output.GetDesc().map_err(|e| werr("output GetDesc", e))?;
-            if desc.Monitor.0 as isize != h_monitor_raw {
-                continue;
+        let output = match found {
+            Some((_, output)) => output,
+            // The factory would not say: the default adapter's outputs,
+            // as before.
+            None => {
+                let adapter = dxgi_device
+                    .GetAdapter()
+                    .map_err(|e| werr("GetAdapter", e))?;
+                let mut output_index = 0u32;
+                loop {
+                    let output = adapter
+                        .EnumOutputs(output_index)
+                        .map_err(|e| werr("monitor's DXGI output not found", e))?;
+                    output_index += 1;
+                    let desc = output.GetDesc().map_err(|e| werr("output GetDesc", e))?;
+                    if desc.Monitor.0 as isize == h_monitor_raw {
+                        break output;
+                    }
+                }
             }
+        };
 
-            let output1: IDXGIOutput1 = output.cast().map_err(|e| werr("cast IDXGIOutput1", e))?;
-            let duplication = output1
-                .DuplicateOutput(&dxgi_device)
-                .map_err(|e| werr("DuplicateOutput", e))?;
+        let output1: IDXGIOutput1 = output.cast().map_err(|e| werr("cast IDXGIOutput1", e))?;
+        let duplication = output1
+            .DuplicateOutput(&dxgi_device)
+            .map_err(|e| werr("DuplicateOutput", e))?;
 
-            return Ok((device, context, duplication));
+        Ok((device, context, duplication))
+    }
+}
+
+/// The adapter one of whose outputs is the monitor, with that output:
+/// every adapter is asked, not only the default one. `None` when DXGI
+/// lists no such output (or no adapters at all).
+unsafe fn find_output(h_monitor_raw: isize) -> Option<(IDXGIAdapter1, IDXGIOutput)> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let mut adapter_index = 0u32;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_index) } {
+        adapter_index += 1;
+        let mut output_index = 0u32;
+        while let Ok(output) = unsafe { adapter.EnumOutputs(output_index) } {
+            output_index += 1;
+            let ours = unsafe { output.GetDesc() }
+                .is_ok_and(|desc| desc.Monitor.0 as isize == h_monitor_raw);
+            if ours {
+                return Some((adapter, output));
+            }
         }
     }
+    None
 }

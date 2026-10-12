@@ -230,8 +230,12 @@ fn main() {
         ..Default::default()
     };
 
-    let mut vc = VoiceChat::new(config).expect("Failed to create VoiceChat");
-    vc.start().expect("Failed to start VoiceChat");
+    let mut vc = VoiceChat::new(config);
+    let outcome = vc.start();
+    assert!(
+        matches!(outcome, audio::StartOutcome::Started),
+        "Failed to start VoiceChat: {outcome:?}"
+    );
     vc.set_loopback(true);
 
     let stats = vc.stats().clone();

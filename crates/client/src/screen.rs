@@ -36,7 +36,7 @@ use audio::{
         input::{PacketSink, SystemAudioCapture},
     },
 };
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, SendError, Sender, TrySendError};
 use log::{info, warn};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use video::codec::FfmpegDecoder;
@@ -256,8 +256,79 @@ impl SharedScreenState {
 
 // ── Public API ──────────────────────────────────────────────────────────
 
+/// The way in to the screen threads: one sender to callers, two
+/// threads behind it. Our own share (capture, encode) and the streams
+/// we watch (reassembly, decode, their audio) each run the same loop on
+/// a thread of their own, and a command goes to the one it is for. On
+/// one thread a sharer who also watched lost capture ticks to decoding:
+/// a decode pass may take 24 ms, a 60 fps tick comes every 16.7 (review
+/// P2-44).
+#[derive(Clone)]
+pub struct ScreenTx {
+    share: Sender<ScreenControl>,
+    watch: Sender<ScreenControl>,
+}
+
+impl ScreenTx {
+    /// The thread `ctrl` is for; `None` for the one command both get.
+    fn lane(&self, ctrl: &ScreenControl) -> Option<&Sender<ScreenControl>> {
+        match ctrl {
+            ScreenControl::StartSharing { .. }
+            | ScreenControl::StopSharing
+            | ScreenControl::RestartSystemAudio
+            | ScreenControl::ForceKeyframe
+            | ScreenControl::StreamHealth { .. }
+            | ScreenControl::UplinkStats { .. } => Some(&self.share),
+            ScreenControl::IncomingVideoFrame { .. }
+            | ScreenControl::PeerStartedSharing { .. }
+            | ScreenControl::PeerStoppedSharing { .. }
+            | ScreenControl::Watch { .. }
+            | ScreenControl::StopWatching { .. }
+            | ScreenControl::SetVisible { .. }
+            | ScreenControl::IncomingSystemAudio { .. }
+            | ScreenControl::SetStreamVolume { .. }
+            | ScreenControl::MuteStream { .. } => Some(&self.watch),
+            ScreenControl::Shutdown => None,
+        }
+    }
+
+    /// Send, waiting for room.
+    ///
+    /// # Errors
+    /// The thread is gone; the command comes back.
+    pub fn send(&self, ctrl: ScreenControl) -> Result<(), SendError<ScreenControl>> {
+        if let Some(lane) = self.lane(&ctrl) {
+            return lane.send(ctrl);
+        }
+        let share = self.share.send(ScreenControl::Shutdown);
+        self.watch.send(ctrl).and(share)
+    }
+
+    /// Send if there is room.
+    ///
+    /// # Errors
+    /// The thread is behind (`Full`) or gone; the command comes back.
+    pub fn try_send(&self, ctrl: ScreenControl) -> Result<(), TrySendError<ScreenControl>> {
+        if let Some(lane) = self.lane(&ctrl) {
+            return lane.try_send(ctrl);
+        }
+        let share = self.share.try_send(ScreenControl::Shutdown);
+        self.watch.try_send(ctrl).and(share)
+    }
+}
+
+/// One channel for everything: a test's stand-in for the threads.
+impl From<Sender<ScreenControl>> for ScreenTx {
+    fn from(tx: Sender<ScreenControl>) -> Self {
+        Self {
+            share: tx.clone(),
+            watch: tx,
+        }
+    }
+}
+
 pub struct ScreenThreadHandle {
-    pub tx: Sender<ScreenControl>,
+    pub tx: ScreenTx,
     pub event_rx: Receiver<ScreenEvent>,
     pub shared: SharedScreenState,
     /// Joined by the frontend on shutdown (with a timeout).
@@ -265,30 +336,51 @@ pub struct ScreenThreadHandle {
 }
 
 impl ScreenThreadHandle {
-    /// Start the screen thread. It does not wake the UI: whoever reads
-    /// `event_rx` does — the frontend's present thread, which wakes the
-    /// UI once it has forwarded an event or prepared a frame. A wake
-    /// here as well was an empty drain of the UI per decoded frame, with
-    /// a phone in the background too (review P1-8). Dropping the handle
-    /// stops the thread.
+    /// Start the screen threads ([`ScreenTx`]): `screen-share` for our
+    /// own share, `screen-watch` for the streams we watch. Neither
+    /// wakes the UI: whoever reads `event_rx` does — the frontend's
+    /// present thread, which wakes the UI once it has forwarded an
+    /// event or prepared a frame. A wake here as well was an empty
+    /// drain of the UI per decoded frame, with a phone in the
+    /// background too (review P1-8). A thread with nothing to do blocks
+    /// on its channel and costs nothing. Dropping the handle stops
+    /// both.
     #[must_use]
     pub fn spawn(network_tx: Sender<NetworkControl>, media_tx: Sender<MediaOut>) -> Self {
         // 256 slots: at 30fps inbound + outbound control messages, 64 was
         // too tight and caused try_send drops during active streaming.
-        let (tx, control_rx) = bounded::<ScreenControl>(256);
+        let (share_tx, share_rx) = bounded::<ScreenControl>(256);
+        let (watch_tx, watch_rx) = bounded::<ScreenControl>(256);
         let (event_tx, event_rx) = bounded::<ScreenEvent>(256);
         let shared = SharedScreenState::new();
 
+        let share = {
+            let (event_tx, network_tx, media_tx, shared) = (
+                event_tx.clone(),
+                network_tx.clone(),
+                media_tx.clone(),
+                shared.clone(),
+            );
+            thread::Builder::new()
+                .name("screen-share".into())
+                .spawn(move || run_screen_loop(share_rx, event_tx, network_tx, media_tx, shared))
+                .expect("failed to spawn screen thread")
+        };
         let shared_clone = shared.clone();
+        // The one handle callers join: it ends when both have.
         let join_handle = thread::Builder::new()
-            .name("screen-share".into())
+            .name("screen-watch".into())
             .spawn(move || {
-                run_screen_loop(control_rx, event_tx, network_tx, media_tx, shared_clone);
+                run_screen_loop(watch_rx, event_tx, network_tx, media_tx, shared_clone);
+                let _ = share.join();
             })
             .expect("failed to spawn screen thread");
 
         Self {
-            tx,
+            tx: ScreenTx {
+                share: share_tx,
+                watch: watch_tx,
+            },
             event_rx,
             shared,
             join_handle: Some(join_handle),
@@ -409,6 +501,9 @@ struct CaptureState {
     /// System audio capture — started alongside video, sends Opus stereo
     /// packets to the network. `None` if platform doesn't support it.
     system_audio: Option<SystemAudioCapture>,
+    /// Not before this is a capture that stopped by itself restarted
+    /// again (`revive_system_audio`).
+    system_audio_retry: Option<Instant>,
     /// Encoder bitrate ladder (see "Sender-side adaptation").
     ladder: BitrateLadder,
     /// The sharer's summary line (`viewlog`).
@@ -754,11 +849,12 @@ const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// While the screen is static (streaming backend reports Unchanged),
 /// re-encode the held frame this often. Identical-content P-frames are
-/// near-zero bytes and the encoder's 2 s IDR cadence rides on top, so a
-/// static share costs a tiny fraction of full-rate encoding while
-/// joining viewers still get a picture within the keyframe interval.
-/// A pending forced keyframe (viewer waiting on an IDR) bypasses this
-/// and encodes on the next tick.
+/// near-zero bytes, and the encoder leaves them out of its keyframe
+/// cadence (`encode_repeat`; a still share sent a full IDR every 2 s
+/// before — review P2-41), so a static share costs next to nothing. A
+/// joining viewer asks for its keyframe: a pending forced keyframe
+/// (viewer waiting on an IDR) bypasses this and encodes on the next
+/// tick.
 const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Upper bound on a keyframe "burst" (see `CaptureState::keyframe_burst_until)`:
@@ -768,6 +864,50 @@ const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// resolves within ~2 s of full-rate frames; this cap just guarantees a
 /// misbehaving encoder can't pin us at full rate forever.
 const KEYFRAME_BURST_MAX: Duration = Duration::from_secs(5);
+
+/// How long a system-audio capture that stopped by itself waits before
+/// it is started again (and again, if it keeps stopping).
+const SYSTEM_AUDIO_RETRY: Duration = Duration::from_secs(10);
+
+/// Stop the share's system-audio capture, if any, and start a new one —
+/// best-effort: a share without sound is still a share.
+fn restart_system_audio(state: &mut CaptureState, media_tx: &Sender<MediaOut>, why: &str) {
+    // Stop the old capture (drops the dead WASAPI loopback stream).
+    if let Some(mut old) = state.system_audio.take() {
+        old.stop();
+        info!("System audio capture stopped ({why})");
+    }
+    match SystemAudioCapture::new(Arc::new(AudioStats::new()), system_audio_sink(media_tx)) {
+        Ok(mut cap) => match cap.start() {
+            Ok(()) => {
+                info!("System audio capture restarted ({why})");
+                state.system_audio = Some(cap);
+            }
+            Err(e) => warn!("System audio capture restart failed ({why}): {e}"),
+        },
+        Err(e) => warn!("System audio capture unavailable ({why}): {e}"),
+    }
+}
+
+/// A system-audio capture that gave up (its device went, the audio
+/// engine kept failing) is started again. It used to log that the share
+/// went on without sound and leave it so until the share ended (review
+/// P2-22). Called on every capture tick: two loads when all is well.
+fn revive_system_audio(state: &mut CaptureState, media_tx: &Sender<MediaOut>) {
+    if !state
+        .system_audio
+        .as_ref()
+        .is_some_and(SystemAudioCapture::failed)
+    {
+        return;
+    }
+    let now = Instant::now();
+    if state.system_audio_retry.is_some_and(|at| now < at) {
+        return;
+    }
+    state.system_audio_retry = Some(now + SYSTEM_AUDIO_RETRY);
+    restart_system_audio(state, media_tx, "it stopped by itself");
+}
 
 /// The capture interval at the current pace.
 /// Our share's sound goes to the network thread as each 20 ms packet is
@@ -1000,6 +1140,11 @@ fn run_screen_loop(
         running: true,
     };
     let mut next_capture = Instant::now();
+    // Whether this thread holds `video::pool` for its pictures, and the
+    // 1 ms timer it holds with it.
+    let mut pooling = false;
+    // (Held for what dropping it does; never read.)
+    let mut _fine_timer: Option<audio::TimerResolutionGuard> = None;
 
     while st.running {
         // Sleep until the earliest thing with a time of its own (review
@@ -1030,6 +1175,23 @@ fn run_screen_loop(
             handle_control(ctrl, &mut st, &event_tx, &network_tx, &media_tx, &shared);
         }
 
+        // Frame buffers go round only while a picture is made or
+        // shown; with no share and nothing watched they are freed
+        // (review P2-43).
+        let busy = st.capture.is_some() || !st.peer_streams.is_empty();
+        if busy != pooling {
+            pooling = busy;
+            if busy {
+                video::pool::retain();
+            } else {
+                video::pool::release();
+            }
+            // Capture ticks and playout slots are short timed waits:
+            // on Windows they need the 1 ms timer, which the voice
+            // engine now holds only in a room (review P2-35).
+            _fine_timer = busy.then(audio::TimerResolutionGuard::acquire);
+        }
+
         // ── Drain jitter buffers → decode → emit ────────────────────
         // Pull packets from each peer's jitter buffer and decode them.
         // This runs AFTER the channel drain, so all newly arrived packets
@@ -1058,7 +1220,12 @@ fn run_screen_loop(
         }
     }
 
-    shared.is_sharing.store(false, Ordering::Relaxed);
+    if pooling {
+        video::pool::release();
+    }
+    if st.capture.is_some() {
+        shared.is_sharing.store(false, Ordering::Relaxed);
+    }
     info!("Screen thread stopped");
 }
 
@@ -1338,6 +1505,7 @@ fn handle_control(
                 telemetry: (Instant::now(), 0, 0, 0, 0, 0),
                 keyframes_logged: 0,
                 system_audio,
+                system_audio_retry: None,
                 ladder: BitrateLadder::new(quality),
                 log: Sharing::new(Instant::now()),
                 offered_bytes: 0,
@@ -1555,30 +1723,7 @@ fn handle_control(
 
         ScreenControl::RestartSystemAudio => {
             if let Some(state) = &mut st.capture {
-                // Stop the old capture (drops the dead WASAPI loopback stream)
-                if let Some(mut old) = state.system_audio.take() {
-                    old.stop();
-                    info!("System audio capture stopped for device rebuild");
-                }
-
-                // Rebuild — best-effort, non-fatal
-                match SystemAudioCapture::new(
-                    Arc::new(AudioStats::new()),
-                    system_audio_sink(media_tx),
-                ) {
-                    Ok(mut cap) => match cap.start() {
-                        Ok(()) => {
-                            info!("System audio capture restarted after device change");
-                            state.system_audio = Some(cap);
-                        }
-                        Err(e) => {
-                            warn!("System audio capture restart failed: {e}");
-                        }
-                    },
-                    Err(e) => {
-                        warn!("System audio capture unavailable after device change: {e}");
-                    }
-                }
+                restart_system_audio(state, media_tx, "device change");
             }
         }
 
@@ -1703,6 +1848,7 @@ fn capture_and_encode(
         CaptureStatus::Empty => {}
     }
     report_share_telemetry(state, network_tx, shared);
+    revive_system_audio(state, media_tx);
     let repeat = match status {
         CaptureStatus::Fresh => false,
         CaptureStatus::Unchanged => {
@@ -1739,8 +1885,8 @@ fn capture_and_encode(
         }
     };
 
-    // A repeated frame gets its timestamp advanced to "now" so PTS,
-    // keyframe cadence, and rate control keep tracking real time.
+    // A repeated frame gets its timestamp advanced to "now" so PTS and
+    // rate control keep tracking real time.
     let Some(frame) = state.capturer.frame(repeat) else {
         return;
     };
@@ -1751,7 +1897,12 @@ fn capture_and_encode(
     // gets its own sequence number — the receiver's jitter buffer treats
     // seq gaps as loss, so skipped/empty encodes must not consume seqs.
     let t1 = Instant::now();
-    let encoded_frames = match state.encoder.encode(frame) {
+    let encoded = if repeat {
+        state.encoder.encode_repeat(frame)
+    } else {
+        state.encoder.encode(frame)
+    };
+    let encoded_frames = match encoded {
         Ok(e) => e,
         Err(e) => {
             warn!("Encode failed: {e}");
@@ -1960,6 +2111,92 @@ fn create_decoder() -> Result<Box<dyn VideoDecoder + Send>, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command reaches the thread it is for, and only that one;
+    /// `Shutdown` reaches both (review P2-44).
+    #[test]
+    fn commands_go_to_the_thread_they_are_for() {
+        let (share, share_rx) = bounded(8);
+        let (watch, watch_rx) = bounded(8);
+        let tx = ScreenTx { share, watch };
+
+        tx.send(ScreenControl::ForceKeyframe).unwrap();
+        tx.try_send(ScreenControl::StopSharing).unwrap();
+        tx.send(ScreenControl::RestartSystemAudio).unwrap();
+        assert!(watch_rx.try_recv().is_err(), "nothing of the share's");
+        assert!(matches!(
+            share_rx.try_recv(),
+            Ok(ScreenControl::ForceKeyframe)
+        ));
+        assert!(matches!(
+            share_rx.try_recv(),
+            Ok(ScreenControl::StopSharing)
+        ));
+        assert!(matches!(
+            share_rx.try_recv(),
+            Ok(ScreenControl::RestartSystemAudio)
+        ));
+
+        tx.send(ScreenControl::Watch { client_id: 7 }).unwrap();
+        tx.try_send(ScreenControl::PeerStoppedSharing { client_id: 7 })
+            .unwrap();
+        tx.send(ScreenControl::SetVisible {
+            client_id: None,
+            visible: false,
+        })
+        .unwrap();
+        assert!(share_rx.try_recv().is_err(), "nothing of the viewers'");
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Ok(ScreenControl::Watch { client_id: 7 })
+        ));
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Ok(ScreenControl::PeerStoppedSharing { client_id: 7 })
+        ));
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Ok(ScreenControl::SetVisible { .. })
+        ));
+
+        tx.send(ScreenControl::Shutdown).unwrap();
+        assert!(matches!(share_rx.try_recv(), Ok(ScreenControl::Shutdown)));
+        assert!(matches!(watch_rx.try_recv(), Ok(ScreenControl::Shutdown)));
+
+        // A viewer that is behind does not hold up the share's commands.
+        for _ in 0..8 {
+            tx.try_send(ScreenControl::Watch { client_id: 1 }).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(ScreenControl::Watch { client_id: 1 }),
+            Err(TrySendError::Full(_))
+        ));
+        tx.try_send(ScreenControl::ForceKeyframe).unwrap();
+    }
+
+    /// Both threads start idle, take their commands and stop on
+    /// `Shutdown`; the one handle joins both.
+    #[test]
+    fn both_threads_stop_on_shutdown() {
+        let (network_tx, _network_rx) = bounded(8);
+        let (media_tx, _media_rx) = bounded(8);
+        let mut handle = ScreenThreadHandle::spawn(network_tx, media_tx);
+        handle.tx.send(ScreenControl::StopSharing).unwrap();
+        handle
+            .tx
+            .send(ScreenControl::StopWatching { client_id: 3 })
+            .unwrap();
+        let started = Instant::now();
+        handle.shutdown();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(handle.join_handle.is_none());
+        // Stopped: nobody takes commands any more.
+        assert!(handle.tx.send(ScreenControl::ForceKeyframe).is_err());
+        assert!(handle
+            .tx
+            .send(ScreenControl::Watch { client_id: 3 })
+            .is_err());
+    }
 
     mod bitrate_ladder {
         use super::*;

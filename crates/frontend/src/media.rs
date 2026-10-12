@@ -105,6 +105,7 @@ fn install_image(
         let mut player = GifPlayer::new(bytes, preview);
         player.start_autoplay();
         app.gifs_mut().insert(row_id, player);
+        app.cap_gif_autoplay();
         app.ensure_gif_ticker();
     }
 }
@@ -239,6 +240,12 @@ impl GifPlayer {
     #[must_use]
     pub fn playing(&self) -> bool {
         !matches!(self.mode, GifMode::Frozen)
+    }
+
+    /// Playing by itself, not under the pointer.
+    #[must_use]
+    pub fn autoplaying(&self) -> bool {
+        matches!(self.mode, GifMode::Autoplay { .. })
     }
 
     /// Stop playback immediately and release the stream, returning the

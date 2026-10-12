@@ -379,6 +379,19 @@ pub trait VideoEncoder {
     /// frame with its own sequence number. Never concatenate them.
     fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError>;
 
+    /// Encode `frame` again: the picture [`VideoEncoder::encode`] last
+    /// took, with only its timestamp moved on — a still screen's
+    /// once-a-second refresh. The same output contract. A backend
+    /// should leave the still time out of its keyframe cadence: an
+    /// unchanged picture needs no new keyframe until somebody asks
+    /// ([`VideoEncoder::force_keyframe`]).
+    ///
+    /// # Errors
+    /// As [`VideoEncoder::encode`].
+    fn encode_repeat(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        self.encode(frame)
+    }
+
     /// Run rate control at `pct` percent of the preset bitrate (clamped
     /// to [`MIN_BITRATE_SCALE_PCT`]`..=100`). Resolution and frame rate
     /// stay as the preset says; only bits per frame change.

@@ -22,8 +22,11 @@ does and how it is run.
  └──────────────────────────────────────────┘         └────────────────────────┘
 ```
 
-Three long-lived threads on the client, one process-wide loop on the
-server, and one transport crate shared by both. Everything crosses
+Three long-lived threads on the client (the screen "thread" is two
+since 1.2.1 — `screen-share` for our own share, `screen-watch` for the
+streams we watch — behind one sender, `ScreenTx`, that routes each
+command; review P2-44), one process-wide loop on the server, and one
+transport crate shared by both. Everything crosses
 thread boundaries as owned messages over crossbeam channels; nothing
 network-related is `async`.
 
@@ -818,7 +821,8 @@ that cannot keep up shows fewer frames, never older ones: the picture
 stays live with its sound (MOB-18). Frame buffers go round
 `video::pool` instead of being allocated per frame — DXGI's captures
 too, and FFmpeg decodes straight into one when the width is a multiple
-of 16 (review P1-11). Closing a viewer drops the stream's decoder,
+of 16 (review P1-11); the pool is held (`retain`/`release`) only while
+something is shared or watched, and freed after (P2-43). Closing a viewer drops the stream's decoder,
 buffer and audio in the screen thread (`ScreenControl::StopWatching`);
 the next viewer starts from a keyframe. The screen thread sleeps until
 a capture tick, a frame's playout slot, a decoder poll or a log line

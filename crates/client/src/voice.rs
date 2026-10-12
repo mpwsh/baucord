@@ -370,45 +370,38 @@ impl VoiceLoopState {
                 self.user_muted = false;
                 self.ptt_held = false;
                 self.in_room = in_room;
-                match VoiceChat::new(config) {
-                    Ok(mut voice) => {
-                        voice.set_presence(in_room, !self.effective_mute());
-                        if let Err(e) = voice.start() {
-                            if !voice.output_running() {
-                                // Nothing came up: no engine this time.
-                                event_tx
-                                    .send(VoiceEvent::Error(format!("Start failed: {e}")))
-                                    .ok();
-                                wake();
-                                return;
-                            }
-                            // Playback is up and only capture failed (no
-                            // microphone; on Android the permission not
-                            // granted yet). Keep the engine: the room stays
-                            // audible, and `service()` retries the input
-                            // every 2 s until it opens. Dropping it here
-                            // silenced everything (first phone test,
-                            // 2026-10-05).
-                            event_tx
-                                .send(VoiceEvent::Error(format!("Microphone unavailable: {e}")))
-                                .ok();
-                        }
-                        self.vc = Some(voice);
-                        // Generations count per engine: republish.
-                        self.aec_published = None;
-                        self.was_speaking = false;
-                        self.apply_mute();
-                        event_tx.send(VoiceEvent::Started).ok();
-                        wake();
-                        info!("Voice started for client {id:?}");
-                    }
-                    Err(e) => {
+                let mut voice = VoiceChat::new(config);
+                voice.set_presence(in_room, !self.effective_mute());
+                match voice.start() {
+                    audio::StartOutcome::Started => {}
+                    // Nothing can be heard: no engine this time.
+                    audio::StartOutcome::NoPlayback(e) => {
                         event_tx
-                            .send(VoiceEvent::Error(format!("Init failed: {e}")))
+                            .send(VoiceEvent::Error(format!("Start failed: {e}")))
                             .ok();
                         wake();
+                        return;
+                    }
+                    // Playback is up and only capture failed (no
+                    // microphone; on Android the permission not granted
+                    // yet). Keep the engine: the room stays audible, and
+                    // `service()` retries the input every 2 s until it
+                    // opens. Dropping it here silenced everything
+                    // (first phone test, 2026-10-05).
+                    audio::StartOutcome::NoMicrophone(e) => {
+                        event_tx
+                            .send(VoiceEvent::Error(format!("Microphone unavailable: {e}")))
+                            .ok();
                     }
                 }
+                self.vc = Some(voice);
+                // Generations count per engine: republish.
+                self.aec_published = None;
+                self.was_speaking = false;
+                self.apply_mute();
+                event_tx.send(VoiceEvent::Started).ok();
+                wake();
+                info!("Voice started for client {id:?}");
             }
             VoiceControl::Stop => {
                 self.vc = None;

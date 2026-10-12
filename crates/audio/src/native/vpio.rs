@@ -53,7 +53,9 @@ use super::{
     avsession,
     pump::{CapturePump, RenderPump},
 };
-use crate::{aec::reasons, input_config::InputConfig, stats::AudioStats, OPUS_SAMPLE_RATE};
+use crate::{
+    aec::reasons, input_config::InputConfig, latch::Ring, stats::AudioStats, OPUS_SAMPLE_RATE,
+};
 
 /// The largest slice the unit may ask for: with the screen locked iOS
 /// moves to 4096-frame buffers, and a unit left at its default refuses
@@ -478,7 +480,7 @@ pub struct NativeCapture {
 pub struct CaptureStartError {
     pub reason: String,
     pub producer: Producer<f32>,
-    pub wake_tx: Sender<()>,
+    pub wake_tx: Ring,
 }
 
 impl NativeCapture {
@@ -490,7 +492,7 @@ impl NativeCapture {
     /// error.
     pub fn start(
         producer: Producer<f32>,
-        wake_tx: Sender<()>,
+        wake_tx: Ring,
         stats: Arc<AudioStats>,
         config: Arc<InputConfig>,
     ) -> Result<Self, CaptureStartError> {
@@ -550,7 +552,7 @@ pub struct NativeRender {
 pub struct RenderStartError {
     pub reason: String,
     pub consumer: Consumer<f32>,
-    pub wake_tx: Sender<()>,
+    pub wake_tx: Ring,
 }
 
 impl NativeRender {
@@ -562,7 +564,7 @@ impl NativeRender {
     /// error.
     pub fn start(
         consumer: Consumer<f32>,
-        wake_tx: Sender<()>,
+        wake_tx: Ring,
         stats: Arc<AudioStats>,
         callback_frames: Arc<AtomicUsize>,
     ) -> Result<Self, RenderStartError> {

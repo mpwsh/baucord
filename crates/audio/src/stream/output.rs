@@ -185,6 +185,11 @@ impl StreamAudioOutput {
 
         stream.play()?;
         self.stream = Some(stream);
+        // Windows lowers what is not part of a call while one runs, and
+        // this output is not: ask it to leave ours alone (AEC-SPEC.md
+        // E14).
+        #[cfg(windows)]
+        crate::native::wasapi::keep_own_volume_on(crate::device_name(&self.device).as_deref());
         info!("Stream audio output started");
         Ok(())
     }
@@ -220,10 +225,18 @@ impl StreamAudioOutput {
         let volume = self.volume.clone();
         let is_muted = self.is_muted.clone();
         let failed = self.failed.clone();
+        // cpal's render thread runs this callback at its own priority,
+        // below a game's audio: promoted on first entry like the voice
+        // output's (review P3-26; `promote_callback_thread`).
+        let mut promoted = false;
 
         let stream = self.device.build_output_stream(
             config,
             move |data: &mut [T], _: &_| {
+                if !promoted {
+                    promoted = true;
+                    crate::platform::promote_callback_thread(480, sample_rate);
+                }
                 let gain = if is_muted.load(Ordering::Relaxed) {
                     // Muted still reads: the queue must not grow.
                     0.0

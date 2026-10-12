@@ -19,7 +19,7 @@ fn main() {
     // the operator's word and the setting stays out of it.
     #[cfg(debug_assertions)]
     {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+        logger().init();
         if std::env::var_os("RUST_LOG").is_none() {
             log::set_max_level(log::LevelFilter::Info);
         }
@@ -38,11 +38,7 @@ fn main() {
             .open("baucord.log")
         {
             Ok(log_file) => {
-                env_logger::Builder::from_env(
-                    env_logger::Env::default().default_filter_or("trace"),
-                )
-                .target(Target::Pipe(Box::new(log_file)))
-                .init();
+                logger().target(Target::Pipe(Box::new(log_file))).init();
                 // Settings → Debug shows, sends and clears it.
                 if let Ok(dir) = std::env::current_dir() {
                     frontend::logfile::set_path(dir.join("baucord.log"));
@@ -51,10 +47,7 @@ fn main() {
             Err(e) => {
                 // Read-only install dir etc. — run without file logging
                 // rather than dying before the window exists.
-                env_logger::Builder::from_env(
-                    env_logger::Env::default().default_filter_or("trace"),
-                )
-                .init();
+                logger().init();
                 log::warn!("could not open baucord.log ({e}); logging to stderr");
             }
         }
@@ -109,6 +102,21 @@ fn main() {
     // normal return from main() would hang waiting for them.
     // Settings are already saved by this point.
     std::process::exit(0);
+}
+
+/// The logger every build starts from: wide open (the comment in
+/// `main`), except the `wasapi` crate, capped at info. It traces from
+/// inside the audio pump threads, once per 10 ms period, and with the
+/// log level set to trace or debug each of those was a write to the log
+/// file on a real-time thread (review P2-37). `RUST_LOG` still decides
+/// when it is set.
+fn logger() -> env_logger::Builder {
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"));
+    if std::env::var_os("RUST_LOG").is_none() {
+        builder.filter_module("wasapi", log::LevelFilter::Info);
+    }
+    builder
 }
 
 /// `--config-dir <dir>`, `--config-dir=<dir>`, `--profile <name>`,

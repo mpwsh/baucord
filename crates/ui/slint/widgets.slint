@@ -299,7 +299,8 @@ export component VuMeter inherits Rectangle {
         background: root.lv > 0.9 ? Theme.danger
             : root.lv > 0.7 ? Theme.warning
             : root.accent;
-        animate width { duration: 80ms; }
+        // No `animate width`: at the meter's 8 samples a second it
+        // made every sample ~5 redraws (review P2-40).
     }
 }
 
@@ -328,7 +329,6 @@ export component GateMeter inherits Rectangle {
         width: (root.width - 4px) * root.lv;
         border-radius: Theme.radius-sm - 2px;
         background: root.lv > root.thr ? Theme.success : Theme.subtle;
-        animate width { duration: 80ms; }
     }
     marker := Rectangle {
         x: 2px + (root.width - 4px) * root.thr - 1px;

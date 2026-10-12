@@ -45,7 +45,9 @@ for the work at hand (§3). Everything else is linked from here.
 
   (It leaves out build output, git history, signing material and logs.
   `assets/` must be in it: the build embeds `assets/sounds/*.wav` and
-  every platform's icon comes from `assets/icons/icon.png`.)
+  every platform's icon comes from `assets/icons/icon.png` — the
+  desktop's through `scripts/desktop-icons.py`, whose output
+  (`icon-256.png`, `icon.ico`, the website's favicon) is committed.)
 - **Work:** the assistant unpacks it into its sandbox, edits,
   compile-checks every platform it can (host, Android, iOS — see
   SESSION-GUIDE §1), runs the tests, renders every `.slint` change at

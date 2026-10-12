@@ -37,15 +37,17 @@
 use std::time::Duration;
 
 use cpal::{BufferSize, SupportedBufferSize};
-use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 // ── High-resolution timer (process-wide) ────────────────────────────────
 
-/// Holds the Windows multimedia timer at 1 ms resolution while alive.
+/// Holds the Windows multimedia timer at 1 ms resolution while alive
+/// (nothing elsewhere).
 ///
 /// `timeBeginPeriod` requests nest per process and are balanced by the
-/// matching `timeEndPeriod` in `Drop`, so scoping this to the voice
-/// session keeps the (small) power cost bounded to active calls.
+/// matching `timeEndPeriod` in `Drop`, so each holder scopes its own:
+/// the voice engine in a room, the screen threads while a stream is
+/// shared or watched — whoever paces something by short timed waits.
+/// Nobody holds it while the app only sits connected (review P2-35).
 pub struct TimerResolutionGuard {
     #[cfg_attr(not(windows), allow(dead_code))]
     active: bool,
@@ -53,6 +55,7 @@ pub struct TimerResolutionGuard {
 
 #[cfg(windows)]
 impl TimerResolutionGuard {
+    #[must_use]
     pub fn acquire() -> Self {
         // TIMERR_NOERROR == 0
         let active = unsafe { timeBeginPeriod(1) } == 0;
@@ -65,6 +68,7 @@ impl TimerResolutionGuard {
 
 #[cfg(not(windows))]
 impl TimerResolutionGuard {
+    #[must_use]
     pub fn acquire() -> Self {
         Self { active: false }
     }
@@ -291,21 +295,6 @@ pub fn request_low_latency_buffer(supported: &SupportedBufferSize, sample_rate: 
 /// (review P1-4: the 5 and 10 ms timers beside the latch woke the
 /// voice workers 100–200 times a second for no audio).
 pub(crate) const LATCH_SAFETY_WAIT: Duration = Duration::from_millis(200);
-
-/// Block until the audio callback pings the wake latch, or until
-/// `timeout` elapses — whichever comes first.
-///
-/// `false` once the latch is gone: every sender was dropped (the stream
-/// and its owner), so nothing will ring it again. That returns at once,
-/// so a stop never waits out the timeout; the caller leaves its loop
-/// rather than spin on the dead channel.
-#[must_use]
-pub fn wait_for_wake(wake_rx: &Receiver<()>, timeout: Duration) -> bool {
-    !matches!(
-        wake_rx.recv_timeout(timeout),
-        Err(RecvTimeoutError::Disconnected)
-    )
-}
 
 /// `thread::spawn` with a name.
 ///

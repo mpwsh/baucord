@@ -51,7 +51,12 @@ use transport::{
     PeerId, Trust, UdpIo, UploadId, VideoItem, OWN_TRACK,
 };
 
-use crate::{inbound_wake::InboundWake, screen::ScreenControl, voice::VoiceControl, WakeFn};
+use crate::{
+    inbound_wake::InboundWake,
+    screen::{ScreenControl, ScreenTx},
+    voice::VoiceControl,
+    WakeFn,
+};
 
 /// The loop's tick where nothing announces a datagram (the inbound
 /// wake could not start) and the socket must be polled.
@@ -2863,9 +2868,10 @@ impl NetworkThreadHandle {
         msg_tx: Sender<NetworkMessage>,
         msg_rx: Receiver<NetworkMessage>,
         voice_tx: Sender<VoiceControl>,
-        screen_tx: Sender<ScreenControl>,
+        screen_tx: impl Into<ScreenTx>,
         wake: WakeFn,
     ) -> Self {
+        let screen_tx = screen_tx.into();
         let join_handle = thread::Builder::new()
             .name("client-network".into())
             .spawn(move || {
@@ -3300,7 +3306,7 @@ fn route_message(
     msg_tx: &Sender<NetworkMessage>,
     voice: Option<&VoiceLink>,
     voice_tx: &Sender<VoiceControl>,
-    screen_tx: &Sender<ScreenControl>,
+    screen_tx: &ScreenTx,
     wake: &WakeFn,
     frames_dropped: &mut Tally,
 ) {
@@ -3364,7 +3370,7 @@ fn route_hot(
     hot: Hot,
     voice: Option<&VoiceLink>,
     voice_tx: &Sender<VoiceControl>,
-    screen_tx: &Sender<ScreenControl>,
+    screen_tx: &ScreenTx,
     frames_dropped: &mut Tally,
 ) {
     match hot {
@@ -3546,7 +3552,7 @@ fn run_network_loop(
     media_rx: &Receiver<MediaOut>,
     msg_tx: &Sender<NetworkMessage>,
     voice_tx: &Sender<VoiceControl>,
-    screen_tx: &Sender<ScreenControl>,
+    screen_tx: &ScreenTx,
     wake: &WakeFn,
 ) {
     let mut client: Option<NetworkClient> = None;

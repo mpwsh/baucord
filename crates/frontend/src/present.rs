@@ -42,7 +42,7 @@ use std::{
 };
 
 use client::{
-    screen::{PresentTallies, ScreenControl, ScreenEvent},
+    screen::{PresentTallies, ScreenControl, ScreenEvent, ScreenTx},
     WakeFn,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -54,12 +54,12 @@ type Pixels = slint::SharedPixelBuffer<slint::Rgba8Pixel>;
 /// The screen thread's control channel, for telling it who can see a
 /// stream: the host's visibility comes from any thread
 /// (`app::set_host_visible`), a viewer window's from its own hooks.
-static SCREEN_TX: OnceLock<Sender<ScreenControl>> = OnceLock::new();
+static SCREEN_TX: OnceLock<ScreenTx> = OnceLock::new();
 
 /// Called once, with the screen thread's sender, when the workers start.
 /// The thread starts out decoding; a background reached before this
 /// only costs what it always did (decoded frames the code below drops).
-pub(crate) fn attach_screen(tx: Sender<ScreenControl>) {
+pub(crate) fn attach_screen(tx: ScreenTx) {
     let _ = SCREEN_TX.set(tx);
 }
 

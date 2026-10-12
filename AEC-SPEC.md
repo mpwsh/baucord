@@ -6,7 +6,7 @@
 > phones a watched stream is cancelled with the voice (E12). Open:
 > macOS and Linux (§9, PRODUCTION-PLAN PRD-5), a software canceller
 > where the platform has none (§8), Windows' ducking on Windows 10
-> (E11, CLI-11). Decisions in §1 are the first draft's; §12 collects
+> (E11, E14, CLI-11). Decisions in §1 are the first draft's; §12 collects
 > the ones taken since, and wins where they differ. Start from
 > `START-HERE.md`.
 
@@ -201,6 +201,31 @@ duck others (`IAudioClientDuckingControl`, Windows 11); the stream's
 log line says whether it was granted. Users still ducked: Sound
 settings → Communications → "Do nothing" (`control mmsys.cpl,,3`).
 
+What is and is not covered (E14, read from the code on 2026-10-12;
+none of it run on Windows):
+
+| Who | Streams | Does Windows lower other apps? |
+|---|---|---|
+| Echo cancellation Off | plain, console default or the picked device | no: nothing says "call" |
+| Automatic on headphones, a device picked | plain, by name | no |
+| Automatic on headphones, "Default" | plain, the Communications default **opened by its id** | no — since E14; 1.2.1 as first written opened it through the Communications role, which is a call to Windows whatever the category |
+| Automatic on speakers / unknown, or Always — Windows 11 | Communications category | render asks not to and Windows documents that it works; capture asks too, and whether Windows offers it there is not known |
+| the same — Windows 10 | Communications category | **yes**: the opt-out does not exist before build 20348 |
+
+"Speakers" is what most desktop jacks report with headphones plugged
+in, and unknown counts as speakers, so the last two rows are most
+desktop users, headphones or not. On headphones, Echo cancellation →
+Off is the in-app way out.
+
+Our own sound is a separate matter: Windows lowers every session that
+is not part of a call, baucord's included — a watched stream on
+another endpoint than the voice, or everything when the call is
+another app's. Each render stream therefore sets the session's
+ducking preference (`IAudioSessionControl2::SetDuckingPreference`,
+every Windows), and a watched stream's own output does the same for
+its endpoint. The render line logs `own-volume=` and what the user's
+Windows setting is (`Windows during calls:`).
+
 ### 4.7 Latency
 
 The platform chain adds processing delay on capture (typically
@@ -332,3 +357,4 @@ Windows in substance.
 | E11 | **Asking Windows not to duck other apps** (2026-10-07; `native/wasapi.rs` `ask_not_to_duck`, `third_party/wasapi`). Users on 1.1.7 reported every other app much quieter while baucord was up: §4.6's accepted side effect, Windows' default "reduce other sounds by 80 %" on any Communications stream, was not acceptable in practice. Now each voice-path stream, after `Initialize` and before `Start`, asks for `AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS` through `IAudioClientDuckingControl` (Windows 10 build 20348+ / Windows 11), and the stream's open line says what Windows answered: `do-not-duck=requested`, `unavailable` (no such service: older Windows, or a capture stream if Windows offers it for render only) or `refused`. `wasapi` 0.24/0.25 keep the `IAudioClient` private, so the crate is vendored with one accessor (`AudioClient::as_iaudioclient`, BAUCORD-PATCH.md there) behind `[patch.crates-io]`. Not yet known: whether it stops ducking caused by the capture stream — Microsoft documents it for render streams, and `IAudioSessionControl2::SetDuckingPreference` is no help (it protects the app being lowered, not the one lowering; a calling app that sets it still ducks others). Windows 10 keeps ducking either way. If Windows 11 still ducks with `requested` on both lines, the remaining fixes are the software canceller (§8: no Communications stream at all) or Auto leaving speakers off the call path; the user's own fix is Sound settings → Communications → "Do nothing" (`control mmsys.cpl,,3`) | the reports came from people who keep a game or music playing beside the call — the case §4.6 underrated |
 | E12 | **A watched stream on a phone's call path is part of the reference** (2026-10-08; ANDROID-SPEC.md D56, IOS-SPEC.md D52): it is mixed into the voice output, so the platform canceller removes it from the microphone like the voice — E7's "screen-share audio is a media stream outside the voice path" no longer holds there. The desktop keeps the stream on its own output (Windows' canceller references the whole endpoint) |
 | E13 | **The output and "Default" move both sides** (2026-10-10, 1.2.1, review P1-18; `audio/src/lib.rs` `set_output_device`, `communications_default`, `native/wasapi.rs`). A new output only reopened playback, so capture kept the old reference and the old plan: picking headphones left the canceller on (and the speakers' reference), picking speakers after headphones left it off. Now an output change reopens both sides when the plan goes stale or the reference changes, and a capture with no output picked passes no reference, so Windows follows the Communications default itself. "Default" is resolved once from the setting: the Communications device unless echo cancellation is Off, for Automatic's decision, both streams and the device watcher alike; the report names a reference only when the reference control took it (D5); the fallback default poll is skipped while "Default" means the Communications device (it reopened the streams every 2 s); switching the setting to or from Off restarts the streams that follow a default. **Not compiled here** (Windows code) | reading only the decision from the Communications default would have opened the plain streams on the Console one — with a headset as the Communications default and speakers as the Console one, Automatic says headphones and everyone gets echo. The cost: someone whose two defaults differ now hears voice on the Communications device under Automatic and Always |
+| E14 | **A plain stream is not a call, and our own sound is not lowered** (2026-10-12, 1.2.1; `native/wasapi.rs` `stream_device`, `keep_own_volume`, `keep_own_volume_on`, `windows_ducking_setting`; `stream/output.rs`). Asked "is ducking really off on Windows?" with users on 1.2.0 still reporting a volume drop, the code was read end to end (§4.6 has the table). Three gaps. (1) E13 made "Default" the Communications default for plain streams too, fetched with `GetDefaultAudioEndpoint(eCommunications)`: Windows treats any stream opened on that device object as communications activity, so headphone users on "Default" would have started ducking in 1.2.1, with no opt-out asked (it was asked on the call path only). A plain stream now takes that device's id and opens it with `GetDevice`, which carries no role; the opt-out is asked on every stream regardless. (2) Nothing protected baucord's own sessions: the render stream now sets `SetDuckingPreference(TRUE)` on its session (shared by a watched stream's cpal output on the same endpoint), and the stream output asks for every session of ours on its endpoint. (3) Nothing in a log said what Windows was set to do: the render line now ends with the user's Sound → Communications setting (`HKCU\Software\Microsoft\Multimedia\Audio\UserDuckingPreference`; absent = 80 %). **Not changed, and not fixable from here:** Windows 10 on the call path still ducks other apps. **Type-checked for Windows, never run** | the role tag is how Chrome turns ducking *on*; D3 promised headphone users would not get it |

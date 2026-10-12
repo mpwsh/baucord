@@ -33,7 +33,7 @@
 //! while the backend said nothing, the probe itself is delivered so the
 //! stream never freezes, whatever new failure mode the OS invents.
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 use std::time::Duration;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use std::time::Instant;
@@ -290,6 +290,15 @@ const STREAM_DROUGHT_GIVE_UP: Duration = Duration::from_secs(12);
 #[cfg(target_os = "windows")]
 const SILENCE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// …and how often it runs once a probe found the screen as the backend
+/// left it: a still screen, which is the usual reason for silence. The
+/// probe is a blit of the whole desktop and a compare; every 2 s for as
+/// long as nothing moved was most of what a still share cost (review
+/// P2-41). A probe that *did* find a change, or a duplication that is
+/// lost, keeps the short interval: then the probe is the picture.
+#[cfg(target_os = "windows")]
+const STILL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Streaming capture via the vendored DXGI module ([`crate::dxgi`]).
 ///
 /// Owns last-frame retention, timestamping, the seed screenshot (DXGI
@@ -312,6 +321,9 @@ pub struct StreamCapturer {
     last_rx: Instant,
     /// Last GDI probe (rate limiting).
     last_probe: Option<Instant>,
+    /// That probe found the screen unchanged: the next one waits
+    /// [`STILL_PROBE_INTERVAL`].
+    probe_found_still: bool,
     /// Set at the first duplicator loss without a delivered frame,
     /// cleared by any real streamed frame. Sustained past
     /// [`STREAM_DROUGHT_GIVE_UP`] => fall back to screenshots.
@@ -347,6 +359,7 @@ impl StreamCapturer {
             start_time: Instant::now(),
             last_rx: Instant::now(),
             last_probe: None,
+            probe_found_still: false,
             stream_drought_since: None,
             last_recreate: None,
             dup_built_at: Instant::now(),
@@ -385,7 +398,8 @@ impl StreamCapturer {
     /// surfaced via [`Self::take_failure`].
     pub fn poll(&mut self) -> CaptureStatus {
         if let Some(dup) = &self.dup {
-            if let Some(cf) = dup.take_frame() {
+            let every = Duration::from_secs(1) / self.quality.fps();
+            if let Some(cf) = dup.take_frame(every) {
                 if !self.dup_delivered {
                     self.dup_delivered = true;
                     info!(
@@ -475,8 +489,17 @@ impl StreamCapturer {
         if self.last_rx.elapsed() < SILENCE_PROBE_INTERVAL {
             return false;
         }
+        let healthy = self
+            .dup
+            .as_ref()
+            .is_some_and(|d| d.health() != crate::dxgi::Health::Lost);
+        let every = if self.probe_found_still && healthy {
+            STILL_PROBE_INTERVAL
+        } else {
+            SILENCE_PROBE_INTERVAL
+        };
         if let Some(t) = self.last_probe {
-            if t.elapsed() < SILENCE_PROBE_INTERVAL {
+            if t.elapsed() < every {
                 return false;
             }
         }
@@ -494,6 +517,7 @@ impl StreamCapturer {
             .last
             .as_ref()
             .is_some_and(|f| f.width == width && f.height == height && f.data == data);
+        self.probe_found_still = unchanged;
         if unchanged {
             return false;
         }
@@ -690,16 +714,22 @@ impl ScreenCapturer {
     }
 
     /// [`Capturer`] poll API: performs one (blocking) screenshot. A
-    /// screenshot backend cannot tell whether the screen changed, so a
-    /// successful capture always reports [`CaptureStatus::Fresh`].
+    /// screenshot API cannot say whether the screen changed, so the
+    /// picture is compared with the one before: the same bytes are
+    /// [`CaptureStatus::Unchanged`], and the share loop encodes nothing
+    /// for them but its once-a-second refresh. Every screenshot used to
+    /// be `Fresh`, so a still screen on macOS and Linux — where this is
+    /// the only backend — was scaled and encoded 30 times a second
+    /// (review P2-41). The compare is a `memcmp` that stops at the first
+    /// difference: under a millisecond for an unchanged 1080p frame,
+    /// against several for its scale and encode.
     ///
     /// # Errors
     ///
     /// Returns [`CaptureError::Capture`] if the OS capture fails.
     pub fn poll(&mut self) -> Result<CaptureStatus, CaptureError> {
         let frame = self.capture()?;
-        self.last = Some(frame);
-        Ok(CaptureStatus::Fresh)
+        Ok(hold_if_changed(&mut self.last, frame))
     }
 
     /// See [`Capturer::frame`].
@@ -710,6 +740,89 @@ impl ScreenCapturer {
             }
         }
         self.last.as_ref()
+    }
+}
+
+/// Does the screen make pictures well faster than we take them? Two
+/// queued frames `apart`, against one taken every `every`: at three
+/// quarters of our interval or less there is one to spare per tick, and
+/// the older of the two can go (`dxgi::DxgiDuplicator::take_frame`,
+/// review P3-28). A 60 fps video on a 144 Hz screen presents 14 and
+/// 21 ms apart: against a 60 fps share (16.7 ms) that is the same rate
+/// and nothing is dropped; against a 30 fps one it is twice as fast.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn source_outpaces(apart: Duration, every: Duration) -> bool {
+    apart * 4 <= every * 3
+}
+
+/// Hold `frame` as the latest unless it is the picture already held
+/// (see [`ScreenCapturer::poll`]).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn hold_if_changed(last: &mut Option<Frame>, frame: Frame) -> CaptureStatus {
+    let same = last.as_ref().is_some_and(|last| {
+        last.width == frame.width && last.height == frame.height && last.data == frame.data
+    });
+    if same {
+        return CaptureStatus::Unchanged;
+    }
+    *last = Some(frame);
+    CaptureStatus::Fresh
+}
+
+#[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
+mod tests {
+    use super::*;
+
+    fn shot(width: u32, height: u32, fill: u8, timestamp_ms: u64) -> Frame {
+        Frame {
+            data: vec![fill; (width * height * 4) as usize],
+            width,
+            height,
+            timestamp_ms,
+            format: crate::PixelFormat::Rgba,
+        }
+    }
+
+    /// Which of two queued desktop frames a share takes (review P3-28).
+    #[test]
+    fn the_older_frame_goes_only_when_the_screen_is_faster() {
+        let ms = Duration::from_millis;
+        let (fps30, fps60) = (Duration::from_secs(1) / 30, Duration::from_secs(1) / 60);
+        // A 60 Hz desktop under a 30 fps share: one to spare each tick.
+        assert!(source_outpaces(ms(17), fps30));
+        // A 60 fps video on a 144 Hz screen, 14 and 21 ms apart.
+        assert!(source_outpaces(ms(14), fps30) && source_outpaces(ms(21), fps30));
+        assert!(!source_outpaces(ms(14), fps60) && !source_outpaces(ms(21), fps60));
+        // The same rate on both sides: every frame is wanted.
+        assert!(!source_outpaces(ms(17), fps60));
+        assert!(!source_outpaces(ms(33), fps30));
+        // A 144 fps game under a 60 fps share.
+        assert!(source_outpaces(ms(7), fps60));
+    }
+
+    #[test]
+    fn the_same_screenshot_twice_is_unchanged() {
+        let mut last = None;
+        assert_eq!(
+            hold_if_changed(&mut last, shot(4, 2, 7, 0)),
+            CaptureStatus::Fresh
+        );
+        // Held as it was: the share loop moves its timestamp itself.
+        assert_eq!(
+            hold_if_changed(&mut last, shot(4, 2, 7, 33)),
+            CaptureStatus::Unchanged
+        );
+        assert_eq!(last.as_ref().map(|f| f.timestamp_ms), Some(0));
+
+        let mut moved = shot(4, 2, 7, 66);
+        moved.data[5] = 8;
+        assert_eq!(hold_if_changed(&mut last, moved), CaptureStatus::Fresh);
+        assert_eq!(last.as_ref().map(|f| f.timestamp_ms), Some(66));
+        // The same bytes at another size are another picture.
+        assert_eq!(
+            hold_if_changed(&mut last, shot(2, 4, 7, 99)),
+            CaptureStatus::Fresh
+        );
     }
 }
 

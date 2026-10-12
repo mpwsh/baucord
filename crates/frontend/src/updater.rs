@@ -120,31 +120,32 @@ pub fn start_download(app: &mut crate::app::AppState) {
     cancelled.store(false, Ordering::Relaxed);
     let progress = Arc::new(AtomicU32::new(0));
 
-    // Progress poll — mirrors the shared atomic into the progress bar.
-    // Runs until the phase leaves Downloading.
+    // Progress poll — mirrors the shared atomic into the progress bar,
+    // and stops itself when the phase leaves Downloading: done, failed
+    // or cancelled. (It ran five times a second for good after any
+    // download — review P2-38.)
     {
         let progress = progress.clone();
-        let timer = slint::Timer::default();
-        let timer_keeper = timer; // moved into AppState.timers below
-        timer_keeper.start(
+        app.update_progress_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(200),
             move || {
                 let frac = f32::from_bits(progress.load(Ordering::Relaxed));
                 app::with_current(move |app| {
                     let s = app.main.global::<State>();
-                    if s.get_phase() == ui::Phase::Downloading {
-                        s.set_update_progress(frac);
-                        s.set_update_progress_text(
-                            t!("update-progress",
-                                "percent" => format!("{:.0}", f64::from(frac) * 100.0))
-                            .into(),
-                        );
+                    if s.get_phase() != ui::Phase::Downloading {
+                        app.update_progress_timer.stop();
+                        return;
                     }
+                    s.set_update_progress(frac);
+                    s.set_update_progress_text(
+                        t!("update-progress",
+                            "percent" => format!("{:.0}", f64::from(frac) * 100.0))
+                        .into(),
+                    );
                 });
             },
         );
-        app.hold_timer(timer_keeper);
     }
 
     let worker_progress = progress;

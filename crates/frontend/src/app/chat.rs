@@ -8,6 +8,9 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// How many chat GIFs play by themselves at once (`cap_gif_autoplay`).
+const AUTOPLAY_GIFS: usize = 2;
+
 impl AppState {
     /// A system line into General, whichever conversation is open,
     /// stamped with the local time: what this session needs to see
@@ -699,6 +702,46 @@ impl AppState {
         self.gif_ticker.stop();
     }
 
+    /// At most [`AUTOPLAY_GIFS`] chat GIFs autoplay at once, the newest
+    /// in chat order; older ones go back to their first frame (a hover
+    /// still plays them). A history page used to start every GIF in it
+    /// at the same moment, each one a decode per tick on the UI thread
+    /// (review P2-39). Call after a player started autoplaying.
+    pub fn cap_gif_autoplay(&mut self) {
+        let autoplaying = self.gifs.values().filter(|p| p.autoplaying()).count();
+        let mut excess = autoplaying.saturating_sub(AUTOPLAY_GIFS);
+        for i in 0..self.chat_model.row_count() {
+            if excess == 0 {
+                break;
+            }
+            let Some(mut row) = self.chat_model.row_data(i) else {
+                continue;
+            };
+            let Some(player) = self.gifs.get_mut(&row.row_id) else {
+                continue;
+            };
+            if !player.autoplaying() {
+                continue;
+            }
+            if let Some(first) = player.force_freeze() {
+                row.image = first;
+                self.chat_model.set_row_data(i, row);
+            }
+            excess -= 1;
+        }
+    }
+
+    /// The window is back on screen: restart the ticker `gif_tick`
+    /// stopped, if anything was playing.
+    pub(super) fn resume_gifs(&mut self) {
+        let animating = self.gallery_gif.is_some()
+            || self.preview_gif.is_some()
+            || self.gifs.values().any(GifPlayer::playing);
+        if animating {
+            self.ensure_gif_ticker();
+        }
+    }
+
     /// Start the 33 ms animation ticker if it isn't already running.
     pub fn ensure_gif_ticker(&mut self) {
         if self.gif_ticker.running() {
@@ -739,20 +782,18 @@ impl AppState {
             })
         }
 
-        // A phone app in the background: nothing is on screen, the
-        // gallery page included. Stop ticking (every frame would be a
-        // redraw nobody sees); `host_shown` restarts the ticker, and
-        // the players carry on from where they were.
-        if !host_visible() {
+        // Nothing of ours is on screen — a phone app in the
+        // background, the window in the tray or minimized (the gallery
+        // and the preview are overlays of the main window, not windows
+        // of their own): stop ticking, every frame would be a decode
+        // and a redraw nobody sees. `resume_gifs` restarts the ticker
+        // when the window is back, and the players carry on from where
+        // they were. It kept running minimized, and in the tray for as
+        // long as the gallery had a GIF open (review P2-39).
+        let window = self.main.window();
+        if !host_visible() || !window.is_visible() || window.is_minimized() {
             self.gif_ticker.stop();
             return;
-        }
-        // Tray/minimized: chat rows and the in-window preview are
-        // invisible — stop paying decode for them. The gallery viewer
-        // is its own window and may still be on screen, so it keeps
-        // animating; the ticker dies below once nothing plays.
-        if !self.main.window().is_visible() {
-            self.freeze_chat_gifs();
         }
 
         let mut any_playing = false;

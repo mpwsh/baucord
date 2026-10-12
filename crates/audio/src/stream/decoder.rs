@@ -382,6 +382,42 @@ impl Sink {
 
 // ── Decoder worker ──────────────────────────────────────────────────────
 
+/// A few packets at most are concealed, or dropped as late.
+const NEAR: i32 = 10;
+
+/// Where a packet stands against the one before it.
+#[derive(Debug, PartialEq, Eq)]
+enum Gap {
+    /// The next one.
+    Next,
+    /// A few behind: already concealed, dropped.
+    Late,
+    /// This many are missing before it: concealed.
+    Missing(u32),
+    /// Too many are missing to conceal: the decoder starts over.
+    Skipped(u32),
+    /// Far behind: the sharer's capture restarted and counts from
+    /// nothing again. The decoder starts over, and nothing was
+    /// skipped — read as a jump forward it was four billion frames in
+    /// the viewer's summary (review P2-22).
+    Restarted,
+}
+
+impl Gap {
+    fn between(last: u32, curr: u32) -> Self {
+        // The distance from the expected number, wrapped into ±2³¹.
+        #[allow(clippy::cast_possible_wrap)]
+        let ahead = curr.wrapping_sub(last.wrapping_add(1)) as i32;
+        match ahead {
+            0 => Self::Next,
+            1..=NEAR => Self::Missing(ahead.unsigned_abs()),
+            a if a > NEAR => Self::Skipped(ahead.unsigned_abs()),
+            a if a >= -NEAR => Self::Late,
+            _ => Self::Restarted,
+        }
+    }
+}
+
 struct StreamDecoderWorker {
     decoder: Decoder,
     rx: Receiver<StreamAudioPacket>,
@@ -406,27 +442,32 @@ impl StreamDecoderWorker {
         info!("Stream decoder thread stopped");
     }
 
+    /// A fresh decoder: what came before says nothing about what
+    /// follows.
+    fn reset_decoder(&mut self) {
+        match Decoder::new(OPUS_SAMPLE_RATE, Channels::Stereo) {
+            Ok(decoder) => self.decoder = decoder,
+            Err(e) => error!("Failed to reset stream decoder: {e}"),
+        }
+    }
+
     fn process_packet(&mut self, packet: &StreamAudioPacket) {
         let curr = packet.seq;
         let counters = Arc::clone(&self.sink.counters);
         counters.received.fetch_add(1, Ordering::Relaxed);
 
         // ── Sequence gap detection & PLC recovery ───────────────────
-        if let Some(last) = self.last_seq {
-            let expect = last.wrapping_add(1);
-            let ahead = curr.wrapping_sub(expect);
-            let behind = expect.wrapping_sub(curr);
-
-            if behind > 0 && behind <= 10 {
-                return; // late packet
-            }
-
-            if ahead > 0 && ahead <= 10 {
-                let gap = ahead as usize;
+        match self
+            .last_seq
+            .map_or(Gap::Next, |last| Gap::between(last, curr))
+        {
+            Gap::Next => {}
+            Gap::Late => return,
+            Gap::Missing(missing) => {
                 counters
                     .concealed
-                    .fetch_add(u64::from(ahead), Ordering::Relaxed);
-                for _ in 0..gap {
+                    .fetch_add(u64::from(missing), Ordering::Relaxed);
+                for _ in 0..missing {
                     match self
                         .decoder
                         .decode_float(&[], &mut self.frame_buffer, false)
@@ -440,16 +481,18 @@ impl StreamDecoderWorker {
                         }
                     }
                 }
-            } else if ahead > 10 {
+            }
+            Gap::Skipped(skipped) => {
                 // Counted in the viewer's summary line (`skipped`).
                 counters
                     .skipped
-                    .fetch_add(u64::from(ahead), Ordering::Relaxed);
-                debug!("Stream audio seq jumped by {ahead} — resetting decoder");
-                match Decoder::new(OPUS_SAMPLE_RATE, Channels::Stereo) {
-                    Ok(new_dec) => self.decoder = new_dec,
-                    Err(e) => error!("Failed to reset stream decoder: {e}"),
-                }
+                    .fetch_add(u64::from(skipped), Ordering::Relaxed);
+                debug!("Stream audio seq jumped by {skipped} — resetting decoder");
+                self.reset_decoder();
+            }
+            Gap::Restarted => {
+                debug!("Stream audio seq went back to {curr}: the sharer's capture restarted");
+                self.reset_decoder();
             }
         }
 
@@ -627,5 +670,24 @@ mod tests {
         assert_ne!(wanted_output(&pick).0, seen, "noticed");
         assert_eq!(wanted_output(&pick).1.as_deref(), Some("Headset"));
         VOICE_OUTPUT.set(None);
+    }
+    /// The numbering of stream audio against the packet before: what is
+    /// next, late, concealed, skipped — and a capture that restarted,
+    /// which is none of those (review P2-22).
+    #[test]
+    fn a_restarted_capture_is_not_a_jump_forward() {
+        assert_eq!(Gap::between(41, 42), Gap::Next);
+        assert_eq!(Gap::between(41, 41), Gap::Late);
+        assert_eq!(Gap::between(41, 32), Gap::Late);
+        assert_eq!(Gap::between(41, 43), Gap::Missing(1));
+        assert_eq!(Gap::between(41, 52), Gap::Missing(10));
+        assert_eq!(Gap::between(41, 53), Gap::Skipped(11));
+        assert_eq!(Gap::between(41, 5_000), Gap::Skipped(4_958));
+        // The sharer's capture starts over from 0.
+        assert_eq!(Gap::between(90_000, 0), Gap::Restarted);
+        assert_eq!(Gap::between(90_000, 3), Gap::Restarted);
+        // The counter wrapping is the next packet, not a restart.
+        assert_eq!(Gap::between(u32::MAX, 0), Gap::Next);
+        assert_eq!(Gap::between(u32::MAX - 1, 1), Gap::Missing(2));
     }
 }

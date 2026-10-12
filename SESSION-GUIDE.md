@@ -380,11 +380,12 @@ Memory-mode servers (persistence off) still use the legacy
 - `/kick` forgets keys and roles (needs a new invite); `/ban` is the
   restriction; a ban never catches the actor or an equal rank, and
   skips an address someone else is on.
-- `VoiceChat::start()` fails if *either* stream fails; the caller
-  must check `output_running()` before dropping the engine, or a
-  missing microphone silences playback too (the Android phone test,
-  2026-10-05 — and a PC with no capture device, the field incident
-  the audio crate's comment describes). A side that is not open —
+- `VoiceChat::start()` says what opened (`StartOutcome`; an `Err`
+  for either stream until 2026-10-12, review P3-24): keep the engine
+  on `NoMicrophone`, or a missing microphone silences playback too
+  (the Android phone test, 2026-10-05 — and a PC with no capture
+  device, the field incident the audio crate's comment describes). A
+  side that is not open —
   never opened, or its reopen failed — is retried by `service()`
   (`input_pending`, `output_pending`; until 2026-10-08 a failed
   reopen was never retried, CLI-9); a failed stream by the
@@ -802,9 +803,13 @@ Memory-mode servers (persistence off) still use the legacy
   not touch the stream; its own volume and mute are applied before the
   mix.
 - **A Windows Communications stream ducks every other app** (by 80 %
-  by default). Any stream opened on the voice-call path asks Windows
-  not to (`ask_not_to_duck` in `native/wasapi.rs`, AEC-SPEC.md E11)
-  and logs `do-not-duck=` on its open line; a new one must too.
+  by default), and so does *any* stream opened on the device
+  `GetDefaultAudioEndpoint(eCommunications)` returns. Every stream
+  asks Windows not to (`ask_not_to_duck` in `native/wasapi.rs`,
+  AEC-SPEC.md E11) and logs `do-not-duck=` on its open line; a plain
+  stream opens the Communications default by its id instead
+  (`stream_device`, E14). Never hand a role-fetched device to a
+  stream that is not on the call path. Windows 10 has no opt-out.
 - **`third_party/wasapi` is crates.io's `wasapi` 0.24.0 plus one
   accessor** (`AudioClient::as_iaudioclient`), wired in by the root
   `[patch.crates-io]` and kept out of the workspace (`exclude`): never

@@ -264,6 +264,93 @@ fn frames_in_flight_and_drain_agree() {
     );
 }
 
+/// A still screen's refreshes stay out of the keyframe cadence (review
+/// P2-41): ten seconds of once-a-second repeats bring no keyframe, a
+/// forced one still comes at once, and the cadence carries on where it
+/// was when the picture moves again. The same ten seconds through
+/// `encode` are a keyframe every [`KEYFRAME_INTERVAL_MS`], as before.
+#[test]
+fn a_still_picture_gets_no_keyframes_until_someone_asks() {
+    let open = || match FfmpegEncoder::new(Quality::HD30) {
+        Ok(e) => Some(e),
+        Err(e) => {
+            eprintln!("SKIP: no usable H.264 encoder in this environment: {e}");
+            None
+        }
+    };
+    let Some(mut encoder) = open() else { return };
+    if !encoder.supports_forced_keyframes() || encoder.output_needs_input() {
+        eprintln!(
+            "SKIP: {} keeps its own keyframe period",
+            encoder.encoder_name()
+        );
+        return;
+    }
+    let keyframes = |aus: Vec<video::EncodedFrame>| aus.iter().filter(|f| f.is_keyframe).count();
+
+    // Half a second of motion, opening with the session's keyframe.
+    let mut seen = 0;
+    for i in 0..15u64 {
+        seen += keyframes(
+            encoder
+                .encode(&synth_frame(640, 360, i, i * 33))
+                .expect("encode"),
+        );
+    }
+    seen += keyframes(encoder.drain().expect("drain"));
+    assert_eq!(seen, 1, "the session's first frame");
+
+    // Ten seconds still.
+    let mut still = 0;
+    for second in 1..=10u64 {
+        let frame = synth_frame(640, 360, 14, 462 + second * 1000);
+        still += keyframes(encoder.encode_repeat(&frame).expect("encode"));
+    }
+    still += keyframes(encoder.drain().expect("drain"));
+    assert_eq!(still, 0, "an unchanged picture needs no keyframe");
+
+    // A viewer asks: the next refresh is one.
+    encoder.force_keyframe();
+    let frame = synth_frame(640, 360, 14, 11_462);
+    let mut forced = keyframes(encoder.encode_repeat(&frame).expect("encode"));
+    forced += keyframes(encoder.drain().expect("drain"));
+    assert_eq!(forced, 1, "a forced keyframe does not wait");
+
+    // Motion again: the next keyframe is one interval of motion later.
+    let mut first_keyframe_at = None;
+    for i in 0..90u64 {
+        let ts = 11_462 + (i + 1) * 33;
+        let mut n = keyframes(
+            encoder
+                .encode(&synth_frame(640, 360, 15 + i, ts))
+                .expect("encode"),
+        );
+        n += keyframes(encoder.drain().expect("drain"));
+        if n > 0 && first_keyframe_at.is_none() {
+            first_keyframe_at = Some(ts - 11_462);
+        }
+    }
+    let at = first_keyframe_at.expect("the cadence carries on");
+    assert!(
+        (KEYFRAME_INTERVAL_MS..KEYFRAME_INTERVAL_MS + 100).contains(&at),
+        "next keyframe {at} ms into the motion"
+    );
+
+    // The same still stretch through `encode`: the old cadence.
+    let Some(mut encoder) = open() else { return };
+    let mut plain = keyframes(
+        encoder
+            .encode(&synth_frame(640, 360, 0, 0))
+            .expect("encode"),
+    );
+    for second in 1..=10u64 {
+        let frame = synth_frame(640, 360, 0, second * 1000);
+        plain += keyframes(encoder.encode(&frame).expect("encode"));
+    }
+    plain += keyframes(encoder.drain().expect("drain"));
+    assert_eq!(plain, 6, "0, 2, 4, 6, 8 and 10 s");
+}
+
 /// What iOS's decoder receives (IOS-SPEC.md §14 D30): the real encoder's
 /// access units, re-framed by `annexb::split` into parameter sets plus
 /// length-prefixed NAL units. Rebuilt into Annex-B and decoded, they must

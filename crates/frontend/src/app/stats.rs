@@ -40,9 +40,18 @@ impl AppState {
     }
 
     #[allow(clippy::cast_precision_loss)]
+    /// The share is over: stop its timer and clear the stats line (it
+    /// kept showing the last sample).
+    pub(super) fn stop_stream_stats(&mut self) {
+        self.stream_stats_timer.stop();
+        self.stream_viewers_seen = 0;
+        self.main.global::<State>().set_stream_stats("".into());
+    }
+
     pub(super) fn update_stream_stats(&mut self) {
         if !self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-            self.stream_viewers_seen = 0;
+            // The share ended without its event reaching us.
+            self.stop_stream_stats();
             return;
         }
         let sh = &self.screen.shared;
@@ -116,12 +125,15 @@ impl AppState {
         if cfg!(target_os = "android") {
             self.sync_keep_alive(true);
         }
-        let animating = self.gallery_gif.is_some()
-            || self.preview_gif.is_some()
-            || self.gifs.values().any(GifPlayer::playing);
-        if animating {
-            self.ensure_gif_ticker();
-        }
+        self.resume_gifs();
+    }
+
+    /// The desktop's main window is back in view (out of the tray,
+    /// restored, uncovered): what waited for that happens now.
+    pub(crate) fn main_revealed(&mut self) {
+        // A roster held back while out of sight (review P1-9).
+        self.flush_roster();
+        self.resume_gifs();
     }
 
     /// `/mem`: where the client's memory goes, from what it holds. The
@@ -247,11 +259,6 @@ impl AppState {
     pub fn save_settings_now(&mut self) {
         self.save_window_geometry();
         self.settings.save();
-    }
-
-    /// Keep a timer alive for the app's lifetime.
-    pub fn hold_timer(&mut self, timer: slint::Timer) {
-        self.timers.push(timer);
     }
 
     pub fn show_error(&mut self, error: &str) {

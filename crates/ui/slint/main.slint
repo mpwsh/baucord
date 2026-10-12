@@ -36,7 +36,7 @@ export component MainWindow inherits Window {
     preferred-height: 640px;
     min-width: 500px;
     min-height: 400px;
-    icon: @image-url("../../../assets/icons/icon.png");   // app icon (workspace assets/); Windows exe/taskbar icon is embedded by desktop/build.rs
+    icon: @image-url("../../../assets/icons/icon-256.png");   // app icon (workspace assets/), 256 px: the 1254 px original is 6 MiB decoded, over Slint's image cache, and stayed resident once for the window and once for the tray (review P2-45). Windows exe/taskbar icon is embedded by desktop/build.rs
 
     // Share-dialog local state
     in-out property <bool> share-dialog-open: false;

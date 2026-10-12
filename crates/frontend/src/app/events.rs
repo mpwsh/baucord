@@ -137,44 +137,24 @@ impl AppState {
                 info!("Screen share started: {quality}");
                 self.push_activity(&t!("chat-share-started", "quality" => quality.to_string()));
                 self.main.global::<State>().set_sharing(true);
-                // Start the 1-second stream stats timer once. It stops
-                // itself when sharing ends; the guard prevents stacking
-                // a new repeating timer on every share start.
-                if !self.stream_stats_timer_active.swap(true, Ordering::Relaxed) {
-                    let timer_active = self.stream_stats_timer_active.clone();
-                    let is_sharing = self.screen.shared.is_sharing.clone();
-                    let t = slint::Timer::default();
-                    let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
-                    if let Some(weak) = weak {
-                        t.start(
-                            slint::TimerMode::Repeated,
-                            Duration::from_secs(1),
-                            move || {
-                                if is_sharing.load(Ordering::Relaxed) {
-                                    with_app(&weak, AppState::update_stream_stats);
-                                } else {
-                                    timer_active.store(false, Ordering::Relaxed);
-                                    with_app(&weak, |app| {
-                                        // Timer removes itself by
-                                        // dropping out of the vec on
-                                        // the next share start.
-                                        app.main.global::<State>().set_stream_stats("".into());
-                                    });
-                                }
-                            },
-                        );
-                        self.timers.push(t);
-                    }
+                // The stats line's 1-second timer, for as long as the
+                // share lasts. (It was never stopped: one tick a second
+                // for good after the first share, and one more timer
+                // with every share after it — review P2-38.)
+                let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+                if let Some(weak) = weak {
+                    self.stream_stats_timer.start(
+                        slint::TimerMode::Repeated,
+                        Duration::from_secs(1),
+                        move || with_app(&weak, AppState::update_stream_stats),
+                    );
                 }
             }
             ScreenEvent::SharingStopped => {
                 info!("Screen share stopped");
                 self.push_activity(&t!("chat-share-stopped"));
-                let s = self.main.global::<State>();
-                s.set_sharing(false);
-                // Clear the stats line — it used to keep showing the
-                // last sample after the share ended.
-                s.set_stream_stats("".into());
+                self.main.global::<State>().set_sharing(false);
+                self.stop_stream_stats();
             }
             ScreenEvent::Error(e) => {
                 self.show_error(&t!("error-screen-share", "error" => e.as_str()));

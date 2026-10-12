@@ -38,12 +38,39 @@ pub struct Block<'a> {
     pub data: &'a [u8],
 }
 
+/// The redundant blocks of one bundle, oldest first: at most
+/// [`MAX_BLOCKS`], so they live in the bundle itself. They were a `Vec`
+/// — an allocation per packet received, as the two lists [`encode`]
+/// built were per packet sent (review P3-21). Reads as a slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blocks<'a> {
+    blocks: [Block<'a>; MAX_BLOCKS],
+    len: usize,
+}
+
+impl<'a> std::ops::Deref for Blocks<'a> {
+    type Target = [Block<'a>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.blocks[..self.len]
+    }
+}
+
+impl<'a, 'b> IntoIterator for &'b Blocks<'a> {
+    type Item = &'b Block<'a>;
+    type IntoIter = std::slice::Iter<'b, Block<'a>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// Parsed bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bundle<'a> {
     pub primary: &'a [u8],
     /// Oldest first.
-    pub redundant: Vec<Block<'a>>,
+    pub redundant: Blocks<'a>,
 }
 
 /// Build a bundle. `redundant` is oldest first, each `(ts_offset, data)`.
@@ -51,21 +78,23 @@ pub struct Bundle<'a> {
 /// 65535 samples of offset are dropped (the primary always goes out).
 pub fn encode(primary: &[u8], redundant: &[(u32, &[u8])], out: &mut Vec<u8>) {
     out.clear();
-    let blocks: Vec<&(u32, &[u8])> = redundant
-        .iter()
-        .filter(|(off, d)| !d.is_empty() && d.len() <= 0xFFFF && *off <= 0xFFFF)
-        .take(MAX_BLOCKS)
-        .collect();
+    // Walked three times rather than collected once: no allocation.
+    let blocks = || {
+        redundant
+            .iter()
+            .filter(|(off, d)| !d.is_empty() && d.len() <= 0xFFFF && *off <= 0xFFFF)
+            .take(MAX_BLOCKS)
+    };
     #[allow(clippy::cast_possible_truncation)] // ≤ MAX_BLOCKS
-    out.push(blocks.len() as u8);
-    for (off, d) in &blocks {
+    out.push(blocks().count() as u8);
+    for (off, d) in blocks() {
         #[allow(clippy::cast_possible_truncation)] // filtered to u16 range
         {
             out.extend_from_slice(&(*off as u16).to_be_bytes());
             out.extend_from_slice(&(d.len() as u16).to_be_bytes());
         }
     }
-    for (_, d) in &blocks {
+    for (_, d) in blocks() {
         out.extend_from_slice(d);
     }
     out.extend_from_slice(primary);
@@ -84,7 +113,14 @@ pub fn decode(payload: &[u8]) -> Option<Bundle<'_>> {
         return None;
     }
     let (headers, mut body) = rest.split_at(header_len);
-    let mut redundant = Vec::with_capacity(count);
+    let mut redundant = Blocks {
+        blocks: [Block {
+            ts_offset: 0,
+            seq_distance: 0,
+            data: &[],
+        }; MAX_BLOCKS],
+        len: 0,
+    };
     for (i, h) in headers.chunks_exact(HEADER_BYTES_PER_BLOCK).enumerate() {
         let ts_offset = u32::from(u16::from_be_bytes([h[0], h[1]]));
         let len = usize::from(u16::from_be_bytes([h[2], h[3]]));
@@ -94,11 +130,13 @@ pub fn decode(payload: &[u8]) -> Option<Bundle<'_>> {
         let (data, tail) = body.split_at(len);
         body = tail;
         #[allow(clippy::cast_possible_truncation)] // count ≤ MAX_BLOCKS
-        redundant.push(Block {
+        let block = Block {
             ts_offset,
             seq_distance: (count - i) as u32,
             data,
-        });
+        };
+        redundant.blocks[i] = block;
+        redundant.len = i + 1;
     }
     if body.is_empty() {
         return None;

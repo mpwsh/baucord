@@ -199,7 +199,14 @@ What stands between this and "production for strangers":
   `do-not-duck=requested`. Windows 10 cannot be helped this way. If 11
   still ducks: the software canceller (AEC-SPEC §8) or Auto keeping
   speakers off the call path — decide then. Meanwhile users:
-  `control mmsys.cpl,,3` → "Do nothing".
+  `control mmsys.cpl,,3` → "Do nothing", or on headphones Echo
+  cancellation → Off. 2026-10-12 (AEC-SPEC E14, §4.6 table): plain
+  streams no longer open through the Communications role (1.2.1 would
+  have ducked headphone users on "Default"), baucord's own sessions
+  opt out of being lowered, and the render line logs the user's
+  Windows setting — ask a reporter for their two `Native WASAPI`
+  lines. Still to decide for Windows 10 on speakers: a notice with a
+  button to the Sound dialog, or Auto staying off the call path there.
 - [ ] **CLI-16 [P2][M] Desktop voice latency: what is left.** The
   2026-10-08 review: native WASAPI cost nothing (event-driven, MMCSS,
   20 ms render buffer). Our code adds ~74 ms one way; the estimate
@@ -292,14 +299,18 @@ review item finished an item of this file, that item left its list.
   - The deployed server writes its log to stderr; compose keeps
     5 × 10 MB of it, so its age depends on traffic. Keep it for a
     fixed time instead.
-- [ ] **REL-1 [P0][S–M] A CI gate.** `ci.yaml` and `pr-check.yaml` are
-  `.disabled`; `release.yml` runs `cargo build` only, without
-  `--locked`; the versions test (`protocol/tests/versions.rs`) never
-  runs in CI, and the release guard checks only `crates/desktop`
-  against the tag while the updater compares `frontend`'s version.
-  Re-enable a PR job (`cargo test --locked --workspace`, clippy
-  `-D warnings` on the host crates, nightly `fmt --check`, the versions
-  test) and make the release jobs `needs:` it.
+- [ ] **REL-1 [P0][S–M] A CI gate.** *In part, 2026-10-12:*
+  `pr-check.yaml` is enabled again and rewritten — nightly
+  `fmt --check`, `cargo check --locked` of the desktop build and the
+  phones' shared code, clippy, and the tests of the eight crates that
+  need no display (the versions test among them), in a Debian 13
+  container, on pull requests and on pushes to `main`. **Never run on
+  GitHub**: its first run is its test — the six socket-wait tests (§8)
+  have only ever failed in the sandbox it was written in. Left:
+  `release.yml` still runs `cargo build` without `--locked`; the release
+  guard checks only `crates/desktop` against the tag; clippy does not
+  yet deny warnings (the crates carry pedantic ones); the release jobs
+  do not `needs:` the check.
 - [ ] **REL-2 [P1][M] Code signing**: Windows (Azure Trusted Signing or an
   OV certificate) and macOS (Developer ID, a real `.app` with an
   `Info.plist` — which is also how macOS attributes the microphone and
@@ -462,8 +473,7 @@ Store is not decided yet.
   goes through xcap's deprecated `CGWindowList` API (ScreenCaptureKit is
   the replacement); system audio in a share is
   a stub on macOS/Linux; no AEC on macOS (the VPIO backend is the
-  answer, AEC-SPEC §9) or Linux; macOS encodes with x264 on the CPU;
-  decode and encode share the screen thread.
+  answer, AEC-SPEC §9) or Linux; macOS encodes with x264 on the CPU.
 - [ ] **PRD-6 Carried over from the old lists**: identity-changed
   accept/reject dialog; connection-quality indicator; per-channel
   speaking indicators (today global); paste an invite string on the
@@ -531,7 +541,10 @@ Store is not decided yet.
    streams, and since 1.2.1 drops what the microphone hears there
    (review P1-6). The AFK room counts as out of a room.
 6. **Mute across reconnects and restarts** (CLI-5): assumed yes.
-7. **The default branch**: `chunk` or `main` — the workflows disagree.
+7. **The default branch**: `main` — *taken as decided 2026-10-12*:
+   it is what the repository's remote names (`origin/HEAD`), and
+   `chunk` no longer exists there. `release.yml` warms its caches from
+   it now. Say so if it should be another.
 
 ## 7. Done
 
@@ -785,12 +798,73 @@ One line each; the spec decision named holds the detail.
     `DecodedFrame.timestamp_ms` (its writers include the iOS decoder,
     which cannot be compiled here), and the two `.disabled` workflows
     (to fix and enable, not to delete).
+- **2026-10-12 — 1.2.1, the review's third batch** (§2a): what costs
+  while nothing happens, and the audio leftovers.
+  - *Timers.* The share's stats timer, the update's progress poll, the
+    device poll and the resource sampler are fields that stop with what
+    they serve; the list nobody could stop is gone (P2-38). The GIF
+    ticker stops while the window is in the tray, minimized or a phone
+    app in the background, and restarts when it is back; only the two
+    newest GIFs of a page autoplay (P2-39). The Settings timer runs at
+    8 Hz on the Audio tab only (2 s elsewhere and out of sight), and
+    the meters no longer animate their width (P2-40).
+  - *Sharing.* A still picture's once-a-second refresh stays out of
+    the encoder's keyframe cadence (`encode_repeat`: a still share sent
+    an IDR every 2 s, and on AMF reopened its session every 4); a
+    screenshot identical to the last is not encoded (macOS, Linux, the
+    GDI fallback); the GDI liveness probe runs every 30 s on a still
+    screen, every 2 s only while it is the picture (P2-41). Our own
+    share and the streams we watch run on a thread each behind one
+    routed sender, `ScreenTx` (P2-44, out of PRD-5). `video::pool`
+    takes the best fit and is freed when nothing is shared or watched
+    (P2-43; VideoToolbox's per-frame zero-fill is left, iOS).
+  - *Audio.* The callbacks wake their workers through `audio::latch`
+    (an atomic and an unpark) and no longer through a channel that
+    locks while the worker sleeps (P2-33). RED sends and receives
+    without a list per packet and does not copy a redundant block it
+    already holds; `adapt()` reuses its list; the peer-settings lock is
+    not held across the decodes (P3-21). The stats line counts
+    clock-drift windows and how many switched the correction on, to
+    decide after a release whether it stays (P3-22). Out of the voice
+    rooms the encoder thread looks every 5 s, not every 250 ms (P3-23).
+    `VoiceChat::new` cannot fail and `start` returns a `StartOutcome`
+    (P3-24). A plan check lists Android's call devices once and asks
+    nothing out of a room (P3-25). The stream output's callback thread
+    is promoted (P3-26). WASAPI device loss is matched on the error
+    code (P3-27; the loops still do not share `pump.rs` — real-time
+    Windows code, not changed unrun).
+  - *Icons.* The window and the tray load a 256 px icon (6 MiB decoded
+    twice before); the `.ico` and the website's favicon are 106 KB, were
+    727 (`scripts/desktop-icons.py`, P2-45).
+  - *Windows ducking* (CLI-11, AEC-SPEC E14): see there.
+  - *Windows.* A stream whose device stopped signalling (a headset
+    unplugged) asks the engine on the next event timeout and reopens
+    (P2-21). A share's system-audio capture that gave up is started
+    again, and a capture that restarted is no longer four billion
+    skipped frames in the viewer's summary (P2-22). DXGI capture opens
+    on the adapter that drives the monitor, not always the default one
+    (P2-26), and with two frames queued hands out the newer when the
+    screen is faster than the share (P3-28). The 1 ms system timer is
+    held in a voice room and while a stream is shared or watched, not
+    for the whole connection (P2-35). The capture pump no longer writes
+    a log line per discontinuity, and the `wasapi` crate is capped at
+    info (P2-37). **All of it type-checked for Windows, none of it
+    run.** Left: the mouse pointer in a share (P2-25) — it has to be
+    looked at on a Windows screen.
+  - *CI.* The release build warms its caches from `main` (it named a
+    branch that is gone, so no release ever restored one), installs
+    the toolchain `rust-toolchain.toml` pins and no other, and no
+    longer wraps rustc in sccache and its Windows shim (P2-50, part of
+    P3-48); `pr-check.yaml` is back (REL-1). **None of it run on
+    GitHub.** Left: one release workflow instead of four (P2-60), the
+    package lists and `cargo-ndk` (P3-48) — each needs a release run to
+    prove.
 
 ## 8. Facts this plan rests on
 
 - **Tests, 2026-10-12, Linux sandbox**: protocol 91 + the versions
   test + 3 wire-pinning tests, transport 55, server 70 unit + 99 e2e,
-  client 55, app-core 112, audio 106, video 73 + 5, i18n 2 — all
+  client 57, app-core 112, audio 113, video 77 + 6, i18n 2 — all
   green. Six more need a real machine:
   that sandbox does not signal UDP readiness, so the socket-wait tests
   (`transport` `udp::read_waiter_tests`, 3; `client` `inbound_wake`,

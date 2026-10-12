@@ -233,6 +233,8 @@ export global SettingsLogic {
     callback save-and-close();
     callback reset-defaults();
     callback closed();
+    // Another tab is showing: the meters run on Audio only.
+    callback tab-shown();
     /// Licenses: a component or license group opened or
     /// closed (`LicenseRow.entry`).
     callback license-toggled(int);
@@ -1515,6 +1517,7 @@ export component SettingsPanel inherits FocusScope {
     /// 6 credits, 7 about, 8 debug, 9 open-source licenses. Mirrored by
     /// `settingsui::TAB_*`.
     in-out property <int> tab: 0;
+    changed tab => { SettingsLogic.tab-shown(); }
     /// The narrow layout (a phone held upright; ANDROID-SPEC.md D28):
     /// the section list and the open section are two pages, as the
     /// sidebar and the chat are in the main window.

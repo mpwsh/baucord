@@ -1,0 +1,115 @@
+name: PR check
+# The gate for pull requests (Dependabot's and yours) and for pushes to
+# the default branch: formatting, a type-check of everything the desktop
+# and the phones share, the lints, and every test that needs no display.
+#
+# It runs in a Debian 13 container with the distro's FFmpeg 7.1 and
+# PipeWire, which is the environment these exact commands were last run
+# in by hand (PRODUCTION-PLAN §8). It is a check, not a release build:
+# release.yml's ubuntu:22.04 container, static FFmpeg and glibc floor
+# are not reproduced here. Windows-, macOS-, Android- and iOS-only code
+# is not compiled by this workflow.
+on:
+  pull_request:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A dev build's incremental data is of no use to a one-shot runner.
+  CARGO_INCREMENTAL: "0"
+  # Same reason as release.yml: some C deps ship CMakeLists with a
+  # too-old cmake_minimum_required.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  # ── Formatting: seconds ────────────────────────────────────────────
+  # rustfmt.toml uses options only the nightly rustfmt has, so this is
+  # `cargo +nightly fmt`, as on a developer's machine.
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Format check
+        run: cargo +nightly fmt --all -- --check
+
+  # ── Everything else ────────────────────────────────────────────────
+  check:
+    runs-on: ubuntu-24.04
+    container: debian:13
+    defaults:
+      run:
+        shell: bash # containers default to sh
+    steps:
+      - name: System dependencies
+        # What the workspace's build scripts look for on Linux: FFmpeg
+        # (video), ALSA (cpal), PipeWire and XCB (screen capture),
+        # X11/Wayland/EGL/GBM/fontconfig (Slint), clang (bindgen),
+        # cmake and nasm (bundled C libraries).
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates \
+            build-essential pkg-config cmake nasm ninja-build python3 \
+            clang libclang-dev \
+            libopus-dev libasound2-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libavfilter-dev libswresample-dev \
+            libpipewire-0.3-dev \
+            libxcb1-dev libxrandr-dev libx11-dev libxext-dev libxcursor-dev \
+            libxfixes-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libegl-dev libgbm-dev \
+            libdbus-1-dev libudev-dev libfontconfig1-dev libfreetype-dev
+
+      - uses: actions/checkout@v7
+
+      # The toolchain rust-toolchain.toml pins, as in release.yml.
+      - name: Read the pinned Rust toolchain
+        id: toolchain
+        run: |
+          echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-check
+          # Slint and Skia dominate the build: keep the cache even when
+          # a later step fails, so the next push does not pay again.
+          cache-on-failure: true
+          # Pull requests restore the default branch's cache; only its
+          # own runs save one.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # --locked: a change to a Cargo.toml without its Cargo.lock fails
+      # here instead of resolving silently.
+      - name: Check the desktop build
+        # The workspace's default members: every crate but the phone
+        # hosts (`android`, `ios`), which build only for their targets.
+        run: cargo check --locked --all-targets
+      - name: Check the desktop with the release feature set
+        run: cargo check --locked -p desktop --features tray
+      - name: Check the phones' shared code
+        run: cargo check --locked -p frontend --no-default-features
+
+      - name: Lints
+        # Warnings are reported; only what the workspace denies fails.
+        run: cargo clippy --locked --all-targets
+
+      - name: Tests
+        # Every crate whose tests need no display. `--no-fail-fast`: one
+        # failing crate does not hide the others' results.
+        run: >
+          cargo test --locked --no-fail-fast
+          -p protocol -p transport -p server -p client
+          -p app-core -p audio -p video -p i18n

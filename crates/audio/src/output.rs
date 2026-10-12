@@ -18,7 +18,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleFormat, Stream, SupportedStreamConfig,
 };
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::Receiver;
 use dasp_sample::{FromSample, Sample as DaspSample, ToSample};
 use log::{debug, error, info};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -26,6 +26,7 @@ use rubato::{Async, Resampler};
 
 use crate::{
     config::PeerAudioSettings,
+    latch::{Ring, Wait},
     processor::limiter::Limiter,
     resampler::build_output_resampler,
     sounds::{SoundBank, SoundType},
@@ -103,11 +104,11 @@ pub struct AudioOutput {
     ring_capacity: usize,
 
     /// Wake latch: playback callback → worker ("ring space freed").
-    wake_tx: Option<Sender<()>>,
-    wake_rx: Option<Receiver<()>>,
+    wake_tx: Option<Ring>,
+    wake_rx: Option<Wait>,
     /// Our own ring of the latch, as in `AudioInput`: a stop wakes the
     /// worker at once, and the latch never goes dead under it.
-    stop_ring: Option<Sender<()>>,
+    stop_ring: Option<Ring>,
     /// Largest playback callback seen, in device frames (0 = none yet,
     /// or a backend that does not report — the native WASAPI render).
     /// The worker sizes its ring fill and the jitter floor from it.
@@ -158,7 +159,7 @@ impl AudioOutput {
         let (ring_producer, ring_consumer) = RingBuffer::new(ring_size);
         // Wake latch: playback callback pings this after draining the ring;
         // the worker refills on it and on nothing else (review P1-4).
-        let (wake_tx, wake_rx) = bounded::<()>(1);
+        let (wake_tx, wake_rx) = crate::latch::latch();
 
         Ok(Self {
             cpal,
@@ -504,7 +505,7 @@ impl AudioOutput {
                 }
 
                 // Ring space just freed — wake the worker to refill.
-                let _ = wake_tx.try_send(());
+                wake_tx.ring();
             },
             move |err| {
                 if matches!(err.kind(), cpal::ErrorKind::DeviceNotAvailable) {
@@ -540,7 +541,7 @@ struct WorkerParts {
     packet_rx: Receiver<(AudioPacket, Instant)>,
     loopback_rx: Receiver<PcmFrame>,
     sound_rx: Receiver<SoundType>,
-    wake_rx: Receiver<()>,
+    wake_rx: Wait,
     callback_frames: Arc<AtomicUsize>,
     peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
     removed_peers: Arc<Mutex<HashSet<u64>>>,
@@ -809,6 +810,12 @@ fn worker_loop(parts: WorkerParts) {
             if js.red > 0 {
                 stats.red_recoveries.fetch_add(js.red, Ordering::Relaxed);
             }
+            if js.drift_windows > 0 {
+                stats
+                    .drift_windows
+                    .fetch_add(js.drift_windows, Ordering::Relaxed);
+                stats.drift_on.fetch_add(js.drift_on, Ordering::Relaxed);
+            }
             let mut ticks = 0;
             while next_tick <= now && ticks < MAX_CATCH_UP_TICKS {
                 jitter_buffer.adapt();
@@ -824,7 +831,7 @@ fn worker_loop(parts: WorkerParts) {
 
         // Wait for the device to consume audio: its callback rings the
         // latch after every drain, and a stop rings it too.
-        if !crate::platform::wait_for_wake(&wake_rx, crate::platform::LATCH_SAFETY_WAIT) {
+        if !wake_rx.wait(crate::platform::LATCH_SAFETY_WAIT) {
             break;
         }
     }
@@ -897,7 +904,7 @@ impl Drop for AudioOutput {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Relaxed);
         if let Some(ring) = &self.stop_ring {
-            let _ = ring.try_send(());
+            ring.ring();
         }
         // Drop the cpal stream FIRST — stops platform audio callbacks so
         // they can't deadlock pulling from the ring buffer while the

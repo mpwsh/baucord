@@ -202,6 +202,24 @@ impl PacketBuffer {
 
     // ── Ingest ──────────────────────────────────────────────────────
 
+    /// Whether [`Self::push`] would accept a packet numbered `seq`: not
+    /// behind the playhead, not held already. Asked before a RED
+    /// bundle's redundant block is copied out — nearly every one is of
+    /// a packet that arrived (review P3-21).
+    #[must_use]
+    pub fn wants(&self, seq: u32) -> bool {
+        if self.started {
+            let behind = seq_dist(seq, self.next_seq);
+            if behind < -RESTART_SLOTS {
+                return true;
+            }
+            if behind < 0 {
+                return false;
+            }
+        }
+        !self.slots.iter().any(|s| s.seq == seq)
+    }
+
     /// Offer a packet. Jitter estimation and underrun classification stay
     /// in the caller (they need `arrival`, which this buffer does not).
     pub fn push(&mut self, pkt: AudioPacket) -> Push {
@@ -651,6 +669,32 @@ mod tests {
             "a floor, not silence"
         );
         assert!(b.comfort_noise(&mut out));
+    }
+
+    /// `wants` answers as `push` would, without taking the packet
+    /// (review P3-21: asked before a redundant copy is made).
+    #[test]
+    fn wants_agrees_with_push() {
+        let mut e = enc();
+        let mut b = PacketBuffer::new().unwrap();
+        assert!(b.wants(5), "anything, before the first packet");
+        b.push(pkt(&mut e, 5, 5 * FRAME_SIZE as u32));
+        assert!(!b.wants(5), "held already");
+        assert!(b.wants(4) && b.wants(7), "not played yet, not held");
+        let mut out = [0.0f32; FRAME_SIZE];
+        b.fill(&mut out, true, false);
+        assert!(!b.wants(4) && !b.wants(5), "behind the playhead");
+        assert_eq!(b.push(pkt(&mut e, 4, 4 * FRAME_SIZE as u32)), Push::Late);
+        assert!(b.wants(6));
+        assert_eq!(
+            b.push(pkt(&mut e, 6, 6 * FRAME_SIZE as u32)),
+            Push::Accepted
+        );
+        assert!(!b.wants(6));
+        assert_eq!(
+            b.push(pkt(&mut e, 6, 6 * FRAME_SIZE as u32)),
+            Push::Duplicate
+        );
     }
 
     #[test]

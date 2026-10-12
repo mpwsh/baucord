@@ -219,9 +219,17 @@ impl EncoderWorker {
             // Bounded wait instead of a blocking recv: while muted the
             // input pipeline sends nothing, and the adaptation tick must
             // keep running so the rate controller can keep evaluating —
-            // and recovering — with no frames flowing. Four wakeups a
-            // second on an idle channel is noise, CPU-wise.
-            match self.rx.recv_timeout(RECV_TICK) {
+            // and recovering — with no frames flowing. Out of every
+            // voice room there is no link to evaluate: the wait is long
+            // (a frame still wakes it at once), where it was four
+            // wakeups a second in a phone's lobby for as long as the
+            // app ran (review P3-23).
+            let tick = if self.stats.in_room.load(Ordering::Relaxed) {
+                RECV_TICK
+            } else {
+                LOBBY_TICK
+            };
+            match self.rx.recv_timeout(tick) {
                 Ok(samples) => self.push_frame(&samples),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -294,12 +302,13 @@ impl EncoderWorker {
                 // Copies of the preceding transmitted packets, oldest first,
                 // with their media offset from this packet. Contiguity is
                 // guaranteed: `history` is cleared on every DTX gap.
-                let blocks: Vec<(u32, &[u8])> = self
-                    .history
-                    .iter()
-                    .map(|(ts, data)| (packet_ts.wrapping_sub(*ts), data.as_slice()))
-                    .collect();
-                red::encode(primary, &blocks, &mut self.bundle);
+                let mut blocks: [(u32, &[u8]); red::MAX_BLOCKS] = [(0, &[]); red::MAX_BLOCKS];
+                let mut count = 0;
+                for ((ts, data), block) in self.history.iter().zip(&mut blocks) {
+                    *block = (packet_ts.wrapping_sub(*ts), data.as_slice());
+                    count += 1;
+                }
+                red::encode(primary, &blocks[..count], &mut self.bundle);
                 (PayloadType::Red, self.bundle.len())
             } else {
                 (PayloadType::Opus, size)
@@ -315,9 +324,19 @@ impl EncoderWorker {
         self.stats.record_packet_sent(wire_bytes);
 
         if self.red {
-            self.history.push_back((packet_ts, primary.to_vec()));
-            while self.history.len() > self.red_distance.min(RED_DISTANCE_MAX) {
-                self.history.pop_front();
+            // The copy that falls out of the history gives its buffer
+            // to the one that enters: no allocation once it is full.
+            let keep = self.red_distance.min(RED_DISTANCE_MAX);
+            let mut copy = Vec::new();
+            while self.history.len() >= keep.max(1) {
+                if let Some((_, old)) = self.history.pop_front() {
+                    copy = old;
+                }
+            }
+            if keep > 0 {
+                copy.clear();
+                copy.extend_from_slice(primary);
+                self.history.push_back((packet_ts, copy));
             }
         }
         // try_send: if the application isn't draining outgoing packets,
@@ -494,6 +513,11 @@ const ADAPT_INTERVAL: Duration = Duration::from_secs(2);
 /// when the input pipeline is silent (muted). Frames normally arrive
 /// every 20 ms; this only bounds the idle case.
 const RECV_TICK: Duration = Duration::from_millis(250);
+
+/// The same wait out of every voice room: only how soon the thread
+/// notices it is in one again without a frame to tell it (joined
+/// muted).
+const LOBBY_TICK: Duration = Duration::from_secs(5);
 
 /// An uplink-loss reading older than this is treated as unknown rather
 /// than current (`LinkSample.uplink_loss_pct = None`): the smoothed

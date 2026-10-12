@@ -132,12 +132,23 @@ pub struct JitterStats {
     pub late: u64,
     /// Packets recovered from a RED copy carried by a later packet.
     pub red: u64,
+    /// Clock-drift windows that ran clean to their end and measured a
+    /// peer's skew, and how many of those left the correction switched
+    /// on. The estimator needs ten seconds of one peer's unbroken speech
+    /// per window; the review doubted it ever gets them (P3-22). These
+    /// two are in the log for a release to answer that: if `drift_on`
+    /// stays 0 in the field, the estimator and the micro rate
+    /// adjustment it drives can go.
+    pub drift_windows: u64,
+    pub drift_on: u64,
 }
 
 /// Per-peer state inside the jitter buffer.
 struct PeerBuffer {
     /// Encoded packets + decoder for this peer.
     packets: PacketBuffer,
+    /// This peer's volume and mute, as of the mix pass under way.
+    settings: PeerAudioSettings,
     /// Timestamp of the last accepted packet.
     last_ts: Option<u32>,
     /// Arrival time of the last accepted packet.
@@ -191,6 +202,7 @@ impl PeerBuffer {
     fn new() -> opus::Result<Self> {
         Ok(Self {
             packets: PacketBuffer::new()?,
+            settings: PeerAudioSettings::default(),
             last_ts: None,
             last_arrival: None,
             last_push: Instant::now(),
@@ -238,6 +250,8 @@ pub struct AdaptiveJitterBuffer {
 
     /// Scratch buffer for per-peer volume/limiting, allocated once.
     scratch: Vec<f32>,
+    /// Scratch for `adapt`'s per-peer jitter values.
+    jitter_scratch: Vec<f32>,
     /// Scratch input for the per-peer micro rate adjustment,
     /// allocated once like `scratch`.
     scratch_in: Vec<f32>,
@@ -294,6 +308,7 @@ impl AdaptiveJitterBuffer {
             removed_peers,
             loopback: VecDeque::with_capacity(LOOPBACK_CAP),
             scratch: Vec::new(),
+            jitter_scratch: Vec::new(),
             scratch_in: Vec::new(),
             mix_scale: 1.0,
             stable_ticks: 0,
@@ -378,8 +393,18 @@ impl AdaptiveJitterBuffer {
         let mut span = 0usize;
         for block in &bundle.redundant {
             span = span.max(block.ts_offset as usize);
+            let seq = h.seq.wrapping_sub(block.seq_distance);
+            // A copy of a packet that arrived (nearly all are) is
+            // not copied out to be dropped.
+            if self
+                .buffers
+                .get(&h.ssrc)
+                .is_some_and(|peer| !peer.packets.wants(seq))
+            {
+                continue;
+            }
             let copy = AudioPacket::new(
-                h.seq.wrapping_sub(block.seq_distance),
+                seq,
                 h.timestamp.wrapping_sub(block.ts_offset),
                 h.ssrc,
                 block.data.to_vec(),
@@ -570,9 +595,17 @@ impl AdaptiveJitterBuffer {
         debug_assert_eq!(out.len(), n);
         out.fill(0.0);
 
-        let Ok(settings) = self.peer_settings.lock() else {
-            return;
-        };
+        // Volume and mute, copied out for this pass: the lock was held
+        // across every peer's decode, and the UI's slider waited for it
+        // (review P3-21).
+        {
+            let Ok(settings) = self.peer_settings.lock() else {
+                return;
+            };
+            for (peer_id, peer) in &mut self.buffers {
+                peer.settings = settings.get(peer_id).cloned().unwrap_or_default();
+            }
+        }
         let mut contributing_peers = 0u32;
         let mut fec = 0u64;
         let mut plc = 0u64;
@@ -590,8 +623,8 @@ impl AdaptiveJitterBuffer {
         let prime_cap = ((60 * self.sample_rate) / 1000).max(self.min_samples);
         let prime_target = self.target_samples.min(prime_cap);
 
-        for (peer_id, peer) in &mut self.buffers {
-            let peer_settings = settings.get(peer_id).cloned().unwrap_or_default();
+        for peer in self.buffers.values_mut() {
+            let peer_settings = peer.settings.clone();
             if peer_settings.is_muted {
                 peer.packets.clear();
                 peer.playing = false;
@@ -812,8 +845,6 @@ impl AdaptiveJitterBuffer {
         }
         self.mix_scale = scale_end;
 
-        drop(settings);
-
         if fec + plc + lost > 0 {
             self.last_loss_at = Some(now);
         }
@@ -903,6 +934,10 @@ impl AdaptiveJitterBuffer {
                             } else {
                                 blended
                             };
+                            self.stats.drift_windows += 1;
+                            if p.drift_estimate != 0.0 {
+                                self.stats.drift_on += 1;
+                            }
                         }
                         p.drift_window = Some((now, p.pushed_samples, p.consumed_samples));
                     }
@@ -917,12 +952,16 @@ impl AdaptiveJitterBuffer {
         // ── Compute jitter-based target ─────────────────────────────
         // Use 75th percentile across active peers instead of max.
         // This prevents one bad peer from inflating the buffer for everyone.
-        let mut jitter_values: Vec<f32> = self
-            .buffers
-            .values()
-            .filter(|p| p.last_arrival.is_some())
-            .map(|p| p.jitter_estimate * 1000.0) // convert to ms
-            .collect();
+        // Into a list kept between calls: this runs 100 times a second
+        // and allocated one each time (review P3-21).
+        let mut jitter_values = std::mem::take(&mut self.jitter_scratch);
+        jitter_values.clear();
+        jitter_values.extend(
+            self.buffers
+                .values()
+                .filter(|p| p.last_arrival.is_some())
+                .map(|p| p.jitter_estimate * 1000.0), // convert to ms
+        );
 
         let jitter_target_ms = if jitter_values.is_empty() {
             0.0
@@ -933,6 +972,7 @@ impl AdaptiveJitterBuffer {
             // Target = 2× p75 jitter — enough headroom without being excessive
             p75_jitter * 2.0
         };
+        self.jitter_scratch = jitter_values;
 
         // ── Health-based adjustment ─────────────────────────────────
         let had_problems = self.concealment_count > 0 || self.underrun_count > 0;
@@ -1239,6 +1279,45 @@ mod tests {
             }
             let stats = jb.drain_stats();
             assert_eq!(stats.red, 1, "the copy of packet 2 is a recovery");
+            assert_eq!((stats.fec, stats.plc, stats.lost), (0, 0, 0));
+        }
+
+        /// The usual bundle: its redundant block is of a packet that
+        /// arrived. Nothing is recovered, nothing concealed, and the
+        /// stream plays as without redundancy (review P3-21: the block
+        /// is no longer copied out first).
+        #[test]
+        fn red_copy_of_a_packet_that_arrived_changes_nothing() {
+            let mut jb = buffer();
+            let mut enc = encoder();
+            let t0 = Instant::now();
+            let p0 = packet(&mut enc, 0, 7);
+            let p1 = packet(&mut enc, 1, 7);
+            let p2 = packet(&mut enc, 2, 7);
+            let p3 = packet(&mut enc, 3, 7);
+
+            let mut bundle = Vec::new();
+            red::encode(
+                &p3.opus_data,
+                &[
+                    (2 * FRAME_SIZE as u32, &p1.opus_data),
+                    (FRAME_SIZE as u32, &p2.opus_data),
+                ],
+                &mut bundle,
+            );
+            jb.push_packet(p0, t0);
+            jb.push_packet(p1, t0);
+            jb.push_packet(p2, t0);
+            let p3_red =
+                AudioPacket::new_typed(3, 3 * FRAME_SIZE as u32, 7, PayloadType::Red, bundle);
+            jb.push_packet(p3_red, t0);
+
+            let mut out = vec![0.0f32; 480];
+            for _ in 0..8 {
+                jb.pull_mixed(480, &mut out);
+            }
+            let stats = jb.drain_stats();
+            assert_eq!(stats.red, 0, "both copies were of packets that arrived");
             assert_eq!((stats.fec, stats.plc, stats.lost), (0, 0, 0));
         }
 

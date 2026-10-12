@@ -7,7 +7,11 @@ on:
     types: [published]
   push:
     branches:
-      - "chunk" # the default branch: tag builds can only restore its caches
+      # The default branch: a tag build can only restore caches saved on
+      # it. This said "chunk", a branch that no longer exists, so nothing
+      # ever saved one and every release rebuilt FFmpeg, x264, PipeWire
+      # and the workspace on all four runners (review P2-50).
+      - "main"
 env:
   # FFmpeg stays on 7.1.x: ffmpeg-next 8.1 does not build against FFmpeg 8+.
   VCPKG_COMMIT: 34823ada10080ddca99b60e85f80f55e18a44eea # ffmpeg 7.1.2
@@ -71,9 +75,18 @@ jobs:
             libudev-dev \
             libwayland-dev libegl-dev
 
+      # The toolchain rust-toolchain.toml pins, which is the one cargo
+      # runs. `@stable` installed another that nothing used, and rustup
+      # then fetched the pinned one at the first cargo call (review
+      # P3-48).
+      - name: Read the pinned Rust toolchain
+        id: toolchain
+        run: |
+          echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -203,22 +216,12 @@ jobs:
           7z x ffmpeg-prebuilt.zip -oC:\ffmpeg-prebuilt
           echo "FFMPEG_DIR=C:\ffmpeg-prebuilt\x64-windows-static-md" >> $env:GITHUB_ENV
 
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-        with:
-          version: "v0.17.0"
-
-      # sccache can't pass rustc @argfiles through on Windows; the shim
-      # sends those calls (ffmpeg-sys-next) straight to rustc.
-      - name: Build rustc shim (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: rustc -O ci/rustc-shim.rs -o C:\rustc-shim.exe
-
+      # No sccache: the Rust cache above restores `target/` from the
+      # default branch's build, which is the same saving without a
+      # second cache, a wrapper around rustc and a shim for Windows'
+      # command-line limit (review P2-50).
       - name: Build desktop app and server
         env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: ${{ runner.os == 'Windows' && 'C:\rustc-shim.exe' || 'sccache' }}
           RUSTFLAGS: ${{ matrix.rustflags }}
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         # Only what ships: the desktop app and the server. Every member
@@ -268,10 +271,6 @@ jobs:
             echo "::error::binary targets macOS $MINOS (> 11.0) — MACOSX_DEPLOYMENT_TARGET was not honoured"
             exit 1
           fi
-
-      - name: Show sccache stats
-        shell: bash
-        run: sccache --show-stats
 
       - name: Read version from crates/desktop
         id: version

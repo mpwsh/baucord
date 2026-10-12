@@ -70,6 +70,15 @@ impl<'a> SettingsSurface<'a> {
         }
     }
 
+    /// Whether anyone can see it: the window up and not minimized, or
+    /// the page open.
+    fn showing(&self) -> bool {
+        match self {
+            Self::Window(w) => w.window().is_visible() && !w.window().is_minimized(),
+            Self::Page(m) => m.global::<State>().get_settings_open(),
+        }
+    }
+
     /// The selected nav tab (`TAB_*`).
     fn tab(&self) -> i32 {
         match self {
@@ -144,6 +153,8 @@ fn route_label(name: &str) -> String {
 /// Licenses 9) — the connect view's pencil jumps here. Mirrors the `NavItem`s in
 /// settings.slint.
 pub const TAB_SERVERS: i32 = 5;
+/// Nav index of the Audio tab, whose meters the settings timer drives.
+const TAB_AUDIO: i32 = 2;
 /// Nav index of the Debug tab, whose log view the settings timer
 /// refreshes while it shows.
 const TAB_DEBUG: i32 = 8;
@@ -152,9 +163,11 @@ const TAB_DEBUG: i32 = 8;
 const LOG_TAIL_LINES: usize = 100;
 /// …read from at most the log's last this many bytes.
 const LOG_TAIL_BYTES: usize = 128 * 1024;
-/// How often the log view reads the file again, in settings-timer
-/// ticks (125 ms): every 2 s while the Debug tab shows.
-const LOG_REFRESH_TICKS: u32 = 16;
+/// The settings timer on the Audio tab: the meters' 8 samples a second.
+const METER_TICK: Duration = Duration::from_millis(125);
+/// …and on every other tab, or off screen: the Debug tab's log view
+/// reads the file again this often.
+const IDLE_TICK: Duration = Duration::from_secs(2);
 
 thread_local! {
     /// When this run last sent its log: the server takes one per
@@ -1191,6 +1204,7 @@ fn wire(sf: &SettingsSurface<'_>) {
             app.voice_tx().send(VoiceControl::SetInputGain(gain)).ok();
         });
     });
+    logic.on_tab_shown(|| app::with_current(|app| _ = pace_meter_timer(app)));
     logic.on_output_gain_changed(|gain| {
         app::with_current(move |app| {
             app.settings.audio.output.gain = gain;
@@ -1467,41 +1481,60 @@ fn populate_binds_only(app: &mut AppState) {
     app.apply_push_to_talk();
 }
 
-/// 8 Hz meter loop while the window is open (the FLTK build's
-/// `MeterUpdate` tick); every 2 s of it, the Debug tab's log view.
+/// The settings timer: the Audio tab's meters and echo-cancellation
+/// line 8 times a second, the Debug tab's log view every 2 s — and
+/// nothing but a 2 s look elsewhere, minimized, or with the app in the
+/// background. It ran at 8 Hz on every tab for as long as Settings was
+/// open (review P2-40). `tab-shown` re-paces it at once on a tab change
+/// ([`pace_meter_timer`]); coming back on screen is noticed by the
+/// next slow tick.
 fn start_meter_timer(app: &mut AppState) {
     let levels = app.voice_levels();
     let aec = app.voice_aec();
-    let mut ticks = 0u32;
-    app.meter_timer.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(125),
-        move || {
-            ticks = ticks.wrapping_add(1);
-            if ticks.is_multiple_of(LOG_REFRESH_TICKS) {
-                app::with_current(|app| {
-                    if surface(app).is_some_and(|sf| sf.tab() == TAB_DEBUG) {
-                        refresh_log(app);
+    app.meter_timer
+        .start(slint::TimerMode::Repeated, METER_TICK, move || {
+            app::with_current(|app| {
+                if !pace_meter_timer(app) {
+                    return;
+                }
+                let Some(sf) = surface(app) else { return };
+                match sf.tab() {
+                    TAB_DEBUG => refresh_log(app),
+                    TAB_AUDIO => {
+                        let (mic, out) = levels.levels();
+                        // Reopening the streams (a headset plugged in,
+                        // the setting changed) changes this; property
+                        // sets of an equal string cost nothing visible.
+                        let aec_line = aec_status(aec.lock().ok().and_then(|g| g.clone()).as_ref());
+                        let s = sf.state();
+                        s.set_mic_level(mic);
+                        s.set_out_level(out);
+                        if s.get_aec_status() != aec_line.as_str() {
+                            s.set_aec_status(aec_line.into());
+                        }
                     }
-                });
-            }
-            let (mic, out) = levels.levels();
-            // Reopening the streams (a headset plugged in, the setting
-            // changed) changes this; property sets of an equal string
-            // cost nothing visible.
-            let aec_line = aec_status(aec.lock().ok().and_then(|g| g.clone()).as_ref());
-            app::with_current(move |app| {
-                if let Some(sf) = surface(app) {
-                    let s = sf.state();
-                    s.set_mic_level(mic);
-                    s.set_out_level(out);
-                    if s.get_aec_status() != aec_line.as_str() {
-                        s.set_aec_status(aec_line.into());
-                    }
+                    _ => {}
                 }
             });
-        },
-    );
+        });
+}
+
+/// Set the settings timer's pace for what is showing now, and say
+/// whether Settings is on screen at all.
+fn pace_meter_timer(app: &AppState) -> bool {
+    let Some(sf) = surface(app) else {
+        return false;
+    };
+    let showing = app::host_visible() && sf.showing();
+    let pace = if showing && sf.tab() == TAB_AUDIO {
+        METER_TICK
+    } else {
+        IDLE_TICK
+    };
+    if app.meter_timer.running() && app.meter_timer.interval() != pace {
+        app.meter_timer.set_interval(pace);
+    }
+    showing
 }
 
 // ── Debug ───────────────────────────────────────────────────────────────

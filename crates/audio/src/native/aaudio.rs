@@ -38,7 +38,7 @@ use std::{
     },
 };
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver};
 use log::{info, warn};
 use ndk::audio::{
     AudioCallbackResult, AudioContentType, AudioDirection, AudioError, AudioFormat,
@@ -51,7 +51,9 @@ use super::{
     android::{self, EchoCanceller, EchoEffect},
     pump::{CapturePump, RenderPump},
 };
-use crate::{aec::reasons, input_config::InputConfig, stats::AudioStats, OPUS_SAMPLE_RATE};
+use crate::{
+    aec::reasons, input_config::InputConfig, latch::Ring, stats::AudioStats, OPUS_SAMPLE_RATE,
+};
 
 /// An open, started `AAudio` stream; stops and closes on drop.
 struct Running(AudioStream);
@@ -132,7 +134,7 @@ pub struct NativeCapture {
 pub struct CaptureStartError {
     pub reason: String,
     pub producer: Producer<f32>,
-    pub wake_tx: Sender<()>,
+    pub wake_tx: Ring,
 }
 
 struct CaptureParts {
@@ -149,7 +151,7 @@ impl NativeCapture {
     /// The open was refused; the ring and latch come back in the error.
     pub fn start(
         producer: Producer<f32>,
-        wake_tx: Sender<()>,
+        wake_tx: Ring,
         stats: Arc<AudioStats>,
         config: Arc<InputConfig>,
     ) -> Result<Self, CaptureStartError> {
@@ -304,7 +306,7 @@ pub struct NativeRender {
 pub struct RenderStartError {
     pub reason: String,
     pub consumer: Consumer<f32>,
-    pub wake_tx: Sender<()>,
+    pub wake_tx: Ring,
 }
 
 struct RenderParts {
@@ -320,7 +322,7 @@ impl NativeRender {
     /// The open was refused; the ring and latch come back in the error.
     pub fn start(
         consumer: Consumer<f32>,
-        wake_tx: Sender<()>,
+        wake_tx: Ring,
         stats: Arc<AudioStats>,
         callback_frames: Arc<AtomicUsize>,
     ) -> Result<Self, RenderStartError> {
