@@ -768,7 +768,7 @@ fn a_dead_peer_is_detected_by_the_idle_timeout() {
     // timer starts again at the keep-alive it sends into the dead link
     // (QUIC restarts it on the first packet sent after the last one
     // received), so a client with nothing else to say takes the
-    // keep-alive interval longer — the price of the 10 s keep-alive
+    // keep-alive interval longer — the price of the 5 s keep-alive
     // (review P2-49); in a voice room it is sending all the time.
     let idle = Budget::client().max_idle_timeout;
     let slack = Duration::from_secs(5);
@@ -1171,10 +1171,10 @@ fn an_idle_connection_is_due_only_at_its_next_timer() {
     assert!(wakes <= 20, "{wakes} wakes in two idle seconds");
 }
 
-/// The client's keep-alive is ten seconds, not two (review P2-49). An
+/// The client's keep-alive is five seconds, not two (review P2-49). An
 /// idle connection — nothing sent but the keep-alives — must still
 /// outlive a link losing four packets in ten, both ways: inside the
-/// 30 s idle timeout that is two pings and their retransmissions.
+/// 30 s idle timeout that is five pings and their retransmissions.
 #[test]
 fn an_idle_connection_survives_heavy_loss_on_the_slow_keep_alive() {
     assert_eq!(

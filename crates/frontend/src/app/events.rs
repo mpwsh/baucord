@@ -1048,7 +1048,6 @@ impl AppState {
                 scope: _,
             } => {
                 self.active_sharers.insert(client_id, (width, height));
-                self.sharer_ids = self.active_sharers.keys().copied().collect();
                 self.update_user_list();
                 // A stream going up in our channel — ours included: the
                 // sharer hears that they are live, the same as the room.
@@ -1065,7 +1064,6 @@ impl AppState {
             }
             NetworkMessage::ScreenShareStopped { client_id } => {
                 self.active_sharers.remove(&client_id);
-                self.sharer_ids = self.active_sharers.keys().copied().collect();
                 self.update_user_list();
             }
             // ── 1.1.2: profiles and blobs (spec §7, §7.1) ────────────
@@ -1325,16 +1323,6 @@ impl AppState {
             NetworkMessage::AccountDeleteRefused { reason } => {
                 self.take_account_delete_refused(reason);
             }
-            // Hot-path variants routed straight to the voice/screen
-            // threads by the network loop. They should never arrive
-            // here; if they do we silently ignore them.
-            NetworkMessage::SystemAudioData { .. }
-            | NetworkMessage::VoiceData { .. }
-            | NetworkMessage::VideoFrame { .. }
-            | NetworkMessage::StreamHealth { .. }
-            | NetworkMessage::VoiceReceiverReport { .. }
-            | NetworkMessage::UplinkVideo { .. }
-            | NetworkMessage::KeyframeRequested { .. } => {}
         }
     }
 

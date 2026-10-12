@@ -89,9 +89,32 @@ Check with `which cargo` and `df -h /` first.
   github.com/apple-oss-distributions/bash (`bash-3.2/`, with a
   `xlocale.h` shim, `-DEBADEXEC=ENOEXEC -DEBADARCH=ENOEXEC` and a
   pass-through `fmtcheck`).
-- **Windows-only code** (`wasapi.rs`, DXGI) cannot be compiled here
-  (§4): check it against the crate sources by reading, and say so in the
-  hand-over.
+- **Windows-only code** (`wasapi.rs`, DXGI, the socket waits, qWAVE) is
+  type-checked against the real target since 2026-10-12, where the
+  sandbox can install packages: `rustup target add
+  x86_64-pc-windows-gnu`, `apt-get install gcc-mingw-w64-x86-64-posix
+  g++-mingw-w64-x86-64-posix`, then `cargo check --target
+  x86_64-pc-windows-gnu -p transport -p audio -p video -p client -p
+  server` (`transport` alone needs `--features server`). `video` needs
+  two variables for `ffmpeg-sys-next`'s bindgen: `FFMPEG_DIR=<dir>`
+  whose `include/` holds links to only the FFmpeg header folders
+  (`/usr/include/<arch>-linux-gnu/libav*`, `libsw*`, `libpostproc`;
+  the folder itself drags glibc's headers in) and an empty `lib/`, and
+  `BINDGEN_EXTRA_CLANG_ARGS="--sysroot=/usr/x86_64-w64-mingw32
+  -I/usr/x86_64-w64-mingw32/include"`. It is the GNU target, not MSVC:
+  the Rust is checked, nothing is linked or run. The frontend's
+  Windows code is not covered (Skia has no prebuilt for that target).
+- **Android without an NDK**, the same way: `rustup target add
+  aarch64-linux-android`, and let the C dependencies build with the
+  host compiler, which is enough because `cargo check` links nothing —
+  `CC_aarch64_linux_android=gcc CXX_aarch64_linux_android=g++
+  AR_aarch64_linux_android=ar` and `CMAKE_TOOLCHAIN_FILE` pointing at
+  a file that says `set(CMAKE_SYSTEM_NAME Linux)`,
+  `set(CMAKE_C_COMPILER gcc)`, `set(CMAKE_CXX_COMPILER g++)`,
+  `set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)`. Then `cargo
+  check --target aarch64-linux-android -p audio -p video -p client`
+  (AAudio, MediaCodec and the phone paths of the client). The
+  `android` crate still needs the scratch crate above.
 - **Dependency graphs** without a target installed: `cargo tree -p
   android --target aarch64-linux-android -e normal,build`, the same for
   `-p ios --target aarch64-apple-ios`.
@@ -505,8 +528,8 @@ Memory-mode servers (persistence off) still use the legacy
   emulator's `Underruns 162` in 6 s was 27/s — one per callback — and
   was first written off as the emulator's audio clock. Divide by the
   time and compare with the callback period first.
-- **Android-only code can be type-checked here; Windows-only code
-  cannot.** `ndk` has a `test` feature that compiles its bindings off
+- **Android-only code can be type-checked here** (and, since
+  2026-10-12, Windows-only code too — §1). `ndk` has a `test` feature that compiles its bindings off
   Android: a scratch crate depending on `ndk` (`audio`, `api-level-28`,
   `test`), `jni` 0.22, `ndk-context` and the real `audio` crate, with
   `#[path]` modules pulling in `native/aaudio.rs` + `native/android.rs`

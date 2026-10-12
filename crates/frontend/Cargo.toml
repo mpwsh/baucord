@@ -34,6 +34,9 @@ desktop = [
   "dep:pollster",
   "dep:open",
   "dep:objc2-app-kit",
+  # HTTP: the updater, and a pasted image URL — and a phone has no
+  # clipboard to paste one from.
+  "dep:ureq",
 ]
 # System tray via Slint's builtin SystemTrayIcon (1.17+). Closing the
 # window then hides to the tray instead of quitting. Enable it in the
@@ -62,7 +65,7 @@ i-slint-backend-winit = { version = "1.18.1", optional = true }
 crossbeam-channel.workspace = true
 log.workspace = true
 chrono = "0.4.45"
-ureq = "3.4"
+ureq = { version = "3.4", optional = true }
 open = { version = "5.4", optional = true }
 global-hotkey = { version = "0.8", optional = true }
 # One instance per config directory: a second launch knocks on the

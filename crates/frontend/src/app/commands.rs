@@ -821,39 +821,6 @@ impl AppState {
                     self.push_command_output(&line);
                 }
             }
-            // The panel's answers (spec §8): until the window lands they
-            // read as one line each, so `/`-typed commands still answer.
-            client::AdminOutcome::RoleCreated(id) => {
-                self.push_command_output(&t!("chat-admin-role-created", "id" => id));
-            }
-            client::AdminOutcome::Stats(stats) => {
-                let line = format!(
-                    "baucord {} · up {} · {} online / {} users · {} messages · {} blobs, {} of {}",
-                    stats.version,
-                    describe_duration(stats.uptime_secs),
-                    stats.online,
-                    stats.users,
-                    stats.messages,
-                    stats.blobs,
-                    app_core::chat::human_size(stats.blob_bytes),
-                    app_core::chat::human_size(stats.blob_cap_bytes),
-                );
-                self.push_command_output(&line);
-            }
-            client::AdminOutcome::Blobs(blobs) => {
-                self.push_command_output(&t!("chat-admin-blobs-header", "count" => blobs.len()));
-                for b in blobs {
-                    let line = format!(
-                        "{} — {} — {} — {} — refs {}",
-                        b.name,
-                        b.mime,
-                        app_core::chat::human_size(u64::from(b.size)),
-                        b.created_by.as_deref().unwrap_or("?"),
-                        b.refs
-                    );
-                    self.push_command_output(&line);
-                }
-            }
             client::AdminOutcome::Reports(list) => {
                 self.push_command_output(&t!("chat-admin-reports-header", "count" => list.len()));
                 for r in list {
@@ -885,26 +852,12 @@ impl AppState {
                     self.push_command_output(&line);
                 }
             }
-            client::AdminOutcome::Audit(entries) => {
-                self.push_command_output(&t!("chat-admin-audit-header", "count" => entries.len()));
-                for e in entries {
-                    let line = format!(
-                        "{} — {} — {}{}{}",
-                        format_wall_time(e.ts),
-                        e.actor.as_deref().unwrap_or("server"),
-                        e.action,
-                        e.target
-                            .as_deref()
-                            .map(|t| format!(" {t}"))
-                            .unwrap_or_default(),
-                        e.detail
-                            .as_deref()
-                            .map(|d| format!(": {d}"))
-                            .unwrap_or_default(),
-                    );
-                    self.push_command_output(&line);
-                }
-            }
+            // Answers to what only the admin panel asks, and it takes
+            // its own (`adminui::take_outcome`): nothing typed leads here.
+            client::AdminOutcome::RoleCreated(_)
+            | client::AdminOutcome::Stats(_)
+            | client::AdminOutcome::Blobs(_)
+            | client::AdminOutcome::Audit(_) => {}
         }
     }
 

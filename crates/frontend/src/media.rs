@@ -360,6 +360,7 @@ pub fn paste_into_chat(app: &mut AppState) {
             attach_path(app, &path);
             return;
         }
+        #[cfg(feature = "desktop")]
         if let Some(url) = images::image_url_in(&text) {
             fetch_image_url(app, &url);
             return;
@@ -542,7 +543,9 @@ pub fn attach_image_from_disk() {
 }
 
 /// Fetch a pasted image URL off-thread, then preview it; a toast says
-/// the fetch is running.
+/// the fetch is running. Desktop only: the phones have no clipboard to
+/// paste from (`stubs/clipboard.rs`).
+#[cfg(feature = "desktop")]
 fn fetch_image_url(app: &mut AppState, url: &str) {
     app.show_toast(ui::ToastKind::Info, &t!("chat-downloading-image"));
     let url = url.to_string();
@@ -563,6 +566,7 @@ fn fetch_image_url(app: &mut AppState, url: &str) {
     });
 }
 
+#[cfg(feature = "desktop")]
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let agent: ureq::Agent = ureq::config::Config::builder()
         .timeout_global(Some(Duration::from_secs(15)))

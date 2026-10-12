@@ -31,9 +31,6 @@ pub struct AudioStats {
 
     // ── Codec stats ─────────────────────────────────────────────────────
     pub encode_errors: AtomicU64,
-    /// Kept for the debug overlay; a corrupt packet is now concealed
-    /// rather than reported, so this stays at 0.
-    pub decode_errors: AtomicU64,
     /// Slots recovered from in-band FEC that was actually present in the
     /// following packet. (Earlier releases counted every *attempt*.)
     pub fec_recoveries: AtomicU64,
@@ -134,8 +131,6 @@ pub struct AudioStats {
     /// Speaking indicator: `RNNoise` speech probability + open gate, with
     /// hold (see `processor::speaking`).
     pub vad_active: AtomicBool,
-    pub denoise_active: AtomicBool,
-    pub dtx_active: AtomicBool,
     /// Whether the noise gate is currently open (passing audio).
     pub gate_active: AtomicBool,
 
@@ -167,7 +162,6 @@ impl AudioStats {
             packets_late: AtomicU64::new(0),
             outgoing_dropped: AtomicU64::new(0),
             encode_errors: AtomicU64::new(0),
-            decode_errors: AtomicU64::new(0),
             fec_recoveries: AtomicU64::new(0),
             plc_frames: AtomicU64::new(0),
             uplink_loss_pct: AtomicU32::new(0),
@@ -198,8 +192,6 @@ impl AudioStats {
             denoised_level: AtomicU32::new(0.0_f32.to_bits()),
             pipeline_level: AtomicU32::new(0.0_f32.to_bits()),
             vad_active: AtomicBool::new(false),
-            denoise_active: AtomicBool::new(true),
-            dtx_active: AtomicBool::new(false),
             gate_active: AtomicBool::new(false),
             aec: Mutex::new(None),
             aec_generation: AtomicU64::new(0),
@@ -297,15 +289,16 @@ impl AudioStats {
         };
 
         format!(
-            "Audio ({}s) | Sent {} Recv {} Lost {} ({:.1}%) | \
+            "Audio ({}s) | Sent {} Recv {} Lost {} ({:.1}%) Late {} | \
              FEC {} RED {} PLC {} (hint {}%, uplink {}%) | Rate {}k/{}ms{} | Overruns {} Underruns {} Drop {} | Jitter {}ms (target {}ms) | \
              BW ↑{:.1}kbps ↓{:.1}kbps | Pkt {}B (avg {:.0}B) | \
-             Enc {}µs Dec {}µs | Errors: enc {} dec {} | aec: {}",
+             Enc {}µs Dec {}µs | Encode errors {} | Device restarts {} | aec: {}",
             elapsed,
             sent,
             received,
             lost,
             loss_rate,
+            self.packets_late.load(Ordering::Relaxed),
             self.fec_recoveries.load(Ordering::Relaxed),
             self.red_recoveries.load(Ordering::Relaxed),
             self.plc_frames.load(Ordering::Relaxed),
@@ -326,7 +319,7 @@ impl AudioStats {
             self.last_encode_us.load(Ordering::Relaxed),
             self.last_decode_us.load(Ordering::Relaxed),
             self.encode_errors.load(Ordering::Relaxed),
-            self.decode_errors.load(Ordering::Relaxed),
+            self.stream_restarts.load(Ordering::Relaxed),
             aec,
         )
     }

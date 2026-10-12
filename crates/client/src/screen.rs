@@ -183,7 +183,6 @@ pub enum ScreenEvent {
         format: video::PictureFormat,
         frame_bytes: usize,
         seq: u32,
-        is_keyframe: bool,
         /// When the jitter buffer released the frame for decoding (after
         /// its playout hold), so `decoded_at - enqueued_at` is decode
         /// latency alone.
@@ -894,7 +893,6 @@ struct PeerStream {
 struct Fed {
     seq: u32,
     frame_bytes: usize,
-    is_keyframe: bool,
     /// The sender's capture timestamp (for "behind live").
     sent_at: u32,
     /// When the jitter buffer released it.
@@ -1107,7 +1105,6 @@ fn emit_picture(
             format: decoded.format,
             frame_bytes: fed.frame_bytes,
             seq: fed.seq,
-            is_keyframe: fed.is_keyframe,
             enqueued_at: fed.enqueued_at,
             decoded_at,
             buffer_depth_ms: stream.jitter_buffer.depth_ms(),
@@ -1154,7 +1151,6 @@ fn drain_and_decode(
             let fed = Fed {
                 seq,
                 frame_bytes: packet.data.len(),
-                is_keyframe,
                 sent_at: packet.timestamp_ms,
                 enqueued_at: Instant::now(),
             };

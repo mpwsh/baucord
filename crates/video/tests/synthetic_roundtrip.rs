@@ -96,7 +96,7 @@ fn synthetic_roundtrip() {
             if let Some(d) = decoder.decode(&ef).expect("decode") {
                 assert_eq!((d.width, d.height), (1152, 720));
                 decoded += 1;
-                decoder.return_buffer(d.data);
+                video::pool::recycle(d.data);
             }
         }
     }
@@ -131,7 +131,7 @@ fn synthetic_roundtrip() {
             if let Some(d) = decoder.decode(&ef).expect("decode after resize") {
                 assert_eq!((d.width, d.height), (800, 600));
                 saw_new_dims = true;
-                decoder.return_buffer(d.data);
+                video::pool::recycle(d.data);
             }
         }
     }

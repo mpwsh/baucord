@@ -92,7 +92,6 @@ pub use config::{PeerAudioSettings, VoiceChatConfig};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use log::{debug, error, info};
-pub use platform::{promote_current_thread, RtGuard};
 pub use sounds::SoundType;
 pub use stats::AudioStats;
 pub use transport::packet::{AudioPacket, PayloadType};
@@ -1009,12 +1008,6 @@ impl VoiceChat {
         self.output.is_some()
     }
 
-    /// Capture is open.
-    #[must_use]
-    pub fn input_running(&self) -> bool {
-        self.input.is_some()
-    }
-
     // ── Public API ───────────────────────────────────────────────────────
 
     pub fn play_sound(&self, sound: SoundType) {
@@ -1101,12 +1094,6 @@ impl VoiceChat {
             .store(now_ms.max(1), Ordering::Relaxed);
     }
 
-    pub fn set_noise_suppression(&self, enabled: bool) {
-        self.input_config
-            .denoise_enabled
-            .store(enabled, Ordering::Relaxed);
-    }
-
     pub fn set_input_gain(&self, gain: f32) {
         self.input_config
             .input_gain
@@ -1120,40 +1107,10 @@ impl VoiceChat {
             .store(threshold.clamp(0.001, 0.5).to_bits(), Ordering::Relaxed);
     }
 
-    pub fn set_compressor_enabled(&self, enabled: bool) {
-        self.input_config
-            .compressor_enabled
-            .store(enabled, Ordering::Relaxed);
-    }
-
-    pub fn set_compressor_threshold(&self, threshold_db: f32) {
-        self.input_config
-            .compressor
-            .threshold_db
-            .store(threshold_db.clamp(-60.0, 0.0).to_bits(), Ordering::Relaxed);
-    }
-
-    pub fn set_compressor_ratio(&self, ratio: f32) {
-        self.input_config
-            .compressor
-            .ratio
-            .store(ratio.clamp(1.0, 20.0).to_bits(), Ordering::Relaxed);
-    }
-
-    pub fn set_agc_enabled(&self, enabled: bool) {
-        self.input_config
-            .agc_enabled
-            .store(enabled, Ordering::Relaxed);
-    }
-
     pub fn set_loopback(&self, enabled: bool) {
         self.input_config
             .loopback_enabled
             .store(enabled, Ordering::Relaxed);
-    }
-
-    pub fn is_loopback(&self) -> bool {
-        self.input_config.loopback_enabled.load(Ordering::Relaxed)
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -1193,20 +1150,6 @@ impl VoiceChat {
     #[must_use]
     pub fn speaking_edges(&self) -> Receiver<()> {
         self.speaking_edges.clone()
-    }
-
-    pub fn input_level(&self) -> f32 {
-        self.input.as_ref().map_or(0.0, |i| {
-            f32::from_bits(i.input_level_handle().load(Ordering::Relaxed))
-        })
-    }
-
-    pub fn output_level(&self) -> f32 {
-        f32::from_bits(self.stats.output_level.load(Ordering::Relaxed))
-    }
-
-    pub fn denoised_level(&self) -> f32 {
-        f32::from_bits(self.stats.denoised_level.load(Ordering::Relaxed))
     }
 
     pub fn stats_summary(&self) -> String {

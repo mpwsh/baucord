@@ -167,7 +167,7 @@ or `WSAPoll` elsewhere; the client waits on a `ReadWaiter` thread
 instead (§6), which exists on every platform since review P1-1.
 
 Application-facing API, per peer: `send(now, peer, lane, bytes)`,
-`recv(peer, lane)`, `send_video` / `video_new_group` / `video_finish_group`
+`recv(peer, lane)`, `video_new_group` / `video_finish_group`
 / `video_reset_group` / `recv_video`, `send_media(frames)` with
 `upload_progress`, `close` / `close_after`, `export_keying_material`,
 `stats(peer) -> LinkStats`, `track_stats(peer, track)`, and
@@ -245,7 +245,7 @@ bulk never fills the bottleneck queue that voice datagrams share.
 ### Budgets
 
 `config::Budget` holds every tunable: idle timeout (30 s both sides),
-client keep-alive (10 s; it was 2 s until 1.2.1 — the simulator holds
+client keep-alive (5 s; it was 2 s until 1.2.1 — the simulator holds
 an idle connection through 40 % loss on it), ACK delay, datagram
 buffers, stream/connection
 receive windows, `send_window`, socket buffer sizes, media pace. Values

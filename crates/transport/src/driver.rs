@@ -1406,10 +1406,14 @@ impl Driver {
 
     /// Video: send one chunk on the track's current group. Dropped
     /// silently when the group was reset (the next keyframe reopens).
+    /// The relay sends with [`Self::send_video_shared`] and a sharer
+    /// with [`Self::send`] on [`Lane::Video`]; this per-track form is
+    /// what the simulator's tests drive.
     ///
     /// # Errors
     /// Unknown or unconnected peer.
-    pub fn send_video(
+    #[cfg(test)]
+    pub(crate) fn send_video(
         &mut self,
         now: Instant,
         peer: PeerId,

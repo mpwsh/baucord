@@ -21,22 +21,20 @@
 use std::{ffi::c_void, sync::OnceLock};
 
 #[cfg(feature = "app")]
-use jni::{errors::LogErrorAndDefault, objects::JClass, refs::Reference};
+use jni::{
+    errors::LogErrorAndDefault,
+    objects::{JClass, JValue},
+    refs::Reference,
+};
 use jni::{
     errors::Result as JniResult,
-    objects::{JObject, JObjectArray, JString, JValue},
+    objects::{JObject, JObjectArray, JString},
     sys::jobject,
     Env, JavaVM,
 };
 
 /// `PackageManager.PERMISSION_GRANTED`.
 const PERMISSION_GRANTED: i32 = 0;
-/// Our one request code; the answer is not handed back to native code
-/// (the next `Resume` re-checks, and the voice engine retries the
-/// microphone every 2 s until it opens).
-// Only the smoke test never asks; the imports it shares stay used.
-#[cfg_attr(feature = "hello", allow(dead_code))]
-const PERMISSION_REQUEST_CODE: i32 = 1;
 
 /// The `JavaVM` and the Activity (a global reference android-activity
 /// keeps alive for as long as the `AndroidApp` lives — the whole
@@ -53,12 +51,13 @@ pub fn init(vm: *mut c_void, activity: *mut c_void) {
 fn with_activity<R>(
     f: impl for<'j> FnOnce(&mut Env<'j>, &JObject<'j>) -> JniResult<R>,
 ) -> JniResult<R> {
-    let (vm_raw, activity_raw) = ACTIVITY.get().copied().unwrap_or_else(|| {
-        // Before `init` (never, in practice): ndk-context's — the
-        // Application, which answers the Context methods only.
-        let ctx = ndk_context::android_context();
-        (ctx.vm() as usize, ctx.context() as usize)
-    });
+    // `init` is the first thing `android_main` does: nothing calls in
+    // before it.
+    let Some((vm_raw, activity_raw)) = ACTIVITY.get().copied() else {
+        return Err(jni::errors::Error::NullPtr(
+            "the Activity: java::init has not run",
+        ));
+    };
     // SAFETY: a live JavaVM pointer for this process (android-activity's);
     // `from_raw` only wraps it.
     let vm = unsafe { JavaVM::from_raw(vm_raw as *mut jni::sys::JavaVM) };
@@ -109,20 +108,16 @@ pub fn request_permissions(names: &[&str]) -> Result<(), String> {
             let jname = env.new_string(name)?;
             array.set_element(env, i, &jname)?;
         }
-        let asked = env.call_method(
+        // `BaucordActivity.askPermissions`: the one Activity there is
+        // defines it. The answer is not handed back to native code (the
+        // next `Resume` re-checks, and the voice engine retries the
+        // microphone every 2 s until it opens).
+        env.call_method(
             activity,
             jni::jni_str!("askPermissions"),
             jni::jni_sig!("([Ljava/lang/String;)V"),
             &[(&array).into()],
-        );
-        if asked.is_err() {
-            env.call_method(
-                activity,
-                jni::jni_str!("requestPermissions"),
-                jni::jni_sig!("([Ljava/lang/String;I)V"),
-                &[(&array).into(), JValue::Int(PERMISSION_REQUEST_CODE)],
-            )?;
-        }
+        )?;
         Ok(())
     })
     .map_err(|e| e.to_string())

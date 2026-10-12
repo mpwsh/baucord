@@ -81,8 +81,8 @@ impl Fingerprint {
     }
 
     /// The SPKI hash of a certificate (DER), if it can be walked.
-    #[must_use]
-    pub fn of_certificate(cert_der: &[u8]) -> Option<Self> {
+    #[cfg(test)]
+    fn of_certificate(cert_der: &[u8]) -> Option<Self> {
         der::parse_certificate(cert_der).map(|c| Self::of_spki(c.spki))
     }
 

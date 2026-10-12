@@ -68,9 +68,6 @@ pub const QUIET_REPORTS: u64 = 1 << 18;
 
 /// What a 1.0 client can do.
 pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
-/// What a 1.0 server offers: it logs telemetry; it only *logs* client
-/// keys, so it does not announce [`IDENTITY`].
-pub const SERVER_1_0: u64 = TELEMETRY;
 /// What a 1.1 client can do: it logs in by key, presents invites,
 /// renders roles and restrictions, replays history, shows progress,
 /// and makes channels.
@@ -130,9 +127,10 @@ mod tests {
 
     #[test]
     fn negotiate_is_the_intersection() {
-        assert_eq!(negotiate(CLIENT_1_0, SERVER_1_0), TELEMETRY);
-        assert!(has(negotiate(CLIENT_1_0, SERVER_1_0), TELEMETRY));
-        assert!(!has(negotiate(CLIENT_1_0, SERVER_1_0), IDENTITY));
+        // A 1.0 server offered telemetry alone (it only logged keys).
+        assert_eq!(negotiate(CLIENT_1_0, TELEMETRY), TELEMETRY);
+        assert!(has(negotiate(CLIENT_1_0, TELEMETRY), TELEMETRY));
+        assert!(!has(negotiate(CLIENT_1_0, TELEMETRY), IDENTITY));
     }
 
     #[test]

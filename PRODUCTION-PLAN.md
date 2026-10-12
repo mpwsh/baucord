@@ -713,10 +713,11 @@ One line each; the spec decision named holds the detail.
     The receive path sizes its buffers by the platform's batch, builds
     its slices on the stack and splits one buffer per GRO batch (P3-2).
     `ServerIdentity` and `rcgen` are behind a `server` feature (P3-3).
-    The client keep-alive is 10 s, held through 40 % loss in the
-    simulator, and a new bit, `QUIET_REPORTS`, stops the two-second
-    `VoiceReceiverReport` to sessions that send no voice (P2-49); an
-    idle client on a dead link now notices after up to 40 s, not 32.
+    The client keep-alive is 5 s (10 s at first; 5 s since
+    2026-10-12), held through 40 % loss in the simulator, and a new
+    bit, `QUIET_REPORTS`, stops the two-second `VoiceReceiverReport`
+    to sessions that send no voice (P2-49); an idle client on a dead
+    link now notices after up to 35 s, not 32.
   - *Server.* Stream health is per sharer and spans five reports
     (P2-3). File references: recounted from the rows at startup,
     released with the messages a retention pass removes (which also
@@ -751,31 +752,60 @@ One line each; the spec decision named holds the detail.
   - *Build.* The product version, the edition and the licence live
     under `[workspace.package]`; the release workflows, Gradle and the
     iOS scripts read the version there (P2-61).
-  - *Dead code.* `Carrier` and `Lane::carrier`, `Driver::is_server` /
-    `is_connecting` / `has_transmits`, `frame::Decoder::buffered`, the
-    reassembler's statistics, the relay's `group_open`, the on-connect
-    stream announcement that could never fire (`share_visible_from`),
-    two one-line wrappers in `policy.rs`, and four fields of
-    `SharedScreenState` nothing read. The rest of the review's list
-    (audio and video surface, catalog entries, Slint properties, the
-    examples, `skills/`) is still to do.
+  - *Dead code and dead files* (the review's list, 2026-10-12). Files:
+    `skills/` (69 files), `scripts/baucord_thread_audit.ps1`, six of
+    the seven example programs (the audio `latency` one stays).
+    Protocol, transport, server: `Carrier` and `Lane::carrier`,
+    `Driver::is_server` / `is_connecting` / `has_transmits`,
+    `frame::Decoder::buffered`, the reassembler's statistics, the
+    relay's `group_open`, the on-connect stream announcement that could
+    never fire, two one-line wrappers in `policy.rs`, `SERVER_1_0`.
+    Client: the seven media-only messages are an internal enum, so the
+    app's `NetworkMessage` has no arm that never runs (the first half
+    of P2-53); four fields of `SharedScreenState`, two re-exports, two
+    test-only `ServerEntry` helpers. Audio: the endpoint-loopback
+    fallback and the macOS and Linux stand-ins of system-audio capture
+    (Windows process loopback is the one backend; an older Windows 10
+    shares without sound), its unused mute and volume, the microphone
+    level meter nothing read (computed per sample in every capture
+    callback), six setters and five getters of `VoiceChat`, three
+    stats; late packets and device restarts are now on the stats line.
+    Video: the `return_buffer` and `quality` trait methods, three size
+    helpers, the stub decoder and the stub capturer. App: unreachable
+    admin-result arms, a duplicated set of sharer ids, `ureq` out of
+    the phone builds. UI: 33 messages in each of the three catalogs, 12
+    `Tr` properties, 11 `State` properties, two callbacks, three struct
+    fields, five functions — and `i18n/tests/catalog.rs` now fails on a
+    message nothing shows or a language missing one. Android: the
+    `ndk-context` and `requestPermissions` fallbacks,
+    `ACCESS_NETWORK_STATE`, two Gradle flags. *Left on purpose:* the
+    stored telemetry blob with its two decoders and the six unused
+    database columns (dropping them deletes stored data: a migration to
+    decide on), `Config.authentication` (until OPS-1),
+    `DecodedFrame.timestamp_ms` (its writers include the iOS decoder,
+    which cannot be compiled here), and the two `.disabled` workflows
+    (to fix and enable, not to delete).
 
 ## 8. Facts this plan rests on
 
 - **Tests, 2026-10-12, Linux sandbox**: protocol 91 + the versions
   test + 3 wire-pinning tests, transport 55, server 70 unit + 99 e2e,
-  client 55, app-core 112, audio 106, video 73 + 5 — all green. Six
-  more need a real machine:
+  client 55, app-core 112, audio 106, video 73 + 5, i18n 2 — all
+  green. Six more need a real machine:
   that sandbox does not signal UDP readiness, so the socket-wait tests
   (`transport` `udp::read_waiter_tests`, 3; `client` `inbound_wake`,
   `network_idle.rs`, `network_uploads.rs`) cannot pass there. The
   frontend type-checks for the phones and the desktop. The chat
-  pane's 48 scrolling checks (`tools/chat-scroll-sim`) passed on
-  2026-10-09 and were not re-run.
-  Windows-only code (`wasapi.rs`, DXGI) is not compiler-checked here.
-  Android: the Java compiles against API 33's real `android.jar`, the
-  Rust JNI code type-checks in a scratch crate; iOS: the app
-  type-checks with `-Zbuild-std` clippy. Nothing was run on a device.
+  pane's scrolling checks (`tools/chat-scroll-sim`) passed again on
+  2026-10-12, after the unread UI properties were removed.
+  Windows-only code in `transport`, `audio`, `video`, `client` and
+  `server` type-checks for `x86_64-pc-windows-gnu`, and Android-only
+  code in `audio`, `video` and `client` for `aarch64-linux-android`
+  (SESSION-GUIDE §1; first done 2026-10-12 — the WASAPI and socket-wait
+  changes of the P1s had never been compiled before). Not covered: the
+  frontend's Windows and macOS code, anything iOS, the `android` crate
+  beyond its JNI module, Gradle and the Java. Nothing was run on a
+  device.
 - **The release pipeline** (every build first refreshes the
   third-party notices, `licenses.yml`):
 

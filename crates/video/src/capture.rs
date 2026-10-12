@@ -598,8 +598,6 @@ fn screenshot_bgra(monitor_index: usize) -> Result<(Vec<u8>, u32, u32), CaptureE
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub struct ScreenCapturer {
     monitor: Monitor,
-    quality: Quality,
-    frame_count: u64,
     start_time: Instant,
     /// Most recent frame, held for the [`Capturer`] poll/frame API.
     /// Untouched by the plain [`ScreenCapturer::capture`] path.
@@ -656,8 +654,6 @@ impl ScreenCapturer {
 
         Self {
             monitor,
-            quality,
-            frame_count: 0,
             start_time: Instant::now(),
             last: None,
         }
@@ -681,7 +677,6 @@ impl ScreenCapturer {
         let width = image.width();
         let height = image.height();
         let timestamp_ms = self.start_time.elapsed().as_millis() as u64;
-        self.frame_count += 1;
 
         let data = image.into_raw();
 
@@ -716,16 +711,6 @@ impl ScreenCapturer {
         }
         self.last.as_ref()
     }
-
-    #[must_use]
-    pub fn quality(&self) -> Quality {
-        self.quality
-    }
-
-    #[must_use]
-    pub fn frame_count(&self) -> u64 {
-        self.frame_count
-    }
 }
 
 // ── Mobile stub ─────────────────────────────────────────────────────────
@@ -744,37 +729,6 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
 #[cfg(any(target_os = "ios", target_os = "android"))]
 pub fn focused_pid() -> Option<u32> {
     None
-}
-
-/// Stub capturer for platforms without a capture backend.
-#[cfg(any(target_os = "ios", target_os = "android"))]
-pub struct ScreenCapturer {
-    _private: (),
-}
-
-#[cfg(any(target_os = "ios", target_os = "android"))]
-impl ScreenCapturer {
-    pub fn new(_monitor_index: usize, _quality: Quality) -> Result<Self, CaptureError> {
-        Err(CaptureError::Capture(
-            "screen capture is not supported on this platform".into(),
-        ))
-    }
-
-    pub fn primary(quality: Quality) -> Result<Self, CaptureError> {
-        Self::new(0, quality)
-    }
-
-    pub fn capture(&mut self) -> Result<Frame, CaptureError> {
-        unreachable!("stub ScreenCapturer cannot be constructed")
-    }
-
-    pub fn quality(&self) -> Quality {
-        unreachable!("stub ScreenCapturer cannot be constructed")
-    }
-
-    pub fn frame_count(&self) -> u64 {
-        unreachable!("stub ScreenCapturer cannot be constructed")
-    }
 }
 
 /// Stub unified capturer for platforms without a capture backend.

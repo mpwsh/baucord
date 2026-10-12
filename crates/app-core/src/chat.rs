@@ -194,7 +194,6 @@ pub struct RangeDelta {
 #[derive(Default)]
 pub struct ChatHistory {
     rows: Vec<ChatItem>,
-    next_row_id: u64,
     /// The reader is above the newest rows (a page loaded with "load
     /// earlier", or scrolled up): appends do not trim the front out
     /// from under them. See [`Self::hold_front`].
@@ -215,12 +214,6 @@ impl ChatHistory {
     pub fn clear(&mut self) {
         self.rows.clear();
         self.front_held = false;
-    }
-
-    /// Monotonic id for image rows (GIF driver / viewer targeting).
-    pub fn next_id(&mut self) -> u64 {
-        self.next_row_id += 1;
-        self.next_row_id
     }
 
     /// Append a user message. Fenced blocks become their own

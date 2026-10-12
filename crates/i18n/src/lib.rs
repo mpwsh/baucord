@@ -56,7 +56,6 @@ struct State {
     current: Bundle,
     /// `None` when the current locale *is* English.
     fallback: Option<Bundle>,
-    code: &'static str,
 }
 
 static STATE: RwLock<Option<State>> = RwLock::new(None);
@@ -82,19 +81,10 @@ pub fn set_locale(preferred: Option<&str>) -> &'static str {
     let state = State {
         current: build_bundle(locale),
         fallback,
-        code: locale.code,
     };
     *STATE.write().unwrap() = Some(state);
     log::info!("i18n: locale set to {}", locale.code);
     locale.code
-}
-
-/// The active locale code ("en" before `init`).
-///
-/// # Panics
-/// If the locale lock is poisoned (see [`set_locale`]).
-pub fn current_locale() -> &'static str {
-    STATE.read().unwrap().as_ref().map_or("en", |s| s.code)
 }
 
 /// Translate a message id. Prefer the [`t!`] macro.

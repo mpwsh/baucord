@@ -161,24 +161,6 @@ impl Quality {
         std::time::Duration::from_nanos(1_000_000_000 / self.fps() as u64)
     }
 
-    /// Pixel count at the maximum resolution for this preset.
-    #[must_use]
-    pub const fn pixel_count(self) -> usize {
-        self.width() as usize * self.height() as usize
-    }
-
-    /// Byte count for one RGBA frame at the maximum resolution.
-    #[must_use]
-    pub const fn rgba_size(self) -> usize {
-        self.pixel_count() * 4
-    }
-
-    /// Byte count for one YUV420 frame at the maximum resolution.
-    #[must_use]
-    pub const fn yuv420_size(self) -> usize {
-        self.pixel_count() * 3 / 2
-    }
-
     pub const ALL: &'static [Quality] = &[
         Self::HD30,
         Self::HD60,
@@ -397,8 +379,6 @@ pub trait VideoEncoder {
     /// frame with its own sequence number. Never concatenate them.
     fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError>;
 
-    fn quality(&self) -> Quality;
-
     /// Run rate control at `pct` percent of the preset bitrate (clamped
     /// to [`MIN_BITRATE_SCALE_PCT`]`..=100`). Resolution and frame rate
     /// stay as the preset says; only bits per frame change.
@@ -509,13 +489,6 @@ pub struct DecodeTiming {
 pub trait VideoDecoder {
     /// Returns `Ok(None)` when the decoder is still buffering (needs more NALs).
     fn decode(&mut self, encoded: &EncodedFrame) -> Result<Option<DecodedFrame>, CodecError>;
-
-    /// Return a previously-decoded buffer for reuse. Every decoder takes
-    /// its buffers from [`pool`], so [`pool::recycle`] does the same from
-    /// anywhere — the app's present thread gives them back that way.
-    fn return_buffer(&mut self, buf: Vec<u8>) {
-        pool::recycle(buf);
-    }
 
     /// Flush decoder state, clearing internal reference frame buffers.
     ///

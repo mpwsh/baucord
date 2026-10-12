@@ -278,7 +278,6 @@ impl EncoderWorker {
         // every 400 ms (MAX_CONSECUTIVE_DTX), which is > 2 bytes and goes
         // out normally.
         let dtx = size <= 2;
-        self.stats.dtx_active.store(dtx, Ordering::Relaxed);
         if dtx {
             // Withhold the packet. The sequence number only counts
             // transmitted packets, so the receiver sees no gap when speech

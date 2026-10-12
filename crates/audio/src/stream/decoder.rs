@@ -506,19 +506,9 @@ impl StreamDecoder {
         self.volume.store(clamped.to_bits(), Ordering::Relaxed);
     }
 
-    #[must_use]
-    pub fn volume(&self) -> f32 {
-        f32::from_bits(self.volume.load(Ordering::Relaxed))
-    }
-
     /// Mute/unmute stream audio playback.
     pub fn set_muted(&self, muted: bool) {
         self.is_muted.store(muted, Ordering::Relaxed);
-    }
-
-    #[must_use]
-    pub fn is_muted(&self) -> bool {
-        self.is_muted.load(Ordering::Relaxed)
     }
 
     /// What the stream's audio has done so far (see

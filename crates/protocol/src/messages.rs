@@ -2235,7 +2235,7 @@ mod tests {
         let welcome = ServerMessage::Welcome {
             client_id: 42,
             user_id: None,
-            features: crate::features::SERVER_1_0,
+            features: crate::features::TELEMETRY,
         };
         let bytes = encode_server_message(&welcome).unwrap();
         assert!(matches!(

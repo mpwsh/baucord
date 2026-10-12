@@ -45,7 +45,6 @@ server-add = Adicionar servidor
 server-remove = Remover
 server-manage = Gerenciar servidores
 server-new-name = Novo servidor
-save = Salvar
 server-fingerprint = Identidade do servidor (SHA256:…, do convite; aprendida na primeira conexão)
 server-config-note =
     A identidade é aprendida na primeira conexão e fixada; cole-a do log de inicialização do servidor para verificá-lo antes. Vale na próxima conexão.
@@ -94,9 +93,6 @@ chat-your-roles-changed = Seus cargos agora são: { $roles }
 roles-none = nenhum
 reason-none = (sem motivo)
 chat-admin-users-header = { $count } usuário(s) registrados (● online):
-chat-admin-role-created = Papel criado (id { $id })
-chat-admin-blobs-header = { $count } blob(s) guardados
-chat-admin-audit-header = { $count } entradas de auditoria, mais novas primeiro
 chat-admin-restrictions-header = { $count } restrição(ões):
 chat-admin-invites-header = { $count } convite(s):
 restricted-voice = O servidor silenciou você{ $until }{ $reason }
@@ -128,7 +124,6 @@ identity-regenerated = Nova identidade criada. A próxima conexão precisa de um
 
 # ── Sidebar ─────────────────────────────────────────────────────────────
 users-count = Usuários: { $count }
-status-connecting = Conectando...
 status-connected = Conectado
 status-disconnected = Desconectado
 mute = Silenciar
@@ -138,7 +133,6 @@ undeafen = Reativar áudio
 share-screen = Compartilhar tela
 stop-sharing = Parar compartilhamento
 disconnect = Desconectar
-user-volume = Volume do usuário
 reset-audio = Redefinir áudio
 watch-stream = Assistir transmissão
 live = Ao vivo
@@ -180,7 +174,6 @@ stop-watching = Parar de assistir
 viewer-stats = { $res } { $fps }fps { $kbps }KB/s { $mb }MB | buf { $depth }/{ $target }ms jit { $jitter }ms
 
 # ── Audio panel ─────────────────────────────────────────────────────────
-audio-devices-header = DISPOSITIVOS
 audio-input-device = Dispositivo de entrada (microfone)
 audio-output-device = Dispositivo de saída (alto-falantes/fones)
 audio-input-header = ENTRADA
@@ -201,9 +194,6 @@ audio-route-auto = Automático
 audio-route-speaker = Alto-falante
 audio-route-earpiece = Fone do celular
 audio-route-wired = Fone com fio
-audio-device-count = { $inputs } dispositivo(s) de entrada, { $outputs } de saída
-audio-gain-value = Ganho: { $percent }%
-audio-volume-value = Volume: { $percent }%
 audio-sensitivity-line = Sensibilidade: { $name }  (limiar: { $threshold } RMS)
 sensitivity-very-high = Muito alta
 sensitivity-high = Alta
@@ -218,10 +208,8 @@ action-toggle-share = Alternar compartilhamento de tela
 action-push-to-talk = Pressionar para falar
 
 # ── Keybinds panel ──────────────────────────────────────────────────────
-keybinds-header = ATALHOS DE TECLADO
 keybinds-hint = Clique em Gravar e pressione uma combinação de teclas. Esc cancela, Backspace limpa.
 keybind-not-set = Não definido
-keybind-record = Gravar
 keybind-press-combo = Pressione uma combinação de teclas...
 
 # ── Screen share dialog ─────────────────────────────────────────────────
@@ -232,19 +220,15 @@ start-sharing = Iniciar compartilhamento
 error-no-monitors = Nenhum monitor encontrado
 
 # ── Credits panel ───────────────────────────────────────────────────────
-credits-header = CRÉDITOS
 credits-super-testers = SUPER BETA TESTERS
 credits-beta-testers = BETA TESTERS
 
 # ── About panel ─────────────────────────────────────────────────────────
-about-header = SOBRE
 about-running-from = Executando de:
 about-config-file = Arquivo de configuração:
 about-open-config = Abrir pasta de configuração
-about-open-folder = Abrir pasta de instalação
 about-built-with = FEITO COM
 tech-rust = Rust - Linguagem de programação
-tech-fltk = FLTK - Interface de usuário
 tech-quinn = quinn-proto - Transporte QUIC
 tech-ffmpeg = FFmpeg - Codificação/decodificação de vídeo
 tech-xcap = Xcap - Captura de tela
@@ -255,24 +239,19 @@ tech-rubato = Rubato - Reamostragem de áudio
 
 # ── Update flow ─────────────────────────────────────────────────────────
 splash-checking = Verificando atualizações...
-update-available-title = Atualização disponível
 update-available-heading = Nova versão disponível!
 update-version-info =
     Sua versão: { $current }
     Versão mais recente: { $latest }
 update-skip = Pular
 update-now = Atualizar
-update-downloading-title = Atualizando
 update-downloading-heading = Baixando atualização v{ $version }...
-update-starting-download = Iniciando download...
 update-progress = Baixando... { $percent }%
-update-ready-title = Atualização pronta
 update-downloaded-heading = Atualização baixada!
 update-ready-info = Pronto para instalar. O aplicativo será reiniciado automaticamente.
 update-not-now = Agora não
 # Rendered in an FLTK label — the code escapes '&' before display.
 update-install-restart = Instalar e reiniciar
-update-failed-title = Falha na atualização
 update-failed-heading = Falha no download
 update-continue = Continuar
 cancel = Cancelar
@@ -287,18 +266,14 @@ unknown = Desconhecido
 chat-emoji-tooltip = Emojis — ou digite códigos :nome: como :joy:
 chat-attach-tooltip = Envie uma imagem do seu computador
 chat-clear-tooltip = Limpar o chat (só para você)
-chat-image-filter = Imagens
 chat-image-load-error = Não foi possível carregar a imagem: { $error }
 chat-image-undisplayable = { $name } enviou uma imagem que não pôde ser exibida
 image-preview-title = Enviar imagem
 image-save-filter = Imagem PNG
-image-window-title = { $name } — imagem
 menu-cut = Recortar
 menu-copy = Copiar
 menu-paste = Colar
 menu-copy-message = Copiar mensagem
-menu-copy-link = Copiar link
-menu-open-link = Abrir link
 menu-open-image = Abrir imagem
 menu-save-image = Salvar imagem…
 menu-copy-image = Copiar imagem
@@ -310,7 +285,6 @@ resource-line = CPU { $cpu }% · Mem { $mem } MB
 chat-gif-too-large = O GIF ultrapassa o limite de { $mb } MB
 chat-gif-too-big = GIFs animados podem ter no máximo { $dim } px de largura ou altura
 image-save-filter-gif = Imagem GIF
-chat-upload-progress = Enviando imagem… { $pct }%
 
 # ── Adições da migração para Slint ──────────────────────────────────────
 tech-slint = Slint - Interface de usuário
@@ -354,7 +328,6 @@ chat-history-unavailable = O histórico não está disponível agora; tente de n
 chat-edited-mark = (editado)
 chat-deleted-placeholder = Mensagem apagada
 chat-message-edited = A mensagem #{ $id } foi editada: { $text }
-chat-message-deleted = A mensagem #{ $id } foi apagada.
 chat-rate-limited = Devagar: o chat tem limite; tente de novo em { $secs } s.
 chat-level-up = Subiu de nível! Agora você é nível { $level } ({ $xp } xp).
 chat-moved-idle = Você foi movido para o canal AFK após { $min } minutos sem atividade.
@@ -623,7 +596,6 @@ month-11 = novembro
 month-12 = dezembro
 
 # ── Mensagens diretas (spec §6) ───────────────────────────────────────
-chat-dm-received = Mensagem direta de { $name }: { $text }
 dm-failed-offline = Está offline, e este servidor não guarda mensagens.
 dm-failed-no-permission = Mensagens diretas são para membros.
 dm-failed-no-such-user = Esse usuário não existe.
@@ -649,12 +621,9 @@ menu-save-file = Salvar arquivo…
 file-save = Salvar
 file-uploading-pct = Enviando
 file-downloading-pct = Baixando
-file-uploading = Enviando { $name } ({ $size })…
 file-upload-failed = { $name } não foi enviado: { $why }
-file-post-failed = O arquivo não foi publicado: { $why }
 file-too-large = { $name } tem mais de { $max } MB
 file-read-error = Não foi possível ler { $name }: { $error }
-file-downloading = Baixando { $name }…
 notif-channel-voice = Conexão de voz
 notif-connected-title = Conectado a { $server }
 notif-connected-text = Toque para voltar ao app.
@@ -695,10 +664,8 @@ dm-back = Voltar ao Geral
 chat-placeholder-dm = Mensagem para
 menu-message = Mensagem…
 sounds-dm = Chega uma mensagem direta
-chat-dm-with-offline = { $name } está offline; a mensagem espera no servidor.
 chat-command-usage-dm = Uso: /dm <nome> <mensagem>
 chat-dm-unknown = Ninguém aqui se chama { $name }.
-dm-close = Fechar conversa
 
 # ── Admin panel (spec §8) ──
 admin-title = Administração

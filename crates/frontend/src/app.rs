@@ -52,8 +52,7 @@ use i18n::t;
 use log::{info, warn};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use ui::{
-    ChannelOption, ChatRow, DmRow, Logic, MainWindow, MenuAction, ModAction, Phase, State,
-    ToastKind, Tr, UserRow,
+    ChatRow, DmRow, Logic, MainWindow, MenuAction, ModAction, Phase, State, ToastKind, Tr, UserRow,
 };
 
 use crate::{
@@ -290,8 +289,6 @@ pub struct AppState {
     picture_acks: HashMap<u32, Vec<u8>>,
     /// Files saved this session, by blob: the card offers Open.
     downloaded: HashMap<client::protocol::BlobId, std::path::PathBuf>,
-    /// The "Move to" submenu's model, rebuilt with the channel list.
-    channel_options: Rc<VecModel<ChannelOption>>,
     /// A server voice mute stands (spec §4.2): the mute button is
     /// locked, and `Some(was_muted)` remembers what to restore.
     server_muted: Option<bool>,
@@ -387,8 +384,6 @@ pub struct AppState {
     /// rise plays the viewer-joined sound (`StreamHealth` is the only
     /// word the sharer gets, and it goes to the screen thread).
     stream_viewers_seen: u32,
-    /// Sharer display order for the roster projection.
-    sharer_ids: HashSet<u64>,
 
     // Chat
     history: ChatHistory,
@@ -659,7 +654,6 @@ pub fn run() {
 
     let chat_model = Rc::new(VecModel::<ChatRow>::default());
     let users_model = Rc::new(VecModel::<UserRow>::default());
-    let channel_options = Rc::new(VecModel::<ChannelOption>::default());
     let dms_model = Rc::new(VecModel::<DmRow>::default());
     main.global::<State>()
         .set_dms(ModelRc::from(dms_model.clone()));
@@ -667,16 +661,13 @@ pub fn run() {
         .set_chat(ModelRc::from(chat_model.clone()));
     main.global::<State>()
         .set_users(ModelRc::from(users_model.clone()));
-    main.global::<State>()
-        .set_channel_options(ModelRc::from(channel_options.clone()));
 
     // The emoji palette — straight from the shared catalog.
     let emoji_rows: Vec<ui::EmojiRow> = app_core::EMOJI
         .iter()
-        .map(|(name, glyph, section)| ui::EmojiRow {
+        .map(|(name, glyph, _section)| ui::EmojiRow {
             code: (*name).into(),
             glyph: (*glyph).into(),
-            section: (*section).into(),
         })
         .collect();
     main.global::<State>()
@@ -715,7 +706,6 @@ pub fn run() {
         pending_pictures: HashMap::new(),
         picture_acks: HashMap::new(),
         downloaded: HashMap::new(),
-        channel_options,
         server_muted: None,
         text_muted: None,
         oldest_history_id: None,
@@ -754,7 +744,6 @@ pub fn run() {
         is_testing_mic_shared,
         active_sharers: HashMap::new(),
         stream_viewers_seen: 0,
-        sharer_ids: HashSet::new(),
         history: ChatHistory::new(),
         chat_model,
         activity_model: Rc::new(VecModel::default()),
@@ -1457,8 +1446,6 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
             crate::adminui::open(app, crate::adminui::TAB_USERS);
         });
     });
-    let w = Rc::downgrade(state);
-    logic.on_admin_channel_open(move || with_app(&w, AppState::open_admin_channel));
     let w = Rc::downgrade(state);
     logic.on_invite_dialog_create(move || with_app(&w, AppState::invite_dialog_create));
     let w = Rc::downgrade(state);

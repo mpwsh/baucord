@@ -33,7 +33,7 @@
 use std::{
     slice,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -152,7 +152,6 @@ impl NativeCapture {
         wake_tx: Sender<()>,
         stats: Arc<AudioStats>,
         config: Arc<InputConfig>,
-        input_level: Arc<AtomicU32>,
     ) -> Result<Self, CaptureStartError> {
         let (parts_tx, parts_rx) = bounded::<CaptureParts>(1);
         let failed = stats.clone();
@@ -207,7 +206,6 @@ impl NativeCapture {
                 wake_tx,
                 stats,
                 config,
-                input_level,
             },
             channels,
         });

@@ -10,7 +10,7 @@ import { IconSet, IconDisplay } from "@lucide";
 import { Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind, MenuAction, MenuEntry } from "globals.slint";
+import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuAction, MenuEntry } from "globals.slint";
 import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
@@ -22,7 +22,7 @@ import { StreamViewerWindow, StreamViewerPanel } from "viewer.slint";
 
 import { BaucordTray } from "tray.slint";
 
-export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ChannelOption, ModAction, ToastKind, MenuAction, MenuEntry }
+export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuAction, MenuEntry }
 export { AdminWindow, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow }
 
 export component MainWindow inherits Window {
@@ -44,8 +44,6 @@ export component MainWindow inherits Window {
     property <int> share-quality: State.default-quality;
     property <int> share-scope: State.default-scope;   // 0 = my channel, 1 = everyone
 
-    public function chat-at-bottom() -> bool { return chat-pane.at-bottom(); }
-    public function chat-scroll-to-end() { chat-pane.scroll-to-end(); }
     public function chat-pin-bottom() { chat-pane.pin-to-bottom(); }
     public function chat-follow-appended() -> bool { return chat-pane.follow-appended(); }
     // The shell calls this after anything that took the keyboard (a

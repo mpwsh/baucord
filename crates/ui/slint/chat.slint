@@ -864,7 +864,6 @@ component ComposerField inherits Rectangle {
     public function select-all() { input.select-all(); }
     public function do-cut() { input.cut(); }
     public function do-copy() { input.copy(); }
-    public function do-paste() { input.paste(); }
     /// Android: the word the keyboard is still composing is shown in
     /// the field but is not in `text` until the keyboard commits it —
     /// on a space or punctuation, not on Enter or the send button, so a
@@ -1026,11 +1025,6 @@ export component ChatPane inherits Rectangle {
     public pure function following() -> bool { return root.stick-to-bottom; }
     /// How far the view is from the newest row (0 at the bottom).
     public pure function bottom-gap() -> length { return list.gap(); }
-    /// True when the user is at (or within ~40px of) the bottom.
-    public pure function at-bottom() -> bool {
-        return list.content-height <= list.visible-height
-            || list.content-y <= -(list.content-height - list.visible-height - 40px);
-    }
     public function focus-composer() { input.focus-input(); }
     public pure function composer-focused() -> bool { return input.input-focused; }
     public function composer-set-cursor(pos: int) { input.set-cursor(pos); }

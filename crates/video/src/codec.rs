@@ -615,11 +615,6 @@ impl FfmpegEncoder {
         self.enc_name != "h264_amf"
     }
 
-    #[must_use]
-    pub fn quality(&self) -> Quality {
-        self.quality
-    }
-
     /// See [`VideoEncoder::set_bitrate_scale_pct`]. Only records the
     /// request; [`Self::ensure_session`] reopens on the next encode if
     /// the running session was opened at a different scale.
@@ -637,21 +632,11 @@ impl FfmpegEncoder {
     pub fn encoder_name(&self) -> &'static str {
         self.enc_name
     }
-
-    /// The output dimensions of the current session, if one exists.
-    #[must_use]
-    pub fn output_dimensions(&self) -> Option<(u32, u32)> {
-        self.session.as_ref().map(|s| (s.out_w, s.out_h))
-    }
 }
 
 impl VideoEncoder for FfmpegEncoder {
     fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
         self.encode(frame)
-    }
-
-    fn quality(&self) -> Quality {
-        self.quality
     }
 
     fn force_keyframe(&mut self) {
@@ -914,20 +899,11 @@ impl FfmpegDecoder {
             format: crate::PictureFormat::Rgba,
         }))
     }
-
-    /// Return a previously-decoded buffer for reuse (`crate::pool`).
-    pub fn return_buffer(&mut self, buf: Vec<u8>) {
-        crate::pool::recycle(buf);
-    }
 }
 
 impl VideoDecoder for FfmpegDecoder {
     fn decode(&mut self, encoded: &EncodedFrame) -> Result<Option<DecodedFrame>, CodecError> {
         self.decode(encoded)
-    }
-
-    fn return_buffer(&mut self, buf: Vec<u8>) {
-        self.return_buffer(buf);
     }
 
     fn last_timing(&self) -> Option<crate::DecodeTiming> {

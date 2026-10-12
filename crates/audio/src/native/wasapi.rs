@@ -45,7 +45,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     thread::JoinHandle,
@@ -561,7 +561,6 @@ struct CaptureParts {
     wake_tx: Sender<()>,
     stats: Arc<AudioStats>,
     config: Arc<InputConfig>,
-    input_level: Arc<AtomicU32>,
 }
 
 type SetupReport<T> = Result<T, String>;
@@ -579,7 +578,6 @@ impl NativeCapture {
         wake_tx: Sender<()>,
         stats: Arc<AudioStats>,
         config: Arc<InputConfig>,
-        input_level: Arc<AtomicU32>,
     ) -> Result<Self, CaptureStartError> {
         let should_stop = Arc::new(AtomicBool::new(false));
         let (setup_tx, setup_rx) = bounded::<SetupReport<CaptureSetup>>(1);
@@ -607,7 +605,6 @@ impl NativeCapture {
                     wake_tx,
                     stats,
                     config,
-                    input_level,
                 };
                 if let Err(returned) = parts_tx.send(parts) {
                     // Thread died between setup and hand-off; the parts
@@ -773,7 +770,6 @@ fn run_capture(
         wake_tx,
         stats,
         config,
-        input_level,
     } = parts;
     let mut packet_buf: Vec<u8> = Vec::new();
     let mut consecutive_errors = 0u32;
@@ -842,7 +838,6 @@ fn run_capture(
             }
 
             if config.silenced() {
-                input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
                 continue;
             }
 
@@ -857,7 +852,6 @@ fn run_capture(
             if want == 0 {
                 continue;
             }
-            let mut rms_acc = 0.0f32;
             let Ok(chunk) = producer.write_chunk_uninit(want) else {
                 continue;
             };
@@ -868,20 +862,15 @@ fn run_capture(
                     .chunks_exact(bpf)
                     .take(want)
                     .map(|frame| {
-                        let mono = if silent {
+                        if silent {
                             0.0
                         } else {
                             layout.frame_to_mono(frame, ch)
-                        };
-                        rms_acc += mono * mono;
-                        mono
+                        }
                     });
                 chunk.fill_from_iter(&mut it);
             }
 
-            #[allow(clippy::cast_precision_loss)]
-            let rms = (rms_acc / want as f32).sqrt();
-            input_level.store((rms * 3.0).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
             let _ = wake_tx.try_send(());
         }
     }

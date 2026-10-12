@@ -25,7 +25,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     thread,
@@ -124,7 +124,6 @@ pub struct AudioInput {
     config: Arc<InputConfig>,
 
     // ── Observable state (read-only from outside) ────────────────────
-    input_level: Arc<AtomicU32>,
     /// The engine's speaking light, which this input's chain drives.
     is_speaking: Arc<SpeakingFlag>,
 
@@ -187,7 +186,6 @@ impl AudioInput {
             worker_thread: None,
             should_stop: Arc::new(AtomicBool::new(false)),
             config,
-            input_level: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             is_speaking,
             stats,
         })
@@ -279,7 +277,6 @@ impl AudioInput {
             wake_tx,
             self.stats.clone(),
             self.config.clone(),
-            self.input_level.clone(),
         ) {
             Ok(native) => {
                 let rate = native.sample_rate;
@@ -321,7 +318,6 @@ impl AudioInput {
             wake_tx,
             self.stats.clone(),
             self.config.clone(),
-            self.input_level.clone(),
         ) {
             Ok(native) => {
                 let rate = native.sample_rate;
@@ -401,7 +397,6 @@ impl AudioInput {
         let config = self.config.clone();
         let stats = self.stats.clone();
         let stats_err = self.stats.clone();
-        let input_level = self.input_level.clone();
         let ch = channels as usize;
         // cpal's capture thread runs our callback; promote it on first
         // entry (see platform::promote_callback_thread).
@@ -419,12 +414,9 @@ impl AudioInput {
                     crate::platform::promote_callback_thread(FRAME_SIZE as u32, sample_rate);
                 }
                 if config.silenced() {
-                    input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
                     return;
                 }
 
-                let mut rms_acc = 0.0f32;
-                let mut count = 0usize;
                 let mut overrun = false;
 
                 // Downmix into the ring in one chunked write per callback.
@@ -437,18 +429,15 @@ impl AudioInput {
                 }
                 if want > 0 {
                     if let Ok(chunk) = ring_producer.write_chunk_uninit(want) {
+                        // No clamp here: f32 has headroom and the
+                        // processing chain (gate → AGC → comp → clamp
+                        // stage) owns levels. Clipping at capture
+                        // destroyed the very peaks the compressor
+                        // exists to handle gracefully.
+                        #[allow(clippy::cast_precision_loss)]
                         let mut it = data.chunks(ch).take(want).map(|frame| {
                             let sum: f32 = frame.iter().map(|s| s.to_sample::<f32>()).sum();
-                            // No clamp here: f32 has headroom and the
-                            // processing chain (gate → AGC → comp → clamp
-                            // stage) owns levels. Clipping at capture
-                            // destroyed the very peaks the compressor
-                            // exists to handle gracefully.
-                            #[allow(clippy::cast_precision_loss)]
-                            let mono = sum / ch as f32;
-                            rms_acc += mono * mono;
-                            count += 1;
-                            mono
+                            sum / ch as f32
                         });
                         chunk.fill_from_iter(&mut it);
                     } else {
@@ -457,13 +446,6 @@ impl AudioInput {
                 }
                 if overrun {
                     stats.input_overruns.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if count > 0 {
-                    #[allow(clippy::cast_precision_loss)]
-                    let rms = (rms_acc / count as f32).sqrt();
-                    let scaled = (rms * 3.0).clamp(0.0, 1.0);
-                    input_level.store(scaled.to_bits(), Ordering::Relaxed);
                 }
 
                 // Data available — wake the worker (lock-free latch).
@@ -539,10 +521,6 @@ impl AudioInput {
             return Some(n.device_name.clone());
         }
         crate::device_name(&self.cpal.as_ref()?.0)
-    }
-
-    pub fn input_level_handle(&self) -> Arc<AtomicU32> {
-        self.input_level.clone()
     }
 }
 
@@ -731,9 +709,6 @@ fn worker_loop(
 
             chain.process(&mut frame, &mut ctx);
 
-            stats
-                .denoise_active
-                .store(ctx.denoise_enabled, Ordering::Relaxed);
             stats
                 .denoised_level
                 .store(ctx.denoised_level.to_bits(), Ordering::Relaxed);

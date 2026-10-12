@@ -18,18 +18,6 @@ pub enum PayloadType {
     Red = 1,
 }
 
-impl PayloadType {
-    /// Decode the wire byte. `None` for values this version doesn't know.
-    #[must_use]
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::Opus),
-            1 => Some(Self::Red),
-            _ => None,
-        }
-    }
-}
-
 /// Header for an audio packet.
 #[derive(Debug, Clone)]
 pub struct PacketHeader {

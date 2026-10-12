@@ -1,16 +1,14 @@
-//! Codec stubs for platforms without an FFmpeg build (iOS / Android).
+//! The encoder's stand-in for platforms without an FFmpeg build (iOS /
+//! Android).
 //!
-//! Same type names and constructor signatures as the real [`codec`
-//! module](crate::codec); construction always fails with a clear
-//! [`CodecError`], which the client's `create_encoder` /
-//! `create_decoder` factories already convert into UI-visible errors
-//! (and, for incoming streams, a one-time warning + dropped frames).
-//!
-//! The mobile *viewers* do not use this decoder: Android decodes with
-//! `mediacodec.rs`, iOS with `videotoolbox.rs` (the client's
-//! `create_decoder` picks them); only the encoder stub matters there.
+//! Same type name and constructor signature as the real [`codec`
+//! module](crate::codec)'s; construction always fails with a clear
+//! [`CodecError`], which the client's `create_encoder` factory already
+//! converts into a UI-visible error. There is no decoder here: Android
+//! decodes with `mediacodec.rs`, iOS with `videotoolbox.rs` (the
+//! client's `create_decoder` picks them).
 
-use crate::{CodecError, DecodedFrame, EncodedFrame, Frame, Quality, VideoDecoder, VideoEncoder};
+use crate::{CodecError, EncodedFrame, Frame, Quality, VideoEncoder};
 
 const UNSUPPORTED: &str = "no video codec backend on this platform";
 
@@ -34,28 +32,7 @@ impl VideoEncoder for FfmpegEncoder {
         unreachable!("stub FfmpegEncoder cannot be constructed")
     }
 
-    fn quality(&self) -> Quality {
-        unreachable!("stub FfmpegEncoder cannot be constructed")
-    }
-
     fn force_keyframe(&mut self) {
         unreachable!("stub FfmpegEncoder cannot be constructed")
-    }
-}
-
-/// Stub decoder — construction always fails.
-pub struct FfmpegDecoder {
-    _private: (),
-}
-
-impl FfmpegDecoder {
-    pub fn new() -> Result<Self, CodecError> {
-        Err(CodecError::DecoderInit(UNSUPPORTED.into()))
-    }
-}
-
-impl VideoDecoder for FfmpegDecoder {
-    fn decode(&mut self, _encoded: &EncodedFrame) -> Result<Option<DecodedFrame>, CodecError> {
-        unreachable!("stub FfmpegDecoder cannot be constructed")
     }
 }

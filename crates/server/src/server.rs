@@ -796,9 +796,9 @@ impl ChatServer {
         }
     }
 
-    /// Mutable access to the persistence handle (the CLI bridge in a
-    /// later step; tests).
-    pub fn persistence_mut(&mut self) -> &mut Persist {
+    /// Mutable access to the persistence handle, for this file's tests.
+    #[cfg(test)]
+    fn persistence_mut(&mut self) -> &mut Persist {
         &mut self.persist
     }
 

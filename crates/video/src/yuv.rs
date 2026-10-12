@@ -5,7 +5,7 @@
 //! buffer — three planes at vendor-chosen offsets and strides, described
 //! either by a `MediaImage2` record (`image-data`) or by the classic
 //! `color-format` + `stride` + `slice-height` trio. [`Yuv420Layout`]
-//! names the common shape of both and [`to_rgba`] walks it.
+//! names the common shape of both and [`to_rgba_into`] walks it.
 //!
 //! `VideoToolbox` (`videotoolbox.rs`, iOS) is asked for BGRA instead —
 //! it converts on the GPU with the stream's own colour signalling — and
@@ -39,7 +39,7 @@ pub struct Yuv420Layout {
     /// Top-left of the visible rectangle, in luma pixels (even).
     pub crop_x: u32,
     pub crop_y: u32,
-    /// Visible size — the [`to_rgba`] output's dimensions.
+    /// Visible size — the [`to_rgba_into`] output's dimensions.
     pub width: u32,
     pub height: u32,
 }
@@ -308,15 +308,10 @@ impl Coeffs {
     }
 }
 
-/// Convert the visible rectangle of `src` (laid out as `layout` says)
-/// into tightly packed RGBA in `out`, which is resized to
-/// `width × height × 4` — without zero-filling a buffer that already
-/// has that size (a reused one).
-///
-/// # Errors
-/// The buffer is too small for the layout (or a stride is zero) — an
-/// error, not a panic, since the layout came from a vendor codec.
-pub fn to_rgba(
+/// [`to_rgba_into`] on one thread, into an `out` it sizes: what the
+/// tests convert with.
+#[cfg(test)]
+fn to_rgba(
     src: &[u8],
     layout: &Yuv420Layout,
     spec: ColorSpec,
@@ -335,15 +330,18 @@ pub fn to_rgba(
 /// enough that handing them out costs nothing.
 const BAND_ROWS: usize = 32;
 
-/// As [`to_rgba`], into `out` of exactly `width × height × 4` bytes —
-/// the buffer the picture will be drawn from — on up to `threads`
-/// threads (the caller's included), which take bands of rows as they
-/// come free. A 1080p picture is ~2 M pixels: on a mid-range phone one
+/// Convert the visible rectangle of `src` (laid out as `layout` says)
+/// into tightly packed RGBA in `out`, of exactly `width × height × 4`
+/// bytes — the buffer the picture will be drawn from — on up to
+/// `threads` threads (the caller's included), which take bands of rows
+/// as they come free. A 1080p picture is ~2 M pixels: on a mid-range phone one
 /// core takes ~25 ms over it (2026-10-08, MOB-18), more than a 60 fps
 /// frame has.
 ///
 /// # Errors
-/// As [`to_rgba`], and when `out` is not the visible size.
+/// The source is too small for the layout (or a stride is zero), or
+/// `out` is not the visible size — errors, not panics, since the layout
+/// came from a vendor codec.
 pub fn to_rgba_into(
     src: &[u8],
     layout: &Yuv420Layout,

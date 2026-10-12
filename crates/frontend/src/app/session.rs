@@ -157,7 +157,6 @@ impl AppState {
         self.is_testing_mic = false;
         self.channels.clear();
         self.channel_infos.clear();
-        self.channel_options.set_vec(Vec::new());
         self.main.global::<State>().set_moderation_open(false);
         self.push_permissions();
         self.pending_channel_join = None;
@@ -193,7 +192,6 @@ impl AppState {
             self.screen.tx.send(ScreenControl::StopSharing).ok();
         }
         self.active_sharers.clear();
-        self.sharer_ids.clear();
         // Closing a viewer only hides it: the screen thread must be told
         // too, or it keeps the stream's decoder, buffers and audio for
         // the rest of the process — the sharer's id is gone with the

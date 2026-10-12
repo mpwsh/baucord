@@ -5,7 +5,7 @@
 //! thread: no locks, no allocation, no logging.
 
 use std::sync::{
-    atomic::{AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
@@ -18,14 +18,13 @@ use crate::{input_config::InputConfig, stats::AudioStats};
 /// buffer; bigger ones are served in pieces.
 const RENDER_SCRATCH: usize = 8192;
 
-/// What a capture callback needs: the ring to the capture worker, its
-/// wake latch, and the meters.
+/// What a capture callback needs: the ring to the capture worker and
+/// its wake latch.
 pub struct CapturePump {
     pub producer: Producer<f32>,
     pub wake_tx: Sender<()>,
     pub stats: Arc<AudioStats>,
     pub config: Arc<InputConfig>,
-    pub input_level: Arc<AtomicU32>,
 }
 
 impl CapturePump {
@@ -33,7 +32,6 @@ impl CapturePump {
     /// → mono into the ring, then ping the worker.
     pub fn push(&mut self, data: &[f32], channels: usize) {
         if self.config.silenced() {
-            self.input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
             return;
         }
         let ch = channels.max(1);
@@ -45,20 +43,14 @@ impl CapturePump {
         if want == 0 {
             return;
         }
-        let mut rms_acc = 0.0f32;
         if let Ok(chunk) = self.producer.write_chunk_uninit(want) {
-            let mut it = data.chunks_exact(ch).take(want).map(|frame| {
-                #[allow(clippy::cast_precision_loss)]
-                let mono = frame.iter().sum::<f32>() / ch as f32;
-                rms_acc += mono * mono;
-                mono
-            });
+            #[allow(clippy::cast_precision_loss)]
+            let mut it = data
+                .chunks_exact(ch)
+                .take(want)
+                .map(|frame| frame.iter().sum::<f32>() / ch as f32);
             chunk.fill_from_iter(&mut it);
         }
-        #[allow(clippy::cast_precision_loss)]
-        let rms = (rms_acc / want as f32).sqrt();
-        self.input_level
-            .store((rms * 3.0).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         let _ = self.wake_tx.try_send(());
     }
 }

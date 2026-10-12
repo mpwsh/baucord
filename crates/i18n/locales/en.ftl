@@ -45,7 +45,6 @@ server-add = Add server
 server-remove = Remove
 server-manage = Manage servers
 server-new-name = New server
-save = Save
 server-fingerprint = Server identity (SHA256:…, from the invite; learned on first connect)
 server-config-note =
     The identity is learned on first connect and pinned; paste it from the server's startup log to verify the server up front. Applies on the next connect.
@@ -94,9 +93,6 @@ chat-your-roles-changed = Your roles are now: { $roles }
 roles-none = none
 reason-none = (no reason given)
 chat-admin-users-header = { $count } user(s) of record (● online):
-chat-admin-role-created = Role created (id { $id })
-chat-admin-blobs-header = { $count } blob(s) stored
-chat-admin-audit-header = { $count } audit entries, newest first
 chat-admin-restrictions-header = { $count } restriction(s):
 chat-admin-invites-header = { $count } invite(s):
 restricted-voice = You have been muted by the server{ $until }{ $reason }
@@ -128,7 +124,6 @@ identity-regenerated = New identity created. The next connection needs an invite
 
 # ── Sidebar ─────────────────────────────────────────────────────────────
 users-count = Users: { $count }
-status-connecting = Connecting ...
 status-connected = Connected
 status-disconnected = Disconnected
 mute = Mute
@@ -138,7 +133,6 @@ undeafen = Undeafen
 share-screen = Share Screen
 stop-sharing = Stop Sharing
 disconnect = Disconnect
-user-volume = User Volume
 reset-audio = Reset Audio
 watch-stream = Watch Stream
 live = Live
@@ -180,7 +174,6 @@ stop-watching = Stop Watching
 viewer-stats = { $res } { $fps }fps { $kbps }KB/s { $mb }MB | buf { $depth }/{ $target }ms jit { $jitter }ms
 
 # ── Audio panel ─────────────────────────────────────────────────────────
-audio-devices-header = DEVICES
 audio-input-device = Input Device (Microphone)
 audio-output-device = Output Device (Speakers/Headphones)
 audio-input-header = INPUT
@@ -201,9 +194,6 @@ audio-route-auto = Automatic
 audio-route-speaker = Speaker
 audio-route-earpiece = Phone earpiece
 audio-route-wired = Wired headset
-audio-device-count = { $inputs } input, { $outputs } output devices
-audio-gain-value = Gain: { $percent }%
-audio-volume-value = Volume: { $percent }%
 audio-sensitivity-line = Sensitivity: { $name }  (threshold: { $threshold } RMS)
 sensitivity-very-high = Very High
 sensitivity-high = High
@@ -218,10 +208,8 @@ action-toggle-share = Toggle Screen Share
 action-push-to-talk = Push to talk
 
 # ── Keybinds panel ──────────────────────────────────────────────────────
-keybinds-header = KEYBOARD SHORTCUTS
 keybinds-hint = Click Record, then press a key combo. Esc cancels, Backspace clears.
 keybind-not-set = Not set
-keybind-record = Record
 keybind-press-combo = Press a key combo...
 
 # ── Screen share dialog ─────────────────────────────────────────────────
@@ -232,19 +220,15 @@ start-sharing = Start Sharing
 error-no-monitors = No monitors found
 
 # ── Credits panel ───────────────────────────────────────────────────────
-credits-header = CREDITS
 credits-super-testers = SUPER BETA TESTERS
 credits-beta-testers = BETA TESTERS
 
 # ── About panel ─────────────────────────────────────────────────────────
-about-header = ABOUT
 about-running-from = Running from:
 about-config-file = Config file:
 about-open-config = Open config location
-about-open-folder = Open install folder
 about-built-with = BUILT WITH
 tech-rust = Rust - Programming Language
-tech-fltk = FLTK - User Interface
 tech-quinn = quinn-proto - QUIC transport
 tech-ffmpeg = FFmpeg - Video Encoding/Decoding
 tech-xcap = Xcap - Screen capture
@@ -255,24 +239,19 @@ tech-rubato = Rubato - Audio Resampling
 
 # ── Update flow ─────────────────────────────────────────────────────────
 splash-checking = Checking for updates...
-update-available-title = Update Available
 update-available-heading = New version available!
 update-version-info =
     Your version: { $current }
     Latest version: { $latest }
 update-skip = Skip
 update-now = Update
-update-downloading-title = Updating
 update-downloading-heading = Downloading update v{ $version }...
-update-starting-download = Starting download...
 update-progress = Downloading... { $percent }%
-update-ready-title = Update Ready
 update-downloaded-heading = Update downloaded!
 update-ready-info = Ready to install. The app will restart automatically.
 update-not-now = Not Now
 # Rendered in an FLTK label — the code escapes '&' before display.
 update-install-restart = Install & Restart
-update-failed-title = Update Failed
 update-failed-heading = Download failed
 update-continue = Continue
 cancel = Cancel
@@ -287,18 +266,14 @@ unknown = Unknown
 chat-emoji-tooltip = Emoji — or type :name: codes like :joy:
 chat-attach-tooltip = Send an image from your computer
 chat-clear-tooltip = Clear chat (just for you)
-chat-image-filter = Images
 chat-image-load-error = Couldn't load image: { $error }
 chat-image-undisplayable = { $name } sent an image that could not be displayed
 image-preview-title = Send image
 image-save-filter = PNG image
-image-window-title = { $name } — image
 menu-cut = Cut
 menu-copy = Copy
 menu-paste = Paste
 menu-copy-message = Copy message
-menu-copy-link = Copy link
-menu-open-link = Open link
 menu-open-image = Open image
 menu-save-image = Save image…
 menu-copy-image = Copy image
@@ -310,7 +285,6 @@ resource-line = CPU { $cpu }% · Mem { $mem } MB
 chat-gif-too-large = GIF is over the { $mb } MB limit
 chat-gif-too-big = Animated GIFs can be at most { $dim } px wide or tall
 image-save-filter-gif = GIF image
-chat-upload-progress = Uploading image… { $pct }%
 
 # ── Slint-migration additions ───────────────────────────────────────────
 tech-slint = Slint - User Interface
@@ -354,7 +328,6 @@ chat-history-unavailable = History is not available right now; try again in { $s
 chat-edited-mark = (edited)
 chat-deleted-placeholder = Message deleted
 chat-message-edited = Message #{ $id } was edited: { $text }
-chat-message-deleted = Message #{ $id } was deleted.
 chat-rate-limited = Slow down — chat is rate limited; try again in { $secs } s.
 chat-level-up = Level up! You are now level { $level } ({ $xp } xp).
 chat-moved-idle = You were moved to the AFK channel after { $min } idle minutes.
@@ -623,7 +596,6 @@ month-11 = November
 month-12 = December
 
 # ── Direct messages (spec §6) ─────────────────────────────────────────
-chat-dm-received = Direct message from { $name }: { $text }
 dm-failed-offline = They're offline, and this server doesn't keep messages.
 dm-failed-no-permission = Direct messages are for members.
 dm-failed-no-such-user = No such user.
@@ -649,12 +621,9 @@ menu-save-file = Save file…
 file-save = Save
 file-uploading-pct = Uploading
 file-downloading-pct = Downloading
-file-uploading = Uploading { $name } ({ $size })…
 file-upload-failed = { $name } was not uploaded: { $why }
-file-post-failed = The file was not posted: { $why }
 file-too-large = { $name } is larger than { $max } MB
 file-read-error = Unable to read { $name }: { $error }
-file-downloading = Downloading { $name }…
 notif-channel-voice = Voice connection
 notif-connected-title = Connected to { $server }
 notif-connected-text = Tap to return to the app.
@@ -695,10 +664,8 @@ dm-back = Back to General
 chat-placeholder-dm = Message
 menu-message = Message…
 sounds-dm = A direct message arrives
-chat-dm-with-offline = { $name } is offline; the message waits on the server.
 chat-command-usage-dm = Usage: /dm <name> <message>
 chat-dm-unknown = Nobody here is called { $name }.
-dm-close = Close conversation
 
 # ── Admin panel (spec §8) ──
 admin-title = Admin

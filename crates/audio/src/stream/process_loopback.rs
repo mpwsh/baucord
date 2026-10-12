@@ -12,8 +12,9 @@
 //! Availability: the API shipped with Windows 10 2004 (build 19041);
 //! Microsoft's ApplicationLoopback sample README claims build 20348+.
 //! We don't version-sniff — activation failure *is* the signal, and
-//! `input::SystemAudioCapture` falls back to the cpal endpoint-loopback
-//! backend when `start()` reports one.
+//! `input::SystemAudioCapture` then reports that the share has no
+//! sound (the endpoint-loopback fallback it once had sent peers' own
+//! voices back to them).
 //!
 //! ## Differences from endpoint loopback worth remembering
 //!

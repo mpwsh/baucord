@@ -182,6 +182,109 @@ fn hex_short(bytes: &[u8]) -> String {
     })
 }
 
+/// What the session produces for the other worker threads, not for the
+/// app: media to play and the link feedback the encoders steer by. They
+/// were variants of [`NetworkMessage`], which the app then had to name
+/// in an arm that never ran (review P2-53).
+enum Hot {
+    VoiceData {
+        client_id: ClientId,
+        seq: u32,
+        timestamp: u32,
+        data: Vec<u8>,
+        /// `data` is a redundant audio bundle (`VOICE_FLAG_RED`), not a
+        /// bare Opus packet.
+        red: bool,
+    },
+    /// The relay's account of our voice over the last two seconds
+    /// (routed to the voice thread, not app): the only loss figure the
+    /// audio ladder acts on (spec §6.1).
+    VoiceReceiverReport {
+        /// Percent of expected packets that never arrived, clamped.
+        loss_pct: u32,
+        rtt_ms: u32,
+        /// The window held enough packets to mean something.
+        exercised: bool,
+    },
+    /// Our own video uplink as the transport measures it (routed to the
+    /// screen thread, not app): the share of groups we had to abandon,
+    /// which is what the bitrate ladder steps on.
+    UplinkVideo {
+        /// Groups reset over groups started in the window, percent.
+        behind_pct: f32,
+        rtt_ms: f32,
+        kbps_up: f32,
+        /// The counts behind `behind_pct`, and the transport's packet
+        /// loss over the same window (the sharer's summary line).
+        groups_started: u32,
+        groups_reset: u32,
+        path_loss_pct: f32,
+    },
+    /// An inbound video frame (routed to screen thread, not app).
+    VideoFrame {
+        client_id: u64,
+        seq: u32,
+        is_keyframe: bool,
+        width: u32,
+        height: u32,
+        /// Sender capture time, ms on the sender's clock (wraps).
+        timestamp_ms: u32,
+        data: Vec<u8>,
+    },
+    /// An inbound system audio packet (routed to screen thread, not app).
+    SystemAudioData {
+        client_id: u64,
+        seq: u32,
+        data: Vec<u8>,
+    },
+    /// A viewer of our screen share requested a fresh keyframe
+    /// (routed to screen thread, not app).
+    KeyframeRequested { viewer_id: ClientId },
+    /// Aggregated viewer health for the stream we are sharing
+    /// (routed to screen thread, not app — shown in the sharer's stats).
+    StreamHealth {
+        worst_loss: f32,
+        worst_rtt_ms: f32,
+        viewers: u16,
+    },
+}
+
+/// One thing a pass of the session produced, in the order it happened.
+enum Routed {
+    App(NetworkMessage),
+    Hot(Hot),
+}
+
+impl From<NetworkMessage> for Routed {
+    fn from(msg: NetworkMessage) -> Self {
+        Routed::App(msg)
+    }
+}
+
+impl From<Hot> for Routed {
+    fn from(hot: Hot) -> Self {
+        Routed::Hot(hot)
+    }
+}
+
+/// What the session has produced since the last poll.
+#[derive(Default)]
+struct Outbox(Vec<Routed>);
+
+impl Outbox {
+    fn push(&mut self, item: impl Into<Routed>) {
+        self.0.push(item.into());
+    }
+
+    /// The messages for the app among them.
+    fn for_app(&self) -> impl Iterator<Item = &NetworkMessage> {
+        self.0.iter().filter_map(|item| match item {
+            Routed::App(msg) => Some(msg),
+            Routed::Hot(_) => None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
     /// Progress of one of our uploads, 0–100, named so the UI moves the
@@ -430,15 +533,6 @@ pub enum NetworkMessage {
         username: String,
         data: Vec<u8>,
     },
-    VoiceData {
-        client_id: ClientId,
-        seq: u32,
-        timestamp: u32,
-        data: Vec<u8>,
-        /// `data` is a redundant audio bundle (`VOICE_FLAG_RED`), not a
-        /// bare Opus packet.
-        red: bool,
-    },
     UserSpeaking {
         client_id: ClientId,
         is_speaking: bool,
@@ -461,30 +555,6 @@ pub enum NetworkMessage {
         /// Inbound throughput in kbit/s.
         kbps_down: f64,
     },
-    /// The relay's account of our voice over the last two seconds
-    /// (routed to the voice thread, not app): the only loss figure the
-    /// audio ladder acts on (spec §6.1).
-    VoiceReceiverReport {
-        /// Percent of expected packets that never arrived, clamped.
-        loss_pct: u32,
-        rtt_ms: u32,
-        /// The window held enough packets to mean something.
-        exercised: bool,
-    },
-    /// Our own video uplink as the transport measures it (routed to the
-    /// screen thread, not app): the share of groups we had to abandon,
-    /// which is what the bitrate ladder steps on.
-    UplinkVideo {
-        /// Groups reset over groups started in the window, percent.
-        behind_pct: f32,
-        rtt_ms: f32,
-        kbps_up: f32,
-        /// The counts behind `behind_pct`, and the transport's packet
-        /// loss over the same window (the sharer's summary line).
-        groups_started: u32,
-        groups_reset: u32,
-        path_loss_pct: f32,
-    },
 
     // ── Screen share events ─────────────────────────────────────────
     /// A remote user started sharing their screen.
@@ -506,35 +576,6 @@ pub enum NetworkMessage {
     SubscribeDenied {
         target_id: ClientId,
         reason: DenyReason,
-    },
-    /// An inbound video frame (routed to screen thread, not app).
-    VideoFrame {
-        client_id: u64,
-        seq: u32,
-        is_keyframe: bool,
-        width: u32,
-        height: u32,
-        /// Sender capture time, ms on the sender's clock (wraps).
-        timestamp_ms: u32,
-        data: Vec<u8>,
-    },
-    /// An inbound system audio packet (routed to screen thread, not app).
-    SystemAudioData {
-        client_id: u64,
-        seq: u32,
-        data: Vec<u8>,
-    },
-    /// A viewer of our screen share requested a fresh keyframe
-    /// (routed to screen thread, not app).
-    KeyframeRequested {
-        viewer_id: ClientId,
-    },
-    /// Aggregated viewer health for the stream we are sharing
-    /// (routed to screen thread, not app — shown in the sharer's stats).
-    StreamHealth {
-        worst_loss: f32,
-        worst_rtt_ms: f32,
-        viewers: u16,
     },
 
     // ── 1.1.2: profiles and blobs (spec §7, §7.1) ────────────────────
@@ -776,7 +817,7 @@ pub(crate) struct NetworkClient {
     identity: Option<Observation>,
     client_info: ClientInfo,
     usernames: HashMap<ClientId, String>,
-    message_queue: Vec<NetworkMessage>,
+    message_queue: Outbox,
     reassembler: VideoReassembler,
     // Speaking status dedupe (only send on change)
     last_speaking_sent: bool,
@@ -900,7 +941,7 @@ impl NetworkClient {
                 portable,
             },
             usernames: HashMap::new(),
-            message_queue: Vec::new(),
+            message_queue: Outbox::default(),
             reassembler: VideoReassembler::new(),
             last_speaking_sent: false,
             image_upload: None,
@@ -1110,7 +1151,7 @@ impl NetworkClient {
                 // admitted, a `Removed`, which closes the session before
                 // this arrives); that verdict was already reported — or
                 // never arrived, in which case say so.
-                if !self.message_queue.iter().any(|m| {
+                if !self.message_queue.for_app().any(|m| {
                     matches!(
                         m,
                         NetworkMessage::NeedInvite { .. }
@@ -1252,12 +1293,11 @@ impl NetworkClient {
                 self.reports_stalled = true;
             }
             #[allow(clippy::cast_sign_loss)] // both non-negative by construction
-            self.message_queue
-                .push(NetworkMessage::VoiceReceiverReport {
-                    loss_pct: UPLINK_LOSS_CLAMP_PCT as u32,
-                    rtt_ms: rtt_ms.max(0.0) as u32,
-                    exercised: true,
-                });
+            self.message_queue.push(Hot::VoiceReceiverReport {
+                loss_pct: UPLINK_LOSS_CLAMP_PCT as u32,
+                rtt_ms: rtt_ms.max(0.0) as u32,
+                exercised: true,
+            });
         }
 
         // The sharer's leg, measured on the video itself: only groups
@@ -1279,7 +1319,7 @@ impl NetworkClient {
             } else {
                 (reset as f32 * 100.0 / started as f32).min(100.0)
             };
-            self.message_queue.push(NetworkMessage::UplinkVideo {
+            self.message_queue.push(Hot::UplinkVideo {
                 behind_pct,
                 rtt_ms: rtt_ms as f32,
                 kbps_up: kbps_up as f32,
@@ -1608,14 +1648,14 @@ impl NetworkClient {
             }
             ServerMessage::KeyframeRequested { viewer_id } => {
                 self.message_queue
-                    .push(NetworkMessage::KeyframeRequested { viewer_id });
+                    .push(Hot::KeyframeRequested { viewer_id });
             }
             ServerMessage::StreamHealth {
                 worst_loss,
                 worst_rtt_ms,
                 viewers,
             } => {
-                self.message_queue.push(NetworkMessage::StreamHealth {
+                self.message_queue.push(Hot::StreamHealth {
                     worst_loss,
                     worst_rtt_ms,
                     viewers,
@@ -1642,12 +1682,11 @@ impl NetworkClient {
                         .round()
                         .min(UPLINK_LOSS_CLAMP_PCT) as u32
                 };
-                self.message_queue
-                    .push(NetworkMessage::VoiceReceiverReport {
-                        loss_pct,
-                        rtt_ms,
-                        exercised,
-                    });
+                self.message_queue.push(Hot::VoiceReceiverReport {
+                    loss_pct,
+                    rtt_ms,
+                    exercised,
+                });
             }
             // ── 1.1: session, removal, invites ───────────────────────
             ServerMessage::Session {
@@ -1972,7 +2011,7 @@ impl NetworkClient {
             let Some((header, frame)) = parse_voice(packet) else {
                 continue;
             };
-            self.message_queue.push(NetworkMessage::VoiceData {
+            self.message_queue.push(Hot::VoiceData {
                 client_id: sender_id,
                 seq: header.seq,
                 timestamp: header.timestamp,
@@ -2004,7 +2043,7 @@ impl NetworkClient {
                         continue;
                     };
                     if let Some(frame) = self.reassembler.push_chunk(sender_id, chunk) {
-                        self.message_queue.push(NetworkMessage::VideoFrame {
+                        self.message_queue.push(Hot::VideoFrame {
                             client_id: frame.sender_id,
                             seq: frame.seq,
                             is_keyframe: frame.is_keyframe,
@@ -2029,7 +2068,7 @@ impl NetworkClient {
             let Some((header, payload)) = parse_system_audio(packet) else {
                 continue;
             };
-            self.message_queue.push(NetworkMessage::SystemAudioData {
+            self.message_queue.push(Hot::SystemAudioData {
                 client_id: sender_id,
                 seq: header.seq,
                 data: payload.to_vec(),
@@ -2560,8 +2599,8 @@ impl NetworkClient {
         self.send_control(now, &ClientMessage::RequestKeyframe { target_id });
     }
 
-    pub fn poll_messages(&mut self) -> Vec<NetworkMessage> {
-        std::mem::take(&mut self.message_queue)
+    fn poll_messages(&mut self) -> Vec<Routed> {
+        std::mem::take(&mut self.message_queue.0)
     }
 
     /// The session is over and its reason has been reported.
@@ -3253,12 +3292,11 @@ impl Tally {
     }
 }
 
-/// Route one message from the session to whoever consumes it: media
+/// Route one thing the session produced to whoever consumes it: media
 /// and link feedback to the voice/screen threads (hot paths, bypassing
 /// the app), everything else to the app.
-#[allow(clippy::too_many_lines)]
 fn route_message(
-    msg: NetworkMessage,
+    msg: Routed,
     msg_tx: &Sender<NetworkMessage>,
     voice: Option<&VoiceLink>,
     voice_tx: &Sender<VoiceControl>,
@@ -3266,10 +3304,73 @@ fn route_message(
     wake: &WakeFn,
     frames_dropped: &mut Tally,
 ) {
+    let msg = match msg {
+        Routed::Hot(hot) => {
+            route_hot(hot, voice, voice_tx, screen_tx, frames_dropped);
+            return;
+        }
+        Routed::App(msg) => msg,
+    };
     match msg {
+        // Screen share signaling → screen thread + app
+        NetworkMessage::ScreenShareStarted {
+            client_id,
+            width,
+            height,
+            scope,
+        } => {
+            let _ = screen_tx.try_send(ScreenControl::PeerStartedSharing {
+                client_id,
+                width,
+                height,
+            });
+            let _ = msg_tx.send(NetworkMessage::ScreenShareStarted {
+                client_id,
+                width,
+                height,
+                scope,
+            });
+            wake();
+        }
+        NetworkMessage::ScreenShareStopped { client_id } => {
+            let _ = screen_tx.try_send(ScreenControl::PeerStoppedSharing { client_id });
+            let _ = msg_tx.send(NetworkMessage::ScreenShareStopped { client_id });
+            wake();
+        }
+
+        // Link stats → app (UI only): nothing to show them on while
+        // the app is off screen.
+        NetworkMessage::NetworkStats { .. } => {
+            if UI_VISIBLE.load(Ordering::Relaxed) {
+                let _ = msg_tx.send(msg);
+                wake();
+            }
+        }
+
+        // Everything else → app. These carry state (join / leave, init,
+        // chat, mute states, denials, identity) — losing one desyncs
+        // the UI until reconnect, so never `try_send`. The app's channel
+        // is unbounded (review P1-16), so this never blocks the network
+        // thread either; the app drains it every event-loop pass.
+        other => {
+            let _ = msg_tx.send(other);
+            wake();
+        }
+    }
+}
+
+/// Media and link feedback, straight to the thread that uses them.
+fn route_hot(
+    hot: Hot,
+    voice: Option<&VoiceLink>,
+    voice_tx: &Sender<VoiceControl>,
+    screen_tx: &Sender<ScreenControl>,
+    frames_dropped: &mut Tally,
+) {
+    match hot {
         // Voice → the engine, stamped here at the socket read (review
         // P1-5). No engine (it is starting, or stopped): dropped.
-        NetworkMessage::VoiceData {
+        Hot::VoiceData {
             client_id,
             seq,
             timestamp,
@@ -3288,7 +3389,7 @@ fn route_message(
         }
 
         // Video → screen thread
-        NetworkMessage::VideoFrame {
+        Hot::VideoFrame {
             client_id,
             seq,
             is_keyframe,
@@ -3316,7 +3417,7 @@ fn route_message(
         }
 
         // System audio → screen thread
-        NetworkMessage::SystemAudioData {
+        Hot::SystemAudioData {
             client_id,
             seq,
             data,
@@ -3328,34 +3429,8 @@ fn route_message(
             });
         }
 
-        // Screen share signaling → screen thread + app
-        NetworkMessage::ScreenShareStarted {
-            client_id,
-            width,
-            height,
-            scope,
-        } => {
-            let _ = screen_tx.try_send(ScreenControl::PeerStartedSharing {
-                client_id,
-                width,
-                height,
-            });
-            let _ = msg_tx.send(NetworkMessage::ScreenShareStarted {
-                client_id,
-                width,
-                height,
-                scope,
-            });
-            wake();
-        }
-        NetworkMessage::ScreenShareStopped { client_id } => {
-            let _ = screen_tx.try_send(ScreenControl::PeerStoppedSharing { client_id });
-            let _ = msg_tx.send(NetworkMessage::ScreenShareStopped { client_id });
-            wake();
-        }
-
         // Keyframe request from a viewer → screen thread
-        NetworkMessage::KeyframeRequested { viewer_id } => {
+        Hot::KeyframeRequested { viewer_id } => {
             // The sharer's summary line counts these (review P3-15).
             debug!("Keyframe requested by viewer {viewer_id:#x}");
             let _ = screen_tx.try_send(ScreenControl::ForceKeyframe);
@@ -3365,7 +3440,7 @@ fn route_message(
         // encoder's only loss input (spec §6.1). RTT lets its rate
         // controller tell congestion (loss + RTT inflation: send fewer
         // bytes) from random loss (add redundancy).
-        NetworkMessage::VoiceReceiverReport {
+        Hot::VoiceReceiverReport {
             loss_pct,
             rtt_ms,
             exercised,
@@ -3378,7 +3453,7 @@ fn route_message(
 
         // Our video uplink → screen thread (drives the bitrate ladder
         // while sharing).
-        NetworkMessage::UplinkVideo {
+        Hot::UplinkVideo {
             behind_pct,
             rtt_ms,
             kbps_up,
@@ -3396,17 +3471,8 @@ fn route_message(
             });
         }
 
-        // Link stats → app (UI only): nothing to show them on while
-        // the app is off screen.
-        NetworkMessage::NetworkStats { .. } => {
-            if UI_VISIBLE.load(Ordering::Relaxed) {
-                let _ = msg_tx.send(msg);
-                wake();
-            }
-        }
-
         // Viewer health for our stream → screen thread (sharer's stats)
-        NetworkMessage::StreamHealth {
+        Hot::StreamHealth {
             worst_loss,
             worst_rtt_ms,
             viewers,
@@ -3416,16 +3482,6 @@ fn route_message(
                 worst_rtt_ms,
                 viewers,
             });
-        }
-
-        // Everything else → app. These carry state (join / leave, init,
-        // chat, mute states, denials, identity) — losing one desyncs
-        // the UI until reconnect, so never `try_send`. The app's channel
-        // is unbounded (review P1-16), so this never blocks the network
-        // thread either; the app drains it every event-loop pass.
-        other => {
-            let _ = msg_tx.send(other);
-            wake();
         }
     }
 }

@@ -99,6 +99,3 @@ ffmpeg-next = { version = "8", default-features = false, features = [
   "software-resampling",
   "software-scaling",
 ] }
-
-[dev-dependencies]
-env_logger = "0.11"

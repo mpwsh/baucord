@@ -126,7 +126,7 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
     thread::sleep(Duration::from_millis(500));
 
     // ── Asleep: a quiet connection wakes only when something is due —
-    // the 10 s keep-alive and its ack, the 2 s link stats — plus the
+    // the 5 s keep-alive and its ack, the 2 s link stats — plus the
     // inbound watcher's two looks a second (review P1-2). The 100 ms
     // quiet tick made it about twelve; polling the socket, as Windows
     // did until review P1-1, a thousand.

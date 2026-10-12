@@ -145,7 +145,3 @@ env_logger = "0.11"
 [[example]]
 name = "latency_profile"
 path = "examples/latency.rs"
-
-[[example]]
-name = "sounds"
-path = "examples/play.rs"

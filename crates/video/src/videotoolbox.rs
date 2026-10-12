@@ -292,10 +292,6 @@ impl VideoDecoder for VideoToolboxDecoder {
         self.decode_sample(bound, encoded.timestamp_ms)
     }
 
-    fn return_buffer(&mut self, buf: Vec<u8>) {
-        self.pool_return(buf);
-    }
-
     fn flush(&mut self) {
         // Deliberately nothing — see the module docs.
     }

@@ -31,7 +31,6 @@ export global Tr {
     in property <string> messages-collapse;
     in property <string> messages-expand;
     in property <string> invite-button;
-    in property <string> card-offline;
     // Invite dialog
     in property <string> invite-dialog-title;
     in property <string> invite-role;
@@ -111,7 +110,6 @@ export global Tr {
     in property <string> admin-stat-queue;
     in property <string> admin-stat-dropped;
     in property <string> admin-stat-errors;
-    in property <string> admin-yours;
     in property <string> admin-role-badge;
     in property <string> admin-col-when;
     in property <string> admin-col-who;
@@ -133,10 +131,6 @@ export global Tr {
 
     // Per-user popover (the menu strings live in the host: app-core's
     // `menu` names them, `menu_label` localizes)
-    in property <string> role-guest;
-    in property <string> role-member;
-    in property <string> role-organizer;
-    in property <string> role-admin;
 
     // Moderation dialog
     in property <string> moderation-duration;
@@ -255,7 +249,6 @@ export global Tr {
     in property <string> server-add;
     in property <string> server-remove;
     in property <string> server-manage;
-    in property <string> save;
     in property <string> server-invite-note;
     in property <string> server-fingerprint;
     in property <string> server-config-note;
@@ -333,17 +326,14 @@ export global Tr {
     in property <string> audio-vad-hint;
     in property <string> audio-ptt-hint;
     in property <string> audio-ptt-unbound;
-    in property <string> ptt-tooltip;
     in property <string> files-header;
     in property <string> about-config-file;
     in property <string> files-note;
     in property <string> servers-lead;
     in property <string> audio-lead;
     in property <string> identity-note;
-    in property <string> audio-devices-header;
     in property <string> audio-input-device;
     in property <string> audio-output-device;
-    in property <string> audio-system-default;
     /// Under the output picker; empty on the desktop (a phone explains
     /// its routes there).
     in property <string> audio-output-hint;
@@ -356,9 +346,7 @@ export global Tr {
     in property <string> audio-stop-testing;
     in property <string> audio-output-header;
     in property <string> audio-master-volume;
-    in property <string> keybinds-header;
     in property <string> keybinds-hint;
-    in property <string> keybind-record;
     in property <string> keybind-press-combo;
     in property <string> keybind-not-set;
 

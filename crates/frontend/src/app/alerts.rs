@@ -198,8 +198,9 @@ impl AppState {
 
     /// A notification about the DM with `dm` (hex) was tapped: open that
     /// conversation, on the chat page.
-    // Reached from the phones' `host` only (`stubs/host.rs`).
-    #[cfg_attr(feature = "desktop", expect(dead_code, reason = "phones only"))]
+    // Reached from the phones' `host` only (`stubs/host.rs`), through
+    // `open_noticed_conversation`, which carries the desktop's
+    // dead-code expectation for both.
     pub(super) fn open_noticed_dm(&mut self, dm: &str) {
         let Some(user) = user_id_from_hex(dm) else {
             info!("notice tapped with a malformed conversation id");

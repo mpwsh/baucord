@@ -598,7 +598,6 @@ pub fn populate(app: &mut AppState) {
     s.set_nickname(settings.user.nickname.as_str().into());
     s.set_initial(app_core::roster::initial_of(&settings.user.nickname).into());
     let palette = palette(app);
-    s.set_is_admin(palette.len() > NAME_COLORS.len());
     let colors: Vec<slint::Color> = palette
         .iter()
         .map(|rgb| {

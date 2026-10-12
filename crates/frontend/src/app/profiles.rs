@@ -63,11 +63,12 @@ impl AppState {
 
     fn rebuild_roster(&mut self) {
         self.roster_sync.dirty = false;
+        let sharers: HashSet<u64> = self.active_sharers.keys().copied().collect();
         let items = roster::grouped_rows(
             &self.channels,
             &self.users,
             self.our_client_id,
-            &self.sharer_ids,
+            &sharers,
             self.is_muted,
             self.is_deafened,
         );

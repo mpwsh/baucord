@@ -143,7 +143,6 @@ pub fn spawn(
                             format,
                             frame_bytes,
                             seq,
-                            is_keyframe: _,
                             enqueued_at,
                             decoded_at,
                             buffer_depth_ms,

@@ -318,10 +318,6 @@ impl VideoDecoder for MediaCodecDecoder {
         self.last_timing
     }
 
-    fn return_buffer(&mut self, buf: Vec<u8>) {
-        crate::pool::recycle(buf);
-    }
-
     fn flush(&mut self) {
         // Deliberately nothing — see the module docs.
     }

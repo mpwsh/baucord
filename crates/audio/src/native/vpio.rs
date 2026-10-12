@@ -28,7 +28,7 @@ use std::{
     ptr::{self, addr_of},
     slice,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, PoisonError, Weak,
     },
 };
@@ -493,7 +493,6 @@ impl NativeCapture {
         wake_tx: Sender<()>,
         stats: Arc<AudioStats>,
         config: Arc<InputConfig>,
-        input_level: Arc<AtomicU32>,
     ) -> Result<Self, CaptureStartError> {
         let unit = match shared_unit(&stats, false) {
             Ok(unit) => unit,
@@ -513,7 +512,6 @@ impl NativeCapture {
                 wake_tx,
                 stats,
                 config,
-                input_level,
             },
         });
         let aec_verdict = if unit.processing {

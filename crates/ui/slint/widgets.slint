@@ -141,9 +141,6 @@ export component Field inherits Rectangle {
     // substring op, and the wire check in send_current still guards.
     callback edited;
     public function focus-input() { input.focus(); }
-    public function do-cut() { input.cut(); }
-    public function do-copy() { input.copy(); }
-    public function do-paste() { input.paste(); }
     /// Android: commit the word the keyboard is still composing into
     /// `text` (Slint does it when the field loses focus) — see the
     /// composer's twin in chat.slint.

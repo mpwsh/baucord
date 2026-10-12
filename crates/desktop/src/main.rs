@@ -27,24 +27,11 @@ fn main() {
 
     #[cfg(not(debug_assertions))]
     {
-        use std::fs::{self, OpenOptions};
+        use std::fs::OpenOptions;
 
         use env_logger::Target;
 
         // Single append-mode log: every run keeps writing baucord.log.
-        // One-time migration: sweep the per-run baucord-<timestamp>.log
-        // files an older scheme left behind (exact prefix + suffix, so
-        // nothing else can match).
-        if let Ok(entries) = fs::read_dir(".") {
-            for name in entries
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with("baucord-") && n.ends_with(".log"))
-            {
-                let _ = fs::remove_file(name);
-            }
-        }
-
         match OpenOptions::new()
             .create(true)
             .append(true)

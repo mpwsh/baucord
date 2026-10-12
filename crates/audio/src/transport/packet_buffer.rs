@@ -310,12 +310,6 @@ impl PacketBuffer {
         self.pos = 0;
     }
 
-    /// Duration of the most recently decoded real frame (samples).
-    #[must_use]
-    pub fn last_frame_samples(&self) -> usize {
-        self.last_real_samples
-    }
-
     /// Comfort-noise continuation for a peer in a DTX pause.
     ///
     /// Opus DTX sends one refresh frame every 400 ms; between them the

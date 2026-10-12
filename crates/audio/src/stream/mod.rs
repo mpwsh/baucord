@@ -12,4 +12,3 @@ pub(crate) mod pace;
 mod process_loopback;
 
 pub use decoder::{OutputSelection, StreamAudioPacket, StreamAudioStats, StreamDecoder};
-pub use output::StreamAudioOutput;

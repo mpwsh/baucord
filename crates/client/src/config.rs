@@ -389,47 +389,6 @@ impl ServerEntry {
         }
     }
 
-    /// Parse the address line the server prints at startup:
-    /// `host:port` or `host:port#SHA256:…` (the pin is optional; it is
-    /// learned on first connect otherwise). The name defaults to the
-    /// address.
-    #[must_use]
-    pub fn from_address(line: &str) -> Option<Self> {
-        let line = line.trim();
-        let (address, fingerprint) = match line.split_once('#') {
-            Some((addr, fp)) => (addr.trim(), Some(fp.trim())),
-            None => (line, None),
-        };
-        if address.is_empty() || !address.contains(':') {
-            return None;
-        }
-        let fingerprint = match fingerprint {
-            Some(fp) if !fp.is_empty() => {
-                // Only a well-formed fingerprint is worth pinning.
-                fp.parse::<transport::Fingerprint>().ok()?;
-                Some(fp.to_string())
-            }
-            _ => None,
-        };
-        Some(Self {
-            name: address.to_string(),
-            address: address.to_string(),
-            invite_code: None,
-            fingerprint,
-            channel_passwords: HashMap::new(),
-        })
-    }
-
-    /// The address with the pin once known, the way the server prints
-    /// it — what to hand a friend along with a code.
-    #[must_use]
-    pub fn pinned_address(&self) -> String {
-        match &self.fingerprint {
-            Some(fp) => format!("{}#{fp}", self.address),
-            None => self.address.clone(),
-        }
-    }
-
     /// Take a typed code as the one to present next time. Returns
     /// whether the input reads as a code (blank clears it).
     pub fn set_invite_input(&mut self, input: &str) -> bool {
@@ -1392,31 +1351,12 @@ mod tests {
                 "password": "pw", "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" } ] }"#,
         );
         assert!(s.servers[0].fingerprint.is_some());
-        assert_eq!(
-            s.servers[0].pinned_address(),
-            "1.2.3.4:5000#SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-        );
         // A malformed pin is dropped rather than trusted.
         let s = parse(
             r#"{ "server": "x", "servers": [ { "name": "x", "address": "1.2.3.4:5000",
                 "fingerprint": "garbage" } ] }"#,
         );
         assert_eq!(s.servers[0].fingerprint, None);
-
-        let e = ServerEntry::from_address(
-            " 10.0.0.1:5000#SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ",
-        )
-        .expect("address");
-        assert_eq!(e.address, "10.0.0.1:5000");
-        assert!(e.fingerprint.is_some());
-        assert_eq!(
-            ServerEntry::from_address("10.0.0.1:5000")
-                .expect("bare")
-                .fingerprint,
-            None
-        );
-        assert!(ServerEntry::from_address("nope").is_none());
-        assert!(ServerEntry::from_address("10.0.0.1:5000#bad").is_none());
 
         // Codes are stored canonical and sent once.
         let mut s = parse(

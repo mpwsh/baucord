@@ -196,7 +196,6 @@ impl AppState {
             .remove(&client_id)
             .is_some_and(|u| Some(u.channel_id) == self.our_channel());
         self.active_sharers.remove(&client_id);
-        self.sharer_ids = self.active_sharers.keys().copied().collect();
 
         // Close viewer if we were watching this user
         if let Some(viewer) = self.viewers.remove(&client_id) {
@@ -382,16 +381,6 @@ impl AppState {
                 }
             })
             .collect();
-        let options: Vec<ChannelOption> = self
-            .channels
-            .iter()
-            .filter(|c| !c.hidden)
-            .map(|c| ChannelOption {
-                id: i32::from(c.id),
-                name: c.name.as_str().into(),
-            })
-            .collect();
-        self.channel_options.set_vec(options);
     }
 
     /// What this session may do, as the bools the UI draws from
@@ -400,26 +389,12 @@ impl AppState {
         use client::permissions as p;
         let has = |bit: u64| p::has(self.permissions, bit);
         let s = self.main.global::<State>();
-        s.set_perm_mute(has(p::MUTE) || has(p::RESTRICT));
-        s.set_perm_disconnect(has(p::DISCONNECT));
-        s.set_perm_kick(has(p::KICK));
-        s.set_perm_ban(has(p::BAN));
         s.set_perm_move(has(p::MANAGE_CHANNELS));
-        s.set_perm_roles(has(p::MANAGE_ROLES));
-        s.set_perm_users(has(p::MANAGE_USERS));
         s.set_perm_create_channels(has(p::CREATE_CHANNELS));
         s.set_perm_create_invites(has(p::CREATE_INVITES));
         s.set_perm_manage_invites(has(p::MANAGE_INVITES));
         s.set_perm_panel(has(p::PANEL));
-        s.set_perm_admin_channel(has(p::ADMIN_CHANNEL));
-        s.set_perm_manage_own(has(p::MANAGE_OWN_CHANNELS));
-        s.set_perm_delete_any(has(p::DELETE_MESSAGES));
         s.set_perm_dm(has(p::DM));
-        s.set_our_role(
-            self.our_client_id
-                .and_then(|id| self.details.get(&id))
-                .map_or(0, |(_, roles)| role_of(roles).as_int()),
-        );
         s.set_server_persistent(self.server_persistent);
         crate::settingsui::refresh_role_line(self);
         // The channel's row, for whoever may read it (the borrow of
@@ -540,17 +515,6 @@ impl AppState {
             self.roles.values().map(|r| (r.rank, r.id)).collect();
         ids.sort_unstable();
         ids.into_iter().map(|(_, id)| id).collect()
-    }
-
-    /// A user's name of record by id: the roster knows the online
-    /// ones; the rest are a short id.
-    #[allow(dead_code)] // kept for the admin feed's next columns
-    pub(crate) fn name_of_user_id(&self, user: &client::UserId) -> String {
-        self.details
-            .iter()
-            .find(|(_, (id, _))| id == user)
-            .and_then(|(client, _)| self.users.get(client))
-            .map_or_else(|| short_id(&user[..8]), |u| u.username.clone())
     }
 
     /// A role's name for people: the built-ins localized, a custom one

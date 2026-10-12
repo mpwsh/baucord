@@ -181,7 +181,6 @@ pub mod convert {
             member_label: "".into(),
             is_our_channel: false,
             role: r.role.as_int(),
-            level: i32::from(r.level),
             // The shell fills these from what the session may do and
             // from the profiles it knows.
             level_label: "".into(),
@@ -201,7 +200,6 @@ pub mod convert {
             name_style: 0,
             members_only: false,
             temporary: false,
-            is_afk: false,
         }
     }
 
@@ -229,7 +227,6 @@ pub mod convert {
             },
             is_our_channel: c.is_ours,
             role: 0,
-            level: 0,
             level_label: "".into(),
             role_label: "".into(),
             role_icon: "".into(),
@@ -247,7 +244,6 @@ pub mod convert {
             name_style: 0,
             members_only: c.members_only,
             temporary: c.temporary,
-            is_afk: c.is_afk,
         }
     }
 
