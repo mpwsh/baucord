@@ -121,7 +121,11 @@ Check with `which cargo` and `df -h /` first.
 
 ### The loop
 
-Slint's viewer and the icon library, matching the app's Slint 1.18.1:
+Slint's viewer and the icon library, matching the app's Slint 1.18.1.
+On an ARM Linux machine take
+`slint-viewer-aarch64-unknown-linux-gnu.tar.gz` from the same release
+(it wants `libinput10`), and the icon library is already in
+`~/.cargo/registry/src/*/lucide-slint-1.35.0/` after any build:
 
 ```sh
 mkdir -p /tmp/sv && cd /tmp/sv && curl -sSL -o sv.tar.gz \
@@ -150,7 +154,15 @@ SLINT_SCALE_FACTOR=2 $V --screenshot out.png ...          # 2× for site screens
 
 `--load-data` takes JSON: top-level keys are the window's own
 properties (`tab`, `phase` lives in `State`) and globals by name
-(`State`, `SettingsState`, `AdminState`, `Tr`). Rows of a model must
+(`State`, `SettingsState`, `AdminState`, `Tr`). The globals are only
+visible through `main.slint`, which exports them: render the other
+windows as `--component SettingsWindow ... main.slint` too, or `Tr` is
+"unknown" and every string comes out empty. A `PopupWindow` never
+shows in a still frame; to look at one (the emoji palette), render a
+scratch copy of the tree with it turned into a `Rectangle`. Two
+renders of the same fixture, before and after a change, diffed pixel
+by pixel (`PIL.ImageChops.difference(...).getbbox()`), say exactly
+what a refactor moved. Rows of a model must
 carry **every** field of their struct — a missing `color`/`image`
 field is filled with unit and panics at render (`binding was of the
 wrong type: ()`); a missing string field just warns and the model is
@@ -599,11 +611,23 @@ Memory-mode servers (persistence off) still use the legacy
   a legal double quote to the PowerShell lexer — the string closed
   early and the rest of the message ran as a command (`run.ps1`,
   2026-10-05: "The term 'drop' is not recognized").
-- A menu action lives in **three** places: `app-core::menu::Action`,
-  the Slint `MenuAction` enum in `globals.slint` (append only — its
-  ordinal crosses the bridge), and both conversions in
-  `ui/src/lib.rs` (`menu_action`, `menu_action_back`). Miss one and
-  only the compile says so, one round later.
+- A menu action lives in **one** place since 2026-10-12 (review
+  P2-57): `app-core::menu::Action`. `ui::convert::menu_entries` hands
+  the overlay rows carrying an `id` and keeps the actions by that id;
+  the pick comes back as the id (`AppState::menu_actions`). The Slint
+  `MenuAction` enum and the two conversions in `ui/src/lib.rs` are
+  gone: a new action is a variant and its arm in `menu_activated`.
+- **A text input drops its selection when it loses the focus** (Slint's
+  `FocusOut`, any reason but a window or popup activation). Anything
+  that opens over one and then acts on its selection — the composer's
+  menu was the case, review P2-16 — has to read
+  `cursor-position-byte-offset` / `anchor-position-byte-offset` before
+  it opens and do the edit host-side (`app_core::composer`).
+- **A wrapped `Text` inside a `HorizontalLayout` inside a
+  `VerticalLayout` reports one line's height**, and the next element
+  is drawn over the rest. Give the box an explicit `height:
+  <text>.preferred-height + padding`, as the chat's standing notice and
+  the settings' Windows notice do.
 - **The narrow (phone) layout renders only at a phone width:**
   `MainWindow` has `preferred-width`/`min-width`, so a fixture alone
   draws the wide layout. Copy the `.slint` tree, swap

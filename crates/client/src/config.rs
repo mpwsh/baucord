@@ -462,6 +462,10 @@ pub struct AudioSettings {
     /// only on speakers), `"always"`, `"off"`.
     #[serde(default)]
     pub echo_cancellation: audio::AecMode,
+    /// The user was told, once, that Windows is lowering their other
+    /// apps and where the way out is (`AEC-SPEC.md` E15).
+    #[serde(default)]
+    pub lowering_told: bool,
 }
 
 impl Default for AudioSettings {
@@ -472,6 +476,7 @@ impl Default for AudioSettings {
             gate_threshold: 0.010,
             push_to_talk: false,
             echo_cancellation: audio::AecMode::Auto,
+            lowering_told: false,
         }
     }
 }

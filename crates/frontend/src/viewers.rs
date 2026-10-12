@@ -351,15 +351,6 @@ pub(crate) fn wire_page(main: &MainWindow) {
 
 // ── Image viewer overlay ────────────────────────────────────────────────
 
-/// GIF playback state for the overlay: loops continuously while shown
-/// (no autoplay budget — matches the old viewer's behavior), advanced
-/// by the app's animation ticker.
-pub struct GalleryGif {
-    pub anim: Rc<app_core::gif::GifAnimation>,
-    pub idx: usize,
-    pub in_frame_ms: f64,
-}
-
 /// Every image row-id in chat order (stepping order).
 fn image_row_ids(app: &AppState) -> Vec<i32> {
     let model = app.chat_model();
@@ -394,26 +385,17 @@ pub fn open_gallery(app: &mut AppState, row_id: i32) {
     s.set_viewer_has_prev(pos > 0);
     s.set_viewer_has_next(pos + 1 < ids.len());
 
-    if is_gif {
-        if let Ok(anim) = app_core::gif::decode_animation(&bytes) {
-            if let Some(first) = anim.frames.first() {
-                s.set_viewer_image(ui::convert::rgba_image(
-                    &first.rgba,
-                    anim.width,
-                    anim.height,
-                ));
-            }
-            app.gallery_gif = Some(GalleryGif {
-                anim: Rc::new(anim),
-                idx: 0,
-                in_frame_ms: 0.0,
-            });
-            app.ensure_gif_ticker();
-        } else if let Ok((img, _, _)) = ui::convert::decode_to_image(&bytes) {
-            s.set_viewer_image(img);
+    // The picture (a GIF's first frame) at full size; an animation then
+    // loops for as long as the overlay shows it, frame by frame like a
+    // chat row's (no autoplay budget here).
+    if let Ok((img, _, _)) = ui::convert::decode_to_image(&bytes) {
+        s.set_viewer_image(img.clone());
+        if is_gif {
+            app.gallery_gif = crate::media::GifPlayer::looping(bytes, img);
         }
-    } else if let Ok((img, _, _)) = ui::convert::decode_to_image(&bytes) {
-        s.set_viewer_image(img);
+    }
+    if app.gallery_gif.is_some() {
+        app.ensure_gif_ticker();
     }
 
     app.main.global::<State>().set_viewer_open(true);

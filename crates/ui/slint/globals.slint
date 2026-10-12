@@ -89,29 +89,14 @@ export enum ToastKind { info, success, warning, error }
 /// What a moderation dialog is about to do (spec §4.1 / §4.2).
 export enum ModAction { mute-voice, mute-chat, unmute-voice, unmute-chat, disconnect, kick, ban }
 
-/// What a context-menu entry does (app-core's `menu::Action`, minus
-/// its parameter, which rides in `MenuEntry.arg`). The host builds
-/// the entries and dispatches the pick against the target it
+/// One row of a context menu, drawn by the overlay in main.slint. The
+/// host builds the entries (app-core's `menu`), keeps what each one
+/// does under its `id`, and dispatches a pick against the target it
 /// remembered — a roster row, a message, the composer.
-export enum MenuAction {
-    none,
-    channel-edit, channel-delete,
-    volume, mute-for-me, reset-audio, watch, message,
-    set-role, move-to, channel-kick,
-    mute-voice, mute-chat, unmute-voice, unmute-chat, disconnect, kick, ban,
-    copy-text, select-text, edit-message, delete-message, open-image, save-image,
-    cut, copy, paste,
-    save-file,
-    copy-image,
-    // 1.2 — blocks and reports
-    block, unblock, report, report-message, block-author,
-}
-
-/// One row of a context menu, drawn by the overlay in main.slint.
 export struct MenuEntry {
     label: string,
-    action: MenuAction,
-    arg: int,            // role, channel id, or 1/0 for select-text
+    id: int,             // the host's handle for the entry, handed back on a pick
+    slider: bool,        // the volume row: a slider, never a pick
     enabled: bool,
     separator: bool,     // a rule above this entry
     danger: bool,        // destructive: danger-colored label
@@ -500,8 +485,10 @@ export global Logic {
     callback user-context(index: int, x: length, y: length);
     /// A chat row; `selecting` = a styled body is in its plain view.
     callback row-context(row: ChatRow, selecting: bool, x: length, y: length);
-    callback composer-context(x: length, y: length);
-    callback menu-activated(action: MenuAction, arg: int);
+    /// The composer, with its selection as the click found it (byte
+    /// offsets): by the time an entry is picked the field has lost it.
+    callback composer-context(x: length, y: length, cursor: int, anchor: int);
+    callback menu-activated(id: int);
     /// The slider in a user's menu: every move is heard at once,
     /// the release is what is kept.
     callback menu-volume-changed(float);

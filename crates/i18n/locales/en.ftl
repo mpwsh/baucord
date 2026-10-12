@@ -285,6 +285,7 @@ resource-line = CPU { $cpu }% · Mem { $mem } MB
 chat-gif-too-large = GIF is over the { $mb } MB limit
 chat-gif-too-big = Animated GIFs can be at most { $dim } px wide or tall
 image-save-filter-gif = GIF image
+image-save-filter-jpeg = JPEG image
 
 # ── Slint-migration additions ───────────────────────────────────────────
 tech-slint = Slint - User Interface
@@ -546,6 +547,9 @@ aec-status-canceller-off = Unavailable — the echo canceller wouldn't switch on
 aec-status-refused = Unavailable — the system wouldn't open call audio. Details are in baucord.log.
 aec-status-unsupported = Not available on this system yet.
 aec-status-idle = Takes effect when you join voice.
+aec-lowering = Windows is lowering your other apps while baucord is connected, and it wouldn't let baucord turn that off. In Windows' sound settings, on the Communications tab, choose "Do nothing".
+aec-lowering-fix = Open Windows sound settings
+aec-lowering-told = Windows is lowering your other apps while baucord is connected. Settings → Audio shows how to stop it.
 ptt-tooltip = Push to talk — hold
 
 # ── Profiles on the wire (spec §7.1) ──────────────────────────────────
@@ -883,3 +887,29 @@ licenses-crates-count = { $count ->
    *[other] { $count } crates
 }
 licenses-used-by = Used by: { $crates }
+
+# ── Spans of time, and what the server refused (review P3-30) ─────────
+span-days = { $n } d
+span-hours = { $n } h
+span-minutes = { $n } min
+span-seconds = { $n } s
+span-days-hours = { $d } d { $h } h
+span-hours-minutes = { $h } h { $m } min
+span-ago = { $span } ago
+share-denied = Screen share denied: { $why }
+watch-denied = Can't watch { $name }: { $why }
+deny-share-limit = the server's screen share limit is reached
+deny-viewer-limit = this stream is at its viewer limit
+deny-not-sharing = that user is not sharing their screen
+deny-dimensions = the share's size was rejected
+deny-not-in-channel = this stream is only visible in its voice channel
+deny-not-permitted = you don't have permission
+channel-deny-missing = That channel no longer exists.
+channel-deny-not-permitted = You don't have permission to join that channel.
+upload-deny-too-large = the file is larger than this server allows
+upload-deny-bad-type = only PNG, JPEG and WebP images are accepted
+upload-deny-damaged = the upload arrived damaged
+upload-deny-refused = the server refused the upload
+upload-deny-quota = you have used today's upload allowance
+upload-deny-full = the server's file store is full
+upload-deny-not-permitted = you don't have permission to upload here

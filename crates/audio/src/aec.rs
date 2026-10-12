@@ -138,6 +138,12 @@ pub struct AecReport {
     pub reference: Option<String>,
     /// Why this tier, in a few log-friendly words.
     pub reason: &'static str,
+    /// The streams are a call to the system and it would not take "do
+    /// not lower the other apps" for them: Windows before 11, which has
+    /// no such request (AEC-SPEC.md §4.6, E15). Whether anything is
+    /// lowered is then the user's own Sound setting
+    /// ([`system_lowers_others`]). Never set elsewhere.
+    pub lowers_others: bool,
 }
 
 impl AecReport {
@@ -154,7 +160,18 @@ impl AecReport {
             } else {
                 reasons::HEADPHONES
             },
+            lowers_others: false,
         }
+    }
+
+    /// Other apps are being lowered because of these streams, as far as
+    /// can be told from here: the system could not be asked not to, and
+    /// the user's setting says it does. Reads that setting now — the
+    /// user may be changing it — so this is for a settings page, not a
+    /// hot path.
+    #[must_use]
+    pub fn lowering_others(&self) -> bool {
+        self.lowers_others && system_lowers_others()
     }
 
     /// Short machine-ish form for logs: `platform (speakers)`,
@@ -169,6 +186,22 @@ impl AecReport {
             Some(r) => format!("{tier} ({}) ref={r}", self.reason),
             None => format!("{tier} ({})", self.reason),
         }
+    }
+}
+
+/// Whether the user's system is set to lower other apps while a call
+/// runs: Windows' Sound → Communications, anything but "Do nothing"
+/// (the default is "reduce by 80 %"). Nowhere else is there such a
+/// setting to read.
+#[must_use]
+pub fn system_lowers_others() -> bool {
+    #[cfg(windows)]
+    {
+        crate::native::wasapi::lowers_others_in_calls()
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -351,6 +384,7 @@ mod tests {
             output: OutputKind::Speakers,
             reference: Some("Speakers (Realtek(R) Audio)".into()),
             reason: "speakers",
+            lowers_others: false,
         };
         assert_eq!(
             r.summary(),

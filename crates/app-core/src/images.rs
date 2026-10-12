@@ -49,23 +49,36 @@ pub enum ImageError {
 /// [`ImageError::TooLargeAfterDownscale`] if even the 320px floor is
 /// over budget.
 pub fn encode_bounded_png(buf: &image::RgbImage, max_bytes: usize) -> Result<Vec<u8>, ImageError> {
+    encode_bounded(buf, max_bytes, |scaled, out| {
+        scaled.write_to(out, image::ImageFormat::Png)
+    })
+}
+
+/// The loop both encoders share: bound the longest edge, encode, and
+/// halve the bound until the bytes fit or the 320 px floor is reached.
+/// A picture already inside the bound is encoded where it is — it used
+/// to be copied first, on every pass (review P3-41, P3-42).
+fn encode_bounded(
+    buf: &image::RgbImage,
+    max_bytes: usize,
+    encode: impl Fn(&image::RgbImage, &mut Cursor<Vec<u8>>) -> image::ImageResult<()>,
+) -> Result<Vec<u8>, ImageError> {
+    let longest = buf.width().max(buf.height());
     let mut bound = MAX_IMAGE_DIM;
     loop {
-        let scaled = if buf.width().max(buf.height()) > bound {
-            image::imageops::resize(
+        let scaled = if longest > bound {
+            std::borrow::Cow::Owned(image::imageops::resize(
                 buf,
-                (buf.width() * bound / buf.width().max(buf.height())).max(1),
-                (buf.height() * bound / buf.width().max(buf.height())).max(1),
+                (buf.width() * bound / longest).max(1),
+                (buf.height() * bound / longest).max(1),
                 image::imageops::FilterType::Triangle,
-            )
+            ))
         } else {
-            buf.clone()
+            std::borrow::Cow::Borrowed(buf)
         };
 
         let mut out = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(scaled)
-            .write_to(&mut out, image::ImageFormat::Png)
-            .map_err(|e| ImageError::Codec(e.to_string()))?;
+        encode(&scaled, &mut out).map_err(|e| ImageError::Codec(e.to_string()))?;
         let bytes = out.into_inner();
 
         if bytes.len() <= max_bytes {
@@ -119,16 +132,20 @@ pub fn load_image_bytes(bytes: Vec<u8>, max_bytes: usize) -> Result<Vec<u8>, Ima
     let is_png = format == Some(image::ImageFormat::Png);
     let is_jpeg = format == Some(image::ImageFormat::Jpeg);
 
-    let decoded = decode_bounded(&bytes)?;
-
     // Already-encoded PNGs and JPEGs inside both budgets pass through
-    // untouched — receivers sniff the magic and decode either.
+    // untouched — receivers sniff the magic and decode either. Their
+    // size is read from the header: every caller decodes the result for
+    // the send preview next, which is where a broken file is found, so
+    // decoding here as well was a second full decode only to measure
+    // (review P3-41).
     if (is_png || is_jpeg)
         && bytes.len() <= max_bytes
-        && decoded.width().max(decoded.height()) <= MAX_IMAGE_DIM
+        && dimensions_of(&bytes).is_some_and(|(w, h)| w.max(h) <= MAX_IMAGE_DIM)
     {
         return Ok(bytes);
     }
+
+    let decoded = decode_bounded(&bytes)?;
 
     // Photographs (anything that arrived as JPEG) re-encode as JPEG:
     // a photo transcoded to PNG balloons 5–10×, which used to turn a
@@ -136,10 +153,37 @@ pub fn load_image_bytes(bytes: Vec<u8>, max_bytes: usize) -> Result<Vec<u8>, Ima
     // everyone. Screenshots and everything else keep the sharp-edged
     // PNG path.
     if is_jpeg {
-        encode_bounded_jpeg(&decoded.to_rgb8(), max_bytes)
+        encode_bounded_jpeg(&decoded.into_rgb8(), max_bytes)
     } else {
-        encode_bounded_png(&decoded.to_rgb8(), max_bytes)
+        encode_bounded_png(&decoded.into_rgb8(), max_bytes)
     }
+}
+
+/// Pixels with no file format around them — a system clipboard's
+/// bitmap (`width` × `height`, RGBA, rows top to bottom) — into
+/// protocol-ready bytes: straight into the bounded-PNG pipeline. Alpha
+/// is dropped, as on every other road into it (and a clipboard bitmap's
+/// is often all zeroes).
+///
+/// # Errors
+/// [`ImageError::Codec`] when the buffer is not `width × height × 4`
+/// bytes of something, or as [`encode_bounded_png`].
+pub fn load_rgba(
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ImageError> {
+    let pixels = u32::try_from(width)
+        .ok()
+        .zip(u32::try_from(height).ok())
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .and_then(|(w, h)| image::RgbaImage::from_raw(w, h, rgba))
+        .ok_or_else(|| ImageError::Codec("not a picture".to_string()))?;
+    encode_bounded_png(
+        &image::DynamicImage::ImageRgba8(pixels).into_rgb8(),
+        max_bytes,
+    )
 }
 
 /// [`encode_bounded_png`]'s photographic sibling: JPEG at quality 85,
@@ -150,34 +194,31 @@ pub fn load_image_bytes(bytes: Vec<u8>, max_bytes: usize) -> Result<Vec<u8>, Ima
 /// [`ImageError::TooLargeAfterDownscale`] below 320 px, or
 /// [`ImageError::Codec`] from the encoder.
 pub fn encode_bounded_jpeg(buf: &image::RgbImage, max_bytes: usize) -> Result<Vec<u8>, ImageError> {
-    let mut bound = MAX_IMAGE_DIM;
-    loop {
-        let scaled = if buf.width().max(buf.height()) > bound {
-            image::imageops::resize(
-                buf,
-                (buf.width() * bound / buf.width().max(buf.height())).max(1),
-                (buf.height() * bound / buf.width().max(buf.height())).max(1),
-                image::imageops::FilterType::Triangle,
-            )
-        } else {
-            buf.clone()
-        };
+    encode_bounded(buf, max_bytes, |scaled, out| {
+        scaled.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(out, 85))
+    })
+}
 
-        let mut out = Cursor::new(Vec::new());
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
-        image::DynamicImage::ImageRgb8(scaled)
-            .write_with_encoder(encoder)
-            .map_err(|e| ImageError::Codec(e.to_string()))?;
-        let bytes = out.into_inner();
-
-        if bytes.len() <= max_bytes {
-            return Ok(bytes);
-        }
-        if bound <= 320 {
-            return Err(ImageError::TooLargeAfterDownscale(bytes.len() / 1024));
-        }
-        bound /= 2;
+/// The file extension a received picture's bytes are saved under: what
+/// they are, not what most pictures are (a JPEG saved as `.png` opens
+/// in a browser and nowhere else; review P3-31). PNG for anything the
+/// sniff does not know — nothing else gets as far as a chat row.
+#[must_use]
+pub fn extension_for(bytes: &[u8]) -> &'static str {
+    match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Jpeg) => "jpg",
+        Ok(image::ImageFormat::Gif) => "gif",
+        _ => "png",
     }
+}
+
+/// A picture's size from its header, without decoding it.
+fn dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
 }
 
 /// Decode with explicit limits so a crafted file (e.g. a 30000×30000
@@ -263,7 +304,7 @@ pub fn avatar_png(bytes: &[u8]) -> Result<Vec<u8>, ImageError> {
     );
     let mut out = Cursor::new(Vec::new());
     square
-        .to_rgba8()
+        .into_rgba8()
         .write_to(&mut out, image::ImageFormat::Png)
         .map_err(|e| ImageError::Codec(e.to_string()))?;
     Ok(out.into_inner())
@@ -429,6 +470,42 @@ mod tests {
     fn image_url_in_rejects_non_image_and_multi_token() {
         assert!(image_url_in("https://x.test/page.html").is_none());
         assert!(image_url_in("look https://x.test/cat.png").is_none());
+    }
+
+    #[test]
+    fn clipboard_pixels_become_a_png_without_their_alpha() {
+        // 2×1, both pixels fully transparent: the picture must still
+        // show (a clipboard bitmap's alpha is often all zeroes).
+        let rgba = vec![255, 0, 0, 0, 0, 0, 255, 0];
+        let png = load_rgba(2, 1, rgba, 1 << 20).expect("encodes");
+        let back = decode_bounded(&png).expect("decodes");
+        assert_eq!((back.width(), back.height()), (2, 1));
+        assert_eq!(back.to_rgba8().into_raw(), [255, 0, 0, 255, 0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_saved_picture_is_named_for_what_it_is() {
+        assert_eq!(extension_for(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), "jpg");
+        assert_eq!(extension_for(b"GIF89a\x01\x00\x01\x00"), "gif");
+        assert_eq!(
+            extension_for(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            "png"
+        );
+        assert_eq!(extension_for(b"?"), "png");
+    }
+
+    #[test]
+    fn clipboard_pixels_of_the_wrong_size_are_refused() {
+        assert!(load_rgba(2, 2, vec![0; 8], 1 << 20).is_err());
+        assert!(load_rgba(0, 0, Vec::new(), 1 << 20).is_err());
+    }
+
+    #[test]
+    fn a_big_clipboard_picture_is_scaled_into_the_bound() {
+        let (w, h) = (2000usize, 500usize);
+        let png = load_rgba(w, h, vec![40; w * h * 4], 1 << 20).expect("encodes");
+        let back = decode_bounded(&png).expect("decodes");
+        assert_eq!(back.width(), MAX_IMAGE_DIM);
     }
 
     #[test]

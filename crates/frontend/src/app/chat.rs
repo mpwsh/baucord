@@ -763,23 +763,23 @@ impl AppState {
         use crate::media::GifStep;
         const DT_MS: f64 = 33.0;
 
-        // (fn defined at top of gif_tick to satisfy items-after-statements)
-        fn step_overlay(g: &mut crate::viewers::GalleryGif, dt_ms: f64) -> Option<slint::Image> {
-            g.in_frame_ms += dt_ms;
-            let mut advanced = false;
-            for _ in 0..g.anim.frames.len() {
-                let delay = f64::from(g.anim.frames[g.idx].delay_ms);
-                if g.in_frame_ms < delay {
-                    break;
+        // The gallery's and the send preview's player: the next frame
+        // to show, if one is due. A stream that ended for good hands
+        // back its first frame and stops.
+        fn step_overlay(slot: &mut Option<GifPlayer>) -> Option<slint::Image> {
+            let player = slot.as_mut()?;
+            match player.step(DT_MS) {
+                GifStep::Idle => None,
+                GifStep::Blit {
+                    rgba,
+                    width,
+                    height,
+                } => Some(ui::convert::rgba_image(&rgba, width, height)),
+                GifStep::Freeze { first } => {
+                    *slot = None;
+                    Some(first)
                 }
-                g.in_frame_ms -= delay;
-                g.idx = (g.idx + 1) % g.anim.frames.len();
-                advanced = true;
             }
-            advanced.then(|| {
-                let frame = &g.anim.frames[g.idx];
-                ui::convert::rgba_image(&frame.rgba, g.anim.width, g.anim.height)
-            })
         }
 
         // Nothing of ours is on screen — a phone app in the
@@ -822,18 +822,13 @@ impl AppState {
             }
         }
 
-        if let Some(g) = &mut self.gallery_gif {
-            any_playing = true;
-            if let Some(img) = step_overlay(g, DT_MS) {
-                self.main.global::<State>().set_viewer_image(img);
-            }
+        if let Some(img) = step_overlay(&mut self.gallery_gif) {
+            self.main.global::<State>().set_viewer_image(img);
         }
-        if let Some(g) = &mut self.preview_gif {
-            any_playing = true;
-            if let Some(img) = step_overlay(g, DT_MS) {
-                self.main.global::<State>().set_preview_image(img);
-            }
+        if let Some(img) = step_overlay(&mut self.preview_gif) {
+            self.main.global::<State>().set_preview_image(img);
         }
+        any_playing |= self.gallery_gif.is_some() || self.preview_gif.is_some();
 
         if !any_playing {
             self.gif_ticker.stop();

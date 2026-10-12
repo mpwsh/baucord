@@ -214,6 +214,23 @@ impl AudioOutput {
         self.communications_default = on;
     }
 
+    /// Windows: this stream is a call to the system, and Windows would
+    /// not take "do not lower the other apps" for it — Windows 10, which
+    /// has no such request (`AecReport::lowers_others`). A plain stream
+    /// lowers nobody, cpal's fallback included.
+    #[must_use]
+    #[cfg_attr(not(windows), allow(clippy::unused_self))]
+    pub fn lowers_others(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.voice && self.native.as_ref().is_some_and(|n| !n.keeps_others)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub fn output_gain_handle(&self) -> Arc<AtomicU32> {
         self.output_gain.clone()
     }

@@ -11,6 +11,10 @@ pub fn clipboard_png() -> Option<Vec<u8>> {
     None
 }
 
+pub fn clipboard_pixels() -> Option<(usize, usize, Vec<u8>)> {
+    None
+}
+
 pub fn clipboard_text() -> Option<String> {
     None
 }

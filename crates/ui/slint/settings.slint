@@ -128,6 +128,9 @@ export global SettingsState {
     in property <[string]> aec-modes;
     in-out property <int> aec-index: 0;
     in property <string> aec-status;
+    /// Windows is lowering the user's other apps because of our call
+    /// streams and would not be asked not to (AEC-SPEC.md E15).
+    in property <bool> aec-lowering;
 
     // ── Keyboard ──
     in property <[KeybindRow]> keybinds;
@@ -214,6 +217,8 @@ export global SettingsLogic {
     callback toggle-test-mic();
     callback transmission-selected(int);
     callback aec-selected(int);
+    /// Open the system's sound settings (Windows: Communications tab).
+    callback open-sound-settings();
 
     // Keyboard
     callback record-keybind(int);
@@ -968,6 +973,45 @@ component AudioPanel inherits VerticalLayout {
             color: Theme.text-secondary;
             font-size: Theme.font-sm;
             wrap: word-wrap;
+        }
+        // What Windows does to the other apps, and the one place it can
+        // be turned off (it goes away by itself once it is). The same
+        // box as the chat's standing notice: its height follows the
+        // wrapped text, which a layout alone gets wrong.
+        if SettingsState.aec-lowering : Rectangle {
+            height: lowering.preferred-height + 2 * Theme.gap-sm;
+            border-radius: Theme.radius-sm;
+            background: Theme.warning.with-alpha(0.12);
+            border-width: 1px;
+            border-color: Theme.warning.with-alpha(0.5);
+            HorizontalLayout {
+                padding-left: Theme.gap-md;
+                padding-right: Theme.gap-md;
+                spacing: Theme.gap-sm;
+                Rectangle {
+                    width: 14px;
+                    IconDisplay {
+                        icon: IconSet.TriangleAlert;
+                        size: 14px;
+                        stroke: Theme.warning;
+                    }
+                }
+                lowering := Text {
+                    text: Tr.aec-lowering;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+        if SettingsState.aec-lowering : HorizontalLayout {
+            Btn {
+                text: Tr.aec-lowering-fix;
+                clicked => { SettingsLogic.open-sound-settings(); }
+            }
+            Rectangle { }   // keep the button its natural width
         }
     }
     Setting {

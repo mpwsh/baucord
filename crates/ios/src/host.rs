@@ -171,10 +171,6 @@ impl Hooks for IosHost {
         preview(mtm, target)
     }
 
-    fn target_exists(&self, target: &Path) -> bool {
-        target.exists()
-    }
-
     fn open_url(&self, url: &str) -> Result<(), String> {
         let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
         let url = NSURL::URLWithString(&NSString::from_str(url)).ok_or("not a valid link")?;
@@ -199,10 +195,6 @@ impl Hooks for IosHost {
     }
 
     // Notifications (D50): `notices.rs`.
-    fn notifies(&self) -> bool {
-        true
-    }
-
     fn notify(&self, notice: &Notice) {
         crate::notices::post(notice);
     }

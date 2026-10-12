@@ -1,42 +1,26 @@
 //! GIF playback support.
 //!
 //! Slint's `Image` has no animation, so the shell drives GIFs itself:
-//! decode the frames once, then swap the row's image on a
-//! `slint::Timer` using each frame's own delay.
+//! it swaps the image on a `slint::Timer`, using each frame's own
+//! delay.
 //!
 //! The wire pipeline caps animated GIFs at 800px / the byte budget,
 //! but neither caps the *frame count* — and every frame decodes to a
 //! full logical-screen RGBA buffer. A legitimate 1 MB, 480px,
 //! 150-frame GIF is ~140 MB of frames and seconds of synchronous
-//! decode on every receiving client at once (which also stalls each
-//! client's event loop long enough for the server to start
-//! retransmitting at them). [`decode_animation`] therefore enforces
-//! its own ceilings — frame count, total RGBA bytes, and wall-clock
-//! decode time — and simply truncates: the animation loops over the
-//! decoded prefix instead of the whole file.
+//! decode if taken whole. So nothing takes one whole: every player —
+//! a chat row, the gallery, the send preview — pulls frames from a
+//! [`GifStream`] as they are shown, and holds one at a time. (The
+//! gallery and the preview used to decode up to 240 frames, 48 MB,
+//! up front; review P2-59.)
 //!
 //! Autoplay policy is unchanged from the FLTK build: play ~3 loops
 //! (from [`loop_secs`]) but never more than 30 s, freeze to the first
 //! frame, replay on hover.
 
-use std::{rc::Rc, time::Instant};
+use std::rc::Rc;
 
 use crate::images::{gif_gct_len, skip_gif_subblocks, ImageError};
-
-/// Most frames a decoded animation may hold. At a typical 100 ms/frame
-/// this is ~24 s of loop — beyond any chat reaction.
-pub const MAX_GIF_FRAMES: usize = 240;
-
-/// Total decoded RGBA budget across all frames. 48 MB ≈ 52 frames at
-/// the 800px wire cap, or 150+ frames of a typical 320–480px GIF.
-pub const MAX_GIF_RGBA_BYTES: usize = 48 * 1024 * 1024;
-
-/// Wall-clock budget for one animation decode. This runs on the UI
-/// thread when a GIF arrives (or is hovered), and every connected
-/// client decodes the same GIF at the same moment — a long stall here
-/// freezes the whole room and stops the network thread's consumer,
-/// which is exactly the failure this bounds.
-pub const MAX_GIF_DECODE_MS: u64 = 150;
 
 /// One decoded frame: packed RGBA at the GIF's logical screen size.
 pub struct GifFrame {
@@ -44,96 +28,12 @@ pub struct GifFrame {
     pub delay_ms: u32,
 }
 
-/// A fully decoded animation.
-pub struct GifAnimation {
-    pub width: u32,
-    pub height: u32,
-    pub frames: Vec<GifFrame>,
-}
-
-impl GifAnimation {
-    /// Autoplay budget: ~3 loops, capped at 30 s — a duration misread
-    /// (or a pathologically long GIF) must not turn into minutes of
-    /// animation. Hover still replays after the freeze.
-    #[must_use]
-    pub fn autoplay_budget_secs(bytes: &[u8]) -> f64 {
-        (3.0 * loop_secs(bytes) + 0.25).min(30.0)
-    }
-}
-
-/// Decode an animated GIF to RGBA frames, within hard ceilings.
-///
-/// `image`'s GIF decoder composites disposal/partial frames onto the
-/// logical screen, so each returned frame is complete — exactly what an
-/// `Image` swap needs. Frames are pulled *incrementally* and decoding
-/// stops at [`MAX_GIF_FRAMES`], [`MAX_GIF_RGBA_BYTES`], or
-/// [`MAX_GIF_DECODE_MS`], whichever comes first: the animation then
-/// loops over the decoded prefix. A decode error after at least one
-/// good frame also just ends the animation early rather than dropping
-/// the GIF entirely.
-///
-/// # Errors
-/// [`ImageError::Codec`] on undecodable input (no frame decoded).
-pub fn decode_animation(bytes: &[u8]) -> Result<GifAnimation, ImageError> {
-    use image::{codecs::gif::GifDecoder, AnimationDecoder, ImageDecoder};
-
-    let mut decoder = GifDecoder::new(std::io::Cursor::new(bytes))
-        .map_err(|e| ImageError::Codec(e.to_string()))?;
-    // Same bomb limits as the still-image path: dimension and
-    // per-allocation caps inside the codec itself.
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(512 * 1024 * 1024);
-    decoder
-        .set_limits(limits)
-        .map_err(|e| ImageError::Codec(e.to_string()))?;
-
-    let started = Instant::now();
-    let (mut width, mut height) = (0u32, 0u32);
-    let mut out = Vec::new();
-    let mut rgba_total = 0usize;
-
-    for frame in decoder.into_frames() {
-        let frame = match frame {
-            Ok(frame) => frame,
-            // Mid-stream decode error: play what we have.
-            Err(e) if !out.is_empty() => {
-                log::warn!("GIF frame {} undecodable, truncating: {e}", out.len());
-                break;
-            }
-            Err(e) => return Err(ImageError::Codec(e.to_string())),
-        };
-        let (num, den) = frame.delay().numer_denom_ms();
-        // Browser convention (matched by Fl_Anim_GIF too): a zero delay
-        // plays as ~100 ms.
-        let ms = num.checked_div(den).unwrap_or(100);
-        let delay_ms = if ms == 0 { 100 } else { ms };
-        let buf = frame.into_buffer();
-        width = buf.width();
-        height = buf.height();
-        let rgba = buf.into_raw();
-        rgba_total += rgba.len();
-        out.push(GifFrame { rgba, delay_ms });
-
-        if out.len() >= MAX_GIF_FRAMES
-            || rgba_total >= MAX_GIF_RGBA_BYTES
-            || started.elapsed().as_millis() >= u128::from(MAX_GIF_DECODE_MS)
-        {
-            log::debug!(
-                "GIF decode truncated at {} frames / {} MB / {:?}",
-                out.len(),
-                rgba_total / 1_048_576,
-                started.elapsed(),
-            );
-            break;
-        }
-    }
-    Ok(GifAnimation {
-        width,
-        height,
-        frames: out,
-    })
+/// Autoplay budget: ~3 loops, capped at 30 s — a duration misread (or
+/// a pathologically long GIF) must not turn into minutes of animation.
+/// Hover still replays after the freeze.
+#[must_use]
+pub fn autoplay_budget_secs(bytes: &[u8]) -> f64 {
+    (3.0 * loop_secs(bytes) + 0.25).min(30.0)
 }
 
 /// `Cursor` needs `AsRef<[u8]>`; this lets one refcounted buffer back
@@ -192,8 +92,7 @@ impl GifStream {
 
     /// Decode the next frame, composited to the full logical screen.
     /// `None` at end of stream — and on a mid-stream decode error,
-    /// which truncates playback the same way [`decode_animation`]
-    /// truncates its prefix.
+    /// which ends the loop there: the frames before it still play.
     pub fn next_frame(&mut self) -> Option<GifFrame> {
         let frame = match self.frames.next()? {
             Ok(frame) => frame,
@@ -251,8 +150,13 @@ pub fn loop_secs(bytes: &[u8]) -> f64 {
         match bytes[i] {
             0x21 => {
                 let is_gce = bytes.get(i + 1) == Some(&0xF9);
-                if is_gce && i + 4 < bytes.len() {
-                    let d = u64::from(u16::from_le_bytes([bytes[i + 3], bytes[i + 4]]));
+                // 21 F9 04 <packed> <delay lo> <delay hi> <transparent> 00.
+                // The delay used to be read one byte early — the packed
+                // field as its low byte, the real low byte as its high
+                // one — which made a 40 ms frame ten seconds and put
+                // nearly every GIF's budget at the 30 s cap.
+                if is_gce && i + 5 < bytes.len() {
+                    let d = u64::from(u16::from_le_bytes([bytes[i + 4], bytes[i + 5]]));
                     total_cs += if d == 0 { 10 } else { d };
                 }
                 i += 2;
@@ -315,41 +219,34 @@ mod decode_tests {
     }
 
     #[test]
-    fn small_gif_decodes_fully() {
-        let bytes = synth_gif(64, 5);
-        let anim = decode_animation(&bytes).expect("decodes");
-        assert_eq!(anim.frames.len(), 5);
-        assert_eq!((anim.width, anim.height), (64, 64));
-        assert!(anim.frames.iter().all(|f| f.delay_ms == 40));
-    }
-
-    #[test]
-    fn pathological_gif_is_truncated_within_budgets() {
-        // 480×480 × 200 frames = ~184 MB decoded if unbounded — the
-        // exact shape that took real clients to ~150 MB and froze every
-        // event loop in the room at once. Wire size stays tiny (solid
-        // frames), so every sender-side check passes.
+    fn a_pathological_gif_costs_one_frame_at_a_time() {
+        // 480×480 × 200 frames = ~184 MB if decoded whole — the shape
+        // that took real clients to ~150 MB and froze every event loop
+        // in the room at once. Wire size stays tiny (solid frames), so
+        // every sender-side check passes. A stream hands out one frame
+        // and keeps none.
         let bytes = synth_gif(480, 200);
         assert!(bytes.len() < 1024 * 1024, "must pass the wire budget");
-
-        let anim = decode_animation(&bytes).expect("decodes");
-        let total: usize = anim.frames.iter().map(|f| f.rgba.len()).sum();
-        assert!(!anim.frames.is_empty(), "keeps a playable prefix");
-        assert!(anim.frames.len() < 200, "must not decode every frame");
-        assert!(
-            total <= MAX_GIF_RGBA_BYTES + 480 * 480 * 4,
-            "decoded bytes stay within budget (+ at most the frame that crossed it): {total}"
-        );
-        assert!(anim.frames.len() <= MAX_GIF_FRAMES);
+        let mut stream = GifStream::open(std::rc::Rc::new(bytes)).expect("opens");
+        for _ in 0..3 {
+            let frame = stream.next_frame().expect("a frame");
+            assert_eq!(frame.rgba.len(), 480 * 480 * 4);
+        }
     }
 
     #[test]
-    fn frame_count_ceiling_holds_for_tiny_frames() {
-        // Tiny frames never hit the byte or time budget — the frame
-        // ceiling must still stop the decode.
-        let bytes = synth_gif(16, 600);
-        let anim = decode_animation(&bytes).expect("decodes");
-        assert_eq!(anim.frames.len(), MAX_GIF_FRAMES);
+    fn the_autoplay_budget_is_three_loops_and_never_over_thirty_seconds() {
+        // 5 frames × 40 ms = 0.2 s a loop.
+        let short = synth_gif(16, 5);
+        assert!(
+            (loop_secs(&short) - 0.2).abs() < 0.001,
+            "a loop reads as {} s",
+            loop_secs(&short)
+        );
+        assert!((autoplay_budget_secs(&short) - 0.85).abs() < 0.01);
+        // 600 frames × 40 ms = 24 s a loop: three would be 72 s.
+        let long = synth_gif(16, 600);
+        assert!((autoplay_budget_secs(&long) - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]

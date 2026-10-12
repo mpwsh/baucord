@@ -140,7 +140,7 @@ pub fn install(config: Option<&Path>) {
     let wav = frontend::host::alert_sound_wav();
     let written = !wav.is_empty()
         && std::fs::create_dir_all(&sounds).is_ok()
-        && std::fs::write(sounds.join(SOUND_FILE), &wav).is_ok();
+        && std::fs::write(sounds.join(SOUND_FILE), wav).is_ok();
     OWN_SOUND.store(written, Ordering::Relaxed);
     if !written {
         log::warn!(

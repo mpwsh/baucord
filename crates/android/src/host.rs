@@ -111,10 +111,6 @@ impl Hooks for AndroidHost {
     }
 
     // Notifications (D52): `Notices.java`, through `BaucordActivity`.
-    fn notifies(&self) -> bool {
-        true
-    }
-
     fn notify(&self, notice: &Notice) {
         // Sound-only notices are iOS's way to chime; here the ringer
         // check of `chime_route` already decided.

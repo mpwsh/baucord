@@ -7,7 +7,7 @@
 
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
-import { MenuEntry, MenuAction } from "globals.slint";
+import { MenuEntry } from "globals.slint";
 
 // ── Buttons ─────────────────────────────────────────────────────────────
 
@@ -543,10 +543,11 @@ export component MenuPanel inherits Rectangle {
     /// The entry whose submenu is open: stays highlighted while the
     /// pointer is in the child column.
     in property <int> open-entry: -1;
-    /// A `MenuAction.volume` entry draws as a slider bound here
+    /// A `slider` entry draws as a slider bound here
     /// instead of a text row.
     in-out property <float> volume: 1.0;
-    callback activated(action: MenuAction, arg: int);
+    /// An entry was picked: its `MenuEntry.id`.
+    callback activated(id: int);
     /// The pointer rests on `entry`; `model` is its submenu (-1 for
     /// none) and `y` where the row starts, relative to this panel.
     callback submenu-hovered(entry: int, model: int, y: length);
@@ -578,7 +579,7 @@ export component MenuPanel inherits Rectangle {
                 }
             }
             // The volume slider, inline: one drag instead of a dialog.
-            if e.action == MenuAction.volume : Rectangle {
+            if e.slider : Rectangle {
                 height: 52px;
                 // Under the slider (declared first): a pointer resting
                 // on the label line is no submenu hover.
@@ -616,7 +617,7 @@ export component MenuPanel inherits Rectangle {
                     }
                 }
             }
-            if e.action != MenuAction.volume : row := Rectangle {
+            if !e.slider : row := Rectangle {
                 height: 30px;
                 border-radius: Theme.radius-sm;
                 background: e.enabled && (it.has-hover || root.open-entry == i)
@@ -657,7 +658,7 @@ export component MenuPanel inherits Rectangle {
                         if (e.submenu >= 0) {
                             root.submenu-hovered(i, e.submenu, row.absolute-position.y - root.absolute-position.y);
                         } else {
-                            root.activated(e.action, e.arg);
+                            root.activated(e.id);
                         }
                     }
                 }

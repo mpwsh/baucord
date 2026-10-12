@@ -1,21 +1,18 @@
-// clipboard.rs — native clipboard readers for what FLTK can't see.
+// clipboard.rs — the system clipboard, for the paste chain
+// (`media::paste_into_chat`) and the "Copy …" menu actions.
 //
-// FLTK's clipboard layer speaks exactly two languages: plain text and
-// one bitmap flavor per platform (TIFF/PDF on macOS, CF_DIB on
-// Windows). Real clipboards carry more:
+// Slint has no clipboard API of its own beyond a TextInput's text.
+// What a clipboard holds differs by platform and by who copied:
 //
-//   - Copied *files* (Finder/Explorer) arrive as file URLs / CF_HDROP —
-//     FLTK either can't see them or, on macOS, offers the file's *icon*
-//     as the image, which is how a copied photo pastes as a PNG badge.
-//   - Some sources (macOS screenshots, Chromium's "PNG" format) put
-//     PNG-only data on the clipboard, invisible to FLTK's TIFF-side.
+//   - Copied *files* (Finder/Explorer) are file URLs / CF_HDROP; on
+//     Linux they are file:// URIs in the text.
+//   - Screenshots and browsers put PNG data there (macOS's PNG type,
+//     Chromium's registered "PNG" format on Windows).
+//   - PrintScreen and paint programs leave only a bitmap.
 //
-// This module answers two questions natively, in priority order used
-// by the paste path: "is there a copied file?" then "is there PNG
-// data?". Everything else falls back to FLTK's own paste.
-//
-// Linux needs no code here: file managers deliver copies/drops as
-// file:// URIs through the text path, which chat.rs sniffs directly.
+// The chain asks in that order: `clipboard_file`, `clipboard_png`
+// (both native, per platform), the text, and last `clipboard_pixels`
+// (arboard's decoded bitmap, every platform).
 
 /// First file on the clipboard as a filesystem path, if any.
 #[cfg(target_os = "macos")]
@@ -157,17 +154,32 @@ pub fn clipboard_png() -> Option<Vec<u8>> {
     }
 }
 
-/// Linux: nothing to do natively — file copies/drops arrive as
-/// file:// URIs through FLTK's text paste, sniffed in chat.rs.
+/// Linux: nothing to do natively — file copies arrive as file:// URIs
+/// in the clipboard's text, which the paste chain sniffs.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn clipboard_file() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Linux: FLTK's X11 image paste already covers the common cases.
+/// Linux: no raw-PNG reader; [`clipboard_pixels`] reads its pictures.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn clipboard_png() -> Option<Vec<u8>> {
     None
+}
+
+// ── A picture as pixels (all platforms, via arboard) ────────────────────
+
+/// The clipboard's picture as `(width, height, RGBA)`, in whatever
+/// flavour the system keeps it: the bitmap the Print Screen key and
+/// paint programs leave on Windows, TIFF on macOS, any image target on
+/// Linux
+/// — what the PNG readers above do not see (review P2-18). The paste
+/// chain asks only when the clipboard has no text, so a spreadsheet's
+/// cells stay the text they also are.
+#[must_use]
+pub fn clipboard_pixels() -> Option<(usize, usize, Vec<u8>)> {
+    let image = with_clipboard(arboard::Clipboard::get_image).ok()?;
+    Some((image.width, image.height, image.bytes.into_owned()))
 }
 
 // ── Plain text (all platforms, via arboard) ─────────────────────────────
@@ -223,7 +235,7 @@ pub fn set_clipboard_text(text: &str) {
 /// the same decoder that renders chat images.
 pub fn set_clipboard_image(bytes: &[u8]) {
     let decoded = match app_core::images::decode_received(bytes) {
-        Ok(img) => img.to_rgba8(),
+        Ok(img) => img.into_rgba8(),
         Err(e) => {
             log::warn!("Copy image: decode failed: {e:?}");
             return;

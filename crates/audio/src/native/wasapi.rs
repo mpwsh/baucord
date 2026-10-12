@@ -389,6 +389,8 @@ fn role_for(communications: bool) -> Role {
 /// after `Initialize` (an uninitialized client refuses services) and
 /// before `Start`, on the thread that owns the client. Returns the word
 /// for the log line.
+const DUCK_REQUESTED: &str = "requested";
+
 fn ask_not_to_duck(client: &AudioClient, what: &str) -> &'static str {
     use windows::Win32::Media::Audio::{
         IAudioClientDuckingControl, AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS,
@@ -413,7 +415,7 @@ fn ask_not_to_duck(client: &AudioClient, what: &str) -> &'static str {
     match unsafe {
         control.SetDuckingOptionsForCurrentStream(AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS)
     } {
-        Ok(()) => "requested",
+        Ok(()) => DUCK_REQUESTED,
         Err(e) => {
             warn!("{what}: Windows refused \"do not duck other streams\": {e}");
             "refused"
@@ -489,12 +491,10 @@ pub fn keep_own_volume_on(name: Option<&str>) {
     }));
 }
 
-/// What the user's Sound settings → Communications say Windows does to
-/// other apps during a call, for the render stream's log line: with a
-/// report of "everything got quieter", this and `do-not-duck=` say
-/// whether Windows did it. The value is absent until the user changes
-/// it; Windows' default is 80 %.
-fn windows_ducking_setting() -> &'static str {
+/// The user's Sound settings → Communications choice, as Windows keeps
+/// it: 0 mute, 1 reduce by 80 %, 2 reduce by 50 %, 3 do nothing. `None`
+/// until the user changes it; Windows' default is 80 %.
+fn ducking_preference() -> Option<u32> {
     use windows::{
         core::w,
         Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
@@ -514,16 +514,28 @@ fn windows_ducking_setting() -> &'static str {
             Some(&raw mut size),
         )
     };
-    if status.is_err() {
-        return "reduce by 80 % (default)";
+    status.is_ok().then_some(value)
+}
+
+/// [`ducking_preference`] in words, for the render stream's log line:
+/// with a report of "everything got quieter", this and `do-not-duck=`
+/// say whether Windows did it.
+fn windows_ducking_setting() -> &'static str {
+    match ducking_preference() {
+        None => "reduce by 80 % (default)",
+        Some(0) => "mute",
+        Some(1) => "reduce by 80 %",
+        Some(2) => "reduce by 50 %",
+        Some(3) => "do nothing",
+        Some(_) => "unknown",
     }
-    match value {
-        0 => "mute",
-        1 => "reduce by 80 %",
-        2 => "reduce by 50 %",
-        3 => "do nothing",
-        _ => "unknown",
-    }
+}
+
+/// Windows is set to lower other apps while a call runs: anything but
+/// "Do nothing" (`aec::system_lowers_others`).
+#[must_use]
+pub fn lowers_others_in_calls() -> bool {
+    ducking_preference() != Some(3)
 }
 
 /// After capture opened in the `Communications` category: point the
@@ -1054,6 +1066,10 @@ pub struct NativeRender {
     /// conversion).
     pub sample_rate: u32,
     pub device_name: String,
+    /// Windows took "do not lower the other apps" for this stream
+    /// ([`ask_not_to_duck`]); false on Windows 10, which cannot be
+    /// asked.
+    pub keeps_others: bool,
 }
 
 struct RenderParts {
@@ -1075,7 +1091,7 @@ impl NativeRender {
         stats: Arc<AudioStats>,
     ) -> Result<Self, RenderStartError> {
         let should_stop = Arc::new(AtomicBool::new(false));
-        let (setup_tx, setup_rx) = bounded::<SetupReport<(u32, String)>>(1);
+        let (setup_tx, setup_rx) = bounded::<SetupReport<(u32, String, bool)>>(1);
         let (parts_tx, parts_rx) = bounded::<RenderParts>(1);
         let name = device_name.map(String::from);
         let stop = should_stop.clone();
@@ -1092,7 +1108,7 @@ impl NativeRender {
         });
 
         match setup_rx.recv() {
-            Ok(Ok((sample_rate, device_name))) => {
+            Ok(Ok((sample_rate, device_name, keeps_others))) => {
                 let parts = RenderParts {
                     consumer,
                     wake_tx,
@@ -1113,6 +1129,7 @@ impl NativeRender {
                     thread: Some(thread),
                     sample_rate,
                     device_name,
+                    keeps_others,
                 })
             }
             other => {
@@ -1144,7 +1161,7 @@ fn render_thread(
     device_name: Option<&str>,
     voice: bool,
     communications: bool,
-    setup_tx: &Sender<SetupReport<(u32, String)>>,
+    setup_tx: &Sender<SetupReport<(u32, String, bool)>>,
     parts_rx: &crossbeam_channel::Receiver<RenderParts>,
     should_stop: &AtomicBool,
 ) {
@@ -1203,7 +1220,11 @@ fn render_thread(
         }
     };
     if setup_tx
-        .send(Ok((negotiated.sample_rate, friendly.clone())))
+        .send(Ok((
+            negotiated.sample_rate,
+            friendly.clone(),
+            ducking == DUCK_REQUESTED,
+        )))
         .is_err()
     {
         wasapi::deinitialize();

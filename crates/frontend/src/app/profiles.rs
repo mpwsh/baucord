@@ -222,7 +222,7 @@ impl AppState {
             .flatten()
             .and_then(|bytes| app_core::images::decode_bounded(&bytes).ok())
             .map(|img| {
-                let rgba = img.to_rgba8();
+                let rgba = img.into_rgba8();
                 ui::convert::rgba_image(rgba.as_raw(), rgba.width(), rgba.height())
             });
     }
@@ -556,9 +556,9 @@ impl AppState {
         // 64 px at most. Never keep more than 128² of it resident.
         let side = app_core::images::AVATAR_SIDE;
         let rgba = if decoded.width().max(decoded.height()) > side {
-            decoded.thumbnail(side, side).to_rgba8()
+            decoded.thumbnail(side, side).into_rgba8()
         } else {
-            decoded.to_rgba8()
+            decoded.into_rgba8()
         };
         let image = ui::convert::rgba_image(rgba.as_raw(), rgba.width(), rgba.height());
         self.avatar_images.insert(blob, image);

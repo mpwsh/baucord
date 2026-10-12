@@ -77,6 +77,11 @@ impl AppState {
             }
         }
 
+        // The pickers in Settings show what is there now, with the
+        // selection the lines above may have just moved.
+        let names = |devices: &[(String, bool)]| devices.iter().map(|(n, _)| n.clone()).collect();
+        crate::settingsui::refresh_devices(self, names(&new_input), names(&new_output));
+
         self.last_input_devices = new_input;
         self.last_output_devices = new_output;
         self.refresh_device_warning();
@@ -147,6 +152,30 @@ impl AppState {
     /// The voice engine's meters, for the Settings meter loop.
     pub fn voice_levels(&self) -> client::voice::SharedAudioState {
         self.voice.shared.clone()
+    }
+
+    /// Once per install: a user whose other apps Windows is lowering
+    /// because of our call streams — Windows 10, which cannot be asked
+    /// not to — is told that it is Windows, and where the way out is
+    /// (AEC-SPEC.md E15). From the device poll; waits until the window
+    /// is where the toast can be read.
+    pub fn tell_lowering_once(&mut self) {
+        if self.settings.audio.lowering_told || !self.main_on_screen() {
+            return;
+        }
+        let lowering = self.voice.shared.aec.lock().is_ok_and(|report| {
+            report
+                .as_ref()
+                .is_some_and(audio::AecReport::lowering_others)
+        });
+        if !lowering {
+            return;
+        }
+        self.settings.audio.lowering_told = true;
+        self.settings.save();
+        let text = t!("aec-lowering-told");
+        self.push_activity(&text);
+        self.show_toast(ToastKind::Warning, &text);
     }
 
     /// What echo cancellation the voice session got (`None` = none

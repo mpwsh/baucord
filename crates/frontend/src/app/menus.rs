@@ -252,6 +252,7 @@ impl AppState {
                 client::permissions::DELETE_MESSAGES,
             ),
             reportable,
+            copy_image: crate::host::HAS_IMAGE_CLIPBOARD,
         };
         let target = MenuTarget::Message {
             row_id: row.row_id,
@@ -273,7 +274,7 @@ impl AppState {
         if entries.is_empty() {
             return;
         }
-        let (main, submenus) = ui::convert::menu_entries(&entries, &menu_label);
+        let (main, submenus, actions) = ui::convert::menu_entries(&entries, &menu_label);
         let submenus: Vec<ModelRc<ui::MenuEntry>> = submenus
             .into_iter()
             .map(|column| ModelRc::new(VecModel::from(column)))
@@ -285,12 +286,14 @@ impl AppState {
         s.set_menu_y(y);
         s.set_menu_open(true);
         self.menu_target = Some(target);
+        self.menu_actions = actions;
     }
 
     /// Escape, a click outside, or a pick: the overlay goes, and the
     /// composer takes back the focus the overlay's key scope held.
     pub(super) fn close_menu(&mut self) {
         self.menu_target = None;
+        self.menu_actions.clear();
         let s = self.main.global::<State>();
         if s.get_menu_open() {
             s.set_menu_open(false);
@@ -301,12 +304,14 @@ impl AppState {
     }
 
     /// An entry was picked: resolve it against the menu's target.
-    pub(super) fn menu_activated(&mut self, action: MenuAction, arg: i32) {
+    pub(super) fn menu_activated(&mut self, id: i32) {
         use menu::Action as A;
         let target = self.menu_target.take();
+        let action = usize::try_from(id)
+            .ok()
+            .and_then(|id| self.menu_actions.get(id).copied());
         self.close_menu();
-        let (Some(target), Some(action)) = (target, ui::convert::menu_action_back(action, arg))
-        else {
+        let (Some(target), Some(action)) = (target, action) else {
             return;
         };
         match (target, action) {
@@ -337,10 +342,35 @@ impl AppState {
                 self.report_message(msg_id, &body);
             }
             (MenuTarget::Message { msg_id, .. }, A::BlockAuthor) => self.block_author(msg_id),
-            (MenuTarget::Composer, A::Cut) => self.main.invoke_composer_cut(),
-            (MenuTarget::Composer, A::Copy) => self.main.invoke_composer_copy(),
-            (MenuTarget::Composer, A::Paste) => media::paste_into_chat(self),
+            (MenuTarget::Composer { cursor, anchor }, A::Cut) => {
+                self.composer_take(cursor, anchor, true);
+            }
+            (MenuTarget::Composer { cursor, anchor }, A::Copy) => {
+                self.composer_take(cursor, anchor, false);
+            }
+            (MenuTarget::Composer { .. }, A::Paste) => media::paste_into_chat(self),
             _ => {}
+        }
+    }
+
+    /// The composer menu's Copy, and its Cut when `cut`, on the
+    /// selection the right-click found. The field's own `copy()` and
+    /// `cut()` have nothing left to work on by now, and its cut would
+    /// call back into the app from inside this call (review P2-16).
+    fn composer_take(&mut self, cursor: usize, anchor: usize, cut: bool) {
+        use app_core::composer;
+        let s = self.main.global::<State>();
+        let draft = s.get_draft();
+        let picked = composer::selected(&draft, cursor, anchor);
+        if picked.is_empty() {
+            return;
+        }
+        crate::clipboard::set_clipboard_text(picked);
+        if cut {
+            let (rest, caret) = composer::cut(&draft, cursor, anchor);
+            s.set_draft(rest.into());
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            self.main.invoke_composer_set_cursor(caret as i32);
         }
     }
 

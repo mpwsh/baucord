@@ -413,6 +413,9 @@ pub struct MessageFacts {
     /// (`features::SAFETY`): it may be reported, and its author
     /// blocked.
     pub reportable: bool,
+    /// The host has a clipboard that takes pictures (the desktop; not
+    /// the phones, where "Copy image" did nothing — review P3-31).
+    pub copy_image: bool,
 }
 
 /// The menu for a chat row. Empty for a deleted message.
@@ -424,11 +427,16 @@ pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
     // A picture is a message with a blob (spec §12, 1.1.5): its own
     // entries first, then the same delete rule as text below.
     let mut entries = match m.kind {
-        MessageKind::Image => vec![
-            Entry::new(Label::OpenImage, Action::OpenImage),
-            Entry::new(Label::SaveImage, Action::SaveImage),
-            Entry::new(Label::CopyImage, Action::CopyImage),
-        ],
+        MessageKind::Image => {
+            let mut image = vec![
+                Entry::new(Label::OpenImage, Action::OpenImage),
+                Entry::new(Label::SaveImage, Action::SaveImage),
+            ];
+            if m.copy_image {
+                image.push(Entry::new(Label::CopyImage, Action::CopyImage));
+            }
+            image
+        }
         MessageKind::File => vec![Entry::new(Label::SaveFile, Action::SaveFile)],
         MessageKind::Code => vec![Entry::new(Label::Copy, Action::CopyText)],
         MessageKind::Text => vec![Entry::new(Label::CopyMessage, Action::CopyText)],
@@ -462,12 +470,19 @@ pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
     entries
 }
 
-/// The composer's menu.
+/// The composer's menu. Cut and Copy need a `selection` to work on.
 #[must_use]
-pub fn composer_menu() -> Vec<Entry> {
+pub fn composer_menu(selection: bool) -> Vec<Entry> {
+    let on_selection = |label: Label, action: Action| {
+        if selection {
+            Entry::new(label, action)
+        } else {
+            Entry::disabled(label)
+        }
+    };
     vec![
-        Entry::new(Label::Cut, Action::Cut),
-        Entry::new(Label::Copy, Action::Copy),
+        on_selection(Label::Cut, Action::Cut),
+        on_selection(Label::Copy, Action::Copy),
         Entry::new(Label::Paste, Action::Paste),
     ]
 }
@@ -478,6 +493,18 @@ mod tests {
 
     fn labels(entries: &[Entry]) -> Vec<Label> {
         entries.iter().map(|e| e.label.clone()).collect()
+    }
+
+    #[test]
+    fn the_composer_offers_cut_and_copy_only_on_a_selection() {
+        let enabled = |selection| {
+            composer_menu(selection)
+                .iter()
+                .map(|e| e.enabled)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(enabled(true), [true, true, true]);
+        assert_eq!(enabled(false), [false, false, true]);
     }
 
     fn member() -> UserFacts {
@@ -807,7 +834,21 @@ mod tests {
             in_dm: false,
             delete_any: false,
             reportable: false,
+            copy_image: true,
         }
+    }
+
+    #[test]
+    fn a_host_without_a_picture_clipboard_offers_no_copy_image() {
+        let image = MessageFacts {
+            kind: MessageKind::Image,
+            copy_image: false,
+            ..text_row()
+        };
+        assert_eq!(
+            labels(&message_menu(&image)),
+            [Label::OpenImage, Label::SaveImage]
+        );
     }
 
     #[test]

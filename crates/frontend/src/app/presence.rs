@@ -104,7 +104,10 @@ impl AppState {
         s.set_server_name(server_name.into());
         s.set_greeting(greeting.into());
         self.update_user_list();
-        self.show_main();
+        // The window is not brought forward: connecting changes what
+        // it shows, wherever it is — in the tray after "start
+        // minimized" with auto-connect, or behind a game when a
+        // reconnect lands (review P2-17).
         // An automatic reconnect lands in the lobby like any connect;
         // go back to the room the drop took us out of (a saved
         // password serves, a missing one asks).

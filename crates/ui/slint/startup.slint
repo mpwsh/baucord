@@ -14,7 +14,8 @@ export component StartupView inherits Rectangle {
     background: Theme.bg-primary;
 
     card := Rectangle {
-        width: 420px;
+        // As the connect card: inside a narrow phone's width.
+        width: Math.min(420px, parent.width - 2 * Theme.gap-md);
         height: layout.preferred-height;
         border-radius: Theme.radius-lg;
         background: Theme.bg-secondary;

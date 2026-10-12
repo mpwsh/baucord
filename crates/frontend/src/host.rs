@@ -18,6 +18,11 @@ pub type Filter = (String, Vec<String>);
 /// and saves into Downloads instead.
 pub const HAS_SAVE_DIALOG: bool = true;
 
+/// The clipboard takes pictures (`clipboard::set_clipboard_image`); a
+/// phone's has no way in from here, and its menus leave "Copy image"
+/// out.
+pub const HAS_IMAGE_CLIPBOARD: bool = true;
+
 /// A file written into the user's Downloads.
 pub struct Saved {
     /// The path written.
@@ -123,4 +128,31 @@ pub fn open_target(target: &Path) -> Result<(), String> {
 /// As [`open_target`].
 pub fn open_url(url: &str) -> Result<(), String> {
     open::that_detached(url).map_err(|e| e.to_string())
+}
+
+/// Open the system's sound settings where what happens to other apps
+/// during a call is chosen: Windows' Sound dialog on its Communications
+/// tab (`AEC-SPEC.md` §4.6).
+///
+/// # Errors
+/// No such setting on this system, or the launcher's own message.
+pub fn open_sound_settings() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // By its full path: a bare name is looked up next to our own
+        // executable first.
+        let control = std::env::var_os("SystemRoot").map_or_else(
+            || PathBuf::from("control.exe"),
+            |root| PathBuf::from(root).join("System32").join("control.exe"),
+        );
+        std::process::Command::new(control)
+            .arg("mmsys.cpl,,3")
+            .spawn()
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("no such setting on this system".to_string())
+    }
 }

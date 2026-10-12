@@ -20,6 +20,10 @@ pub type Filter = (String, Vec<String>);
 /// put the file in Downloads instead ([`save_download`]).
 pub const HAS_SAVE_DIALOG: bool = false;
 
+/// No way to put a picture on this host's clipboard: the menus leave
+/// "Copy image" out.
+pub const HAS_IMAGE_CLIPBOARD: bool = false;
+
 /// The callback a picked file is handed to (any thread).
 pub type OnPick = Box<dyn FnOnce(PathBuf) + Send>;
 
@@ -50,8 +54,11 @@ pub trait Hooks: Send + Sync {
     /// # Errors
     /// The host's own message (no app for that type, say).
     fn open_target(&self, target: &Path, mime: &str) -> Result<(), String>;
-    /// Whether a [`Saved::target`] is still there.
-    fn target_exists(&self, target: &Path) -> bool;
+    /// Whether a [`Saved::target`] is still there. A host whose saves
+    /// are not all plain files (Android's `MediaStore` rows) says how.
+    fn target_exists(&self, target: &Path) -> bool {
+        target.exists()
+    }
     /// Open a link in the browser.
     ///
     /// # Errors
@@ -63,10 +70,6 @@ pub trait Hooks: Send + Sync {
     /// Keep the screen on (`true`: a stream is being watched) or let the
     /// system dim and lock it again (`false`). Called on the UI thread.
     fn keep_screen_on(&self, _on: bool) {}
-    /// Whether this host shows notifications at all ([`notify`]).
-    fn notifies(&self) -> bool {
-        false
-    }
     /// Post (or replace, by [`Notice::key`]) a notification. A tap on one
     /// with [`Notice::open_dm`] comes back through [`open_conversation`].
     /// Called on the UI thread.
@@ -75,7 +78,7 @@ pub trait Hooks: Send + Sync {
     /// may have refused the permission or switched the channel off, and
     /// then a DM in the background chimes instead of vanishing.
     fn notices_allowed(&self, _kind: NoticeKind) -> bool {
-        self.notifies()
+        true
     }
     /// Take down the notification posted under `key`, if it is up.
     fn cancel_notice(&self, _key: &str) {}
@@ -159,14 +162,16 @@ pub fn keep_screen_on(on: bool) {
     }
 }
 
-/// Whether this host shows notifications (a phone that installed hooks).
+/// Whether this host shows notifications: a phone that installed its
+/// hooks does (both do; the trait used to ask each, and each said yes —
+/// review P3-47).
 pub fn notifies() -> bool {
-    HOOKS.get().is_some_and(|h| h.notifies())
+    HOOKS.get().is_some()
 }
 
 /// Post a notification, if this host shows them.
 pub fn notify(notice: &Notice) {
-    if let Some(hooks) = HOOKS.get().filter(|h| h.notifies()) {
+    if let Some(hooks) = HOOKS.get() {
         log::info!(
             "notice {} ({:?}{})",
             notice.key,
@@ -180,14 +185,12 @@ pub fn notify(notice: &Notice) {
 /// Whether a notification of `kind` would be shown now (the host
 /// shows them, and the user has not refused or silenced them).
 pub fn notices_allowed(kind: NoticeKind) -> bool {
-    HOOKS
-        .get()
-        .is_some_and(|h| h.notifies() && h.notices_allowed(kind))
+    HOOKS.get().is_some_and(|h| h.notices_allowed(kind))
 }
 
 /// Take down the notification posted under `key`.
 pub fn cancel_notice(key: &str) {
-    if let Some(hooks) = HOOKS.get().filter(|h| h.notifies()) {
+    if let Some(hooks) = HOOKS.get() {
         hooks.cancel_notice(key);
     }
 }
@@ -207,21 +210,19 @@ pub fn open_conversation(dm: String) {
 /// Have the host play the message chime itself (`Hooks::play_chime`);
 /// `false` when it cannot.
 pub fn play_chime() -> bool {
-    HOOKS
-        .get()
-        .is_some_and(|h| h.play_chime(&alert_sound_wav()))
+    HOOKS.get().is_some_and(|h| h.play_chime(alert_sound_wav()))
 }
 
 /// The DM chime as a WAV file, for a host that plays it through the
-/// system (iOS writes it where notifications find their sounds).
+/// system (iOS writes it where notifications find their sounds). Made
+/// once; every chime borrows it.
 #[must_use]
-pub fn alert_sound_wav() -> Vec<u8> {
+pub fn alert_sound_wav() -> &'static [u8] {
     static WAV: OnceLock<Vec<u8>> = OnceLock::new();
     WAV.get_or_init(|| {
         let bank = audio::sounds::SoundBank::new();
         audio::sounds::wav_bytes(bank.get(audio::SoundType::DirectMessage))
     })
-    .clone()
 }
 
 static HOOKS: OnceLock<Box<dyn Hooks>> = OnceLock::new();
@@ -313,6 +314,14 @@ pub fn open_target(target: &Path) -> Result<(), String> {
         .and_then(|n| n.to_str())
         .unwrap_or_default();
     hooks.open_target(target, crate::media::mime_for(name))
+}
+
+/// The desktop's: a phone has no such setting.
+///
+/// # Errors
+/// Always.
+pub fn open_sound_settings() -> Result<(), String> {
+    Err("no such setting on this system".to_string())
 }
 
 /// # Errors

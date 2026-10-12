@@ -14,7 +14,7 @@ use std::{
 };
 
 use app_core::{
-    gif::{self, GifAnimation},
+    gif,
     images::{self, ImageError},
 };
 use i18n::t;
@@ -139,6 +139,9 @@ enum GifMode {
     Autoplay { deadline: Instant },
     /// Hover replay — runs until the pointer leaves.
     Hover,
+    /// Runs until the player is dropped (the gallery, the send
+    /// preview).
+    Loop,
     /// Showing frame 0, decoded frames released.
     Frozen,
 }
@@ -212,8 +215,21 @@ impl GifPlayer {
         true
     }
 
+    /// A player that loops for as long as it is kept: the gallery's
+    /// and the send preview's, which show one picture and go away with
+    /// it. `first` is what is on screen until the second frame is due.
+    /// `None` when the bytes will not open as an animation.
+    #[must_use]
+    pub fn looping(bytes: Rc<Vec<u8>>, first: slint::Image) -> Option<Self> {
+        let mut player = Self::new(bytes, first);
+        player.open_stream().then(|| {
+            player.mode = GifMode::Loop;
+            player
+        })
+    }
+
     pub fn start_autoplay(&mut self) {
-        let budget = GifAnimation::autoplay_budget_secs(&self.bytes);
+        let budget = gif::autoplay_budget_secs(&self.bytes);
         if self.open_stream() {
             self.mode = GifMode::Autoplay {
                 deadline: Instant::now() + Duration::from_secs_f64(budget),
@@ -337,6 +353,8 @@ impl GifPlayer {
 ///   2. native clipboard PNG (screenshots)
 ///   3. pasted text that is an image URL → fetch
 ///   4. plain text → append to the draft
+///   5. no text at all: the clipboard's picture as pixels (the Print
+///      Screen key, a paint program, every picture on Linux)
 pub fn paste_into_chat(app: &mut AppState) {
     // 1. Copied file (platform clipboards expose these differently —
     //    clipboard.rs handles each).
@@ -350,19 +368,14 @@ pub fn paste_into_chat(app: &mut AppState) {
     // 2. Native image data (PNG from screenshots etc.).
     if let Some(png) = crate::clipboard::clipboard_png() {
         match images::load_image_bytes(png, app.image_budget()) {
-            Ok(bytes) => {
-                show_preview(app, bytes);
-                return;
-            }
-            Err(e) => {
-                app.show_error(&describe(&e));
-                return;
-            }
+            Ok(bytes) => show_preview(app, bytes),
+            Err(e) => app.show_error(&describe(&e)),
         }
+        return;
     }
 
     // 3./4. Text flavors.
-    if let Some(text) = crate::clipboard::clipboard_text() {
+    if let Some(text) = crate::clipboard::clipboard_text().filter(|text| !text.is_empty()) {
         if let Some(path) = images::first_image_path_in(&text) {
             attach_path(app, &path);
             return;
@@ -383,6 +396,15 @@ pub fn paste_into_chat(app: &mut AppState) {
             .take(app_core::chat::MAX_MESSAGE_CHARS)
             .collect();
         s.set_draft(capped.into());
+        return;
+    }
+
+    // 5. A picture and no text beside it (review P2-18).
+    if let Some((width, height, rgba)) = crate::clipboard::clipboard_pixels() {
+        match images::load_rgba(width, height, rgba, app.image_budget()) {
+            Ok(bytes) => show_preview(app, bytes),
+            Err(e) => app.show_error(&describe(&e)),
+        }
     }
 }
 
@@ -605,21 +627,16 @@ fn show_preview(app: &mut AppState, bytes: Vec<u8>) {
         Ok((image, w, h)) => {
             let kb = bytes.len() / 1024;
             let s = app.main.global::<State>();
-            s.set_preview_image(image);
+            s.set_preview_image(image.clone());
             s.set_preview_caption(format!("{w}×{h} — {kb} KB").into());
             s.set_preview_open(true);
 
-            app.preview_gif = None;
-            if bytes.starts_with(b"GIF8")
-                && images::gif_is_animated(&bytes)
-                && let Ok(anim) = gif::decode_animation(&bytes)
-                && !anim.frames.is_empty()
-            {
-                app.preview_gif = Some(crate::viewers::GalleryGif {
-                    anim: Rc::new(anim),
-                    idx: 0,
-                    in_frame_ms: 0.0,
-                });
+            // An animation plays in the preview, frame by frame from
+            // its own copy of the (compressed) bytes.
+            app.preview_gif = (bytes.starts_with(b"GIF8") && images::gif_is_animated(&bytes))
+                .then(|| GifPlayer::looping(Rc::new(bytes.clone()), image.clone()))
+                .flatten();
+            if app.preview_gif.is_some() {
                 app.ensure_gif_ticker();
             }
 
@@ -629,7 +646,6 @@ fn show_preview(app: &mut AppState, bytes: Vec<u8>) {
     }
 }
 
-/// Save an image row to disk via the native save dialog.
 /// "Copy image": the row's picture onto the clipboard as pixels.
 pub fn copy_image(app: &AppState, row_id: i32) {
     if let Some(entry) = app.images.get(&row_id) {
@@ -637,16 +653,14 @@ pub fn copy_image(app: &AppState, row_id: i32) {
     }
 }
 
+/// Save an image row to disk via the native save dialog.
 pub fn save_image_dialog(app: &mut AppState, row_id: i32) {
     let Some(entry) = app.images.get(&row_id) else {
         return;
     };
     let bytes: Arc<Vec<u8>> = Arc::new(entry.bytes.as_ref().clone());
-    let (ext, filter) = if entry.is_gif {
-        ("gif", &["gif"][..])
-    } else {
-        ("png", &["png"][..])
-    };
+    // Named for what the bytes are: they are written as received.
+    let ext = images::extension_for(&bytes);
     // Timestamped so several saves land side by side without renaming.
     let default_name = format!(
         "baucord-{}.{ext}",
@@ -664,12 +678,14 @@ pub fn save_image_dialog(app: &mut AppState, row_id: i32) {
         }
         return;
     }
-    let filter_name = if entry.is_gif {
-        t!("image-save-filter-gif")
-    } else {
-        t!("image-save-filter")
+    let (filter_name, filter) = match ext {
+        "gif" => (t!("image-save-filter-gif"), vec!["gif".to_string()]),
+        "jpg" => (
+            t!("image-save-filter-jpeg"),
+            vec!["jpg".to_string(), "jpeg".to_string()],
+        ),
+        _ => (t!("image-save-filter"), vec!["png".to_string()]),
     };
-    let filter: Vec<String> = filter.iter().map(|s| (*s).to_string()).collect();
     crate::host::save_file(&default_name, Some((filter_name, filter)), move |path| {
         let write_result = std::fs::write(&path, bytes.as_slice());
         let _ = slint::invoke_from_event_loop(move || {

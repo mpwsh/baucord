@@ -205,8 +205,12 @@ What stands between this and "production for strangers":
   have ducked headphone users on "Default"), baucord's own sessions
   opt out of being lowered, and the render line logs the user's
   Windows setting — ask a reporter for their two `Native WASAPI`
-  lines. Still to decide for Windows 10 on speakers: a notice with a
-  button to the Sound dialog, or Auto staying off the call path there.
+  lines. Windows 10 on speakers, decided 2026-10-12: keep the
+  platform canceller and say so (AEC-SPEC E15) — Settings → Audio
+  shows a notice with a button to Windows' Sound dialog whenever the
+  opt-out was not granted and Windows is set to lower, and a toast
+  points there once per install. Not ducking at all on Windows 10
+  takes our own canceller on plain streams (AEC-SPEC §8); not now.
 - [ ] **CLI-16 [P2][M] Desktop voice latency: what is left.** The
   2026-10-08 review: native WASAPI cost nothing (event-driven, MMCSS,
   20 ms render buffer). Our code adds ~74 ms one way; the estimate
@@ -855,23 +859,74 @@ One line each; the spec decision named holds the detail.
     branch that is gone, so no release ever restored one), installs
     the toolchain `rust-toolchain.toml` pins and no other, and no
     longer wraps rustc in sccache and its Windows shim (P2-50, part of
-    P3-48); `pr-check.yaml` is back (REL-1). **None of it run on
-    GitHub.** Left: one release workflow instead of four (P2-60), the
-    package lists and `cargo-ndk` (P3-48) — each needs a release run to
-    prove.
+    P3-48); `pr-check.yaml` is back (REL-1) and **ran green on GitHub
+    on `0b8c374`** (the user, 2026-10-12) — with the six socket-wait
+    tests the sandbox cannot pass, so those are the sandbox's. The
+    release workflow's changes have not run yet. Left: one release
+    workflow instead of four (P2-60), the package lists and `cargo-ndk`
+    (P3-48) — each needs a release run to prove.
+- **2026-10-12 — 1.2.1, the review's fourth batch** (§2a): what the
+  user sees. From here on Slint changes are *looked at* in the sandbox
+  (guide §1, "The loop": the aarch64 viewer), not only compiled.
+  - *Windows 10 ducking, decided* (CLI-11, AEC-SPEC E15): keep the
+    canceller, say what Windows is doing, and put the way out one
+    click away.
+  - *Bugs.* A connect, a reconnect or a lost connection no longer
+    brings the window forward or takes the focus; it is shown at
+    launch (unless that starts in the tray) and when the user asks
+    (P2-17). The composer menu's Cut and Copy work: the selection
+    travels with the right-click and the edit is done host-side, and
+    they are greyed without one (P2-16); a callback that re-enters the
+    app state is dropped with a log line in a release build instead of
+    aborting it. Pasting a picture works on Linux and from
+    bitmap-only sources (PrintScreen, a paint program) elsewhere:
+    with no text on the clipboard, its pixels are taken through
+    arboard (P2-18). A saved picture is named for what its bytes are,
+    not always `.png`; a phone's menu has no "Copy image" (P3-31).
+    A device plugged in with Settings open no longer shifts what a
+    pick means, and the pickers refresh as devices come and go
+    (P3-35's second half). The profile card waits its dwell again on
+    the same row and stays away under a menu (P3-37). The connect and
+    startup cards fit a 360–375 pt phone, the terms line wrapping onto
+    a second line there (P3-40). Share denied, can't watch, upload
+    refused, channel join refused and the time units ("3 d", "5 min
+    ago") are in the three catalogs (P3-30; an admin's command output
+    — flags of `/channel list`, the restriction list — is still
+    English).
+  - *A GIF's loop length was misread* — the delay one byte early, so
+    a 40 ms frame counted as ten seconds and nearly every GIF got the
+    30 s autoplay cap instead of "about three loops". Found by a test
+    written for P2-59. **GIFs now freeze after ~3 loops**, as
+    `gif.rs` always said they did; hovering replays them as before.
+  - *Simpler.* One GIF player: the gallery and the send preview loop
+    the streaming player; the up-front decoder (240 frames, 48 MB) is
+    gone (P2-59). A menu action is described once (P2-57). The emoji
+    palette builds only the rows in view (P3-38). One bounded-encode
+    loop, no copy of the picture before it, no second full decode of a
+    pass-through picture to read its size (P3-41, P3-42). The phones'
+    hooks lose `notifies` (both said yes) and a repeated
+    `target_exists`; the chime's WAV is borrowed, not cloned (P3-47 —
+    **the two-line deletions in `crates/android` and `crates/ios` are
+    not compiled here**).
+  - Left of the UI list: the Session structs (P2-51), one audio
+    `reconcile()` (P2-55), the Slint row/dialog scaffolding (P2-58 —
+    now checkable by pixel diff), one `host.rs` (P3-33), the admin
+    panel's action enum (P3-34), the settings table macro (P3-35's
+    first half), `FrameMeta` (P3-36).
 
 ## 8. Facts this plan rests on
 
 - **Tests, 2026-10-12, Linux sandbox**: protocol 91 + the versions
   test + 3 wire-pinning tests, transport 55, server 70 unit + 99 e2e,
-  client 57, app-core 112, audio 113, video 77 + 6, i18n 2 — all
+  client 57, app-core 120, audio 113, video 77 + 6, i18n 2 — all
   green. Six more need a real machine:
   that sandbox does not signal UDP readiness, so the socket-wait tests
   (`transport` `udp::read_waiter_tests`, 3; `client` `inbound_wake`,
   `network_idle.rs`, `network_uploads.rs`) cannot pass there. The
   frontend type-checks for the phones and the desktop. The chat
   pane's scrolling checks (`tools/chat-scroll-sim`) passed again on
-  2026-10-12, after the unread UI properties were removed.
+  2026-10-12, after the unread UI properties were removed, and once
+  more the same day after the fourth batch's `chat.slint` changes.
   Windows-only code in `transport`, `audio`, `video`, `client` and
   `server` type-checks for `x86_64-pc-windows-gnu`, and Android-only
   code in `audio`, `video` and `client` for `aarch64-linux-android`

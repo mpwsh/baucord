@@ -21,15 +21,34 @@ fn snap(text: &str, pos: usize) -> usize {
 /// what Shift+Enter should do. Returns the new text and caret offset.
 #[must_use]
 pub fn insert_newline(text: &str, cursor: usize, anchor: usize) -> (String, usize) {
-    let (a, b) = {
-        let (c, a) = (snap(text, cursor), snap(text, anchor));
-        (c.min(a), c.max(a))
-    };
+    let (a, b) = span(text, cursor, anchor);
     let mut out = String::with_capacity(text.len() + 1);
     out.push_str(&text[..a]);
     out.push('\n');
     out.push_str(&text[b..]);
     (out, a + 1)
+}
+
+/// The selection's two ends in order, on char boundaries.
+fn span(text: &str, cursor: usize, anchor: usize) -> (usize, usize) {
+    let (c, a) = (snap(text, cursor), snap(text, anchor));
+    (c.min(a), c.max(a))
+}
+
+/// What is selected between the caret and the anchor — what Copy takes.
+/// Empty when they are in the same place.
+#[must_use]
+pub fn selected(text: &str, cursor: usize, anchor: usize) -> &str {
+    let (a, b) = span(text, cursor, anchor);
+    &text[a..b]
+}
+
+/// The text without its selection, and where the caret then is — what
+/// Cut leaves.
+#[must_use]
+pub fn cut(text: &str, cursor: usize, anchor: usize) -> (String, usize) {
+    let (a, b) = span(text, cursor, anchor);
+    (format!("{}{}", &text[..a], &text[b..]), a)
 }
 
 /// Byte offset of the start (`to_end == false`) or end of the line the
@@ -71,6 +90,28 @@ pub fn split_command(rest: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_and_cut_take_the_selection_whichever_way_it_was_dragged() {
+        assert_eq!(selected("hello world", 0, 5), "hello");
+        assert_eq!(selected("hello world", 5, 0), "hello");
+        assert_eq!(cut("hello world", 5, 0), (" world".into(), 0));
+        assert_eq!(cut("hello world", 6, 11), ("hello ".into(), 6));
+    }
+
+    #[test]
+    fn nothing_selected_is_nothing_taken() {
+        assert_eq!(selected("abc", 2, 2), "");
+        assert_eq!(cut("abc", 2, 2), ("abc".into(), 2));
+    }
+
+    #[test]
+    fn stale_offsets_stay_inside_the_text_and_on_characters() {
+        // The draft shrank since the offsets were read, and one of them
+        // now falls inside "é".
+        assert_eq!(selected("né", 2, 40), "é");
+        assert_eq!(cut("né", 2, 40), ("n".into(), 1));
+    }
 
     #[test]
     fn newline_at_caret() {

@@ -24,9 +24,13 @@ impl AppState {
                 self.pending_channel_join = None;
                 self.show_toast(ToastKind::Warning, &t!("channel-full"));
             }
-            client::ChannelDenyReason::NoSuchChannel | client::ChannelDenyReason::NotPermitted => {
+            client::ChannelDenyReason::NoSuchChannel => {
                 self.pending_channel_join = None;
-                self.show_error(reason.describe());
+                self.show_error(&t!("channel-deny-missing"));
+            }
+            client::ChannelDenyReason::NotPermitted => {
+                self.pending_channel_join = None;
+                self.show_error(&t!("channel-deny-not-permitted"));
             }
         }
     }
@@ -272,8 +276,12 @@ impl AppState {
         self.kept_alive = None;
         let first = !self.startup_done;
         self.startup_done = true;
-        let stay_hidden = first && self.settings.startup.start_minimized && cfg!(feature = "tray");
-        if !stay_hidden {
+        // Shown at launch only (unless that starts in the tray). A
+        // session ending later — a lost connection, a kick — changes
+        // the view where the window is and takes no focus from
+        // whatever the user is in (review P2-17).
+        let stay_hidden = self.settings.startup.start_minimized && cfg!(feature = "tray");
+        if first && !stay_hidden {
             self.show_main();
         }
         if first && self.settings.startup.auto_connect {

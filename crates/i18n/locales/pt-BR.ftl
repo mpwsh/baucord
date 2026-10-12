@@ -285,6 +285,7 @@ resource-line = CPU { $cpu }% · Mem { $mem } MB
 chat-gif-too-large = O GIF ultrapassa o limite de { $mb } MB
 chat-gif-too-big = GIFs animados podem ter no máximo { $dim } px de largura ou altura
 image-save-filter-gif = Imagem GIF
+image-save-filter-jpeg = Imagem JPEG
 
 # ── Adições da migração para Slint ──────────────────────────────────────
 tech-slint = Slint - Interface de usuário
@@ -546,6 +547,9 @@ aec-status-canceller-off = Indisponível — não foi possível ligar o cancelam
 aec-status-refused = Indisponível — o sistema não abriu o áudio de chamada. Os detalhes estão no baucord.log.
 aec-status-unsupported = Ainda não disponível neste sistema.
 aec-status-idle = Vale quando você entrar num canal de voz.
+aec-lowering = O Windows abaixa o volume dos seus outros apps enquanto o baucord está conectado, e não deixou o baucord desativar isso. Nas configurações de som do Windows, na aba Comunicações, escolha "Não fazer nada".
+aec-lowering-fix = Abrir as configurações de som do Windows
+aec-lowering-told = O Windows abaixa o volume dos seus outros apps enquanto o baucord está conectado. Em Configurações → Áudio você vê como evitar.
 ptt-tooltip = Apertar para falar — segure
 
 # ── Perfis na rede (spec §7.1) ────────────────────────────────────────
@@ -881,3 +885,29 @@ licenses-crates-count = { $count ->
    *[other] { $count } crates
 }
 licenses-used-by = Usado por: { $crates }
+
+# ── Intervalos de tempo, e o que o servidor recusou (review P3-30) ────
+span-days = { $n } d
+span-hours = { $n } h
+span-minutes = { $n } min
+span-seconds = { $n } s
+span-days-hours = { $d } d { $h } h
+span-hours-minutes = { $h } h { $m } min
+span-ago = há { $span }
+share-denied = Não foi possível compartilhar a tela: { $why }
+watch-denied = Não é possível assistir { $name }: { $why }
+deny-share-limit = o servidor atingiu o limite de telas compartilhadas
+deny-viewer-limit = esta transmissão atingiu o limite de espectadores
+deny-not-sharing = esse usuário não está compartilhando a tela
+deny-dimensions = o servidor recusou o tamanho da transmissão
+deny-not-in-channel = esta transmissão só aparece no canal de voz dela
+deny-not-permitted = você não tem permissão
+channel-deny-missing = Esse canal não existe mais.
+channel-deny-not-permitted = Você não tem permissão para entrar nesse canal.
+upload-deny-too-large = o arquivo é maior do que este servidor aceita
+upload-deny-bad-type = só são aceitas imagens PNG, JPEG e WebP
+upload-deny-damaged = o arquivo chegou corrompido
+upload-deny-refused = o servidor recusou o arquivo
+upload-deny-quota = você já usou sua cota de envios de hoje
+upload-deny-full = o servidor não tem mais espaço para arquivos
+upload-deny-not-permitted = você não tem permissão para enviar arquivos aqui

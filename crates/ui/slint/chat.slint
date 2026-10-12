@@ -862,8 +862,6 @@ component ComposerField inherits Rectangle {
     public function focus-input() { input.focus(); }
     public function set-cursor(pos: int) { input.set-selection-offsets(pos, pos); }
     public function select-all() { input.select-all(); }
-    public function do-cut() { input.cut(); }
-    public function do-copy() { input.copy(); }
     /// Android: the word the keyboard is still composing is shown in
     /// the field but is not in `text` until the keyboard commits it —
     /// on a space or punctuation, not on Enter or the send button, so a
@@ -1028,8 +1026,6 @@ export component ChatPane inherits Rectangle {
     public function focus-composer() { input.focus-input(); }
     public pure function composer-focused() -> bool { return input.input-focused; }
     public function composer-set-cursor(pos: int) { input.set-cursor(pos); }
-    public function composer-cut() { input.do-cut(); }
-    public function composer-copy() { input.do-copy(); }
     /// The host appended rows to the conversation on screen. A reader
     /// stuck to the bottom follows them (on the layout pass that
     /// measures them: a scroll-to-end right after a push reads the old
@@ -1611,7 +1607,9 @@ export component ChatPane inherits Rectangle {
                         : "";
                     text <=> State.draft;
                     edited => { Logic.draft-edited(); }
-                    context(x, y) => { Logic.composer-context(x, y); }
+                    context(x, y) => {
+                        Logic.composer-context(x, y, input.cursor-offset, input.anchor-offset);
+                    }
                 }
             }
             // Narrow: only once the limit is near — on a phone the
@@ -1726,21 +1724,27 @@ export component ChatPane inherits Rectangle {
             border-width: 1px;
             border-color: Theme.border;
             clip: true;
-            Flickable {
+            // A ListView, so only the rows in view exist: as one
+            // layout the palette built all 344 cells — about a thousand
+            // items — every time it opened (review P3-38).
+            ListView {
+                // 8 columns of 40px cells, gap-xs breathing room
+                property <int> cols: 8;
                 x: Theme.gap-sm; y: Theme.gap-sm;
                 width: parent.width - 2 * Theme.gap-sm;
                 height: parent.height - 2 * Theme.gap-sm - 26px;
-                content-height: grid.preferred-height;
-                grid := VerticalLayout {
-                    // 8 columns of 40px cells, gap-xs breathing room
-                    property <int> cols: 8;
-                    spacing: Theme.gap-xs;
-                    for r in Math.ceil(State.emoji.length / self.cols) : HorizontalLayout {
+                for r in Math.ceil(State.emoji.length / self.cols) : Rectangle {
+                    // The row and the gap under it: a ListView has no
+                    // spacing of its own.
+                    height: 40px + Theme.gap-xs;
+                    HorizontalLayout {
+                        y: 0px;
                         height: 40px;
+                        alignment: start;
                         spacing: Theme.gap-xs;
-                        for c in grid.cols : Rectangle {
+                        for c in 8 : Rectangle {
                             width: 40px;
-                            property <int> idx: r * grid.cols + c;
+                            property <int> idx: r * 8 + c;
                             border-radius: Theme.radius-sm;
                             background: et.has-hover ? Theme.hover : transparent;
                             if idx < State.emoji.length : Text {

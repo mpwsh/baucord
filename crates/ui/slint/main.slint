@@ -10,7 +10,7 @@ import { IconSet, IconDisplay } from "@lucide";
 import { Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuAction, MenuEntry } from "globals.slint";
+import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuEntry } from "globals.slint";
 import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
@@ -22,7 +22,7 @@ import { StreamViewerWindow, StreamViewerPanel } from "viewer.slint";
 
 import { BaucordTray } from "tray.slint";
 
-export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuAction, MenuEntry }
+export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuEntry }
 export { AdminWindow, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow }
 
 export component MainWindow inherits Window {
@@ -61,8 +61,6 @@ export component MainWindow inherits Window {
     }
     public function composer-set-cursor(pos: int) { chat-pane.composer-set-cursor(pos); }
     // The composer's menu entries (the host dispatches the pick).
-    public function composer-cut() { chat-pane.composer-cut(); }
-    public function composer-copy() { chat-pane.composer-copy(); }
 
     // Flipped by the shell after a minimize→restore on Windows: the OS
     // repaints the uncovered window white, but the renderer's damage
@@ -248,12 +246,21 @@ export component MainWindow inherits Window {
     property <int> card-key: State.card-index >= 0 ? State.card-index
         : State.card-guest-open ? -2 : -1;
     property <int> card-shown-for: -1;
+    // Gone is gone: coming back to the same row waits its dwell again
+    // (it used to pop up at once), and nothing shows under an open
+    // menu — on touch, the tap that opens a row's menu is also its
+    // hover (review P3-37).
+    changed card-key => {
+        if (root.card-key == -1) {
+            root.card-shown-for = -1;
+        }
+    }
     Timer {
         interval: 450ms;
-        running: root.card-key != -1 && root.card-shown-for != root.card-key;
+        running: root.card-key != -1 && root.card-shown-for != root.card-key && !State.menu-open;
         triggered => { root.card-shown-for = root.card-key; }
     }
-    if root.card-key != -1 && root.card-shown-for == root.card-key
+    if root.card-key != -1 && root.card-shown-for == root.card-key && !State.menu-open
         && (root.card-key == -2
             || (State.card-index < State.users.length
                 && !State.users[State.card-index].is-channel)) : card := Rectangle {
@@ -422,7 +429,7 @@ export component MainWindow inherits Window {
                 menu-layer.open-model = model;
                 menu-layer.open-y = y;
             }
-            activated(action, arg) => { Logic.menu-activated(action, arg); }
+            activated(id) => { Logic.menu-activated(id); }
         }
         if menu-layer.open-model >= 0 && menu-layer.open-model < State.menu-submenus.length : MenuPanel {
             entries: State.menu-submenus[menu-layer.open-model];
@@ -431,7 +438,7 @@ export component MainWindow inherits Window {
                 : Math.max(Theme.gap-sm, main-column.x - self.width + 4px);
             y: Math.max(Theme.gap-sm, Math.min(main-column.y + menu-layer.open-y - 4px,
                 root.height - self.height - Theme.gap-sm));
-            activated(action, arg) => { Logic.menu-activated(action, arg); }
+            activated(id) => { Logic.menu-activated(id); }
         }
     }
 

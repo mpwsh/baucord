@@ -49,11 +49,9 @@ use client::{
     AdminCommand, AdminTarget,
 };
 use i18n::t;
-use log::{info, warn};
+use log::{error, info, warn};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
-use ui::{
-    ChatRow, DmRow, Logic, MainWindow, MenuAction, ModAction, Phase, State, ToastKind, Tr, UserRow,
-};
+use ui::{ChatRow, DmRow, Logic, MainWindow, ModAction, Phase, State, ToastKind, Tr, UserRow};
 
 use crate::{
     hotkeys::HotkeyManager,
@@ -255,6 +253,8 @@ pub struct AppState {
     /// What the open context menu is about: its entries were built
     /// for this target, and a pick resolves against it.
     menu_target: Option<MenuTarget>,
+    /// What each entry of the open menu does, by `MenuEntry.id`.
+    menu_actions: Vec<menu::Action>,
     /// The conversation a slash command was typed in: its output
     /// (and the answer to the admin command it sent) lands there —
     /// the admin channel, a DM, or General.
@@ -470,10 +470,10 @@ pub struct AppState {
     /// Image-viewer overlay: the chat row shown, and GIF playback
     /// state while that row is an animated GIF.
     pub gallery_row: Option<i32>,
-    pub gallery_gif: Option<crate::viewers::GalleryGif>,
+    pub gallery_gif: Option<GifPlayer>,
     /// GIF playback for the *send preview* overlay (the FLTK preview
     /// animated GIFs too).
-    pub preview_gif: Option<crate::viewers::GalleryGif>,
+    pub preview_gif: Option<GifPlayer>,
 
     // Update flow
     update_version: Option<String>,
@@ -481,6 +481,10 @@ pub struct AppState {
     download_cancelled: Arc<AtomicBool>,
 
     // Device hot-reload polling
+    /// The devices Settings' two pickers are showing, in their order:
+    /// what a picked index means (`settingsui::refresh_devices`).
+    pub picker_inputs: Vec<String>,
+    pub picker_outputs: Vec<String>,
     last_input_devices: Vec<(String, bool)>,
     last_output_devices: Vec<(String, bool)>,
 
@@ -703,6 +707,7 @@ pub fn run() {
         telemetry_notes: HashMap::new(),
         moderation: None,
         menu_target: None,
+        menu_actions: Vec::new(),
         command_conv: None,
         roles: builtin_role_table(),
         pending_uploads: HashMap::new(),
@@ -791,6 +796,8 @@ pub fn run() {
         update_version: None,
         update_zip_path: None,
         download_cancelled: Arc::new(AtomicBool::new(false)),
+        picker_inputs: Vec::new(),
+        picker_outputs: Vec::new(),
         last_input_devices: Vec::new(),
         last_output_devices: Vec::new(),
         present: present_shared,
@@ -978,7 +985,7 @@ fn center_on_monitor(win: &slint::Window) {
 
 fn with_app(weak: &Weak<RefCell<AppState>>, f: impl FnOnce(&mut AppState)) {
     if let Some(rc) = weak.upgrade() {
-        f(&mut rc.borrow_mut());
+        enter(&rc, f);
     }
 }
 
@@ -986,7 +993,23 @@ fn with_app(weak: &Weak<RefCell<AppState>>, f: impl FnOnce(&mut AppState)) {
 pub fn with_current(f: impl FnOnce(&mut AppState)) {
     let app = APP.with(|a| a.borrow().clone());
     if let Some(app) = app {
-        f(&mut app.borrow_mut());
+        enter(&app, f);
+    }
+}
+
+/// Run `f` on the app, unless a call is already running on it. Slint
+/// delivers some callbacks from inside another — a function invoked on
+/// the window that edits a field, whose `edited` then calls back — and
+/// the second one finds the state borrowed. That was a `borrow_mut`
+/// panic, which a release build turns into an abort; a developer's
+/// build still stops there, a user's drops the inner call and says so
+/// in the log (review P2-16).
+fn enter(app: &RefCell<AppState>, f: impl FnOnce(&mut AppState)) {
+    if let Ok(mut app) = app.try_borrow_mut() {
+        f(&mut app);
+    } else {
+        debug_assert!(false, "a UI callback re-entered the app state");
+        error!("a UI callback arrived while another was running; dropped");
     }
 }
 
@@ -1124,14 +1147,24 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, |app| app.open_row_menu(&row, selecting, x, y));
     });
     let w = Rc::downgrade(state);
-    logic.on_composer_context(move |x, y| {
+    logic.on_composer_context(move |x, y, cursor, anchor| {
         with_app(&w, |app| {
-            app.show_menu(menu::composer_menu(), MenuTarget::Composer, x, y);
+            // The selection as the click found it: the menu takes the
+            // focus, and a text input drops its selection with it
+            // (review P2-16).
+            let cursor = usize::try_from(cursor).unwrap_or(0);
+            let anchor = usize::try_from(anchor).unwrap_or(0);
+            app.show_menu(
+                menu::composer_menu(cursor != anchor),
+                MenuTarget::Composer { cursor, anchor },
+                x,
+                y,
+            );
         });
     });
     let w = Rc::downgrade(state);
-    logic.on_menu_activated(move |action, arg| {
-        with_app(&w, |app| app.menu_activated(action, arg));
+    logic.on_menu_activated(move |id| {
+        with_app(&w, |app| app.menu_activated(id));
     });
     let w = Rc::downgrade(state);
     logic.on_menu_volume_changed(move |volume| {
@@ -1628,7 +1661,10 @@ fn start_timers(state: &Rc<RefCell<AppState>>) {
             }
             let input = audio::VoiceChat::list_input_devices().unwrap_or_default();
             let output = audio::VoiceChat::list_output_devices().unwrap_or_default();
-            with_app(&w, |app| app.handle_devices_changed(input, output));
+            with_app(&w, |app| {
+                app.handle_devices_changed(input, output);
+                app.tell_lowering_once();
+            });
         },
     );
 
@@ -1765,7 +1801,12 @@ enum MenuTarget {
         msg_id: u64,
         body: String,
     },
-    Composer,
+    /// The composer, with its selection when the menu opened (UTF-8
+    /// byte offsets, as `app_core::composer` takes them).
+    Composer {
+        cursor: usize,
+        anchor: usize,
+    },
 }
 
 /// The first bytes of a user id, for log lines and the identity panel.
@@ -1908,30 +1949,64 @@ fn lifted_key(kind: client::RestrictionKind) -> &'static str {
     }
 }
 
-/// "3 min ago", "2 d ago".
-/// "3 d 4 h", "12 min", "45 s": an uptime.
+/// "3 d 4 h", "12 min", "45 s": an uptime. The units are the catalog's
+/// (`span-*`), as in everything below (review P3-30).
 pub(crate) fn describe_duration(secs: u64) -> String {
     let (d, h, m) = (secs / 86_400, (secs / 3_600) % 24, (secs / 60) % 60);
     if d > 0 {
-        format!("{d} d {h} h")
+        t!("span-days-hours", "d" => d, "h" => h)
     } else if h > 0 {
-        format!("{h} h {m} min")
+        t!("span-hours-minutes", "h" => h, "m" => m)
     } else if m > 0 {
-        format!("{m} min")
+        t!("span-minutes", "n" => m)
     } else {
-        format!("{secs} s")
+        t!("span-seconds", "n" => secs)
     }
 }
 
-pub(crate) fn describe_ago(ts: u64) -> String {
-    let ago = wall_now_ms().saturating_sub(ts) / 1000;
-    if ago >= 86_400 {
-        format!("{} d ago", ago / 86_400)
-    } else if ago >= 3_600 {
-        format!("{} h ago", ago / 3_600)
+/// `secs` in its largest sensible unit: "2 d", "3 h", "12 min".
+fn describe_span(secs: u64) -> String {
+    if secs >= 86_400 {
+        t!("span-days", "n" => secs / 86_400)
+    } else if secs >= 3_600 {
+        t!("span-hours", "n" => secs / 3_600)
     } else {
-        format!("{} min ago", ago / 60)
+        t!("span-minutes", "n" => secs / 60)
     }
+}
+
+/// "3 min ago", "2 d ago".
+pub(crate) fn describe_ago(ts: u64) -> String {
+    let span = describe_span(wall_now_ms().saturating_sub(ts) / 1000);
+    t!("span-ago", "span" => span.as_str())
+}
+
+/// Why the server refused a share or a watch, in the user's language.
+pub(crate) fn describe_deny(reason: client::protocol::DenyReason) -> String {
+    use client::protocol::DenyReason as R;
+    t!(match reason {
+        R::ShareLimitReached => "deny-share-limit",
+        R::ViewerLimitReached => "deny-viewer-limit",
+        R::NotSharing => "deny-not-sharing",
+        R::InvalidDimensions => "deny-dimensions",
+        R::NotInChannel => "deny-not-in-channel",
+        R::NotPermitted => "deny-not-permitted",
+    })
+}
+
+/// Why the server refused an upload, in the user's language.
+pub(crate) fn describe_upload_deny(reason: client::protocol::UploadRejectReason) -> String {
+    use client::protocol::UploadRejectReason as R;
+    t!(match reason {
+        R::TooLarge => "upload-deny-too-large",
+        R::BadType => "upload-deny-bad-type",
+        // Both are the transfer going wrong, not something to act on.
+        R::HashMismatch | R::NotAnnounced => "upload-deny-damaged",
+        R::Refused => "upload-deny-refused",
+        R::Quota => "upload-deny-quota",
+        R::Full => "upload-deny-full",
+        R::NoPermission => "upload-deny-not-permitted",
+    })
 }
 
 /// The built-in role's name, or `role <id>` for a custom one.
@@ -2268,14 +2343,8 @@ pub(crate) fn describe_until(until: Option<u64>) -> String {
 
 /// The time between now and `at` in the largest sensible unit.
 fn describe_left(at: u64) -> String {
-    let left = at.saturating_sub(wall_now_ms()) / 1000;
-    if left >= 86_400 {
-        format!("{} d", left / 86_400)
-    } else if left >= 3_600 {
-        format!("{} h", left / 3_600)
-    } else {
-        format!("{} min", (left / 60).max(1))
-    }
+    // Never "0 min": something that still counts has a minute left.
+    describe_span((at.saturating_sub(wall_now_ms()) / 1000).max(60))
 }
 
 fn peer_audio_from(a: &PeerAudioSettings) -> PeerAudio {

@@ -604,8 +604,13 @@ pub fn populate(app: &mut AppState) {
         .collect();
     s.set_aec_modes(ModelRc::new(VecModel::from(aec_modes)));
     s.set_aec_index(i32::try_from(settings.audio.echo_cancellation.index()).unwrap_or(0));
-    let aec = app.voice_aec();
-    s.set_aec_status(aec_status(aec.lock().ok().and_then(|g| g.clone()).as_ref()).into());
+    let report = app.voice_aec().lock().ok().and_then(|g| g.clone());
+    s.set_aec_status(aec_status(report.as_ref()).into());
+    s.set_aec_lowering(
+        report
+            .as_ref()
+            .is_some_and(audio::AecReport::lowering_others),
+    );
 
     // Profile (spec §7.1): what this device keeps.
     s.set_nickname(settings.user.nickname.as_str().into());
@@ -654,41 +659,6 @@ pub fn populate(app: &mut AppState) {
     push_server_rows(app);
     fill_server_editor(app);
 
-    // Device lists: "System default" first, saved selection restored.
-    let sys_default = t!("audio-system-default");
-    let input_devices = audio::VoiceChat::list_input_devices().unwrap_or_default();
-    let output_devices = audio::VoiceChat::list_output_devices().unwrap_or_default();
-    let dev_model = |devices: &[(String, bool)]| -> Vec<slint::SharedString> {
-        std::iter::once(sys_default.as_str().into())
-            .chain(devices.iter().map(|(n, _)| n.as_str().into()))
-            .collect()
-    };
-    // A phone's outputs are routes (audio::route): "Automatic" first,
-    // the built-in ones in the user's language. The setting keeps the
-    // engine's names; only the shown text changes.
-    let output_model: Vec<slint::SharedString> = if app::SINGLE_WINDOW_HOST {
-        std::iter::once(t!("audio-route-auto").into())
-            .chain(output_devices.iter().map(|(n, _)| route_label(n).into()))
-            .collect()
-    } else {
-        dev_model(&output_devices)
-    };
-    let dev_index = |devices: &[(String, bool)], saved: Option<&str>| -> i32 {
-        saved
-            .and_then(|name| devices.iter().position(|(n, _)| n == name))
-            .map_or(0, |i| i32::try_from(i + 1).unwrap_or(0))
-    };
-    s.set_input_devices(ModelRc::new(VecModel::from(dev_model(&input_devices))));
-    s.set_output_devices(ModelRc::new(VecModel::from(output_model)));
-    s.set_input_index(dev_index(
-        &input_devices,
-        settings.audio.input.device.as_deref(),
-    ));
-    s.set_output_index(dev_index(
-        &output_devices,
-        settings.audio.output.device.as_deref(),
-    ));
-
     s.set_input_gain(settings.audio.input.gain);
     s.set_output_gain(settings.audio.output.gain);
     s.set_gate_threshold(settings.audio.gate_threshold);
@@ -720,6 +690,59 @@ pub fn populate(app: &mut AppState) {
     set_credits(&s);
     set_about(&s);
     set_licenses(&s);
+
+    let names = |devices: Vec<(String, bool)>| devices.into_iter().map(|(n, _)| n).collect();
+    refresh_devices(
+        app,
+        names(audio::VoiceChat::list_input_devices().unwrap_or_default()),
+        names(audio::VoiceChat::list_output_devices().unwrap_or_default()),
+    );
+}
+
+/// The device pickers: "System default" first, the saved selection
+/// restored. Filled with Settings and again whenever a device comes or
+/// goes (`AppState::handle_devices_changed`), and the names shown are
+/// kept: a pick is an index into the list on screen. Resolving it
+/// against a fresh enumeration, as before, picked the neighbour of the
+/// device the user clicked once something had been plugged in with
+/// Settings open (review P3-35).
+pub fn refresh_devices(app: &mut AppState, inputs: Vec<String>, outputs: Vec<String>) {
+    if let Some(sf) = surface(app) {
+        let s = sf.state();
+        let sys_default = t!("audio-system-default");
+        let dev_model = |devices: &[String]| -> Vec<slint::SharedString> {
+            std::iter::once(sys_default.as_str().into())
+                .chain(devices.iter().map(|n| n.as_str().into()))
+                .collect()
+        };
+        // A phone's outputs are routes (audio::route): "Automatic"
+        // first, the built-in ones in the user's language. The setting
+        // keeps the engine's names; only the shown text changes.
+        let output_model: Vec<slint::SharedString> = if app::SINGLE_WINDOW_HOST {
+            std::iter::once(t!("audio-route-auto").into())
+                .chain(outputs.iter().map(|n| route_label(n).into()))
+                .collect()
+        } else {
+            dev_model(&outputs)
+        };
+        let dev_index = |devices: &[String], saved: Option<&str>| -> i32 {
+            saved
+                .and_then(|name| devices.iter().position(|n| n == name))
+                .map_or(0, |i| i32::try_from(i + 1).unwrap_or(0))
+        };
+        s.set_input_devices(ModelRc::new(VecModel::from(dev_model(&inputs))));
+        s.set_output_devices(ModelRc::new(VecModel::from(output_model)));
+        s.set_input_index(dev_index(
+            &inputs,
+            app.settings.audio.input.device.as_deref(),
+        ));
+        s.set_output_index(dev_index(
+            &outputs,
+            app.settings.audio.output.device.as_deref(),
+        ));
+    }
+    app.picker_inputs = inputs;
+    app.picker_outputs = outputs;
 }
 
 /// Wire `SettingsLogic` callbacks (once per surface).
@@ -939,6 +962,11 @@ fn wire(sf: &SettingsSurface<'_>) {
             app.apply_push_to_talk();
             app.refresh_hotkeys();
         });
+    });
+    logic.on_open_sound_settings(|| {
+        if let Err(e) = crate::host::open_sound_settings() {
+            log::warn!("sound settings: {e}");
+        }
     });
     logic.on_aec_selected(|index| {
         app::with_current(move |app| {
@@ -1187,13 +1215,13 @@ fn wire(sf: &SettingsSurface<'_>) {
 
     logic.on_input_device_selected(|index| {
         app::with_current(move |app| {
-            let device = device_at(&audio::VoiceChat::list_input_devices(), index);
+            let device = device_at(&app.picker_inputs, index);
             app.set_input_device(device);
         });
     });
     logic.on_output_device_selected(|index| {
         app::with_current(move |app| {
-            let device = device_at(&audio::VoiceChat::list_output_devices(), index);
+            let device = device_at(&app.picker_outputs, index);
             app.set_output_device(device);
         });
     });
@@ -1320,18 +1348,11 @@ fn update_selected_address(app: &mut AppState) {
     push_server_rows(app);
 }
 
-/// `index` 0 = system default; otherwise the (index-1)-th device.
-/// Error-generic: only the Ok shape matters here, so the real crate's
-/// error type (Box<dyn Error>) and any future change both fit.
-fn device_at<E>(devices: &Result<Vec<(String, bool)>, E>, index: i32) -> Option<String> {
-    if index <= 0 {
-        return None;
-    }
-    devices
-        .as_ref()
-        .ok()
-        .and_then(|list| usize::try_from(index - 1).ok().and_then(|i| list.get(i)))
-        .map(|(name, _)| name.clone())
+/// `index` 0 = system default; otherwise the (index-1)-th of the
+/// devices the picker is showing (`refresh_devices`).
+fn device_at(shown: &[String], index: i32) -> Option<String> {
+    let index = usize::try_from(index).ok()?.checked_sub(1)?;
+    shown.get(index).cloned()
 }
 
 fn set_row_recording(s: &SettingsState, index: i32, recording: bool) {
@@ -1505,12 +1526,22 @@ fn start_meter_timer(app: &mut AppState) {
                         // Reopening the streams (a headset plugged in,
                         // the setting changed) changes this; property
                         // sets of an equal string cost nothing visible.
-                        let aec_line = aec_status(aec.lock().ok().and_then(|g| g.clone()).as_ref());
+                        let report = aec.lock().ok().and_then(|g| g.clone());
+                        let aec_line = aec_status(report.as_ref());
+                        // Read again each time for the same reason, and
+                        // one more: the way out is a Windows setting
+                        // the user may have just changed.
+                        let lowering = report
+                            .as_ref()
+                            .is_some_and(audio::AecReport::lowering_others);
                         let s = sf.state();
                         s.set_mic_level(mic);
                         s.set_out_level(out);
                         if s.get_aec_status() != aec_line.as_str() {
                             s.set_aec_status(aec_line.into());
+                        }
+                        if s.get_aec_lowering() != lowering {
+                            s.set_aec_lowering(lowering);
                         }
                     }
                     _ => {}

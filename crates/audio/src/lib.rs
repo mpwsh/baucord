@@ -1047,6 +1047,7 @@ impl VoiceChat {
                 output,
                 reference: None,
                 reason: aec::reasons::UNSUPPORTED,
+                lowers_others: false,
             })
         } else if !self.aec_wanted {
             Some(aec::AecReport::not_wanted(mode, output))
@@ -1056,6 +1057,9 @@ impl VoiceChat {
                 .as_ref()
                 .and_then(AudioInput::aec_verdict)
                 .unwrap_or(Err(aec::reasons::PATH_REFUSED));
+            // Whatever the canceller's verdict: the streams are a call
+            // to Windows with or without one.
+            let lowers_others = self.output.as_ref().is_some_and(AudioOutput::lowers_others);
             Some(match verdict {
                 Ok(()) => aec::AecReport {
                     mode,
@@ -1074,6 +1078,7 @@ impl VoiceChat {
                         (_, aec::OutputKind::Unknown) => aec::reasons::UNKNOWN_OUTPUT,
                         _ => aec::reasons::SPEAKERS,
                     },
+                    lowers_others,
                 },
                 Err(reason) => aec::AecReport {
                     mode,
@@ -1081,6 +1086,7 @@ impl VoiceChat {
                     output,
                     reference: None,
                     reason,
+                    lowers_others,
                 },
             })
         };

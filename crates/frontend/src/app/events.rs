@@ -1011,7 +1011,8 @@ impl AppState {
                 if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
                     self.screen.tx.send(ScreenControl::StopSharing).ok();
                 }
-                self.show_error(&format!("Screen share denied: {}", reason.describe()));
+                let why = describe_deny(reason);
+                self.show_error(&t!("share-denied", "why" => why.as_str()));
             }
             NetworkMessage::SubscribeDenied { target_id, reason } => {
                 // Close the viewer window WatchPeer opened optimistically.
@@ -1019,7 +1020,10 @@ impl AppState {
                     viewer.close();
                 }
                 let username = self.username_of(target_id);
-                self.push_chat_system(&format!("Can't watch {username}: {}", reason.describe()));
+                let why = describe_deny(reason);
+                self.push_chat_system(
+                    &t!("watch-denied", "name" => username.as_str(), "why" => why.as_str()),
+                );
             }
             NetworkMessage::ScreenShareStarted {
                 client_id,
@@ -1126,16 +1130,18 @@ impl AppState {
                             app.sync_range(&delta);
                         }
                     });
+                    let why = describe_upload_deny(reason);
                     let line = t!(
                         "file-upload-failed",
                         "name" => upload.name.as_str(),
-                        "why" => reason.describe()
+                        "why" => why.as_str()
                     );
                     self.show_toast(ToastKind::Warning, &line);
                 } else if upload_id == AVATAR_UPLOAD_ID {
+                    let why = describe_upload_deny(reason);
                     self.show_toast(
                         ToastKind::Warning,
-                        &t!("profile-avatar-refused", "why" => reason.describe()),
+                        &t!("profile-avatar-refused", "why" => why.as_str()),
                     );
                     // The rest of the look still goes out.
                     self.own_avatar_blob = None;

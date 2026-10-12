@@ -22,7 +22,9 @@ export component ConnectView inherits Rectangle {
     background: Theme.bg-primary;
 
     card := Rectangle {
-        width: 400px;
+        // A 375 pt phone is narrower than the card: keep a margin
+        // there instead of running off both edges (review P3-40).
+        width: Math.min(400px, parent.width - 2 * Theme.gap-md);
         height: layout.preferred-height;
         border-radius: Theme.radius-lg;
         background: Theme.bg-secondary;
@@ -124,34 +126,41 @@ export component ConnectView inherits Rectangle {
             }
 
             // Connecting is agreeing to the terms (1.2): said once, small,
-            // with the whole line a way to read them.
+            // with the whole line a way to read them. One line where it
+            // fits; on a narrow phone the link drops to a second line
+            // instead of running past the card's edge (360 dp is
+            // narrower than the sentence; review P3-40).
             Rectangle {
+                property <length> line-width: terms-notice.preferred-width + 3px + terms-link.preferred-width;
+                property <bool> stacked: self.line-width > self.width;
                 // A little taller than the text: a finger's worth to tap.
-                height: terms-row.preferred-height + 10px;
-                Rectangle {
-                    width: Math.min(terms-row.preferred-width, parent.width);
-                    x: (parent.width - self.width) / 2;
-                    terms-row := HorizontalLayout {
-                        spacing: 3px;
-                        Text {
-                            text: Tr.terms-notice;
-                            color: Theme.text-muted;
-                            font-size: Theme.font-xs;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: Tr.terms-link;
-                            color: terms-touch.has-hover ? Theme.accent-text : Theme.text-secondary;
-                            font-size: Theme.font-xs;
-                            font-weight: 600;
-                            vertical-alignment: center;
-                            animate color { duration: 120ms; }
-                        }
-                    }
-                    terms-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { Logic.link-clicked(State.terms-url); }
-                    }
+                height: (self.stacked ? terms-notice.preferred-height + terms-link.preferred-height
+                    : terms-notice.preferred-height) + 10px;
+                terms-notice := Text {
+                    x: parent.stacked ? (parent.width - self.width) / 2 : (parent.width - parent.line-width) / 2;
+                    y: 5px;
+                    width: self.preferred-width;
+                    height: self.preferred-height;
+                    text: Tr.terms-notice;
+                    color: Theme.text-muted;
+                    font-size: Theme.font-xs;
+                }
+                terms-link := Text {
+                    x: parent.stacked ? (parent.width - self.width) / 2 : terms-notice.x + terms-notice.width + 3px;
+                    y: parent.stacked ? terms-notice.y + terms-notice.height : 5px;
+                    width: self.preferred-width;
+                    height: self.preferred-height;
+                    text: Tr.terms-link;
+                    color: terms-touch.has-hover ? Theme.accent-text : Theme.text-secondary;
+                    font-size: Theme.font-xs;
+                    font-weight: 600;
+                    animate color { duration: 120ms; }
+                }
+                terms-touch := TouchArea {
+                    x: Math.min(terms-notice.x, terms-link.x);
+                    width: parent.stacked ? Math.max(terms-notice.width, terms-link.width) : parent.line-width;
+                    mouse-cursor: pointer;
+                    clicked => { Logic.link-clicked(State.terms-url); }
                 }
             }
 
