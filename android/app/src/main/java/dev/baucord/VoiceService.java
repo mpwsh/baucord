@@ -209,13 +209,26 @@ public class VoiceService extends Service {
         }
     }
 
+    /**
+     * How long the app's own wake lock for a room lasts, each time it is taken. While voice flows
+     * the audio streams hold the system's wake locks ("AudioMix", "AudioIn"), so ours is for the
+     * moments around them: joining, and the retries after a lost connection. Each of those starts
+     * this service again, which takes the lock anew. Held without a limit it was a wake lock for
+     * as long as someone stayed in a room — hours a day, which Play counts against the app as
+     * "excessive partial wake locks" (review P2-28).
+     */
+    private static final long WAKE_LOCK_MS = 10 * 60 * 1000L;
+
     private void holdWakeLock(boolean hold) {
-        if (hold && wakeLock == null) {
-            PowerManager power = getSystemService(PowerManager.class);
-            wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "baucord:voice");
-            wakeLock.setReferenceCounted(false);
-            wakeLock.acquire();
-        } else if (!hold && wakeLock != null) {
+        if (hold) {
+            if (wakeLock == null) {
+                PowerManager power = getSystemService(PowerManager.class);
+                wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "baucord:voice");
+                wakeLock.setReferenceCounted(false);
+            }
+            // Not reference counted: taking it again starts its time over.
+            wakeLock.acquire(WAKE_LOCK_MS);
+        } else if (wakeLock != null) {
             if (wakeLock.isHeld()) {
                 wakeLock.release();
             }

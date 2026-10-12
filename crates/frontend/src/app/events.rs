@@ -682,11 +682,20 @@ impl AppState {
                         None
                     };
                 }
+                // In a room the host was holding the device awake.
+                let was_in_room = self.kept_alive == Some(true);
                 self.teardown_connection();
                 // Retrying: the host keeps the process alive meanwhile
                 // (on a phone in the background, the retry could not run
                 // otherwise).
                 self.reconnect_hold = self.reconnect_attempts < MAX_AUTO_RECONNECTS;
+                if self.reconnect_hold && was_in_room {
+                    // Said again, as it was: Android's wake lock for a
+                    // room runs out by itself (review P2-28) and the
+                    // audio streams that kept the device awake after
+                    // that are closed now, so the retries get a new one.
+                    crate::host::keep_alive(Some(&self.server_name), true);
+                }
                 self.show_connect_phase();
                 if self.reconnect_attempts >= MAX_AUTO_RECONNECTS {
                     self.show_error(&format!("{what} {}", t!("error-lost-gave-up")));
@@ -1203,21 +1212,7 @@ impl AppState {
                     self.session.transfers.pending_downloads.remove(&blob_id)
                 {
                     self.set_transfer(conv, msg_id, None);
-                    match media::save_to_downloads(&name, &data) {
-                        Ok(saved) => {
-                            // The card turns into Open (a check, a
-                            // re-download beside it); a toast says where.
-                            let line = t!("file-saved", "path" => saved.shown.as_str());
-                            self.downloaded.insert(blob_id, saved.target);
-                            self.set_transfer(conv, msg_id, None);
-                            self.show_toast(ToastKind::Success, &line);
-                        }
-                        Err(e) => self.show_error(&t!(
-                            "file-save-error",
-                            "name" => name.as_str(),
-                            "error" => e.as_str()
-                        )),
-                    }
+                    self.save_download(blob_id, name, conv, msg_id, data);
                 } else {
                     self.session.avatar_fetches.remove(&blob_id);
                     self.take_avatar_bytes(blob_id, &data, true);

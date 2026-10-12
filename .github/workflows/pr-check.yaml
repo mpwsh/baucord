@@ -61,14 +61,14 @@ jobs:
             git curl ca-certificates \
             build-essential pkg-config cmake nasm ninja-build python3 \
             clang libclang-dev \
-            libopus-dev libasound2-dev \
+            libasound2-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libavfilter-dev libswresample-dev \
             libpipewire-0.3-dev \
             libxcb1-dev libxrandr-dev libx11-dev libxext-dev libxcursor-dev \
             libxfixes-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libegl-dev libgbm-dev \
-            libdbus-1-dev libudev-dev libfontconfig1-dev libfreetype-dev
+            libudev-dev libfontconfig1-dev libfreetype-dev
 
       - uses: actions/checkout@v7
 
@@ -112,4 +112,4 @@ jobs:
         run: >
           cargo test --locked --no-fail-fast
           -p protocol -p transport -p server -p client
-          -p app-core -p audio -p video -p i18n
+          -p app-core -p audio -p video -p i18n -p keywatch

@@ -460,10 +460,10 @@ impl StreamCapturer {
     /// Drop the dead duplicator (joining its worker, releasing the
     /// duplication) and build a fresh one on this thread.
     fn try_recreate(&mut self) {
-        if let Some(t) = self.last_recreate {
-            if t.elapsed() < RECREATE_INTERVAL {
-                return;
-            }
+        if let Some(t) = self.last_recreate
+            && t.elapsed() < RECREATE_INTERVAL
+        {
+            return;
         }
         self.last_recreate = Some(Instant::now());
         // Old one must be fully gone before the new DuplicateOutput
@@ -498,10 +498,10 @@ impl StreamCapturer {
         } else {
             SILENCE_PROBE_INTERVAL
         };
-        if let Some(t) = self.last_probe {
-            if t.elapsed() < every {
-                return false;
-            }
+        if let Some(t) = self.last_probe
+            && t.elapsed() < every
+        {
+            return false;
         }
         self.last_probe = Some(Instant::now());
 
@@ -541,10 +541,8 @@ impl StreamCapturer {
 
     /// See [`Capturer::frame`].
     pub fn frame(&mut self, advance_timestamp: bool) -> Option<&Frame> {
-        if advance_timestamp {
-            if let Some(f) = &mut self.last {
-                f.timestamp_ms = self.start_time.elapsed().as_millis() as u64;
-            }
+        if advance_timestamp && let Some(f) = &mut self.last {
+            f.timestamp_ms = self.start_time.elapsed().as_millis() as u64;
         }
         self.last.as_ref()
     }
@@ -571,21 +569,21 @@ impl StreamCapturer {
     /// while a failed switch leaves it in place, the switch naturally
     /// retries every poll until it lands.
     fn failure_message(&self) -> Option<String> {
-        if let Some(d) = &self.dup {
-            if d.health() == crate::dxgi::Health::Failed {
-                return Some(
-                    d.failure()
-                        .unwrap_or_else(|| "unknown capture failure".into()),
-                );
-            }
+        if let Some(d) = &self.dup
+            && d.health() == crate::dxgi::Health::Failed
+        {
+            return Some(
+                d.failure()
+                    .unwrap_or_else(|| "unknown capture failure".into()),
+            );
         }
-        if let Some(since) = self.stream_drought_since {
-            if since.elapsed() >= STREAM_DROUGHT_GIVE_UP {
-                return Some(format!(
-                    "no streamed frames for {:.0}s despite duplicator recreations",
-                    since.elapsed().as_secs_f32()
-                ));
-            }
+        if let Some(since) = self.stream_drought_since
+            && since.elapsed() >= STREAM_DROUGHT_GIVE_UP
+        {
+            return Some(format!(
+                "no streamed frames for {:.0}s despite duplicator recreations",
+                since.elapsed().as_secs_f32()
+            ));
         }
         None
     }
@@ -734,10 +732,8 @@ impl ScreenCapturer {
 
     /// See [`Capturer::frame`].
     pub fn frame(&mut self, advance_timestamp: bool) -> Option<&Frame> {
-        if advance_timestamp {
-            if let Some(f) = &mut self.last {
-                f.timestamp_ms = self.start_time.elapsed().as_millis() as u64;
-            }
+        if advance_timestamp && let Some(f) = &mut self.last {
+            f.timestamp_ms = self.start_time.elapsed().as_millis() as u64;
         }
         self.last.as_ref()
     }

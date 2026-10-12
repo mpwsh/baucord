@@ -316,10 +316,10 @@ impl VideoJitterBuffer {
             return false;
         }
         let now = Instant::now();
-        if let Some(last) = self.last_keyframe_request {
-            if now.duration_since(last) < KEYFRAME_REQUEST_COOLDOWN {
-                return false;
-            }
+        if let Some(last) = self.last_keyframe_request
+            && now.duration_since(last) < KEYFRAME_REQUEST_COOLDOWN
+        {
+            return false;
         }
         self.want_keyframe = false;
         self.last_keyframe_request = Some(now);
@@ -630,13 +630,13 @@ impl PlayoutClock {
         let epoch = *self.epoch.get_or_insert(arrival);
         let sender_ms = self.unwrap_ts(ts);
         let offset = Self::local_ms(epoch, arrival) - sender_ms;
-        if let Some(current) = self.offset.min() {
-            if (offset - current).abs() > CLOCK_JUMP_MS {
-                // Sender clock restarted: start over rather than
-                // schedule against a dead reference.
-                self.offset = MinWindow::default();
-                self.late_peak = PeakHold::default();
-            }
+        if let Some(current) = self.offset.min()
+            && (offset - current).abs() > CLOCK_JUMP_MS
+        {
+            // Sender clock restarted: start over rather than
+            // schedule against a dead reference.
+            self.offset = MinWindow::default();
+            self.late_peak = PeakHold::default();
         }
         self.offset.observe(offset, arrival);
         let fastest = self.offset.min().unwrap_or(offset);

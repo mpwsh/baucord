@@ -94,8 +94,17 @@ const MIN_IDR_REOPEN_INTERVAL_MS: u64 = KEYFRAME_INTERVAL_MS;
 /// if that logic ever fails. Kept long so the two mechanisms don't fight.
 const GOP_BACKSTOP_SECS: u32 = 8;
 
-/// Encoder names to try, in priority order.
-const ENCODER_PRIORITY: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"];
+/// Encoder names to try, in priority order: the hardware ones (each
+/// exists in the `FFmpeg` build of the systems that can have it — the
+/// first three on Windows and Linux, `VideoToolbox` on macOS), then
+/// software. One that is absent, or will not open, is passed over.
+const ENCODER_PRIORITY: &[&str] = &[
+    "h264_nvenc",
+    "h264_qsv",
+    "h264_amf",
+    "h264_videotoolbox",
+    "libx264",
+];
 
 /// Hard per-access-unit cap for AMF, in bits: 250 KB, under the
 /// transport's 275,400 B chunking limit with room for the AUD/SPS/PPS
@@ -255,7 +264,7 @@ impl FfmpegEncoder {
             // behind it exists. (The probe's pixel format is arbitrary —
             // this session is discarded; the real one opens lazily from
             // the first frame's actual dimensions and format.)
-            match open_session(
+            let probe = open_session(
                 codec,
                 name,
                 quality,
@@ -264,8 +273,9 @@ impl FfmpegEncoder {
                 quality.width(),
                 quality.height(),
                 PixelFormat::Rgba,
-            ) {
-                Ok(_probe) => {
+            );
+            match probe {
+                Ok(_) => {
                     log::info!("Using FFmpeg encoder: {name}");
                     return Ok(Self {
                         codec,
@@ -471,10 +481,10 @@ impl FfmpegEncoder {
         // Strictly increasing PTS in the 1/1000 time base. Capture
         // timestamps are ms-resolution, so a burst can repeat a value.
         let mut pts = frame.timestamp_ms as i64;
-        if let Some(last) = self.last_pts {
-            if pts <= last {
-                pts = last + 1;
-            }
+        if let Some(last) = self.last_pts
+            && pts <= last
+        {
+            pts = last + 1;
         }
         self.last_pts = Some(pts);
 
@@ -555,11 +565,11 @@ impl FfmpegEncoder {
     /// One step back down after [`QP_FLOOR_RELAX_AFTER`] without a
     /// frame too large.
     fn relax_qp_floor(&mut self, now: Instant) {
-        if let (Some(i), Some(moved)) = (self.qp_floor, self.qp_floor_moved) {
-            if now.duration_since(moved) >= QP_FLOOR_RELAX_AFTER {
-                self.qp_floor = i.checked_sub(1);
-                self.qp_floor_moved = Some(now);
-            }
+        if let (Some(i), Some(moved)) = (self.qp_floor, self.qp_floor_moved)
+            && now.duration_since(moved) >= QP_FLOOR_RELAX_AFTER
+        {
+            self.qp_floor = i.checked_sub(1);
+            self.qp_floor_moved = Some(now);
         }
     }
 
@@ -950,7 +960,9 @@ fn drain_before_submit(name: &str) -> bool {
 /// interleaved chroma). swscale converts RGBA to either directly.
 fn encoder_pix_fmt(name: &str) -> Pixel {
     match name {
-        "h264_qsv" => Pixel::NV12,
+        // VideoToolbox takes planar frames too, and converts them; NV12
+        // is what its hardware reads.
+        "h264_qsv" | "h264_videotoolbox" => Pixel::NV12,
         _ => Pixel::YUV420P,
     }
 }
@@ -1198,6 +1210,26 @@ fn codec_options(name: &str, rc: RateControl) -> Dictionary<'static> {
             // FFmpeg 8's rewritten amfenc — kept so an ffmpeg upgrade
             // restores on-demand IDRs without a code change.
             opts.set("forced_idr", "1");
+        }
+        "h264_videotoolbox" => {
+            // The Mac's hardware encoder. The release build has had it
+            // all along and the list never tried it, so a Mac encoded
+            // its share with x264 on the CPU (review P2-42).
+            //
+            // Hardware or nothing: a Mac without one fails the probe
+            // and gets libx264, tuned above, not VideoToolbox's own
+            // software encoder.
+            opts.set("allow_sw", "0");
+            // No lookahead, no reordering: a frame is encoded as it
+            // arrives. It finishes after the call that submitted it;
+            // the next call, or the next tick's `drain`, hands it out.
+            opts.set("realtime", "1");
+            opts.set("profile", "high");
+            // Besides the target, the one bound VideoToolbox takes: a
+            // data-rate limit over a second. `bufsize` means nothing
+            // to it. A frame forced to `I` is an IDR with its
+            // parameter sets, as `FFmpeg` writes it out.
+            opts.set("maxrate", &format!("{maxrate}"));
         }
         "h264_amf" => {
             // NO usage preset — deliberately. FFmpeg's AMF wrapper

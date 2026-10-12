@@ -225,6 +225,7 @@ const SERVER_MESSAGE: &[Row] = &[
     ("AccountDeleteRefused", 2, None),
     ("ChatFrom", 37, Some((38, 0x0902_53ea))),
     ("Authors", 2, Some((74, 0x8a02_ff18))),
+    ("AdminRows", 3, Some((78, 0xf8e7_e989))),
 ];
 
 #[rustfmt::skip]

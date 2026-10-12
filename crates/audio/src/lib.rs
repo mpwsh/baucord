@@ -760,7 +760,7 @@ impl VoiceChat {
                 }
             );
         }
-        match (done.output, done.input) {
+        match (&done.output, &done.input) {
             (Some(Err(e)), _) => StartOutcome::NoPlayback(e.to_string()),
             (_, Some(Err(e))) => StartOutcome::NoMicrophone(e.to_string()),
             _ => StartOutcome::Started,
@@ -1991,12 +1991,11 @@ impl VoiceChat {
         // (If the periodic receive-side underruns thin out after this
         // change, enumeration stalls were indeed the cause.)
         static CACHE: DeviceListCache = Mutex::new(None);
-        if let Ok(cache) = CACHE.lock() {
-            if let Some((at, list)) = cache.as_ref() {
-                if at.elapsed() < std::time::Duration::from_secs(10) {
-                    return Ok(list.clone());
-                }
-            }
+        if let Ok(cache) = CACHE.lock()
+            && let Some((at, list)) = cache.as_ref()
+            && at.elapsed() < std::time::Duration::from_secs(10)
+        {
+            return Ok(list.clone());
         }
 
         let host = cpal::default_host();
@@ -2007,16 +2006,16 @@ impl VoiceChat {
                 let is_default = default_name.as_deref() == Some(&name);
                 // As for the outputs below: no config round trip unless
                 // the line is written (review P2-36).
-                if log::log_enabled!(log::Level::Debug) {
-                    if let Ok(cfg) = device.default_input_config() {
-                        debug!(
-                            "  Input device: \"{name}\" {}Hz {}ch {:?}{}",
-                            cfg.sample_rate(),
-                            cfg.channels(),
-                            cfg.sample_format(),
-                            if is_default { " [DEFAULT]" } else { "" },
-                        );
-                    }
+                if log::log_enabled!(log::Level::Debug)
+                    && let Ok(cfg) = device.default_input_config()
+                {
+                    debug!(
+                        "  Input device: \"{name}\" {}Hz {}ch {:?}{}",
+                        cfg.sample_rate(),
+                        cfg.channels(),
+                        cfg.sample_format(),
+                        if is_default { " [DEFAULT]" } else { "" },
+                    );
                 }
                 devices.push((name, is_default));
             }
@@ -2041,12 +2040,11 @@ impl VoiceChat {
     fn list_cpal_output_devices() -> Result<Vec<(String, bool)>, Box<dyn std::error::Error>> {
         // Same 10 s cache as list_input_devices — see the note there.
         static CACHE: DeviceListCache = Mutex::new(None);
-        if let Ok(cache) = CACHE.lock() {
-            if let Some((at, list)) = cache.as_ref() {
-                if at.elapsed() < std::time::Duration::from_secs(10) {
-                    return Ok(list.clone());
-                }
-            }
+        if let Ok(cache) = CACHE.lock()
+            && let Some((at, list)) = cache.as_ref()
+            && at.elapsed() < std::time::Duration::from_secs(10)
+        {
+            return Ok(list.clone());
         }
 
         let host = cpal::default_host();
@@ -2059,16 +2057,16 @@ impl VoiceChat {
                 // round trip to each driver, on the UI thread, every
                 // 10 s: only when the line will be written (review
                 // P2-36).
-                if log::log_enabled!(log::Level::Debug) {
-                    if let Ok(cfg) = device.default_output_config() {
-                        debug!(
-                            "  Output device: \"{name}\" {}Hz {}ch {:?}{}",
-                            cfg.sample_rate(),
-                            cfg.channels(),
-                            cfg.sample_format(),
-                            if is_default { " [DEFAULT]" } else { "" },
-                        );
-                    }
+                if log::log_enabled!(log::Level::Debug)
+                    && let Ok(cfg) = device.default_output_config()
+                {
+                    debug!(
+                        "  Output device: \"{name}\" {}Hz {}ch {:?}{}",
+                        cfg.sample_rate(),
+                        cfg.channels(),
+                        cfg.sample_format(),
+                        if is_default { " [DEFAULT]" } else { "" },
+                    );
                 }
                 devices.push((name, is_default));
             }

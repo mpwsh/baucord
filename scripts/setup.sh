@@ -34,6 +34,12 @@ MEDIA_VIA_DOCKER_NAT="true" # true  = baucord uses `ports:` (iptables DNAT -> co
 BAUCORD_UID="10000"       # uid:gid the mpwsh/baucord image runs as (user "runner")
 DATA_DIR="./data/baucord" # mounted at /app/data; holds identity.key (the server's identity — back it up)
 IFACE="${IFACE:-$(ip -o route show default | awk '{print $5; exit}')}"
+# cloud-init re-renders the host's network config when a NIC is hot-plugged, which
+# undoes the NIC tuning below. This script turns that off for the whole host (a
+# drop-in under /etc/cloud/cloud.cfg.d). KEEP_CLOUD_INIT_HOTPLUG=1 leaves cloud-init
+# as it is — for a host whose NICs do come and go, at the price of running this
+# script again after one does.
+KEEP_CLOUD_INIT_HOTPLUG="${KEEP_CLOUD_INIT_HOTPLUG:-}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 [[ $EUID -eq 0 ]] || {
@@ -217,13 +223,25 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-# Cloud-init: don't let network hotplug rewrite the NIC config under us
-mkdir -p /etc/cloud/cloud.cfg.d
-cat >/etc/cloud/cloud.cfg.d/99-disable-hotplug.cfg <<'EOF'
+# Cloud-init: don't let network hotplug rewrite the NIC config under us.
+# Host-wide, so only where there is a cloud-init to tell, said out loud,
+# and not at all with KEEP_CLOUD_INIT_HOTPLUG=1 (which also takes back
+# what an earlier run of this script wrote).
+HOTPLUG_DROPIN=/etc/cloud/cloud.cfg.d/99-disable-hotplug.cfg
+if [[ -n "$KEEP_CLOUD_INIT_HOTPLUG" ]]; then
+  if [[ -f "$HOTPLUG_DROPIN" ]]; then
+    rm -f "$HOTPLUG_DROPIN"
+    log "cloud-init network hotplug left on (removed $HOTPLUG_DROPIN)"
+  fi
+elif [[ -d /etc/cloud ]]; then
+  mkdir -p /etc/cloud/cloud.cfg.d
+  cat >"$HOTPLUG_DROPIN" <<'EOF'
 updates:
   network:
     when: []
 EOF
+  log "cloud-init network hotplug turned off for this host ($HOTPLUG_DROPIN; KEEP_CLOUD_INIT_HOTPLUG=1 keeps it)"
+fi
 
 log "Applying host tuning"
 sysctl --system >/dev/null

@@ -7,22 +7,15 @@
 //! from Settings → General → Log level, exactly as on desktop and
 //! Android. The Android host's `logging.rs` with stderr for logcat.
 
-use std::{
-    fs::{File, OpenOptions},
-    io::Write,
-    path::Path,
-    sync::Mutex,
-};
+use std::path::Path;
 
+use app_core::logfile::{self, FileSink};
 use log::{LevelFilter, Log, Metadata, Record};
 
-/// `baucord.log` is rolled over to `baucord.log.1` when it passes this
-/// at startup. The desktop appends forever; a phone's storage and the
-/// user's patience when attaching a log justify one cut.
-const ROLL_OVER_BYTES: u64 = 5 * 1024 * 1024;
-
 struct Tee {
-    file: Mutex<Option<File>>,
+    /// `baucord.log`, rolled over to `baucord.log.1` past 5 MB — as it
+    /// is written, not only at launch (review P3-45).
+    file: Option<FileSink>,
 }
 
 /// winit 0.30's iOS backend warns on every turn of the run loop: it
@@ -46,27 +39,17 @@ impl Log for Tee {
         if !self.enabled(record.metadata()) {
             return;
         }
-        // env_logger's default line: `[ts LEVEL target] message`.
         let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z");
-        let line = format!(
-            "[{ts} {:<5} {}] {}",
-            record.level(),
-            record.target(),
-            record.args()
-        );
+        let line = logfile::line(ts, record);
         eprintln!("{line}");
-        if let Ok(mut guard) = self.file.lock()
-            && let Some(file) = guard.as_mut()
-        {
-            let _ = writeln!(file, "{line}");
+        if let Some(file) = &self.file {
+            file.write_line(&line);
         }
     }
 
     fn flush(&self) {
-        if let Ok(mut guard) = self.file.lock()
-            && let Some(file) = guard.as_mut()
-        {
-            let _ = file.flush();
+        if let Some(file) = &self.file {
+            file.flush();
         }
     }
 }
@@ -75,7 +58,7 @@ impl Log for Tee {
 /// `log` and ignored here.
 pub fn init(log_dir: Option<&Path>) {
     let tee = Tee {
-        file: Mutex::new(log_dir.and_then(open_log_file)),
+        file: log_dir.and_then(open_log_file),
     };
     if log::set_boxed_logger(Box::new(tee)).is_ok() {
         // Until the settings file says otherwise (`RUST_LOG` has no
@@ -84,23 +67,14 @@ pub fn init(log_dir: Option<&Path>) {
     }
 }
 
-fn open_log_file(dir: &Path) -> Option<File> {
-    let path = dir.join("baucord.log");
-    if let Ok(meta) = std::fs::metadata(&path)
-        && meta.len() > ROLL_OVER_BYTES
-    {
-        let _ = std::fs::rename(&path, dir.join("baucord.log.1"));
-    }
-    match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(file) => {
-            // Settings → Debug shows, sends and clears it.
-            #[cfg(all(feature = "app", not(feature = "hello")))]
-            frontend::logfile::set_path(path);
-            Some(file)
-        }
+/// Settings → Debug shows, sends and clears the file this opens
+/// (`FileSink::open` names it as the app's log).
+fn open_log_file(dir: &Path) -> Option<FileSink> {
+    match FileSink::open(dir) {
+        Ok(sink) => Some(sink),
         Err(e) => {
             // Nothing to log to yet; stderr still works.
-            eprintln!("baucord: could not open {}: {e}", path.display());
+            eprintln!("baucord: could not open a log in {}: {e}", dir.display());
             None
         }
     }

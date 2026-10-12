@@ -5,17 +5,22 @@
 //! its working folder, Android in the app's private folder, iOS in
 //! Documents) and says where with [`set_path`]; a build that logs only
 //! to a terminal never does, and [`path`] stays `None`. The phone hosts
-//! roll a log past 5 MB over to `baucord.log.1` at startup, so "the end
-//! of the log" reads across both files, the rolled-over one first.
+//! write through a [`FileSink`], which rolls a log past 5 MB over to
+//! `baucord.log.1` — when it is opened and as it is written — so "the
+//! end of the log" reads across both files, the rolled-over one first.
 //!
 //! Clearing truncates the file in place: every host keeps it open in
 //! append mode, so its next line lands at the new end — the start.
+//!
+//! Also here, because every host needs the same: the line format
+//! ([`line`]) and the panic hook ([`install_panic_hook`]).
 
 use std::{
+    fmt::Display,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock, PoisonError},
 };
 
 static PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -37,6 +42,159 @@ pub fn rolled_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".1");
     path.with_file_name(name)
+}
+
+/// A phone's `baucord.log` is rolled over to `baucord.log.1` when it
+/// passes this. The desktop appends for ever; a phone's storage, and
+/// the user's patience when sending a log, justify the cut.
+pub const ROLL_OVER_BYTES: u64 = 5 * 1024 * 1024;
+
+/// One log line as every host writes it — `env_logger`'s default,
+/// `[ts LEVEL target] message` — under the host's own clock.
+#[must_use]
+pub fn line(ts: impl Display, record: &log::Record) -> String {
+    format!(
+        "[{ts} {:<5} {}] {}",
+        record.level(),
+        record.target(),
+        record.args()
+    )
+}
+
+/// The log file a phone host appends to, cut to size as it grows.
+///
+/// A log past the limit is rolled over to [`rolled_path`], replacing
+/// the one there, and a new file begun. The phones did that at launch
+/// only, so a process alive for days grew its log without limit
+/// (review P3-45).
+pub struct FileSink {
+    path: PathBuf,
+    limit: u64,
+    state: Mutex<SinkState>,
+}
+
+struct SinkState {
+    /// `None` after a roll-over that could not open a new file; tried
+    /// again at the next line.
+    file: Option<File>,
+    /// Bytes in the file, as far as this handle knows: its length when
+    /// opened plus what was written since. [`clear`] empties the file
+    /// behind our back, so the file itself is asked before a roll.
+    len: u64,
+}
+
+fn append_to(path: &Path) -> io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+impl FileSink {
+    /// Open `dir/baucord.log` for appending, rolled over first if it is
+    /// already past [`ROLL_OVER_BYTES`], and name it as the app's log
+    /// ([`set_path`]).
+    ///
+    /// # Errors
+    /// The file could not be opened.
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        let sink = Self::with_limit(dir.join("baucord.log"), ROLL_OVER_BYTES)?;
+        set_path(sink.path.clone());
+        Ok(sink)
+    }
+
+    /// As [`Self::open`], for a file and a limit of the caller's, and
+    /// without naming it as the app's log.
+    ///
+    /// # Errors
+    /// The file could not be opened.
+    pub fn with_limit(path: PathBuf, limit: u64) -> io::Result<Self> {
+        if fs::metadata(&path).is_ok_and(|meta| meta.len() > limit) {
+            let _ = fs::rename(&path, rolled_path(&path));
+        }
+        let file = append_to(&path)?;
+        let len = file.metadata().map_or(0, |meta| meta.len());
+        Ok(Self {
+            path,
+            limit,
+            state: Mutex::new(SinkState {
+                file: Some(file),
+                len,
+            }),
+        })
+    }
+
+    /// Where the sink writes.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Append `line` and a newline. A failure is dropped: there is
+    /// nowhere to report a log that cannot be written.
+    pub fn write_line(&self, line: &str) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.len > self.limit {
+            self.roll(&mut state);
+        }
+        if state.file.is_none() {
+            state.file = append_to(&self.path).ok();
+            state.len = 0;
+        }
+        if let Some(file) = state.file.as_mut()
+            && writeln!(file, "{line}").is_ok()
+        {
+            state.len += line.len() as u64 + 1;
+        }
+    }
+
+    /// The file is past the limit, by our count: roll it over — unless
+    /// it was cleared meanwhile, in which case the count is put right.
+    fn roll(&self, state: &mut SinkState) {
+        let on_disk = fs::metadata(&self.path).map_or(0, |meta| meta.len());
+        if on_disk <= self.limit {
+            state.len = on_disk;
+            return;
+        }
+        // Closed before it is renamed: the next line opens a new file
+        // under the old name.
+        state.file = None;
+        let _ = fs::rename(&self.path, rolled_path(&self.path));
+        state.file = append_to(&self.path).ok();
+        state.len = 0;
+    }
+
+    pub fn flush(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(file) = state.file.as_mut() {
+            let _ = file.flush();
+        }
+    }
+}
+
+/// A release build aborts on panic, and a windowed process (or one on
+/// a phone) has no stderr anyone reads: without this a crash on any
+/// thread leaves nothing behind but a log that stops mid-sentence.
+/// Write the panic — thread, message, location, backtrace — to the log
+/// before the abort. The one hook of the desktop and both phone hosts;
+/// each had its own copy (review P3-44).
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let location = info.location().map_or_else(
+            || "<unknown location>".to_string(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        log::error!("PANIC in thread '{thread}' at {location}: {message}\n{backtrace}");
+        log::logger().flush();
+    }));
 }
 
 /// The last `max` bytes of `path` (fewer if the file is shorter);
@@ -221,6 +379,90 @@ mod tests {
         let s = String::from_utf8(up).unwrap();
         assert!(s.starts_with("# baucord 1.2.3 (ios)\nentry "));
         assert!(s.ends_with("entry 1000\n"));
+    }
+
+    #[test]
+    fn a_line_reads_like_env_loggers() {
+        let args = format_args!("hello {}", 7);
+        let record = log::Record::builder()
+            .args(args)
+            .level(log::Level::Warn)
+            .target("client::network")
+            .build();
+        assert_eq!(
+            line("2026-10-12T08:00:00.000+00:00", &record),
+            "[2026-10-12T08:00:00.000+00:00 WARN  client::network] hello 7"
+        );
+    }
+
+    /// Review P3-45: the log is cut as it grows, not only at launch.
+    #[test]
+    fn the_sink_rolls_the_log_over_as_it_is_written() {
+        let p = scratch("sink-roll");
+        let sink = FileSink::with_limit(p.clone(), 100).unwrap();
+        // 11 bytes a line: the tenth takes the file past 100.
+        for i in 0..10 {
+            sink.write_line(&format!("line {i:05}"));
+        }
+        assert!(!rolled_path(&p).exists(), "not rolled until past the limit");
+        assert_eq!(fs::metadata(&p).unwrap().len(), 110);
+        sink.write_line("line 00010");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "line 00010\n");
+        let rolled = fs::read_to_string(rolled_path(&p)).unwrap();
+        assert!(rolled.starts_with("line 00000\n") && rolled.ends_with("line 00009\n"));
+        // The reader sees one log across both.
+        assert_eq!(
+            tail_lines(&p, 2, 1 << 20).unwrap(),
+            "line 00009\nline 00010"
+        );
+        // And again: the rolled-over file is replaced, never a third.
+        for i in 11..21 {
+            sink.write_line(&format!("line {i:05}"));
+        }
+        assert_eq!(fs::read_to_string(&p).unwrap(), "line 00020\n");
+        let rolled = fs::read_to_string(rolled_path(&p)).unwrap();
+        assert!(rolled.starts_with("line 00010\n") && rolled.ends_with("line 00019\n"));
+    }
+
+    #[test]
+    fn the_sink_rolls_a_log_that_is_already_too_long_when_opened() {
+        let p = scratch("sink-open");
+        fs::write(&p, "x".repeat(150)).unwrap();
+        let sink = FileSink::with_limit(p.clone(), 100).unwrap();
+        sink.write_line("fresh");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "fresh\n");
+        assert_eq!(fs::metadata(rolled_path(&p)).unwrap().len(), 150);
+
+        // One within the limit is appended to.
+        let q = scratch("sink-append");
+        fs::write(&q, "earlier\n").unwrap();
+        let sink = FileSink::with_limit(q.clone(), 100).unwrap();
+        sink.write_line("later");
+        sink.flush();
+        assert_eq!(fs::read_to_string(&q).unwrap(), "earlier\nlater\n");
+        assert!(!rolled_path(&q).exists());
+    }
+
+    /// Settings → Debug → Clear empties the file behind the sink's
+    /// back: its count is stale, and must not roll a short file over
+    /// (which would also replace the older one with it).
+    #[test]
+    fn a_log_cleared_behind_the_sink_is_not_rolled_over() {
+        let p = scratch("sink-clear");
+        let sink = FileSink::with_limit(p.clone(), 100).unwrap();
+        for i in 0..9 {
+            sink.write_line(&format!("line {i:05}"));
+        }
+        clear(&p).unwrap();
+        // By the sink's count these take it past the limit.
+        sink.write_line("after 1");
+        sink.write_line("after 2");
+        sink.write_line("after 3");
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "after 1\nafter 2\nafter 3\n"
+        );
+        assert!(!rolled_path(&p).exists());
     }
 
     #[test]

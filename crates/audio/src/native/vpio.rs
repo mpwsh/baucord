@@ -144,18 +144,17 @@ impl<P> Mailbox<P> {
     /// The callback's current half: a new one from the slot replaces
     /// it, a detached one is given back.
     fn current<'a>(&self, held: &'a mut Option<Half<P>>) -> Option<&'a mut P> {
-        if let Some(new) = self.slot.take() {
-            if let Some(old) = held.replace(new) {
-                self.retire(old);
-            }
+        if let Some(new) = self.slot.take()
+            && let Some(old) = held.replace(new)
+        {
+            self.retire(old);
         }
         if held
             .as_ref()
             .is_some_and(|h| !h.attached.load(Ordering::Relaxed))
+            && let Some(old) = held.take()
         {
-            if let Some(old) = held.take() {
-                self.retire(old);
-            }
+            self.retire(old);
         }
         held.as_mut().map(|h| &mut h.pump)
     }

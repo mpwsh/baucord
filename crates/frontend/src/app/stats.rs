@@ -145,22 +145,13 @@ impl AppState {
     /// allocator's slack are the remainder.
     #[allow(clippy::cast_precision_loss)]
     pub(super) fn memory_report(&mut self) -> String {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
         let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         let texture = |img: &slint::Image| {
             let size = img.size();
             size.width as usize * size.height as usize * 4
         };
-        let rss = self.pid.and_then(|pid| {
-            self.sys.refresh_processes_specifics(
-                ProcessesToUpdate::Some(&[pid]),
-                false,
-                ProcessRefreshKind::nothing().with_memory(),
-            );
-            self.sys.process(pid).map(sysinfo::Process::memory)
-        });
         let rss = crate::resources::native_monitor_memory()
-            .or(rss)
+            .or_else(|| self.usage.resident())
             .map_or_else(|| "?".to_string(), |b| format!("{:.0} MB", mb(b as usize)));
 
         // Chat rows and their pictures, over every conversation.
@@ -215,30 +206,22 @@ impl AppState {
 
     #[allow(clippy::cast_precision_loss)]
     pub(super) fn sample_resources(&mut self) {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
-
         // Sample only when someone can actually see the result. The
         // check comes first so a hidden/minimized app pays nothing —
-        // not even the process-table refresh.
-        let Some(pid) = self.pid else { return };
+        // not even the look at the process.
         if !self.main_on_screen() {
             return;
         }
-        self.sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            false,
-            ProcessRefreshKind::nothing().with_memory().with_cpu(),
-        );
-        if let Some(proc) = self.sys.process(pid) {
-            // cpu_usage() is % of one core; normalize to % of the whole
-            // machine (task-manager style).
+        if let Some((cpu_one_core, resident)) = self.usage.sample() {
+            // % of one core; normalize to % of the whole machine
+            // (task-manager style).
             let cores =
                 std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as f32;
-            let cpu_pct = proc.cpu_usage() / cores;
+            let cpu_pct = cpu_one_core / cores;
             // Memory: the platform-native figure (what the user's own
-            // task monitor shows), with sysinfo's RSS as the fallback.
-            let mem_bytes =
-                crate::resources::native_monitor_memory().unwrap_or_else(|| proc.memory());
+            // task monitor shows), with the resident size as the
+            // fallback.
+            let mem_bytes = crate::resources::native_monitor_memory().unwrap_or(resident);
             let mem_mb = mem_bytes as f64 / (1024.0 * 1024.0);
             self.main.global::<State>().set_resource_line(
                 t!("resource-line",

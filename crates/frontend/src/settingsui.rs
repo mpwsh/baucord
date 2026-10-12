@@ -618,6 +618,9 @@ pub fn populate(app: &mut AppState) {
     s.set_transmission_modes(ModelRc::new(VecModel::from(modes)));
     s.set_transmission_index(i32::from(settings.audio.push_to_talk));
     s.set_ptt_bind(settings.bind_for(BindableAction::PushToTalk).into());
+    // macOS without the Accessibility permission: the Keyboard tab
+    // says what that costs and offers the prompt.
+    s.set_keybinds_need_access(!crate::hotkeys::access_granted());
     // Echo cancellation: the picker in AecMode::ALL order, and what the
     // running session got (refreshed by the meter timer).
     let aec_modes: Vec<slint::SharedString> = audio::AecMode::ALL
@@ -960,6 +963,8 @@ fn wire(sf: &SettingsSurface<'_>) {
             log::warn!("sound settings: {e}");
         }
     });
+    // The one place the system's prompt comes from (review P2-30).
+    logic.on_ask_keybind_access(crate::hotkeys::ask_for_access);
     logic.on_aec_selected(|index| {
         app::with_current(move |app| {
             let mode = audio::AecMode::from_index(usize::try_from(index).unwrap_or(0));
@@ -1509,6 +1514,20 @@ fn start_meter_timer(app: &mut AppState) {
             app::with_current(|app| {
                 if !pace_meter_timer(app) {
                     return;
+                }
+                // The permission is granted in System Settings, not
+                // here: while the note about it shows, look whether it
+                // has been, and watch the keys from then on.
+                let granted = surface(app).is_some_and(|sf| {
+                    let waiting = sf.state().get_keybinds_need_access();
+                    if waiting && crate::hotkeys::access_granted() {
+                        sf.state().set_keybinds_need_access(false);
+                        return true;
+                    }
+                    false
+                });
+                if granted {
+                    app.rearm_hotkeys();
                 }
                 let Some(sf) = surface(app) else { return };
                 match sf.tab() {

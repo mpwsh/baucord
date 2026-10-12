@@ -203,10 +203,8 @@ impl DxgiDuplicator {
             }
             _ => false,
         };
-        if surplus {
-            if let Some(stale) = queue.pop_front() {
-                crate::pool::recycle(stale.data);
-            }
+        if surplus && let Some(stale) = queue.pop_front() {
+            crate::pool::recycle(stale.data);
         }
         queue.pop_front()
     }

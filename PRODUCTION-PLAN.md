@@ -540,7 +540,16 @@ Store is not decided yet.
    Apache-2.0; a desktop build as a whole is GPL-3.0 (FFmpeg and x264);
    Slint under its royalty-free licence.
 2. **Stores** — *Google Play decided 2026-10-07*: yes, PLAY-STORE.md
-   (its §2 holds the decisions it needs). The App Store: still open.
+   (its §2 holds the decisions it needs). The App Store: still open,
+   and it comes with two questions of its own. Push (4, below). And
+   the lobby's keep-alive: iOS keeps a connected app alive in the
+   background with a silent audio output (`audio/src/lib.rs`, the
+   `audio` background mode in `ios/project.yml`; IOS-SPEC D47), which
+   App Review knows and rejects under guideline 2.5.4 when no audio
+   the user can hear is playing (review P2-29). In a room that mode is
+   honest; in the lobby it is not. For the App Store the lobby either
+   drops the connection in the background (and PRD-1's push brings the
+   user back), or the app is offered outside the store only.
 3. **Privacy** (LEG-5): what the official server keeps and for how
    long, telemetry consent, who answers for self-hosted servers.
 4. **Push** (PRD-1): run an official push relay, or live with
@@ -554,6 +563,13 @@ Store is not decided yet.
    it is what the repository's remote names (`origin/HEAD`), and
    `chunk` no longer exists there. `release.yml` warms its caches from
    it now. Say so if it should be another.
+8. **A kick or a ban with the window in the tray** — *decided
+   2026-10-12*: the window stays where it is (what review P2-17 left
+   it doing).
+9. **The sharer's mouse pointer** (review P2-25) — open. It is not in
+   a share today. Built without a Windows screen to look at it, it
+   would be a guess drawn into every Windows share; it can be built
+   behind a switch that is off until someone has looked.
 
 ## 7. Done
 
@@ -718,9 +734,10 @@ One line each; the spec decision named holds the detail.
   - *Weight.* `zip` and `nnnoiseless` without their default features
     (P2-46); dependencies carry line tables only in dev, and the unused
     `debug-opt` profile is gone (P3-51).
-  - *Still open of P0 and P1*: paging for the admin lists (P0-1, needs
-    a feature bit) and the keybind watcher's event sources (P1-3 step
-    2, one test pass per OS).
+  - *Still open of P0 and P1* (at the time; both done in the seventh
+    batch, below): paging for the admin lists (P0-1, needs a feature
+    bit) and the keybind watcher's event sources (P1-3 step 2, one
+    test pass per OS).
 - **2026-10-12 — 1.2.1, the review's second batch** (§2a).
   - *Protocol.* `lane()` names every variant, and so does the new
     `ServerMessage::required_feature()`; one codec serves both
@@ -1029,6 +1046,86 @@ One line each; the spec decision named holds the detail.
     alone — the readme's copy is a pointer, and the two details it
     had over the page moved there (P3-52). *Left:* the cloud-init
     hotplug switch, which is a decision about the host, not a trim.
+- **2026-10-12 — 1.2.1, the review's seventh batch** (§2a): what was
+  left, as far as it can go without the machines. `DEVICE-CHECKLIST.md`
+  marks its lines **[7]** and has a macOS section now.
+  - *Admin lists of any length* (P0-1, the rest). Feature bit
+    `ADMIN_PAGES` (19) and one new message, `AdminRows`: a listing
+    longer than one 17 KiB message goes out as pages — the rows ahead
+    as `AdminRows`, then the `AdminResult` that closes the answer —
+    and the client joins them before the app sees one list
+    (`network::AdminPages`). A session without the bit gets the first
+    page, as before. At most 64 messages an answer. Reports go through
+    the same path (200 of them at their longest are 34 messages; they
+    were cut to six). A typed `/users`, `/bans`, `/invites` or
+    `/reports` prints 150 rows and says how many more the panel has.
+  - *Keybinds without a clock* (P1-3 step 2, P2-30). The watcher is a
+    crate of its own, `keywatch`: it sleeps until a key a binding
+    names changes — Windows Raw Input, a listen-only event tap on
+    macOS, XInput2 raw events on X11 — and reads the key state then,
+    a few times more, and every 12 ms only while a binding is held.
+    Measured on X11 (a virtual display, keys from `xdotool`): 0 wakes
+    with the keyboard at rest, where it was about 166 a second; one
+    per event for keys nobody bound. The events are trusted only once
+    three presses have arrived with one; until then a 250 ms heartbeat
+    also reads, and a press it finds that no event announced sends the
+    watcher back to the 12 ms clock for good, with a log line.
+    **The Windows and macOS halves were type-checked and linted for
+    their targets and never run.** On macOS the Accessibility prompt
+    comes only from a button in Settings → Keyboard, which shows only
+    while the permission is missing.
+  - *The phones' shared parts* (P3-44, P3-45, P3-50). One log writer
+    for both (`app_core::logfile::FileSink`), which rolls the log over
+    at 5 MB as it is written — it was at launch only; one panic hook
+    for the desktop and both phones; one safe-file-name and
+    never-overwrite pair (the desktop's Downloads uses it too) and one
+    pick slot (`app_core::files`). A phone build no longer carries
+    `sysinfo`: its CPU and memory figures are `getrusage` and
+    `/proc/self/statm` or `task_info` (`app_core::usage`, tested on
+    Linux and type-checked for both phones). iOS's memory figure is
+    the footprint now.
+  - *Android, unbuilt* (P2-27, P2-28, P3-46). A saved file is written
+    by Rust to a descriptor `MediaStore` hands over, on a thread of
+    its own (every platform's save left the UI thread) — it crossed
+    into the Java heap whole. The room's wake lock lasts 10 minutes a
+    time and is taken again when a reconnect starts. A release build
+    is arm64-v8a unless told otherwise (`gradle.properties` said both
+    ABIs for every build). The host's Rust was type-checked in a
+    scratch crate and the Java compiles against API 34's
+    `android.jar`; **Gradle has not built it and no phone has run it —
+    the wake lock is the line to check first.**
+  - *Video on Apple hardware* (P2-42, P2-43). `h264_videotoolbox` is
+    tried before libx264 (hardware only, `realtime`); a Mac that
+    cannot open it gets libx264 as before. iOS's decoder hands its
+    picture on as BGRA (`PictureFormat::Bgra`) and the display swaps
+    two bytes a pixel as it writes its own buffer: one pass and no
+    cleared buffer per frame, where there were two and one. The iOS
+    half is type-checked for iOS; neither was run.
+  - *Edition 2024 for `audio` and `video`* (P3-49, the rest).
+    Type-checked on Linux, for Windows and Android, and `video` for
+    iOS; `audio`'s iOS code was read for what the edition rejects.
+    Sixteen nested `if`s became let-chains (clippy denies them there).
+  - *The workflows* (P2-60 and P3-48, in part). The release checks its
+    tag against the workspace version in a first job, not the last;
+    the `version` file goes to R2 in a step of its own after the zips.
+    The Linux package lists lost what no crate links (`libopus`,
+    `libdbus`, and for the release Xinerama, Xft, Xrender, pango,
+    cairo); `cargo-ndk` is a pinned prebuilt. All four workflows pass
+    `actionlint`; none has run.
+  - *The host script* (P3-52, the rest). The cloud-init hotplug switch
+    is written only where there is a cloud-init, said in the script's
+    output, and left alone (or taken back) with
+    `KEEP_CLOUD_INIT_HOTPLUG=1`.
+  - *Not done, and why.* The pointer in a share (P2-25; §6, 9). The
+    WASAPI loops still do not share `pump.rs` (P3-27): a refactor of
+    real-time Windows code with nothing to gain but lines, not done
+    unrun. One release workflow in place of four (P2-60): merging
+    them makes one platform's failure everyone's — the website's
+    deploy waits for the release workflow to succeed — so it wants a
+    decision on that and a dry run, not a guess. The server half of
+    P2-51 (decided against: its teardown is one function already).
+    The migration that drops unused telemetry columns (it deletes
+    data). App Store questions (§6, 2).
 
 ## 8. Facts this plan rests on
 

@@ -17,7 +17,13 @@
 //
 // The syscalls are declared by hand instead of pulling mach2/windows
 // crates: one call each, layouts verified against the platform headers
-// (XNU osfmk/mach/task_info.h; psapi.h), zero new dependencies.
+// (XNU osfmk/mach/task_info.h, in `app_core::usage`; psapi.h), zero
+// new dependencies.
+//
+// Also here: the [`Sampler`] behind the resource line and `/mem`. The
+// desktop's is `sysinfo`; a phone's is `app_core::usage` — two system
+// calls about itself, for which it carried that library (review
+// P3-50).
 
 // The workspace otherwise avoids `unsafe`; these two single-syscall
 // wrappers are the deliberate exception (see module docs).
@@ -27,72 +33,11 @@
 /// this process, or `None` when sysinfo's RSS already matches the
 /// local convention (Linux) or the syscall fails.
 #[cfg(target_os = "macos")]
+#[must_use]
 pub fn native_monitor_memory() -> Option<u64> {
-    // task_vm_info, rev1 layout — ends at phys_footprint (XNU
-    // osfmk/mach/task_info.h). 8 + 4 + 4 + 17×8 = 152 bytes, i.e.
-    // 38 natural_t units. The kernel fills at most `count` units and
-    // writes back how many it actually filled, so requesting the rev1
-    // size works on every macOS new enough to run this app.
-    #[repr(C)]
-    struct TaskVmInfo {
-        _virtual_size: u64,
-        _region_count: i32,
-        _page_size: i32,
-        _resident_size: u64,
-        _resident_size_peak: u64,
-        _device: u64,
-        _device_peak: u64,
-        _internal: u64,
-        _internal_peak: u64,
-        _external: u64,
-        _external_peak: u64,
-        _reusable: u64,
-        _reusable_peak: u64,
-        _purgeable_volatile_pmap: u64,
-        _purgeable_volatile_resident: u64,
-        _purgeable_volatile_virtual: u64,
-        _compressed: u64,
-        _compressed_peak: u64,
-        _compressed_lifetime: u64,
-        phys_footprint: u64,
-    }
-
-    /// `#define TASK_VM_INFO 22` (task_info.h).
-    const TASK_VM_INFO: u32 = 22;
-    const KERN_SUCCESS: i32 = 0;
-
-    unsafe extern "C" {
-        /// The calling task's port — what the `mach_task_self()` macro
-        /// expands to in C.
-        static mach_task_self_: u32;
-        fn task_info(
-            target_task: u32,
-            flavor: u32,
-            task_info_out: *mut i32,
-            task_info_out_cnt: *mut u32,
-        ) -> i32;
-    }
-
-    // All-integer struct: zeroed is a valid initial value.
-    let mut info: TaskVmInfo = unsafe { std::mem::zeroed() };
-    let mut count = (size_of::<TaskVmInfo>() / size_of::<u32>()) as u32;
-
-    let kr = unsafe {
-        task_info(
-            mach_task_self_,
-            TASK_VM_INFO,
-            std::ptr::from_mut(&mut info).cast::<i32>(),
-            &mut count,
-        )
-    };
-
-    // Guard against a kernel that filled fewer units than our struct —
-    // phys_footprint would then still be our zero, not data.
-    if kr == KERN_SUCCESS && count as usize * size_of::<u32>() >= size_of::<TaskVmInfo>() {
-        Some(info.phys_footprint)
-    } else {
-        None
-    }
+    // The physical footprint, from the one `task_info` the iOS build
+    // also makes.
+    app_core::usage::memory()
 }
 
 /// Bytes of memory as the platform's own task monitor would show for
@@ -165,4 +110,89 @@ pub fn native_monitor_memory() -> Option<u64> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn native_monitor_memory() -> Option<u64> {
     None
+}
+
+/// This process's CPU and memory, from `sysinfo`.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod sampler {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+
+    pub struct Sampler {
+        sys: sysinfo::System,
+        /// Resolved once: a process's id does not change.
+        pid: Option<sysinfo::Pid>,
+    }
+
+    impl Sampler {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                sys: sysinfo::System::new(),
+                pid: sysinfo::get_current_pid().ok(),
+            }
+        }
+
+        /// Resident memory, in bytes.
+        pub fn resident(&mut self) -> Option<u64> {
+            let pid = self.pid?;
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                false,
+                ProcessRefreshKind::nothing().with_memory(),
+            );
+            self.sys.process(pid).map(sysinfo::Process::memory)
+        }
+
+        /// Percent of one core since the last call, and resident
+        /// memory in bytes.
+        pub fn sample(&mut self) -> Option<(f32, u64)> {
+            let pid = self.pid?;
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                false,
+                ProcessRefreshKind::nothing().with_memory().with_cpu(),
+            );
+            let process = self.sys.process(pid)?;
+            Some((process.cpu_usage(), process.memory()))
+        }
+    }
+}
+
+/// This process's CPU and memory, asked of the system directly.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+mod sampler {
+    pub struct Sampler {
+        cpu: app_core::usage::CpuMeter,
+    }
+
+    // The same methods as the desktop's, which keeps state for both.
+    #[allow(clippy::unused_self)]
+    impl Sampler {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                cpu: app_core::usage::CpuMeter::new(),
+            }
+        }
+
+        /// The memory the system's own monitor shows, in bytes.
+        pub fn resident(&mut self) -> Option<u64> {
+            app_core::usage::memory()
+        }
+
+        /// Percent of one core since the last call (0 for the first,
+        /// which has nothing to measure from), and memory in bytes.
+        pub fn sample(&mut self) -> Option<(f32, u64)> {
+            let cpu = self.cpu.percent_of_one_core().unwrap_or(0.0);
+            Some((cpu, app_core::usage::memory()?))
+        }
+    }
+}
+
+pub use sampler::Sampler;
+
+impl Default for Sampler {
+    fn default() -> Self {
+        Self::new()
+    }
 }

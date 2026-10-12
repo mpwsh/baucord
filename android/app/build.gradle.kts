@@ -18,9 +18,15 @@ plugins {
 
 // ── Knobs (gradle.properties, or -P on the command line) ───────────────
 // Android ABI names, comma-separated; the same list feeds cargo-ndk and
-// AGP's abiFilters so the APK only declares what it carries.
+// AGP's abiFilters so the APK only declares what it carries. Unset, a
+// release build is for phones (arm64-v8a) and any other build also runs
+// on the emulator (x86_64): a release built at a desk used to carry the
+// emulator's library too, which nobody installs (review P3-46).
+val releaseRequested: Boolean =
+    gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }
 val cargoTargets: String = (project.findProperty("cargoTargets") as String?)
-    ?.takeIf { it.isNotBlank() } ?: "arm64-v8a,x86_64"
+    ?.takeIf { it.isNotBlank() }
+    ?: if (releaseRequested) "arm64-v8a" else "arm64-v8a,x86_64"
 // Cargo features for the `android` crate. Empty = the real client;
 // "hello" = M0's toolchain smoke test (spec §12).
 val cargoFeatures: String = (project.findProperty("cargoFeatures") as String?) ?: ""

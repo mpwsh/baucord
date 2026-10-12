@@ -23,5 +23,10 @@ image = { version = "0.25.9", default-features = false, features = [
 thiserror = "2"
 log.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# `getrusage` and the page size, for the app's own CPU and memory
+# figures (usage.rs). Already in the tree on every platform.
+libc = "0.2"
+
 [dev-dependencies]
 # (unit tests only use std)

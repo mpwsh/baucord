@@ -22,8 +22,28 @@ jobs:
   licenses:
     uses: ./.github/workflows/licenses.yml
 
+  # A release's tag has to be the workspace's version. Checked first:
+  # it used to be the last job's business, after an hour of builds.
+  # (A push has no tag; the job passes with nothing to do.)
+  tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        if: github.event_name == 'release'
+        uses: actions/checkout@v7
+      - name: Check tag matches crate version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::Release tag $TAG != workspace version v$VERSION — retag or bump the version."
+            exit 1
+          fi
+
   build:
-    needs: licenses
+    needs: [licenses, tag]
     strategy:
       matrix:
         include:
@@ -66,14 +86,18 @@ jobs:
             build-essential curl git ca-certificates zip binutils \
             meson ninja-build \
             pkg-config cmake nasm libclang-dev \
-            libopus-dev libasound2-dev \
-            libx11-dev libxext-dev libxinerama-dev libxcursor-dev \
-            libxrender-dev libxfixes-dev libxft-dev libfontconfig1-dev \
-            libpango1.0-dev libcairo2-dev \
+            libasound2-dev \
+            libx11-dev libxext-dev libxcursor-dev \
+            libxfixes-dev libfontconfig1-dev \
             libgbm-dev \
-            libxcb1-dev libxrandr-dev libdbus-1-dev \
+            libxcb1-dev libxrandr-dev \
             libudev-dev \
             libwayland-dev libegl-dev
+          # Not here any more (review P3-48): libopus (the audio crate
+          # builds its own), libdbus (the tray speaks D-Bus in Rust), and
+          # Xinerama, Xrender, Xft, pango and cairo, which the toolkit
+          # before Slint wanted. No crate in Cargo.lock links any of
+          # them; pr-check.yaml builds and tests without them.
 
       # The toolchain rust-toolchain.toml pins, which is the one cargo
       # runs. `@stable` installed another that nothing used, and rustup
@@ -318,14 +342,6 @@ jobs:
           path: artifacts
           pattern: baucord-v*
           merge-multiple: true
-      - name: Check tag matches crate version
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          TAG="${{ github.event.release.tag_name }}"
-          if [ "$TAG" != "v$VERSION" ]; then
-            echo "::error::Release tag $TAG != crates/desktop version v$VERSION — retag or bump the crate."
-            exit 1
-          fi
       - name: Attach zips to release
         uses: softprops/action-gh-release@v3
         with:
@@ -334,10 +350,10 @@ jobs:
       - name: Stage zips and version file for R2
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          mkdir -p r2-upload
+          mkdir -p r2-upload r2-version
           cp artifacts/*.zip r2-upload/
-          echo "$VERSION" > r2-upload/version
-      - name: Upload release to R2
+          echo "$VERSION" > r2-version/version
+      - name: Upload zips to R2
         uses: jakejarvis/s3-sync-action@v0.5.1
         env:
           AWS_S3_BUCKET: baucord
@@ -345,3 +361,15 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_S3_ENDPOINT: https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com
           SOURCE_DIR: r2-upload
+      # Last, in a step of its own: the updater and the website read
+      # this file, and the zips it names have to be there already. It
+      # went up in the same sync as they did, in no particular order
+      # (review P2-60).
+      - name: Upload version file to R2
+        uses: jakejarvis/s3-sync-action@v0.5.1
+        env:
+          AWS_S3_BUCKET: baucord
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_S3_ENDPOINT: https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com
+          SOURCE_DIR: r2-version

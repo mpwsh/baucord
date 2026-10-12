@@ -5,6 +5,14 @@ use client::config::{BindableAction, Settings};
 
 pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
+/// Nothing to grant where no key is watched.
+#[must_use]
+pub fn access_granted() -> bool {
+    true
+}
+
+pub fn ask_for_access() {}
+
 pub struct HotkeyManager;
 
 impl HotkeyManager {
@@ -14,6 +22,8 @@ impl HotkeyManager {
     }
 
     pub fn update(&mut self, _settings: &Settings) {}
+
+    pub fn rearm(&mut self) {}
 
     pub fn set_connected(&mut self, _connected: bool) {}
 

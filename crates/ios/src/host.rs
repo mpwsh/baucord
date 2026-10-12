@@ -24,10 +24,9 @@ use std::{
     cell::RefCell,
     path::{Path, PathBuf},
     ptr::NonNull,
-    sync::{Mutex, MutexGuard, PoisonError},
-    time::{Duration, Instant},
 };
 
+use app_core::files::{safe_name, unique_path, PickSlot};
 use block2::RcBlock;
 use frontend::host::{ChimeRoute, Hooks, KeepAlive, Notice, NoticeKind, OnPick, Saved};
 use i18n::t;
@@ -56,21 +55,9 @@ use objc2_uniform_type_identifiers::{UTType, UTTypeItem};
 /// while the first file is still being copied would clear the folder
 /// under it. The callback is *claimed* by the first delivery of a file
 /// ([`claim`]); the slot stays taken until that file is handed over or
-/// has failed.
-struct Pick {
-    on_pick: Option<OnPick>,
-    since: Instant,
-}
-
-static PENDING: Mutex<Option<Pick>> = Mutex::new(None);
-
-/// A pick older than this is taken as lost and no longer blocks a new
-/// one (Android's `PICK_STALE`).
-const PICK_STALE: Duration = Duration::from_mins(10);
-
-fn pending() -> MutexGuard<'static, Option<Pick>> {
-    PENDING.lock().unwrap_or_else(PoisonError::into_inner)
-}
+/// has failed. A pick older than `app_core::files::PICK_STALE` is
+/// taken as lost and no longer blocks a new one.
+static PICK: PickSlot<OnPick> = PickSlot::new();
 
 /// The waiting callback, for a file just delivered — once. `None`: the
 /// pick was cancelled, or this is a second delivery of the same pick.
@@ -78,15 +65,13 @@ fn pending() -> MutexGuard<'static, Option<Pick>> {
 /// D36): the first moved the file and attached it, the second found it
 /// gone and showed "No such file or directory".
 fn claim() -> Option<OnPick> {
-    pending().as_mut().and_then(|pick| pick.on_pick.take())
+    PICK.claim()
 }
 
 /// Nothing was picked: free the slot — unless a file already delivered
 /// is still being copied, which ends the pick itself.
 fn cancel(how: &str) {
-    let mut slot = pending();
-    if slot.as_ref().is_some_and(|pick| pick.on_pick.is_some()) {
-        *slot = None;
+    if PICK.cancel() {
         log::info!("file pick cancelled{how}");
     }
 }
@@ -114,20 +99,9 @@ struct IosHost {
 
 impl Hooks for IosHost {
     fn pick_file(&self, mime: &str, max_bytes: u64, on_pick: OnPick) {
-        {
-            let mut slot = pending();
-            if slot
-                .as_ref()
-                .is_some_and(|pick| pick.since.elapsed() < PICK_STALE)
-            {
-                drop(slot);
-                frontend::host::pick_failed(String::new(), "busy".to_string());
-                return;
-            }
-            *slot = Some(Pick {
-                on_pick: Some(on_pick),
-                since: Instant::now(),
-            });
+        if PICK.begin(on_pick).is_err() {
+            frontend::host::pick_failed(String::new(), "busy".to_string());
+            return;
         }
         let images_only = mime.starts_with("image/");
         // Hooks run on Slint's thread, the main one; a call from
@@ -141,7 +115,7 @@ impl Hooks for IosHost {
         })
         .is_err()
         {
-            pending().take();
+            PICK.finish();
         }
     }
 
@@ -311,7 +285,7 @@ fn top_view_controller(mtm: MainThreadMarker) -> Option<Retained<UIViewControlle
 /// its own delegate (Apple DTS: no `picker:didFinishPicking:`, no
 /// `documentPickerWasCancelled:`); only the sheet's presentation
 /// controller does. Without this the slot stays taken and every Attach
-/// says "still reading" for [`PICK_STALE`].
+/// says "still reading" for `PICK_STALE`.
 fn watch_swipe(
     picker: &UIViewController,
     delegate: &ProtocolObject<dyn UIAdaptivePresentationControllerDelegate>,
@@ -332,7 +306,7 @@ fn swiped_away() {
 /// The pick failed before any file: say so, and free the slot.
 fn fail_pick(name: String, error: String) {
     log::warn!("file pick failed: {error}");
-    pending().take();
+    PICK.finish();
     frontend::host::pick_failed(name, error);
 }
 
@@ -340,7 +314,7 @@ fn fail_pick(name: String, error: String) {
 /// slot's lock is not held through the callback, which may decode and
 /// write a picture — the avatar's.)
 fn finish_pick(on_pick: OnPick, path: PathBuf) {
-    pending().take();
+    PICK.finish();
     on_pick(path);
 }
 
@@ -618,7 +592,7 @@ fn take_file(source: &Path, name: &str, max_bytes: u64, owned: bool, on_pick: On
         return fail("too-large".to_string());
     }
     let dir = std::env::temp_dir().join("picks");
-    // One pick at a time (PENDING), and the frontend reads the file as
+    // One pick at a time (`PICK`), and the frontend reads the file as
     // soon as it is handed over: the last pick's copy can go.
     let _ = std::fs::remove_dir_all(&dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -631,44 +605,6 @@ fn take_file(source: &Path, name: &str, max_bytes: u64, owned: bool, on_pick: On
     }
     log::info!("picked {} ({size} bytes)", target.display());
     finish_pick(on_pick, target);
-}
-
-/// A file name that is one path component.
-fn safe_name(name: &str) -> String {
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let trimmed = safe.trim();
-    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        "file".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// `dir/name`, or `dir/name (2).ext` and so on if taken.
-fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let base = Path::new(name);
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = base
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
-    let mut path = dir.join(name);
-    let mut n = 2;
-    while path.exists() {
-        path = dir.join(format!("{stem} ({n}){ext}"));
-        n += 1;
-    }
-    path
 }
 
 // ── Opening a saved file (Quick Look) ───────────────────────────────

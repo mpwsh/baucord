@@ -93,6 +93,7 @@ chat-your-roles-changed = Your roles are now: { $roles }
 roles-none = none
 reason-none = (no reason given)
 chat-admin-users-header = { $count } user(s) of record (● online):
+chat-admin-list-more = … and { $count } more. The admin panel lists them all.
 chat-admin-restrictions-header = { $count } restriction(s):
 chat-admin-invites-header = { $count } invite(s):
 restricted-voice = You have been muted by the server{ $until }{ $reason }
@@ -209,6 +210,8 @@ action-push-to-talk = Push to talk
 
 # ── Keybinds panel ──────────────────────────────────────────────────────
 keybinds-hint = Click Record, then press a key combo. Esc cancels, Backspace clears.
+keybinds-access = macOS lets baucord see your keybinds while you are in another app only with the Accessibility permission. Until it has it, a bound key still works, but macOS takes it from the app you are in: it types nothing there.
+keybinds-access-ask = Allow in System Settings…
 keybind-not-set = Not set
 keybind-press-combo = Press a key combo...
 

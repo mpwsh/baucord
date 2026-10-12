@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Environment;
+import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.util.Log;
@@ -298,11 +299,16 @@ public class BaucordActivity extends NativeActivity {
     }
 
     /**
-     * Rust: write {@code bytes} into the public Downloads (MediaStore,
-     * no permission needed from API 29; the system renames on a clash).
-     * Returns "uri\nDownload/shown-name", or "error\nmessage".
+     * Rust: start a file in the public Downloads (MediaStore, no
+     * permission needed from API 29; the system renames on a clash): a
+     * pending row, and a file descriptor to write it through. The
+     * descriptor is the caller's — it writes, closes it, and then calls
+     * {@link #endDownload}. Returns "uri\nfd", or "error\nmessage".
+     *
+     * The bytes used to cross into Java whole, and on the UI thread: a
+     * 50 MiB file was 100 MiB held at once (review P2-27).
      */
-    public String saveDownload(String name, String mime, byte[] bytes) {
+    public String beginDownload(String name, String mime) {
         ContentResolver resolver = getContentResolver();
         Uri uri = null;
         try {
@@ -315,33 +321,61 @@ public class BaucordActivity extends NativeActivity {
             if (uri == null) {
                 return "error\nDownloads refused the file";
             }
-            try (OutputStream os = resolver.openOutputStream(uri)) {
-                if (os == null) {
-                    throw new java.io.IOException("Downloads gave no stream");
-                }
-                os.write(bytes);
+            ParcelFileDescriptor file = resolver.openFileDescriptor(uri, "w");
+            if (file == null) {
+                throw new java.io.IOException("Downloads gave no file");
             }
-            values.clear();
+            // Detached: nothing here closes it any more.
+            return uri + "\n" + file.detachFd();
+        } catch (Exception e) {
+            Log.w(TAG, "starting a file in Downloads failed", e);
+            discardDownload(resolver, uri);
+            return "error\n" + e.getMessage();
+        }
+    }
+
+    /**
+     * Rust: finish what {@link #beginDownload} started, once its
+     * descriptor is closed. {@code keep}: publish the file; returns
+     * "Download/shown-name" ("Download/" alone if the name could not be
+     * read back), or "error\nmessage". Otherwise remove its row;
+     * returns "".
+     */
+    public String endDownload(String uriText, boolean keep) {
+        ContentResolver resolver = getContentResolver();
+        Uri uri = Uri.parse(uriText);
+        if (!keep) {
+            discardDownload(resolver, uri);
+            return "";
+        }
+        try {
+            ContentValues values = new ContentValues();
             values.put(MediaStore.MediaColumns.IS_PENDING, 0);
             resolver.update(uri, values, null, null);
-            String shown = name;
+            String shown = "";
             try (Cursor c = resolver.query(uri,
                     new String[] {MediaStore.MediaColumns.DISPLAY_NAME}, null, null, null)) {
                 if (c != null && c.moveToFirst() && c.getString(0) != null) {
                     shown = c.getString(0);
                 }
             }
-            return uri + "\n" + Environment.DIRECTORY_DOWNLOADS + "/" + shown;
+            return Environment.DIRECTORY_DOWNLOADS + "/" + shown;
         } catch (Exception e) {
             Log.w(TAG, "saving to Downloads failed", e);
-            if (uri != null) {
-                try {
-                    resolver.delete(uri, null, null);
-                } catch (Exception ignored) {
-                    // Nothing more to undo.
-                }
-            }
+            discardDownload(resolver, uri);
             return "error\n" + e.getMessage();
+        }
+    }
+
+    /** Remove a download's row (and with it the file), if there is one. */
+    private static void discardDownload(ContentResolver resolver, Uri uri) {
+        if (uri == null) {
+            return;
+        }
+        try {
+            resolver.delete(uri, null, null);
+        } catch (Exception ignored) {
+            // Nothing more to undo.
         }
     }
 

@@ -290,6 +290,65 @@ impl AppState {
             .ok();
     }
 
+    /// A fetched file goes into Downloads, on a thread of its own: the
+    /// write of a large one took the UI with it for as long as the
+    /// disk did, and on Android it also crossed into Java (review
+    /// P2-27). [`Self::download_saved`] takes the result back on the
+    /// UI thread.
+    pub(super) fn save_download(
+        &mut self,
+        blob_id: [u8; 32],
+        name: String,
+        conv: Option<client::UserId>,
+        msg_id: u64,
+        data: Vec<u8>,
+    ) {
+        let shown_name = name.clone();
+        let spawned = std::thread::Builder::new()
+            .name("save-download".into())
+            .spawn(move || {
+                let result = media::save_to_downloads(&name, &data);
+                // Gone with the app (it is shutting down): nothing to tell.
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_current(|app| app.download_saved(blob_id, &name, conv, msg_id, result));
+                });
+            });
+        if let Err(e) = spawned {
+            let error = e.to_string();
+            self.show_error(&t!(
+                "file-save-error",
+                "name" => shown_name.as_str(),
+                "error" => error.as_str()
+            ));
+        }
+    }
+
+    /// The file is in Downloads, or could not be written.
+    fn download_saved(
+        &mut self,
+        blob_id: [u8; 32],
+        name: &str,
+        conv: Option<client::UserId>,
+        msg_id: u64,
+        result: Result<crate::host::Saved, String>,
+    ) {
+        match result {
+            Ok(saved) => {
+                // The card turns into Open (a check, a re-download
+                // beside it); a toast says where.
+                let line = t!("file-saved", "path" => saved.shown.as_str());
+                self.downloaded.insert(blob_id, saved.target);
+                self.set_transfer(conv, msg_id, None);
+                self.show_toast(ToastKind::Success, &line);
+            }
+            Err(e) => self.show_error(&t!(
+                "file-save-error",
+                "name" => name,
+                "error" => e.as_str()
+            )),
+        }
+    }
+
     /// Show, move or clear a card's transfer ring: the state lives in
     /// `transfers` (rows are rebuilt at will) and the row is rebuilt
     /// from it.

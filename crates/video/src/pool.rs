@@ -59,10 +59,11 @@ pub fn recycle(buf: Vec<u8>) {
     if buf.capacity() == 0 {
         return;
     }
-    if let Ok(mut pool) = POOL.lock() {
-        if pool.keeping && pool.buffers.len() < KEEP {
-            pool.buffers.push(buf);
-        }
+    if let Ok(mut pool) = POOL.lock()
+        && pool.keeping
+        && pool.buffers.len() < KEEP
+    {
+        pool.buffers.push(buf);
     }
 }
 

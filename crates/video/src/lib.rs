@@ -259,6 +259,12 @@ pub struct EncodedFrame {
 pub enum PictureFormat {
     /// Tightly packed RGBA, `width × height × 4` bytes.
     Rgba,
+    /// Tightly packed BGRA, the same size (iOS's `VideoToolbox`).
+    /// Whoever shows the picture swaps it into RGBA as it writes the
+    /// buffer it draws from ([`yuv::bgra_to_rgba_into`]): the decoder
+    /// used to zero-fill a buffer and swap into it, and the picture was
+    /// then copied once more (review P2-43).
+    Bgra,
     /// The decoder's own 4:2:0 planes (Android's `MediaCodec`). Whoever
     /// shows the picture converts it ([`yuv::to_rgba_into`]) straight
     /// into the buffer it draws from, and only the pictures it will

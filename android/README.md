@@ -170,10 +170,10 @@ sideload for testing.
 
 | property | default | meaning |
 |---|---|---|
-| `-PcargoTargets=` | `arm64-v8a,x86_64` | ABIs to build (both doubles the Rust build time; pick one while iterating) |
+| `-PcargoTargets=` | `arm64-v8a,x86_64`; `arm64-v8a` for a release task | ABIs to build (both doubles the Rust build time; pick one while iterating) |
 | `-PcargoFeatures=` | *(empty = the app)* | `hello` for the smoke test |
 
-Both also live in `gradle.properties`. Two more the release workflow
+`cargoFeatures` also lives in `gradle.properties`; `cargoTargets` can be set there too. Two more the release workflow
 passes: `-PbaucordVersionCode=` (the run number) and
 `-PbaucordVersionName=` (the tag); local builds default to 1 / the
 workspace version. `run.ps1` builds with the versionCode already

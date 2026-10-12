@@ -557,10 +557,8 @@ pub struct AppState {
     last_input_devices: Vec<(String, bool)>,
     last_output_devices: Vec<(String, bool)>,
 
-    // Own-process resource sampling (sidebar stats line)
-    sys: sysinfo::System,
-    /// `None` if the OS refused to identify our own process.
-    pid: Option<sysinfo::Pid>,
+    // Own-process resource sampling (sidebar stats line, `/mem`)
+    usage: crate::resources::Sampler,
 
     hotkeys: Option<HotkeyManager>,
     pub keybind_recording: Option<usize>,
@@ -820,8 +818,7 @@ pub fn run() {
         last_output_devices: Vec::new(),
         present: present_shared,
         ui_screen_rx: screen_fwd_rx,
-        sys: sysinfo::System::new(),
-        pid: sysinfo::get_current_pid().ok(),
+        usage: crate::resources::Sampler::new(),
         hotkeys: None,
         keybind_recording: None,
         device_timer: slint::Timer::default(),

@@ -40,6 +40,10 @@ slint.workspace = true
 # `std` for `set_boxed_logger` (logging.rs), asked for here rather than
 # inherited by accident from whichever dependency enables it.
 log = { workspace = true, features = ["std"] }
+# The log file's writer and the panic hook (shared with the desktop),
+# and on the app side the pick slot and safe file names. Not behind
+# `app`: the hello build logs to the same file.
+app-core = { path = "../app-core" }
 frontend = { path = "../frontend", default-features = false, optional = true }
 client = { path = "../client", optional = true }
 # The attach sheet's words (host.rs), from the app's own catalogs.

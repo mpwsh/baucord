@@ -476,10 +476,10 @@ impl EncoderWorker {
         // or silent the accumulator is empty, and applying here keeps the
         // encoder ctls and published stats truthful during the gap
         // instead of deferring to the first frame after unmute.
-        if self.accum.is_empty() {
-            if let Some(d) = self.pending.take() {
-                self.apply(d);
-            }
+        if self.accum.is_empty()
+            && let Some(d) = self.pending.take()
+        {
+            self.apply(d);
         }
     }
 

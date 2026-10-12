@@ -5,49 +5,32 @@
 //! links; the clipboard. The Java halves are `BaucordActivity`'s,
 //! reached through `java.rs`.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard, PoisonError},
-    time::{Duration, Instant},
-};
+use std::path::{Path, PathBuf};
 
+use app_core::files::PickSlot;
 use frontend::host::{ChimeRoute, Hooks, KeepAlive, Notice, NoticeKind, OnPick, Saved};
 
 use crate::java;
 
-/// The pick in flight: its callback and when it started. One at a
-/// time — a second Attach while a large file is still being copied
-/// would delete the copy under it and could hand one pick's file to
-/// the other's callback (an attachment as the avatar).
-static PENDING: Mutex<Option<(OnPick, Instant)>> = Mutex::new(None);
-
-/// A pick older than this is taken as lost (the Activity went away
-/// with the picker open) and no longer blocks a new one.
-const PICK_STALE: Duration = Duration::from_mins(10);
-
-fn pending() -> MutexGuard<'static, Option<(OnPick, Instant)>> {
-    PENDING.lock().unwrap_or_else(PoisonError::into_inner)
-}
+/// The pick in flight. One at a time — a second Attach while a large
+/// file is still being copied would delete the copy under it and could
+/// hand one pick's file to the other's callback (an attachment as the
+/// avatar). A pick older than `app_core::files::PICK_STALE` is taken
+/// as lost (the Activity went away with the picker open) and no longer
+/// blocks a new one.
+static PICK: PickSlot<OnPick> = PickSlot::new();
 
 struct AndroidHost;
 
 impl Hooks for AndroidHost {
     fn pick_file(&self, mime: &str, max_bytes: u64, on_pick: OnPick) {
-        {
-            let mut slot = pending();
-            if slot
-                .as_ref()
-                .is_some_and(|(_, at)| at.elapsed() < PICK_STALE)
-            {
-                drop(slot);
-                frontend::host::pick_failed(String::new(), "busy".to_string());
-                return;
-            }
-            *slot = Some((on_pick, Instant::now()));
+        if PICK.begin(on_pick).is_err() {
+            frontend::host::pick_failed(String::new(), "busy".to_string());
+            return;
         }
         if let Err(e) = java::pick_file(mime, max_bytes) {
             log::warn!("file picker: {e}");
-            pending().take();
+            PICK.finish();
             frontend::host::pick_failed(String::new(), e);
         }
     }
@@ -168,7 +151,7 @@ impl Hooks for AndroidHost {
 /// `nativeFilePicked`: a readable copy of the picked file, a failure,
 /// or (all `None`) a cancel.
 pub(crate) fn picked(path: Option<String>, name: Option<String>, error: Option<String>) {
-    let on_pick = pending().take().map(|(on_pick, _)| on_pick);
+    let on_pick = PICK.finish();
     match (path, error) {
         (Some(path), _) => match on_pick {
             Some(on_pick) => on_pick(PathBuf::from(path)),

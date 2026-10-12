@@ -44,6 +44,10 @@ hello = []
 # Android backend brings the Skia renderer itself.
 slint = { workspace = true, features = ["backend-android-activity-06"] }
 log.workspace = true
+# The log file's writer and the panic hook (shared with the desktop),
+# and on the app side the pick slot and safe file names. Not behind
+# `app`: the hello build logs to the same file.
+app-core = { path = "../app-core" }
 frontend = { path = "../frontend", default-features = false, optional = true }
 client = { path = "../client", optional = true }
 

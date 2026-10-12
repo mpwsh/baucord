@@ -125,13 +125,20 @@ message fails there, which no round-trip test can catch.
   peers fail the TLS handshake and the client shows `OUTDATED_MESSAGE`.
 - Additive capability → a bit in `protocol::features`, offered in
   `Hello`, announced in `Welcome`, `negotiate()`d to the intersection.
-  Bits run up to `QUIET_REPORTS` (18) in 1.2.1; every appended variant
+  Bits run up to `ADMIN_PAGES` (19) in 1.2.1; every appended variant
   gets a new one, since a client that negotiated an older bit cannot
   decode it (PERSISTENCE-SPEC §12). The server enforces this in one
   place: `send_msg` drops a message whose `required_feature()` the
   session did not negotiate. `QUIET_REPORTS` adds no message: a client
   with it is sent no `VoiceReceiverReport` for an interval in which
   the relay expected none of its voice.
+- A message is at most 17 KiB (`MAX_CONTROL_MESSAGE_BYTES`, what every
+  shipped client decodes), so a list is fitted by its sender. An admin
+  listing longer than that goes out as pages (`send_admin_result`):
+  `AdminRows` for the rows ahead, then the `AdminResult` that closes
+  the answer; the client joins them (`network::AdminPages`) and the
+  app gets one list. A session without `ADMIN_PAGES` is sent the first
+  page alone. At most 64 messages an answer.
 
 ### Media packing
 
@@ -669,7 +676,11 @@ without it each compiles to a same-API twin under `src/stubs/`, which
 is what `cargo check -p frontend --no-default-features` builds.
 Native dialogs and the URL launcher are the `host` module's
 `DesktopHooks`, one implementation of the trait the phones implement
-too.
+too. Keybinds are watched, not registered (`hotkeys.rs`): the
+`keywatch` crate's thread sleeps on the OS's key events and reads the
+state of the bound keys when one arrives, so a bound key still types
+everywhere else and an idle keyboard costs nothing; where the state
+cannot be read the bindings are registered hotkeys instead.
 
 Profile flow: `send_own_profile` runs after `Session` and on Save &
 close of Settings when the look changed (`profile_dirty`); with a

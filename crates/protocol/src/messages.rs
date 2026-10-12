@@ -1297,6 +1297,15 @@ pub enum ServerMessage {
     Authors {
         authors: Vec<AuthorInfo>,
     },
+    /// Rows of an admin listing that did not fit its `AdminResult`
+    /// (1.2.1, feature bit `ADMIN_PAGES`). Sent *before* the result,
+    /// in order, under the same request id: the result carries the
+    /// last rows and closes the answer, so a client joins what it
+    /// holds when the result lands and never shows half a list.
+    AdminRows {
+        request_id: u32,
+        rows: crate::admin::AdminOutcome,
+    },
 }
 
 /// Why a DM was not sent (spec §6).
@@ -1564,6 +1573,7 @@ impl ServerMessage {
             | ServerMessage::Restricted { .. }
             | ServerMessage::RestrictionLifted { .. }
             | ServerMessage::AdminResult { .. }
+            | ServerMessage::AdminRows { .. }
             | ServerMessage::History { .. }
             | ServerMessage::HistoryUnavailable { .. }
             | ServerMessage::MessageEdited { .. }
@@ -1679,6 +1689,7 @@ impl ServerMessage {
             | ServerMessage::AccountDeleteRefused { .. }
             | ServerMessage::ChatFrom { .. }
             | ServerMessage::Authors { .. } => features::SAFETY,
+            ServerMessage::AdminRows { .. } => features::ADMIN_PAGES,
         }
     }
 }

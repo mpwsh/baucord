@@ -32,7 +32,7 @@ desktop = [
   "slint/unstable-winit-030",
   "dep:arboard",
   "dep:global-hotkey",
-  "dep:x11rb",
+  "dep:keywatch",
   "dep:interprocess",
   "dep:zip",
   "dep:self-replace",
@@ -68,13 +68,15 @@ chrono.workspace = true
 ureq = { version = "3.4", optional = true }
 open = { version = "5.4", optional = true }
 global-hotkey = { version = "0.8", optional = true }
+# Keybinds watch the key state instead of registering a global hotkey,
+# so the key still types everywhere else (hotkeys.rs).
+keywatch = { path = "../keywatch", optional = true }
 # One instance per config directory: a second launch knocks on the
 # first one's local socket (named pipe / abstract socket / /tmp file)
 # and the first raises its window. See instance.rs.
 interprocess = { version = "2.4", optional = true }
 # The Downloads folder, for file cards' Save (spec §7).
 dirs = "6"
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Deflate only, which is all a release zip uses: the default features
 # add AES, bzip2, lzma, ppmd, xz and C zstd for archives the updater
 # never opens. (`deflate-flate2` alone names no backend.)
@@ -101,13 +103,11 @@ arboard = { version = "3", default-features = false, optional = true, features =
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"], optional = true }
 pollster = { version = "0.4", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Keybinds watch the key state instead of registering a global hotkey,
-# so the key still types everywhere else (hotkeys.rs). On X11 that is
-# one `QueryKeymap` per pass; x11rb is already in the tree (arboard,
-# global-hotkey, winit), and pure Rust. Windows and macOS declare their
-# two or three calls by hand.
-x11rb = { version = "0.13", optional = true }
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# The app's own CPU and memory, for the resource line and `/mem`. A
+# phone reads the two numbers itself (`app_core::usage`) and does not
+# carry the library (review P3-50).
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Native NSPasteboard access for what the toolkit clipboard layer can't

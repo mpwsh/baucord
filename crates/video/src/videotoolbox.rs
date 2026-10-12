@@ -7,10 +7,11 @@
 //! temporal-processing flag, so the output callback runs before
 //! `VTDecompressionSessionDecodeFrame` returns) into **BGRA** pixel
 //! buffers — `VideoToolbox` does the YUV conversion on the GPU, honouring
-//! the stream's colour signalling — and [`yuv::bgra_to_rgba`] turns the
-//! picture into the RGBA the client's `FrameReady → SharedPixelBuffer`
-//! path expects. The hardware decoder does the work; the CPU only swaps
-//! two bytes a pixel.
+//! the stream's colour signalling. The picture leaves as BGRA
+//! ([`crate::PictureFormat::Bgra`]), copied once out of the pixel buffer
+//! without its row padding ([`yuv::pack_rows`]); the client's
+//! `FrameReady → SharedPixelBuffer` path swaps two bytes a pixel as it
+//! writes the buffer it draws from. The hardware decoder does the work.
 //!
 //! Lifecycle in the client's terms:
 //! - `new()` only builds the struct; the session is made on the first
@@ -107,8 +108,9 @@ impl Drop for Session {
 /// decoded. Lives on `decode`'s stack; its address is the frame's
 /// `sourceFrameRefCon`.
 struct Target {
-    /// RGBA, from the shared pool (`crate::pool`).
-    rgba: Vec<u8>,
+    /// The picture as BGRA, in a buffer from the shared pool
+    /// (`crate::pool`).
+    pixels: Vec<u8>,
     /// The stream's announced size: the picture is cut to it (decoders
     /// may hand back padded buffers).
     bound: (u32, u32),
@@ -175,7 +177,7 @@ impl VideoToolboxDecoder {
             .expect("decode_sample needs a session");
         let sample = make_sample(&self.avcc, &session.format)?;
         let mut target = Target {
-            rgba: crate::pool::take(bound.0 as usize * bound.1 as usize * 4),
+            pixels: crate::pool::take(bound.0 as usize * bound.1 as usize * 4),
             bound,
             result: None,
         };
@@ -197,7 +199,7 @@ impl VideoToolboxDecoder {
         };
         self.frames_in += 1;
         if status != 0 {
-            self.pool_return(target.rgba);
+            self.pool_return(target.pixels);
             self.needs_reset = true;
             return Err(CodecError::Decode(format!(
                 "VTDecompressionSessionDecodeFrame: {}",
@@ -211,21 +213,21 @@ impl VideoToolboxDecoder {
                     info!("VideoToolbox: first picture {width}x{height}");
                 }
                 Ok(Some(DecodedFrame {
-                    data: target.rgba,
+                    data: target.pixels,
                     width,
                     height,
                     timestamp_ms,
-                    format: crate::PictureFormat::Rgba,
+                    format: crate::PictureFormat::Bgra,
                 }))
             }
             Some(Err(e)) => {
-                self.pool_return(target.rgba);
+                self.pool_return(target.pixels);
                 self.needs_reset = true;
                 Err(e)
             }
             None => {
                 self.frames_dropped += 1;
-                self.pool_return(target.rgba);
+                self.pool_return(target.pixels);
                 Ok(None)
             }
         }
@@ -505,16 +507,16 @@ unsafe extern "C-unwind" fn on_decoded(
         match unsafe { image.as_ref() } {
             // Dropped by the decoder: no picture for this frame.
             None => None,
-            Some(image) => Some(copy_picture(image, target.bound, &mut target.rgba)),
+            Some(image) => Some(copy_picture(image, target.bound, &mut target.pixels)),
         }
     };
 }
 
-/// Lock the BGRA pixel buffer, copy its visible part out as RGBA.
+/// Lock the BGRA pixel buffer, copy its visible part out as it is.
 fn copy_picture(
     image: &CVImageBuffer,
     bound: (u32, u32),
-    rgba: &mut Vec<u8>,
+    out: &mut Vec<u8>,
 ) -> Result<(u32, u32), CodecError> {
     let format = CVPixelBufferGetPixelFormatType(image);
     if format != kCVPixelFormatType_32BGRA {
@@ -554,7 +556,7 @@ fn copy_picture(
         // SAFETY: while locked, a chunky pixel buffer's memory holds
         // `full_h` rows of `stride` bytes from `base`.
         let pixels = unsafe { std::slice::from_raw_parts(base, stride * full_h) };
-        yuv::bgra_to_rgba(pixels, stride, width as u32, height as u32, rgba)
+        yuv::pack_rows(pixels, stride, width as u32, height as u32, out)
             .map(|()| (width as u32, height as u32))
             .map_err(CodecError::ColorConversion)
     };

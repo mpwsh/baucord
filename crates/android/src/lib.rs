@@ -56,7 +56,9 @@ fn android_main(app: AndroidApp) {
 
     PROCESS_SETUP.get_or_init(|| {
         logging::init(data_dir.as_deref());
-        install_panic_hook();
+        // A release build aborts on panic and an Android process has
+        // no stderr anyone reads: the panic goes to the log first.
+        app_core::logfile::install_panic_hook();
     });
     // Every Java call goes to the Activity itself (java.rs: ndk-context
     // only holds the Application).
@@ -184,29 +186,4 @@ fn request_missing_permissions() {
     if let Err(e) = java::request_permissions(&missing) {
         log::warn!("requestPermissions failed: {e}");
     }
-}
-
-/// A release build aborts on panic and an Android process has no
-/// stderr anyone reads, so the panic — thread, message, location,
-/// backtrace — goes to the log first. Same hook as `desktop/main.rs`.
-fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        let thread = std::thread::current()
-            .name()
-            .unwrap_or("<unnamed>")
-            .to_owned();
-        let message = info
-            .payload()
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "<non-string panic payload>".to_string());
-        let location = info.location().map_or_else(
-            || "<unknown location>".to_string(),
-            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
-        );
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        log::error!("PANIC in thread '{thread}' at {location}: {message}\n{backtrace}");
-        log::logger().flush();
-    }));
 }

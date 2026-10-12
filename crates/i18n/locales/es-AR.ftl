@@ -94,6 +94,7 @@ chat-your-roles-changed = Tus roles ahora son: { $roles }
 roles-none = ninguno
 reason-none = (sin motivo)
 chat-admin-users-header = { $count } usuario(s) registrados (● conectados):
+chat-admin-list-more = … y { $count } más. El panel de administración los muestra todos.
 chat-admin-restrictions-header = { $count } restricción(es):
 chat-admin-invites-header = { $count } invitación(es):
 restricted-voice = El servidor te silenció{ $until }{ $reason }
@@ -210,6 +211,8 @@ action-push-to-talk = Pulsar para hablar
 
 # ── Panel de atajos ─────────────────────────────────────────────────────
 keybinds-hint = Hacé clic en Grabar y presioná una combinación de teclas. Esc cancela, Retroceso borra.
+keybinds-access = macOS deja que baucord vea tus atajos mientras estás en otra app solo con el permiso de Accesibilidad. Hasta tenerlo, una tecla asignada funciona igual, pero macOS se la saca a la app en la que estás: ahí no escribe nada.
+keybinds-access-ask = Permitir en Ajustes del Sistema…
 keybind-not-set = Sin asignar
 keybind-press-combo = Presioná una combinación...
 

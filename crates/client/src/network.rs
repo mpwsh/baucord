@@ -125,6 +125,57 @@ const VOICE_RUN_GAP: Duration = Duration::from_secs(2);
 /// forgotten (its sender vanished or gave up mid-pace).
 const IMAGE_PARTIAL_TTL: Duration = Duration::from_mins(2);
 
+/// Rows of admin listings held while their answers are still arriving
+/// (`AdminRows`). A server sends at most a megabyte for one answer;
+/// this is far past what that holds.
+const MAX_HELD_ADMIN_ROWS: usize = 50_000;
+
+/// The pages of admin listings that arrived ahead of their
+/// `AdminResult`, by request id (feature bit `ADMIN_PAGES`). The
+/// result closes an answer: the app is handed one list, in the order
+/// the server sent it, and never half of one.
+#[derive(Default)]
+struct AdminPages {
+    held: HashMap<u32, protocol::AdminOutcome>,
+}
+
+impl AdminPages {
+    /// One more page of the answer to `request_id`.
+    fn hold(&mut self, request_id: u32, rows: protocol::AdminOutcome) {
+        let held: usize = self.held.values().map(protocol::AdminOutcome::rows).sum();
+        if held.saturating_add(rows.rows()) > MAX_HELD_ADMIN_ROWS {
+            warn!("admin rows for request {request_id} dropped: {held} already held");
+            return;
+        }
+        // `prepend` puts its argument in front: the new page takes
+        // what is held and replaces it.
+        let mut joined = rows;
+        if let Some(earlier) = self.held.remove(&request_id)
+            && !joined.prepend(earlier)
+        {
+            warn!("admin rows for request {request_id} changed kind; kept the newer");
+        }
+        self.held.insert(request_id, joined);
+    }
+
+    /// The result for `request_id` landed: put the held pages in front
+    /// of its rows. A refusal drops them.
+    fn close(
+        &mut self,
+        request_id: u32,
+        result: &mut Result<protocol::AdminOutcome, protocol::AdminError>,
+    ) {
+        let Some(earlier) = self.held.remove(&request_id) else {
+            return;
+        };
+        if let Ok(outcome) = result
+            && !outcome.prepend(earlier)
+        {
+            warn!("admin rows for request {request_id} do not match its result");
+        }
+    }
+}
+
 /// One "send my log" upload per this interval, mirroring the server's
 /// acceptance window.
 pub const LOG_UPLOAD_MIN_INTERVAL: Duration = Duration::from_mins(10);
@@ -846,6 +897,9 @@ pub(crate) struct NetworkClient {
     /// Blobs whose fetch was cancelled: chunks still arriving are
     /// dropped until the blob is asked for again.
     ignored_blobs: HashSet<[u8; 32]>,
+    /// Rows of an admin listing that arrived ahead of its
+    /// `AdminResult` (`AdminRows`), by request id.
+    admin_rows: AdminPages,
     last_stats_check: Instant,
     /// Transport counters at the last stats sample.
     stats_baseline: Option<LinkStats>,
@@ -955,6 +1009,7 @@ impl NetworkClient {
             incoming_blobs: HashMap::new(),
             pending_blobs: HashMap::new(),
             ignored_blobs: HashSet::new(),
+            admin_rows: AdminPages::default(),
             last_stats_check: now,
             stats_baseline: None,
             telemetry_baseline: None,
@@ -1769,7 +1824,14 @@ impl NetworkClient {
                 self.message_queue
                     .push(NetworkMessage::RestrictionLifted { kind });
             }
-            ServerMessage::AdminResult { request_id, result } => {
+            ServerMessage::AdminRows { request_id, rows } => {
+                self.admin_rows.hold(request_id, rows);
+            }
+            ServerMessage::AdminResult {
+                request_id,
+                mut result,
+            } => {
+                self.admin_rows.close(request_id, &mut result);
                 self.message_queue
                     .push(NetworkMessage::AdminResult { request_id, result });
             }
@@ -3537,6 +3599,72 @@ fn send_voice(client: Option<&mut NetworkClient>, link: Option<&VoiceLink>, pack
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit(ids: std::ops::Range<u64>) -> protocol::AdminOutcome {
+        protocol::AdminOutcome::Audit(
+            ids.map(|id| protocol::AuditEntry {
+                id,
+                ts: id,
+                actor: None,
+                target: None,
+                action: "test".to_string(),
+                detail: None,
+            })
+            .collect(),
+        )
+    }
+
+    /// Review P0-1: pages arrive before the result that closes them.
+    #[test]
+    fn admin_pages_are_joined_in_order_when_the_result_lands() {
+        let mut pages = AdminPages::default();
+        pages.hold(7, audit(0..3));
+        // Another answer in between keeps its own rows.
+        pages.hold(8, audit(100..101));
+        pages.hold(7, audit(3..5));
+        let mut result = Ok(audit(5..6));
+        pages.close(7, &mut result);
+        assert_eq!(result, Ok(audit(0..6)));
+        let mut other = Ok(audit(101..102));
+        pages.close(8, &mut other);
+        assert_eq!(other, Ok(audit(100..102)));
+        assert!(pages.held.is_empty());
+
+        // An answer of one message is left as it came.
+        let mut single = Ok(audit(0..2));
+        pages.close(9, &mut single);
+        assert_eq!(single, Ok(audit(0..2)));
+    }
+
+    #[test]
+    fn a_refusal_drops_the_pages_and_a_flood_is_cut() {
+        let mut pages = AdminPages::default();
+        pages.hold(1, audit(0..3));
+        let mut refused = Err(protocol::AdminError::NoPermission);
+        pages.close(1, &mut refused);
+        assert_eq!(refused, Err(protocol::AdminError::NoPermission));
+        assert!(pages.held.is_empty());
+
+        // Rows of another listing under the same id do not mix in.
+        pages.hold(2, protocol::AdminOutcome::Invites(Vec::new()));
+        let mut result = Ok(audit(0..1));
+        pages.close(2, &mut result);
+        assert_eq!(result, Ok(audit(0..1)));
+
+        let cap = MAX_HELD_ADMIN_ROWS as u64;
+        pages.hold(3, audit(0..cap));
+        pages.hold(3, audit(cap..cap + 1));
+        let mut result = Ok(audit(cap + 1..cap + 2));
+        pages.close(3, &mut result);
+        let Ok(joined) = result else {
+            panic!("an answer");
+        };
+        assert_eq!(
+            joined.rows(),
+            MAX_HELD_ADMIN_ROWS + 1,
+            "the page past the cap was dropped"
+        );
+    }
 
     fn whole(parts: &[&[u8]]) -> [u8; 32] {
         let mut hasher = transport::sha256::Hasher::new();

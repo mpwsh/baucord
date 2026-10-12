@@ -528,15 +528,15 @@ impl ChatServer {
         outcome: Outcome,
     ) {
         let result = match outcome {
-            Outcome::Answered(Answer::Reports(list)) => {
-                Ok(AdminOutcome::Reports(fit_reports(list)))
-            }
+            Outcome::Answered(Answer::Reports(list)) => Ok(AdminOutcome::Reports(list)),
             Outcome::Answered(Answer::Failed(e)) => Err(AdminError::Invalid(e)),
             _ => Err(AdminError::Invalid(
                 "the reports did not answer in time".into(),
             )),
         };
-        self.send_msg(client, &ServerMessage::AdminResult { request_id, result });
+        // Newest first; a report can carry a 2,000-byte excerpt and a
+        // 500-byte note, so 200 of them are pages, not a message.
+        self.send_admin_result(client, request_id, result);
     }
 
     /// `ResolveReport`: handled, out of the open list.
@@ -647,14 +647,6 @@ fn remove_logs_of(dir: &std::path::Path, user: &UserId, name: &str) {
     }
 }
 
-/// The newest reports that fit one control message: each can carry a
-/// 2,000-byte excerpt and a 500-byte note, and a list past the cap is
-/// not sent at all. The rest show as these are handled.
-fn fit_reports(mut list: Vec<protocol::ReportSummary>) -> Vec<protocol::ReportSummary> {
-    protocol::keep_prefix_that_fits(&mut list, protocol::LIST_ITEMS_BUDGET);
-    list
-}
-
 /// A name as it appears in an uploaded log's file name: letters and
 /// digits, everything else `_` (so a name never contains the `-` that
 /// separates the parts).
@@ -707,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn the_reports_list_always_fits_one_message() {
+    fn a_full_reports_list_splits_into_pages_that_each_encode() {
         let long = |n: usize| "x".repeat(n);
         let list: Vec<protocol::ReportSummary> = (0..200)
             .map(|i| protocol::ReportSummary {
@@ -724,16 +716,35 @@ mod tests {
                 resolved: false,
             })
             .collect();
-        let fitted = fit_reports(list);
         // Worst case, ~2.6 KB a report: a 17 KiB message (what every
-        // shipped client decodes) holds six; the rest show as these are
-        // handled.
-        assert!(fitted.len() >= 6, "{}", fitted.len());
-        assert_eq!(fitted[0].id, 0, "newest first, kept in order");
-        let msg = ServerMessage::AdminResult {
-            request_id: 1,
-            result: Ok(AdminOutcome::Reports(fitted)),
-        };
-        assert!(protocol::encode_server_message(&msg).is_some());
+        // shipped client decodes) holds six, and the first page is what
+        // such a client gets.
+        let pages = AdminOutcome::Reports(list).into_pages(protocol::LIST_ITEMS_BUDGET);
+        let mut next = 0u64;
+        for (i, page) in pages.iter().enumerate() {
+            let AdminOutcome::Reports(rows) = page else {
+                panic!("page {i} is not a reports page");
+            };
+            if i + 1 < pages.len() {
+                assert!(rows.len() >= 6, "page {i} holds {}", rows.len());
+            }
+            for row in rows {
+                assert_eq!(row.id, next, "newest first, kept in order");
+                next += 1;
+            }
+            let msg = if i + 1 == pages.len() {
+                ServerMessage::AdminResult {
+                    request_id: 1,
+                    result: Ok(page.clone()),
+                }
+            } else {
+                ServerMessage::AdminRows {
+                    request_id: 1,
+                    rows: page.clone(),
+                }
+            };
+            assert!(protocol::encode_server_message(&msg).is_some(), "page {i}");
+        }
+        assert_eq!(next, 200, "every report is on a page");
     }
 }

@@ -38,10 +38,10 @@ struct Shared {
 
 impl Shared {
     fn wake(&self) {
-        if self.registered.load(Ordering::SeqCst) {
-            if let Some(waiter) = self.waiter.get() {
-                waiter.unpark();
-            }
+        if self.registered.load(Ordering::SeqCst)
+            && let Some(waiter) = self.waiter.get()
+        {
+            waiter.unpark();
         }
     }
 }

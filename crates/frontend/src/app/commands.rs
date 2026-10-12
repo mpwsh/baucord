@@ -8,6 +8,12 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// How many rows a typed listing (`/users`, `/bans`, `/invites`,
+/// `/reports`) prints into the chat. The server sends a long listing
+/// whole since 1.2.1 (review P0-1); the panel shows all of it, and a
+/// chat that keeps 500 rows should not lose them to one command.
+const COMMAND_LIST_ROWS: usize = 150;
+
 impl AppState {
     pub(super) fn handle_connect(&mut self, nickname: &str) {
         self.reconnect_timer.stop();
@@ -687,6 +693,17 @@ impl AppState {
             .ok();
     }
 
+    /// The line under a typed listing that was cut to
+    /// [`COMMAND_LIST_ROWS`]: how many more there are, and where.
+    fn push_list_rest(&mut self, total: usize) {
+        if let Some(rest) = total
+            .checked_sub(COMMAND_LIST_ROWS)
+            .filter(|rest| *rest > 0)
+        {
+            self.push_command_output(&t!("chat-admin-list-more", "count" => rest));
+        }
+    }
+
     pub(super) fn handle_admin_result(
         &mut self,
         request_id: u32,
@@ -772,8 +789,9 @@ impl AppState {
         match outcome {
             client::AdminOutcome::Done => self.push_command_output(&t!("chat-admin-done")),
             client::AdminOutcome::Users(users) => {
-                self.push_command_output(&t!("chat-admin-users-header", "count" => users.len()));
-                for u in users {
+                let total = users.len();
+                self.push_command_output(&t!("chat-admin-users-header", "count" => total));
+                for u in users.into_iter().take(COMMAND_LIST_ROWS) {
                     let roles: Vec<String> =
                         u.roles.iter().map(|r| self.role_name_of(*r)).collect();
                     let line = format!(
@@ -794,13 +812,15 @@ impl AppState {
                     );
                     self.push_command_output(&line);
                 }
+                self.push_list_rest(total);
             }
             client::AdminOutcome::Restrictions(list) => {
+                let total = list.len();
                 self.push_command_output(&t!(
                     "chat-admin-restrictions-header",
-                    "count" => list.len()
+                    "count" => total
                 ));
-                for r in list {
+                for r in list.into_iter().take(COMMAND_LIST_ROWS) {
                     let who = r
                         .user_name
                         .clone()
@@ -823,6 +843,7 @@ impl AppState {
                     );
                     self.push_command_output(&line);
                 }
+                self.push_list_rest(total);
             }
             client::AdminOutcome::Telemetry(sample) => match sample {
                 Some(t) => {
@@ -832,8 +853,9 @@ impl AppState {
                 None => self.push_command_output(&t!("chat-admin-no-telemetry")),
             },
             client::AdminOutcome::Invites(list) => {
-                self.push_command_output(&t!("chat-admin-invites-header", "count" => list.len()));
-                for i in list {
+                let total = list.len();
+                self.push_command_output(&t!("chat-admin-invites-header", "count" => total));
+                for i in list.into_iter().take(COMMAND_LIST_ROWS) {
                     let uses = match i.max_uses {
                         Some(max) => format!("{}/{max}", i.uses),
                         None => i.uses.to_string(),
@@ -852,10 +874,12 @@ impl AppState {
                     );
                     self.push_command_output(&line);
                 }
+                self.push_list_rest(total);
             }
             client::AdminOutcome::Reports(list) => {
-                self.push_command_output(&t!("chat-admin-reports-header", "count" => list.len()));
-                for r in list {
+                let total = list.len();
+                self.push_command_output(&t!("chat-admin-reports-header", "count" => total));
+                for r in list.into_iter().take(COMMAND_LIST_ROWS) {
                     let mut line = format!(
                         "#{} {} — {} — {}",
                         r.id,
@@ -883,6 +907,7 @@ impl AppState {
                     }
                     self.push_command_output(&line);
                 }
+                self.push_list_rest(total);
             }
             // Answers to what only the admin panel asks, and it takes
             // its own (`adminui::take_outcome`): nothing typed leads here.

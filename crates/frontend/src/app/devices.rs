@@ -243,6 +243,14 @@ impl AppState {
         }
     }
 
+    /// The permission to watch keys was just granted: bindings that
+    /// were registered as hotkeys meanwhile are watched from here on.
+    pub fn rearm_hotkeys(&mut self) {
+        if let Some(hotkeys) = &mut self.hotkeys {
+            hotkeys.rearm();
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════
     //  CHAT MODEL
     // ════════════════════════════════════════════════════════════════

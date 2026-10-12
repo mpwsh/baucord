@@ -6,7 +6,12 @@
 > type-checked there, the iOS code was not even compiled, and nothing
 > platform-specific was *run*. This is the list of what has to be seen
 > on the real thing before 1.2.1 ships. Tick a line when it holds; a
-> line that fails goes into `PRODUCTION-PLAN.md` with what §5 asks for.
+> line that fails goes into `PRODUCTION-PLAN.md` with what §6 asks for.
+>
+> **Since then (the review's seventh batch, same day):** the iOS build
+> compiles (the user, before that batch). That batch changed platform code
+> again; its lines are marked **[7]** and each platform's §x.0 says
+> what was type-checked in the sandbox and what was not.
 
 Each line is *do this → expect that*. `log:` is a line to find in
 `baucord.log` (desktop: Settings → Debug shows it and copies it;
@@ -20,8 +25,8 @@ Three kinds of line:
 - **same** — a refactor: must behave exactly as before.
 
 The "changed blind" lists are `git diff v1.2.0..HEAD` for the files
-only that platform compiles. macOS and the Linux desktop are not
-covered here.
+only that platform compiles. macOS has §4 since the seventh batch
+changed it; the Linux desktop is where the work was done.
 
 ---
 
@@ -42,6 +47,13 @@ built-in speakers is the machine that matters most.
 - [ ] The first release run on GitHub: the build restores a cache
   warmed from `main`, installs the toolchain `rust-toolchain.toml`
   names, and has no `sccache` step [P2-50, P3-48].
+- [ ] **builds [7]** — the same build again. New since: the `keywatch`
+  crate (its Windows half was type-checked and linted for
+  `x86_64-pc-windows-gnu`; `frontend/src/hotkeys.rs`, which now only
+  calls it, was not), `audio` and `video` on the 2024 edition
+  (type-checked for Windows; two `extern` blocks in
+  `audio/src/platform.rs` became `unsafe extern`), and
+  `frontend/src/resources.rs` (the `Sampler` around `sysinfo`).
 
 ### 1.1 Voice and devices [P2-55, P1-18, P2-21, P3-27]
 
@@ -137,7 +149,7 @@ Play music in another app first, at a steady volume.
 - [ ] **new** — in a full-screen game, pull the network for ten
   seconds. The reconnect does not take the focus [P2-17].
 - [ ] **new** — get kicked while the window is in the tray: it stays
-  there. *Decide whether a kick or a ban should still bring it up.*
+  there, and so it does for a ban (decided 2026-10-12) [P2-17].
 - [ ] **new** — in the composer, select text, right-click: Cut and Copy
   work; with nothing selected they are greyed [P2-16].
 - [ ] **new** — PrintScreen, then Ctrl+V in the composer: the send
@@ -190,6 +202,48 @@ Play music in another app first, at a steady volume.
 - [ ] **same** — starting baucord a second time brings the first one's
   window up instead of opening another; a second `--profile` still
   opens its own.
+- [ ] **new [7]** — on a server with more than about 140 accounts, the
+  admin panel's Users tab lists all of them (it stopped at what one
+  message holds), and so do Invites, Restrictions, Files, Reports and
+  an Audit page. `/users` in the chat prints 150 and a line saying how
+  many more the panel has. A 1.2.0 client on the same server still
+  gets the first 140 or so, not an empty tab [P0-1].
+- [ ] **new [7]** — download a large file (50 MB or more) from a file
+  card: the window keeps responding while it is written, then the
+  toast says where it went and the card offers Open [P2-27].
+
+### 1.6 Keybinds without polling [P1-3 step 2] **[7]**
+
+The watcher sleeps until Windows reports a key (Raw Input) and reads
+the bound keys then. `cargo run -p keywatch --example watch` prints
+the same edges without the app (F7, Ctrl+F8, hold V).
+
+- [ ] **new** — connect. log: `Watching N keybind(s), woken by key
+  events` and `Key watcher: N binding(s), woken by key events`. (If it
+  says `on a clock`, or `Raw Input not available`, it fell back to
+  reading every 12 ms: works as 1.2.0 did — send the log.)
+- [ ] **new** — the default keys (F7, F8, F9) toggle while another
+  program has the focus, a full-screen game included; push-to-talk
+  opens on the press and closes on the release, also after holding it
+  for a minute; a chord (Ctrl+Shift+M) fires only with its modifiers.
+- [ ] **new** — the log does **not** get `a key was pressed and no
+  event said so`. That line is the safety net: the watcher found a
+  press its events did not announce and went back to the clock. If it
+  appears, keybinds still work — send the log and say which key.
+- [ ] **same** — a bound key still types in other programs (bind `N`,
+  type in Notepad).
+- [ ] **new** — Task Manager, connected and idle with the keyboard at
+  rest: the `key-watch` thread does nothing (it woke 83 times a second
+  in 1.2.0, 4 times a second for the first three presses of a session
+  now, then never).
+- [ ] *Find out* — with a window that runs as administrator in front
+  (Task Manager, an elevated game) and baucord not elevated: do the
+  keys reach baucord? In 1.2.0? (Windows hides input to elevated
+  windows from other programs; this should be no different, and needs
+  saying in the docs if it bites.)
+- [ ] **same** — disconnect and connect again several times: keybinds
+  work each time (the watcher hands the process's Raw Input
+  registration back to the window toolkit when it stops).
 
 ---
 
@@ -211,6 +265,34 @@ Bluetooth headset. `android/README.md` has the build.
   meet the compiler.
 - [ ] **same** — a first run on a clean install still asks for the
   microphone and the notification permission, each once.
+- [ ] **builds [7]** — the Gradle build again. Closer to checked than
+  the list above was: `java.rs`, `host.rs` and `logging.rs` were
+  type-checked on Linux in a scratch crate against the real `jni`,
+  `android_logger` and `app-core` (and a copy of `frontend`'s hook
+  trait), and the three Java files compile with `javac` against API
+  34's `android.jar`. Gradle, the Kotlin build script, `lib.rs`'s one
+  changed line and the manifest of dependencies did not run. In the
+  order they are likely to complain:
+  - `crates/android/Cargo.toml` — `app-core` is a dependency now, in
+    the hello build too;
+  - `crates/android/src/logging.rs` — the tee writes through
+    `app_core::logfile::FileSink` [P3-44, P3-45];
+  - `crates/android/src/host.rs` — the pick slot is
+    `app_core::files::PickSlot` [P3-44];
+  - `crates/android/src/lib.rs` — the panic hook is
+    `app_core::logfile::install_panic_hook` [P3-44];
+  - `crates/android/src/java.rs` — `save_download` calls
+    `beginDownload` / `endDownload` and writes to a file descriptor
+    itself [P2-27];
+  - `BaucordActivity.java` — those two methods in place of
+    `saveDownload` [P2-27]; `VoiceService.java` — `holdWakeLock`
+    [P2-28];
+  - `android/app/build.gradle.kts`, `gradle.properties` — the ABI
+    default [P3-46];
+  - `frontend/src/resources.rs` — the phone `Sampler`
+    (`app_core::usage`, which *was* type-checked for
+    `aarch64-linux-android` and whose `/proc` half is tested on Linux)
+    [P3-50].
 
 ### 2.1 Voice: the lobby, a room, mute, routes [P2-55, ANDROID-SPEC D53]
 
@@ -269,12 +351,38 @@ agrees with it.
 - [ ] **same** — watch a stream: picture and sound, rotate, leave the
   app and come back (the picture returns at once) [P1-7, P2-44].
 
-### 2.4 Not done yet on Android
+### 2.4 The seventh batch, written without a phone **[7]**
 
-P2-27 (saving a 50 MiB file copies it through the Java heap), P2-28
-(the wake lock without a timeout), P3-44 and P3-45 (the log tee and its
-rolling), and of P3-46 the Gradle ABI default (a local release build
-still ships x86_64).
+- [ ] **new** — **the one to do first.** In a room, screen off, phone
+  unplugged, for 15 minutes: voice keeps flowing both ways the whole
+  time. The app's own wake lock now lasts 10 minutes from the join
+  (it had no limit); after that the audio streams' wake locks are
+  what keeps the phone awake. `adb shell dumpsys power | grep -iE
+  "baucord|AudioMix|AudioIn"`: `baucord:voice` for the first 10
+  minutes, `AudioMix` / `AudioIn` throughout. If voice stops after 10
+  minutes, `WAKE_LOCK_MS` in `VoiceService.java` is the line to raise
+  and the plan gets an entry [P2-28].
+- [ ] **new** — in a room for more than 10 minutes, screen off, then
+  cut the network for 20 seconds: the app reconnects by itself (the
+  wake lock is taken again when a retry starts) [P2-28].
+- [ ] **new** — save a received file of 50 MB or more: the app stays
+  responsive, the file is in Downloads under the name the toast says,
+  and Open on the card opens it. A second save of the same file gets
+  a numbered name. Out of storage, or the save cancelled by killing
+  the app: no empty file is left in Downloads [P2-27].
+- [ ] **new** — `baucord.log` passes 5 MB while the app runs (debug
+  level in a room gets there in an hour or two): `baucord.log.1`
+  appears and `baucord.log` starts over; Settings → Debug shows the
+  end of the log across both, Clear empties both [P3-45].
+- [ ] **same** — attach a file, set an avatar, import the identity
+  key: each picker works, and a second Attach while a large file is
+  still being read says it is busy [P3-44].
+- [ ] **same** — the resource line (Settings → General, if shown on
+  the phone) and `/mem` show a CPU percentage and a memory figure
+  that move; memory is what `adb shell dumpsys meminfo dev.baucord`
+  calls RSS, about [P3-50].
+- [ ] **new** — `./gradlew assembleRelease` with no `-PcargoTargets`
+  builds arm64-v8a only; `assembleDebug` builds both ABIs [P3-46].
 
 ---
 
@@ -283,7 +391,10 @@ still ships x86_64).
 An older and a current iPhone; AirPods or another headset.
 `ios/README.md` has the build.
 
-### 3.0 Build — nothing here has met a compiler
+### 3.0 Build — nothing here had met a compiler
+
+The list below compiled on 2026-10-12 (the user). The one
+after it is the seventh batch's.
 
 - [ ] **builds** — `ios/run.sh --hello`, then the client. The files
   changed blind, in the order they are likely to complain:
@@ -298,6 +409,21 @@ An older and a current iPhone; AirPods or another headset.
   - `crates/ios/Cargo.toml` and the `ios/` scripts — the version now
     comes from the workspace [P2-61]: check the build number Xcode
     shows.
+- [ ] **builds [7]** — `ios/run.sh --hello`, then the client, again:
+  - `crates/audio` is on the 2024 edition. Its iOS-only code
+    (`native/vpio.rs`, the iOS blocks of `lib.rs`, `input.rs`,
+    `output.rs`, `platform.rs`) was read for what that edition
+    rejects, not compiled; two nested `if`s in `vpio.rs`
+    (`Mailbox::current`) became `if … && let …` [P3-49];
+  - `crates/ios/Cargo.toml` — `app-core` is a dependency now, in the
+    hello build too;
+  - `crates/ios/src/logging.rs`, `main.rs`, `host.rs` — the log
+    writer, the panic hook, the pick slot and the safe file names come
+    from `app_core` [P3-44, P3-45] (`logging.rs` is plain Rust and was
+    type-checked on Linux; the other two were not);
+  - `frontend/src/resources.rs` — the phone `Sampler` [P3-50];
+  - `crates/video/src/videotoolbox.rs` and `app_core::usage` did meet
+    the compiler this time (type-checked for `aarch64-apple-ios`).
 
 ### 3.1 Voice [P2-55, IOS-SPEC D47, D51]
 
@@ -329,15 +455,86 @@ An older and a current iPhone; AirPods or another headset.
   tap outside.
 - [ ] **same** — watch a stream: picture, sound, pinch, rotate.
 
-### 3.4 Not done yet on iOS
+### 3.4 The seventh batch **[7]**
 
-P2-29 (the lobby's silent output is a known App Review 2.5.4
-rejection: it belongs in the App Store decision with PRD-1), and the
-VideoToolbox half of P2-43.
+- [ ] **new** — **watch a screen share: the colours are right.** Blue
+  and red swapped (skin blue, a red button blue) means the picture's
+  BGRA was shown as RGBA: `frontend/src/present.rs`, `fill`. The
+  decoder now copies the picture out as it is and the swap happens as
+  the display's buffer is written — one pass over the pixels and no
+  cleared buffer per frame, where there were two and one [P2-43].
+- [ ] **new** — the same stream for a few minutes on the older phone:
+  log's 5 s summary shows no more late or dropped pictures than
+  before, and the phone is no warmer.
+- [ ] **same** — attach a photo, attach a file from Files, pick an
+  avatar; cancel each picker by swiping it down and attach again (the
+  slot must be free); a file whose name has a `/` or `:` saves under
+  a safe name [P3-44].
+- [ ] **new** — `baucord.log` in Files passes 5 MB while the app runs:
+  `baucord.log.1` appears beside it [P3-45].
+- [ ] **new** — the resource line and `/mem`: memory is now the
+  footprint Xcode's gauge shows, not the larger resident size [P3-50].
+
+Not done on iOS, and not code: P2-29 — the lobby's silent output is a
+known App Review 2.5.4 rejection. It is on the App Store decision list
+now (`PRODUCTION-PLAN.md` §6).
 
 ---
 
-## 4. A server host
+## 4. macOS **[7]**
+
+Not covered before; the seventh batch changed it. A Mac with Apple
+silicon, and an Intel one if there is one.
+
+### 4.0 Build
+
+- [ ] **builds** — the desktop builds. Type-checked in the sandbox for
+  `aarch64-apple-darwin`: `keywatch` (its macOS half declares Core
+  Graphics, Core Foundation and Accessibility calls by hand — a wrong
+  signature links and then misbehaves, so §4.1 matters) and
+  `app_core::usage`. Not compiled: `frontend` (`hotkeys.rs`,
+  `resources.rs`), `audio` on the 2024 edition, `video/src/codec.rs`
+  for macOS.
+
+### 4.1 Keybinds [P1-3 step 2, P2-30]
+
+- [ ] **new** — a fresh install (or after `tccutil reset Accessibility
+  dev.baucord`): launching, connecting and rebinding a key put up
+  **no** system prompt. Settings → Keyboard shows a note that bound
+  keys are taken from other apps until Accessibility is granted, and a
+  button.
+- [ ] **new** — the button puts up the system's Accessibility prompt
+  (and lists baucord in System Settings → Privacy & Security →
+  Accessibility). Grant it: within a couple of seconds the note is
+  gone, and — while connected — log: `Watching N keybind(s), woken by
+  key events`.
+- [ ] **new** — with the permission: F7/F8/F9 toggle from another app,
+  push-to-talk follows a held key, a bound letter still types in the
+  other app. Without it: the keys work and do not type elsewhere (as
+  in 1.2.0).
+- [ ] **new** — the log does **not** get `a key was pressed and no
+  event said so` (see §1.6), nor `no event tap`. If macOS asks for
+  *Input Monitoring* as well, say so: the code checks that it may
+  listen before it creates the tap, to avoid a second prompt.
+- [ ] **new** — Activity Monitor, connected, keyboard at rest: the
+  `key-watch` thread shows no wake-ups.
+
+### 4.2 Sharing a screen [P2-42]
+
+- [ ] **new** — share a screen. log: `Using FFmpeg encoder:
+  h264_videotoolbox` (it was `libx264`), and baucord's CPU in Activity
+  Monitor is well below what 1.2.0 used for the same share.
+- [ ] **new** — a viewer sees a sharp picture; joining mid-share shows
+  a picture within about a second (a keyframe with its parameter
+  sets); scrolling text does not smear for longer than before. The
+  sharer's 5 s summary has no `frame too large` drops.
+- [ ] **same** — on a Mac where the hardware encoder will not open
+  (a VM): log `Encoder h264_videotoolbox failed to open, trying next`,
+  then `libx264`, and the share works.
+
+---
+
+## 5. A server host
 
 Not a client platform, but changed blind all the same.
 
@@ -347,10 +544,28 @@ Not a client platform, but changed blind all the same.
   `wmem_default` (the server sizes its own socket). log at start:
   `UDP socket on …`; `scripts/monitor-net.sh` shows no new `RCVBUF` or
   `SNDBUF` notes under a share with several viewers [P3-52].
+- [ ] **new [7]** — the same run says `cloud-init network hotplug
+  turned off for this host (…)` on a cloud image, and nothing about
+  cloud-init on a host without one. `KEEP_CLOUD_INIT_HOTPLUG=1 sudo
+  scripts/setup.sh` removes the drop-in an earlier run wrote and says
+  so [P3-52].
+
+### 5.1 The workflows **[7]**
+
+- [ ] The next push: `pr-check` is green. It installs neither
+  `libopus-dev` nor `libdbus-1-dev` any more, which is the proof the
+  release build's shorter package list rests on [P3-48].
+- [ ] The next release: the `tag` job runs first and passes; the Linux
+  build finds what it needs without `libopus-dev`, the Xinerama, Xft,
+  Xrender, pango and cairo headers and `libdbus-1-dev`; the last two
+  steps upload the zips and then the `version` file, in that order
+  [P2-60, P3-48].
+- [ ] The Android release: `Install cargo-ndk` takes seconds
+  (`cargo-ndk 4.1.2`, prebuilt) and the Gradle build finds it [P3-48].
 
 ---
 
-## 5. When a line fails
+## 6. When a line fails
 
 Send back: the platform and its version (Windows build number,
 Android version and phone model, iOS version), the line, and from the

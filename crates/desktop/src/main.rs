@@ -72,29 +72,9 @@ fn main() {
         return;
     }
 
-    // A release build aborts on panic and a GUI process has no stderr,
-    // so without this a crash on any thread leaves nothing behind but a
-    // log that stops mid-sentence. Write the panic — thread, message,
-    // location, backtrace — to the log before the abort.
-    std::panic::set_hook(Box::new(|info| {
-        let thread = std::thread::current()
-            .name()
-            .unwrap_or("<unnamed>")
-            .to_owned();
-        let message = info
-            .payload()
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "<non-string panic payload>".to_string());
-        let location = info.location().map_or_else(
-            || "<unknown location>".to_string(),
-            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
-        );
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        log::error!("PANIC in thread '{thread}' at {location}: {message}\n{backtrace}");
-        log::logger().flush();
-    }));
+    // A release build aborts on panic and a GUI process has no stderr:
+    // the panic goes to the log first.
+    frontend::logfile::install_panic_hook();
 
     app::run();
 

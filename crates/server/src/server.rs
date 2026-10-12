@@ -105,6 +105,11 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 /// Failed admissions per source address in [`ADMISSION_FAILURE_WINDOW`]
 /// before further attempts are refused outright.
 const ADMISSION_FAILURE_LIMIT: usize = 5;
+
+/// How many messages one admin answer may take: 64 of 16 KiB, a
+/// megabyte on the control lane (200 reports at their longest take
+/// 34). A listing past that is cut, and the log says by how much.
+const ADMIN_ANSWER_PAGES: usize = 64;
 const ADMISSION_FAILURE_WINDOW: Duration = Duration::from_mins(1);
 
 /// Time given for a `Refused` message to reach the peer before the
@@ -1459,22 +1464,59 @@ impl ChatServer {
         }
     }
 
-    /// An admin answer, its listing cut to one message (review P0-1).
+    /// An admin answer. A listing longer than one message goes out as
+    /// several to a session that joins them (`ADMIN_PAGES`): the rows
+    /// before the last page as `AdminRows`, then the `AdminResult`
+    /// that closes the answer. Any other session gets the first page
+    /// alone — a shipped client drops a larger message unread, so its
+    /// panel came back empty (review P0-1).
     pub(super) fn send_admin_result(
         &mut self,
         client_id: ClientId,
         request_id: u32,
-        mut result: Result<protocol::AdminOutcome, protocol::AdminError>,
+        result: Result<protocol::AdminOutcome, protocol::AdminError>,
     ) {
-        if let Ok(outcome) = &mut result {
-            let dropped = outcome.fit_to(protocol::LIST_ITEMS_BUDGET);
-            if dropped > 0 {
-                info!("admin answer for {client_id:#x} cut to fit one message ({dropped} rows left out)");
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.send_msg(
+                    client_id,
+                    &ServerMessage::AdminResult {
+                        request_id,
+                        result: Err(e),
+                    },
+                );
+                return;
             }
+        };
+        let total = outcome.rows();
+        let mut pages = outcome.into_pages(protocol::LIST_ITEMS_BUDGET);
+        let limit = if self.has_feature(client_id, features::ADMIN_PAGES) {
+            ADMIN_ANSWER_PAGES
+        } else {
+            1
+        };
+        pages.truncate(limit);
+        let sent: usize = pages.iter().map(protocol::AdminOutcome::rows).sum();
+        if sent < total {
+            info!(
+                "admin answer for {client_id:#x} cut to {} message(s) ({} rows left out)",
+                pages.len(),
+                total - sent
+            );
+        }
+        let Some(last) = pages.pop() else {
+            return;
+        };
+        for rows in pages {
+            self.send_msg(client_id, &ServerMessage::AdminRows { request_id, rows });
         }
         self.send_msg(
             client_id,
-            &ServerMessage::AdminResult { request_id, result },
+            &ServerMessage::AdminResult {
+                request_id,
+                result: Ok(last),
+            },
         );
     }
 

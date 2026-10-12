@@ -65,6 +65,12 @@ pub const SAFETY: u64 = 1 << 17;
 /// it, a session that says nothing is sent nothing on a clock — which
 /// is what lets a phone's radio rest in the lobby (review P2-49).
 pub const QUIET_REPORTS: u64 = 1 << 18;
+/// An admin listing longer than one message (1.2.1): the rows that do
+/// not fit `AdminResult` arrive before it, as `AdminRows` under the
+/// same request id, and the client joins them. A session without this
+/// bit is sent the first rows only — every shipped client dropped a
+/// larger answer unread (review P0-1).
+pub const ADMIN_PAGES: u64 = 1 << 19;
 
 /// What a 1.0 client can do.
 pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
@@ -87,7 +93,8 @@ pub const CLIENT_1_1: u64 = CLIENT_1_0
     | ADMIN_FEED
     | LOBBY
     | SAFETY
-    | QUIET_REPORTS;
+    | QUIET_REPORTS
+    | ADMIN_PAGES;
 /// What a 1.1 server offers: keys are the login, invites the door,
 /// roles decide what a session may do, and it keeps history.
 pub const SERVER_1_1: u64 = TELEMETRY
@@ -107,7 +114,8 @@ pub const SERVER_1_1: u64 = TELEMETRY
     | ADMIN_FEED
     | LOBBY
     | SAFETY
-    | QUIET_REPORTS;
+    | QUIET_REPORTS
+    | ADMIN_PAGES;
 
 /// Bits both sides announced.
 #[must_use]
@@ -155,6 +163,7 @@ mod tests {
             LOBBY,
             SAFETY,
             QUIET_REPORTS,
+            ADMIN_PAGES,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);

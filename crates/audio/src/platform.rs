@@ -126,10 +126,10 @@ impl Drop for RtGuard {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for RtGuard {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            if let Err(e) = audio_thread_priority::demote_current_thread_from_real_time(handle) {
-                log::debug!("real-time demotion failed: {e}");
-            }
+        if let Some(handle) = self.handle.take()
+            && let Err(e) = audio_thread_priority::demote_current_thread_from_real_time(handle)
+        {
+            log::debug!("real-time demotion failed: {e}");
         }
     }
 }
@@ -318,14 +318,14 @@ where
 
 #[cfg(windows)]
 #[link(name = "winmm")]
-extern "system" {
+unsafe extern "system" {
     fn timeBeginPeriod(u_period: u32) -> u32;
     fn timeEndPeriod(u_period: u32) -> u32;
 }
 
 #[cfg(windows)]
 #[link(name = "avrt")]
-extern "system" {
+unsafe extern "system" {
     fn AvSetMmThreadCharacteristicsW(
         task_name: *const u16,
         task_index: *mut u32,

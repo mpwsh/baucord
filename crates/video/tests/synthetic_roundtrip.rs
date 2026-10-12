@@ -206,10 +206,10 @@ fn every_width_decodes_to_a_whole_tight_picture() {
                 .expect("encode")
             {
                 assert_eq!((ef.width, ef.height), (w, h));
-                if let Some(d) = decoder.decode(&ef).expect("decode") {
-                    if let Some(old) = last.replace(d.data) {
-                        video::pool::recycle(old);
-                    }
+                if let Some(d) = decoder.decode(&ef).expect("decode")
+                    && let Some(old) = last.replace(d.data)
+                {
+                    video::pool::recycle(old);
                 }
             }
         }

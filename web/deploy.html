@@ -442,7 +442,9 @@ sudo chmod +x scripts/*.sh</code></pre>
               kernel's receive backlog
               (<code>/etc/sysctl.d/99-baucord-udp.conf</code>), connection
               tracking sized for Docker's port publishing, NIC ring
-              buffers and RPS at boot, and no cloud-init network hotplug;
+              buffers and RPS at boot, and no cloud-init network hotplug
+              (for the whole host; <code>KEEP_CLOUD_INIT_HOTPLUG=1</code>
+              leaves cloud-init as it is);
             </li>
             <li>
               pulls the image and starts the server

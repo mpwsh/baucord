@@ -529,33 +529,8 @@ fn write_into_downloads(name: &str, bytes: &[u8]) -> std::io::Result<std::path::
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let base = std::path::Path::new(&safe);
-    let stem = base
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file")
-        .to_string();
-    let ext = base
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
-    let mut path = dir.join(&safe);
-    let mut n = 2;
-    while path.exists() {
-        path = dir.join(format!("{stem} ({n}){ext}"));
-        n += 1;
-    }
+    // One path component, and never over a file that is there.
+    let path = app_core::files::unique_path(&dir, &app_core::files::safe_name(name));
     std::fs::write(&path, bytes)?;
     Ok(path)
 }

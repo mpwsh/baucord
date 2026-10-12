@@ -898,10 +898,10 @@ impl AdaptiveJitterBuffer {
         // 160↔200 ms sawtooth seen in the field with zero underruns).
         // ~0.99 per 10 ms tick ≈ estimate thirds every second of silence.
         for p in self.buffers.values_mut() {
-            if let Some(last) = p.last_arrival {
-                if last.elapsed() > Duration::from_secs(1) {
-                    p.jitter_estimate = (p.jitter_estimate * 0.99).max(0.001);
-                }
+            if let Some(last) = p.last_arrival
+                && last.elapsed() > Duration::from_secs(1)
+            {
+                p.jitter_estimate = (p.jitter_estimate * 0.99).max(0.001);
             }
         }
 

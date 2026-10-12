@@ -352,6 +352,7 @@ fn fill(
             out.copy_from_slice(pixels);
             Ok(())
         }
+        PictureFormat::Bgra => video::yuv::bgra_to_rgba_into(pixels, out),
         PictureFormat::Yuv420 { layout, color } => {
             video::yuv::to_rgba_into(pixels, &layout, color, out, threads)
         }
@@ -369,6 +370,17 @@ mod tests {
         fill(&mut out, &pixels, PictureFormat::Rgba, 2).unwrap();
         assert_eq!(out, pixels);
         assert!(fill(&mut out, &pixels[..12], PictureFormat::Rgba, 2).is_err());
+    }
+
+    /// iOS's decoder hands BGRA on; it becomes RGBA as it is written
+    /// into the picture the UI draws (review P2-43).
+    #[test]
+    fn bgra_is_swapped_into_the_ui_buffer() {
+        let pixels = [1u8, 2, 3, 0, 4, 5, 6, 0];
+        let mut out = vec![0u8; 8];
+        fill(&mut out, &pixels, PictureFormat::Bgra, 2).unwrap();
+        assert_eq!(out, [3, 2, 1, 255, 6, 5, 4, 255]);
+        assert!(fill(&mut out, &pixels[..4], PictureFormat::Bgra, 2).is_err());
     }
 
     #[test]

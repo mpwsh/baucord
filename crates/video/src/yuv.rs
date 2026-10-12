@@ -8,9 +8,10 @@
 //! names the common shape of both and [`to_rgba_into`] walks it.
 //!
 //! `VideoToolbox` (`videotoolbox.rs`, iOS) is asked for BGRA instead —
-//! it converts on the GPU with the stream's own colour signalling — and
-//! [`bgra_to_rgba`] only swaps two bytes per pixel and drops the row
-//! padding.
+//! it converts on the GPU with the stream's own colour signalling. The
+//! decoder drops the row padding ([`pack_rows`]) and whoever shows the
+//! picture swaps two bytes per pixel as it writes its own buffer
+//! ([`bgra_to_rgba_into`]).
 //!
 //! Pure code, no platform dependencies: the unit tests run on the host.
 
@@ -539,16 +540,17 @@ fn convert_row(
     }
 }
 
-/// Copy the top-left `width × height` pixels of a BGRA image whose rows
-/// start `stride` bytes apart into tightly packed RGBA in `out` (resized
-/// to fit). Alpha is set opaque: a decoded video frame has none, and
-/// some decoders leave the byte undefined.
+/// Copy the top-left `width × height` pixels of a four-byte-a-pixel
+/// image whose rows start `stride` bytes apart into `out`, tightly
+/// packed (`out` is emptied first and grown to fit). The bytes are not
+/// touched and nothing is zero-filled first: a recycled buffer costs
+/// one copy.
 ///
 /// # Errors
 /// The buffer is too small for the rectangle, or `stride` is shorter
 /// than a row — an error, not a panic, since both come from the
 /// decoder.
-pub fn bgra_to_rgba(
+pub fn pack_rows(
     src: &[u8],
     stride: usize,
     width: u32,
@@ -557,37 +559,48 @@ pub fn bgra_to_rgba(
 ) -> Result<(), String> {
     let (w, h) = (width as usize, height as usize);
     let row = w * 4;
+    out.clear();
     if w == 0 || h == 0 {
-        out.clear();
         return Ok(());
     }
     if stride < row {
-        out.clear();
         return Err(format!(
-            "{stride} byte rows cannot hold {width} BGRA pixels"
+            "{stride} byte rows cannot hold {width} four-byte pixels"
         ));
     }
     let need = stride * (h - 1) + row;
     if src.len() < need {
-        out.clear();
         return Err(format!(
-            "{width}x{height} BGRA at stride {stride} needs {need} bytes, decoder gave {}",
+            "{width}x{height} pixels at stride {stride} need {need} bytes, decoder gave {}",
             src.len()
         ));
     }
-    // Every byte is written below: a buffer already this size (the
-    // decoder reuses it frame after frame) is not zero-filled first.
-    if out.len() != row * h {
-        out.clear();
-        out.resize(row * h, 0);
+    out.reserve(row * h);
+    for src_row in src.chunks(stride).take(h) {
+        out.extend_from_slice(&src_row[..row]);
     }
-    for (dst, src_row) in out.chunks_exact_mut(row).zip(src.chunks(stride)) {
-        for (d, s) in dst.chunks_exact_mut(4).zip(src_row[..row].chunks_exact(4)) {
-            d[0] = s[2];
-            d[1] = s[1];
-            d[2] = s[0];
-            d[3] = 255;
-        }
+    Ok(())
+}
+
+/// Write tightly packed BGRA as RGBA into `out`, a buffer of the same
+/// size. Alpha is set opaque: a decoded video frame has none, and some
+/// decoders leave the byte undefined.
+///
+/// # Errors
+/// The two are not the same size, or not whole pixels.
+pub fn bgra_to_rgba_into(src: &[u8], out: &mut [u8]) -> Result<(), String> {
+    if src.len() != out.len() || !src.len().is_multiple_of(4) {
+        return Err(format!(
+            "{} bytes of BGRA for a {}-byte picture",
+            src.len(),
+            out.len()
+        ));
+    }
+    for (d, s) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        d[0] = s[2];
+        d[1] = s[1];
+        d[2] = s[0];
+        d[3] = 255;
     }
     Ok(())
 }
@@ -681,34 +694,56 @@ mod tests {
     }
 
     #[test]
-    fn bgra_swaps_red_and_blue_and_drops_row_padding() {
+    fn packing_drops_row_padding_and_keeps_the_bytes() {
         // 2×2 at a 12-byte stride (4 bytes of padding per row).
         let src = [
             1, 2, 3, 0, 4, 5, 6, 0, 0xEE, 0xEE, 0xEE, 0xEE, //
             7, 8, 9, 0, 10, 11, 12, 0,
         ];
-        let mut out = vec![0xAB; 3];
-        bgra_to_rgba(&src, 12, 2, 2, &mut out).unwrap();
+        // A recycled buffer: longer than needed, and not zeroed.
+        let mut out = vec![0xAB; 64];
+        pack_rows(&src, 12, 2, 2, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0, 10, 11, 12, 0]);
+        // Cut to the announced size: one pixel of the first row.
+        pack_rows(&src, 12, 1, 1, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn packing_refuses_short_buffers_and_rows() {
+        let mut out = vec![1, 2, 3];
+        assert!(
+            pack_rows(&[0; 8], 4, 2, 1, &mut out).is_err(),
+            "stride < row"
+        );
+        assert!(out.is_empty(), "nothing left of the last picture");
+        assert!(
+            pack_rows(&[0; 15], 8, 2, 2, &mut out).is_err(),
+            "one byte short"
+        );
+        assert!(pack_rows(&[0; 16], 8, 2, 2, &mut out).is_ok());
+        assert!(pack_rows(&[], 0, 0, 0, &mut out).is_ok());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn bgra_is_written_as_rgba_with_opaque_alpha() {
+        let src = [1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0, 10, 11, 12, 0];
+        let mut out = [0xAB; 16];
+        bgra_to_rgba_into(&src, &mut out).unwrap();
         assert_eq!(
             out,
             [3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255]
         );
-    }
-
-    #[test]
-    fn bgra_refuses_short_buffers_and_rows() {
-        let mut out = Vec::new();
         assert!(
-            bgra_to_rgba(&[0; 8], 4, 2, 1, &mut out).is_err(),
-            "stride < row"
+            bgra_to_rgba_into(&src, &mut [0; 12]).is_err(),
+            "sizes differ"
         );
         assert!(
-            bgra_to_rgba(&[0; 15], 8, 2, 2, &mut out).is_err(),
-            "one byte short"
+            bgra_to_rgba_into(&src[..6], &mut [0; 6]).is_err(),
+            "half a pixel"
         );
-        assert!(bgra_to_rgba(&[0; 16], 8, 2, 2, &mut out).is_ok());
-        assert!(bgra_to_rgba(&[], 0, 0, 0, &mut out).is_ok());
-        assert!(out.is_empty());
+        assert!(bgra_to_rgba_into(&[], &mut []).is_ok());
     }
 
     #[test]

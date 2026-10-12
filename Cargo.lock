@@ -79,6 +79,7 @@ name = "android"
 version = "1.2.1"
 dependencies = [
  "android_logger",
+ "app-core",
  "chrono",
  "client",
  "frontend",
@@ -250,6 +251,7 @@ name = "app-core"
 version = "0.3.4"
 dependencies = [
  "image",
+ "libc",
  "log",
  "thiserror 2.0.19",
 ]
@@ -1868,6 +1870,7 @@ dependencies = [
  "global-hotkey",
  "i18n",
  "interprocess",
+ "keywatch",
  "log",
  "objc2-app-kit 0.3.2",
  "open",
@@ -1882,7 +1885,6 @@ dependencies = [
  "ui",
  "ureq",
  "video",
- "x11rb",
  "zip",
 ]
 
@@ -2995,6 +2997,7 @@ dependencies = [
 name = "ios"
 version = "1.2.1"
 dependencies = [
+ "app-core",
  "block2 0.6.2",
  "chrono",
  "client",
@@ -3201,6 +3204,16 @@ dependencies = [
  "bitflags 2.13.1",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "keywatch"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "windows",
+ "x11rb",
 ]
 
 [[package]]

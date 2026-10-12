@@ -16,6 +16,7 @@ default-members = [
   "crates/i18n",
   "crates/audio",
   "crates/video",
+  "crates/keywatch",
 ]
 # Vendored dependencies (`[patch.crates-io]` below) are not members: no
 # fmt or clippy of upstream code, and nothing Windows-only built

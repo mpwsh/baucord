@@ -134,6 +134,9 @@ export global SettingsState {
 
     // ── Keyboard ──
     in property <[KeybindRow]> keybinds;
+    /// macOS without the Accessibility permission: a bound key works
+    /// but is taken from every other program.
+    in property <bool> keybinds-need-access;
     /// True while some row is recording — arms the window's key capture.
     in property <bool> capturing: false;
 
@@ -222,6 +225,8 @@ export global SettingsLogic {
 
     // Keyboard
     callback record-keybind(int);
+    /// Put up the system's prompt for watching keys (macOS).
+    callback ask-keybind-access();
     /// A key landed while recording: (key-text, ctrl, alt, shift).
     /// The host filters bare modifiers and maps text → key codes.
     callback capture-key(string, bool, bool, bool);
@@ -312,6 +317,39 @@ component PanelHeader inherits VerticalLayout {
 }
 
 /// Label, control, optional hint — one unit.
+/// A standing warning inside a panel: the icon and a text that wraps.
+/// The same box as the chat's standing notice — its height follows the
+/// wrapped text, which a layout alone gets wrong.
+component WarningNote inherits Rectangle {
+    in property <string> text;
+    height: note.preferred-height + 2 * Theme.gap-sm;
+    border-radius: Theme.radius-sm;
+    background: Theme.warning.with-alpha(0.12);
+    border-width: 1px;
+    border-color: Theme.warning.with-alpha(0.5);
+    HorizontalLayout {
+        padding-left: Theme.gap-md;
+        padding-right: Theme.gap-md;
+        spacing: Theme.gap-sm;
+        Rectangle {
+            width: 14px;
+            IconDisplay {
+                icon: IconSet.TriangleAlert;
+                size: 14px;
+                stroke: Theme.warning;
+            }
+        }
+        note := Text {
+            text: root.text;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
 component Setting inherits VerticalLayout {
     in property <string> label;
     in property <string> hint;
@@ -975,36 +1013,9 @@ component AudioPanel inherits VerticalLayout {
             wrap: word-wrap;
         }
         // What Windows does to the other apps, and the one place it can
-        // be turned off (it goes away by itself once it is). The same
-        // box as the chat's standing notice: its height follows the
-        // wrapped text, which a layout alone gets wrong.
-        if SettingsState.aec-lowering : Rectangle {
-            height: lowering.preferred-height + 2 * Theme.gap-sm;
-            border-radius: Theme.radius-sm;
-            background: Theme.warning.with-alpha(0.12);
-            border-width: 1px;
-            border-color: Theme.warning.with-alpha(0.5);
-            HorizontalLayout {
-                padding-left: Theme.gap-md;
-                padding-right: Theme.gap-md;
-                spacing: Theme.gap-sm;
-                Rectangle {
-                    width: 14px;
-                    IconDisplay {
-                        icon: IconSet.TriangleAlert;
-                        size: 14px;
-                        stroke: Theme.warning;
-                    }
-                }
-                lowering := Text {
-                    text: Tr.aec-lowering;
-                    color: Theme.text-secondary;
-                    font-size: Theme.font-sm;
-                    vertical-alignment: center;
-                    wrap: word-wrap;
-                    horizontal-stretch: 1;
-                }
-            }
+        // be turned off (it goes away by itself once it is).
+        if SettingsState.aec-lowering : WarningNote {
+            text: Tr.aec-lowering;
         }
         if SettingsState.aec-lowering : HorizontalLayout {
             Btn {
@@ -1103,6 +1114,21 @@ component AudioPanel inherits VerticalLayout {
 component KeyboardPanel inherits VerticalLayout {
     spacing: Theme.gap-lg;
     PanelHeader { title: Tr.tab-keyboard; lead: Tr.keybinds-hint; }
+    // macOS without the Accessibility permission. The prompt comes
+    // from this button and from nowhere else.
+    if SettingsState.keybinds-need-access : VerticalLayout {
+        spacing: Theme.gap-sm;
+        WarningNote {
+            text: Tr.keybinds-access;
+        }
+        HorizontalLayout {
+            Btn {
+                text: Tr.keybinds-access-ask;
+                clicked => { SettingsLogic.ask-keybind-access(); }
+            }
+            Rectangle { }   // keep the button its natural width
+        }
+    }
     VerticalLayout {
         spacing: Theme.gap-xs;
         for kb[i] in SettingsState.keybinds : Rectangle {

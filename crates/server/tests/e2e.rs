@@ -1320,6 +1320,64 @@ fn a_ban_on_a_shared_address_hits_only_the_named_user() {
     assert_eq!(bans[0].user_id, Some(alice_user));
 }
 
+/// Review P0-1: a listing longer than one message. A session that
+/// joins pages gets every row behind one result; an older one gets the
+/// first message's worth, as it always did — and not an empty panel.
+#[test]
+fn a_long_admin_listing_arrives_in_pages_and_an_older_client_gets_the_first() {
+    const CODES: usize = 1500;
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    for _ in 0..CODES {
+        w.invite(ROLE_GUEST);
+    }
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let key = admin.key.clone();
+
+    admin.admin(&mut w, 1, AdminCommand::ListInvites);
+    let Ok(AdminOutcome::Invites(last)) = admin.admin_result(&mut w, &mut [], 1) else {
+        panic!("no list");
+    };
+    let mut codes: Vec<String> = Vec::new();
+    let mut pages = 0;
+    for m in &admin.inbox {
+        if let ServerMessage::AdminRows {
+            request_id: 1,
+            rows: AdminOutcome::Invites(rows),
+        } = m
+        {
+            pages += 1;
+            codes.extend(rows.iter().map(|r| r.code.clone()));
+        }
+    }
+    codes.extend(last.iter().map(|r| r.code.clone()));
+    assert!(pages >= 2, "{pages} pages ahead of the result");
+    assert!(codes.len() >= CODES + 2, "{} codes listed", codes.len());
+    let distinct: std::collections::HashSet<&String> = codes.iter().collect();
+    assert_eq!(distinct.len(), codes.len(), "no row twice");
+
+    // The same admin on a client from before the bit.
+    admin.leave(&mut w);
+    let mut older = w.open();
+    older.key = key;
+    older.features = features::CLIENT_1_1 & !features::ADMIN_PAGES;
+    w.admission(&mut older, "mpw", Auth::Key).expect("admitted");
+    older.admin(&mut w, 2, AdminCommand::ListInvites);
+    let Ok(AdminOutcome::Invites(first)) = older.admin_result(&mut w, &mut [], 2) else {
+        panic!("no list");
+    };
+    assert!(
+        !older
+            .inbox
+            .iter()
+            .any(|m| matches!(m, ServerMessage::AdminRows { .. })),
+        "a client that cannot join pages is sent none"
+    );
+    assert!(!first.is_empty() && first.len() < codes.len());
+    let first: Vec<&String> = first.iter().map(|r| &r.code).collect();
+    assert_eq!(first, codes.iter().take(first.len()).collect::<Vec<_>>());
+}
+
 #[test]
 fn nobody_acts_on_themselves_or_on_an_equal_rank() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));

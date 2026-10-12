@@ -118,6 +118,32 @@ Check with `which cargo` and `df -h /` first.
 - **Dependency graphs** without a target installed: `cargo tree -p
   android --target aarch64-linux-android -e normal,build`, the same for
   `-p ios --target aarch64-apple-ios`.
+- **Crates with no C in them, for any target** (2026-10-12): `rustup
+  target add aarch64-apple-darwin aarch64-apple-ios`, then `cargo
+  clippy --target <t> -p keywatch -p app-core` (macOS, iOS, Windows,
+  Android) and `cargo check --target aarch64-apple-ios -p video` — on
+  iOS `video` is `objc2` crates only, so `videotoolbox.rs` type-checks
+  with no SDK. `audio` does not (cpal's Core Audio bindings want the
+  SDK's headers). A call declared by hand (`keywatch/src/macos.rs`)
+  is only as right as its signature: the check proves the Rust, not
+  the declaration.
+- **X11 keys for real:** `apt-get install xvfb xdotool`, start `Xvfb
+  :97`, run `target/debug/examples/watch` (`-p keywatch`) with
+  `DISPLAY=:97` and press keys at it with `xdotool key F7`, `keydown
+  v` / `keyup v`. XTEST keys do raise XInput2 raw events. Wake-ups are
+  the sum of `voluntary_ctxt_switches` over `/proc/<pid>/task/*/status`.
+- **The Android host's Rust, with the `app` feature:** the scratch
+  crate above now `#[path]`-includes `java.rs`, `host.rs` and
+  `logging.rs` (and iOS's `logging.rs`), with `jni`, `android_logger`,
+  `chrono`, the real `app-core`, and a stub `frontend` whose `host`
+  module holds the `Hooks` trait and its types cut out of the real
+  file by a few lines of Python. Java: API 34's jar is at the same
+  address as 33's (`android-34/android.jar`) and has the constants
+  `VoiceService` names.
+- **Workflows:** `actionlint` (a static binary from
+  github.com/rhysd/actionlint's releases) reads all of
+  `.github/workflows/`. An old one does not know the newest runner
+  labels; anything else it says is worth reading.
 
 ### The loop
 
@@ -256,7 +282,13 @@ otherwise).
   (`ChatHistory`, `ChatItem`, `FileMeta`), `roster.rs`, `menu.rs`,
   `markdown.rs`, `images.rs`, `gif.rs` (the streaming player),
   `emoji.rs`, `composer.rs`, `devices.rs`, `update.rs`, `stats.rs`,
-  `fps.rs`, `logfile.rs`.
+  `fps.rs`, `logfile.rs` (also the hosts' log writer and panic hook),
+  `files.rs` (safe names, the pick slot), `usage.rs` (the phones' own
+  CPU and memory). What two hosts need and no UI does goes here: it
+  is the one crate that type-checks for every target from the sandbox.
+- `keywatch` — the keybind watcher: key state and key events per
+  desktop OS behind one `Watcher`, no dependency on the rest. Pure
+  Rust, so `cargo check --target` covers its Windows and macOS halves.
 - `ui` — the `.slint` files and `convert` glue (`lib.rs`):
   `main.slint` (window, overlays, card, dialogs, the phone pages),
   `connect.slint`, `startup.slint`, `sidebar.slint`, `chat.slint`,
@@ -654,6 +686,26 @@ Memory-mode servers (persistence off) still use the legacy
 - **A hash is `transport::sha256`** (`digest`, or `Hasher` for bytes
   that arrive in pieces). A dependency several crates share is
   declared once, under `[workspace.dependencies]`.
+- **A list for an admin goes out through `send_admin_result`**, never
+  as an `AdminResult` built by hand: it pages what does not fit one
+  17 KiB message (`AdminRows`, then the result that closes them) and
+  cuts to the first page for a session without `ADMIN_PAGES`. A new
+  listing gets its arm in `AdminOutcome::into_pages`, `rows` and
+  `prepend` — the compiler asks for all three.
+- **A test of the process's own CPU or memory asserts nothing about
+  "idle" or "before and after"**: the figures are the whole test
+  binary's, and the other tests run beside it (`usage.rs`'s first
+  version failed in the full run and passed alone).
+- **Code two hosts need goes in `app-core`, not copied into both**:
+  the log writer, the panic hook, the pick slot and safe file names
+  were three copies each. Code for one OS that needs no UI goes in a
+  crate without C dependencies (`keywatch`), where the sandbox can
+  type-check it for that OS.
+- **A blind platform change gets a way back that needs no release**:
+  the key watcher falls back to its old clock when its events prove
+  unreliable, the Mac's hardware encoder to libx264 when it will not
+  open. Where there is no such way back (the pointer in a share), it
+  is not written blind.
 - **An e2e test that waits for the database waits in real time**: the
   world's `settle` runs simulated time, which a busy machine gets
   through before the persistence thread has done its write. Poll for

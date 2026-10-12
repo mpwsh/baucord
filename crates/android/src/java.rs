@@ -444,24 +444,81 @@ pub fn pick_file(mime: &str, max_bytes: u64) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-/// `BaucordActivity.saveDownload(name, mime, bytes)`: the file in the
-/// public Downloads. Returns its `content://` URI and the name the user
-/// will find it under (`Download/report (1).pdf`).
+/// A file in the public Downloads: `BaucordActivity.beginDownload`
+/// makes its `MediaStore` row and hands over a file descriptor, the
+/// bytes are written here, and `endDownload` publishes the file (or
+/// removes the row if the write failed). Returns its `content://` URI
+/// and the name the user will find it under (`Download/report (1).pdf`).
+///
+/// The bytes do not cross into Java: they used to, whole, as a
+/// `byte[]` (review P2-27). Called off the UI thread
+/// (`frontend`'s save runs on a thread of its own).
 ///
 /// # Errors
-/// What `MediaStore` said, or any JNI failure, as text.
+/// What `MediaStore` or the write said, or any JNI failure, as text.
 #[cfg(feature = "app")]
 pub fn save_download(name: &str, mime: &str, bytes: &[u8]) -> Result<(String, String), String> {
+    use std::{
+        fs::File,
+        io::Write as _,
+        os::fd::{FromRawFd as _, RawFd},
+    };
+
     let reply = with_activity(|env, activity| {
         let jname = env.new_string(name)?;
         let jmime = env.new_string(mime)?;
-        let jbytes = env.byte_array_from_slice(bytes)?;
         let out = env
             .call_method(
                 activity,
-                jni::jni_str!("saveDownload"),
-                jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;[B)Ljava/lang/String;"),
-                &[(&jname).into(), (&jmime).into(), (&jbytes).into()],
+                jni::jni_str!("beginDownload"),
+                jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
+                &[(&jname).into(), (&jmime).into()],
+            )?
+            .l()?;
+        let out = env.cast_local::<JString>(out)?;
+        out.try_to_string(env)
+    })
+    .map_err(|e| e.to_string())?;
+    let (uri, fd) = match reply.split_once('\n') {
+        Some(("error", message)) => return Err(message.to_string()),
+        Some((uri, fd)) => (uri.to_string(), fd.parse::<RawFd>()),
+        None => return Err(reply),
+    };
+    let Ok(fd) = fd else {
+        let _ = end_download(&uri, false);
+        return Err("Downloads gave no file descriptor".to_string());
+    };
+    // SAFETY: the descriptor `beginDownload` detached for this call:
+    // open, nobody else's, and closed by the `File`.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let written = file.write_all(bytes);
+    // Closed before the row is published (or removed).
+    drop(file);
+    if let Err(e) = written {
+        let _ = end_download(&uri, false);
+        return Err(e.to_string());
+    }
+    let mut shown = end_download(&uri, true)?;
+    // The folder alone: the name could not be read back; it is the one
+    // asked for unless the system renamed it.
+    if shown.ends_with('/') {
+        shown.push_str(name);
+    }
+    Ok((uri, shown))
+}
+
+/// `BaucordActivity.endDownload(uri, keep)`: publish a written
+/// download (the name it is shown under comes back) or remove its row.
+#[cfg(feature = "app")]
+fn end_download(uri: &str, keep: bool) -> Result<String, String> {
+    let reply = with_activity(|env, activity| {
+        let juri = env.new_string(uri)?;
+        let out = env
+            .call_method(
+                activity,
+                jni::jni_str!("endDownload"),
+                jni::jni_sig!("(Ljava/lang/String;Z)Ljava/lang/String;"),
+                &[(&juri).into(), JValue::Bool(keep)],
             )?
             .l()?;
         let out = env.cast_local::<JString>(out)?;
@@ -470,8 +527,7 @@ pub fn save_download(name: &str, mime: &str, bytes: &[u8]) -> Result<(String, St
     .map_err(|e| e.to_string())?;
     match reply.split_once('\n') {
         Some(("error", message)) => Err(message.to_string()),
-        Some((uri, shown)) => Ok((uri.to_string(), shown.to_string())),
-        None => Err(reply),
+        _ => Ok(reply),
     }
 }
 

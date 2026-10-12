@@ -368,6 +368,65 @@ impl AdminOutcome {
             Self::Done | Self::Telemetry(_) | Self::Stats(_) | Self::RoleCreated(_) => 0,
         }
     }
+
+    /// A listing as the messages that carry it, in order: each holds
+    /// the rows that fit `budget`. One page for what is not a listing,
+    /// and for a listing with no rows.
+    #[must_use]
+    pub fn into_pages(self, budget: usize) -> Vec<Self> {
+        use crate::messages::split_to_fit as split;
+        fn pages<T>(runs: Vec<Vec<T>>, wrap: fn(Vec<T>) -> AdminOutcome) -> Vec<AdminOutcome> {
+            if runs.is_empty() {
+                return vec![wrap(Vec::new())];
+            }
+            runs.into_iter().map(wrap).collect()
+        }
+        match self {
+            Self::Users(rows) => pages(split(rows, budget), Self::Users),
+            Self::Restrictions(rows) => pages(split(rows, budget), Self::Restrictions),
+            Self::Invites(rows) => pages(split(rows, budget), Self::Invites),
+            Self::Audit(rows) => pages(split(rows, budget), Self::Audit),
+            Self::Blobs(rows) => pages(split(rows, budget), Self::Blobs),
+            Self::Reports(rows) => pages(split(rows, budget), Self::Reports),
+            other @ (Self::Done | Self::Telemetry(_) | Self::Stats(_) | Self::RoleCreated(_)) => {
+                vec![other]
+            }
+        }
+    }
+
+    /// How many rows a listing holds; 0 for what is not one.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        match self {
+            Self::Users(rows) => rows.len(),
+            Self::Restrictions(rows) => rows.len(),
+            Self::Invites(rows) => rows.len(),
+            Self::Audit(rows) => rows.len(),
+            Self::Blobs(rows) => rows.len(),
+            Self::Reports(rows) => rows.len(),
+            Self::Done | Self::Telemetry(_) | Self::Stats(_) | Self::RoleCreated(_) => 0,
+        }
+    }
+
+    /// Put the rows of `earlier` (pages that arrived before this one)
+    /// in front of this listing's. `false`, and nothing changed, when
+    /// the two are not the same listing.
+    pub fn prepend(&mut self, earlier: Self) -> bool {
+        fn join<T>(rows: &mut Vec<T>, mut earlier: Vec<T>) -> bool {
+            earlier.append(rows);
+            *rows = earlier;
+            true
+        }
+        match (self, earlier) {
+            (Self::Users(rows), Self::Users(earlier)) => join(rows, earlier),
+            (Self::Restrictions(rows), Self::Restrictions(earlier)) => join(rows, earlier),
+            (Self::Invites(rows), Self::Invites(earlier)) => join(rows, earlier),
+            (Self::Audit(rows), Self::Audit(earlier)) => join(rows, earlier),
+            (Self::Blobs(rows), Self::Blobs(earlier)) => join(rows, earlier),
+            (Self::Reports(rows), Self::Reports(earlier)) => join(rows, earlier),
+            _ => false,
+        }
+    }
 }
 
 /// A user's last telemetry, as the server logs it.
@@ -421,6 +480,80 @@ impl AdminError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review P0-1: a listing of 60 KiB (four times what one message
+    /// holds) leaves as pages that each encode, and joins back whole.
+    #[test]
+    fn a_long_listing_splits_into_pages_that_join_back_in_order() {
+        use crate::messages::{
+            decode_server_message, encode_server_message, ServerMessage, LIST_ITEMS_BUDGET,
+            MAX_CONTROL_MESSAGE_BYTES,
+        };
+        let users: Vec<UserSummary> = (0..700u32)
+            .map(|i| UserSummary {
+                user_id: [u8::try_from(i % 251).expect("under 251"); 32],
+                name: format!("user-{i:04}"),
+                roles: vec![crate::permissions::ROLE_MEMBER],
+                client_id: None,
+                last_seen: 1_700_000_000_000 + u64::from(i),
+                keys: vec![KeySummary {
+                    key_hash: [7u8; 32],
+                    retired: false,
+                    last_seen: 1_700_000_000_000,
+                }],
+            })
+            .collect();
+        let whole = AdminOutcome::Users(users);
+        let bytes = postcard::to_allocvec(&whole).expect("encodes").len();
+        assert!(bytes > 60 * 1024, "the listing is {bytes} bytes");
+
+        let mut pages = whole.clone().into_pages(LIST_ITEMS_BUDGET);
+        assert!(pages.len() >= 4, "{} pages", pages.len());
+        assert_eq!(
+            pages.iter().map(AdminOutcome::rows).sum::<usize>(),
+            whole.rows()
+        );
+        // Every page crosses the wire: the rows ahead as `AdminRows`,
+        // the last as the result.
+        let mut joined = pages.pop().expect("a last page");
+        let closing = ServerMessage::AdminResult {
+            request_id: 3,
+            result: Ok(joined.clone()),
+        };
+        let wire = encode_server_message(&closing).expect("the result fits");
+        assert!(wire.len() <= MAX_CONTROL_MESSAGE_BYTES);
+        let mut earlier = AdminOutcome::Users(Vec::new());
+        for page in pages {
+            let msg = ServerMessage::AdminRows {
+                request_id: 3,
+                rows: page,
+            };
+            let wire = encode_server_message(&msg).expect("a page fits");
+            assert!(wire.len() <= MAX_CONTROL_MESSAGE_BYTES);
+            let Some(ServerMessage::AdminRows { rows, .. }) = decode_server_message(&wire) else {
+                panic!("a page decodes");
+            };
+            let mut next = rows;
+            assert!(next.prepend(earlier));
+            earlier = next;
+        }
+        assert!(joined.prepend(earlier));
+        assert_eq!(joined, whole);
+    }
+
+    #[test]
+    fn what_is_not_a_listing_is_one_page_and_joins_nothing() {
+        assert_eq!(AdminOutcome::Done.into_pages(16), vec![AdminOutcome::Done]);
+        assert_eq!(
+            AdminOutcome::Invites(Vec::new()).into_pages(16),
+            vec![AdminOutcome::Invites(Vec::new())]
+        );
+        let mut done = AdminOutcome::Done;
+        assert!(!done.prepend(AdminOutcome::Audit(Vec::new())));
+        let mut audit = AdminOutcome::Audit(Vec::new());
+        assert!(!audit.prepend(AdminOutcome::Invites(Vec::new())));
+        assert_eq!(audit, AdminOutcome::Audit(Vec::new()));
+    }
 
     #[test]
     fn restriction_kinds_round_trip_the_db_encoding_and_names() {
