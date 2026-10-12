@@ -758,6 +758,15 @@ tail -f /var/log/baucord-net.log</code></pre>
         <code>ct_count</code> nearing <code>ct_max</code> means connection
         tracking is about to start refusing new people.
       </p>
+      <p>
+        To sample other containers too, set
+        <code>CONTAINERS="baucord other"</code> for the script
+        (<code>CONTAINERS=""</code> samples the host only). On a host
+        you set up by hand, run it yourself while there is load,
+        <code>sudo nohup scripts/monitor-net.sh 10 &gt;/dev/null
+        2&gt;&amp;1 &amp;</code>, and give
+        <code>/var/log/baucord-net.log</code> a logrotate rule.
+      </p>
 
       <h2 id="data">Your server, your data</h2>
       <p>

@@ -44,6 +44,7 @@ use audio::{PeerAudioSettings, SoundType};
 use client::{
     config::{peer_key, BindableAction, Settings},
     network::{DisconnectKind, LossKind, NetworkControl, NetworkMessage, NetworkThreadHandle},
+    protocol::ClientMessage,
     screen::{ScreenControl, ScreenEvent, ScreenThreadHandle},
     voice::{VoiceControl, VoiceEvent, VoiceThreadHandle},
     AdminCommand, AdminTarget,
@@ -962,7 +963,7 @@ pub(crate) fn apply_log_level(settings: &Settings) {
 /// that is merely behind others or minimized where it is.
 #[cfg(feature = "desktop")]
 fn raise_window(win: &slint::Window) {
-    use i_slint_backend_winit::WinitWindowAccessor;
+    use slint::winit_030::WinitWindowAccessor;
     win.with_winit_window(|w| {
         w.set_minimized(false);
         w.focus_window();
@@ -982,7 +983,7 @@ fn center_on_monitor(_win: &slint::Window) {}
 /// mixed-DPI setups land where they look centred.
 #[cfg(feature = "desktop")]
 fn center_on_monitor(win: &slint::Window) {
-    use i_slint_backend_winit::{winit::dpi::PhysicalPosition, WinitWindowAccessor};
+    use slint::winit_030::{winit::dpi::PhysicalPosition, WinitWindowAccessor};
     win.with_winit_window(|w| {
         let Some(monitor) = w.current_monitor().or_else(|| w.primary_monitor()) else {
             return;
@@ -1615,9 +1616,9 @@ pub fn repaint_on_reveal(_win: &slint::Window, _armed: Rc<Cell<bool>>, _flip: im
 
 #[cfg(feature = "desktop")]
 pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl Fn() + 'static) {
-    use i_slint_backend_winit::WinitWindowAccessor;
+    use slint::winit_030::WinitWindowAccessor;
     win.on_winit_window_event(move |_w, ev| {
-        use i_slint_backend_winit::winit::event::WindowEvent;
+        use slint::winit_030::winit::event::WindowEvent;
         // OS drag-and-drop of files onto the window (Slint's DropArea
         // does not see external drops in 1.17; winit does). The hook
         // runs inside winit's dispatch, so everything is deferred to
@@ -1648,7 +1649,7 @@ pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl 
         if reveal {
             flip();
         }
-        i_slint_backend_winit::EventResult::Propagate
+        slint::winit_030::EventResult::Propagate
     });
 }
 
@@ -2011,6 +2012,24 @@ pub(crate) fn describe_deny(reason: client::protocol::DenyReason) -> String {
         R::InvalidDimensions => "deny-dimensions",
         R::NotInChannel => "deny-not-in-channel",
         R::NotPermitted => "deny-not-permitted",
+    })
+}
+
+/// Why the server refused an admin command, in the user's language.
+/// (`Invalid` carries the server's own sentence, as it wrote it.)
+pub(crate) fn describe_admin_error(error: &client::AdminError) -> String {
+    use client::AdminError as E;
+    t!(match error {
+        E::NoPermission => "admin-error-no-permission",
+        E::NoSuchUser => "admin-error-no-user",
+        E::NoSuchRestriction => "admin-error-no-restriction",
+        E::NoSuchInvite => "admin-error-no-invite",
+        E::NoSuchRole => "admin-error-no-role",
+        E::NoSuchChannel => "admin-error-no-channel",
+        E::Outranked => "admin-error-outranked",
+        E::LastAdmin => "admin-error-last-admin",
+        E::Yourself => "admin-error-yourself",
+        E::Invalid(why) => return why.clone(),
     })
 }
 

@@ -78,10 +78,6 @@ impl Denoiser {
 }
 
 impl AudioProcessor for Denoiser {
-    fn name(&self) -> &'static str {
-        "denoise"
-    }
-
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         if !ctx.denoise_enabled {
             // Assume speech when denoise is off — no RNNoise VAD available;

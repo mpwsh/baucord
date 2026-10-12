@@ -136,4 +136,4 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
   "UNUserNotificationCenter",
 ] }
 # Timestamps in baucord.log (the desktop's env_logger format).
-chrono = "0.4"
+chrono.workspace = true

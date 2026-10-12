@@ -225,9 +225,9 @@ impl AppState {
         self.network
             .tx
             .send(if block {
-                NetworkControl::Block(user)
+                NetworkControl::Send(ClientMessage::Block { user })
             } else {
-                NetworkControl::Unblock(user)
+                NetworkControl::Send(ClientMessage::Unblock { user })
             })
             .ok();
     }
@@ -349,11 +349,11 @@ impl AppState {
         s.set_report_note("".into());
         self.network
             .tx
-            .send(NetworkControl::Report {
+            .send(NetworkControl::Send(ClientMessage::Report {
                 target: report.target,
                 reason,
                 note,
-            })
+            }))
             .ok();
         if also_block && let Some(author) = report.author {
             self.set_blocked(author, true);
@@ -393,7 +393,10 @@ impl AppState {
             return;
         }
         info!("Asking the server to delete our account");
-        self.network.tx.send(NetworkControl::DeleteAccount).ok();
+        self.network
+            .tx
+            .send(NetworkControl::Send(ClientMessage::DeleteAccount))
+            .ok();
     }
 
     /// `AccountDeleted`: the account is gone on the server; the session

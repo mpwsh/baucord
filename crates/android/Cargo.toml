@@ -54,4 +54,4 @@ android_logger = { version = "0.15", default-features = false }
 # jni major as Slint's backend and cpal's AAudio host, so one copy.
 jni = "0.22"
 # Timestamps in baucord.log (the desktop's env_logger format).
-chrono = "0.4"
+chrono.workspace = true

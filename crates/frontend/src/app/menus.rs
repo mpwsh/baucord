@@ -460,10 +460,10 @@ impl AppState {
         };
         self.network
             .tx
-            .send(NetworkControl::ChannelKick {
+            .send(NetworkControl::Send(ClientMessage::ChannelKick {
                 channel_id: user.channel_id,
                 user_id: *user_id,
-            })
+            }))
             .ok();
     }
 

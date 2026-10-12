@@ -78,7 +78,7 @@ impl Minimized {
 /// events, and an X11 restore need not send either.
 #[cfg(feature = "desktop")]
 fn window_minimized(win: &slint::Window) -> bool {
-    use i_slint_backend_winit::{winit::window::Window, WinitWindowAccessor};
+    use slint::winit_030::{winit::window::Window, WinitWindowAccessor};
     win.with_winit_window(Window::is_minimized)
         .flatten()
         .unwrap_or_else(|| win.is_minimized())

@@ -623,7 +623,10 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// the preview (looping via the app's animation ticker), same as the
 /// FLTK build.
 fn show_preview(app: &mut AppState, bytes: Vec<u8>) {
-    match ui::convert::decode_to_image(&bytes) {
+    // At the size it is drawn; the caption still gives the picture's
+    // own dimensions.
+    let max_edge = ui::convert::send_preview_max_edge(app.main.window().scale_factor());
+    match ui::convert::decode_to_preview(&bytes, max_edge) {
         Ok((image, w, h)) => {
             let kb = bytes.len() / 1024;
             let s = app.main.global::<State>();

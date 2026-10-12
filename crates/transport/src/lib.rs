@@ -16,6 +16,7 @@ pub mod config;
 mod der;
 pub mod driver;
 pub mod identity;
+pub mod sha256;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 pub mod udp;

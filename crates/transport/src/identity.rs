@@ -36,7 +36,6 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
     DigitallySignedStruct, SignatureScheme,
 };
-use sha2::{Digest, Sha256};
 
 use crate::der;
 
@@ -77,7 +76,7 @@ pub struct Fingerprint(pub [u8; 32]);
 impl Fingerprint {
     #[must_use]
     pub fn of_spki(spki_der: &[u8]) -> Self {
-        Self(Sha256::digest(spki_der).into())
+        Self(crate::sha256::digest(spki_der))
     }
 
     /// The SPKI hash of a certificate (DER), if it can be walked.
@@ -277,7 +276,7 @@ impl ClientKey {
     /// The user id the server derives: SHA-256 of the public key.
     #[must_use]
     pub fn user_id(&self) -> [u8; 32] {
-        Sha256::digest(self.public_key()).into()
+        crate::sha256::digest(&self.public_key())
     }
 }
 

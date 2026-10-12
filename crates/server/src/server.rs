@@ -33,7 +33,6 @@ use protocol::{
     RefusedReason, RemovedKind, RestrictionKind, ServerMessage, ShareScope, TelemetryEvent,
     TelemetrySample, UserId,
 };
-use sha2::{Digest, Sha256};
 use transport::{
     identity::{verify_ed25519, CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL},
     Budget, DisconnectReason, Driver, DriverHost, Event, Fingerprint, LinkStats, ServerIdentity,
@@ -1326,7 +1325,7 @@ impl ChatServer {
         self.driver
             .export_keying_material(peer, CLIENT_AUTH_EXPORTER_LABEL, b"", &mut exported)?;
         if verify_ed25519(&proof.public_key, &exported, &proof.signature) {
-            Some(Sha256::digest(proof.public_key).into())
+            Some(transport::sha256::digest(&proof.public_key))
         } else {
             warn!("connection {peer:#x} sent a client key proof that does not verify");
             None
@@ -1690,7 +1689,7 @@ impl ChatServer {
     /// receiver's downlink queue — voice shares that queue.
     fn relay_image(&mut self, client_id: ClientId, upload_id: u32, image: &[u8]) {
         let (id, ts) = self.stamp();
-        let hash: [u8; 32] = Sha256::digest(image).into();
+        let hash = transport::sha256::digest(image);
         #[allow(clippy::cast_possible_truncation)] // bounded by MAX_IMAGE_CHUNKS
         let count = image.len().div_ceil(protocol::IMAGE_CHUNK_BYTES) as u32;
         let mut encoded: Vec<protocol::Bytes> = Vec::with_capacity(count as usize);

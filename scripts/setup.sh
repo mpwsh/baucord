@@ -100,11 +100,8 @@ docker compose version
 # ── 2. Data dir for the non-root container ────────────────────────────────────
 log "Preparing $DATA_DIR (owner uid $BAUCORD_UID)"
 mkdir -p "$DATA_DIR"
-# 0.5 kept a netcode.key here; 1.0 generates identity.key on first start
-# and clients pin it, so the directory must persist across recreates.
-if [[ -f "$DATA_DIR/netcode.key" ]]; then
-  echo "  netcode.key from the 0.5 line is no longer used; leaving it in place"
-fi
+# The server generates identity.key here on first start and clients pin
+# it, so the directory must persist across recreates.
 chown -R "$BAUCORD_UID:$BAUCORD_UID" "$DATA_DIR"
 chmod 700 "$DATA_DIR"
 
@@ -126,10 +123,9 @@ cat >/etc/sysctl.d/99-baucord-udp.conf <<'EOF'
 # socket's send buffer (200 viewers ≈ 35 MB).
 net.core.wmem_max = 67108864
 net.core.rmem_max = 8388608
-# Defaults apply to every socket on the box. Baucord should still set
-# SO_SNDBUF/SO_RCVBUF explicitly on its relay socket.
-net.core.rmem_default = 4194304
-net.core.wmem_default = 4194304
+# No *_default here: those would resize every socket on the box, and
+# the server asks for its own buffers (SO_SNDBUF/SO_RCVBUF, up to the
+# caps above) when it binds.
 
 # NIC -> IP stack backlog (per CPU). Default 1000 drops under UDP bursts.
 net.core.netdev_max_backlog = 65536

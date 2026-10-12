@@ -37,14 +37,13 @@ use crossbeam_channel::{Receiver, RecvError, Sender, TryRecvError};
 use log::{debug, info, warn};
 use protocol::{
     features, pack_system_audio, pack_video_frame, pack_voice_with_flags, parse_system_audio,
-    parse_voice, split_sender, AdminCommand, AdminError, AdminOutcome, AudioSample, Auth,
-    ChannelDenyReason, ChannelInfo, ChannelSpec, ChannelUiDenyReason, ClientId, ClientInfo,
-    ClientKeyProof, ClientMessage, ConvRef, DenyReason, HistoryMessage, InviteDenyReason,
-    InviteInvalidReason, Lane, NeedInviteReason, PathSample, RefusedReason, RemovedKind,
-    RestrictionKind, RoleId, ServerMessage, ShareScope, SharingSample, TelemetryEvent,
-    TelemetrySample, UserId, VideoReassembler, ViewingSample, VOICE_FLAG_RED,
+    parse_voice, split_sender, AdminError, AdminOutcome, AudioSample, Auth, ChannelDenyReason,
+    ChannelInfo, ChannelUiDenyReason, ClientId, ClientInfo, ClientKeyProof, ClientMessage, ConvRef,
+    DenyReason, HistoryMessage, InviteDenyReason, InviteInvalidReason, Lane, NeedInviteReason,
+    PathSample, RefusedReason, RemovedKind, RestrictionKind, RoleId, ServerMessage, ShareScope,
+    SharingSample, TelemetryEvent, TelemetrySample, UserId, VideoReassembler, ViewingSample,
+    VOICE_FLAG_RED,
 };
-use sha2::{Digest, Sha256};
 use transport::{
     identity::{CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL},
     Budget, ClientKey, DisconnectReason, Driver, Event, Fingerprint, LinkStats, Observation,
@@ -693,7 +692,7 @@ struct Reassembly {
     /// The chunk that comes next.
     next: u32,
     bytes: Vec<u8>,
-    hasher: Sha256,
+    hasher: transport::sha256::Hasher,
     /// What the whole must hash to.
     hash: [u8; 32],
     started: Instant,
@@ -720,7 +719,7 @@ impl Reassembly {
             count,
             next: 0,
             bytes: Vec::new(),
-            hasher: Sha256::new(),
+            hasher: transport::sha256::Hasher::new(),
             hash,
             started: now,
             last_pct: 0,
@@ -748,7 +747,7 @@ impl Reassembly {
         if self.next < self.count {
             return Folded::More;
         }
-        let digest: [u8; 32] = std::mem::take(&mut self.hasher).finalize().into();
+        let digest = std::mem::take(&mut self.hasher).finish();
         if digest == self.hash {
             Folded::Whole(std::mem::take(&mut self.bytes))
         } else {
@@ -2351,7 +2350,7 @@ impl NetworkClient {
         mime: String,
         data: Vec<u8>,
     ) {
-        let blob_id: [u8; 32] = Sha256::digest(&data).into();
+        let blob_id = transport::sha256::digest(&data);
         let Ok(size) = u32::try_from(data.len()) else {
             return;
         };
@@ -2692,41 +2691,6 @@ pub enum NetworkControl {
         expires_secs: Option<u64>,
         max_uses: Option<u32>,
     },
-    /// An administrative action (spec §8); answered by `AdminResult`
-    /// with the same `request_id`.
-    Admin {
-        request_id: u32,
-        command: AdminCommand,
-    },
-    /// Older messages (spec §6); answered by `History`.
-    FetchHistory {
-        conv: ConvRef,
-        before: Option<u64>,
-        limit: u16,
-    },
-    EditMessage {
-        msg_id: u64,
-        text: String,
-    },
-    DeleteMessage {
-        msg_id: u64,
-    },
-    /// Channels from the UI (spec §5).
-    CreateChannel(ChannelSpec),
-    EditChannel {
-        channel_id: u16,
-        spec: ChannelSpec,
-    },
-    DeleteChannel {
-        channel_id: u16,
-    },
-    ChannelKick {
-        channel_id: u16,
-        user_id: UserId,
-    },
-    // ── 1.1.2: profiles and blobs ────────────────────────────────────
-    SetProfile(protocol::Profile),
-    SetNickname(String),
     /// Announce and, if the server wants it, send a blob. Ends in
     /// `NetworkMessage::UploadDone` / `UploadRejected`.
     UploadBlob {
@@ -2750,37 +2714,12 @@ pub enum NetworkControl {
     CancelFetch {
         blob_id: protocol::BlobId,
     },
-    /// Post an uploaded blob into a conversation (spec §7). Ends in
-    /// `NetworkMessage::MessageAck` / `MessageFailed` on `client_ref`.
-    SendFile {
-        conv: protocol::ConvRef,
-        blob_id: protocol::BlobId,
-        client_ref: u32,
-    },
-    // ── 1.1.1: direct messages ───────────────────────────────────────
-    SendDm {
-        to: UserId,
-        text: String,
-        client_ref: u32,
-    },
-    MarkRead {
-        conv: protocol::ConvRef,
-        msg_id: u64,
-    },
-    // ── 1.2: blocks, reports, deleting one's account ─────────────────
-    /// Answered by `NetworkMessage::Blocks`.
-    Block(UserId),
-    Unblock(UserId),
-    /// Answered by `NetworkMessage::ReportAck`.
-    Report {
-        target: protocol::ReportTarget,
-        reason: protocol::ReportReason,
-        note: String,
-    },
-    /// Answered by `AccountDeleted` (then the session ends) or
-    /// `AccountDeleteRefused`.
-    DeleteAccount,
     Disconnect,
+    /// Send a message that needs nothing else from the network thread:
+    /// an edit, a channel change, an admin command, a block. Each of
+    /// these was a variant here restating the wire message field for
+    /// field, and an arm passing it on (review P2-53).
+    Send(ClientMessage),
     SendMessage(String),
     /// Send a chat image (encoded PNG; the UI caps it at
     /// `protocol::MAX_CHAT_IMAGE_BYTES` before it gets here).
@@ -2973,6 +2912,12 @@ fn handle_control(
                 .ok();
             wake();
         }
+        // A message that needs nothing from this thread but sending.
+        NetworkControl::Send(message) => {
+            if let Some(c) = client {
+                c.send_control(now, &message);
+            }
+        }
         NetworkControl::SendMessage(text) => {
             if let Some(c) = client {
                 c.send_message(now, text);
@@ -2987,88 +2932,9 @@ fn handle_control(
                 c.send_create_invite(now, grants_role, expires_secs, max_uses);
             }
         }
-        NetworkControl::Admin {
-            request_id,
-            command,
-        } => {
-            if let Some(c) = client {
-                c.send_control(
-                    now,
-                    &ClientMessage::Admin {
-                        request_id,
-                        command,
-                    },
-                );
-            }
-        }
-        NetworkControl::FetchHistory {
-            conv,
-            before,
-            limit,
-        } => {
-            if let Some(c) = client {
-                c.send_control(
-                    now,
-                    &ClientMessage::FetchHistory {
-                        conv,
-                        before,
-                        limit,
-                    },
-                );
-            }
-        }
-        NetworkControl::EditMessage { msg_id, text } => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::EditMessage { msg_id, text });
-            }
-        }
-        NetworkControl::DeleteMessage { msg_id } => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::DeleteMessage { msg_id });
-            }
-        }
-        NetworkControl::CreateChannel(spec) => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::CreateChannel(spec));
-            }
-        }
-        NetworkControl::EditChannel { channel_id, spec } => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::EditChannel { channel_id, spec });
-            }
-        }
-        NetworkControl::DeleteChannel { channel_id } => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::DeleteChannel { channel_id });
-            }
-        }
-        NetworkControl::ChannelKick {
-            channel_id,
-            user_id,
-        } => {
-            if let Some(c) = client {
-                c.send_control(
-                    now,
-                    &ClientMessage::ChannelKick {
-                        channel_id,
-                        user_id,
-                    },
-                );
-            }
-        }
         NetworkControl::SendImage(data) => {
             if let Some(c) = client {
                 c.send_image(now, &data);
-            }
-        }
-        NetworkControl::SetProfile(profile) => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::SetProfile(profile));
-            }
-        }
-        NetworkControl::SetNickname(name) => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::SetNickname { name });
             }
         }
         NetworkControl::UploadBlob {
@@ -3097,80 +2963,12 @@ fn handle_control(
                 c.ignored_blobs.insert(blob_id);
             }
         }
-        NetworkControl::SendFile {
-            conv,
-            blob_id,
-            client_ref,
-        } => {
-            if let Some(c) = client {
-                c.send_control(
-                    now,
-                    &ClientMessage::SendFile {
-                        conv,
-                        blob_id,
-                        client_ref,
-                    },
-                );
-            }
-        }
         NetworkControl::FetchBlob { blob_id } => {
             if let Some(c) = client {
                 c.ignored_blobs.remove(&blob_id);
             }
             if let Some(c) = client {
                 c.send_control(now, &ClientMessage::FetchBlob { blob_id });
-            }
-        }
-        NetworkControl::SendDm {
-            to,
-            text,
-            client_ref,
-        } => {
-            if let Some(c) = client {
-                c.send_control(
-                    now,
-                    &ClientMessage::DirectMessage {
-                        to,
-                        text,
-                        client_ref,
-                    },
-                );
-            }
-        }
-        NetworkControl::MarkRead { conv, msg_id } => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::MarkRead { conv, msg_id });
-            }
-        }
-        NetworkControl::Block(user) => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::Block { user });
-            }
-        }
-        NetworkControl::Unblock(user) => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::Unblock { user });
-            }
-        }
-        NetworkControl::Report {
-            target,
-            reason,
-            note,
-        } => {
-            if let Some(c) = client {
-                c.send_control(
-                    now,
-                    &ClientMessage::Report {
-                        target,
-                        reason,
-                        note,
-                    },
-                );
-            }
-        }
-        NetworkControl::DeleteAccount => {
-            if let Some(c) = client {
-                c.send_control(now, &ClientMessage::DeleteAccount);
             }
         }
         NetworkControl::SendLog(data) => {
@@ -3741,11 +3539,11 @@ mod tests {
     use super::*;
 
     fn whole(parts: &[&[u8]]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
+        let mut hasher = transport::sha256::Hasher::new();
         for part in parts {
             hasher.update(part);
         }
-        hasher.finalize().into()
+        hasher.finish()
     }
 
     #[test]

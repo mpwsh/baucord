@@ -140,9 +140,6 @@ impl Default for FrameContext {
 /// `FrameContext` field (e.g., `ctx.denoise_enabled`) and early-return
 /// inside `process` — the chain always runs every stage.
 pub trait AudioProcessor: Send {
-    /// Human-readable name for logging and debug.
-    fn name(&self) -> &str;
-
     /// Process one frame of audio in-place.
     ///
     /// The frame is always at the pipeline's internal sample rate (48 kHz)
@@ -160,41 +157,78 @@ pub trait AudioProcessor: Send {
     fn reset(&mut self);
 }
 
-// ── Processor chain ─────────────────────────────────────────────────────
+// ── The microphone's chain ──────────────────────────────────────────────
 
-/// An ordered chain of audio processors, applied in insertion order.
-pub struct ProcessorChain {
-    name: String,
-    processors: Vec<Box<dyn AudioProcessor>>,
+/// What every captured frame goes through, in this order: denoise →
+/// (meter) → gate → AGC → compressor → gain → clamp → (meter) →
+/// speaking light.
+///
+/// The stages are fields. It used to be a `Vec<Box<dyn
+/// AudioProcessor>>` filled by `add` calls, a shape that could change
+/// at run time and never did; what does change — a stage switched off
+/// — is a field of [`FrameContext`] the stage reads (review P2-54).
+pub struct InputChain {
+    denoise: denoise::Denoiser,
+    denoised_level: level_meter::LevelMeter,
+    gate: gate::NoiseGate,
+    agc: agc::AutoGainControl,
+    compressor: compressor::Compressor,
+    gain: gain::GainStage,
+    clamp: clamp::ClampStage,
+    level: level_meter::LevelMeter,
+    speaking: speaking::SpeakingIndicator,
 }
 
-impl ProcessorChain {
-    /// Create an empty chain with a name (for logging).
-    pub fn new(name: impl Into<String>) -> Self {
+impl InputChain {
+    /// The chain around the three stages that carry settings and the
+    /// one that drives the speaking light.
+    #[must_use]
+    pub fn new(
+        gate: gate::NoiseGate,
+        agc: agc::AutoGainControl,
+        compressor: compressor::Compressor,
+        speaking: speaking::SpeakingIndicator,
+    ) -> Self {
         Self {
-            name: name.into(),
-            processors: Vec::new(),
+            denoise: denoise::Denoiser::new(),
+            denoised_level: level_meter::LevelMeter::new(level_meter::MeterTarget::Denoised),
+            gate,
+            agc,
+            compressor,
+            gain: gain::GainStage::new(),
+            clamp: clamp::ClampStage::new(),
+            level: level_meter::LevelMeter::new(level_meter::MeterTarget::Pipeline),
+            speaking,
         }
     }
 
-    /// Add a processor to the end of the chain.
-    pub fn add(&mut self, processor: Box<dyn AudioProcessor>) -> &mut Self {
-        log::debug!("Chain '{}': added '{}'", self.name, processor.name());
-        self.processors.push(processor);
-        self
+    /// The stages in the order a frame meets them: the one list both
+    /// `process` and `reset` walk.
+    fn stages(&mut self) -> [&mut dyn AudioProcessor; 9] {
+        [
+            &mut self.denoise,
+            &mut self.denoised_level,
+            &mut self.gate,
+            &mut self.agc,
+            &mut self.compressor,
+            &mut self.gain,
+            &mut self.clamp,
+            &mut self.level,
+            &mut self.speaking,
+        ]
     }
 
-    /// Process a frame through all processors in order.
+    /// Process a frame through every stage in order.
     pub fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
-        for processor in &mut self.processors {
-            processor.process(samples, ctx);
+        for stage in self.stages() {
+            stage.process(samples, ctx);
         }
     }
 
-    /// Reset all processors in the chain.
+    /// Reset every stage: the next frame is processed as the first.
     pub fn reset(&mut self) {
-        for processor in &mut self.processors {
-            processor.reset();
+        for stage in self.stages() {
+            stage.reset();
         }
     }
 }

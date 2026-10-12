@@ -48,14 +48,10 @@ use crate::{
     latch::{Ring, Wait},
     processor::{
         agc::AutoGainControl,
-        clamp::ClampStage,
         compressor::Compressor,
-        denoise::Denoiser,
-        gain::GainStage,
         gate::NoiseGate,
-        level_meter::{LevelMeter, MeterTarget},
         speaking::{SpeakingFlag, SpeakingIndicator},
-        FrameContext, ProcessorChain,
+        FrameContext, InputChain,
     },
     resampler::build_input_resampler,
     stats::AudioStats,
@@ -525,24 +521,15 @@ impl AudioInput {
     }
 }
 
-/// The processor chain (the DAW view), driving `is_speaking`.
-fn build_chain(config: &InputConfig, is_speaking: Arc<SpeakingFlag>) -> ProcessorChain {
-    let gate = NoiseGate::new(config.gate.clone(), 200);
-    let agc = AutoGainControl::new(config.agc.clone(), 30.0);
-    let compressor = Compressor::with_defaults(config.compressor.clone());
-    let speaking = SpeakingIndicator::with_flag(is_speaking);
-
-    let mut chain = ProcessorChain::new("voice_input");
-    chain.add(Box::new(Denoiser::new()));
-    chain.add(Box::new(LevelMeter::new(MeterTarget::Denoised)));
-    chain.add(Box::new(gate));
-    chain.add(Box::new(agc));
-    chain.add(Box::new(compressor));
-    chain.add(Box::new(GainStage::new()));
-    chain.add(Box::new(ClampStage::new()));
-    chain.add(Box::new(LevelMeter::new(MeterTarget::Pipeline)));
-    chain.add(Box::new(speaking));
-    chain
+/// The microphone's chain with this input's settings, driving
+/// `is_speaking`.
+fn build_chain(config: &InputConfig, is_speaking: Arc<SpeakingFlag>) -> InputChain {
+    InputChain::new(
+        NoiseGate::new(config.gate.clone(), 200),
+        AutoGainControl::new(config.agc.clone(), 30.0),
+        Compressor::with_defaults(config.compressor.clone()),
+        SpeakingIndicator::with_flag(is_speaking),
+    )
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one straight-line real-time loop
@@ -554,7 +541,7 @@ fn worker_loop(
     encoder_tx: Sender<PcmFrame>,
     loopback_tx: Sender<PcmFrame>,
     config: Arc<InputConfig>,
-    mut chain: ProcessorChain,
+    mut chain: InputChain,
     is_speaking: Arc<SpeakingFlag>,
     device_sample_rate: u32,
 ) {

@@ -282,11 +282,11 @@ impl AppState {
         };
         self.network
             .tx
-            .send(NetworkControl::SendFile {
+            .send(NetworkControl::Send(ClientMessage::SendFile {
                 conv,
                 blob_id,
                 client_ref,
-            })
+            }))
             .ok();
     }
 
@@ -481,7 +481,7 @@ impl AppState {
         self.main.global::<State>().set_history_loading(true);
         self.network
             .tx
-            .send(NetworkControl::FetchHistory {
+            .send(NetworkControl::Send(ClientMessage::FetchHistory {
                 conv: self
                     .session
                     .chat
@@ -489,7 +489,7 @@ impl AppState {
                     .map_or(client::ConvRef::General, client::ConvRef::Dm),
                 before: self.session.oldest_history_id,
                 limit,
-            })
+            }))
             .ok();
     }
 
@@ -578,7 +578,9 @@ impl AppState {
                 } else {
                     self.network
                         .tx
-                        .send(NetworkControl::DeleteMessage { msg_id })
+                        .send(NetworkControl::Send(ClientMessage::DeleteMessage {
+                            msg_id,
+                        }))
                         .ok();
                     self.session.chat.pending_delete = Some(msg_id);
                     Self::arm_apply_timeout(msg_id, true);
@@ -587,7 +589,9 @@ impl AppState {
             Some(Confirm::DeleteChannel { channel_id }) => {
                 self.network
                     .tx
-                    .send(NetworkControl::DeleteChannel { channel_id })
+                    .send(NetworkControl::Send(ClientMessage::DeleteChannel {
+                        channel_id,
+                    }))
                     .ok();
             }
             None => {}

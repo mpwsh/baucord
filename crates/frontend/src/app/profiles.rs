@@ -373,7 +373,7 @@ impl AppState {
         };
         self.network
             .tx
-            .send(NetworkControl::SetProfile(profile))
+            .send(NetworkControl::Send(ClientMessage::SetProfile(profile)))
             .ok();
     }
 
@@ -461,7 +461,10 @@ impl AppState {
 
     /// Ask the server to rename this session (spec §7.1).
     pub fn request_rename(&mut self, name: String) {
-        self.network.tx.send(NetworkControl::SetNickname(name)).ok();
+        self.network
+            .tx
+            .send(NetworkControl::Send(ClientMessage::SetNickname { name }))
+            .ok();
     }
 
     /// A session's look arrived: keep it (by account too, so it stays

@@ -24,7 +24,6 @@ use server::{
     policy::Restriction,
     server::ChatServer,
 };
-use sha2::Digest;
 use transport::{
     identity::{CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL},
     sim::{LinkSpec, NodeId, SimNet},
@@ -549,7 +548,7 @@ impl TestClient {
         mime: &str,
         bytes: &[u8],
     ) -> [u8; 32] {
-        let sha256: [u8; 32] = sha2::Sha256::digest(bytes).into();
+        let sha256 = transport::sha256::digest(bytes);
         self.send(
             world,
             &ClientMessage::UploadBegin {
@@ -2158,7 +2157,7 @@ fn post_file(
     bytes: &[u8],
     conv: ConvRef,
 ) -> Result<(u64, [u8; 32]), DmFailReason> {
-    let sha256: [u8; 32] = sha2::Sha256::digest(bytes).into();
+    let sha256 = transport::sha256::digest(bytes);
     who.send(
         w,
         &ClientMessage::UploadBegin {
@@ -4787,7 +4786,7 @@ fn an_avatar_uploads_once_and_reaches_everyone() {
             name: "huge.png".into(),
             mime: "image/png".into(),
             size: u32::try_from(huge.len()).unwrap(),
-            sha256: sha2::Sha256::digest(&huge).into(),
+            sha256: transport::sha256::digest(&huge),
         },
     );
     let why = alice.wait_for(&mut w, &mut [&mut bob], |m| match m {
@@ -4962,7 +4961,7 @@ fn profiles_and_avatars_survive_a_restart() {
     let key = Arc::new(ClientKey::generate());
     let alice_user = key.user_id();
     let picture = png_blob(6, 6 * 1024);
-    let blob_id: [u8; 32] = sha2::Sha256::digest(&picture).into();
+    let blob_id = transport::sha256::digest(&picture);
     {
         let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
         let code = w.invite(ROLE_MEMBER);
@@ -6116,7 +6115,7 @@ fn a_picture_someone_else_also_uses_outlives_its_uploaders_account() {
     };
     use_as_avatar(&mut alice, &mut bob, &mut w);
     use_as_avatar(&mut bob, &mut alice, &mut w);
-    let blob: [u8; 32] = sha2::Sha256::digest(&picture).into();
+    let blob = transport::sha256::digest(&picture);
     w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(500));
 
     alice.send(&mut w, &ClientMessage::DeleteAccount);

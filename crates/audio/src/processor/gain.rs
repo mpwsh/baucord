@@ -29,10 +29,6 @@ impl GainStage {
 }
 
 impl AudioProcessor for GainStage {
-    fn name(&self) -> &'static str {
-        "gain"
-    }
-
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         let gain = ctx.input_gain;
         // Skip multiply when gain is unity (common case)

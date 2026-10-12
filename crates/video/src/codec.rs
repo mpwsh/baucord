@@ -395,23 +395,6 @@ impl FfmpegEncoder {
         Ok(())
     }
 
-    /// Encode one RGBA frame. See [`VideoEncoder::encode`] for the output
-    /// contract (zero or more access units, one `EncodedFrame` each).
-    pub fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
-        self.encode_frame(frame, false)
-    }
-
-    /// See [`VideoEncoder::encode_repeat`]: the time since the last
-    /// frame was spent on a still picture and does not count towards
-    /// the next keyframe. A still share used to send a full IDR every
-    /// [`KEYFRAME_INTERVAL_MS`] — every second refresh — and on AMF
-    /// reopened its session for one every two intervals (review P2-41).
-    /// A viewer who needs a keyframe asks, and
-    /// [`Self::force_keyframe`] still gets one out at once.
-    pub fn encode_repeat(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
-        self.encode_frame(frame, true)
-    }
-
     fn encode_frame(
         &mut self,
         frame: &Frame,
@@ -569,9 +552,44 @@ impl FfmpegEncoder {
         Ok(out)
     }
 
-    /// See [`VideoEncoder::frames_in_flight`].
+    /// One step back down after [`QP_FLOOR_RELAX_AFTER`] without a
+    /// frame too large.
+    fn relax_qp_floor(&mut self, now: Instant) {
+        if let (Some(i), Some(moved)) = (self.qp_floor, self.qp_floor_moved) {
+            if now.duration_since(moved) >= QP_FLOOR_RELAX_AFTER {
+                self.qp_floor = i.checked_sub(1);
+                self.qp_floor_moved = Some(now);
+            }
+        }
+    }
+
+    /// Returns the name of the active encoder (e.g. "`h264_nvenc`", "libx264").
     #[must_use]
-    pub fn frames_in_flight(&self) -> usize {
+    pub fn encoder_name(&self) -> &'static str {
+        self.enc_name
+    }
+}
+
+impl VideoEncoder for FfmpegEncoder {
+    /// Encode one RGBA frame. See [`VideoEncoder::encode`] for the output
+    /// contract (zero or more access units, one `EncodedFrame` each).
+    fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        self.encode_frame(frame, false)
+    }
+
+    /// See [`VideoEncoder::encode_repeat`]: the time since the last
+    /// frame was spent on a still picture and does not count towards
+    /// the next keyframe. A still share used to send a full IDR every
+    /// [`KEYFRAME_INTERVAL_MS`] — every second refresh — and on AMF
+    /// reopened its session for one every two intervals (review P2-41).
+    /// A viewer who needs a keyframe asks, and
+    /// [`Self::force_keyframe`] still gets one out at once.
+    fn encode_repeat(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
+        self.encode_frame(frame, true)
+    }
+
+    /// See [`VideoEncoder::frames_in_flight`].
+    fn frames_in_flight(&self) -> usize {
         self.session.as_ref().map_or(0, |s| s.pending_ts.len())
     }
 
@@ -579,7 +597,7 @@ impl FfmpegEncoder {
     ///
     /// # Errors
     /// When the encoder fails while handing its output out.
-    pub fn drain(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
+    fn drain(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
         let mut out = Vec::new();
         let Some(session) = self.session.as_mut() else {
             return Ok(out);
@@ -599,8 +617,7 @@ impl FfmpegEncoder {
     /// wrapper (`ff_amf_receive_packet`) returns at once, without asking
     /// AMF for output, when no new frame is queued — so a drain hands
     /// out only what an earlier submission already collected.
-    #[must_use]
-    pub fn output_needs_input(&self) -> bool {
+    fn output_needs_input(&self) -> bool {
         self.enc_name == "h264_amf"
     }
 
@@ -608,19 +625,18 @@ impl FfmpegEncoder {
     ///
     /// Call this when a new viewer subscribes or reports an unrecoverable
     /// gap, so they immediately get a decodable frame with SPS/PPS.
-    pub fn force_keyframe(&mut self) {
+    fn force_keyframe(&mut self) {
         self.force_next_keyframe = true;
     }
 
     /// Whether a forced keyframe is queued but not yet encoded.
-    #[must_use]
-    pub fn keyframe_pending(&self) -> bool {
+    fn keyframe_pending(&self) -> bool {
         self.force_next_keyframe
     }
 
     /// See [`VideoEncoder::frame_too_large`]: the next quantizer floor,
     /// applied by the session [`Self::ensure_session`] opens next.
-    pub fn frame_too_large(&mut self) -> Option<u32> {
+    fn frame_too_large(&mut self) -> Option<u32> {
         let next = qp_floor_after_oversize(self.qp_floor)?;
         self.qp_floor = Some(next);
         self.qp_floor_moved = Some(Instant::now());
@@ -628,95 +644,25 @@ impl FfmpegEncoder {
     }
 
     /// The quantizer floor in force, if any.
-    #[must_use]
-    pub fn qp_floor(&self) -> Option<u32> {
+    fn qp_floor(&self) -> Option<u32> {
         self.qp_floor.map(|i| QP_FLOORS[i])
-    }
-
-    /// One step back down after [`QP_FLOOR_RELAX_AFTER`] without a
-    /// frame too large.
-    fn relax_qp_floor(&mut self, now: Instant) {
-        if let (Some(i), Some(moved)) = (self.qp_floor, self.qp_floor_moved) {
-            if now.duration_since(moved) >= QP_FLOOR_RELAX_AFTER {
-                self.qp_floor = i.checked_sub(1);
-                self.qp_floor_moved = Some(now);
-            }
-        }
     }
 
     /// See [`VideoEncoder::supports_forced_keyframes`]: everything we
     /// use honors `pict_type=I` except `FFmpeg`'s AMF wrapper (<= 7.1).
-    #[must_use]
-    pub fn supports_forced_keyframes(&self) -> bool {
+    fn supports_forced_keyframes(&self) -> bool {
         self.enc_name != "h264_amf"
     }
 
     /// See [`VideoEncoder::set_bitrate_scale_pct`]. Only records the
     /// request; [`Self::ensure_session`] reopens on the next encode if
     /// the running session was opened at a different scale.
-    pub fn set_bitrate_scale_pct(&mut self, pct: u32) {
+    fn set_bitrate_scale_pct(&mut self, pct: u32) {
         self.bitrate_scale_pct = crate::clamp_bitrate_scale_pct(pct);
     }
 
-    #[must_use]
-    pub fn bitrate_scale_pct(&self) -> u32 {
-        self.bitrate_scale_pct
-    }
-
-    /// Returns the name of the active encoder (e.g. "`h264_nvenc`", "libx264").
-    #[must_use]
-    pub fn encoder_name(&self) -> &'static str {
-        self.enc_name
-    }
-}
-
-impl VideoEncoder for FfmpegEncoder {
-    fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
-        self.encode(frame)
-    }
-
-    fn encode_repeat(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
-        self.encode_repeat(frame)
-    }
-
-    fn force_keyframe(&mut self) {
-        self.force_keyframe();
-    }
-
-    fn keyframe_pending(&self) -> bool {
-        self.keyframe_pending()
-    }
-
-    fn supports_forced_keyframes(&self) -> bool {
-        self.supports_forced_keyframes()
-    }
-
-    fn set_bitrate_scale_pct(&mut self, pct: u32) {
-        self.set_bitrate_scale_pct(pct);
-    }
-
     fn bitrate_scale_pct(&self) -> u32 {
-        self.bitrate_scale_pct()
-    }
-
-    fn frame_too_large(&mut self) -> Option<u32> {
-        self.frame_too_large()
-    }
-
-    fn qp_floor(&self) -> Option<u32> {
-        self.qp_floor()
-    }
-
-    fn frames_in_flight(&self) -> usize {
-        self.frames_in_flight()
-    }
-
-    fn drain(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
-        self.drain()
-    }
-
-    fn output_needs_input(&self) -> bool {
-        self.output_needs_input()
+        self.bitrate_scale_pct
     }
 }
 

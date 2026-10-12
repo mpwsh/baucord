@@ -18,7 +18,6 @@ use protocol::{
     features, permissions, AuthorInfo, BlobId, ClientId, Profile, ProfileDenyReason,
     RenameDenyReason, RestrictionKind, ServerMessage, UploadRejectReason, UserId,
 };
-use sha2::{Digest, Sha256};
 
 use super::{fold_upload, ChatServer, Folded, Waiting};
 use crate::{
@@ -498,7 +497,7 @@ impl ChatServer {
         let Some(announced) = self.announced_uploads.remove(&client) else {
             return;
         };
-        let digest: BlobId = Sha256::digest(&bytes).into();
+        let digest: BlobId = transport::sha256::digest(&bytes);
         if digest != announced.sha256 || bytes.len() != announced.size as usize {
             self.reject_upload(client, upload_id, UploadRejectReason::HashMismatch);
             return;

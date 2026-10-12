@@ -515,10 +515,10 @@ impl AppState {
             if !text.is_empty() && self.session.chat.own_texts.get(&edit.msg_id) != Some(&text) {
                 self.network
                     .tx
-                    .send(NetworkControl::EditMessage {
+                    .send(NetworkControl::Send(ClientMessage::EditMessage {
                         msg_id: edit.msg_id,
                         text,
-                    })
+                    }))
                     .ok();
                 self.session.chat.pending_edit = Some(edit.msg_id);
                 Self::arm_apply_timeout(edit.msg_id, false);

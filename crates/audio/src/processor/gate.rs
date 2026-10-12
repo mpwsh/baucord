@@ -242,10 +242,6 @@ impl NoiseGate {
 }
 
 impl AudioProcessor for NoiseGate {
-    fn name(&self) -> &'static str {
-        "gate"
-    }
-
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         ctx.gate_open = self.process_inner(samples);
         ctx.gate_holding = matches!(self.state, GateState::Holding);

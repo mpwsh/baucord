@@ -16,7 +16,6 @@ use std::{
 use log::{info, warn};
 use protocol::{permissions::BUILTIN_ROLES, UserId};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, MAIN_DB};
-use sha2::Digest;
 
 use super::{
     AuditRow, BlobRecord, ConvKey, MessageRow, PersistError, ProgressDelta, ReportRow,
@@ -427,7 +426,7 @@ impl Sqlite {
     pub fn read_blob(&self, blob_id: &[u8; 32]) -> Option<Vec<u8>> {
         let path = self.blobs.join(hex(blob_id));
         let bytes = fs::read(&path).ok()?;
-        let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        let digest = transport::sha256::digest(&bytes);
         if digest != *blob_id {
             warn!("blob {} on disk does not match its hash", path.display());
             return None;
@@ -2902,9 +2901,8 @@ mod tests {
 
     /// A stored file of `fill` bytes, created at `created_at`.
     fn file(db: &Sqlite, fill: u8, created_at: WallMs) -> [u8; 32] {
-        use sha2::Digest;
         let bytes = vec![fill; 64];
-        let blob_id: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        let blob_id = transport::sha256::digest(&bytes);
         db.store_blob(&BlobRecord {
             blob_id,
             mime: "image/png".into(),

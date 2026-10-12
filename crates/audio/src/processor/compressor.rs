@@ -147,10 +147,6 @@ impl Compressor {
 }
 
 impl AudioProcessor for Compressor {
-    fn name(&self) -> &'static str {
-        "compressor"
-    }
-
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         // See AGC: the hold window carries only noise floor, so hold
         // gain rather than releasing upward through the noise tail.

@@ -93,10 +93,6 @@ impl ClampStage {
 }
 
 impl AudioProcessor for ClampStage {
-    fn name(&self) -> &'static str {
-        "clamp"
-    }
-
     fn process(&mut self, samples: &mut [f32], _ctx: &mut FrameContext) {
         let ceiling = self.ceiling;
 

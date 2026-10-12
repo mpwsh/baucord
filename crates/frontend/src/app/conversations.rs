@@ -271,10 +271,10 @@ impl AppState {
                 {
                     self.network
                         .tx
-                        .send(NetworkControl::MarkRead {
+                        .send(NetworkControl::Send(ClientMessage::MarkRead {
                             conv: client::ConvRef::Dm(user),
                             msg_id,
-                        })
+                        }))
                         .ok();
                 }
             }
@@ -515,10 +515,10 @@ impl AppState {
         if is_open {
             self.network
                 .tx
-                .send(NetworkControl::MarkRead {
+                .send(NetworkControl::Send(ClientMessage::MarkRead {
                     conv: client::ConvRef::Dm(from),
                     msg_id: id,
-                })
+                }))
                 .ok();
         }
         // The chime on screen; a notification off screen on a phone.
@@ -568,11 +568,11 @@ impl AppState {
         self.rebuild_dms_model();
         self.network
             .tx
-            .send(NetworkControl::SendDm {
+            .send(NetworkControl::Send(ClientMessage::DirectMessage {
                 to,
                 text,
                 client_ref,
-            })
+            }))
             .ok();
     }
 

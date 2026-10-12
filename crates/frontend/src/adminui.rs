@@ -891,7 +891,9 @@ fn confirm_accept(app: &mut AppState) {
         PanelAction::DeleteChannel(channel_id) => {
             app.network
                 .tx
-                .send(NetworkControl::DeleteChannel { channel_id })
+                .send(NetworkControl::Send(
+                    client::protocol::ClientMessage::DeleteChannel { channel_id },
+                ))
                 .ok();
         }
     }

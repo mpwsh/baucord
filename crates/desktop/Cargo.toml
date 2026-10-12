@@ -27,7 +27,7 @@ frontend = { path = "../frontend" }
 client = { path = "../client" }
 slint.workspace = true
 log.workspace = true
-env_logger = "0.11"
+env_logger.workspace = true
 
 [build-dependencies]
 winresource = "0.1"

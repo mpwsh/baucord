@@ -40,13 +40,6 @@ impl LevelMeter {
 }
 
 impl AudioProcessor for LevelMeter {
-    fn name(&self) -> &str {
-        match self.target {
-            MeterTarget::Denoised => "meter_denoised",
-            MeterTarget::Pipeline => "meter_pipeline",
-        }
-    }
-
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         let rms = compute_rms(samples);
         // Scale ×3 and clamp for UI-friendly 0–1 range.

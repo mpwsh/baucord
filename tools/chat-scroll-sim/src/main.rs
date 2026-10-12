@@ -16,11 +16,13 @@ slint::include_modules!();
 
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use slint::platform::software_renderer::{
-    MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
+use slint::{
+    platform::{
+        software_renderer::{MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType},
+        Platform, PointerEventButton, WindowAdapter, WindowEvent,
+    },
+    ComponentHandle, LogicalPosition, Model, ModelRc, VecModel,
 };
-use slint::platform::{Platform, PointerEventButton, WindowAdapter, WindowEvent};
-use slint::{ComponentHandle, LogicalPosition, Model, ModelRc, VecModel};
 
 thread_local! { static NOW: Cell<u64> = const { Cell::new(0) }; }
 
@@ -42,8 +44,16 @@ struct Sim {
     model: Rc<VecModel<ChatRow>>,
     buf: Vec<PremultipliedRgbaColor>,
     next: i32,
+    /// The host holds the front of the list for a reader above the
+    /// newest rows (`ChatHistory::hold_front`), as of its last append.
+    held: bool,
     failures: Vec<String>,
 }
+
+/// `app_core::chat::MAX_ROWS` and `HELD_MAX_ROWS`: what an append trims
+/// the list to, from the front — the second while the front is held.
+const MAX_ROWS: usize = 500;
+const HELD_MAX_ROWS: usize = 4 * MAX_ROWS;
 
 impl Sim {
     fn frame(&mut self) {
@@ -100,6 +110,61 @@ impl Sim {
         }
         r
     }
+    /// An append as the host does it with the cap (`ChatHistory::cap`,
+    /// then `sync_history_tail`): rows over the limit leave from the
+    /// front first, the new ones are pushed, and whether the reader
+    /// followed decides if the front is held at the *next* append.
+    /// Returns how many rows left.
+    fn append_capped(&mut self, n: usize, tall_every: usize) -> usize {
+        let limit = if self.held { HELD_MAX_ROWS } else { MAX_ROWS };
+        let dropped = (self.model.row_count() + n).saturating_sub(limit);
+        for _ in 0..dropped {
+            self.model.remove(0);
+        }
+        for k in 0..n {
+            let tall = tall_every > 0 && k % tall_every == tall_every - 1;
+            let r = self.row(tall, false);
+            self.model.push(r);
+        }
+        let following = self.ui.invoke_appended();
+        self.held = !following;
+        if !following {
+            let s = self.ui.global::<State>();
+            s.set_chat_new_count(s.get_chat_new_count() + i32::try_from(n).unwrap());
+        }
+        dropped
+    }
+
+    /// What the reader is looking at: the middle of the list, without
+    /// the scrollbar, the header and whatever floats over the bottom.
+    fn view(&mut self) -> Vec<(u8, u8, u8)> {
+        self.frame();
+        let mut out = Vec::with_capacity(340 * 260);
+        for y in 140..400 {
+            for x in 20..360 {
+                let p = self.buf[y * 400 + x];
+                out.push((p.red, p.green, p.blue));
+            }
+        }
+        out
+    }
+
+    /// The reader's view did not move since `before`.
+    fn report_still(&mut self, step: &str, before: &[(u8, u8, u8)]) {
+        let now = self.view();
+        let moved = now.iter().zip(before).filter(|(a, b)| a != b).count();
+        let ok = moved == 0;
+        println!(
+            "{} {step:<58} {} of {} pixels changed",
+            if ok { "ok  " } else { "FAIL" },
+            moved,
+            now.len()
+        );
+        if !ok {
+            self.failures.push(step.to_string());
+        }
+    }
+
     /// What the host does: push rows, ask the pane, count if scrolled up.
     fn append(&mut self, n: usize, tall_every: usize) {
         for k in 0..n {
@@ -209,6 +274,7 @@ fn main() {
         model,
         buf: vec![PremultipliedRgbaColor::default(); 400 * 640],
         next: 0,
+        held: false,
         failures: Vec::new(),
     };
 
@@ -434,6 +500,101 @@ fn main() {
     sim.append(2, 2);
     sim.frames(40);
     sim.report("released at the end, 2 arrive: followed", true, Some(true));
+
+    // ── The cap (review P3-43) ──────────────────────────────────────
+    // The host keeps 500 rows: an append takes the oldest out from the
+    // front. A reader at the newest rows must stay there through it.
+    sim.ui.invoke_jump();
+    sim.frames(60);
+    sim.ui.global::<State>().set_chat_new_count(0);
+    while sim.model.row_count() < MAX_ROWS {
+        sim.append_capped(25, 6);
+        sim.frames(12);
+    }
+    sim.frames(40);
+    sim.report("filled to the cap at the bottom", true, Some(true));
+    for round in 0..5 {
+        let dropped = sim.append_capped(3, 2);
+        sim.frames(40);
+        sim.report(
+            &format!("at the cap, 3 arrive and {dropped} leave (round {round})"),
+            true,
+            Some(true),
+        );
+    }
+
+    // Scrolled up at the cap. The host learns that the reader left the
+    // newest rows from the append that follows — so that one still
+    // trims the front, above what they are reading; from the next on
+    // the front is held. Neither may move what is on screen.
+    sim.wheel(6);
+    sim.frames(40);
+    sim.report("scrolled up at the cap", false, Some(false));
+    let before = sim.view();
+    let dropped = sim.append_capped(4, 0);
+    sim.frames(40);
+    sim.report_still(
+        &format!("the first append after it: {dropped} leave above the reader"),
+        &before,
+    );
+    let before = sim.view();
+    let dropped = sim.append_capped(4, 0);
+    sim.frames(40);
+    sim.report_still(
+        &format!("the next one: the front is held, {dropped} leave"),
+        &before,
+    );
+
+    // Held, the list grows to four times the cap, and then the oldest
+    // rows go again — still above a reader who must not notice.
+    while sim.model.row_count() < HELD_MAX_ROWS {
+        let room = HELD_MAX_ROWS - sim.model.row_count();
+        sim.append_capped(room.min(100), 6);
+        sim.frames(4);
+    }
+    sim.frames(40);
+    sim.report("the held list at four times the cap", false, Some(false));
+    let before = sim.view();
+    let dropped = sim.append_capped(40, 0);
+    sim.frames(40);
+    sim.report_still(
+        &format!("past the held cap: {dropped} leave above the reader"),
+        &before,
+    );
+    if dropped != 40 {
+        println!("FAIL the held cap let {dropped} rows go, not 40");
+        sim.failures.push("the held cap".into());
+    }
+
+    // Back at the newest rows. The host hears of it at the next append
+    // (which still holds the front), and lets go at the one after:
+    // that one trims three quarters of the list in one step.
+    sim.ui.invoke_jump();
+    sim.frames(90);
+    sim.report("jump from the held list", true, Some(true));
+    let dropped = sim.append_capped(2, 0);
+    sim.frames(60);
+    sim.report(&format!("then 2 arrive, {dropped} leave"), true, Some(true));
+    let dropped = sim.append_capped(2, 0);
+    sim.frames(60);
+    sim.report(
+        &format!("and 2 more: {dropped} leave at once"),
+        true,
+        Some(true),
+    );
+    for round in 0..3 {
+        sim.append_capped(3, 2);
+        sim.frames(40);
+        sim.report(
+            &format!("after the big trim, 3 arrive (round {round})"),
+            true,
+            Some(true),
+        );
+    }
+    if sim.model.row_count() != MAX_ROWS {
+        println!("FAIL the list holds {} rows", sim.model.row_count());
+        sim.failures.push("the cap after the hold".into());
+    }
 
     println!(
         "\n{} of the checks failed{}",

@@ -250,10 +250,11 @@ feature bits in `Hello`/`Welcome`.
 
 ## Deploying a server
 
-The production layout is Docker Compose on a Linux host. The same
-guide, for people who will never open this repository, is on the
-website: [baucord.com/deploy.html](https://baucord.com/deploy.html)
-(`web/deploy.html`). Change the two together.
+The production layout is Docker Compose on a Linux host. The guide
+for running one is on the website:
+[baucord.com/deploy.html](https://baucord.com/deploy.html)
+(`web/deploy.html`). What follows is what a maintainer needs beside
+it: how the image and the published files come to be.
 
 The compose file runs the published image `mpwsh/baucord:latest`,
 which `docker.yaml` builds from the `Dockerfile` and pushes on every
@@ -298,115 +299,14 @@ scripts/
 data/baucord/       # created by setup.sh; identity key, database, blobs, uploaded client logs (keep out of git, back it up)
 ```
 
-### Bootstrapping a host
+### Running one
 
-1. Open `udp/51000` in the cloud firewall. (No DNS or TLS certificate
-   is needed: the server's own key is its identity.)
-2. Put the four files on the host (download them from
-   `baucord.com/deploy/` as the web guide shows, or clone this
-   repository and `cp config/baucord.example.yaml
-   config/baucord.yaml`), and set `server.public_address` there to the
-   host's public IP and port (the server prints it in its `Address for
-   clients` line). `setup.sh` makes the copy itself if the file is
-   missing, and warns while the address is still the example's.
-3. Run:
-
-   ```bash
-   sudo scripts/setup.sh
-   ```
-
-   It is idempotent — re-run it after pulling config changes. It:
-
-   - checks for Docker and the compose plugin and installs them from the
-     distro repos only if missing
-   - creates `./data/baucord` owned by uid 10000 (the identity key is
-     generated there on first start)
-   - tunes the host for UDP fan-out: socket buffer caps and kernel
-     ingress backlog (`/etc/sysctl.d/99-baucord-udp.conf`), conntrack
-     sizing for Docker's port publishing, a boot-time service for NIC
-     ring buffers / RPS, and disables cloud-init network hotplug
-   - pulls the image and runs `docker compose up -d` (so re-running it
-     also updates the server to the latest release)
-   - prints the address and identity line from the log (and, on a new
-     server, the bootstrap admin invite — see "Server" above)
-   - installs the network monitor as a service (below)
-
-   The settings block at the top of the script (`MEDIA_PORT`, read from
-   the config's `server.port` when empty; `MEDIA_VIA_DOCKER_NAT`;
-   `BAUCORD_UID`; interface auto-detection) is the only thing you should
-   need to touch.
-
-4. Check it came up:
-
-   ```bash
-   docker compose ps
-   docker compose logs -f baucord
-   ss -uln | grep :51000
-   ```
-
-### Reading the server log
-
-Two periodic lines carry most of what you'll ever need:
-
-- `link: <user>: rtt, cwnd, path loss, tx/rx, mtu, dgram drops, groups
-  behind N/M (cause), voice rx/expected/lost/late` — the relay's view of
-  one client every `link_stats_interval_secs`. *Path loss* is the
-  transport's own accounting and informational; *voice lost* is what
-  listeners actually missed; *groups behind* is how often that client's
-  downlink couldn't keep up with a share (the cause breakdown says
-  which rule gave up).
-- `telemetry: <user>: …` — the client's own numbers every 10 s: path,
-  audio ladder, encoder rung/fps when sharing, decode stats when
-  viewing.
-
-A rising loss curve with flat RTT is the client's network; a rising RTT
-with low loss is a queue somewhere — ours or a router's.
-
-### Monitoring while it runs
-
-A relay is a UDP fan-out — a ~177 KB keyframe goes to every viewer at
-once — and the kernel drops those bursts silently; you see abandoned
-video groups and idle timeouts, not errors. `setup.sh` installs
-`scripts/monitor-net.sh` as a service, `baucord-monitor`, sampling every
-10 s (with a logrotate rule: weekly, eight kept):
-
-```bash
-systemctl status baucord-monitor
-tail -f /var/log/baucord-net.log
-```
-
-UDP counters are per network namespace, so the script samples the host
-*and* the `baucord` container (`CONTAINERS="baucord other"` to add
-more, `CONTAINERS=""` for host only) and writes one CSV row per
-namespace per interval. Every `*_err` / `*_drop` column is the delta for
-that interval, and `note` names the layer that dropped:
-
-| note            | meaning                                                      |
-| --------------- | ------------------------------------------------------------ |
-| `RCVBUF`        | receive buffer overflow — app not draining, or `rmem` small  |
-| `SNDBUF`        | send buffer overflow — keyframe burst > `wmem`, or link full |
-| `SOFTNET`       | kernel backlog overflow — `netdev_max_backlog` / CPU bound   |
-| `NIC`           | NIC ring or cloud pps/bandwidth allowance — see `ethtool -S` |
-| `VETH`          | drops on the Docker bridge / veth                            |
-| `COUNTER_RESET` | the container restarted                                      |
-
-`max_txq_bytes` creeping toward `wmem_max` during keyframes means you're
-close to `SNDBUF` drops — pace keyframes rather than raising the cap.
-Sustained `softirq_pct` above ~30% means packet processing is CPU bound.
-`ct_count` approaching `ct_max` means conntrack is about to start
-dropping new clients.
-
-On a host set up by hand, run it yourself during load
-(`sudo nohup scripts/monitor-net.sh 10 >/dev/null 2>&1 &`) and add a
-logrotate rule for `/var/log/baucord-net.log`.
-
-### Moving to host networking (optional)
-
-For the last bit of headroom, run `baucord` with `network_mode: host`
-instead of `ports:`. That removes Docker's DNAT and conntrack from the
-media path. Then set `MEDIA_VIA_DOCKER_NAT="false"` in
-`scripts/setup.sh` and re-run it — that enables a `notrack` rule for the
-media port, which is only safe without DNAT.
+Setting up a host, reading the server's log, the network monitor and
+host networking are the operator's guide, and it lives in one place:
+[baucord.com/deploy.html](https://baucord.com/deploy.html)
+(`web/deploy.html`). It used to be repeated here, to be changed
+together; now a change to how a server is run is a change to that
+page.
 
 ## Known Limitations
 

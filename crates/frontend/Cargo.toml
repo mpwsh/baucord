@@ -23,7 +23,13 @@ default = ["desktop"]
 # twin and `cargo check -p frontend --no-default-features` is what
 # Android starts from (ANDROID-SPEC.md §5).
 desktop = [
-  "dep:i-slint-backend-winit",
+  # Raw winit window events and the window handle: the OS invalidates
+  # window surfaces on focus/reveal transitions that Slint's damage
+  # tracking can't see (app.rs::repaint_on_reveal hooks them), and
+  # winit sees files dropped from the OS. Through Slint's own feature;
+  # it used to be a direct dependency on Slint's internal backend
+  # crate (review P3-50).
+  "slint/unstable-winit-030",
   "dep:arboard",
   "dep:global-hotkey",
   "dep:x11rb",
@@ -54,17 +60,11 @@ app-core = { path = "../app-core" }
 ui = { path = "../ui" }
 # Settings → Open-source licenses reads licenses.json.
 serde.workspace = true
-serde_json = "1.0"
+serde_json.workspace = true
 slint.workspace = true
-# Raw winit window events: the OS invalidates window surfaces on
-# focus/reveal transitions that Slint's damage tracking can't see;
-# app.rs::repaint_on_reveal hooks them. Default features are empty —
-# this only pulls the accessor trait; cargo unifies the version with
-# slint's own internal dependency.
-i-slint-backend-winit = { version = "1.18.1", optional = true }
 crossbeam-channel.workspace = true
 log.workspace = true
-chrono = "0.4.45"
+chrono.workspace = true
 ureq = { version = "3.4", optional = true }
 open = { version = "5.4", optional = true }
 global-hotkey = { version = "0.8", optional = true }
@@ -99,7 +99,7 @@ arboard = { version = "3", default-features = false, optional = true, features =
 # accesskit, xcap) run on async-io with no Tokio runtime — with
 # `tokio` on, the tray panicked at startup ("no reactor running").
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"], optional = true }
-pollster = { version = "1.0", optional = true }
+pollster = { version = "0.4", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Keybinds watch the key state instead of registering a global hotkey,

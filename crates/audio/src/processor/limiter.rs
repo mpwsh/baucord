@@ -21,7 +21,7 @@
 //! The limiter is self-contained: it tracks its own envelope and gain.
 //! It is used per-peer in the jitter buffer and once more on the master
 //! bus after output gain — both on the output worker, neither in a
-//! `ProcessorChain`, so it does not implement `AudioProcessor`.
+//! `InputChain`, so it does not implement `AudioProcessor`.
 
 /// Per-peer output limiter.
 ///

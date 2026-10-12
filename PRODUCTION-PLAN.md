@@ -530,6 +530,9 @@ Store is not decided yet.
   cellular; screen off for 10 minutes; the notifications. On
   the desktop: watched keybinds per OS, the single-instance guard, the
   tray, `server restore` on a real backup, an image over 10 MiB.
+  **For 1.2.1 the list is `DEVICE-CHECKLIST.md`** (2026-10-12): every
+  change of the review work that was not run on its platform, per
+  platform.
 
 ## 6. Decisions only you can take
 

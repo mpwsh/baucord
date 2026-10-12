@@ -6,7 +6,7 @@
 
 use video::{
     codec::{FfmpegDecoder, FfmpegEncoder, KEYFRAME_INTERVAL_MS},
-    Frame, PixelFormat, Quality,
+    Frame, PixelFormat, Quality, VideoEncoder,
 };
 
 /// Synthetic RGBA frame: gradient background + a moving white square, so

@@ -129,7 +129,7 @@ wasapi = "0.24"
 # 0.62 `wasapi` and `video` use, and features `wasapi` already turns on
 # — but the registry, read once per render open for the user's "during
 # calls" setting in the log (AEC-SPEC.md E14).
-windows = { version = "0.62", features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
@@ -142,7 +142,7 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 # examples only — the library itself never initializes a logger
-env_logger = "0.11"
+env_logger.workspace = true
 
 [[example]]
 name = "latency_profile"

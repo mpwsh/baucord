@@ -138,10 +138,6 @@ impl SpeakingIndicator {
 }
 
 impl AudioProcessor for SpeakingIndicator {
-    fn name(&self) -> &'static str {
-        "speaking"
-    }
-
     fn process(&mut self, _samples: &mut [f32], ctx: &mut FrameContext) {
         let is_speech = self.classify(ctx.gate_open, ctx.rnnoise_vad_prob);
         ctx.is_speech = is_speech;

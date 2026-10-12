@@ -50,7 +50,6 @@ rcgen = { version = "0.14.10", default-features = false, features = [
 # Ed25519 verification of successor proofs and client-key proofs; already
 # in the tree via rustls.
 ring = "0.17"
-sha2 = "0.11"
 base64 = "0.23"
 # quinn-proto's own rand; reused for peer ids.
 rand.workspace = true
@@ -61,7 +60,7 @@ rand_pcg = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
-env_logger = "0.11"
+env_logger.workspace = true
 # The crate's own tests always build the server side.
 rcgen = { version = "0.14.10", default-features = false, features = [
   "ring",

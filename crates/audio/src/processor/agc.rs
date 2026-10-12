@@ -159,10 +159,6 @@ impl AutoGainControl {
 }
 
 impl AudioProcessor for AutoGainControl {
-    fn name(&self) -> &'static str {
-        "agc"
-    }
-
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         if !ctx.agc_enabled {
             return;

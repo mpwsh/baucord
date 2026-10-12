@@ -270,9 +270,26 @@ pub mod convert {
     /// old fixed 720 paid the hidpi price everywhere. Capped at 2×.
     #[must_use]
     pub fn preview_max_edge(scale_factor: f32) -> u32 {
+        scaled_edge(PREVIEW_BOX_EDGE, scale_factor)
+    }
+
+    /// The send preview's picture box at its widest (main.slint: a
+    /// 520 px card, 300 px tall inside its padding).
+    pub const SEND_PREVIEW_BOX_EDGE: u32 = 480;
+
+    /// Longest edge of the send preview's texture: its box at the
+    /// window's scale. The dialog used to hold the full-resolution
+    /// decode — up to 1280², 6.5 MB — to draw it at a third of that
+    /// (review P3-41).
+    #[must_use]
+    pub fn send_preview_max_edge(scale_factor: f32) -> u32 {
+        scaled_edge(SEND_PREVIEW_BOX_EDGE, scale_factor)
+    }
+
+    fn scaled_edge(logical: u32, scale_factor: f32) -> u32 {
         let scale = scale_factor.clamp(1.0, 2.0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let edge = (PREVIEW_BOX_EDGE as f32 * scale).ceil() as u32;
+        let edge = (logical as f32 * scale).ceil() as u32;
         edge
     }
 

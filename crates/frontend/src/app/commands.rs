@@ -354,13 +354,18 @@ impl AppState {
                                     .map(|u| u.username.clone())
                             })
                             .unwrap_or_else(|| t!("channel-owner-server"));
-                        let flags: Vec<&str> = [
-                            facts.is_some_and(|f| f.is_afk).then_some("afk"),
-                            facts.is_some_and(|f| !f.permanent).then_some("temporary"),
-                            c.locked.then_some("password"),
+                        let flags: Vec<String> = [
+                            facts
+                                .is_some_and(|f| f.is_afk)
+                                .then_some("channel-flag-afk"),
+                            facts
+                                .is_some_and(|f| !f.permanent)
+                                .then_some("channel-flag-temporary"),
+                            c.locked.then_some("channel-flag-password"),
                         ]
                         .into_iter()
                         .flatten()
+                        .map(|key| t!(key))
                         .collect();
                         format!(
                             "#{} {} — {} — {}{}",
@@ -368,12 +373,14 @@ impl AppState {
                             c.name,
                             owner,
                             if flags.is_empty() {
-                                "permanent".to_string()
+                                t!("channel-flag-permanent")
                             } else {
                                 flags.join(", ")
                             },
-                            c.user_limit
-                                .map_or(String::new(), |l| format!(" — limit {l}"))
+                            c.user_limit.map_or(String::new(), |l| format!(
+                                " — {}",
+                                t!("channel-list-limit", "limit" => l)
+                            ))
                         )
                     })
                     .collect();
@@ -405,7 +412,9 @@ impl AppState {
                 if verb == "delete" {
                     self.network
                         .tx
-                        .send(NetworkControl::DeleteChannel { channel_id })
+                        .send(NetworkControl::Send(ClientMessage::DeleteChannel {
+                            channel_id,
+                        }))
                         .ok();
                 } else if let Some(mut spec) = self.current_spec(channel_id) {
                     spec.permanent = true;
@@ -425,10 +434,10 @@ impl AppState {
                 };
                 self.network
                     .tx
-                    .send(NetworkControl::ChannelKick {
+                    .send(NetworkControl::Send(ClientMessage::ChannelKick {
                         channel_id,
                         user_id,
-                    })
+                    }))
                     .ok();
             }
             _ => self.push_command_output(&t!("chat-command-usage-channel")),
@@ -447,7 +456,7 @@ impl AppState {
         }
         self.network
             .tx
-            .send(NetworkControl::CreateChannel(spec))
+            .send(NetworkControl::Send(ClientMessage::CreateChannel(spec)))
             .ok();
     }
 
@@ -480,7 +489,10 @@ impl AppState {
         }
         self.network
             .tx
-            .send(NetworkControl::EditChannel { channel_id, spec })
+            .send(NetworkControl::Send(ClientMessage::EditChannel {
+                channel_id,
+                spec,
+            }))
             .ok();
     }
 
@@ -668,10 +680,10 @@ impl AppState {
         self.session.pending_admin.insert(request_id, then);
         self.network
             .tx
-            .send(NetworkControl::Admin {
+            .send(NetworkControl::Send(ClientMessage::Admin {
                 request_id,
                 command,
-            })
+            }))
             .ok();
     }
 
@@ -694,7 +706,7 @@ impl AppState {
                     log::info!("telemetry for {client_id:#x} refused: {}", e.describe());
                     return;
                 }
-                let why = e.describe();
+                let why = describe_admin_error(&e);
                 if matches!(then, PendingAdmin::Panel(_) | PendingAdmin::AuditMore) {
                     crate::adminui::take_error(self, &why);
                     return;
@@ -773,7 +785,7 @@ impl AppState {
                         },
                         u.name,
                         if roles.is_empty() {
-                            "no roles".to_string()
+                            t!("admin-list-no-roles")
                         } else {
                             roles.join(", ")
                         },
@@ -792,7 +804,12 @@ impl AppState {
                     let who = r
                         .user_name
                         .clone()
-                        .or_else(|| r.key_hash.map(|k| format!("key {}", short_id(&k))))
+                        .or_else(|| {
+                            r.key_hash.map(|k| {
+                                let id = short_id(&k);
+                                t!("admin-list-key", "id" => id.as_str())
+                            })
+                        })
                         .or_else(|| r.address.clone())
                         .unwrap_or_default();
                     let line = format!(
@@ -821,12 +838,17 @@ impl AppState {
                         Some(max) => format!("{}/{max}", i.uses),
                         None => i.uses.to_string(),
                     };
-                    let state = if i.revoked { " (revoked)" } else { "" };
+                    let state = if i.revoked {
+                        format!(" ({})", t!("admin-revoked"))
+                    } else {
+                        String::new()
+                    };
                     let line = format!(
-                        "{} — {} — {} — uses {uses}{state}",
+                        "{} — {} — {} — {}{state}",
                         client::invite::display_code(&i.code),
                         self.role_name_of(i.grants_role),
-                        describe_expiry(i.expires_at)
+                        describe_expiry(i.expires_at),
+                        t!("admin-list-uses", "uses" => uses.as_str())
                     );
                     self.push_command_output(&line);
                 }
