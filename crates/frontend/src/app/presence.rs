@@ -34,7 +34,7 @@ impl AppState {
         s.set_narrow_chat_open(false);
         s.set_phase(Phase::Main);
 
-        self.our_client_id = Some(client_id);
+        self.session.our_client_id = Some(client_id);
         self.server_name = server_name.to_string();
         // The lobby is wherever the server put us on arrival.
         self.lobby_name = if self.lobby {
@@ -47,10 +47,10 @@ impl AppState {
         };
         // `ChannelDetails` follow, one per channel, and are keyed by
         // these ids — a stale set from an earlier list must not leak.
-        self.channel_infos = channels.to_vec();
-        self.channel_details.clear();
+        self.session.channel_infos = channels.to_vec();
+        self.session.channel_details.clear();
         self.rebuild_channels();
-        self.pending_channel_join = None;
+        self.session.pending_channel_join = None;
         let default_audio = PeerAudioSettings::default();
         for (&id, name) in users {
             let audio = peer_audio_from(
@@ -60,7 +60,8 @@ impl AppState {
                     .unwrap_or(&default_audio),
             );
             let channel_id = memberships.get(&id).copied().unwrap_or_default();
-            self.users
+            self.session
+                .users
                 .insert(id, UserState::new(name.clone(), audio, channel_id));
         }
 
@@ -87,7 +88,7 @@ impl AppState {
         self.play_chime(SoundType::UserJoined);
 
         // Sync per-user audio settings to voice engine
-        for (&id, user) in &self.users {
+        for (&id, user) in &self.session.users {
             self.voice.tx.send(VoiceControl::AddPeer(id)).ok();
             self.voice
                 .tx
@@ -112,7 +113,12 @@ impl AppState {
         // go back to the room the drop took us out of (a saved
         // password serves, a missing one asks).
         if let Some(name) = self.rejoin_channel.take()
-            && let Some(id) = self.channels.iter().find(|c| c.name == name).map(|c| c.id)
+            && let Some(id) = self
+                .session
+                .channels
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.id)
         {
             self.channel_clicked(id);
         }
@@ -123,10 +129,15 @@ impl AppState {
     /// (At the join only the name is known, and only an entry still
     /// filed under a name can be found by it — review P2-24.)
     pub(super) fn apply_saved_peer_audio(&mut self, client_id: u64, user_id: &client::UserId) {
-        if Some(client_id) == self.our_client_id {
+        if Some(client_id) == self.session.our_client_id {
             return;
         }
-        let Some(name) = self.users.get(&client_id).map(|u| u.username.clone()) else {
+        let Some(name) = self
+            .session
+            .users
+            .get(&client_id)
+            .map(|u| u.username.clone())
+        else {
             return;
         };
         let (saved, moved) = self.settings.claim_peer_audio(user_id, &name);
@@ -136,7 +147,7 @@ impl AppState {
         let Some(saved) = saved else {
             return;
         };
-        if let Some(user) = self.users.get_mut(&client_id) {
+        if let Some(user) = self.session.users.get_mut(&client_id) {
             user.audio = peer_audio_from(&saved);
         }
         self.voice
@@ -176,10 +187,10 @@ impl AppState {
         let mut user = UserState::new(username, peer_audio_from(&saved), channel_id);
         // `UserDetails` normally follows `UserJoined`; if it got here
         // first (a replaced session's details), honor it.
-        if let Some((_, roles)) = self.details.get(&client_id) {
+        if let Some((_, roles)) = self.session.details.get(&client_id) {
             user.role = role_of(roles);
         }
-        self.users.insert(client_id, user);
+        self.session.users.insert(client_id, user);
         // Join ding only for arrivals into *our* channel — like the
         // classics, other rooms come and go silently.
         if Some(channel_id) == self.our_channel() {
@@ -189,16 +200,17 @@ impl AppState {
     }
 
     pub(super) fn handle_user_left(&mut self, client_id: u64, username: &str) {
-        self.details.remove(&client_id);
-        self.telemetry_notes.remove(&client_id);
-        self.profiles.remove(&client_id);
+        self.session.details.remove(&client_id);
+        self.session.telemetry_notes.remove(&client_id);
+        self.session.profiles.remove(&client_id);
         self.rebuild_dms_model();
         self.voice.tx.send(VoiceControl::RemovePeer(client_id)).ok();
         let was_in_our_channel = self
+            .session
             .users
             .remove(&client_id)
             .is_some_and(|u| Some(u.channel_id) == self.our_channel());
-        self.active_sharers.remove(&client_id);
+        self.session.active_sharers.remove(&client_id);
 
         // Close viewer if we were watching this user
         if let Some(viewer) = self.viewers.remove(&client_id) {
@@ -226,21 +238,26 @@ impl AppState {
     /// test, which needs it anywhere.
     pub(super) fn voice_room_wanted(&self) -> bool {
         let afk = self.our_channel().is_some_and(|id| {
-            self.channel_details.get(&id).is_some_and(|f| f.is_afk)
-                || self.channels.iter().any(|c| c.id == id && c.is_afk)
+            self.session
+                .channel_details
+                .get(&id)
+                .is_some_and(|f| f.is_afk)
+                || self.session.channels.iter().any(|c| c.id == id && c.is_afk)
         });
         self.is_testing_mic || !(self.in_lobby() || afk)
     }
 
     /// The channel we are currently in, per server echo.
     pub(super) fn our_channel(&self) -> Option<u16> {
-        self.our_client_id
-            .and_then(|id| self.users.get(&id))
+        self.session
+            .our_client_id
+            .and_then(|id| self.session.users.get(&id))
             .map(|u| u.channel_id)
     }
 
     pub(super) fn channel_name(&self, channel_id: u16) -> String {
-        self.channels
+        self.session
+            .channels
             .iter()
             .find(|c| c.id == channel_id)
             .map_or_else(|| format!("#{channel_id}"), |c| c.name.clone())
@@ -248,7 +265,7 @@ impl AppState {
 
     pub(super) fn handle_user_moved(&mut self, client_id: u64, channel_id: u16) {
         let our_channel_before = self.our_channel();
-        let old = if let Some(user) = self.users.get_mut(&client_id) {
+        let old = if let Some(user) = self.session.users.get_mut(&client_id) {
             let old = user.channel_id;
             user.channel_id = channel_id;
             Some(old)
@@ -256,12 +273,12 @@ impl AppState {
             None
         };
 
-        if Some(client_id) == self.our_client_id {
+        if Some(client_id) == self.session.our_client_id {
             // Our own move confirmed — close the prompt if it drove
             // this, and ding into the new room. Back into the lobby
             // (an admin's move, a kick) there is no room to ding
             // into: the banner says where we are.
-            self.pending_channel_join = None;
+            self.session.pending_channel_join = None;
             let state = self.main.global::<State>();
             state.set_channel_prompt_open(false);
             state.set_channel_password("".into());
@@ -307,8 +324,9 @@ impl AppState {
         channels: &[client::ChannelInfo],
         memberships: &HashMap<u64, u16>,
     ) {
-        let pending_name = self.pending_channel_join.and_then(|id| {
-            self.channels
+        let pending_name = self.session.pending_channel_join.and_then(|id| {
+            self.session
+                .channels
                 .iter()
                 .find(|c| c.id == id)
                 .map(|c| c.name.clone())
@@ -316,20 +334,20 @@ impl AppState {
 
         // Ids are renumbered: the facts keyed by the old ids are void
         // until the server's fresh `ChannelDetails` land.
-        self.channel_infos = channels.to_vec();
-        self.channel_details.clear();
+        self.session.channel_infos = channels.to_vec();
+        self.session.channel_details.clear();
         self.rebuild_channels();
         for (id, channel_id) in memberships {
-            if let Some(user) = self.users.get_mut(id) {
+            if let Some(user) = self.session.users.get_mut(id) {
                 user.channel_id = *channel_id;
             }
         }
 
-        self.pending_channel_join = pending_name
+        self.session.pending_channel_join = pending_name
             .as_ref()
-            .and_then(|name| self.channels.iter().find(|c| &c.name == name))
+            .and_then(|name| self.session.channels.iter().find(|c| &c.name == name))
             .map(|c| c.id);
-        if pending_name.is_some() && self.pending_channel_join.is_none() {
+        if pending_name.is_some() && self.session.pending_channel_join.is_none() {
             // The channel the prompt was for no longer exists.
             self.channel_password_cancel();
         }
@@ -341,7 +359,13 @@ impl AppState {
         ));
         // The list the server just sent is the answer to a create or
         // an edit the dialog is waiting on.
-        if self.channel_dialog.as_ref().is_some_and(|d| d.pending) {
+        if self
+            .session
+            .chat
+            .channel_dialog
+            .as_ref()
+            .is_some_and(|d| d.pending)
+        {
             self.channel_dialog_cancel();
         }
         self.update_user_list();
@@ -353,13 +377,16 @@ impl AppState {
     /// sees everything).
     pub(super) fn rebuild_channels(&mut self) {
         let our_rank = self.our_rank();
-        let sees_all =
-            client::permissions::has(self.permissions, client::permissions::MANAGE_CHANNELS);
-        self.channels = self
+        let sees_all = client::permissions::has(
+            self.session.permissions,
+            client::permissions::MANAGE_CHANNELS,
+        );
+        self.session.channels = self
+            .session
             .channel_infos
             .iter()
             .map(|c| {
-                let facts = self.channel_details.get(&c.id);
+                let facts = self.session.channel_details.get(&c.id);
                 let gate_rank = facts.and_then(|f| f.min_role).and_then(builtin_rank);
                 ChannelMeta {
                     id: c.id,
@@ -371,7 +398,7 @@ impl AppState {
                     is_afk: facts.is_some_and(|f| f.is_afk),
                     owned: facts
                         .and_then(|f| f.owner)
-                        .is_some_and(|owner| Some(owner) == self.our_user_id),
+                        .is_some_and(|owner| Some(owner) == self.session.our_user_id),
                     // Config channels have no owner and stable id 0.
                     from_config: facts.is_none_or(|f| f.stable_id == 0),
                     // A gate we cannot rank (a custom role) is left to
@@ -390,7 +417,7 @@ impl AppState {
     /// (spec §8: the server decides; the client renders).
     pub(super) fn push_permissions(&mut self) {
         use client::permissions as p;
-        let has = |bit: u64| p::has(self.permissions, bit);
+        let has = |bit: u64| p::has(self.session.permissions, bit);
         let s = self.main.global::<State>();
         s.set_perm_move(has(p::MANAGE_CHANNELS));
         s.set_perm_create_channels(has(p::CREATE_CHANNELS));
@@ -398,11 +425,11 @@ impl AppState {
         s.set_perm_manage_invites(has(p::MANAGE_INVITES));
         s.set_perm_panel(has(p::PANEL));
         s.set_perm_dm(has(p::DM));
-        s.set_server_persistent(self.server_persistent);
+        s.set_server_persistent(self.session.server_persistent);
         crate::settingsui::refresh_role_line(self);
         // The channel's row, for whoever may read it (the borrow of
         // the window's globals is over by here).
-        if p::has(self.permissions, p::ADMIN_CHANNEL) {
+        if p::has(self.session.permissions, p::ADMIN_CHANNEL) {
             self.ensure_admin_channel();
             self.rebuild_dms_model();
         }
@@ -498,24 +525,30 @@ impl AppState {
         if !self.connected {
             return None;
         }
-        self.our_client_id
-            .and_then(|id| self.users.get(&id))
+        self.session
+            .our_client_id
+            .and_then(|id| self.session.users.get(&id))
             .map(|u| u.username.as_str())
     }
 
     /// Our role badge and level as the roster knows them (for the
     /// profile tab).
     pub fn our_role_and_level(&self) -> (Role, u16) {
-        self.our_client_id
-            .and_then(|id| self.users.get(&id))
+        self.session
+            .our_client_id
+            .and_then(|id| self.session.users.get(&id))
             .map_or((Role::Unknown, 0), |u| (u.role, u.level))
     }
 
     /// The role table's ids in rank order (the panel's lists and the
     /// Role dropdown share it).
     pub(crate) fn role_table_in_rank_order(&self) -> Vec<client::RoleId> {
-        let mut ids: Vec<(u16, client::RoleId)> =
-            self.roles.values().map(|r| (r.rank, r.id)).collect();
+        let mut ids: Vec<(u16, client::RoleId)> = self
+            .session
+            .roles
+            .values()
+            .map(|r| (r.rank, r.id))
+            .collect();
         ids.sort_unstable();
         ids.into_iter().map(|(_, id)| id).collect()
     }
@@ -526,6 +559,7 @@ impl AppState {
         match Role::from_int(i32::try_from(role).unwrap_or(0)) {
             Some(builtin) if builtin != Role::Unknown => role_name(builtin),
             _ => self
+                .session
                 .roles
                 .get(&role)
                 .map_or_else(|| format!("role {role}"), |r| r.name.clone()),
@@ -536,7 +570,8 @@ impl AppState {
     /// (case-insensitive) or an id.
     pub(super) fn parse_role_name(&self, text: &str) -> Option<client::RoleId> {
         let lower = text.trim().to_ascii_lowercase();
-        self.roles
+        self.session
+            .roles
             .values()
             .find(|r| r.name == lower)
             .map(|r| r.id)
@@ -547,12 +582,13 @@ impl AppState {
     /// badge and its color come from it); `None` for a built-in
     /// without a style, or no entry.
     pub(super) fn top_role_info(&self, client_id: u64) -> Option<&client::protocol::RoleInfo> {
-        self.details
+        self.session
+            .details
             .get(&client_id)
             .and_then(|(_, roles)| {
                 roles
                     .iter()
-                    .filter_map(|r| self.roles.get(r))
+                    .filter_map(|r| self.session.roles.get(r))
                     .max_by_key(|info| (info.rank, info.id))
             })
             .filter(|info| !info.icon.is_empty() || info.color != 0)
@@ -561,18 +597,20 @@ impl AppState {
     /// The name of a client's highest-ranked role, for the card.
     pub(super) fn top_role_name(&self, client_id: u64) -> String {
         let top = self
+            .session
             .details
             .get(&client_id)
             .and_then(|(_, roles)| {
                 roles
                     .iter()
-                    .filter_map(|r| self.roles.get(r).map(|info| (info.rank, *r)))
+                    .filter_map(|r| self.session.roles.get(r).map(|info| (info.rank, *r)))
                     .max()
             })
             .map(|(_, id)| id);
         match top {
             Some(id) => self.role_name_of(id),
             None => self
+                .session
                 .users
                 .get(&client_id)
                 .map_or_else(String::new, |u| role_name(u.role)),
@@ -600,26 +638,29 @@ impl AppState {
     /// steward outranks organizers); a guest's until its details
     /// arrive.
     pub(super) fn rank_of_client(&self, client_id: u64) -> client::permissions::Rank {
-        self.details
-            .get(&client_id)
-            .map_or(client::permissions::RANK_GUEST, |(_, roles)| {
+        self.session.details.get(&client_id).map_or(
+            client::permissions::RANK_GUEST,
+            |(_, roles)| {
                 roles
                     .iter()
                     .filter_map(|r| {
-                        self.roles
+                        self.session
+                            .roles
                             .get(r)
                             .map(|info| info.rank)
                             .or_else(|| builtin_rank(*r))
                     })
                     .max()
                     .unwrap_or(client::permissions::RANK_GUEST)
-            })
+            },
+        )
     }
 
     /// Our highest built-in rank, from our roles; a guest's when the
     /// details have not arrived yet.
     pub(super) fn our_rank(&self) -> client::permissions::Rank {
-        self.our_client_id
+        self.session
+            .our_client_id
             .map_or(client::permissions::RANK_GUEST, |id| {
                 self.rank_of_client(id)
             })

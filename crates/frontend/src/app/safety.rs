@@ -42,16 +42,17 @@ impl AppState {
     // ── Who is blocked ──────────────────────────────────────────────
 
     pub(super) fn is_blocked(&self, user: &client::UserId) -> bool {
-        self.blocked.contains_key(user)
+        self.session.safety.blocked.contains_key(user)
     }
 
     /// The account behind a session, when the server said
     /// (`UserDetails`, or `Authors` for someone in the lobby).
     pub(super) fn account_of(&self, client_id: u64) -> Option<client::UserId> {
-        self.details
+        self.session
+            .details
             .get(&client_id)
             .map(|(user, _)| *user)
-            .or_else(|| self.lurkers.get(&client_id).copied())
+            .or_else(|| self.session.lurkers.get(&client_id).copied())
     }
 
     /// Whether a session belongs to someone we blocked.
@@ -63,7 +64,7 @@ impl AppState {
     /// A message from a blocked person stays out; its id is kept so an
     /// edit or a deletion of it later says nothing either.
     pub(super) fn hide_message(&mut self, msg_id: u64) {
-        self.hidden_messages.insert(msg_id);
+        self.session.safety.hidden_messages.insert(msg_id);
     }
 
     /// `Blocks`: the whole list, on join and after every change (from
@@ -73,18 +74,20 @@ impl AppState {
             users.into_iter().map(|b| (b.user_id, b.name)).collect();
         let added: Vec<client::UserId> = fresh
             .keys()
-            .filter(|u| !self.blocked.contains_key(*u))
+            .filter(|u| !self.session.safety.blocked.contains_key(*u))
             .copied()
             .collect();
         let removed: Vec<(client::UserId, String)> = self
+            .session
+            .safety
             .blocked
             .iter()
             .filter(|(u, _)| !fresh.contains_key(*u))
             .map(|(u, name)| (*u, name.clone()))
             .collect();
-        let announce = self.blocks_known;
-        self.blocks_known = true;
-        self.blocked = fresh;
+        let announce = self.session.safety.blocks_known;
+        self.session.safety.blocks_known = true;
+        self.session.safety.blocked = fresh;
         for user in &added {
             self.hide_everything_of(user);
         }
@@ -93,7 +96,13 @@ impl AppState {
         }
         if announce {
             for user in &added {
-                let name = self.blocked.get(user).cloned().unwrap_or_default();
+                let name = self
+                    .session
+                    .safety
+                    .blocked
+                    .get(user)
+                    .cloned()
+                    .unwrap_or_default();
                 self.show_toast(
                     ToastKind::Info,
                     &t!("toast-blocked", "name" => name.as_str()),
@@ -116,9 +125,10 @@ impl AppState {
     /// stream stops if we were watching it.
     fn hide_everything_of(&mut self, user: &client::UserId) {
         // General, every parked DM, and whatever is shown.
-        let mut keys: Vec<Option<client::UserId>> = self.parked.keys().copied().collect();
-        if !keys.contains(&self.active_dm) {
-            keys.push(self.active_dm);
+        let mut keys: Vec<Option<client::UserId>> =
+            self.session.chat.parked.keys().copied().collect();
+        if !keys.contains(&self.session.chat.active_dm) {
+            keys.push(self.session.chat.active_dm);
         }
         if !keys.contains(&None) {
             keys.push(None);
@@ -126,14 +136,14 @@ impl AppState {
         for key in keys {
             self.with_conversation(key, |app| app.drop_rows_of(user));
         }
-        if self.active_dm == Some(*user) {
+        if self.session.chat.active_dm == Some(*user) {
             self.switch_conversation(None);
         }
         // Their DM: out of the list, its rows dropped; it is fetched
         // again if they are unblocked and it is opened.
-        self.parked.remove(&Some(*user));
-        self.dm_order.retain(|u| u != user);
-        if let Some(meta) = self.dm_meta.get_mut(user) {
+        self.session.chat.parked.remove(&Some(*user));
+        self.session.chat.dm_order.retain(|u| u != user);
+        if let Some(meta) = self.session.chat.dm_meta.get_mut(user) {
             meta.fetched = false;
             meta.unread = 0;
         }
@@ -164,7 +174,7 @@ impl AppState {
         if removed.is_empty() {
             return;
         }
-        self.hidden_messages.extend(ids);
+        self.session.safety.hidden_messages.extend(ids);
         for &index in removed.iter().rev() {
             if index < self.chat_model.row_count() {
                 self.evict_row(index);
@@ -179,26 +189,37 @@ impl AppState {
     /// message puts it. Rows hidden earlier this session stay hidden
     /// (the toast says so); new ones show.
     fn show_conversation_again(&mut self, user: &client::UserId) {
-        let Some(last_ts) = self.dm_meta.get(user).map(|m| m.last_ts) else {
+        let Some(last_ts) = self.session.chat.dm_meta.get(user).map(|m| m.last_ts) else {
             return;
         };
-        if self.dm_order.contains(user) || self.dm_hidden(user) {
+        if self.session.chat.dm_order.contains(user) || self.dm_hidden(user) {
             return;
         }
         let at = self
+            .session
+            .chat
             .dm_order
             .iter()
             .position(|u| {
-                *u != ADMIN_CHANNEL_KEY && self.dm_meta.get(u).is_none_or(|m| m.last_ts < last_ts)
+                *u != ADMIN_CHANNEL_KEY
+                    && self
+                        .session
+                        .chat
+                        .dm_meta
+                        .get(u)
+                        .is_none_or(|m| m.last_ts < last_ts)
             })
-            .unwrap_or(self.dm_order.len());
-        self.dm_order.insert(at, *user);
+            .unwrap_or(self.session.chat.dm_order.len());
+        self.session.chat.dm_order.insert(at, *user);
     }
 
     /// Block or unblock an account; the server answers with the whole
     /// list (`Blocks`), which does the rest.
     pub(super) fn set_blocked(&mut self, user: client::UserId, block: bool) {
-        if !self.safety || Some(user) == self.our_user_id || user == ADMIN_CHANNEL_KEY {
+        if !self.session.safety.on
+            || Some(user) == self.session.our_user_id
+            || user == ADMIN_CHANNEL_KEY
+        {
             return;
         }
         self.network
@@ -258,7 +279,7 @@ impl AppState {
         let Some((author, name)) = self.author_of_message(msg_id) else {
             return;
         };
-        let conv = match self.active_dm {
+        let conv = match self.session.chat.active_dm {
             None => client::ConvRef::General,
             Some(partner) => client::ConvRef::Dm(partner),
         };
@@ -286,7 +307,7 @@ impl AppState {
         title: &str,
         excerpt: &str,
     ) {
-        if !self.safety {
+        if !self.session.safety.on {
             return;
         }
         let reasons: Vec<slint::SharedString> = ReportReason::ALL
@@ -302,7 +323,7 @@ impl AppState {
         s.set_report_block(false);
         s.set_report_block_offered(author.is_some_and(|a| !self.is_blocked(&a)));
         s.set_report_open(true);
-        self.report = Some(PendingReport { target, author });
+        self.session.safety.report = Some(PendingReport { target, author });
     }
 
     /// Send: the report, then the block if asked for.
@@ -315,7 +336,7 @@ impl AppState {
             // Send waits for a reason; nothing to do yet.
             return;
         };
-        let Some(report) = self.report.take() else {
+        let Some(report) = self.session.safety.report.take() else {
             s.set_report_open(false);
             return;
         };
@@ -341,7 +362,7 @@ impl AppState {
     }
 
     pub(super) fn report_cancel(&mut self) {
-        self.report = None;
+        self.session.safety.report = None;
         let s = self.main.global::<State>();
         s.set_report_open(false);
         s.set_report_note("".into());
@@ -368,7 +389,7 @@ impl AppState {
 
     /// The Settings button, armed: ask the server.
     pub(crate) fn delete_account(&mut self) {
-        if !self.connected || !self.safety {
+        if !self.connected || !self.session.safety.on {
             return;
         }
         info!("Asking the server to delete our account");
@@ -413,12 +434,7 @@ impl AppState {
 
     /// Forget this session's safety state (teardown).
     pub(super) fn reset_safety(&mut self) {
-        self.safety = false;
-        self.blocked.clear();
-        self.blocks_known = false;
-        self.hidden_messages.clear();
-        self.report = None;
-        self.admin_reports.clear();
+        self.session.safety = Safety::default();
         let s = self.main.global::<State>();
         s.set_report_open(false);
         crate::settingsui::refresh_safety(self);

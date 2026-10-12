@@ -30,7 +30,7 @@ import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, ChatRow } from "globals.slint";
-import { IconBtn, AvatarTile } from "widgets.slint";
+import { IconBtn, AvatarTile, ProgressRing } from "widgets.slint";
 
 // ── Rows ────────────────────────────────────────────────────────────────
 //
@@ -128,165 +128,193 @@ component RowHeader inherits HorizontalLayout {
     Rectangle { }
 }
 
-component MessageRow inherits Rectangle {
+/// What a person's row has around its body, whatever the body is: the
+/// roster's hover tint, the right-click (and, on touch, the held
+/// finger) that opens the row's menu, the author's picture in the
+/// gutter and the name line on the first row of a run. The row puts
+/// its body inside and says where the name line goes. (Four rows each
+/// carried a copy; review P2-58.)
+component RowFrame inherits Rectangle {
     in property <ChatRow> data;
-    /// StyledText cannot be selected with the mouse, so a styled row
-    /// can be switched to its selectable plain view (menu, or a
-    /// double-click on the text) and back.
-    in property <bool> select-mode: false;
-    callback select-requested(bool);
+    /// The body is in its selectable plain view: told to the host with
+    /// the menu request (a text row's; false elsewhere).
+    in property <bool> selecting: false;
+    /// Where the row's content starts, from its top edge.
+    in property <length> top;
+    /// The name line: whether this row has one, where it starts and
+    /// what it leaves free on the right.
+    in property <bool> header-shown: root.cozy && root.head;
+    in property <length> header-x: Theme.chat-gutter;
+    in property <length> header-margin: Theme.gap-sm;
+    out property <bool> cozy: !State.compact-rows;
+    out property <bool> head: !root.data.continuation;
+    /// A long press opened the menu and the finger is still down: its
+    /// release is not a tap.
+    out property <bool> held: lp.fired;
+    /// Open the row's menu at window coordinates.
+    public function context-menu(x: length, y: length) {
+        Logic.row-context(root.data, root.selecting, x, y);
+    }
 
-    property <bool> cozy: !State.compact-rows;
-    property <bool> head: !data.continuation;
-    // Which view is up: the selectable input for plain rows and for
-    // styled rows in select mode, the StyledText otherwise.
-    property <bool> plain-view: !data.styled || root.select-mode;
-    property <length> top: root.cozy ? (root.head ? Theme.gap-sm : 2px) : (root.head ? 4px : 1px);
-    property <length> header-h: root.cozy && root.head ? Theme.chat-header : 0px;
-    height: root.top + root.header-h + cell.height + (root.cozy ? 4px : 3px);
-    // The roster's hover, here too: the TouchArea wraps the content,
-    // so its hover holds over the text bodies as well.
+    // The TouchArea wraps the content, so its hover holds over the
+    // text bodies as well.
     border-radius: Theme.radius-sm;
     background: ctx.has-hover ? Theme.hover : transparent;
     animate background { duration: 100ms; }
 
-    // Under everything: the read-only body ignores right-clicks, so
-    // they land here and open the row's menu.
+    // Under everything: a read-only body ignores right-clicks, so
+    // they land here.
     lp := LongPress {
         pressing: ctx.has-hover;
         long-pressed => {
-            Logic.row-context(data, root.select-mode,
-                ctx.absolute-position.x + ctx.mouse-x,
+            root.context-menu(ctx.absolute-position.x + ctx.mouse-x,
                 ctx.absolute-position.y + ctx.mouse-y);
         }
     }
     ctx := TouchArea {
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
-                Logic.row-context(data, root.select-mode,
-                    self.absolute-position.x + self.mouse-x,
+                root.context-menu(self.absolute-position.x + self.mouse-x,
                     self.absolute-position.y + self.mouse-y);
             }
         }
         Rectangle {
-        if root.cozy : Gutter {
-            x: 0px;
-            y: root.top;
-            height: 36px;
-            data: data;
-            head: root.head;
-            context(x, y) => { Logic.row-context(data, root.select-mode, x, y); }
-        }
-        if root.cozy && root.head : RowHeader {
-            x: Theme.chat-gutter;
-            y: root.top;
-            width: parent.width - Theme.chat-gutter - Theme.gap-sm;
-            data: data;
-        }
-        // Compact: name and time inline, in front of the body. Always
-        // instantiated (hidden in cozy) so the cell can read its width.
-        compact-head := HorizontalLayout {
-            x: Theme.gap-sm;
-            y: root.top;
-            height: cell.height;
-            visible: !root.cozy && root.head;
-            spacing: Theme.gap-sm;
-            Text {
-                text: data.user;
-                color: data.has-name-color ? data.name-color : Theme.accent-text;
-                font-size: Theme.font-body;
-                font-weight: data.name-style == 2 ? 600 : 700;
-                font-italic: data.name-style == 2;
+            if root.cozy : Gutter {
+                x: 0px;
+                y: root.top;
+                height: 36px;
+                data: root.data;
+                head: root.head;
+                context(x, y) => { root.context-menu(x, y); }
             }
-            if State.show-timestamps : Text {
-                text: data.ts;
-                color: Theme.text-muted;
-                font-size: Theme.font-sm;
-                vertical-alignment: center;
+            if root.header-shown : RowHeader {
+                x: root.header-x;
+                y: root.top;
+                width: parent.width - root.header-x - root.header-margin;
+                data: root.data;
             }
+            @children
         }
+    }
+}
 
-        // Plain messages render in a read-only TextInput (mouse
-        // selection + Ctrl/Cmd+C); styled ones in a StyledText
-        // (inline bold/italic/code — not selectable, but the
-        // right-click Copy still grabs the raw text). Both live in
-        // one cell; `visible` picks the active one and the cell
-        // tracks its height. A deleted message keeps its header and
-        // shows a muted placeholder instead.
-        cell := Rectangle {
-            x: root.cozy ? Theme.chat-gutter
-                : root.head ? Theme.gap-sm + compact-head.preferred-width + Theme.gap-sm
-                : Theme.gap-sm + 20px;
-            y: root.top + root.header-h;
-            width: parent.width - self.x - Theme.gap-sm
-                - (data.edited && !root.plain-view && !data.deleted ? mark.preferred-width + Theme.gap-sm : 0px);
-            height: data.deleted ? gone.preferred-height
-                : root.plain-view ? body.preferred-height
-                : styled-body.preferred-height;
-            // Under the StyledText: a double-click on the text
-            // (off a link) switches to the selectable view.
-            if data.styled && !root.select-mode : TouchArea {
-                double-clicked => { root.select-requested(true); }
-            }
-            body := TextInput {
-                x: 0;
-                y: 0;
-                width: 100%;
-                visible: root.plain-view && !data.deleted;
-                text: data.edited ? "\{data.body} \{Tr.chat-edited-mark}" : data.body;
-                read-only: true;
-                single-line: false;
-                // Sent and waiting for the server: muted until acked.
-                color: data.pending ? Theme.text-muted : Theme.text-secondary;
-                font-size: Theme.font-body;
-                wrap: word-wrap;
-                selection-background-color: Theme.accent;
-                selection-foreground-color: Theme.on-accent;
-                // A key on a read-only row: printable characters go
-                // to the composer (see Logic.type-through); the
-                // rest (⌘C, arrows) stays here for the selection.
-                key-pressed(ev) => {
-                    if (!ev.modifiers.control && !ev.modifiers.meta && !ev.modifiers.alt
-                        && ev.text != "") {
-                        Logic.type-through(ev.text);
-                        return accept;
-                    }
-                    reject
-                }
-            }
-            styled-body := StyledText {
-                x: 0;
-                y: 0;
-                width: 100%;
-                visible: !root.plain-view && !data.deleted;
-                text: data.body-styled;
-                default-color: Theme.text-secondary;
-                default-font-size: Theme.font-body;
-                link-color: Theme.accent-text;
-                link-clicked(url) => { Logic.link-clicked(url); }
-            }
-            gone := Text {
-                x: 0;
-                y: 0;
-                width: 100%;
-                visible: data.deleted;
-                text: Tr.chat-deleted-placeholder;
-                color: Theme.text-muted;
-                font-size: Theme.font-body;
-                font-italic: true;
-            }
+component MessageRow inherits RowFrame {
+    /// StyledText cannot be selected with the mouse, so a styled row
+    /// can be switched to its selectable plain view (menu, or a
+    /// double-click on the text) and back.
+    in property <bool> select-mode: false;
+    callback select-requested(bool);
+
+    // Which view is up: the selectable input for plain rows and for
+    // styled rows in select mode, the StyledText otherwise.
+    property <bool> plain-view: !root.data.styled || root.select-mode;
+    top: root.cozy ? (root.head ? Theme.gap-sm : 2px) : (root.head ? 4px : 1px);
+    property <length> header-h: root.cozy && root.head ? Theme.chat-header : 0px;
+    height: root.top + root.header-h + cell.height + (root.cozy ? 4px : 3px);
+    selecting: root.select-mode;
+
+    // Compact: name and time inline, in front of the body. Always
+    // instantiated (hidden in cozy) so the cell can read its width.
+    compact-head := HorizontalLayout {
+        x: Theme.gap-sm;
+        y: root.top;
+        height: cell.height;
+        visible: !root.cozy && root.head;
+        spacing: Theme.gap-sm;
+        Text {
+            text: root.data.user;
+            color: root.data.has-name-color ? root.data.name-color : Theme.accent-text;
+            font-size: Theme.font-body;
+            font-weight: root.data.name-style == 2 ? 600 : 700;
+            font-italic: root.data.name-style == 2;
         }
-        // The mark for a styled body: StyledText is pre-parsed, so it
-        // sits beside the cell rather than inside the text.
-        mark := Text {
-            x: cell.x + cell.width + Theme.gap-sm;
-            y: cell.y;
-            visible: data.edited && !root.plain-view && !data.deleted;
-            text: Tr.chat-edited-mark;
+        if State.show-timestamps : Text {
+            text: root.data.ts;
             color: Theme.text-muted;
             font-size: Theme.font-sm;
+            vertical-alignment: center;
         }
+    }
+
+    // Plain messages render in a read-only TextInput (mouse
+    // selection + Ctrl/Cmd+C); styled ones in a StyledText
+    // (inline bold/italic/code — not selectable, but the
+    // right-click Copy still grabs the raw text). Both live in
+    // one cell; `visible` picks the active one and the cell
+    // tracks its height. A deleted message keeps its header and
+    // shows a muted placeholder instead.
+    cell := Rectangle {
+        x: root.cozy ? Theme.chat-gutter
+            : root.head ? Theme.gap-sm + compact-head.preferred-width + Theme.gap-sm
+            : Theme.gap-sm + 20px;
+        y: root.top + root.header-h;
+        width: parent.width - self.x - Theme.gap-sm
+            - (root.data.edited && !root.plain-view && !root.data.deleted ? mark.preferred-width + Theme.gap-sm : 0px);
+        height: root.data.deleted ? gone.preferred-height
+            : root.plain-view ? body.preferred-height
+            : styled-body.preferred-height;
+        // Under the StyledText: a double-click on the text
+        // (off a link) switches to the selectable view.
+        if root.data.styled && !root.select-mode : TouchArea {
+            double-clicked => { root.select-requested(true); }
         }
+        body := TextInput {
+            x: 0;
+            y: 0;
+            width: 100%;
+            visible: root.plain-view && !root.data.deleted;
+            text: root.data.edited ? "\{root.data.body} \{Tr.chat-edited-mark}" : root.data.body;
+            read-only: true;
+            single-line: false;
+            // Sent and waiting for the server: muted until acked.
+            color: root.data.pending ? Theme.text-muted : Theme.text-secondary;
+            font-size: Theme.font-body;
+            wrap: word-wrap;
+            selection-background-color: Theme.accent;
+            selection-foreground-color: Theme.on-accent;
+            // A key on a read-only row: printable characters go
+            // to the composer (see Logic.type-through); the
+            // rest (⌘C, arrows) stays here for the selection.
+            key-pressed(ev) => {
+                if (!ev.modifiers.control && !ev.modifiers.meta && !ev.modifiers.alt
+                    && ev.text != "") {
+                    Logic.type-through(ev.text);
+                    return accept;
+                }
+                reject
+            }
+        }
+        styled-body := StyledText {
+            x: 0;
+            y: 0;
+            width: 100%;
+            visible: !root.plain-view && !root.data.deleted;
+            text: root.data.body-styled;
+            default-color: Theme.text-secondary;
+            default-font-size: Theme.font-body;
+            link-color: Theme.accent-text;
+            link-clicked(url) => { Logic.link-clicked(url); }
+        }
+        gone := Text {
+            x: 0;
+            y: 0;
+            width: 100%;
+            visible: root.data.deleted;
+            text: Tr.chat-deleted-placeholder;
+            color: Theme.text-muted;
+            font-size: Theme.font-body;
+            font-italic: true;
+        }
+    }
+    // The mark for a styled body: StyledText is pre-parsed, so it
+    // sits beside the cell rather than inside the text.
+    mark := Text {
+        x: cell.x + cell.width + Theme.gap-sm;
+        y: cell.y;
+        visible: root.data.edited && !root.plain-view && !root.data.deleted;
+        text: Tr.chat-edited-mark;
+        color: Theme.text-muted;
+        font-size: Theme.font-sm;
     }
 }
 
@@ -329,236 +357,166 @@ component SystemRow inherits Rectangle {
 // A bordered card under the usual header: a type glyph, the name, the
 // size, and Save. Nothing is previewed or opened; Save fetches the
 // bytes into the Downloads folder.
-component FileRow inherits Rectangle {
-    in property <ChatRow> data;
-    in property <bool> cozy: !State.compact-rows;
-    in property <bool> head: !data.continuation;
-    in property <length> top: root.cozy && root.head ? Theme.gap-xs : 2px;
+component FileRow inherits RowFrame {
+    top: root.cozy && root.head ? Theme.gap-xs : 2px;
     height: root.top + (root.cozy && root.head ? 20px : 0px) + 60px + Theme.gap-xs;
-    // The roster's hover, here too: the TouchArea wraps the content,
-    // so its hover holds over the text bodies as well.
-    border-radius: Theme.radius-sm;
-    background: ctx.has-hover ? Theme.hover : transparent;
-    animate background { duration: 100ms; }
+    header-margin: Theme.gap-md;
 
-    lp := LongPress {
-        pressing: ctx.has-hover;
-        long-pressed => {
-            Logic.row-context(data, false,
-                ctx.absolute-position.x + ctx.mouse-x,
-                ctx.absolute-position.y + ctx.mouse-y);
-        }
-    }
-    ctx := TouchArea {
-        pointer-event(ev) => {
-            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
-                Logic.row-context(data, false,
-                    self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y);
+    card := Rectangle {
+        x: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
+        y: root.top + (root.cozy && root.head ? 20px : 0px);
+        width: Math.min(360px, parent.width - self.x - Theme.gap-md);
+        height: 60px;
+        border-radius: Theme.radius-md;
+        background: Theme.bg-secondary;
+        border-width: 1px;
+        border-color: Theme.border;
+        opacity: root.data.pending ? 0.6 : 1.0;
+        HorizontalLayout {
+            padding: Theme.gap-sm;
+            spacing: Theme.gap-sm;
+            // The type word in a tile, where an image would be.
+            Rectangle {
+                width: 44px;
+                border-radius: Theme.radius-sm;
+                background: Theme.bg-tertiary;
+                Text {
+                    text: root.data.file-kind;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-xs;
+                    font-weight: 700;
+                    overflow: elide;
+                }
             }
-        }
-        Rectangle {
-        if root.cozy : Gutter {
-            x: 0px;
-            y: root.top;
-            height: 36px;
-            data: data;
-            head: root.head;
-            context(x, y) => { Logic.row-context(data, false, x, y); }
-        }
-        if root.cozy && root.head : RowHeader {
-            x: Theme.chat-gutter;
-            y: root.top;
-            width: parent.width - Theme.chat-gutter - Theme.gap-md;
-            data: data;
-        }
-        card := Rectangle {
-            x: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
-            y: root.top + (root.cozy && root.head ? 20px : 0px);
-            width: Math.min(360px, parent.width - self.x - Theme.gap-md);
-            height: 60px;
-            border-radius: Theme.radius-md;
-            background: Theme.bg-secondary;
-            border-width: 1px;
-            border-color: Theme.border;
-            opacity: data.pending ? 0.6 : 1.0;
-            HorizontalLayout {
-                padding: Theme.gap-sm;
-                spacing: Theme.gap-sm;
-                // The type word in a tile, where an image would be.
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.data.body;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-body;
+                    font-weight: 500;
+                    overflow: elide;
+                }
+                // The size — or, while bytes move, what is
+                // happening and how far along.
+                Text {
+                    text: root.data.transfer-kind == 1
+                        ? Tr.file-uploading-pct + " " + root.data.transfer-pct + "%"
+                        : root.data.transfer-kind == 2
+                        ? Tr.file-downloading-pct + " " + root.data.transfer-pct + "%"
+                        : root.data.file-meta;
+                    color: root.data.transfer-kind != 0 ? Theme.accent-text : Theme.text-muted;
+                    font-size: Theme.font-xs;
+                    overflow: elide;
+                }
+            }
+            // Already saved: a check and Open, with a small
+            // re-download beside them.
+            if root.data.transfer-kind == 0 && root.data.file-saved : HorizontalLayout {
+                spacing: Theme.gap-xs;
                 Rectangle {
-                    width: 44px;
-                    border-radius: Theme.radius-sm;
-                    background: Theme.bg-tertiary;
-                    Text {
-                        text: data.file-kind;
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                        font-weight: 700;
-                        overflow: elide;
-                    }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 2px;
-                    horizontal-stretch: 1;
-                    Text {
-                        text: data.body;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-body;
-                        font-weight: 500;
-                        overflow: elide;
-                    }
-                    // The size — or, while bytes move, what is
-                    // happening and how far along.
-                    Text {
-                        text: data.transfer-kind == 1
-                            ? Tr.file-uploading-pct + " " + data.transfer-pct + "%"
-                            : data.transfer-kind == 2
-                            ? Tr.file-downloading-pct + " " + data.transfer-pct + "%"
-                            : data.file-meta;
-                        color: data.transfer-kind != 0 ? Theme.accent-text : Theme.text-muted;
-                        font-size: Theme.font-xs;
-                        overflow: elide;
-                    }
-                }
-                // Already saved: a check and Open, with a small
-                // re-download beside them.
-                if data.transfer-kind == 0 && data.file-saved : HorizontalLayout {
-                    spacing: Theme.gap-xs;
-                    Rectangle {
-                        width: 16px;
-                        IconDisplay {
-                            icon: IconSet.Check;
-                            size: 16px;
-                            stroke: Theme.success;
-                        }
-                    }
-                    Rectangle {
-                        width: open-lbl.preferred-width + 2 * Theme.gap-sm;
-                        Rectangle {
-                            y: (parent.height - self.height) / 2;
-                            height: 28px;
-                            border-radius: Theme.radius-sm;
-                            background: open-t.has-hover ? Theme.hover : Theme.bg-tertiary;
-                            animate background { duration: 150ms; }
-                            open-lbl := Text {
-                                text: Tr.file-open;
-                                color: Theme.text-primary;
-                                font-size: Theme.font-sm;
-                                font-weight: 500;
-                                vertical-alignment: center;
-                                horizontal-alignment: center;
-                            }
-                            open-t := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { Logic.file-open(data.row-id); }
-                            }
-                        }
-                    }
-                    Rectangle {
-                        width: 28px;
-                        IconBtn {
-                            y: (parent.height - self.height) / 2;
-                            size: 28px;
-                            icon-size: 14px;
-                            icon: IconSet.Download;
-                            tooltip: Tr.file-save-again;
-                            clicked => { Logic.file-save(data.row-id); }
-                        }
+                    width: 16px;
+                    IconDisplay {
+                        icon: IconSet.Check;
+                        size: 16px;
+                        stroke: Theme.success;
                     }
                 }
                 Rectangle {
-                    width: data.file-saved && data.transfer-kind == 0 ? 0px
-                        : data.transfer-kind != 0 ? 28px + Theme.gap-xs + 28px
-                        : save-lbl.preferred-width + 2 * Theme.gap-sm;
-                    // Save — or a turning ring while a transfer runs.
-                    if data.transfer-kind == 0 && !data.file-saved : Rectangle {
+                    width: open-lbl.preferred-width + 2 * Theme.gap-sm;
+                    Rectangle {
                         y: (parent.height - self.height) / 2;
                         height: 28px;
                         border-radius: Theme.radius-sm;
-                        background: save-t.has-hover ? Theme.hover : Theme.bg-tertiary;
+                        background: open-t.has-hover ? Theme.hover : Theme.bg-tertiary;
                         animate background { duration: 150ms; }
-                        Text {
-                            text: Tr.file-save;
+                        open-lbl := Text {
+                            text: Tr.file-open;
                             color: Theme.text-primary;
                             font-size: Theme.font-sm;
                             font-weight: 500;
                             vertical-alignment: center;
                             horizontal-alignment: center;
                         }
-                        save-t := TouchArea {
-                            enabled: !data.pending;
+                        open-t := TouchArea {
                             mouse-cursor: pointer;
-                            clicked => { Logic.file-save(data.row-id); }
+                            clicked => { Logic.file-open(root.data.row-id); }
                         }
                     }
-                    // A ring that fills with the percent: determinate,
-                    // so it says how far, not just that something moves.
-                    // The ✕ beside it stops the transfer.
-                    if data.transfer-kind != 0 : Rectangle {
-                        y: (parent.height - self.height) / 2;
-                        width: 28px;
-                        height: 28px;
-                        property <float> frac: Math.clamp(data.transfer-pct, 0, 100) / 100;
-                        property <angle> sweep: frac * 360deg;
-                        property <float> ex: 9 + 8 * Math.sin(sweep);
-                        property <float> ey: 9 - 8 * Math.cos(sweep);
-                        Path {
-                            x: 5px;
-                            y: 5px;
-                            width: 18px;
-                            height: 18px;
-                            viewbox-width: 18;
-                            viewbox-height: 18;
-                            commands: "M 9 1 A 8 8 0 1 1 8.99 1";
-                            stroke: Theme.subtle;
-                            stroke-width: 2px;
-                        }
-                        Path {
-                            x: 5px;
-                            y: 5px;
-                            width: 18px;
-                            height: 18px;
-                            viewbox-width: 18;
-                            viewbox-height: 18;
-                            commands: parent.frac >= 0.999
-                                ? "M 9 1 A 8 8 0 1 1 8.99 1"
-                                : "M 9 1 A 8 8 0 \{parent.frac > 0.5 ? 1 : 0} 1 \{parent.ex} \{parent.ey}";
-                            stroke: Theme.accent-text;
-                            stroke-width: 2px;
-                            stroke-line-cap: round;
-                        }
-                    }
-                    if data.transfer-kind != 0 : IconBtn {
-                        x: 28px + Theme.gap-xs;
+                }
+                Rectangle {
+                    width: 28px;
+                    IconBtn {
                         y: (parent.height - self.height) / 2;
                         size: 28px;
                         icon-size: 14px;
-                        icon: IconSet.X;
-                        tooltip: Tr.file-cancel;
-                        clicked => { Logic.file-cancel(data.row-id); }
-                    }
-                    // Measured off-screen so the slot keeps its width
-                    // whichever face shows.
-                    save-lbl := Text {
-                        text: Tr.file-save;
-                        font-size: Theme.font-sm;
-                        font-weight: 500;
-                        visible: false;
+                        icon: IconSet.Download;
+                        tooltip: Tr.file-save-again;
+                        clicked => { Logic.file-save(root.data.row-id); }
                     }
                 }
             }
-            // A progress rail along the bottom edge.
-            if data.transfer-kind != 0 : Rectangle {
-                x: 0;
-                y: parent.height - 3px;
-                height: 3px;
-                width: parent.width * Math.clamp(data.transfer-pct, 0, 100) / 100;
-                background: Theme.accent-text;
-                animate width { duration: 150ms; }
+            Rectangle {
+                width: root.data.file-saved && root.data.transfer-kind == 0 ? 0px
+                    : root.data.transfer-kind != 0 ? 28px + Theme.gap-xs + 28px
+                    : save-lbl.preferred-width + 2 * Theme.gap-sm;
+                // Save — or a turning ring while a transfer runs.
+                if root.data.transfer-kind == 0 && !root.data.file-saved : Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: save-t.has-hover ? Theme.hover : Theme.bg-tertiary;
+                    animate background { duration: 150ms; }
+                    Text {
+                        text: Tr.file-save;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-sm;
+                        font-weight: 500;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                    save-t := TouchArea {
+                        enabled: !root.data.pending;
+                        mouse-cursor: pointer;
+                        clicked => { Logic.file-save(root.data.row-id); }
+                    }
+                }
+                // A ring that fills with the percent: determinate,
+                // so it says how far, not just that something moves.
+                // The ✕ beside it stops the transfer.
+                if root.data.transfer-kind != 0 : ProgressRing {
+                    y: (parent.height - self.height) / 2;
+                    percent: root.data.transfer-pct;
+                }
+                if root.data.transfer-kind != 0 : IconBtn {
+                    x: 28px + Theme.gap-xs;
+                    y: (parent.height - self.height) / 2;
+                    size: 28px;
+                    icon-size: 14px;
+                    icon: IconSet.X;
+                    tooltip: Tr.file-cancel;
+                    clicked => { Logic.file-cancel(root.data.row-id); }
+                }
+                // Measured off-screen so the slot keeps its width
+                // whichever face shows.
+                save-lbl := Text {
+                    text: Tr.file-save;
+                    font-size: Theme.font-sm;
+                    font-weight: 500;
+                    visible: false;
+                }
             }
         }
+        // A progress rail along the bottom edge.
+        if root.data.transfer-kind != 0 : Rectangle {
+            x: 0;
+            y: parent.height - 3px;
+            height: 3px;
+            width: parent.width * Math.clamp(root.data.transfer-pct, 0, 100) / 100;
+            background: Theme.accent-text;
+            animate width { duration: 150ms; }
         }
     }
 }
@@ -607,241 +565,143 @@ component DayMarkerRow inherits Rectangle {
     }
 }
 
-component CodeRow inherits Rectangle {
-    in property <ChatRow> data;
-    property <bool> cozy: !State.compact-rows;
-    property <bool> head: !data.continuation;
-    property <length> top: root.head ? (root.cozy ? Theme.gap-sm : 4px) : 2px;
+component CodeRow inherits RowFrame {
+    top: root.head ? (root.cozy ? Theme.gap-sm : 4px) : 2px;
     property <length> header-h: root.head ? Theme.chat-header : 0px;
     property <length> left: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
     height: root.top + root.header-h + panel.height + 6px;
-    // The roster's hover, here too: the TouchArea wraps the content,
-    // so its hover holds over the text bodies as well.
-    border-radius: Theme.radius-sm;
-    background: ctx.has-hover ? Theme.hover : transparent;
-    animate background { duration: 100ms; }
-    lp := LongPress {
-        pressing: ctx.has-hover;
-        long-pressed => {
-            Logic.row-context(data, false,
-                ctx.absolute-position.x + ctx.mouse-x,
-                ctx.absolute-position.y + ctx.mouse-y);
-        }
-    }
-    ctx := TouchArea {
-        pointer-event(ev) => {
-            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
-                Logic.row-context(data, false,
-                    self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y);
-            }
-        }
-        Rectangle {
-        if root.cozy : Gutter {
-            x: 0px;
-            y: root.top;
-            height: 36px;
-            data: data;
-            head: root.head;
-            context(x, y) => { Logic.row-context(data, false, x, y); }
-        }
-        if root.head : RowHeader {
-            x: root.left;
-            y: root.top;
-            width: parent.width - root.left - Theme.gap-sm;
-            data: data;
-        }
-        VerticalLayout {
-            x: root.left;
-            y: root.top + root.header-h;
-            width: parent.width - root.left - Theme.gap-sm;
-            panel := Rectangle {
-                height: code.preferred-height + 2 * Theme.gap-sm;
-                background: Theme.surface;
-                border-radius: Theme.radius-md;
-                border-width: 1px;
-                border-color: Theme.border;
-                // Manually positioned (no layout) so long lines can't
-                // inflate ancestors; read-only TextInput keeps code
-                // selectable — the thing people copy most.
-                code := TextInput {
-                    x: Theme.gap-sm;
-                    y: Theme.gap-sm;
-                    width: parent.width - 2 * Theme.gap-sm;
-                    text: data.body;
-                    read-only: true;
-                    single-line: false;
-                    wrap: word-wrap;
-                    color: Theme.mono-text;
-                    font-family: "monospace";
-                    font-size: Theme.font-sm;
-                    selection-background-color: Theme.accent;
-                    selection-foreground-color: Theme.on-accent;
-                    // A key on a read-only row: printable characters go
-                    // to the composer (see Logic.type-through); the
-                    // rest (⌘C, arrows) stays here for the selection.
-                    key-pressed(ev) => {
-                        if (!ev.modifiers.control && !ev.modifiers.meta && !ev.modifiers.alt
-                            && ev.text != "") {
-                            Logic.type-through(ev.text);
-                            return accept;
-                        }
-                        reject
+    header-shown: root.head;
+    header-x: root.left;
+
+    VerticalLayout {
+        x: root.left;
+        y: root.top + root.header-h;
+        width: parent.width - root.left - Theme.gap-sm;
+        panel := Rectangle {
+            height: code.preferred-height + 2 * Theme.gap-sm;
+            background: Theme.surface;
+            border-radius: Theme.radius-md;
+            border-width: 1px;
+            border-color: Theme.border;
+            // Manually positioned (no layout) so long lines can't
+            // inflate ancestors; read-only TextInput keeps code
+            // selectable — the thing people copy most.
+            code := TextInput {
+                x: Theme.gap-sm;
+                y: Theme.gap-sm;
+                width: parent.width - 2 * Theme.gap-sm;
+                text: root.data.body;
+                read-only: true;
+                single-line: false;
+                wrap: word-wrap;
+                color: Theme.mono-text;
+                font-family: "monospace";
+                font-size: Theme.font-sm;
+                selection-background-color: Theme.accent;
+                selection-foreground-color: Theme.on-accent;
+                // A key on a read-only row: printable characters go
+                // to the composer (see Logic.type-through); the
+                // rest (⌘C, arrows) stays here for the selection.
+                key-pressed(ev) => {
+                    if (!ev.modifiers.control && !ev.modifiers.meta && !ev.modifiers.alt
+                        && ev.text != "") {
+                        Logic.type-through(ev.text);
+                        return accept;
                     }
+                    reject
                 }
             }
-        }
         }
     }
 }
 
-component ImageRow inherits Rectangle {
-    in property <ChatRow> data;
+component ImageRow inherits RowFrame {
 
     // Fit within 360×280 like before, and never wider than the view.
     property <length> avail: root.width - root.left - Theme.gap-sm;
     property <float> maxw: Math.min(360.0, avail / 1px);
     property <float> scale: Math.min(1.0, Math.min(
-        maxw / Math.max(1.0, data.img-w),
-        280.0 / Math.max(1.0, data.img-h)));
-    property <length> disp-w: Math.max(1.0, data.img-w * scale) * 1px;
-    property <length> disp-h: Math.max(1.0, data.img-h * scale) * 1px;
+        maxw / Math.max(1.0, root.data.img-w),
+        280.0 / Math.max(1.0, root.data.img-h)));
+    property <length> disp-w: Math.max(1.0, root.data.img-w * scale) * 1px;
+    property <length> disp-h: Math.max(1.0, root.data.img-h * scale) * 1px;
 
-    property <bool> cozy: !State.compact-rows;
-    property <bool> head: !data.continuation;
-    property <length> top: root.head ? (root.cozy ? Theme.gap-sm : 4px) : 2px;
+    top: root.head ? (root.cozy ? Theme.gap-sm : 4px) : 2px;
     property <length> header-h: root.head ? Theme.chat-header : 0px;
     property <length> left: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
     height: root.top + root.header-h + disp-h + 6px;
-    // The roster's hover, here too: the TouchArea wraps the content,
-    // so its hover holds over the text bodies as well.
-    border-radius: Theme.radius-sm;
-    background: ctx.has-hover ? Theme.hover : transparent;
-    animate background { duration: 100ms; }
+    header-shown: root.head;
+    header-x: root.left;
 
-    lp := LongPress {
-        pressing: ctx.has-hover;
-        long-pressed => {
-            Logic.row-context(data, false,
-                ctx.absolute-position.x + ctx.mouse-x,
-                ctx.absolute-position.y + ctx.mouse-y);
-        }
-    }
-    ctx := TouchArea {
-        pointer-event(ev) => {
-            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
-                Logic.row-context(data, false,
-                    self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y);
-            }
-        }
-        Rectangle {
-        if root.cozy : Gutter {
-            x: 0px;
-            y: root.top;
-            height: 36px;
-            data: data;
-            head: root.head;
-            context(x, y) => { Logic.row-context(data, false, x, y); }
-        }
-        if root.head : RowHeader {
-            x: root.left;
-            y: root.top;
-            width: parent.width - root.left - Theme.gap-sm;
-            data: data;
-        }
-        VerticalLayout {
-            x: root.left;
-            y: root.top + root.header-h;
-            width: parent.width - root.left - Theme.gap-sm;
-            HorizontalLayout {
-                frame := Rectangle {
-                    width: root.disp-w;
-                    height: root.disp-h;
+    VerticalLayout {
+        x: root.left;
+        y: root.top + root.header-h;
+        width: parent.width - root.left - Theme.gap-sm;
+        HorizontalLayout {
+            frame := Rectangle {
+                width: root.disp-w;
+                height: root.disp-h;
+                border-radius: Theme.radius-md;
+                background: Theme.surface;
+                clip: true;
+                Image {
+                    width: 100%;
+                    height: 100%;
+                    source: root.data.image;
+                    image-fit: contain;
+                }
+                // On its way up: muted, with the ring, the percent
+                // and a ✕ over the picture (the file card's look).
+                if root.data.transfer-kind != 0 : Rectangle {
+                    background: #00000088;
                     border-radius: Theme.radius-md;
-                    background: Theme.surface;
-                    clip: true;
-                    Image {
-                        width: 100%;
-                        height: 100%;
-                        source: data.image;
-                        image-fit: contain;
-                    }
-                    // On its way up: muted, with the ring, the percent
-                    // and a ✕ over the picture (the file card's look).
-                    if data.transfer-kind != 0 : Rectangle {
-                        background: #00000088;
-                        border-radius: Theme.radius-md;
-                        HorizontalLayout {
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: Theme.gap-sm;
+                        VerticalLayout {
                             alignment: center;
-                            spacing: Theme.gap-sm;
-                            VerticalLayout {
-                                alignment: center;
-                                HorizontalLayout {
-                                    spacing: Theme.gap-sm;
-                                    Rectangle {
-                                        width: 28px;
-                                        height: 28px;
-                                        property <float> frac: Math.clamp(data.transfer-pct, 0, 100) / 100;
-                                        property <angle> sweep: frac * 360deg;
-                                        property <float> ex: 9 + 8 * Math.sin(sweep);
-                                        property <float> ey: 9 - 8 * Math.cos(sweep);
-                                        Path {
-                                            x: 5px; y: 5px; width: 18px; height: 18px;
-                                            viewbox-width: 18; viewbox-height: 18;
-                                            commands: "M 9 1 A 8 8 0 1 1 8.99 1";
-                                            stroke: #FFFFFF55;
-                                            stroke-width: 2px;
-                                        }
-                                        Path {
-                                            x: 5px; y: 5px; width: 18px; height: 18px;
-                                            viewbox-width: 18; viewbox-height: 18;
-                                            commands: parent.frac >= 0.999
-                                                ? "M 9 1 A 8 8 0 1 1 8.99 1"
-                                                : "M 9 1 A 8 8 0 \{parent.frac > 0.5 ? 1 : 0} 1 \{parent.ex} \{parent.ey}";
-                                            stroke: white;
-                                            stroke-width: 2px;
-                                            stroke-line-cap: round;
-                                        }
-                                    }
-                                    Text {
-                                        text: Tr.file-uploading-pct + " " + data.transfer-pct + "%";
-                                        color: white;
-                                        font-size: Theme.font-sm;
-                                        font-weight: 600;
-                                        vertical-alignment: center;
-                                    }
-                                    IconBtn {
-                                        size: 28px;
-                                        icon-size: 14px;
-                                        icon: IconSet.X;
-                                        tooltip: Tr.file-cancel;
-                                        clicked => { Logic.file-cancel(data.row-id); }
-                                    }
+                            HorizontalLayout {
+                                spacing: Theme.gap-sm;
+                                ProgressRing {
+                                    percent: root.data.transfer-pct;
+                                    track-color: #FFFFFF55;
+                                    ring-color: white;
+                                }
+                                Text {
+                                    text: Tr.file-uploading-pct + " " + root.data.transfer-pct + "%";
+                                    color: white;
+                                    font-size: Theme.font-sm;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                                IconBtn {
+                                    size: 28px;
+                                    icon-size: 14px;
+                                    icon: IconSet.X;
+                                    tooltip: Tr.file-cancel;
+                                    clicked => { Logic.file-cancel(root.data.row-id); }
                                 }
                             }
                         }
                     }
-                    it := TouchArea {
-                        enabled: data.transfer-kind == 0;
-                        mouse-cursor: pointer;
-                        // Not the release of a long press (its menu is open).
-                        clicked => { if (!lp.fired) { Logic.row-open-image(data.row-id); } }
-                        pointer-event(ev) => {
-                            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
-                                Logic.row-context(data, false,
-                                    self.absolute-position.x + self.mouse-x,
-                                    self.absolute-position.y + self.mouse-y);
-                            }
-                        }
-                        changed has-hover => {
-                            if (data.is-gif) { Logic.gif-hover(data.row-id, self.has-hover); }
+                }
+                it := TouchArea {
+                    enabled: root.data.transfer-kind == 0;
+                    mouse-cursor: pointer;
+                    // Not the release of a long press (its menu is open).
+                    clicked => { if (!root.held) { Logic.row-open-image(root.data.row-id); } }
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                            root.context-menu(self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
                         }
                     }
+                    changed has-hover => {
+                        if (root.data.is-gif) { Logic.gif-hover(root.data.row-id, self.has-hover); }
+                    }
                 }
-                Rectangle { }   // left-align the image
             }
-        }
+            Rectangle { }   // left-align the image
         }
     }
 }

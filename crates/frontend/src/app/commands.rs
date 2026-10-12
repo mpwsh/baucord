@@ -74,7 +74,7 @@ impl AppState {
     /// answer lands in chat.
     pub(super) fn handle_slash_command(&mut self, command: &str, args: &str) {
         // Output goes back where the command was typed.
-        self.command_conv = self.active_dm;
+        self.command_conv = self.session.chat.active_dm;
         match command {
             "invite" => self.handle_invite_command(args),
             "help" | "commands" => {
@@ -125,6 +125,7 @@ impl AppState {
                     }
                 };
                 let found = self
+                    .session
                     .users
                     .iter()
                     .find(|(_, u)| u.username.eq_ignore_ascii_case(name))
@@ -133,7 +134,7 @@ impl AppState {
                     self.push_command_output(&t!("chat-dm-unknown", "name" => name));
                     return;
                 };
-                let Some(user_id) = self.details.get(&client_id).map(|(u, _)| *u) else {
+                let Some(user_id) = self.session.details.get(&client_id).map(|(u, _)| *u) else {
                     return;
                 };
                 self.open_dm(user_id, &shown);
@@ -229,6 +230,7 @@ impl AppState {
                 // Their current roles, known while they are online.
                 let mut roles: Vec<client::RoleId> = match &target {
                     AdminTarget::User(user_id) => self
+                        .session
                         .details
                         .values()
                         .find(|(u, _)| u == user_id)
@@ -248,6 +250,7 @@ impl AppState {
             "move" => {
                 let wanted = rest.join(" ");
                 let Some(channel_id) = self
+                    .session
                     .channels
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(wanted.trim()))
@@ -268,7 +271,7 @@ impl AppState {
     /// admin can.
     pub(super) fn commands_available(&self) -> String {
         use client::permissions as p;
-        let has = |bit: u64| p::has(self.permissions, bit);
+        let has = |bit: u64| p::has(self.session.permissions, bit);
         let mut out: Vec<&str> = vec!["/help", "/history [n]", "/channel list", "/mem", "/leave"];
         if super::HOST_CAN_QUIT {
             out.push("/quit");
@@ -292,7 +295,7 @@ impl AppState {
             out.push("/unmute [voice|text] <user>");
             out.push("/bans");
         }
-        if has(p::RESTRICT) && self.safety {
+        if has(p::RESTRICT) && self.session.safety.on {
             out.push("/reports [all]");
             out.push("/resolve <id>");
         }
@@ -335,17 +338,19 @@ impl AppState {
         match verb {
             "list" => {
                 let lines: Vec<String> = self
+                    .session
                     .channels
                     .iter()
                     .map(|c| {
-                        let facts = self.channel_details.get(&c.id);
+                        let facts = self.session.channel_details.get(&c.id);
                         let owner = facts
                             .and_then(|f| f.owner)
                             .and_then(|o| {
-                                self.details
+                                self.session
+                                    .details
                                     .iter()
                                     .find(|(_, (u, _))| *u == o)
-                                    .and_then(|(client_id, _)| self.users.get(client_id))
+                                    .and_then(|(client_id, _)| self.session.users.get(client_id))
                                     .map(|u| u.username.clone())
                             })
                             .unwrap_or_else(|| t!("channel-owner-server"));
@@ -451,6 +456,7 @@ impl AppState {
     pub(super) fn edit_channel(&mut self, channel_id: u16, spec: client::ChannelSpec) {
         if let Some(server) = self.settings.default_server_mut() {
             let old_name = self
+                .session
                 .channels
                 .iter()
                 .find(|c| c.id == channel_id)
@@ -482,8 +488,8 @@ impl AppState {
     /// the facts, and the password only if it was saved locally (the
     /// server never sends it, so an edit without it clears it).
     pub(super) fn current_spec(&self, channel_id: u16) -> Option<client::ChannelSpec> {
-        let info = self.channel_infos.get(usize::from(channel_id))?;
-        let facts = self.channel_details.get(&channel_id);
+        let info = self.session.channel_infos.get(usize::from(channel_id))?;
+        let facts = self.session.channel_details.get(&channel_id);
         let password = if info.has_password {
             self.settings
                 .default_server()
@@ -503,7 +509,7 @@ impl AppState {
 
     /// The `+`: an empty dialog.
     pub(super) fn channel_create(&mut self) {
-        self.channel_dialog = Some(ChannelDialog {
+        self.session.chat.channel_dialog = Some(ChannelDialog {
             editing: None,
             min_role: None,
             pending: false,
@@ -529,10 +535,11 @@ impl AppState {
             return;
         };
         let has_password = self
+            .session
             .channel_infos
             .get(usize::from(channel_id))
             .is_some_and(|c| c.has_password);
-        self.channel_dialog = Some(ChannelDialog {
+        self.session.chat.channel_dialog = Some(ChannelDialog {
             editing: Some(channel_id),
             min_role: spec.min_role,
             pending: false,
@@ -568,7 +575,7 @@ impl AppState {
     /// "Delete channel…": confirm with the name, then send.
     pub(super) fn channel_delete(&mut self, channel_id: u16) {
         let name = self.channel_name(channel_id);
-        self.pending_confirm = Some(Confirm::DeleteChannel { channel_id });
+        self.session.chat.pending_confirm = Some(Confirm::DeleteChannel { channel_id });
         let s = self.main.global::<State>();
         s.set_confirm_title(t!("confirm-delete-channel-title", "name" => name.as_str()).into());
         s.set_confirm_body(t!("confirm-delete-channel-body").into());
@@ -579,7 +586,7 @@ impl AppState {
     /// Save on the dialog: validate what the server would refuse as
     /// `Invalid` here, with a sentence per field, then send the spec.
     pub(super) fn channel_dialog_save(&mut self) {
-        let Some(dialog) = self.channel_dialog.as_mut() else {
+        let Some(dialog) = self.session.chat.channel_dialog.as_mut() else {
             return;
         };
         if dialog.pending {
@@ -621,13 +628,14 @@ impl AppState {
     }
 
     pub(super) fn channel_dialog_cancel(&mut self) {
-        self.channel_dialog = None;
+        self.session.chat.channel_dialog = None;
         self.main.global::<State>().set_channel_dialog_open(false);
     }
 
     /// The wire id of a channel by name, case-insensitive.
     pub(super) fn channel_id_named(&self, name: &str) -> Option<u16> {
-        self.channels
+        self.session
+            .channels
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(name.trim()))
             .and_then(|i| u16::try_from(i).ok())
@@ -638,10 +646,11 @@ impl AppState {
     /// a ban to lift, a kicked person's roles).
     pub(super) fn target_for(&self, name: &str) -> AdminTarget {
         let name = name.trim_start_matches('@');
-        self.users
+        self.session
+            .users
             .iter()
             .find(|(_, u)| u.username.eq_ignore_ascii_case(name))
-            .and_then(|(client_id, _)| self.details.get(client_id))
+            .and_then(|(client_id, _)| self.session.details.get(client_id))
             .map_or_else(
                 || AdminTarget::Name(name.to_string()),
                 |(user_id, _)| AdminTarget::User(*user_id),
@@ -652,11 +661,11 @@ impl AppState {
         // A printed answer lands in the conversation shown when it was
         // asked for — a menu pick as much as a typed command.
         if matches!(then, PendingAdmin::Show) {
-            self.command_conv = self.active_dm;
+            self.command_conv = self.session.chat.active_dm;
         }
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-        self.pending_admin.insert(request_id, then);
+        self.session.pending_admin.insert(request_id, then);
         self.network
             .tx
             .send(NetworkControl::Admin {
@@ -672,6 +681,7 @@ impl AppState {
         result: Result<client::AdminOutcome, client::AdminError>,
     ) {
         let then = self
+            .session
             .pending_admin
             .remove(&request_id)
             .unwrap_or(PendingAdmin::Show);
@@ -736,7 +746,7 @@ impl AppState {
                     }
                     None => t!("tooltip-no-telemetry"),
                 };
-                self.telemetry_notes.insert(
+                self.session.telemetry_notes.insert(
                     client_id,
                     TelemetryNote {
                         fetched: Instant::now(),

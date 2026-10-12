@@ -63,19 +63,20 @@ impl AppState {
 
     fn rebuild_roster(&mut self) {
         self.roster_sync.dirty = false;
-        let sharers: HashSet<u64> = self.active_sharers.keys().copied().collect();
+        let sharers: HashSet<u64> = self.session.active_sharers.keys().copied().collect();
         let items = roster::grouped_rows(
-            &self.channels,
-            &self.users,
-            self.our_client_id,
+            &self.session.channels,
+            &self.session.users,
+            self.session.our_client_id,
             &sharers,
-            self.is_muted,
-            self.is_deafened,
+            self.session.is_muted,
+            self.session.is_deafened,
         );
         // Each account's session, once per rebuild: the look of every
         // row is found by account, and scanning `details` per row made
         // the rebuild quadratic.
         let sessions: HashMap<client::UserId, u64> = self
+            .session
             .details
             .iter()
             .map(|(client, (user, _))| (*user, *client))
@@ -107,7 +108,7 @@ impl AppState {
         }
         self.main
             .global::<State>()
-            .set_users_count_label(t!("users-count", "count" => self.users.len()).into());
+            .set_users_count_label(t!("users-count", "count" => self.session.users.len()).into());
     }
 
     /// A speaking or audio-state edge: rewrite that one row, no re-sort
@@ -121,7 +122,7 @@ impl AppState {
             self.roster_sync.dirty = true;
             return;
         }
-        let Some(user) = self.users.get(&client_id) else {
+        let Some(user) = self.session.users.get(&client_id) else {
             return;
         };
         let Some(&index) = self.roster_sync.rows.get(&client_id) else {
@@ -138,7 +139,7 @@ impl AppState {
         // shows as speaking.
         let speaking = user.is_speaking && (row.is_us || !self.client_blocked(client_id));
         let (muted, deafened) = if row.is_us {
-            (self.is_muted, self.is_deafened)
+            (self.session.is_muted, self.session.is_deafened)
         } else {
             (user.is_self_muted, user.is_self_deafened)
         };
@@ -201,12 +202,12 @@ impl AppState {
     /// The last telemetry for sessions that may see it — or a note
     /// that none arrived yet; empty for everyone else.
     pub(super) fn user_telemetry(&self, user: &roster::RosterRow) -> String {
-        if !client::permissions::has(self.permissions, client::permissions::MANAGE_USERS)
+        if !client::permissions::has(self.session.permissions, client::permissions::MANAGE_USERS)
             || user.is_us
         {
             return String::new();
         }
-        match self.telemetry_notes.get(&user.client_id) {
+        match self.session.telemetry_notes.get(&user.client_id) {
             Some(note) => note.text.clone(),
             None => t!("tooltip-no-telemetry"),
         }
@@ -307,23 +308,29 @@ impl AppState {
             let session = match sessions {
                 Some(sessions) => sessions.get(user).copied(),
                 None => self
+                    .session
                     .details
                     .iter()
                     .find(|(_, (u, _))| u == user)
                     .map(|(c, _)| *c),
             };
-            let online = session.and_then(|c| self.profiles.get(&c));
-            if let Some(look) = online.or_else(|| self.author_looks.get(user).map(|l| &l.profile)) {
+            let online = session.and_then(|c| self.session.profiles.get(&c));
+            if let Some(look) =
+                online.or_else(|| self.session.author_looks.get(user).map(|l| &l.profile))
+            {
                 return Some(look);
             }
         }
-        self.users
+        self.session
+            .users
             .iter()
-            .find(|(id, u)| (is_us && Some(**id) == self.our_client_id) || u.username == name)
-            .and_then(|(id, _)| self.profiles.get(id))
+            .find(|(id, u)| {
+                (is_us && Some(**id) == self.session.our_client_id) || u.username == name
+            })
+            .and_then(|(id, _)| self.session.profiles.get(id))
             .or_else(|| {
                 (!is_us)
-                    .then(|| self.author_looks.values().find(|l| l.name == name))
+                    .then(|| self.session.author_looks.values().find(|l| l.name == name))
                     .flatten()
                     .map(|l| &l.profile)
             })
@@ -337,7 +344,7 @@ impl AppState {
             return;
         }
         if self.settings.profile.avatar
-            && self.own_avatar_blob.is_none()
+            && self.session.own_avatar_blob.is_none()
             && let Ok(bytes) = std::fs::read(client::config::avatar_path())
         {
             self.network
@@ -359,7 +366,7 @@ impl AppState {
                 client::config::NameStyle::Italic => client::protocol::NameStyle::Italic,
             },
             avatar: if self.settings.profile.avatar {
-                self.own_avatar_blob
+                self.session.own_avatar_blob
             } else {
                 None
             },
@@ -376,8 +383,8 @@ impl AppState {
         if old == new || old.is_empty() {
             return;
         }
-        let keys: Vec<Option<client::UserId>> = std::iter::once(self.active_dm)
-            .chain(self.parked.keys().copied())
+        let keys: Vec<Option<client::UserId>> = std::iter::once(self.session.chat.active_dm)
+            .chain(self.session.chat.parked.keys().copied())
             .collect();
         for key in keys {
             self.with_conversation(key, |app| {
@@ -404,8 +411,8 @@ impl AppState {
     /// Re-apply the look of every chat row `matches` picks (its author's
     /// name, its account when known), in every conversation.
     fn refresh_looks(&mut self, matches: &dyn Fn(&str, Option<&client::UserId>) -> bool) {
-        let keys: Vec<Option<client::UserId>> = std::iter::once(self.active_dm)
-            .chain(self.parked.keys().copied())
+        let keys: Vec<Option<client::UserId>> = std::iter::once(self.session.chat.active_dm)
+            .chain(self.session.chat.parked.keys().copied())
             .collect();
         for key in keys {
             self.with_conversation(key, |app| {
@@ -443,7 +450,7 @@ impl AppState {
     /// The picture changed locally: the server's hash for it no longer
     /// applies (the next `send_own_profile` uploads the new one).
     pub fn forget_avatar_blob(&mut self) {
-        self.own_avatar_blob = None;
+        self.session.own_avatar_blob = None;
     }
 
     /// Our own look changed in Settings: our rows follow at once.
@@ -465,7 +472,7 @@ impl AppState {
         let name = self.username_of(client_id);
         let account = self.account_of(client_id);
         if let Some(user) = account {
-            self.author_looks.insert(
+            self.session.author_looks.insert(
                 user,
                 AuthorLook {
                     name: name.clone(),
@@ -473,7 +480,7 @@ impl AppState {
                 },
             );
         }
-        self.profiles.insert(client_id, profile);
+        self.session.profiles.insert(client_id, profile);
         self.update_user_list();
         self.rebuild_dms_model();
         match account {
@@ -488,7 +495,7 @@ impl AppState {
     pub(super) fn take_authors(&mut self, authors: Vec<client::protocol::AuthorInfo>) {
         for author in authors {
             if let Some(client_id) = author.client_id {
-                self.lurkers.insert(client_id, author.user_id);
+                self.session.lurkers.insert(client_id, author.user_id);
                 let fallback = client::network::fallback_username(client_id);
                 self.rename_author(&fallback, &author.name);
             }
@@ -507,11 +514,11 @@ impl AppState {
     ) {
         self.want_avatar(profile.avatar);
         let look = AuthorLook { name, profile };
-        if self.author_looks.get(&user) == Some(&look) {
+        if self.session.author_looks.get(&user) == Some(&look) {
             return;
         }
         let name = look.name.clone();
-        self.author_looks.insert(user, look);
+        self.session.author_looks.insert(user, look);
         self.rebuild_dms_model();
         self.refresh_account_look(&user, &name);
     }
@@ -529,7 +536,7 @@ impl AppState {
         match std::fs::read(&cached) {
             Ok(bytes) => self.take_avatar_bytes(blob, &bytes, false),
             Err(_) => {
-                if self.avatar_fetches.insert(blob) {
+                if self.session.avatar_fetches.insert(blob) {
                     self.network
                         .tx
                         .send(NetworkControl::FetchBlob { blob_id: blob })
@@ -573,12 +580,14 @@ impl AppState {
         // Whoever's picture this is, their rows can show it now: by
         // account (everyone the session has one for), else by name.
         let online: Vec<String> = self
+            .session
             .profiles
             .iter()
             .filter(|(c, p)| p.avatar == Some(blob) && self.account_of(**c).is_none())
-            .filter_map(|(c, _)| self.users.get(c).map(|u| u.username.clone()))
+            .filter_map(|(c, _)| self.session.users.get(c).map(|u| u.username.clone()))
             .collect();
         let accounts: Vec<(client::UserId, String)> = self
+            .session
             .author_looks
             .iter()
             .filter(|(_, l)| l.profile.avatar == Some(blob))
@@ -651,23 +660,24 @@ impl AppState {
     /// The pointer rests on a user row: fetch their last telemetry
     /// for the tooltip when we may, at most once every ten seconds.
     pub(super) fn user_hovered(&mut self, index: i32) {
-        if !client::permissions::has(self.permissions, client::permissions::MANAGE_USERS) {
+        if !client::permissions::has(self.session.permissions, client::permissions::MANAGE_USERS) {
             return;
         }
         let Some(client_id) = self.user_id_at(index) else {
             return;
         };
-        if Some(client_id) == self.our_client_id {
+        if Some(client_id) == self.session.our_client_id {
             return;
         }
         let fresh = self
+            .session
             .telemetry_notes
             .get(&client_id)
             .is_some_and(|n| n.fetched.elapsed() < Duration::from_secs(10));
         if fresh {
             return;
         }
-        let Some((user_id, _)) = self.details.get(&client_id) else {
+        let Some((user_id, _)) = self.session.details.get(&client_id) else {
             return;
         };
         let target = AdminTarget::User(*user_id);

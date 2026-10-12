@@ -208,7 +208,7 @@ fn palette(app: &AppState) -> Vec<u32> {
     let mut colors = NAME_COLORS.to_vec();
     // The band follows the permission, not the role: a custom role
     // may hold it, and an "everything but gold" role may not.
-    if client::permissions::has(app.permissions, client::permissions::GOLD_NAME) {
+    if client::permissions::has(app.session.permissions, client::permissions::GOLD_NAME) {
         colors.push(GOLD);
     }
     colors
@@ -351,9 +351,11 @@ pub fn refresh_role_line(app: &AppState) {
 pub fn refresh_safety(app: &AppState) {
     let Some(sf) = surface(app) else { return };
     let s = sf.state();
-    let on = app.connected && app.safety;
+    let on = app.connected && app.session.safety.on;
     s.set_safety(on);
     let mut rows: Vec<BlockedRow> = app
+        .session
+        .safety
         .blocked
         .iter()
         .map(|(user, name)| BlockedRow {
@@ -506,6 +508,33 @@ pub(crate) fn wire_page(main: &MainWindow) {
     wire(&SettingsSurface::Page(main));
 }
 
+/// The page's plain switches, one row each: the `SettingsState`
+/// setter, the `SettingsLogic` handler, and the field of `Settings`
+/// both stand for (then what to refresh, where a change shows at
+/// once). `populate` and `wire` each expand the table, so a switch
+/// cannot be shown from one field and saved into another, and a new
+/// one is a line here — it was a setter in one function and a closure
+/// 350 lines further down (review P3-35).
+macro_rules! switches {
+    ($apply:ident) => {
+        $apply! {
+            set_auto_connect, on_auto_connect_changed => startup.auto_connect;
+            set_start_minimized, on_start_minimized_changed => startup.start_minimized;
+            set_check_updates, on_check_updates_changed => startup.check_updates;
+            set_sounds_enabled, on_sounds_enabled_changed => sounds.enabled;
+            set_join_leave_sounds, on_join_leave_sounds_changed => sounds.join_leave;
+            set_mention_sound, on_mention_sound_changed => sounds.mention;
+            set_dm_sound, on_dm_sound_changed => sounds.direct_message;
+            set_share_started_sound, on_share_started_sound_changed => sounds.share_started;
+            set_viewer_joined_sound, on_viewer_joined_sound_changed => sounds.viewer_joined;
+            set_notify_messages, on_notify_messages_changed => notifications.messages;
+            set_notify_first_join, on_notify_first_join_changed => notifications.first_join;
+            set_show_timestamps, on_show_timestamps_changed => ui.show_timestamps, push_ui_prefs;
+            set_compact_rows, on_compact_rows_changed => ui.compact_rows, push_ui_prefs;
+        }
+    };
+}
+
 /// Fill every `SettingsState` property from current settings + devices.
 pub fn populate(app: &mut AppState) {
     let Some(sf) = surface(app) else { return };
@@ -554,22 +583,15 @@ pub fn populate(app: &mut AppState) {
     // Debug: what the last send or clear said belongs to that visit.
     s.set_debug_status("".into());
     refresh_log(app);
-    // Startup / sounds / chat.
-    s.set_auto_connect(settings.startup.auto_connect);
-    s.set_start_minimized(settings.startup.start_minimized);
+    // Startup / sounds / chat: the switches, each from its field.
+    macro_rules! show {
+        ($($set:ident, $on:ident => $($field:ident).+ $(, $then:ident)?;)*) => {
+            $( s.$set(settings.$($field).+); )*
+        };
+    }
+    switches!(show);
     s.set_tray_available(cfg!(feature = "tray"));
-    s.set_check_updates(settings.startup.check_updates);
-    s.set_sounds_enabled(settings.sounds.enabled);
-    s.set_join_leave_sounds(settings.sounds.join_leave);
-    s.set_mention_sound(settings.sounds.mention);
-    s.set_dm_sound(settings.sounds.direct_message);
-    s.set_share_started_sound(settings.sounds.share_started);
-    s.set_viewer_joined_sound(settings.sounds.viewer_joined);
     s.set_notifications_available(crate::host::notifies());
-    s.set_notify_messages(settings.notifications.messages);
-    s.set_notify_first_join(settings.notifications.first_join);
-    s.set_show_timestamps(settings.ui.show_timestamps);
-    s.set_compact_rows(settings.ui.compact_rows);
     let sizes: Vec<slint::SharedString> = IMAGE_SIZES
         .iter()
         .map(|(label, _)| {
@@ -904,51 +926,21 @@ fn wire(sf: &SettingsSurface<'_>) {
             refresh_log(app);
         });
     });
-    logic.on_sounds_enabled_changed(|on| {
-        app::with_current(move |app| app.settings.sounds.enabled = on);
-    });
-    logic.on_join_leave_sounds_changed(|on| {
-        app::with_current(move |app| app.settings.sounds.join_leave = on);
-    });
-    logic.on_mention_sound_changed(|on| {
-        app::with_current(move |app| app.settings.sounds.mention = on);
-    });
-    logic.on_dm_sound_changed(|on| {
-        app::with_current(move |app| app.settings.sounds.direct_message = on);
-    });
-    logic.on_share_started_sound_changed(|on| {
-        app::with_current(move |app| app.settings.sounds.share_started = on);
-    });
-    logic.on_viewer_joined_sound_changed(|on| {
-        app::with_current(move |app| app.settings.sounds.viewer_joined = on);
-    });
-    logic.on_notify_messages_changed(|on| {
-        app::with_current(move |app| app.settings.notifications.messages = on);
-    });
-    logic.on_notify_first_join_changed(|on| {
-        app::with_current(move |app| app.settings.notifications.first_join = on);
-    });
-    logic.on_auto_connect_changed(|on| {
-        app::with_current(move |app| app.settings.startup.auto_connect = on);
-    });
-    logic.on_start_minimized_changed(|on| {
-        app::with_current(move |app| app.settings.startup.start_minimized = on);
-    });
-    logic.on_check_updates_changed(|on| {
-        app::with_current(move |app| app.settings.startup.check_updates = on);
-    });
-    logic.on_show_timestamps_changed(|on| {
-        app::with_current(move |app| {
-            app.settings.ui.show_timestamps = on;
-            app.push_ui_prefs();
-        });
-    });
-    logic.on_compact_rows_changed(|on| {
-        app::with_current(move |app| {
-            app.settings.ui.compact_rows = on;
-            app.push_ui_prefs();
-        });
-    });
+    // The switches: each saves into the field `populate` showed it
+    // from.
+    macro_rules! save {
+        ($($set:ident, $on:ident => $($field:ident).+ $(, $then:ident)?;)*) => {
+            $(
+                logic.$on(|on| {
+                    app::with_current(move |app| {
+                        app.settings.$($field).+ = on;
+                        $( app.$then(); )?
+                    });
+                });
+            )*
+        };
+    }
+    switches!(save);
     logic.on_image_size_selected(|index| {
         app::with_current(move |app| {
             if let Some((_, kb)) = usize::try_from(index).ok().and_then(|i| IMAGE_SIZES.get(i)) {

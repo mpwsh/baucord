@@ -162,6 +162,29 @@ pub enum ScreenControl {
     Shutdown,
 }
 
+/// What travels with a decoded frame from the screen thread to the
+/// window that shows it: whose it is, its size, and the figures the
+/// viewer's stats line and the stream's summary report. One struct all
+/// the way (it was listed field by field four times; review P3-36): a
+/// new figure is added here and where it is read.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameMeta {
+    pub client_id: u64,
+    pub width: u32,
+    pub height: u32,
+    /// The encoded frame's size.
+    pub frame_bytes: usize,
+    pub seq: u32,
+    /// When the jitter buffer released the frame for decoding (after
+    /// its playout hold), so `decoded_at - enqueued_at` is decode
+    /// latency alone.
+    pub enqueued_at: Instant,
+    pub decoded_at: Instant,
+    pub buffer_depth_ms: f32,
+    pub buffer_target_ms: f32,
+    pub buffer_jitter_ms: f32,
+}
+
 #[derive(Debug, Clone)]
 pub enum ScreenEvent {
     /// Our screen share started successfully.
@@ -176,21 +199,9 @@ pub enum ScreenEvent {
     /// gets shown. They come from `video::pool`: give them back with
     /// `video::pool::recycle` when done.
     FrameReady {
-        client_id: u64,
-        width: u32,
-        height: u32,
+        meta: FrameMeta,
         pixels: Vec<u8>,
         format: video::PictureFormat,
-        frame_bytes: usize,
-        seq: u32,
-        /// When the jitter buffer released the frame for decoding (after
-        /// its playout hold), so `decoded_at - enqueued_at` is decode
-        /// latency alone.
-        enqueued_at: Instant,
-        decoded_at: Instant,
-        buffer_depth_ms: f32,
-        buffer_target_ms: f32,
-        buffer_jitter_ms: f32,
     },
     /// A remote peer started sharing (so UI can show "Watch" button).
     PeerStartedSharing {
@@ -1265,20 +1276,22 @@ fn emit_picture(
     }
     event_tx
         .send(ScreenEvent::FrameReady {
-            client_id,
-            width: decoded.width,
-            height: decoded.height,
+            meta: FrameMeta {
+                client_id,
+                width: decoded.width,
+                height: decoded.height,
+                frame_bytes: fed.frame_bytes,
+                seq: fed.seq,
+                enqueued_at: fed.enqueued_at,
+                decoded_at,
+                buffer_depth_ms: stream.jitter_buffer.depth_ms(),
+                // The buffer's steady hold; the reorder window this
+                // showed is gone (review P1-12).
+                buffer_target_ms: stream.jitter_buffer.playout_delay_ms(),
+                buffer_jitter_ms: stream.jitter_buffer.adaptive_jitter_ms(),
+            },
             pixels: decoded.data,
             format: decoded.format,
-            frame_bytes: fed.frame_bytes,
-            seq: fed.seq,
-            enqueued_at: fed.enqueued_at,
-            decoded_at,
-            buffer_depth_ms: stream.jitter_buffer.depth_ms(),
-            // The buffer's steady hold; the reorder window this showed
-            // is gone (review P1-12).
-            buffer_target_ms: stream.jitter_buffer.playout_delay_ms(),
-            buffer_jitter_ms: stream.jitter_buffer.adaptive_jitter_ms(),
         })
         .ok();
     report

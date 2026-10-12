@@ -15,7 +15,7 @@ import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
-import { Btn, IconBtn, Card, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph } from "widgets.slint";
+import { Btn, IconBtn, Modal, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph } from "widgets.slint";
 import { SettingsWindow, SettingsPanel, SettingsState, SettingsLogic } from "settings.slint";
 import { AdminWindow, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow } from "admin.slint";
 import { StreamViewerWindow, StreamViewerPanel } from "viewer.slint";
@@ -613,59 +613,44 @@ export component MainWindow inherits Window {
     }
 
     // ── Image send preview (modal overlay) ─────────────────────────
-    if State.preview-open : Rectangle {
-        background: #000000AA;
-        TouchArea { clicked => { Logic.preview-cancel(); } }
+    if State.preview-open : Modal {
+        card-width: 520px;
+        dismissed => { Logic.preview-cancel(); }
         // Enter = Send, Escape = Cancel — same paths as the buttons;
         // the shell refocuses the composer after the dialog closes.
-        preview-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Return) { Logic.preview-send(); return accept; }
-                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.preview-cancel(); return accept; }
-                reject
+        key(ev) => {
+            if (ev.text == Key.Return) { Logic.preview-send(); return accept; }
+            reject
+        }
+        Text {
+            text: Tr.image-preview-title;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+        Rectangle {
+            height: 300px;
+            border-radius: Theme.radius-md;
+            background: Theme.surface;
+            clip: true;
+            Image {
+                width: parent.width - 2 * Theme.gap-sm;
+                height: parent.height - 2 * Theme.gap-sm;
+                source: State.preview-image;
+                image-fit: contain;
             }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: Math.min(520px, root.width - 48px);
-                height: pv.preferred-height;
-                TouchArea { }   // swallow clicks inside the card
-                pv := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    Text {
-                        text: Tr.image-preview-title;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
-                        horizontal-alignment: center;
-                    }
-                    Rectangle {
-                        height: 300px;
-                        border-radius: Theme.radius-md;
-                        background: Theme.surface;
-                        clip: true;
-                        Image {
-                            width: parent.width - 2 * Theme.gap-sm;
-                            height: parent.height - 2 * Theme.gap-sm;
-                            source: State.preview-image;
-                            image-fit: contain;
-                        }
-                    }
-                    Text {
-                        text: State.preview-caption;
-                        color: Theme.text-muted;
-                        font-size: Theme.font-sm;
-                        horizontal-alignment: center;
-                    }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        Btn { text: Tr.cancel; clicked => { Logic.preview-cancel(); } }
-                        Btn { text: Tr.send; accent: true; clicked => { Logic.preview-send(); } }
-                    }
-                }
-            }
+        }
+        Text {
+            text: State.preview-caption;
+            color: Theme.text-muted;
+            font-size: Theme.font-sm;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn { text: Tr.cancel; clicked => { Logic.preview-cancel(); } }
+            Btn { text: Tr.send; accent: true; clicked => { Logic.preview-send(); } }
         }
     }
 
@@ -792,55 +777,37 @@ export component MainWindow inherits Window {
     }
 
     // ── Screen-share dialog (modal overlay) ────────────────────────
-    if root.share-dialog-open : Rectangle {
-        background: #000000AA;
-        TouchArea { clicked => { root.share-dialog-open = false; } }
-        share-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape || ev.text == Key.Back) { root.share-dialog-open = false; return accept; }
-                reject
-            }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: 380px;
-                height: sh.preferred-height;
-                TouchArea { }
-                sh := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    Text {
-                        text: Tr.share-screen;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
-                    }
-                    FieldLabel { text: Tr.monitor; }
-                    Dropdown {
-                        options: State.monitors;
-                        current <=> root.share-monitor;
-                    }
-                    FieldLabel { text: Tr.quality; }
-                    Dropdown {
-                        options: State.qualities;
-                        current <=> root.share-quality;
-                    }
-                    FieldLabel { text: Tr.share-visibility; }
-                    Dropdown {
-                        options: [Tr.share-channel-only, Tr.share-everyone];
-                        current <=> root.share-scope;
-                    }
-                    Btn {
-                        text: Tr.start-sharing;
-                        accent: true;
-                        clicked => {
-                            root.share-dialog-open = false;
-                            Logic.start-share(root.share-monitor, root.share-quality,
-                                root.share-scope == 1);
-                        }
-                    }
-                }
+    if root.share-dialog-open : Modal {
+        card-width: 380px;
+        dismissed => { root.share-dialog-open = false; }
+        Text {
+            text: Tr.share-screen;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+        }
+        FieldLabel { text: Tr.monitor; }
+        Dropdown {
+            options: State.monitors;
+            current <=> root.share-monitor;
+        }
+        FieldLabel { text: Tr.quality; }
+        Dropdown {
+            options: State.qualities;
+            current <=> root.share-quality;
+        }
+        FieldLabel { text: Tr.share-visibility; }
+        Dropdown {
+            options: [Tr.share-channel-only, Tr.share-everyone];
+            current <=> root.share-scope;
+        }
+        Btn {
+            text: Tr.start-sharing;
+            accent: true;
+            clicked => {
+                root.share-dialog-open = false;
+                Logic.start-share(root.share-monitor, root.share-quality,
+                    root.share-scope == 1);
             }
         }
     }
@@ -848,56 +815,38 @@ export component MainWindow inherits Window {
     // Opened by the shell when a locked channel is clicked with no
     // saved password, or when the server answers WrongPassword. OK
     // saves the password on the server entry and retries the join.
-    if State.channel-prompt-open : Rectangle {
-        background: #000000AA;
-        TouchArea { clicked => { Logic.channel-password-cancel(); } }
-        chp-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.channel-password-cancel(); return accept; }
-                reject
+    if State.channel-prompt-open : Modal {
+        card-width: 340px;
+        dismissed => { Logic.channel-password-cancel(); }
+        opened => { chp-field.focus-input(); }
+        Text {
+            text: "\{Tr.channel-password-title} — \{State.channel-prompt-name}";
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+            overflow: elide;
+        }
+        chp-field := Field {
+            placeholder: Tr.channel-password-title;
+            secret: true;
+            text <=> State.channel-password;
+            accepted => { Logic.channel-password-ok(); }
+        }
+        if State.channel-prompt-error != "" : Text {
+            text: State.channel-prompt-error;
+            color: Theme.danger;
+            font-size: Theme.font-xs;
+        }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn {
+                text: Tr.cancel;
+                clicked => { Logic.channel-password-cancel(); }
             }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: 340px;
-                height: chp.preferred-height;
-                TouchArea { }
-                chp := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    Text {
-                        text: "\{Tr.channel-password-title} — \{State.channel-prompt-name}";
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
-                        overflow: elide;
-                    }
-                    chp-field := Field {
-                        placeholder: Tr.channel-password-title;
-                        secret: true;
-                        text <=> State.channel-password;
-                        init => { self.focus-input(); }
-                        accepted => { Logic.channel-password-ok(); }
-                    }
-                    if State.channel-prompt-error != "" : Text {
-                        text: State.channel-prompt-error;
-                        color: Theme.danger;
-                        font-size: Theme.font-xs;
-                    }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        Btn {
-                            text: Tr.cancel;
-                            clicked => { Logic.channel-password-cancel(); }
-                        }
-                        Btn {
-                            text: Tr.channel-join;
-                            accent: true;
-                            clicked => { Logic.channel-password-ok(); }
-                        }
-                    }
-                }
+            Btn {
+                text: Tr.channel-join;
+                accent: true;
+                clicked => { Logic.channel-password-ok(); }
             }
         }
     }
@@ -906,136 +855,121 @@ export component MainWindow inherits Window {
     // Pick who the code admits, for how long and how many times; the
     // code appears in the same dialog once the server minted it (and
     // is on the clipboard already). Escape closes.
-    if State.invite-dialog-open : Rectangle {
-        background: #000000AA;
-        TouchArea { clicked => { Logic.invite-dialog-cancel(); } }
-        inv-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.invite-dialog-cancel(); return accept; }
-                if (ev.text == Key.Return && State.invite-dialog-code == "") {
-                    Logic.invite-dialog-create();
-                    return accept;
-                }
-                reject
+    if State.invite-dialog-open : Modal {
+        card-width: 400px;
+        dismissed => { Logic.invite-dialog-cancel(); }
+        key(ev) => {
+            if (ev.text == Key.Return && State.invite-dialog-code == "") {
+                Logic.invite-dialog-create();
+                return accept;
             }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: Math.min(400px, root.width - 48px);
-                height: invd.preferred-height;
-                TouchArea { }
-                invd := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
+            reject
+        }
+        Text {
+            text: Tr.invite-dialog-title;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+        }
+        if State.invite-dialog-code == "" : VerticalLayout {
+            spacing: Theme.gap-md;
+            VerticalLayout {
+                spacing: Theme.gap-xs;
+                FieldLabel { text: Tr.invite-role; }
+                Dropdown {
+                    options: State.invite-role-options;
+                    current <=> State.invite-dialog-role;
+                }
+            }
+            HorizontalLayout {
+                spacing: Theme.gap-md;
+                VerticalLayout {
+                    spacing: Theme.gap-xs;
+                    FieldLabel { text: Tr.invite-expiry; }
+                    Dropdown {
+                        options: State.invite-expiry-options;
+                        current <=> State.invite-dialog-expiry;
+                    }
+                }
+                VerticalLayout {
+                    spacing: Theme.gap-xs;
+                    FieldLabel { text: Tr.invite-uses-label; }
+                    Dropdown {
+                        options: State.invite-uses-options;
+                        current <=> State.invite-dialog-uses;
+                    }
+                }
+            }
+            if State.invite-dialog-expiry > 1 && !State.perm-manage-invites : Hint {
+                text: Tr.invite-expiry-note;
+            }
+        }
+        // The minted code: big, monospace, one click to copy.
+        if State.invite-dialog-code != "" : VerticalLayout {
+            spacing: Theme.gap-sm;
+            Rectangle {
+                height: 56px;
+                border-radius: Theme.radius-md;
+                background: code-t.has-hover ? Theme.hover : Theme.bg-primary;
+                border-width: 1px;
+                border-color: Theme.border;
+                animate background { duration: 150ms; }
+                HorizontalLayout {
+                    padding-left: Theme.gap-md;
+                    padding-right: Theme.gap-md;
+                    spacing: Theme.gap-sm;
                     Text {
-                        text: Tr.invite-dialog-title;
+                        text: State.invite-dialog-code;
                         color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
+                        font-family: "monospace";
+                        font-size: Theme.font-lg;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
                     }
-                    if State.invite-dialog-code == "" : VerticalLayout {
-                        spacing: Theme.gap-md;
-                        VerticalLayout {
-                            spacing: Theme.gap-xs;
-                            FieldLabel { text: Tr.invite-role; }
-                            Dropdown {
-                                options: State.invite-role-options;
-                                current <=> State.invite-dialog-role;
-                            }
-                        }
-                        HorizontalLayout {
-                            spacing: Theme.gap-md;
-                            VerticalLayout {
-                                spacing: Theme.gap-xs;
-                                FieldLabel { text: Tr.invite-expiry; }
-                                Dropdown {
-                                    options: State.invite-expiry-options;
-                                    current <=> State.invite-dialog-expiry;
-                                }
-                            }
-                            VerticalLayout {
-                                spacing: Theme.gap-xs;
-                                FieldLabel { text: Tr.invite-uses-label; }
-                                Dropdown {
-                                    options: State.invite-uses-options;
-                                    current <=> State.invite-dialog-uses;
-                                }
-                            }
-                        }
-                        if State.invite-dialog-expiry > 1 && !State.perm-manage-invites : Hint {
-                            text: Tr.invite-expiry-note;
-                        }
-                    }
-                    // The minted code: big, monospace, one click to copy.
-                    if State.invite-dialog-code != "" : VerticalLayout {
-                        spacing: Theme.gap-sm;
-                        Rectangle {
-                            height: 56px;
-                            border-radius: Theme.radius-md;
-                            background: code-t.has-hover ? Theme.hover : Theme.bg-primary;
-                            border-width: 1px;
-                            border-color: Theme.border;
-                            animate background { duration: 150ms; }
-                            HorizontalLayout {
-                                padding-left: Theme.gap-md;
-                                padding-right: Theme.gap-md;
-                                spacing: Theme.gap-sm;
-                                Text {
-                                    text: State.invite-dialog-code;
-                                    color: Theme.text-primary;
-                                    font-family: "monospace";
-                                    font-size: Theme.font-lg;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                }
-                                Rectangle {
-                                    width: 18px;
-                                    IconDisplay {
-                                        icon: IconSet.Copy;
-                                        size: 18px;
-                                        stroke: Theme.text-secondary;
-                                    }
-                                }
-                            }
-                            code-t := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { Logic.invite-dialog-copy(); }
-                            }
-                        }
-                        Text {
-                            text: State.invite-dialog-summary;
-                            color: Theme.text-secondary;
-                            font-size: Theme.font-sm;
-                            wrap: word-wrap;
-                        }
-                        Hint { text: Tr.invite-share-hint; }
-                    }
-                    if State.invite-dialog-error != "" : Text {
-                        text: State.invite-dialog-error;
-                        color: Theme.danger-text;
-                        font-size: Theme.font-sm;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        Btn {
-                            text: State.invite-dialog-code == "" ? Tr.cancel : Tr.invite-close;
-                            clicked => { Logic.invite-dialog-cancel(); }
-                        }
-                        if State.invite-dialog-code == "" : Btn {
-                            text: Tr.invite-create;
-                            accent: true;
-                            clicked => { Logic.invite-dialog-create(); }
-                        }
-                        if State.invite-dialog-code != "" : Btn {
-                            text: Tr.invite-copy;
-                            accent: true;
-                            clicked => { Logic.invite-dialog-copy(); }
+                    Rectangle {
+                        width: 18px;
+                        IconDisplay {
+                            icon: IconSet.Copy;
+                            size: 18px;
+                            stroke: Theme.text-secondary;
                         }
                     }
                 }
+                code-t := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Logic.invite-dialog-copy(); }
+                }
+            }
+            Text {
+                text: State.invite-dialog-summary;
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                wrap: word-wrap;
+            }
+            Hint { text: Tr.invite-share-hint; }
+        }
+        if State.invite-dialog-error != "" : Text {
+            text: State.invite-dialog-error;
+            color: Theme.danger-text;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn {
+                text: State.invite-dialog-code == "" ? Tr.cancel : Tr.invite-close;
+                clicked => { Logic.invite-dialog-cancel(); }
+            }
+            if State.invite-dialog-code == "" : Btn {
+                text: Tr.invite-create;
+                accent: true;
+                clicked => { Logic.invite-dialog-create(); }
+            }
+            if State.invite-dialog-code != "" : Btn {
+                text: Tr.invite-copy;
+                accent: true;
+                clicked => { Logic.invite-dialog-copy(); }
             }
         }
     }
@@ -1044,102 +978,84 @@ export component MainWindow inherits Window {
     // The host validates the numbers and sends the spec; the dialog
     // stays open until the server's list update (success) or its
     // refusal, shown inline. Escape cancels, Enter in a field saves.
-    if State.channel-dialog-open : Rectangle {
-        background: #000000AA;
-        TouchArea { clicked => { Logic.channel-dialog-cancel(); } }
-        ch-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.channel-dialog-cancel(); return accept; }
-                reject
+    if State.channel-dialog-open : Modal {
+        card-width: 400px;
+        dismissed => { Logic.channel-dialog-cancel(); }
+        opened => { chd-name.focus-input(); }
+        Text {
+            text: State.channel-dialog-title;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+            overflow: elide;
+        }
+        VerticalLayout {
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.channel-name; }
+            chd-name := Field {
+                text <=> State.channel-dialog-name;
+                placeholder: Tr.channel-name-placeholder;
+                accepted => { Logic.channel-dialog-save(); }
             }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: Math.min(400px, root.width - 48px);
-                height: chd.preferred-height;
-                TouchArea { }
-                chd := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    Text {
-                        text: State.channel-dialog-title;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
-                        overflow: elide;
-                    }
-                    VerticalLayout {
-                        spacing: Theme.gap-xs;
-                        FieldLabel { text: Tr.channel-name; }
-                        Field {
-                            text <=> State.channel-dialog-name;
-                            placeholder: Tr.channel-name-placeholder;
-                            init => { self.focus-input(); }
-                            accepted => { Logic.channel-dialog-save(); }
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: Theme.gap-xs;
-                        FieldLabel { text: Tr.channel-password-title; }
-                        Field {
-                            text <=> State.channel-dialog-password;
-                            placeholder: Tr.channel-password-placeholder;
-                            secret: true;
-                            accepted => { Logic.channel-dialog-save(); }
-                        }
-                        if State.channel-dialog-password-note != "" : Hint {
-                            text: State.channel-dialog-password-note;
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: Theme.gap-md;
-                        VerticalLayout {
-                            spacing: Theme.gap-xs;
-                            FieldLabel { text: Tr.channel-limit; }
-                            Field {
-                                text <=> State.channel-dialog-limit;
-                                placeholder: Tr.channel-limit-placeholder;
-                                accepted => { Logic.channel-dialog-save(); }
-                            }
-                        }
-                        VerticalLayout {
-                            spacing: Theme.gap-xs;
-                            FieldLabel { text: Tr.channel-afk; }
-                            Field {
-                                text <=> State.channel-dialog-afk;
-                                placeholder: Tr.channel-afk-placeholder;
-                                accepted => { Logic.channel-dialog-save(); }
-                            }
-                        }
-                    }
-                    CheckRow {
-                        text: Tr.channel-keep;
-                        hint: Tr.channel-keep-hint;
-                        checked <=> State.channel-dialog-keep;
-                    }
-                    CheckRow {
-                        text: Tr.channel-members-only;
-                        hint: Tr.channel-members-only-hint;
-                        checked <=> State.channel-dialog-members-only;
-                    }
-                    if State.channel-dialog-error != "" : Text {
-                        text: State.channel-dialog-error;
-                        color: Theme.danger;
-                        font-size: Theme.font-sm;
-                        wrap: word-wrap;
-                    }
-                    if !State.server-persistent : Hint { text: Tr.channel-not-persistent-note; }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        Btn { text: Tr.cancel; clicked => { Logic.channel-dialog-cancel(); } }
-                        Btn {
-                            text: State.channel-dialog-editing ? Tr.channel-save : Tr.channel-create;
-                            accent: true;
-                            clicked => { Logic.channel-dialog-save(); }
-                        }
-                    }
+        }
+        VerticalLayout {
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.channel-password-title; }
+            Field {
+                text <=> State.channel-dialog-password;
+                placeholder: Tr.channel-password-placeholder;
+                secret: true;
+                accepted => { Logic.channel-dialog-save(); }
+            }
+            if State.channel-dialog-password-note != "" : Hint {
+                text: State.channel-dialog-password-note;
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.gap-md;
+            VerticalLayout {
+                spacing: Theme.gap-xs;
+                FieldLabel { text: Tr.channel-limit; }
+                Field {
+                    text <=> State.channel-dialog-limit;
+                    placeholder: Tr.channel-limit-placeholder;
+                    accepted => { Logic.channel-dialog-save(); }
                 }
+            }
+            VerticalLayout {
+                spacing: Theme.gap-xs;
+                FieldLabel { text: Tr.channel-afk; }
+                Field {
+                    text <=> State.channel-dialog-afk;
+                    placeholder: Tr.channel-afk-placeholder;
+                    accepted => { Logic.channel-dialog-save(); }
+                }
+            }
+        }
+        CheckRow {
+            text: Tr.channel-keep;
+            hint: Tr.channel-keep-hint;
+            checked <=> State.channel-dialog-keep;
+        }
+        CheckRow {
+            text: Tr.channel-members-only;
+            hint: Tr.channel-members-only-hint;
+            checked <=> State.channel-dialog-members-only;
+        }
+        if State.channel-dialog-error != "" : Text {
+            text: State.channel-dialog-error;
+            color: Theme.danger;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+        if !State.server-persistent : Hint { text: Tr.channel-not-persistent-note; }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn { text: Tr.cancel; clicked => { Logic.channel-dialog-cancel(); } }
+            Btn {
+                text: State.channel-dialog-editing ? Tr.channel-save : Tr.channel-create;
+                accent: true;
+                clicked => { Logic.channel-dialog-save(); }
             }
         }
     }
@@ -1147,43 +1063,28 @@ export component MainWindow inherits Window {
     // ── Generic confirm (delete a message, later a channel) ────────
     // Title and button repeat the consequence; Enter confirms, Escape
     // cancels. The host remembers what is being confirmed.
-    if State.confirm-open : Rectangle {
-        background: #000000AA;
-        TouchArea { clicked => { Logic.confirm-cancel(); } }
-        confirm-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.confirm-cancel(); return accept; }
-                if (ev.text == Key.Return) { Logic.confirm-accept(); return accept; }
-                reject
-            }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: Math.min(360px, root.width - 48px);
-                height: cf.preferred-height;
-                TouchArea { }
-                cf := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    Text {
-                        text: State.confirm-title;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
-                        wrap: word-wrap;
-                    }
-                    if State.confirm-body != "" : Hint { text: State.confirm-body; }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        Btn { text: Tr.cancel; clicked => { Logic.confirm-cancel(); } }
-                        Btn {
-                            text: State.confirm-label;
-                            danger: true;
-                            clicked => { Logic.confirm-accept(); }
-                        }
-                    }
-                }
+    if State.confirm-open : Modal {
+        card-width: 360px;
+        dismissed => { Logic.confirm-cancel(); }
+        key(ev) => {
+            if (ev.text == Key.Return) { Logic.confirm-accept(); return accept; }
+            reject
+        }
+        Text {
+            text: State.confirm-title;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        if State.confirm-body != "" : Hint { text: State.confirm-body; }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn { text: Tr.cancel; clicked => { Logic.confirm-cancel(); } }
+            Btn {
+                text: State.confirm-label;
+                danger: true;
+                clicked => { Logic.confirm-accept(); }
             }
         }
     }
@@ -1193,66 +1094,48 @@ export component MainWindow inherits Window {
     // confirm label repeat the consequence, so the dialog is
     // answerable without reading the body; Escape cancels, Enter in
     // the reason field confirms.
-    if State.moderation-open : Rectangle {
-        background: #000000AA;
-        TouchArea { clicked => { Logic.moderation-cancel(); } }
-        mod-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.moderation-cancel(); return accept; }
-                reject
+    if State.moderation-open : Modal {
+        card-width: 380px;
+        dismissed => { Logic.moderation-cancel(); }
+        opened => { mod-reason.focus-input(); }
+        Text {
+            text: State.moderation-title;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        Hint { text: State.moderation-hint; }
+        if State.moderation-durations.length > 0 : VerticalLayout {
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.moderation-duration; }
+            Dropdown {
+                options: State.moderation-durations;
+                current <=> State.moderation-duration;
             }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: Math.min(380px, root.width - 48px);
-                height: md.preferred-height;
-                TouchArea { }
-                md := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    Text {
-                        text: State.moderation-title;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
-                        wrap: word-wrap;
-                    }
-                    Hint { text: State.moderation-hint; }
-                    if State.moderation-durations.length > 0 : VerticalLayout {
-                        spacing: Theme.gap-xs;
-                        FieldLabel { text: Tr.moderation-duration; }
-                        Dropdown {
-                            options: State.moderation-durations;
-                            current <=> State.moderation-duration;
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: Theme.gap-xs;
-                        FieldLabel { text: Tr.moderation-reason; }
-                        Field {
-                            placeholder: Tr.moderation-reason-placeholder;
-                            text <=> State.moderation-reason;
-                            init => { self.focus-input(); }
-                            accepted => { Logic.moderation-confirm(); }
-                        }
-                    }
-                    if !State.server-persistent : Hint { text: Tr.server-not-persistent-note; }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        Btn { text: Tr.cancel; clicked => { Logic.moderation-cancel(); } }
-                        Btn {
-                            text: State.moderation-confirm-label;
-                            // Mutes and disconnects are reversible; the
-                            // raspberry fill is for the two that are not.
-                            danger: State.moderation-action == ModAction.kick
-                                || State.moderation-action == ModAction.ban;
-                            accent: State.moderation-action != ModAction.kick
-                                && State.moderation-action != ModAction.ban;
-                            clicked => { Logic.moderation-confirm(); }
-                        }
-                    }
-                }
+        }
+        VerticalLayout {
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.moderation-reason; }
+            mod-reason := Field {
+                placeholder: Tr.moderation-reason-placeholder;
+                text <=> State.moderation-reason;
+                accepted => { Logic.moderation-confirm(); }
+            }
+        }
+        if !State.server-persistent : Hint { text: Tr.server-not-persistent-note; }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn { text: Tr.cancel; clicked => { Logic.moderation-cancel(); } }
+            Btn {
+                text: State.moderation-confirm-label;
+                // Mutes and disconnects are reversible; the
+                // raspberry fill is for the two that are not.
+                danger: State.moderation-action == ModAction.kick
+                    || State.moderation-action == ModAction.ban;
+                accent: State.moderation-action != ModAction.kick
+                    && State.moderation-action != ModAction.ban;
+                clicked => { Logic.moderation-confirm(); }
             }
         }
     }
@@ -1261,83 +1144,65 @@ export component MainWindow inherits Window {
     // A reason is required (Send waits for it); the note is optional,
     // and "Also block them" is offered while they are not blocked yet.
     // Escape cancels.
-    if State.report-open : Rectangle {
-        background: #000000AA;
-        TouchArea { clicked => { Logic.report-cancel(); } }
-        report-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.report-cancel(); return accept; }
-                reject
+    if State.report-open : Modal {
+        card-width: 400px;
+        dismissed => { Logic.report-cancel(); }
+        Text {
+            text: State.report-title;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        if State.report-excerpt != "" : Rectangle {
+            border-radius: Theme.radius-sm;
+            background: Theme.bg-primary;
+            border-width: 1px;
+            border-color: Theme.border;
+            height: quote.preferred-height + 2 * Theme.gap-sm;
+            quote := Text {
+                x: Theme.gap-sm;
+                width: parent.width - 2 * Theme.gap-sm;
+                text: State.report-excerpt;
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                wrap: word-wrap;
+                overflow: elide;
+                max-height: 80px;
             }
-            Card {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: Math.min(400px, root.width - 48px);
-                height: rp.preferred-height;
-                TouchArea { }
-                rp := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    Text {
-                        text: State.report-title;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
-                        wrap: word-wrap;
-                    }
-                    if State.report-excerpt != "" : Rectangle {
-                        border-radius: Theme.radius-sm;
-                        background: Theme.bg-primary;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        height: quote.preferred-height + 2 * Theme.gap-sm;
-                        quote := Text {
-                            x: Theme.gap-sm;
-                            width: parent.width - 2 * Theme.gap-sm;
-                            text: State.report-excerpt;
-                            color: Theme.text-secondary;
-                            font-size: Theme.font-sm;
-                            wrap: word-wrap;
-                            overflow: elide;
-                            max-height: 80px;
-                        }
-                    }
-                    Hint { text: Tr.report-hint; }
-                    VerticalLayout {
-                        spacing: Theme.gap-xs;
-                        FieldLabel { text: Tr.report-reason; }
-                        Dropdown {
-                            options: State.report-reasons;
-                            current <=> State.report-reason;
-                            placeholder: Tr.report-reason-placeholder;
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: Theme.gap-xs;
-                        FieldLabel { text: Tr.report-note; }
-                        Field {
-                            placeholder: Tr.report-note-placeholder;
-                            text <=> State.report-note;
-                            accepted => { if (State.report-reason >= 0) { Logic.report-send(); } }
-                        }
-                    }
-                    if State.report-block-offered : CheckRow {
-                        text: Tr.report-also-block;
-                        hint: Tr.report-also-block-hint;
-                        checked <=> State.report-block;
-                    }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        Btn { text: Tr.cancel; clicked => { Logic.report-cancel(); } }
-                        Btn {
-                            text: Tr.report-send;
-                            accent: true;
-                            enabled: State.report-reason >= 0;
-                            clicked => { Logic.report-send(); }
-                        }
-                    }
-                }
+        }
+        Hint { text: Tr.report-hint; }
+        VerticalLayout {
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.report-reason; }
+            Dropdown {
+                options: State.report-reasons;
+                current <=> State.report-reason;
+                placeholder: Tr.report-reason-placeholder;
+            }
+        }
+        VerticalLayout {
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.report-note; }
+            Field {
+                placeholder: Tr.report-note-placeholder;
+                text <=> State.report-note;
+                accepted => { if (State.report-reason >= 0) { Logic.report-send(); } }
+            }
+        }
+        if State.report-block-offered : CheckRow {
+            text: Tr.report-also-block;
+            hint: Tr.report-also-block-hint;
+            checked <=> State.report-block;
+        }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn { text: Tr.cancel; clicked => { Logic.report-cancel(); } }
+            Btn {
+                text: Tr.report-send;
+                accent: true;
+                enabled: State.report-reason >= 0;
+                clicked => { Logic.report-send(); }
             }
         }
     }

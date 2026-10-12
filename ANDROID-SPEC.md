@@ -235,7 +235,7 @@ twins under `src/stubs/` for the phones; `cargo check -p frontend
 `main.rs` alone (ARCHITECTURE §7.1).
 
 Where a phone needs the platform, the first draft's `Platform` trait
-became `frontend::host::Hooks` (`stubs/host.rs`), which each phone
+became `frontend::host::Hooks` (`host.rs`), which each phone
 host installs at startup: pick a file, save a download, open a file
 or a link, keep alive (the service), keep the screen on, copy text,
 post and cancel notifications, play a chime. Android's implementation

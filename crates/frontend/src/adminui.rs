@@ -30,24 +30,24 @@ pub const TAB_REPORTS: i32 = 8;
 /// Audit entries per page.
 const AUDIT_PAGE: u16 = 50;
 
-/// An action the panel asked about; it runs on "confirm" with the
-/// reason typed into the dialog, when it takes one.
+/// What the panel asked about; it runs on "confirm".
 #[derive(Debug, Clone)]
 pub enum PanelAction {
-    Disconnect(AdminTarget),
-    Kick(AdminTarget),
-    Ban(AdminTarget),
-    Purge(AdminTarget),
-    ResetProfile(AdminTarget),
-    DeleteRole(u32),
-    DeleteBlob(client::protocol::BlobId),
+    /// An admin command as it will be sent, and the tab its answer
+    /// refreshes. One that takes a reason gets the one typed into the
+    /// dialog. (This used to be a second enum re-describing
+    /// `AdminCommand` variant by variant, and a match turning one back
+    /// into the other; review P3-34.)
+    Admin(AdminCommand, i32),
+    /// A channel goes through the channel message, not the admin
+    /// channel.
     DeleteChannel(u16),
-    RevokeInvite(String),
-    Lift(u64),
-    /// A reported message, deleted for everyone (Reports tab).
-    DeleteMessage(u64),
-    /// Banning a reported person; refreshes the Reports tab.
-    BanReported(AdminTarget),
+}
+
+impl PanelAction {
+    fn on_users(command: AdminCommand) -> Self {
+        Self::Admin(command, TAB_USERS)
+    }
 }
 
 /// Open the panel (creating it on first use) on `tab`.
@@ -159,7 +159,7 @@ fn wire(win: &AdminWindow) {
                 let name = app.role_name_of(role);
                 ask(
                     app,
-                    PanelAction::DeleteRole(role),
+                    PanelAction::Admin(AdminCommand::DeleteRole { role }, TAB_ROLES),
                     t!("admin-confirm-delete-role", "name" => name.as_str()),
                     t!("admin-confirm-delete-role-text"),
                     t!("admin-delete"),
@@ -180,7 +180,7 @@ fn wire(win: &AdminWindow) {
             if let Ok(restriction_id) = u64::try_from(id) {
                 ask(
                     app,
-                    PanelAction::Lift(restriction_id),
+                    PanelAction::Admin(AdminCommand::Lift { restriction_id }, TAB_RESTRICTIONS),
                     t!("admin-confirm-lift"),
                     t!("admin-confirm-lift-text"),
                     t!("admin-lift"),
@@ -193,7 +193,12 @@ fn wire(win: &AdminWindow) {
         app::with_current(move |app| {
             ask(
                 app,
-                PanelAction::RevokeInvite(code.to_string()),
+                PanelAction::Admin(
+                    AdminCommand::RevokeInvite {
+                        code: code.to_string(),
+                    },
+                    TAB_INVITES,
+                ),
                 t!("admin-confirm-revoke", "code" => code.as_str()),
                 t!("admin-confirm-revoke-text"),
                 t!("admin-revoke"),
@@ -219,6 +224,7 @@ fn wire(win: &AdminWindow) {
         app::with_current(move |app| {
             if let Ok(id) = u16::try_from(id) {
                 let name = app
+                    .session
                     .channels
                     .iter()
                     .find(|c| c.id == id)
@@ -239,7 +245,7 @@ fn wire(win: &AdminWindow) {
             if let Some(blob_id) = app::parse_hex_id(&hex) {
                 ask(
                     app,
-                    PanelAction::DeleteBlob(blob_id),
+                    PanelAction::Admin(AdminCommand::DeleteBlob { blob_id }, TAB_FILES),
                     t!("admin-confirm-delete-file"),
                     t!("admin-confirm-delete-file-text"),
                     t!("admin-delete"),
@@ -265,7 +271,7 @@ fn wire(win: &AdminWindow) {
             };
             ask(
                 app,
-                PanelAction::DeleteMessage(msg_id),
+                PanelAction::Admin(AdminCommand::DeleteMessage { msg_id }, TAB_REPORTS),
                 t!("confirm-delete-message-title"),
                 t!("confirm-delete-message-body-admin"),
                 t!("confirm-delete-message"),
@@ -284,7 +290,14 @@ fn wire(win: &AdminWindow) {
             let name = report.target_name.clone();
             ask(
                 app,
-                PanelAction::BanReported(AdminTarget::User(user)),
+                PanelAction::Admin(
+                    AdminCommand::Ban {
+                        target: AdminTarget::User(user),
+                        duration_secs: None,
+                        reason: String::new(),
+                    },
+                    TAB_REPORTS,
+                ),
                 t!("admin-confirm-ban", "name" => name.as_str()),
                 t!("admin-confirm-ban-text"),
                 t!("admin-ban"),
@@ -555,7 +568,7 @@ pub fn take_outcome(app: &mut AppState, tab: i32, outcome: AdminOutcome) {
         AdminOutcome::Reports(list) => {
             let rows: Vec<AdminReportRow> = list.iter().map(report_row).collect();
             s.set_reports(ModelRc::new(VecModel::from(rows)));
-            app.admin_reports = list;
+            app.session.safety.admin_reports = list;
         }
         AdminOutcome::Telemetry(_) => {}
     }
@@ -592,7 +605,7 @@ fn report_row(r: &client::protocol::ReportSummary) -> AdminReportRow {
 /// The report behind a row's id, as last fetched.
 fn report_by_id(app: &AppState, id: i32) -> Option<&client::protocol::ReportSummary> {
     let id = u64::try_from(id).ok()?;
-    app.admin_reports.iter().find(|r| r.id == id)
+    app.session.safety.admin_reports.iter().find(|r| r.id == id)
 }
 
 /// A refusal the panel asked for.
@@ -610,7 +623,8 @@ fn fill_roles(app: &mut AppState) {
         return;
     };
     let holders = |id: client::RoleId| {
-        app.details
+        app.session
+            .details
             .values()
             .filter(|(_, roles)| roles.contains(&id))
             .count()
@@ -618,7 +632,7 @@ fn fill_roles(app: &mut AppState) {
     let rows: Vec<AdminRoleRow> = app
         .role_table_in_rank_order()
         .into_iter()
-        .filter_map(|id| app.roles.get(&id))
+        .filter_map(|id| app.session.roles.get(&id))
         .map(|r| AdminRoleRow {
             id: i32::try_from(r.id).unwrap_or(-1),
             name: r.name.as_str().into(),
@@ -654,14 +668,21 @@ fn fill_channels(app: &mut AppState) {
         return;
     };
     let rows: Vec<AdminChannelRow> = app
+        .session
         .channels
         .iter()
         .filter(|c| Some(c.name.as_str()) != app.lobby_name.as_deref())
         .map(|c| AdminChannelRow {
             id: i32::from(c.id),
             name: c.name.as_str().into(),
-            members: i32::try_from(app.users.values().filter(|u| u.channel_id == c.id).count())
-                .unwrap_or(0),
+            members: i32::try_from(
+                app.session
+                    .users
+                    .values()
+                    .filter(|u| u.channel_id == c.id)
+                    .count(),
+            )
+            .unwrap_or(0),
             owner: if c.owned {
                 t!("admin-yours").into()
             } else {
@@ -680,7 +701,9 @@ fn role_select(app: &mut AppState, id: i32) {
         return;
     };
     let s = win.global::<AdminState>();
-    let current = u32::try_from(id).ok().and_then(|id| app.roles.get(&id));
+    let current = u32::try_from(id)
+        .ok()
+        .and_then(|id| app.session.roles.get(&id));
     let bits = current.map_or(client::permissions::GUEST_PERMISSIONS, |r| r.permissions);
     let on: Vec<bool> = client::permissions::PERMISSION_NAMES
         .iter()
@@ -760,35 +783,48 @@ fn user_action(app: &mut AppState, user_id: &str, action: i32) {
     let n = name.as_str();
     let (pending, title, text, label, reason) = match action {
         1 => (
-            PanelAction::Disconnect(target),
+            PanelAction::on_users(AdminCommand::Disconnect {
+                target,
+                reason: String::new(),
+            }),
             t!("admin-confirm-disconnect", "name" => n),
             t!("admin-confirm-disconnect-text"),
             t!("admin-disconnect"),
             true,
         ),
         2 => (
-            PanelAction::Kick(target),
+            PanelAction::on_users(AdminCommand::Kick {
+                target,
+                reason: String::new(),
+            }),
             t!("admin-confirm-kick", "name" => n),
             t!("admin-confirm-kick-text"),
             t!("admin-kick"),
             true,
         ),
         3 => (
-            PanelAction::Ban(target),
+            PanelAction::on_users(AdminCommand::Ban {
+                target,
+                duration_secs: None,
+                reason: String::new(),
+            }),
             t!("admin-confirm-ban", "name" => n),
             t!("admin-confirm-ban-text"),
             t!("admin-ban"),
             true,
         ),
         4 => (
-            PanelAction::Purge(target),
+            PanelAction::on_users(AdminCommand::PurgeUser { target }),
             t!("admin-confirm-purge", "name" => n),
             t!("admin-confirm-purge-text"),
             t!("admin-purge"),
             false,
         ),
         5 => (
-            PanelAction::ResetProfile(target),
+            PanelAction::on_users(AdminCommand::ResetProfile {
+                target,
+                lock: false,
+            }),
             t!("admin-confirm-reset-profile", "name" => n),
             t!("admin-confirm-reset-profile-text"),
             t!("admin-reset-profile"),
@@ -817,7 +853,12 @@ fn ask(
     s.set_confirm_label(label.into());
     s.set_confirm_asks_reason(asks_reason);
     s.set_confirm_reason("".into());
-    s.set_confirm_danger(!matches!(action, PanelAction::Lift(_)));
+    // Lifting a restriction is the one confirmed action that takes
+    // nothing away.
+    s.set_confirm_danger(!matches!(
+        action,
+        PanelAction::Admin(AdminCommand::Lift { .. }, _)
+    ));
     s.set_confirm_open(true);
     app.admin_pending = Some(action);
 }
@@ -837,71 +878,22 @@ fn confirm_accept(app: &mut AppState) {
         })
         .unwrap_or_default();
     match action {
-        PanelAction::Disconnect(target) => app.send_admin(
-            AdminCommand::Disconnect { target, reason },
-            PendingAdmin::Panel(TAB_USERS),
-        ),
-        PanelAction::Kick(target) => app.send_admin(
-            AdminCommand::Kick { target, reason },
-            PendingAdmin::Panel(TAB_USERS),
-        ),
-        PanelAction::Ban(target) => app.send_admin(
-            AdminCommand::Ban {
-                target,
-                duration_secs: None,
-                reason,
-            },
-            PendingAdmin::Panel(TAB_USERS),
-        ),
-        PanelAction::Purge(target) => {
-            app.send_admin(
-                AdminCommand::PurgeUser { target },
-                PendingAdmin::Panel(TAB_USERS),
-            );
+        PanelAction::Admin(mut command, tab) => {
+            if let AdminCommand::Restrict { reason: slot, .. }
+            | AdminCommand::Disconnect { reason: slot, .. }
+            | AdminCommand::Kick { reason: slot, .. }
+            | AdminCommand::Ban { reason: slot, .. } = &mut command
+            {
+                *slot = reason;
+            }
+            app.send_admin(command, PendingAdmin::Panel(tab));
         }
-        PanelAction::ResetProfile(target) => app.send_admin(
-            AdminCommand::ResetProfile {
-                target,
-                lock: false,
-            },
-            PendingAdmin::Panel(TAB_USERS),
-        ),
-        PanelAction::DeleteRole(role) => {
-            app.send_admin(
-                AdminCommand::DeleteRole { role },
-                PendingAdmin::Panel(TAB_ROLES),
-            );
-        }
-        PanelAction::DeleteBlob(blob_id) => app.send_admin(
-            AdminCommand::DeleteBlob { blob_id },
-            PendingAdmin::Panel(TAB_FILES),
-        ),
         PanelAction::DeleteChannel(channel_id) => {
             app.network
                 .tx
                 .send(NetworkControl::DeleteChannel { channel_id })
                 .ok();
         }
-        PanelAction::RevokeInvite(code) => app.send_admin(
-            AdminCommand::RevokeInvite { code },
-            PendingAdmin::Panel(TAB_INVITES),
-        ),
-        PanelAction::Lift(restriction_id) => app.send_admin(
-            AdminCommand::Lift { restriction_id },
-            PendingAdmin::Panel(TAB_RESTRICTIONS),
-        ),
-        PanelAction::DeleteMessage(msg_id) => app.send_admin(
-            AdminCommand::DeleteMessage { msg_id },
-            PendingAdmin::Panel(TAB_REPORTS),
-        ),
-        PanelAction::BanReported(target) => app.send_admin(
-            AdminCommand::Ban {
-                target,
-                duration_secs: None,
-                reason,
-            },
-            PendingAdmin::Panel(TAB_REPORTS),
-        ),
     }
 }
 

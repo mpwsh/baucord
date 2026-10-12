@@ -271,11 +271,12 @@ otherwise).
   `profiles`, `stats`, `alerts`, `activity`, `safety`), `settingsui`,
   `adminui`, `media`,
   `viewers`, `present`, `resources`, `notice` (what a phone's
-  notification is), and the host seams `host`, `clipboard`, `hotkeys`
-  and `updater` behind the `desktop` feature, with same-API twins under
-  `src/stubs/` for the phones (`instance` is desktop-only, with no
-  twin) — the phones' `host` takes a `Hooks` object their crate
-  installs (files, links, the keep-alive, notifications).
+  notification is), `host` (one module: a `Hooks` object answers —
+  the desktop's own `DesktopHooks`, or what a phone's crate installs:
+  files, links, the keep-alive, notifications), and the host seams
+  `clipboard`, `hotkeys` and `updater` behind the `desktop` feature,
+  with same-API twins under `src/stubs/` for the phones (`instance`
+  is desktop-only, with no twin).
 - `desktop` — `main.rs` alone: logging, the config directory, the
   single instance, the panic hook, `frontend::app::run()`.
 - `android` — the cdylib host: `lib.rs` (`android_main`), `java.rs`
@@ -623,6 +624,21 @@ Memory-mode servers (persistence off) still use the legacy
   menu was the case, review P2-16 — has to read
   `cursor-position-byte-offset` / `anchor-position-byte-offset` before
   it opens and do the edit host-side (`app_core::composer`).
+- **A new dialog is a `Modal`** (`widgets.slint`): `card-width`,
+  `dismissed` (Escape, Back, a click outside), `key` for Return, the
+  content as children. A field that should have the keyboard is
+  focused in the dialog's `opened`, never in the field's own `init`:
+  that one runs *before* the component's, whose scope then takes the
+  keyboard back (found the hard way — no render shows it).
+- **A person's chat row inherits `RowFrame`** (`chat.slint`): it sets
+  `top` and where the name line goes and puts its body inside. In a
+  component that inherits another, the base's properties are not in
+  scope unqualified: `root.data`, not `data`.
+- **What belongs to one connection goes in `Session`** (`app.rs`; or
+  its `Safety`, `Transfers`, `ChatFlow`), not in `AppState`: the
+  teardown replaces it whole, so nothing has to be remembered there.
+  A session thing that also shows on screen is cleared where it is
+  shown, beside the reset.
 - **A wrapped `Text` inside a `HorizontalLayout` inside a
   `VerticalLayout` reports one line's height**, and the next element
   is drawn over the rest. Give the box an explicit `height:

@@ -239,17 +239,21 @@ impl Viewer {
     }
 
     /// Blit a decoded frame and refresh the once-per-second stats line.
-    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+    #[allow(clippy::cast_precision_loss)]
     pub fn update_frame(
         &mut self,
         buffer: slint::SharedPixelBuffer<slint::Rgba8Pixel>,
-        width: u32,
-        height: u32,
-        frame_bytes: usize,
-        buffer_depth_ms: f32,
-        buffer_target_ms: f32,
-        buffer_jitter_ms: f32,
+        meta: &client::screen::FrameMeta,
     ) {
+        let client::screen::FrameMeta {
+            width,
+            height,
+            frame_bytes,
+            buffer_depth_ms,
+            buffer_target_ms,
+            buffer_jitter_ms,
+            ..
+        } = *meta;
         // A minimized window: stop the stream's decoding until it is
         // restored (Slint's flag is enough here — it is current on
         // Windows and macOS, and where it is not, decoding just goes

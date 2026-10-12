@@ -479,6 +479,95 @@ export component Card inherits Rectangle {
     background: Theme.bg-secondary;
 }
 
+/// A dialog over the window: the scrim, a card in the middle of it, and
+/// the ways out every dialog has — a click on the scrim, Escape, and
+/// Android's Back, which arrives as a key. What is put inside is laid
+/// out as a column in the card. (Eight dialogs each carried a copy of
+/// this, Back handling included; review P2-58.)
+///
+/// The dialog takes the keyboard when it appears. A dialog that wants
+/// its first field focused does that in `opened`, not in the field's
+/// own `init`: that one runs before this component's, and the scope
+/// then took the keyboard back — typing and Enter went nowhere.
+export component Modal inherits Rectangle {
+    /// The card's width, where the window has the room.
+    in property <length> card-width: 380px;
+    /// The dialog is up and has the keyboard: focus a field here.
+    callback opened();
+    /// Escape, Back, or a click outside the card.
+    callback dismissed();
+    /// Any other key no field inside took: Return for the dialog's
+    /// default action.
+    callback key(KeyEvent) -> EventResult;
+
+    background: Theme.scrim;
+    TouchArea { clicked => { root.dismissed(); } }
+    FocusScope {
+        init => {
+            self.focus();
+            root.opened();
+        }
+        key-pressed(ev) => {
+            if (ev.text == Key.Escape || ev.text == Key.Back) {
+                root.dismissed();
+                return accept;
+            }
+            return root.key(ev);
+        }
+        Card {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: Math.min(root.card-width, root.width - 48px);
+            height: body.preferred-height;
+            TouchArea { }   // swallow clicks inside the card
+            body := VerticalLayout {
+                padding: Theme.gap-lg;
+                spacing: Theme.gap-md;
+                @children
+            }
+        }
+    }
+}
+
+/// A ring that fills with a percent: determinate, so it says how far,
+/// not just that something moves. 28 px square, the ring 18 px in it.
+export component ProgressRing inherits Rectangle {
+    in property <int> percent;
+    in property <brush> track-color: Theme.subtle;
+    in property <brush> ring-color: Theme.accent-text;
+    property <float> frac: Math.clamp(root.percent, 0, 100) / 100;
+    property <angle> sweep: frac * 360deg;
+    property <float> ex: 9 + 8 * Math.sin(sweep);
+    property <float> ey: 9 - 8 * Math.cos(sweep);
+    width: 28px;
+    height: 28px;
+    Path {
+        x: 5px;
+        y: 5px;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 18;
+        viewbox-height: 18;
+        commands: "M 9 1 A 8 8 0 1 1 8.99 1";
+        stroke: root.track-color;
+        stroke-width: 2px;
+    }
+    Path {
+        x: 5px;
+        y: 5px;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 18;
+        viewbox-height: 18;
+        commands: root.frac >= 0.999
+            ? "M 9 1 A 8 8 0 1 1 8.99 1"
+            : "M 9 1 A 8 8 0 \{root.frac > 0.5 ? 1 : 0} 1 \{root.ex} \{root.ey}";
+        stroke: root.ring-color;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+    }
+}
+
 /// Small field label above a control.
 export component FieldLabel inherits Text {
     color: Theme.text-secondary;

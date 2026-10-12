@@ -176,7 +176,7 @@ impl AppState {
             }
         }
         let mut parked_rows = 0usize;
-        for conv in self.parked.values() {
+        for conv in self.session.chat.parked.values() {
             parked_rows += conv.model.row_count();
             for i in 0..conv.model.row_count() {
                 if let Some(row) = conv.model.row_data(i)
@@ -201,15 +201,15 @@ impl AppState {
              {} GIF players ({gifs_playing} playing)\n\
              avatars: {} decoded, {:.1} MB (+{:.1} MB ours)\n\
              roster: {} users, {} profiles; {viewers} stream viewers open",
-            self.parked.len(),
+            self.session.chat.parked.len(),
             mb(preview_bytes),
             mb(compressed),
             self.gifs.len(),
             self.avatar_images.len(),
             mb(avatars),
             mb(own_avatar),
-            self.users.len(),
-            self.profiles.len(),
+            self.session.users.len(),
+            self.session.profiles.len(),
         )
     }
 

@@ -664,10 +664,12 @@ every host; `desktop` is `main.rs` alone (the config directory from
 panic hook, `frontend::app::run()`), and the phone hosts (§7.2) are as
 thin. Host-only pieces — the
 winit window hooks, the system clipboard, global hotkeys, the single
-instance, the updater, native dialogs and the URL launcher (the
-`host` module) — sit behind `frontend`'s `desktop` feature; without it
-each compiles to a same-API twin under `src/stubs/`, which is what
-`cargo check -p frontend --no-default-features` builds.
+instance and the updater — sit behind `frontend`'s `desktop` feature;
+without it each compiles to a same-API twin under `src/stubs/`, which
+is what `cargo check -p frontend --no-default-features` builds.
+Native dialogs and the URL launcher are the `host` module's
+`DesktopHooks`, one implementation of the trait the phones implement
+too.
 
 Profile flow: `send_own_profile` runs after `Session` and on Save &
 close of Settings when the look changed (`profile_dirty`); with a
@@ -735,8 +737,9 @@ stream viewer as pages inside the one window, ANDROID-SPEC D22/D23).
   `notices.rs`: UserNotifications; `session.rs`: the audio session).
   No Swift.
 
-The phones' hooks are one trait, `frontend::host::Hooks`
-(`stubs/host.rs`), that each host installs at startup: pick a file,
+The hosts' hooks are one trait, `frontend::host::Hooks` (`host.rs`
+— one module since 2026-10-12, the desktop's answers being its
+`DesktopHooks`), that each phone installs at startup: pick a file,
 save a download, open a target or a link, keep alive (the service, or
 on iOS the moment to ask for notifications), keep the screen on, and
 the notification calls (§7.4). A phone tells the app when it goes to the

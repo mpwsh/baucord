@@ -19,7 +19,7 @@ impl AppState {
     }
 
     pub fn username_of(&self, client_id: u64) -> String {
-        self.users.get(&client_id).map_or_else(
+        self.session.users.get(&client_id).map_or_else(
             || t!("fallback-username", "id" => client_id.to_string()),
             |u| u.username.clone(),
         )
@@ -29,7 +29,7 @@ impl AppState {
     /// command names it.
     pub(super) fn admin_target_at(&self, index: i32) -> Option<AdminTarget> {
         let client_id = self.user_id_at(index)?;
-        let (user_id, _) = self.details.get(&client_id)?;
+        let (user_id, _) = self.session.details.get(&client_id)?;
         Some(AdminTarget::User(*user_id))
     }
 
@@ -50,14 +50,14 @@ impl AppState {
             return None;
         }
         let channel_id = u16::try_from(row.channel_id).ok()?;
-        let current = self.users.get(&client_id).map(|u| u.channel_id);
+        let current = self.session.users.get(&client_id).map(|u| u.channel_id);
         (current != Some(channel_id)).then_some((client_id, channel_id))
     }
 
     /// The drop: the same `MoveUser` the "Move to" submenu sends,
     /// the server judging permission and the target's gates.
     pub(super) fn move_user_to(&mut self, client_id: u64, channel_id: u16) {
-        let Some((user_id, _)) = self.details.get(&client_id) else {
+        let Some((user_id, _)) = self.session.details.get(&client_id) else {
             return;
         };
         let target = AdminTarget::User(*user_id);
@@ -78,7 +78,7 @@ impl AppState {
     /// What this session may do, as the menu builders read it.
     pub(super) fn menu_session(&self) -> menu::Session {
         use client::permissions as p;
-        let has = |bit: u64| p::has(self.permissions, bit);
+        let has = |bit: u64| p::has(self.session.permissions, bit);
         menu::Session {
             mute: has(p::MUTE) || has(p::RESTRICT),
             disconnect: has(p::DISCONNECT),
@@ -89,7 +89,7 @@ impl AppState {
             dm: has(p::DM),
             manage_own_channels: has(p::MANAGE_OWN_CHANNELS),
             create_channels: has(p::CREATE_CHANNELS),
-            safety: self.safety,
+            safety: self.session.safety.on,
             our_rank: self.our_rank(),
         }
     }
@@ -110,7 +110,7 @@ impl AppState {
         if row.is_channel {
             let Some(channel) = u16::try_from(row.channel_id)
                 .ok()
-                .and_then(|id| self.channels.iter().find(|c| c.id == id))
+                .and_then(|id| self.session.channels.iter().find(|c| c.id == id))
             else {
                 return;
             };
@@ -129,13 +129,17 @@ impl AppState {
             } else {
                 let theirs =
                     self.rank_of_client(roster::join_id(row.client_id_lo, row.client_id_hi));
-                let owns_their_channel =
-                    self.channels.iter().any(|c| c.id == channel_id && c.owned);
+                let owns_their_channel = self
+                    .session
+                    .channels
+                    .iter()
+                    .any(|c| c.id == channel_id && c.owned);
                 (
                     theirs < session.our_rank,
                     theirs <= session.our_rank,
-                    p::has(self.permissions, p::MANAGE_CHANNELS)
-                        || (owns_their_channel && p::has(self.permissions, p::MANAGE_OWN_CHANNELS)),
+                    p::has(self.session.permissions, p::MANAGE_CHANNELS)
+                        || (owns_their_channel
+                            && p::has(self.session.permissions, p::MANAGE_OWN_CHANNELS)),
                 )
             };
             let facts = menu::UserFacts {
@@ -153,6 +157,7 @@ impl AppState {
                     .is_some_and(|c| self.client_blocked(c)),
             };
             let channels: Vec<menu::ChannelChoice> = self
+                .session
                 .channels
                 .iter()
                 .filter(|c| !c.hidden)
@@ -163,10 +168,11 @@ impl AppState {
                 .collect();
             let held: Vec<client::RoleId> = self
                 .user_id_at(index)
-                .and_then(|id| self.details.get(&id))
+                .and_then(|id| self.session.details.get(&id))
                 .map(|(_, roles)| roles.clone())
                 .unwrap_or_default();
             let mut roles: Vec<menu::RoleChoice> = self
+                .session
                 .roles
                 .values()
                 .map(|r| menu::RoleChoice {
@@ -185,7 +191,7 @@ impl AppState {
             // The slider row starts at their current level.
             let volume = self
                 .user_id_at(index)
-                .and_then(|id| self.users.get(&id))
+                .and_then(|id| self.session.users.get(&id))
                 .map_or(1.0, |u| u.audio.volume);
             self.main.global::<State>().set_menu_volume(volume);
             self.show_menu(entries, MenuTarget::User(index), x, y);
@@ -208,6 +214,7 @@ impl AppState {
             return;
         }
         let mut audio = self
+            .session
             .users
             .get(&client_id)
             .map(|u| peer_audio_to(u.audio))
@@ -233,22 +240,22 @@ impl AppState {
         let msg_id = roster::join_id(row.msg_id_lo, row.msg_id_hi);
         // Someone else's stored message, in General or a DM (not the
         // admin channel's lines): reportable, its author blockable.
-        let reportable = self.safety
+        let reportable = self.session.safety.on
             && !row.own
             && !row.pending
-            && self.active_dm != Some(ADMIN_CHANNEL_KEY)
+            && self.session.chat.active_dm != Some(ADMIN_CHANNEL_KEY)
             && self
                 .author_of_message(msg_id)
-                .is_some_and(|(author, _)| Some(author) != self.our_user_id);
+                .is_some_and(|(author, _)| Some(author) != self.session.our_user_id);
         let facts = menu::MessageFacts {
             kind,
             own: row.own,
             deleted: row.deleted,
             styled: row.styled,
             selecting,
-            in_dm: self.active_dm.is_some(),
+            in_dm: self.session.chat.active_dm.is_some(),
             delete_any: client::permissions::has(
-                self.permissions,
+                self.session.permissions,
                 client::permissions::DELETE_MESSAGES,
             ),
             reportable,
@@ -381,7 +388,11 @@ impl AppState {
             A::MuteForMe => {
                 if let Some(id) = self.user_id_at(index) {
                     let username = self.username_of(id);
-                    let muted = self.users.get(&id).is_some_and(|u| u.audio.is_muted);
+                    let muted = self
+                        .session
+                        .users
+                        .get(&id)
+                        .is_some_and(|u| u.audio.is_muted);
                     self.handle_mute_user(id, &username, !muted);
                 }
             }
@@ -441,9 +452,10 @@ impl AppState {
         let Some(client_id) = self.user_id_at(index) else {
             return;
         };
-        let (Some((user_id, _)), Some(user)) =
-            (self.details.get(&client_id), self.users.get(&client_id))
-        else {
+        let (Some((user_id, _)), Some(user)) = (
+            self.session.details.get(&client_id),
+            self.session.users.get(&client_id),
+        ) else {
             return;
         };
         self.network
@@ -529,7 +541,7 @@ impl AppState {
         };
         let labels: Vec<slint::SharedString> =
             durations.iter().map(|(k, _)| t!(k).into()).collect();
-        self.moderation = Some(Moderation {
+        self.session.moderation = Some(Moderation {
             action,
             client_id,
             duration_secs: durations.iter().map(|(_, secs)| *secs).collect(),
@@ -546,7 +558,7 @@ impl AppState {
     }
 
     pub(super) fn confirm_moderation(&mut self) {
-        let Some(m) = self.moderation.take() else {
+        let Some(m) = self.session.moderation.take() else {
             self.cancel_moderation();
             return;
         };
@@ -559,7 +571,7 @@ impl AppState {
         s.set_moderation_open(false);
         s.set_moderation_reason("".into());
         // The person may have left while the dialog was open.
-        let Some((user_id, _)) = self.details.get(&m.client_id) else {
+        let Some((user_id, _)) = self.session.details.get(&m.client_id) else {
             return;
         };
         let target = AdminTarget::User(*user_id);
@@ -588,7 +600,7 @@ impl AppState {
     }
 
     pub(super) fn cancel_moderation(&mut self) {
-        self.moderation = None;
+        self.session.moderation = None;
         let s = self.main.global::<State>();
         s.set_moderation_open(false);
         s.set_moderation_reason("".into());
@@ -603,12 +615,12 @@ impl AppState {
         username: &str,
         audio: Option<PeerAudioSettings>,
     ) {
-        let user = self.details.get(&client_id).map(|(user, _)| *user);
+        let user = self.session.details.get(&client_id).map(|(user, _)| *user);
         self.settings.set_peer_audio(user.as_ref(), username, audio);
     }
 
     pub(super) fn handle_mute_user(&mut self, client_id: u64, username: &str, muted: bool) {
-        if let Some(user) = self.users.get_mut(&client_id) {
+        if let Some(user) = self.session.users.get_mut(&client_id) {
             user.audio.is_muted = muted;
             let audio = peer_audio_to(user.audio);
             self.save_peer_audio(client_id, username, Some(audio));
@@ -617,7 +629,8 @@ impl AppState {
             .tx
             .send(VoiceControl::SetPeerAudio(
                 client_id,
-                self.users
+                self.session
+                    .users
                     .get(&client_id)
                     .map(|u| peer_audio_to(u.audio))
                     .unwrap_or_default(),
@@ -628,7 +641,7 @@ impl AppState {
     }
 
     pub(super) fn handle_set_user_volume(&mut self, client_id: u64, username: &str, volume: f32) {
-        if let Some(user) = self.users.get_mut(&client_id) {
+        if let Some(user) = self.session.users.get_mut(&client_id) {
             user.audio.volume = volume;
             let audio = peer_audio_to(user.audio);
             self.save_peer_audio(client_id, username, Some(audio));
@@ -637,7 +650,8 @@ impl AppState {
             .tx
             .send(VoiceControl::SetPeerAudio(
                 client_id,
-                self.users
+                self.session
+                    .users
                     .get(&client_id)
                     .map(|u| peer_audio_to(u.audio))
                     .unwrap_or_default(),
@@ -649,7 +663,7 @@ impl AppState {
 
     pub(super) fn handle_reset_peer_audio(&mut self, client_id: u64, username: &str) {
         self.save_peer_audio(client_id, username, None);
-        if let Some(user) = self.users.get_mut(&client_id) {
+        if let Some(user) = self.session.users.get_mut(&client_id) {
             user.audio = PeerAudio::default();
         }
         self.voice
@@ -691,6 +705,7 @@ impl AppState {
         // Open at the sharer's announced dimensions so a 1080p stream
         // doesn't flash open as a 720p window before the first frame.
         let (share_w, share_h) = self
+            .session
             .active_sharers
             .get(&client_id)
             .copied()
@@ -722,7 +737,7 @@ impl AppState {
                     &app.main,
                 ) {
                     Ok(viewer) => {
-                        viewer.set_self_audio(app.is_muted, app.is_deafened);
+                        viewer.set_self_audio(app.session.is_muted, app.session.is_deafened);
                         app.viewers.insert(client_id, viewer);
                         // The screen thread first, so the stream's
                         // frames are wanted before the server sends any.

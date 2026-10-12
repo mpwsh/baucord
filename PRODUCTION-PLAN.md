@@ -908,11 +908,44 @@ One line each; the spec decision named holds the detail.
     `target_exists`; the chime's WAV is borrowed, not cloned (P3-47 —
     **the two-line deletions in `crates/android` and `crates/ios` are
     not compiled here**).
-  - Left of the UI list: the Session structs (P2-51), one audio
-    `reconcile()` (P2-55), the Slint row/dialog scaffolding (P2-58 —
-    now checkable by pixel diff), one `host.rs` (P3-33), the admin
-    panel's action enum (P3-34), the settings table macro (P3-35's
-    first half), `FrameMeta` (P3-36).
+  - Left of the UI list then: see the fifth batch.
+- **2026-10-12 — 1.2.1, the review's fifth batch** (§2a): the UI
+  list's simplifications. Checked with a scratch harness that drives
+  the real `MainWindow` headless (Slint's software renderer, real key
+  and pointer events) against the tree before and after: 131 observed
+  facts and 51 screenshots, identical.
+  - *One dialog, one row frame, one ring* (P2-58). `Modal` in
+    `widgets.slint` is the scrim, the centred card, the click outside,
+    Escape and Android's Back; eight dialogs in `main.slint` are its
+    content (`Theme.scrim`). `RowFrame` in `chat.slint` is a person's
+    row: hover tint, right-click and long-press menu, gutter picture,
+    name line; the text, code, picture and file rows inherit it.
+    `ProgressRing` is the two copies of the transfer ring.
+    `main.slint` 1345 → 1210 lines, `chat.slint` 1801 → 1661. The
+    harness caught the one thing a render cannot: a field that
+    focused itself in its own `init` lost the keyboard to the shared
+    dialog, so typing and Enter went nowhere in three dialogs — they
+    now take it in `Modal`'s `opened`.
+  - *One host module* (P3-33): `frontend/src/host.rs` for every host;
+    the desktop's answers are its `DesktopHooks`, a phone installs its
+    own. `stubs/host.rs` is gone. The `Hooks` trait asks nothing new
+    of the phones (three defaulted methods were added).
+  - *The session is one value* (P2-51, the frontend half). The 53
+    fields that belong to a connection moved from `AppState` into
+    `Session` (with `Safety`, `Transfers`, `ChatFlow` inside it);
+    `teardown_connection` replaces it whole, where three hand-kept
+    lists reset it a line per field. **Not done: the server's half.**
+    Its teardown is already one function, and the relays read several
+    of its per-session maps on every packet; folding them into one
+    struct changes hot-path signatures for little gain — to decide.
+  - *Smaller.* A decoded frame's figures travel as one `FrameMeta`
+    (P3-36). The admin panel keeps the `AdminCommand` it will send,
+    not a second enum describing it (P3-34). Settings' thirteen plain
+    switches are one table that `populate` and `wire` both expand
+    (P3-35).
+  - Left of the list: one audio `reconcile()` (P2-55) — real-time
+    code on four platforms, three of which cannot be run here; it
+    wants TST-2's tests first.
 
 ## 8. Facts this plan rests on
 

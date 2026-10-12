@@ -41,12 +41,12 @@ impl AppState {
 
     /// The activity view is on screen: General's, toggled to it.
     pub(super) fn activity_shown(&self) -> bool {
-        self.showing_activity && self.active_dm.is_none()
+        self.showing_activity && self.session.chat.active_dm.is_none()
     }
 
     /// General's header toggle: the conversation, or the activity.
     pub(super) fn set_general_view(&mut self, activity: bool) {
-        if self.active_dm.is_some() {
+        if self.session.chat.active_dm.is_some() {
             self.switch_conversation(None);
         }
         if activity == self.showing_activity {

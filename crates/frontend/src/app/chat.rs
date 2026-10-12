@@ -27,11 +27,11 @@ impl AppState {
     /// open: a DM being read must not swallow the room's traffic.
     pub fn push_chat_message(&mut self, meta: &Meta, body: &str, edited: bool) {
         self.with_conversation(None, |app| app.push_message_here(meta, body, edited));
-        if self.active_dm.is_some() && !meta.own && !meta.pending {
-            self.general_unread += 1;
-            self.main
-                .global::<State>()
-                .set_general_unread(i32::try_from(self.general_unread).unwrap_or(i32::MAX));
+        if self.session.chat.active_dm.is_some() && !meta.own && !meta.pending {
+            self.session.chat.general_unread += 1;
+            self.main.global::<State>().set_general_unread(
+                i32::try_from(self.session.chat.general_unread).unwrap_or(i32::MAX),
+            );
         }
     }
 
@@ -64,11 +64,11 @@ impl AppState {
     /// A file card into General, whichever conversation is shown.
     pub(super) fn push_chat_file(&mut self, meta: &Meta, file: app_core::chat::FileMeta) {
         self.with_conversation(None, |app| app.push_file_here(meta, file));
-        if self.active_dm.is_some() && !meta.own {
-            self.general_unread += 1;
-            self.main
-                .global::<State>()
-                .set_general_unread(i32::try_from(self.general_unread).unwrap_or(i32::MAX));
+        if self.session.chat.active_dm.is_some() && !meta.own {
+            self.session.chat.general_unread += 1;
+            self.main.global::<State>().set_general_unread(
+                i32::try_from(self.session.chat.general_unread).unwrap_or(i32::MAX),
+            );
         }
     }
 
@@ -86,8 +86,14 @@ impl AppState {
         if !inline {
             return;
         }
-        let fresh = !self.pending_pictures.contains_key(&a.blob_id);
-        self.pending_pictures
+        let fresh = !self
+            .session
+            .transfers
+            .pending_pictures
+            .contains_key(&a.blob_id);
+        self.session
+            .transfers
+            .pending_pictures
             .entry(a.blob_id)
             .or_default()
             .push((conv, msg_id));
@@ -117,17 +123,20 @@ impl AppState {
             ts_ms: now,
             day: local_day(now),
             user: self.settings.user.nickname.clone(),
-            author: self.our_user_id,
+            author: self.session.our_user_id,
             own: true,
             pending: true,
         };
-        self.transfers.insert((None, placeholder), (1, 0));
-        self.image_upload = Some(placeholder);
+        self.session
+            .transfers
+            .shown
+            .insert((None, placeholder), (1, 0));
+        self.session.transfers.image_upload = Some(placeholder);
         let shown =
             self.with_conversation(None, |app| media::push_image_row(app, &meta, png.clone()));
         if !shown {
-            self.transfers.remove(&(None, placeholder));
-            self.image_upload = None;
+            self.session.transfers.shown.remove(&(None, placeholder));
+            self.session.transfers.image_upload = None;
         }
         self.network.tx.send(NetworkControl::SendImage(png)).ok();
     }
@@ -135,10 +144,10 @@ impl AppState {
     /// Our image came back from the server: the card it replaces goes
     /// (its picture and player with it) before the real row is pushed.
     pub(super) fn drop_image_card(&mut self) {
-        let Some(placeholder) = self.image_upload.take() else {
+        let Some(placeholder) = self.session.transfers.image_upload.take() else {
             return;
         };
-        self.transfers.remove(&(None, placeholder));
+        self.session.transfers.shown.remove(&(None, placeholder));
         self.with_conversation(None, |app| {
             let at = app
                 .history
@@ -176,7 +185,7 @@ impl AppState {
         let client_ref = self.next_client_ref;
         self.next_client_ref = self.next_client_ref.wrapping_add(1).max(1);
         let placeholder = u64::MAX - u64::from(client_ref);
-        let conv = self.active_dm;
+        let conv = self.session.chat.active_dm;
         let now = u64::try_from(chrono::Local::now().timestamp_millis()).unwrap_or(0);
         let meta = Meta {
             id: placeholder,
@@ -184,7 +193,7 @@ impl AppState {
             ts_ms: now,
             day: local_day(now),
             user: self.settings.user.nickname.clone(),
-            author: self.our_user_id,
+            author: self.session.our_user_id,
             own: true,
             pending: true,
         };
@@ -194,9 +203,12 @@ impl AppState {
             mime: mime.clone(),
             size,
         };
-        self.transfers.insert((conv, placeholder), (1, 0));
+        self.session
+            .transfers
+            .shown
+            .insert((conv, placeholder), (1, 0));
         self.with_conversation(conv, |app| app.push_file_here(&meta, file));
-        self.pending_uploads.insert(
+        self.session.transfers.pending_uploads.insert(
             upload_id,
             PendingUpload {
                 conv,
@@ -228,7 +240,10 @@ impl AppState {
         let client_ref = (u64::MAX - placeholder) as u32;
         // Uploaded: the card knows its blob now (Save works once acked)
         // and the ring goes; the muted look stays until the ack.
-        self.transfers.remove(&(upload.conv, placeholder));
+        self.session
+            .transfers
+            .shown
+            .remove(&(upload.conv, placeholder));
         self.with_conversation(upload.conv, |app| {
             let at = app
                 .history
@@ -247,12 +262,19 @@ impl AppState {
                 app.chat_model.set_row_data(i, row);
             }
         });
-        self.pending_files
+        self.session
+            .transfers
+            .pending_files
             .insert(client_ref, (upload.conv, placeholder));
         // A picture: once acked, our own card shows it (no echo comes
         // back on a DM).
-        if let Some(png) = self.pending_picture_uploads.remove(&upload_id) {
-            self.picture_acks.insert(client_ref, png);
+        if let Some(png) = self
+            .session
+            .transfers
+            .pending_picture_uploads
+            .remove(&upload_id)
+        {
+            self.session.transfers.picture_acks.insert(client_ref, png);
         }
         let conv = match upload.conv {
             None => client::ConvRef::General,
@@ -279,10 +301,10 @@ impl AppState {
     ) {
         match state {
             Some(state) => {
-                self.transfers.insert((conv, msg_id), state);
+                self.session.transfers.shown.insert((conv, msg_id), state);
             }
             None => {
-                self.transfers.remove(&(conv, msg_id));
+                self.session.transfers.shown.remove(&(conv, msg_id));
             }
         }
         self.with_conversation(conv, |app| {
@@ -340,21 +362,29 @@ impl AppState {
         let Some(msg_id) = self.history.rows()[index].message_id() else {
             return;
         };
-        let conv = self.active_dm;
-        match self.transfers.get(&(conv, msg_id)).map(|t| t.0) {
-            Some(1) if self.image_upload == Some(msg_id) => {
+        let conv = self.session.chat.active_dm;
+        match self
+            .session
+            .transfers
+            .shown
+            .get(&(conv, msg_id))
+            .map(|t| t.0)
+        {
+            Some(1) if self.session.transfers.image_upload == Some(msg_id) => {
                 self.network.tx.send(NetworkControl::CancelImage).ok();
                 self.drop_image_card();
             }
             Some(1) => {
                 if let Some((upload_id, _)) = self
+                    .session
+                    .transfers
                     .pending_uploads
                     .iter()
                     .find(|(_, u)| u.placeholder == msg_id)
                     .map(|(id, u)| (*id, u.conv))
                 {
-                    self.pending_uploads.remove(&upload_id);
-                    self.transfers.remove(&(conv, msg_id));
+                    self.session.transfers.pending_uploads.remove(&upload_id);
+                    self.session.transfers.shown.remove(&(conv, msg_id));
                     self.network
                         .tx
                         .send(NetworkControl::CancelUpload { upload_id })
@@ -366,12 +396,14 @@ impl AppState {
             }
             Some(2) => {
                 let blob = self
+                    .session
+                    .transfers
                     .pending_downloads
                     .iter()
                     .find(|(_, d)| d.msg_id == msg_id && d.conv == conv)
                     .map(|(b, _)| *b);
                 if let Some(blob) = blob {
-                    self.pending_downloads.remove(&blob);
+                    self.session.transfers.pending_downloads.remove(&blob);
                     self.network
                         .tx
                         .send(NetworkControl::CancelFetch { blob_id: blob })
@@ -398,11 +430,16 @@ impl AppState {
         let Some(msg_id) = self.history.rows()[index].message_id() else {
             return;
         };
-        if self.pending_downloads.contains_key(&file.blob) {
+        if self
+            .session
+            .transfers
+            .pending_downloads
+            .contains_key(&file.blob)
+        {
             return;
         }
-        let conv = self.active_dm;
-        self.pending_downloads.insert(
+        let conv = self.session.chat.active_dm;
+        self.session.transfers.pending_downloads.insert(
             file.blob,
             PendingDownload {
                 name: file.name.clone(),
@@ -437,18 +474,20 @@ impl AppState {
 
     /// Ask the server for the page before the oldest message shown.
     pub(super) fn load_earlier(&mut self, limit: u16) {
-        if self.history_page_pending.is_some() {
+        if self.session.chat.history_page_pending.is_some() {
             return;
         }
-        self.history_page_pending = Some(self.active_dm);
+        self.session.chat.history_page_pending = Some(self.session.chat.active_dm);
         self.main.global::<State>().set_history_loading(true);
         self.network
             .tx
             .send(NetworkControl::FetchHistory {
                 conv: self
+                    .session
+                    .chat
                     .active_dm
                     .map_or(client::ConvRef::General, client::ConvRef::Dm),
-                before: self.oldest_history_id,
+                before: self.session.oldest_history_id,
                 limit,
             })
             .ok();
@@ -457,21 +496,23 @@ impl AppState {
     /// "Edit message" on one of ours: the composer starts from its
     /// full text; the draft that was there comes back on cancel.
     pub(super) fn row_edit(&mut self, msg_id: u64) {
-        let Some(text) = self.own_texts.get(&msg_id).cloned() else {
+        let Some(text) = self.session.chat.own_texts.get(&msg_id).cloned() else {
             return;
         };
         let s = self.main.global::<State>();
-        let previous_draft = if self.editing.is_some() {
+        let previous_draft = if self.session.chat.editing.is_some() {
             // Switching from one edit to another keeps the first
             // draft, not the half-edited text.
-            self.editing
+            self.session
+                .chat
+                .editing
                 .take()
                 .map(|e| e.previous_draft)
                 .unwrap_or_default()
         } else {
             s.get_draft().to_string()
         };
-        self.editing = Some(Editing {
+        self.session.chat.editing = Some(Editing {
             msg_id,
             previous_draft,
         });
@@ -482,7 +523,7 @@ impl AppState {
 
     pub(super) fn edit_cancel(&mut self) {
         let s = self.main.global::<State>();
-        if let Some(edit) = self.editing.take() {
+        if let Some(edit) = self.session.chat.editing.take() {
             s.set_draft(edit.previous_draft.into());
         }
         s.set_editing(false);
@@ -505,11 +546,14 @@ impl AppState {
         });
         let by_admin = !own;
         if by_admin
-            && !client::permissions::has(self.permissions, client::permissions::DELETE_MESSAGES)
+            && !client::permissions::has(
+                self.session.permissions,
+                client::permissions::DELETE_MESSAGES,
+            )
         {
             return;
         }
-        self.pending_confirm = Some(Confirm::DeleteMessage { msg_id, by_admin });
+        self.session.chat.pending_confirm = Some(Confirm::DeleteMessage { msg_id, by_admin });
         let s = self.main.global::<State>();
         s.set_confirm_title(t!("confirm-delete-message-title").into());
         s.set_confirm_body(
@@ -527,7 +571,7 @@ impl AppState {
     pub(super) fn confirm_accept(&mut self) {
         let s = self.main.global::<State>();
         s.set_confirm_open(false);
-        match self.pending_confirm.take() {
+        match self.session.chat.pending_confirm.take() {
             Some(Confirm::DeleteMessage { msg_id, by_admin }) => {
                 if by_admin {
                     self.send_admin(AdminCommand::DeleteMessage { msg_id }, PendingAdmin::Show);
@@ -536,7 +580,7 @@ impl AppState {
                         .tx
                         .send(NetworkControl::DeleteMessage { msg_id })
                         .ok();
-                    self.pending_delete = Some(msg_id);
+                    self.session.chat.pending_delete = Some(msg_id);
                     Self::arm_apply_timeout(msg_id, true);
                 }
             }
@@ -552,7 +596,7 @@ impl AppState {
     }
 
     pub(super) fn confirm_cancel(&mut self) {
-        self.pending_confirm = None;
+        self.session.chat.pending_confirm = None;
         self.main.global::<State>().set_confirm_open(false);
         self.main.invoke_focus_composer();
     }
@@ -568,9 +612,17 @@ impl AppState {
         slint::Timer::single_shot(Duration::from_secs(3), move || {
             with_app(&weak, |app| {
                 let still = if delete {
-                    app.pending_delete.take_if(|id| *id == msg_id).is_some()
+                    app.session
+                        .chat
+                        .pending_delete
+                        .take_if(|id| *id == msg_id)
+                        .is_some()
                 } else {
-                    app.pending_edit.take_if(|id| *id == msg_id).is_some()
+                    app.session
+                        .chat
+                        .pending_edit
+                        .take_if(|id| *id == msg_id)
+                        .is_some()
                 };
                 if still {
                     app.show_toast(
@@ -592,21 +644,8 @@ impl AppState {
         // The activity belongs to one session: nothing of it survives
         // a connect or a disconnect.
         self.clear_activity();
-        self.own_texts.clear();
-        self.editing = None;
-        self.pending_edit = None;
-        self.pending_delete = None;
-        self.pending_confirm = None;
-        self.channel_dialog = None;
-        self.history_page_pending = None;
-        self.pending_dm_sends.clear();
-        self.parked.clear();
-        self.dm_order.clear();
-        self.dm_meta.clear();
+        self.session.chat = ChatFlow::default();
         self.dms_model.set_vec(Vec::new());
-        self.active_dm = None;
-        self.history_more = false;
-        self.general_unread = 0;
         let s = self.main.global::<State>();
         s.set_general_unread(0);
         s.set_chat_new_count(0);

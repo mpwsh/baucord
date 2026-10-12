@@ -24,9 +24,9 @@ impl AppState {
             // cursor the trimmed rows in between were never fetched
             // again, a gap in the middle of the history (review P2-23).
             if let Some(oldest) = self.history.oldest_message_id() {
-                self.oldest_history_id = Some(oldest);
-                if self.server_persistent && !self.history_more {
-                    self.history_more = true;
+                self.session.oldest_history_id = Some(oldest);
+                if self.session.server_persistent && !self.session.chat.history_more {
+                    self.session.chat.history_more = true;
                     if !self.borrowed_conversation {
                         self.main.global::<State>().set_history_more(true);
                     }
@@ -73,7 +73,7 @@ impl AppState {
         more: bool,
     ) {
         if let Some(first) = messages.first() {
-            self.oldest_history_id = Some(first.id);
+            self.session.oldest_history_id = Some(first.id);
         }
         // A blocked person's messages stay out of every page; their ids
         // are kept so later edits and deletions of them say nothing.
@@ -82,11 +82,11 @@ impl AppState {
             .filter(|m| self.is_blocked(&m.user_id))
             .map(|m| m.id)
             .collect();
-        self.hidden_messages.extend(hidden);
+        self.session.safety.hidden_messages.extend(hidden);
         if key.is_none() {
             for m in messages {
-                if Some(m.user_id) == self.our_user_id {
-                    self.own_texts.insert(m.id, m.text.clone());
+                if Some(m.user_id) == self.session.our_user_id {
+                    self.session.chat.own_texts.insert(m.id, m.text.clone());
                 }
             }
         }
@@ -101,24 +101,24 @@ impl AppState {
                     day: local_day(m.ts),
                     user: m.name.clone(),
                     author: Some(m.user_id),
-                    own: Some(m.user_id) == self.our_user_id,
+                    own: Some(m.user_id) == self.session.our_user_id,
                     pending: false,
                 };
                 (meta, app_core::emoji::replace_shortcodes(&m.text), m.edited)
             })
             .collect();
-        if key == self.active_dm {
+        if key == self.session.chat.active_dm {
             let s = self.main.global::<State>();
             s.set_history_more(more);
             s.set_history_loading(false);
         }
-        self.history_more = more;
+        self.session.chat.history_more = more;
         // DM pages are always asked for; the general replay after
         // `Init` is the one page that is appended.
-        let page = self.history_page_pending == Some(key) || key.is_some();
+        let page = self.session.chat.history_page_pending == Some(key) || key.is_some();
         if page {
-            if self.history_page_pending == Some(key) {
-                self.history_page_pending = None;
+            if self.session.chat.history_page_pending == Some(key) {
+                self.session.chat.history_page_pending = None;
             }
             if prepared.is_empty() {
                 if key.is_none() {
@@ -177,10 +177,10 @@ impl AppState {
         key: Option<client::UserId>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        if key == self.active_dm {
+        if key == self.session.chat.active_dm {
             return f(self);
         }
-        let active = self.active_dm;
+        let active = self.session.chat.active_dm;
         let borrowed = std::mem::replace(&mut self.borrowed_conversation, true);
         self.swap_in(key);
         let out = f(self);
@@ -192,22 +192,30 @@ impl AppState {
     /// Exchange the active fields with the parked conversation `key`
     /// (created empty if new), parking the current one under its key.
     pub(super) fn swap_in(&mut self, key: Option<client::UserId>) {
-        if key == self.active_dm {
+        if key == self.session.chat.active_dm {
             return;
         }
-        let mut target = self.parked.remove(&key).unwrap_or_else(|| Conversation {
-            history: ChatHistory::new(),
-            model: Rc::new(VecModel::default()),
-            oldest_history_id: None,
-            more: false,
-        });
+        let mut target = self
+            .session
+            .chat
+            .parked
+            .remove(&key)
+            .unwrap_or_else(|| Conversation {
+                history: ChatHistory::new(),
+                model: Rc::new(VecModel::default()),
+                oldest_history_id: None,
+                more: false,
+            });
         std::mem::swap(&mut self.history, &mut target.history);
         std::mem::swap(&mut self.chat_model, &mut target.model);
-        std::mem::swap(&mut self.oldest_history_id, &mut target.oldest_history_id);
-        std::mem::swap(&mut self.history_more, &mut target.more);
-        let old_key = self.active_dm;
-        self.parked.insert(old_key, target);
-        self.active_dm = key;
+        std::mem::swap(
+            &mut self.session.oldest_history_id,
+            &mut target.oldest_history_id,
+        );
+        std::mem::swap(&mut self.session.chat.history_more, &mut target.more);
+        let old_key = self.session.chat.active_dm;
+        self.session.chat.parked.insert(old_key, target);
+        self.session.chat.active_dm = key;
     }
 
     /// Show a conversation in the chat pane: General (`None`) or the
@@ -216,38 +224,45 @@ impl AppState {
     pub(super) fn switch_conversation(&mut self, key: Option<client::UserId>) {
         // Any switch lands on a conversation, not General's activity.
         self.leave_activity_view();
-        if key != self.active_dm {
+        if key != self.session.chat.active_dm {
             self.freeze_chat_gifs();
             self.swap_in(key);
             let s = self.main.global::<State>();
             s.set_chat(ModelRc::from(self.chat_model.clone()));
-            s.set_history_more(self.history_more);
+            s.set_history_more(self.session.chat.history_more);
             s.set_history_loading(false);
-            self.history_page_pending = None;
+            self.session.chat.history_page_pending = None;
         }
         let s = self.main.global::<State>();
         match key {
             None => {
                 s.set_active_dm(-1);
                 s.set_conv_name("".into());
-                self.general_unread = 0;
+                self.session.chat.general_unread = 0;
                 s.set_general_unread(0);
             }
             Some(user) => {
                 Self::clear_dm_notice(&user);
-                let index = self.dm_order.iter().position(|u| *u == user);
+                let index = self.session.chat.dm_order.iter().position(|u| *u == user);
                 s.set_active_dm(index.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1));
                 let name = self
+                    .session
+                    .chat
                     .dm_meta
                     .get(&user)
                     .map(|m| m.name.clone())
                     .unwrap_or_default();
                 s.set_conv_name(name.into());
-                let (fetch, mark) = self.dm_meta.get_mut(&user).map_or((false, None), |meta| {
-                    let mark = (meta.unread > 0).then_some(meta.last_msg_id);
-                    meta.unread = 0;
-                    (!meta.fetched && self.server_persistent, mark)
-                });
+                let (fetch, mark) =
+                    self.session
+                        .chat
+                        .dm_meta
+                        .get_mut(&user)
+                        .map_or((false, None), |meta| {
+                            let mark = (meta.unread > 0).then_some(meta.last_msg_id);
+                            meta.unread = 0;
+                            (!meta.fetched && self.session.server_persistent, mark)
+                        });
                 if fetch {
                     self.load_earlier(50);
                 }
@@ -272,12 +287,12 @@ impl AppState {
     /// Hide a DM from the list. Nothing is deleted: the server keeps
     /// the conversation, and the next message brings it back.
     pub(super) fn close_dm(&mut self, user: client::UserId) {
-        if self.active_dm == Some(user) {
+        if self.session.chat.active_dm == Some(user) {
             self.switch_conversation(None);
         }
-        self.parked.remove(&Some(user));
-        self.dm_meta.remove(&user);
-        self.dm_order.retain(|u| *u != user);
+        self.session.chat.parked.remove(&Some(user));
+        self.session.chat.dm_meta.remove(&user);
+        self.session.chat.dm_order.retain(|u| *u != user);
         self.set_dm_hidden(user, true);
         self.rebuild_dms_model();
     }
@@ -309,19 +324,24 @@ impl AppState {
     /// Open (or start) the DM with `user`, named `name`.
     pub fn open_dm(&mut self, user: client::UserId, name: &str) {
         self.set_dm_hidden(user, false);
-        let meta = self.dm_meta.entry(user).or_insert_with(|| DmMeta {
-            name: name.to_string(),
-            unread: 0,
-            last_ts: 0,
-            last_msg_id: 0,
-            // Nothing to fetch without a store.
-            fetched: false,
-        });
+        let meta = self
+            .session
+            .chat
+            .dm_meta
+            .entry(user)
+            .or_insert_with(|| DmMeta {
+                name: name.to_string(),
+                unread: 0,
+                last_ts: 0,
+                last_msg_id: 0,
+                // Nothing to fetch without a store.
+                fetched: false,
+            });
         if meta.name.is_empty() {
             meta.name = name.to_string();
         }
-        if !self.dm_order.contains(&user) {
-            self.dm_order.insert(0, user);
+        if !self.session.chat.dm_order.contains(&user) {
+            self.session.chat.dm_order.insert(0, user);
         }
         self.switch_conversation(Some(user));
         // From a roster menu or `/dm`: the narrow layout turns to the
@@ -333,7 +353,9 @@ impl AppState {
     /// the reserved key, first in the Messages list, never fetched
     /// from the DM store.
     pub(super) fn ensure_admin_channel(&mut self) {
-        self.dm_meta
+        self.session
+            .chat
+            .dm_meta
             .entry(ADMIN_CHANNEL_KEY)
             .or_insert_with(|| DmMeta {
                 name: t!("admin-channel"),
@@ -342,8 +364,8 @@ impl AppState {
                 last_msg_id: 0,
                 fetched: true,
             });
-        if !self.dm_order.contains(&ADMIN_CHANNEL_KEY) {
-            self.dm_order.insert(0, ADMIN_CHANNEL_KEY);
+        if !self.session.chat.dm_order.contains(&ADMIN_CHANNEL_KEY) {
+            self.session.chat.dm_order.insert(0, ADMIN_CHANNEL_KEY);
         }
     }
 
@@ -372,23 +394,26 @@ impl AppState {
     pub(super) fn rebuild_dms_model(&mut self) {
         let mut total = 0;
         let rows: Vec<DmRow> = self
+            .session
+            .chat
             .dm_order
             .iter()
             .filter_map(|user| {
-                let meta = self.dm_meta.get(user)?;
+                let meta = self.session.chat.dm_meta.get(user)?;
                 total += meta.unread;
                 let client = self
+                    .session
                     .details
                     .iter()
                     .find(|(_, (u, _))| u == user)
                     .map(|(c, _)| *c);
                 let name = client
-                    .and_then(|c| self.users.get(&c))
+                    .and_then(|c| self.session.users.get(&c))
                     .map_or(meta.name.clone(), |u| u.username.clone());
                 let mut row = DmRow {
                     name: name.as_str().into(),
                     unread: i32::try_from(meta.unread).unwrap_or(i32::MAX),
-                    active: self.active_dm == Some(*user),
+                    active: self.session.chat.active_dm == Some(*user),
                     online: client.is_some(),
                     avatar: slint::Image::default(),
                     has_avatar: false,
@@ -399,8 +424,8 @@ impl AppState {
                 // Online: their session's look; offline: what the server
                 // said of them with the list (`Authors`).
                 if let Some(image) = client
-                    .and_then(|c| self.profiles.get(&c))
-                    .or_else(|| self.author_looks.get(user).map(|l| &l.profile))
+                    .and_then(|c| self.session.profiles.get(&c))
+                    .or_else(|| self.session.author_looks.get(user).map(|l| &l.profile))
                     .and_then(|p| p.avatar)
                     .and_then(|blob| self.avatar_images.get(&blob))
                 {
@@ -413,8 +438,8 @@ impl AppState {
         self.dms_model.set_vec(rows);
         let s = self.main.global::<State>();
         s.set_dm_unread_total(i32::try_from(total).unwrap_or(i32::MAX));
-        if let Some(user) = self.active_dm {
-            let index = self.dm_order.iter().position(|u| *u == user);
+        if let Some(user) = self.session.chat.active_dm {
+            let index = self.session.chat.dm_order.iter().position(|u| *u == user);
             s.set_active_dm(index.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1));
         }
     }
@@ -438,28 +463,33 @@ impl AppState {
         }
         // A new message brings a closed conversation back.
         self.set_dm_hidden(from, false);
-        let is_open = self.active_dm == Some(from);
-        let meta = self.dm_meta.entry(from).or_insert_with(|| DmMeta {
-            name: username.to_string(),
-            unread: 0,
-            last_ts: 0,
-            last_msg_id: 0,
-            // Never opened: with a store the page will bring this one
-            // too, so it is not pushed twice.
-            fetched: false,
-        });
+        let is_open = self.session.chat.active_dm == Some(from);
+        let meta = self
+            .session
+            .chat
+            .dm_meta
+            .entry(from)
+            .or_insert_with(|| DmMeta {
+                name: username.to_string(),
+                unread: 0,
+                last_ts: 0,
+                last_msg_id: 0,
+                // Never opened: with a store the page will bring this one
+                // too, so it is not pushed twice.
+                fetched: false,
+            });
         meta.name = username.to_string();
         meta.last_ts = ts;
         meta.last_msg_id = meta.last_msg_id.max(id);
-        let show_now = is_open || meta.fetched || !self.server_persistent;
-        if !self.server_persistent {
+        let show_now = is_open || meta.fetched || !self.session.server_persistent;
+        if !self.session.server_persistent {
             meta.fetched = true;
         }
         if !is_open {
             meta.unread += 1;
         }
-        self.dm_order.retain(|u| *u != from);
-        self.dm_order.insert(0, from);
+        self.session.chat.dm_order.retain(|u| *u != from);
+        self.session.chat.dm_order.insert(0, from);
         if show_now {
             let meta = Meta {
                 id,
@@ -479,7 +509,7 @@ impl AppState {
                     }
                     Incoming::File(file) => app.push_file_here(&meta, file.clone()),
                 }
-                app.oldest_history_id.get_or_insert(id);
+                app.session.oldest_history_id.get_or_insert(id);
             });
         }
         if is_open {
@@ -520,19 +550,21 @@ impl AppState {
             ts_ms: now,
             day: local_day(now),
             user: self.settings.user.nickname.clone(),
-            author: self.our_user_id,
+            author: self.session.our_user_id,
             own: true,
             pending: true,
         };
         let body = app_core::emoji::replace_shortcodes(&text);
         self.push_message_here(&meta, &body, false);
-        self.pending_dm_sends
+        self.session
+            .chat
+            .pending_dm_sends
             .insert(client_ref, (Some(to), placeholder));
-        if let Some(m) = self.dm_meta.get_mut(&to) {
+        if let Some(m) = self.session.chat.dm_meta.get_mut(&to) {
             m.last_ts = now;
         }
-        self.dm_order.retain(|u| *u != to);
-        self.dm_order.insert(0, to);
+        self.session.chat.dm_order.retain(|u| *u != to);
+        self.session.chat.dm_order.insert(0, to);
         self.rebuild_dms_model();
         self.network
             .tx
@@ -549,7 +581,7 @@ impl AppState {
         let Some(client_id) = self.user_id_at(index) else {
             return;
         };
-        let Some(user_id) = self.details.get(&client_id).map(|(u, _)| *u) else {
+        let Some(user_id) = self.session.details.get(&client_id).map(|(u, _)| *u) else {
             return;
         };
         let name = self.username_of(client_id);
@@ -621,7 +653,11 @@ impl AppState {
         }
         if row.kind == 5 || row.kind == 2 {
             if let Some(id) = self.history.rows()[index].message_id()
-                && let Some((kind, pct)) = self.transfers.get(&(self.active_dm, id))
+                && let Some((kind, pct)) = self
+                    .session
+                    .transfers
+                    .shown
+                    .get(&(self.session.chat.active_dm, id))
             {
                 row.transfer_kind = *kind;
                 row.transfer_pct = *pct;

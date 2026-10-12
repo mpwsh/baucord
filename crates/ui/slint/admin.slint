@@ -830,7 +830,7 @@ export component AdminWindow inherits Window {
     // one (kept in the audit and shown to the person), Escape or
     // Cancel to back out.
     if AdminState.confirm-open : Rectangle {
-        background: #000000AA;
+        background: Theme.scrim;
         TouchArea { clicked => { AdminLogic.confirm-cancel(); } }
         confirm-keys := FocusScope {
             init => { self.focus(); }

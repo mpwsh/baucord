@@ -42,7 +42,7 @@ use std::{
 };
 
 use client::{
-    screen::{PresentTallies, ScreenControl, ScreenEvent, ScreenTx},
+    screen::{FrameMeta, PresentTallies, ScreenControl, ScreenEvent, ScreenTx},
     WakeFn,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -89,17 +89,8 @@ const FORGET_AFTER: Duration = Duration::from_secs(3);
 /// A decoded frame whose pixels already live in a Slint-ready buffer.
 /// Everything the UI needs to present + log, minus any heavy work.
 pub struct PreparedFrame {
-    pub client_id: u64,
+    pub meta: FrameMeta,
     pub buffer: Pixels,
-    pub width: u32,
-    pub height: u32,
-    pub frame_bytes: usize,
-    pub seq: u32,
-    pub enqueued_at: Instant,
-    pub decoded_at: Instant,
-    pub buffer_depth_ms: f32,
-    pub buffer_target_ms: f32,
-    pub buffer_jitter_ms: f32,
 }
 
 /// Shared between the prep thread (producer) and the UI drain
@@ -136,33 +127,15 @@ pub fn spawn(
                 while let Some(evt) = next {
                     match evt {
                         ScreenEvent::FrameReady {
-                            client_id,
-                            width,
-                            height,
+                            meta,
                             pixels,
                             format,
-                            frame_bytes,
-                            seq,
-                            enqueued_at,
-                            decoded_at,
-                            buffer_depth_ms,
-                            buffer_target_ms,
-                            buffer_jitter_ms,
                         } => prep.keep_newest(
                             &mut newest,
                             Waiting {
-                                client_id,
-                                width,
-                                height,
+                                meta,
                                 pixels,
                                 format,
-                                frame_bytes,
-                                seq,
-                                enqueued_at,
-                                decoded_at,
-                                buffer_depth_ms,
-                                buffer_target_ms,
-                                buffer_jitter_ms,
                             },
                         ),
                         other => {
@@ -201,18 +174,9 @@ pub fn spawn(
 
 /// A decoded frame waiting to be prepared.
 struct Waiting {
-    client_id: u64,
-    width: u32,
-    height: u32,
+    meta: FrameMeta,
     pixels: Vec<u8>,
     format: PictureFormat,
-    frame_bytes: usize,
-    seq: u32,
-    enqueued_at: Instant,
-    decoded_at: Instant,
-    buffer_depth_ms: f32,
-    buffer_target_ms: f32,
-    buffer_jitter_ms: f32,
 }
 
 /// One stream's pixel buffers, oldest first.
@@ -269,7 +233,7 @@ impl Prep {
     /// Queue `frame` as its stream's newest, passing over the one it
     /// replaces before anyone paid to convert it.
     fn keep_newest(&self, newest: &mut HashMap<u64, Waiting>, frame: Waiting) {
-        let id = frame.client_id;
+        let id = frame.meta.client_id;
         if let Some(older) = newest.insert(id, frame) {
             video::pool::recycle(older.pixels);
             if let Ok(mut tallies) = self.tallies.lock() {
@@ -283,19 +247,17 @@ impl Prep {
     /// show.
     fn prepare(&mut self, frame: Waiting) -> bool {
         let Waiting {
+            meta,
+            pixels,
+            format,
+        } = frame;
+        let FrameMeta {
             client_id,
             width,
             height,
-            pixels,
-            format,
-            frame_bytes,
             seq,
-            enqueued_at,
-            decoded_at,
-            buffer_depth_ms,
-            buffer_target_ms,
-            buffer_jitter_ms,
-        } = frame;
+            ..
+        } = meta;
         // A phone app in the background shows nothing: no conversion,
         // no redraw. The screen thread stops decoding once it hears
         // (`set_stream_visible`); this catches what was already on its
@@ -323,19 +285,7 @@ impl Prep {
             ring.buffers.push_back(buffer.clone());
         }
 
-        let prepared = PreparedFrame {
-            client_id,
-            buffer,
-            width,
-            height,
-            frame_bytes,
-            seq,
-            enqueued_at,
-            decoded_at,
-            buffer_depth_ms,
-            buffer_target_ms,
-            buffer_jitter_ms,
-        };
+        let prepared = PreparedFrame { meta, buffer };
         let replaced = self
             .shared
             .slots
@@ -450,18 +400,20 @@ mod tests {
     fn frame(id: u64, fill_byte: u8) -> Waiting {
         let now = Instant::now();
         Waiting {
-            client_id: id,
-            width: 2,
-            height: 2,
+            meta: FrameMeta {
+                client_id: id,
+                width: 2,
+                height: 2,
+                frame_bytes: 100,
+                seq: u32::from(fill_byte),
+                enqueued_at: now,
+                decoded_at: now,
+                buffer_depth_ms: 0.0,
+                buffer_target_ms: 0.0,
+                buffer_jitter_ms: 0.0,
+            },
             pixels: vec![fill_byte; 16],
             format: PictureFormat::Rgba,
-            frame_bytes: 100,
-            seq: u32::from(fill_byte),
-            enqueued_at: now,
-            decoded_at: now,
-            buffer_depth_ms: 0.0,
-            buffer_target_ms: 0.0,
-            buffer_jitter_ms: 0.0,
         }
     }
 
@@ -478,7 +430,7 @@ mod tests {
         }
         let slots = p.shared.slots.lock().unwrap();
         let shown = slots.get(&7).expect("prepared");
-        assert_eq!(shown.seq, 3);
+        assert_eq!(shown.meta.seq, 3);
         assert!(shown.buffer.as_bytes().iter().all(|&b| b == 3));
         let tally = p.tallies.lock().unwrap()[&7];
         assert_eq!((tally.prepared, tally.replaced), (1, 2));
@@ -526,7 +478,7 @@ mod tests {
             assert!(p.prepare(frame(7, b)));
         }
         let mut big = frame(7, 9);
-        big.width = 4;
+        big.meta.width = 4;
         big.pixels = vec![9; 4 * 2 * 4];
         assert!(p.prepare(big));
         assert_eq!(p.rings[&7].buffers.len(), 1);

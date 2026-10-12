@@ -91,8 +91,8 @@ impl AppState {
             // Our own speech shows from this local edge, at once; the
             // server's echo of it is ignored (`UserSpeaking`).
             VoiceEvent::SpeakingChanged(speaking) => {
-                if let Some(id) = self.our_client_id {
-                    if let Some(user) = self.users.get_mut(&id) {
+                if let Some(id) = self.session.our_client_id {
+                    if let Some(user) = self.session.users.get_mut(&id) {
                         user.is_speaking = speaking;
                     }
                     self.refresh_voice_row(id);
@@ -108,23 +108,15 @@ impl AppState {
     /// under a millisecond, which is what lets the UI keep up with
     /// 60 fps streams.
     pub(super) fn present_frame(&mut self, f: crate::present::PreparedFrame) {
-        let Some(viewer) = self.viewers.get_mut(&f.client_id) else {
+        let Some(viewer) = self.viewers.get_mut(&f.meta.client_id) else {
             return;
         };
-        viewer.update_frame(
-            f.buffer,
-            f.width,
-            f.height,
-            f.frame_bytes,
-            f.buffer_depth_ms,
-            f.buffer_target_ms,
-            f.buffer_jitter_ms,
-        );
+        viewer.update_frame(f.buffer, &f.meta);
         // For the stream's summary line (client::viewlog): decoded →
         // handed to the UI, this side's whole share of a frame's way.
-        let to_screen = u64::try_from(f.decoded_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let to_screen = u64::try_from(f.meta.decoded_at.elapsed().as_micros()).unwrap_or(u64::MAX);
         if let Ok(mut tallies) = self.screen.shared.present.lock() {
-            let tally = tallies.entry(f.client_id).or_default();
+            let tally = tallies.entry(f.meta.client_id).or_default();
             tally.shown += 1;
             tally.to_screen_us = tally.to_screen_us.saturating_add(to_screen);
             tally.to_screen_max_us = tally.to_screen_max_us.max(to_screen);
@@ -203,7 +195,7 @@ impl AppState {
                     hotkeys.set_connected(true);
                 }
                 self.lobby = lobby;
-                self.safety = safety;
+                self.session.safety.on = safety;
                 self.account_deleted = false;
                 self.reconnect_attempts = 0;
                 self.main.global::<State>().set_error_text("".into());
@@ -223,9 +215,9 @@ impl AppState {
                 permissions,
                 persistent,
             } => {
-                self.permissions = permissions;
-                self.our_user_id = Some(user_id);
-                self.server_persistent = persistent;
+                self.session.permissions = permissions;
+                self.session.our_user_id = Some(user_id);
+                self.session.server_persistent = persistent;
                 log::info!(
                     "session: user {}, permissions {permissions:#x}, persistent {persistent}",
                     short_id(&user_id)
@@ -330,26 +322,26 @@ impl AppState {
                     client::ConvRef::Dm(user) => Some(user),
                 };
                 if let Some(user) = key
-                    && let Some(meta) = self.dm_meta.get_mut(&user)
+                    && let Some(meta) = self.session.chat.dm_meta.get_mut(&user)
                 {
                     meta.fetched = true;
                 }
                 self.with_conversation(key, |app| app.take_history_page(key, &messages, more));
             }
             NetworkMessage::HistoryUnavailable { retry_secs, .. } => {
-                self.history_page_pending = None;
+                self.session.chat.history_page_pending = None;
                 self.main.global::<State>().set_history_loading(false);
                 self.push_chat_system(&t!("chat-history-unavailable", "secs" => retry_secs));
             }
             NetworkMessage::MessageEdited { msg_id, text } => {
-                if self.pending_edit == Some(msg_id) {
-                    self.pending_edit = None;
+                if self.session.chat.pending_edit == Some(msg_id) {
+                    self.session.chat.pending_edit = None;
                 }
                 // A blocked person's message: not shown, not narrated.
-                if self.hidden_messages.contains(&msg_id) {
+                if self.session.safety.hidden_messages.contains(&msg_id) {
                     return;
                 }
-                if let Some(own) = self.own_texts.get_mut(&msg_id) {
+                if let Some(own) = self.session.chat.own_texts.get_mut(&msg_id) {
                     own.clone_from(&text);
                 }
                 let text = app_core::emoji::replace_shortcodes(&text);
@@ -373,14 +365,20 @@ impl AppState {
                 }
             }
             NetworkMessage::MessageDeleted { msg_id } => {
-                if self.pending_delete == Some(msg_id) {
-                    self.pending_delete = None;
+                if self.session.chat.pending_delete == Some(msg_id) {
+                    self.session.chat.pending_delete = None;
                 }
-                if self.hidden_messages.remove(&msg_id) {
+                if self.session.safety.hidden_messages.remove(&msg_id) {
                     return;
                 }
-                self.own_texts.remove(&msg_id);
-                if self.editing.as_ref().is_some_and(|e| e.msg_id == msg_id) {
+                self.session.chat.own_texts.remove(&msg_id);
+                if self
+                    .session
+                    .chat
+                    .editing
+                    .as_ref()
+                    .is_some_and(|e| e.msg_id == msg_id)
+                {
                     self.edit_cancel();
                 }
                 // Off screen (scrolled out, or never shown): nothing to
@@ -396,7 +394,11 @@ impl AppState {
                 self.show_toast(ToastKind::Warning, &t!("chat-rate-limited", "secs" => secs));
             }
             NetworkMessage::ProgressUpdate { xp, level } => {
-                if let Some(user) = self.our_client_id.and_then(|id| self.users.get_mut(&id)) {
+                if let Some(user) = self
+                    .session
+                    .our_client_id
+                    .and_then(|id| self.session.users.get_mut(&id))
+                {
                     user.xp = Some(xp);
                     user.level = level;
                 }
@@ -410,25 +412,25 @@ impl AppState {
                 xp,
                 level,
             } => {
-                if let Some(user) = self.users.get_mut(&client_id) {
+                if let Some(user) = self.session.users.get_mut(&client_id) {
                     user.xp = Some(xp);
                     user.level = level;
                     self.update_user_list();
                 }
             }
             NetworkMessage::RoleList { roles } => {
-                self.roles = roles.into_iter().map(|r| (r.id, r)).collect();
+                self.session.roles = roles.into_iter().map(|r| (r.id, r)).collect();
                 // Custom names on the cards, and in the roster's menu.
                 self.update_user_list();
             }
             NetworkMessage::AuditLine { entry } => {
                 self.ensure_admin_channel();
                 let line = audit_line_text(&entry);
-                let open = self.active_dm == Some(ADMIN_CHANNEL_KEY);
+                let open = self.session.chat.active_dm == Some(ADMIN_CHANNEL_KEY);
                 self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| {
                     app.push_system_here(&line);
                 });
-                if !open && let Some(meta) = self.dm_meta.get_mut(&ADMIN_CHANNEL_KEY) {
+                if !open && let Some(meta) = self.session.chat.dm_meta.get_mut(&ADMIN_CHANNEL_KEY) {
                     meta.unread += 1;
                     self.rebuild_dms_model();
                 }
@@ -465,7 +467,7 @@ impl AppState {
                             day: local_day(ts),
                             user: username,
                             author: Some(from),
-                            own: Some(client_id) == self.our_client_id,
+                            own: Some(client_id) == self.session.our_client_id,
                             pending: false,
                         };
                         // Our own post came back: the ack already turned
@@ -516,7 +518,7 @@ impl AppState {
                 afk_after_min,
                 is_afk,
             } => {
-                self.channel_details.insert(
+                self.session.channel_details.insert(
                     channel_id,
                     ChannelFacts {
                         stable_id,
@@ -535,7 +537,7 @@ impl AppState {
             }
             NetworkMessage::ChannelDenied { reason } => {
                 let what = t!(channel_denied_key(reason));
-                if let Some(dialog) = self.channel_dialog.as_mut()
+                if let Some(dialog) = self.session.chat.channel_dialog.as_mut()
                     && dialog.pending
                 {
                     dialog.pending = false;
@@ -558,23 +560,26 @@ impl AppState {
                 roles,
                 level,
             } => {
-                let before = self.details.insert(client_id, (user_id, roles.clone()));
-                if let Some(user) = self.users.get_mut(&client_id) {
+                let before = self
+                    .session
+                    .details
+                    .insert(client_id, (user_id, roles.clone()));
+                if let Some(user) = self.session.users.get_mut(&client_id) {
                     user.role = role_of(&roles);
                     user.level = level;
                 }
                 self.apply_saved_peer_audio(client_id, &user_id);
-                if self.dm_meta.contains_key(&user_id) {
+                if self.session.chat.dm_meta.contains_key(&user_id) {
                     self.rebuild_dms_model();
                 }
-                if Some(client_id) == self.our_client_id {
+                if Some(client_id) == self.session.our_client_id {
                     // Our own rank decides which gated channels we see
                     // and which roles the menu may hand out.
                     self.rebuild_channels();
                     self.push_permissions();
                 }
                 self.update_user_list();
-                if Some(client_id) == self.our_client_id
+                if Some(client_id) == self.session.our_client_id
                     && let Some((_, old)) = before
                     && old != roles
                 {
@@ -621,15 +626,15 @@ impl AppState {
                     // A server mute: stop sending (spec §4.2), and keep
                     // the button locked until it lifts.
                     client::RestrictionKind::Voice => {
-                        if self.server_muted.is_none() {
-                            self.server_muted = Some(self.is_muted);
+                        if self.session.server_muted.is_none() {
+                            self.session.server_muted = Some(self.session.is_muted);
                         }
-                        if !self.is_muted {
+                        if !self.session.is_muted {
                             self.set_muted(true);
                         }
                     }
                     client::RestrictionKind::GeneralText => {
-                        self.text_muted = Some(TextMute { until: until_ms });
+                        self.session.text_muted = Some(TextMute { until: until_ms });
                     }
                     _ => {}
                 }
@@ -638,13 +643,13 @@ impl AppState {
                 self.push_chat_system(&t!(lifted_key(kind)));
                 match kind {
                     client::RestrictionKind::Voice => {
-                        if let Some(was_muted) = self.server_muted.take()
+                        if let Some(was_muted) = self.session.server_muted.take()
                             && !was_muted
                         {
                             self.set_muted(false);
                         }
                     }
-                    client::RestrictionKind::GeneralText => self.text_muted = None,
+                    client::RestrictionKind::GeneralText => self.session.text_muted = None,
                     _ => {}
                 }
             }
@@ -902,11 +907,11 @@ impl AppState {
                     day: local_day(ts),
                     user: username,
                     author,
-                    own: Some(client_id) == self.our_client_id,
+                    own: Some(client_id) == self.session.our_client_id,
                     pending: false,
                 };
                 if meta.own {
-                    self.own_texts.insert(id, text.clone());
+                    self.session.chat.own_texts.insert(id, text.clone());
                 }
                 // Render shortcodes from clients that send them raw.
                 let text = app_core::emoji::replace_shortcodes(&text);
@@ -922,8 +927,12 @@ impl AppState {
                 // image's (review P1-17). One that has no card (the
                 // avatar) or whose card is gone shows nowhere.
                 let card = match upload {
-                    client::network::UploadKey::Image => self.image_upload.map(|id| (None, id)),
+                    client::network::UploadKey::Image => {
+                        self.session.transfers.image_upload.map(|id| (None, id))
+                    }
                     client::network::UploadKey::Blob(upload_id) => self
+                        .session
+                        .transfers
                         .pending_uploads
                         .get(&upload_id)
                         .map(|u| (u.conv, u.placeholder)),
@@ -950,7 +959,7 @@ impl AppState {
                     day: local_day(ts),
                     user: username.clone(),
                     author: self.account_of(client_id),
-                    own: Some(client_id) == self.our_client_id,
+                    own: Some(client_id) == self.session.our_client_id,
                     pending: false,
                 };
                 if meta.own {
@@ -972,8 +981,8 @@ impl AppState {
             } => {
                 // Ours is the local edge's (`SpeakingChanged`): handling
                 // the echo too updated our row twice per edge.
-                if Some(client_id) != self.our_client_id {
-                    if let Some(user) = self.users.get_mut(&client_id) {
+                if Some(client_id) != self.session.our_client_id {
+                    if let Some(user) = self.session.users.get_mut(&client_id) {
                         user.is_speaking = is_speaking;
                     }
                     self.refresh_voice_row(client_id);
@@ -984,7 +993,7 @@ impl AppState {
                 muted,
                 deafened,
             } => {
-                if let Some(user) = self.users.get_mut(&client_id) {
+                if let Some(user) = self.session.users.get_mut(&client_id) {
                     user.is_self_muted = muted;
                     user.is_self_deafened = deafened;
                 }
@@ -1031,11 +1040,14 @@ impl AppState {
                 height,
                 scope: _,
             } => {
-                self.active_sharers.insert(client_id, (width, height));
+                self.session
+                    .active_sharers
+                    .insert(client_id, (width, height));
                 self.update_user_list();
                 // A stream going up in our channel — ours included: the
                 // sharer hears that they are live, the same as the room.
                 let in_our_channel = self
+                    .session
                     .users
                     .get(&client_id)
                     .is_some_and(|u| Some(u.channel_id) == self.our_channel());
@@ -1047,7 +1059,7 @@ impl AppState {
                 }
             }
             NetworkMessage::ScreenShareStopped { client_id } => {
-                self.active_sharers.remove(&client_id);
+                self.session.active_sharers.remove(&client_id);
                 self.update_user_list();
             }
             // ── 1.1.2: profiles and blobs (spec §7, §7.1) ────────────
@@ -1056,13 +1068,19 @@ impl AppState {
             }
             NetworkMessage::ProfileUpdated { user_id, profile } => {
                 let client = self
+                    .session
                     .details
                     .iter()
                     .find(|(_, (u, _))| *u == user_id)
                     .map(|(c, _)| *c);
                 if let Some(client_id) = client {
                     self.take_profile(client_id, profile);
-                } else if let Some(name) = self.author_looks.get(&user_id).map(|l| l.name.clone()) {
+                } else if let Some(name) = self
+                    .session
+                    .author_looks
+                    .get(&user_id)
+                    .map(|l| l.name.clone())
+                {
                     // Someone not in the roster whose rows are on screen.
                     self.take_author_look(user_id, name, profile);
                 }
@@ -1073,22 +1091,23 @@ impl AppState {
             }
             NetworkMessage::UserRenamed { client_id, name } => {
                 let old = self.username_of(client_id);
-                if let Some(user) = self.users.get_mut(&client_id) {
+                if let Some(user) = self.session.users.get_mut(&client_id) {
                     user.username.clone_from(&name);
                 }
                 // The Messages list and an open DM header follow a
                 // partner's rename.
                 let renamed_partner = self
+                    .session
                     .details
                     .get(&client_id)
                     .map(|(u, _)| *u)
-                    .filter(|u| self.dm_meta.contains_key(u));
+                    .filter(|u| self.session.chat.dm_meta.contains_key(u));
                 if let Some(user_id) = renamed_partner {
-                    if let Some(meta) = self.dm_meta.get_mut(&user_id) {
+                    if let Some(meta) = self.session.chat.dm_meta.get_mut(&user_id) {
                         meta.name.clone_from(&name);
                     }
                     self.rebuild_dms_model();
-                    if self.active_dm == Some(user_id) {
+                    if self.session.chat.active_dm == Some(user_id) {
                         self.main
                             .global::<State>()
                             .set_conv_name(name.as_str().into());
@@ -1109,12 +1128,12 @@ impl AppState {
                 self.show_toast(ToastKind::Warning, &t!(rename_denied_key(reason)));
             }
             NetworkMessage::UploadDone { upload_id, blob_id } => {
-                if let Some(upload) = self.pending_uploads.remove(&upload_id) {
+                if let Some(upload) = self.session.transfers.pending_uploads.remove(&upload_id) {
                     self.file_uploaded(upload_id, upload, blob_id);
                 } else if upload_id == AVATAR_UPLOAD_ID {
                     // The picture is on the server: now the profile
                     // can point at it.
-                    self.own_avatar_blob = Some(blob_id);
+                    self.session.own_avatar_blob = Some(blob_id);
                     self.avatar_images
                         .entry(blob_id)
                         .or_insert_with(|| self.own_avatar.clone().unwrap_or_default());
@@ -1122,9 +1141,15 @@ impl AppState {
                 }
             }
             NetworkMessage::UploadRejected { upload_id, reason } => {
-                if let Some(upload) = self.pending_uploads.remove(&upload_id) {
-                    self.pending_picture_uploads.remove(&upload_id);
-                    self.transfers.remove(&(upload.conv, upload.placeholder));
+                if let Some(upload) = self.session.transfers.pending_uploads.remove(&upload_id) {
+                    self.session
+                        .transfers
+                        .pending_picture_uploads
+                        .remove(&upload_id);
+                    self.session
+                        .transfers
+                        .shown
+                        .remove(&(upload.conv, upload.placeholder));
                     self.with_conversation(upload.conv, |app| {
                         if let Some(delta) = app.history.discard_message(upload.placeholder) {
                             app.sync_range(&delta);
@@ -1144,19 +1169,19 @@ impl AppState {
                         &t!("profile-avatar-refused", "why" => why.as_str()),
                     );
                     // The rest of the look still goes out.
-                    self.own_avatar_blob = None;
+                    self.session.own_avatar_blob = None;
                     self.send_own_profile();
                 }
             }
             NetworkMessage::BlobProgress { blob_id, pct } => {
-                if let Some(d) = self.pending_downloads.get(&blob_id) {
+                if let Some(d) = self.session.transfers.pending_downloads.get(&blob_id) {
                     let (conv, msg_id) = (d.conv, d.msg_id);
                     self.set_transfer(conv, msg_id, Some((2, i32::from(pct))));
                 }
             }
             NetworkMessage::BlobFailed { blob_id } => {
                 if let Some(PendingDownload { name, conv, msg_id }) =
-                    self.pending_downloads.remove(&blob_id)
+                    self.session.transfers.pending_downloads.remove(&blob_id)
                 {
                     self.set_transfer(conv, msg_id, None);
                     self.show_toast(
@@ -1166,7 +1191,7 @@ impl AppState {
                 }
             }
             NetworkMessage::Blob { blob_id, data } => {
-                if let Some(rows) = self.pending_pictures.remove(&blob_id) {
+                if let Some(rows) = self.session.transfers.pending_pictures.remove(&blob_id) {
                     for (conv, msg_id) in rows {
                         let bytes = data.clone();
                         self.with_conversation(conv, |app| {
@@ -1175,7 +1200,7 @@ impl AppState {
                     }
                 }
                 if let Some(PendingDownload { name, conv, msg_id }) =
-                    self.pending_downloads.remove(&blob_id)
+                    self.session.transfers.pending_downloads.remove(&blob_id)
                 {
                     self.set_transfer(conv, msg_id, None);
                     match media::save_to_downloads(&name, &data) {
@@ -1194,14 +1219,14 @@ impl AppState {
                         )),
                     }
                 } else {
-                    self.avatar_fetches.remove(&blob_id);
+                    self.session.avatar_fetches.remove(&blob_id);
                     self.take_avatar_bytes(blob_id, &data, true);
                 }
             }
             NetworkMessage::BlobMissing { blob_id } => {
-                self.pending_pictures.remove(&blob_id);
+                self.session.transfers.pending_pictures.remove(&blob_id);
                 if let Some(PendingDownload { name, conv, msg_id }) =
-                    self.pending_downloads.remove(&blob_id)
+                    self.session.transfers.pending_downloads.remove(&blob_id)
                 {
                     self.set_transfer(conv, msg_id, None);
                     self.show_toast(
@@ -1209,7 +1234,7 @@ impl AppState {
                         &t!("file-download-failed", "name" => name.as_str()),
                     );
                 } else {
-                    self.avatar_fetches.remove(&blob_id);
+                    self.session.avatar_fetches.remove(&blob_id);
                 }
             }
             // ── 1.1.1: direct messages — the conversation UI is the
@@ -1226,12 +1251,14 @@ impl AppState {
             }
             NetworkMessage::MessageAck { client_ref, msg_id } => {
                 if let Some((key, placeholder)) = self
+                    .session
+                    .chat
                     .pending_dm_sends
                     .remove(&client_ref)
-                    .or_else(|| self.pending_files.remove(&client_ref))
+                    .or_else(|| self.session.transfers.pending_files.remove(&client_ref))
                 {
-                    self.transfers.remove(&(key, placeholder));
-                    let picture = self.picture_acks.remove(&client_ref);
+                    self.session.transfers.shown.remove(&(key, placeholder));
+                    let picture = self.session.transfers.picture_acks.remove(&client_ref);
                     self.with_conversation(key, |app| {
                         // Confirm first: the rebuild that follows keeps a
                         // picture only when the row's id stays the same,
@@ -1239,13 +1266,13 @@ impl AppState {
                         if let Some(delta) = app.history.confirm_message(placeholder, msg_id) {
                             app.sync_range(&delta);
                         }
-                        app.oldest_history_id.get_or_insert(msg_id);
+                        app.session.oldest_history_id.get_or_insert(msg_id);
                         if let Some(png) = picture {
                             media::picture_from_file(app, msg_id, png);
                         }
                     });
                     if let Some(user) = key
-                        && let Some(meta) = self.dm_meta.get_mut(&user)
+                        && let Some(meta) = self.session.chat.dm_meta.get_mut(&user)
                     {
                         meta.last_msg_id = meta.last_msg_id.max(msg_id);
                     }
@@ -1253,9 +1280,11 @@ impl AppState {
             }
             NetworkMessage::MessageFailed { client_ref, reason } => {
                 if let Some((key, placeholder)) = self
+                    .session
+                    .chat
                     .pending_dm_sends
                     .remove(&client_ref)
-                    .or_else(|| self.pending_files.remove(&client_ref))
+                    .or_else(|| self.session.transfers.pending_files.remove(&client_ref))
                 {
                     self.with_conversation(key, |app| {
                         if let Some(delta) = app.history.discard_message(placeholder) {
@@ -1268,7 +1297,7 @@ impl AppState {
             NetworkMessage::Conversations { dms } => {
                 // The list from the store: names, unread counts, the
                 // newest id per partner. Histories load when opened.
-                self.dm_order.clear();
+                self.session.chat.dm_order.clear();
                 for dm in dms {
                     // Closed by its ✕ and nothing new since: stays out.
                     if dm.unread == 0 && self.dm_hidden(&dm.user_id) {
@@ -1280,25 +1309,30 @@ impl AppState {
                     if dm.unread > 0 {
                         self.set_dm_hidden(dm.user_id, false);
                     }
-                    let meta = self.dm_meta.entry(dm.user_id).or_insert_with(|| DmMeta {
-                        name: dm.name.clone(),
-                        unread: 0,
-                        last_ts: 0,
-                        last_msg_id: 0,
-                        fetched: false,
-                    });
+                    let meta = self
+                        .session
+                        .chat
+                        .dm_meta
+                        .entry(dm.user_id)
+                        .or_insert_with(|| DmMeta {
+                            name: dm.name.clone(),
+                            unread: 0,
+                            last_ts: 0,
+                            last_msg_id: 0,
+                            fetched: false,
+                        });
                     meta.name = dm.name;
                     meta.unread = if blocked { 0 } else { dm.unread };
                     meta.last_ts = dm.last_ts;
                     meta.last_msg_id = dm.last_msg_id;
                     if !blocked {
-                        self.dm_order.push(dm.user_id);
+                        self.session.chat.dm_order.push(dm.user_id);
                     }
                 }
                 // The admin channel is ours, not the store's: it keeps
                 // its place at the top.
-                if self.dm_meta.contains_key(&ADMIN_CHANNEL_KEY) {
-                    self.dm_order.insert(0, ADMIN_CHANNEL_KEY);
+                if self.session.chat.dm_meta.contains_key(&ADMIN_CHANNEL_KEY) {
+                    self.session.chat.dm_order.insert(0, ADMIN_CHANNEL_KEY);
                 }
                 self.rebuild_dms_model();
             }

@@ -126,7 +126,6 @@ pub fn set_host_visible(visible: bool) {
 
 /// A notification about the DM with `dm` (the user id in hex) was
 /// tapped: open that conversation (ANDROID-SPEC.md D52). Any thread.
-#[cfg_attr(feature = "desktop", expect(dead_code, reason = "phones only"))]
 pub(crate) fn open_noticed_conversation(dm: String) {
     let _ = slint::invoke_from_event_loop(move || {
         with_current(|app| app.open_noticed_dm(&dm));
@@ -193,44 +192,15 @@ fn wake() {
     }
 }
 
-// struct_excessive_bools: connected/is_muted/is_deafened/is_testing_mic
-// are four independent facts about the session, not an encoded state
-// machine — a bitflags/enum here would only obscure the call sites.
-#[allow(clippy::struct_excessive_bools)]
-pub struct AppState {
-    // Thread handles (own the threads + their channels)
-    pub(crate) network: NetworkThreadHandle,
-    voice: VoiceThreadHandle,
-    screen: ScreenThreadHandle,
-    /// Prepared frames + the forward channel from the present-prep
-    /// thread (see present.rs), which owns `screen.event_rx` now.
-    present: Arc<crate::present::PresentShared>,
-    ui_screen_rx: crossbeam_channel::Receiver<ScreenEvent>,
-
-    // Domain state
-    pub(crate) users: HashMap<u64, UserState>,
-    our_client_id: Option<u64>,
-    /// Server display name (from Init) — prefixes server-originated
-    /// system chat lines, same style as the greeting.
-    pub server_name: String,
-    /// Voice channels this server defines (from Init), in id order —
-    /// derived from `channel_infos` + `channel_details` + our rank by
-    /// `rebuild_channels`.
-    pub(crate) channels: Vec<ChannelMeta>,
-    /// The wire list as last received (`Init` / `ChannelListUpdated`).
-    channel_infos: Vec<client::ChannelInfo>,
-    /// Channel a `JoinChannel` is in flight for (the password prompt's
-    /// target; also lets a `WrongPassword` reply reopen the prompt).
-    pending_channel_join: Option<u16>,
-    pub connected: bool,
-    pub settings: Settings,
-    /// Our Ed25519 identity key (next to settings.json): the login
-    /// (spec §3). `None` if it could not be loaded — then there is no
-    /// connecting until it can.
-    pub client_key: Option<Arc<transport::ClientKey>>,
+/// Everything that belongs to one connection and ends with it.
+/// `teardown_connection` replaces it whole, so a field added here
+/// cannot be forgotten at a disconnect: the resets used to be three
+/// lists kept by hand, a line per field (review P2-51). What a session
+/// leaves on screen is cleared beside it, where it is shown.
+pub(crate) struct Session {
     /// What the server said we may do this session (`Session`,
     /// spec §10); the UI renders what this allows.
-    pub permissions: u64,
+    pub(crate) permissions: u64,
     /// Who we are on this server (`Session.user_id`): history rows
     /// authored by this id are ours to edit and delete.
     our_user_id: Option<client::UserId>,
@@ -243,52 +213,6 @@ pub struct AppState {
     pub(crate) details: HashMap<u64, (client::UserId, Vec<client::RoleId>)>,
     /// Admin requests in flight: what to do with the answer.
     pending_admin: HashMap<u32, PendingAdmin>,
-    next_request_id: u32,
-    /// The last telemetry fetched per session for the roster tooltip
-    /// (spec §8), and when, so a hover does not ask twice in ten
-    /// seconds.
-    telemetry_notes: HashMap<u64, TelemetryNote>,
-    /// The moderation dialog's subject while it is open.
-    moderation: Option<Moderation>,
-    /// What the open context menu is about: its entries were built
-    /// for this target, and a pick resolves against it.
-    menu_target: Option<MenuTarget>,
-    /// What each entry of the open menu does, by `MenuEntry.id`.
-    menu_actions: Vec<menu::Action>,
-    /// The conversation a slash command was typed in: its output
-    /// (and the answer to the admin command it sent) lands there —
-    /// the admin channel, a DM, or General.
-    command_conv: Option<client::UserId>,
-    /// The server's role table (`RoleList`, spec §4), the built-ins
-    /// alone until it arrives — custom roles are named by it.
-    pub(crate) roles: BTreeMap<client::RoleId, client::protocol::RoleInfo>,
-    /// File uploads in flight, by upload id (spec §7): where they go
-    /// once the server has the bytes.
-    pending_uploads: HashMap<u32, PendingUpload>,
-    /// Files posted and awaiting the server's ack, by client ref: the
-    /// conversation and the placeholder row.
-    pending_files: HashMap<u32, (Option<client::UserId>, u64)>,
-    /// Blobs fetched for a Save, by hash: the name to write them as,
-    /// and the row (conversation, message id) whose card shows it.
-    pending_downloads: HashMap<client::protocol::BlobId, PendingDownload>,
-    next_file_upload_id: u32,
-    /// Transfers shown on cards, by (conversation, message id): the
-    /// kind (1 up, 2 down) and percent. Rows are rebuilt freely, so
-    /// `chat_row_at` reads this rather than the row carrying it.
-    transfers: HashMap<(Option<client::UserId>, u64), (i32, i32)>,
-    /// An image on its way: the placeholder row's message id, replaced
-    /// by our own echo.
-    image_upload: Option<u64>,
-    /// Pictures going up as files (DMs), by upload id: the bytes, to
-    /// show our own card as a picture once the post is acked.
-    pending_picture_uploads: HashMap<u32, Vec<u8>>,
-    /// Pictures posted as files by others, by blob: the rows waiting
-    /// for the bytes to become images.
-    pending_pictures: HashMap<client::protocol::BlobId, Vec<(Option<client::UserId>, u64)>>,
-    /// Our own picture posts awaiting their ack, by client ref.
-    picture_acks: HashMap<u32, Vec<u8>>,
-    /// Files saved this session, by blob: the card offers Open.
-    downloaded: HashMap<client::protocol::BlobId, std::path::PathBuf>,
     /// A server voice mute stands (spec §4.2): the mute button is
     /// locked, and `Some(was_muted)` remembers what to restore.
     server_muted: Option<bool>,
@@ -299,39 +223,149 @@ pub struct AppState {
     /// The oldest history id shown, for paging ("load earlier",
     /// `/history`).
     oldest_history_id: Option<u64>,
-    /// The conversation whose `FetchHistory` page is in flight: its
-    /// page goes in front of that list; the general replay after
-    /// `Init` is appended.
-    // The inner `Option` is the conversation key used throughout this
-    // file (`None` = General); the outer one is "a page is in flight".
-    #[expect(clippy::option_option)]
-    history_page_pending: Option<Option<client::UserId>>,
-    /// Which conversation the chat pane shows: `None` = General, else
-    /// the DM partner (spec §6). `history` / `chat_model` /
-    /// `oldest_history_id` are that conversation's; the others are
-    /// parked with theirs.
-    active_dm: Option<client::UserId>,
-    parked: HashMap<Option<client::UserId>, Conversation>,
-    /// The active fields hold a conversation that is not on screen
-    /// (`with_conversation` borrowed it): what lands there does not
-    /// move the pane or count as unseen.
-    borrowed_conversation: bool,
-    /// DM partners as the Messages section lists them, newest first,
-    /// and what the list knows about each.
-    dm_order: Vec<client::UserId>,
-    dm_meta: HashMap<client::UserId, DmMeta>,
-    dms_model: Rc<VecModel<DmRow>>,
-    /// Row ids are unique across conversations (images and GIFs are
-    /// keyed by them), so the counter lives here, not per history.
-    next_row_id: u64,
-    /// Our DMs waiting for the server: `client_ref` → (conversation,
-    /// placeholder message id).
-    next_client_ref: u32,
-    pending_dm_sends: HashMap<u32, (Option<client::UserId>, u64)>,
-    /// The active conversation's "older pages exist" (swapped with it).
-    history_more: bool,
-    /// General messages that arrived while a DM was open.
-    general_unread: u32,
+    /// Per-channel facts from `ChannelDetails`, keyed by wire id.
+    channel_details: HashMap<u16, ChannelFacts>,
+    /// The last telemetry fetched per session for the roster tooltip
+    /// (spec §8), and when, so a hover does not ask twice in ten
+    /// seconds.
+    telemetry_notes: HashMap<u64, TelemetryNote>,
+    /// The moderation dialog's subject while it is open.
+    moderation: Option<Moderation>,
+    /// Everyone's look, from the server (spec §7.1).
+    profiles: HashMap<u64, client::protocol::Profile>,
+    /// Names and looks by account (1.2): whoever the server introduced
+    /// (`Authors`: someone in the lobby, the authors of a history page,
+    /// the other end of a DM) and everyone seen online this session —
+    /// so a picture shows for someone offline, and stays when its
+    /// owner leaves. Memory only, emptied with the session.
+    author_looks: HashMap<client::UserId, profiles::AuthorLook>,
+    /// Lobby sessions the server introduced, by account: a picture
+    /// names only its session.
+    lurkers: HashMap<u64, client::UserId>,
+    /// Blobs asked for and not yet here (no double fetches).
+    avatar_fetches: HashSet<client::protocol::BlobId>,
+    /// The hash of our own avatar as uploaded, once the server has it.
+    own_avatar_blob: Option<client::protocol::BlobId>,
+    /// Voice channels this server defines (from Init), in id order —
+    /// derived from `channel_infos` + `channel_details` + our rank by
+    /// `rebuild_channels`.
+    pub(crate) channels: Vec<ChannelMeta>,
+    /// The wire list as last received (`Init` / `ChannelListUpdated`).
+    channel_infos: Vec<client::ChannelInfo>,
+    /// Channel a `JoinChannel` is in flight for (the password prompt's
+    /// target; also lets a `WrongPassword` reply reopen the prompt).
+    pending_channel_join: Option<u16>,
+    /// Active screen sharers: `client_id` → (width, height).
+    active_sharers: HashMap<u64, (u32, u32)>,
+    // Domain state
+    pub(crate) users: HashMap<u64, UserState>,
+    our_client_id: Option<u64>,
+    is_muted: bool,
+    is_deafened: bool,
+    /// The server's role table (`RoleList`, spec §4), the built-ins
+    /// alone until it arrives — custom roles are named by it.
+    pub(crate) roles: BTreeMap<client::RoleId, client::protocol::RoleInfo>,
+    /// Blocks and reports ([`Safety`]).
+    pub(crate) safety: Safety,
+    /// Files and pictures on their way ([`Transfers`]).
+    pub(crate) transfers: Transfers,
+    /// The conversations and what is being written in them
+    /// ([`ChatFlow`]); also started afresh when a session opens.
+    pub(crate) chat: ChatFlow,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            permissions: 0,
+            our_user_id: None,
+            details: HashMap::new(),
+            pending_admin: HashMap::new(),
+            server_muted: None,
+            text_muted: None,
+            oldest_history_id: None,
+            channel_details: HashMap::new(),
+            telemetry_notes: HashMap::new(),
+            moderation: None,
+            profiles: HashMap::new(),
+            author_looks: HashMap::new(),
+            lurkers: HashMap::new(),
+            avatar_fetches: HashSet::new(),
+            own_avatar_blob: None,
+            channels: Vec::new(),
+            channel_infos: Vec::new(),
+            pending_channel_join: None,
+            active_sharers: HashMap::new(),
+            users: HashMap::new(),
+            our_client_id: None,
+            is_muted: false,
+            is_deafened: false,
+            // Until the server says otherwise.
+            server_persistent: true,
+            roles: builtin_role_table(),
+            safety: Safety::default(),
+            transfers: Transfers::default(),
+            chat: ChatFlow::default(),
+        }
+    }
+}
+
+/// What the session knows of blocks and reports (`app/safety.rs`).
+#[derive(Default)]
+pub(crate) struct Safety {
+    // ── 1.2: blocks, reports, deleting the account (`features::SAFETY`)
+    /// The server takes them (`Connected.safety`): the menus and the
+    /// Settings sections offer them only then.
+    pub(crate) on: bool,
+    /// Whom this account blocked on this server, by user id, with
+    /// their names: nothing of theirs is shown, their voice never
+    /// arrives (the server's side), DMs are refused both ways.
+    pub(crate) blocked: HashMap<client::UserId, String>,
+    /// The list arrived once this session: later ones are changes.
+    blocks_known: bool,
+    /// Messages kept out of the chat because a blocked person wrote
+    /// them: an edit or a deletion of one says nothing.
+    hidden_messages: HashSet<u64>,
+    /// The report dialog's subject while it is open.
+    report: Option<safety::PendingReport>,
+    /// The Reports tab's list as last fetched, for its row actions.
+    pub(crate) admin_reports: Vec<client::protocol::ReportSummary>,
+}
+
+/// Transfers end with the session: nothing more arrives for them
+/// (`AppState::clear_transfers`).
+#[derive(Default)]
+pub(crate) struct Transfers {
+    /// Blobs fetched for a Save, by hash: the name to write them as,
+    /// and the row (conversation, message id) whose card shows it.
+    pending_downloads: HashMap<client::protocol::BlobId, PendingDownload>,
+    /// File uploads in flight, by upload id (spec §7): where they go
+    /// once the server has the bytes.
+    pending_uploads: HashMap<u32, PendingUpload>,
+    /// Files posted and awaiting the server's ack, by client ref: the
+    /// conversation and the placeholder row.
+    pending_files: HashMap<u32, (Option<client::UserId>, u64)>,
+    /// Pictures going up as files (DMs), by upload id: the bytes, to
+    /// show our own card as a picture once the post is acked.
+    pending_picture_uploads: HashMap<u32, Vec<u8>>,
+    /// Pictures posted as files by others, by blob: the rows waiting
+    /// for the bytes to become images.
+    pub(crate) pending_pictures:
+        HashMap<client::protocol::BlobId, Vec<(Option<client::UserId>, u64)>>,
+    /// Our own picture posts awaiting their ack, by client ref.
+    picture_acks: HashMap<u32, Vec<u8>>,
+    /// An image on its way: the placeholder row's message id, replaced
+    /// by our own echo.
+    image_upload: Option<u64>,
+    /// Transfers shown on cards, by (conversation, message id): the
+    /// kind (1 up, 2 down) and percent. Rows are rebuilt freely, so
+    /// `chat_row_at` reads this rather than the row carrying it.
+    shown: HashMap<(Option<client::UserId>, u64), (i32, i32)>,
+}
+
+/// The chat's own state for one session (`AppState::reset_chat_flow`).
+#[derive(Default)]
+pub(crate) struct ChatFlow {
     /// The full text of our own messages by id (rows hold segments):
     /// what the composer starts from on "Edit message".
     own_texts: HashMap<u64, String>,
@@ -346,40 +380,91 @@ pub struct AppState {
     pending_confirm: Option<Confirm>,
     /// The channel dialog while it is open.
     channel_dialog: Option<ChannelDialog>,
+    /// The conversation whose `FetchHistory` page is in flight: its
+    /// page goes in front of that list; the general replay after
+    /// `Init` is appended.
+    // The inner `Option` is the conversation key used throughout this
+    // file (`None` = General); the outer one is "a page is in flight".
+    #[expect(clippy::option_option)]
+    history_page_pending: Option<Option<client::UserId>>,
+    pending_dm_sends: HashMap<u32, (Option<client::UserId>, u64)>,
+    parked: HashMap<Option<client::UserId>, Conversation>,
+    /// DM partners as the Messages section lists them, newest first,
+    /// and what the list knows about each.
+    dm_order: Vec<client::UserId>,
+    dm_meta: HashMap<client::UserId, DmMeta>,
+    /// Which conversation the chat pane shows: `None` = General, else
+    /// the DM partner (spec §6). `history` / `chat_model` /
+    /// `oldest_history_id` are that conversation's; the others are
+    /// parked with theirs.
+    active_dm: Option<client::UserId>,
+    /// The active conversation's "older pages exist" (swapped with it).
+    history_more: bool,
+    /// General messages that arrived while a DM was open.
+    general_unread: u32,
+}
+
+// struct_excessive_bools: connected and is_testing_mic here, is_muted
+// and is_deafened in the session, are independent facts, not an
+// encoded state machine — a bitflags/enum would only obscure the call
+// sites.
+#[allow(clippy::struct_excessive_bools)]
+pub struct AppState {
+    // Thread handles (own the threads + their channels)
+    pub(crate) network: NetworkThreadHandle,
+    voice: VoiceThreadHandle,
+    screen: ScreenThreadHandle,
+    /// Prepared frames + the forward channel from the present-prep
+    /// thread (see present.rs), which owns `screen.event_rx` now.
+    present: Arc<crate::present::PresentShared>,
+    ui_screen_rx: crossbeam_channel::Receiver<ScreenEvent>,
+
+    /// Server display name (from Init) — prefixes server-originated
+    /// system chat lines, same style as the greeting.
+    pub server_name: String,
+    pub connected: bool,
+    pub settings: Settings,
+    /// Our Ed25519 identity key (next to settings.json): the login
+    /// (spec §3). `None` if it could not be loaded — then there is no
+    /// connecting until it can.
+    pub client_key: Option<Arc<transport::ClientKey>>,
+    next_request_id: u32,
+    /// What the open context menu is about: its entries were built
+    /// for this target, and a pick resolves against it.
+    menu_target: Option<MenuTarget>,
+    /// What each entry of the open menu does, by `MenuEntry.id`.
+    menu_actions: Vec<menu::Action>,
+    /// The conversation a slash command was typed in: its output
+    /// (and the answer to the admin command it sent) lands there —
+    /// the admin channel, a DM, or General.
+    command_conv: Option<client::UserId>,
+    next_file_upload_id: u32,
+    /// Files saved this session, by blob: the card offers Open.
+    downloaded: HashMap<client::protocol::BlobId, std::path::PathBuf>,
+    /// The active fields hold a conversation that is not on screen
+    /// (`with_conversation` borrowed it): what lands there does not
+    /// move the pane or count as unseen.
+    borrowed_conversation: bool,
+    dms_model: Rc<VecModel<DmRow>>,
+    /// Row ids are unique across conversations (images and GIFs are
+    /// keyed by them), so the counter lives here, not per history.
+    next_row_id: u64,
+    /// Our DMs waiting for the server: `client_ref` → (conversation,
+    /// placeholder message id).
+    next_client_ref: u32,
     /// The connect screen has been reached once: auto-connect and
     /// start-in-tray apply only then, not after a disconnect.
     startup_done: bool,
     /// Our own avatar, decoded once for the rows (spec §7.1).
     pub own_avatar: Option<slint::Image>,
-    /// The hash of our own avatar as uploaded, once the server has it.
-    own_avatar_blob: Option<client::protocol::BlobId>,
     /// The look changed in Settings since the server last got it;
     /// sent as one `SetProfile` on Save & close.
     pub profile_dirty: bool,
-    /// Everyone's look, from the server (spec §7.1).
-    profiles: HashMap<u64, client::protocol::Profile>,
-    /// Names and looks by account (1.2): whoever the server introduced
-    /// (`Authors`: someone in the lobby, the authors of a history page,
-    /// the other end of a DM) and everyone seen online this session —
-    /// so a picture shows for someone offline, and stays when its
-    /// owner leaves. Memory only, emptied with the session.
-    author_looks: HashMap<client::UserId, profiles::AuthorLook>,
-    /// Lobby sessions the server introduced, by account: a picture
-    /// names only its session.
-    lurkers: HashMap<u64, client::UserId>,
     /// Decoded pictures by hash: the on-disk cache, warmed on demand.
     avatar_images: HashMap<client::protocol::BlobId, slint::Image>,
-    /// Blobs asked for and not yet here (no double fetches).
-    avatar_fetches: HashSet<client::protocol::BlobId>,
-    /// Per-channel facts from `ChannelDetails`, keyed by wire id.
-    channel_details: HashMap<u16, ChannelFacts>,
-    is_muted: bool,
-    is_deafened: bool,
     pub is_testing_mic: bool,
     is_testing_mic_shared: Arc<AtomicBool>,
 
-    /// Active screen sharers: `client_id` → (width, height).
-    active_sharers: HashMap<u64, (u32, u32)>,
     /// How many were watching our stream at the last stats tick: a
     /// rise plays the viewer-joined sound (`StreamHealth` is the only
     /// word the sharer gets, and it goes to the screen thread).
@@ -442,24 +527,7 @@ pub struct AppState {
     pub(crate) admin_blob_cap: u64,
     /// The panel's action awaiting its confirmation.
     pub(crate) admin_pending: Option<crate::adminui::PanelAction>,
-    /// The Reports tab's list as last fetched, for its row actions.
-    pub(crate) admin_reports: Vec<client::protocol::ReportSummary>,
 
-    // ── 1.2: blocks, reports, deleting the account (`features::SAFETY`)
-    /// The server takes them (`Connected.safety`): the menus and the
-    /// Settings sections offer them only then.
-    pub(crate) safety: bool,
-    /// Whom this account blocked on this server, by user id, with
-    /// their names: nothing of theirs is shown, their voice never
-    /// arrives (the server's side), DMs are refused both ways.
-    pub(crate) blocked: HashMap<client::UserId, String>,
-    /// The list arrived once this session: later ones are changes.
-    blocks_known: bool,
-    /// Messages kept out of the chat because a blocked person wrote
-    /// them: an edit or a deletion of one says nothing.
-    hidden_messages: HashSet<u64>,
-    /// The report dialog's subject while it is open.
-    report: Option<safety::PendingReport>,
     /// The server entry this session connected with (its name): what
     /// an account deletion clears, whatever the default is by then.
     session_server: Option<String>,
@@ -522,6 +590,8 @@ pub struct AppState {
     /// The single animation ticker driving every playing GIF (chat
     /// rows + the viewer overlay). Runs only while something plays.
     gif_ticker: slint::Timer,
+    /// What ends with the connection ([`Session`]).
+    pub(crate) session: Session,
 }
 
 /// Spawn the three worker threads. Network needs `voice_tx/screen_tx` to
@@ -690,73 +760,26 @@ pub fn run() {
         network,
         voice,
         screen,
-        users: HashMap::new(),
-        our_client_id: None,
         server_name: String::new(),
-        channels: Vec::new(),
-        channel_infos: Vec::new(),
-        pending_channel_join: None,
         connected: false,
         client_key: client::config::load_client_key(),
-        permissions: 0,
-        our_user_id: None,
-        server_persistent: true,
-        details: HashMap::new(),
-        pending_admin: HashMap::new(),
         next_request_id: 1,
-        telemetry_notes: HashMap::new(),
-        moderation: None,
         menu_target: None,
         menu_actions: Vec::new(),
         command_conv: None,
-        roles: builtin_role_table(),
-        pending_uploads: HashMap::new(),
-        pending_files: HashMap::new(),
-        pending_downloads: HashMap::new(),
         next_file_upload_id: FILE_UPLOAD_BASE,
-        transfers: HashMap::new(),
-        image_upload: None,
-        pending_picture_uploads: HashMap::new(),
-        pending_pictures: HashMap::new(),
-        picture_acks: HashMap::new(),
         downloaded: HashMap::new(),
-        server_muted: None,
-        text_muted: None,
-        oldest_history_id: None,
-        history_page_pending: None,
-        active_dm: None,
-        parked: HashMap::new(),
         borrowed_conversation: false,
-        dm_order: Vec::new(),
-        dm_meta: HashMap::new(),
         dms_model,
         next_row_id: 0,
         next_client_ref: 1,
-        pending_dm_sends: HashMap::new(),
-        history_more: false,
-        general_unread: 0,
-        own_texts: HashMap::new(),
-        editing: None,
-        pending_edit: None,
-        pending_delete: None,
-        pending_confirm: None,
-        channel_dialog: None,
         startup_done: false,
         own_avatar: None,
-        own_avatar_blob: None,
         profile_dirty: false,
-        profiles: HashMap::new(),
         avatar_images: HashMap::new(),
-        avatar_fetches: HashSet::new(),
-        author_looks: HashMap::new(),
-        lurkers: HashMap::new(),
-        channel_details: HashMap::new(),
         settings,
-        is_muted: false,
-        is_deafened: false,
         is_testing_mic: false,
         is_testing_mic_shared,
-        active_sharers: HashMap::new(),
         stream_viewers_seen: 0,
         history: ChatHistory::new(),
         chat_model,
@@ -781,12 +804,6 @@ pub fn run() {
         admin_audit_oldest: None,
         admin_blob_cap: 0,
         admin_pending: None,
-        admin_reports: Vec::new(),
-        safety: false,
-        blocked: HashMap::new(),
-        blocks_known: false,
-        hidden_messages: HashSet::new(),
-        report: None,
         session_server: None,
         account_deleted: false,
         viewers: HashMap::new(),
@@ -816,6 +833,7 @@ pub fn run() {
         reconnect_attempts: 0,
         meter_timer: slint::Timer::default(),
         gif_ticker: slint::Timer::default(),
+        session: Session::default(),
     }));
 
     APP.with(|a| *a.borrow_mut() = Some(state.clone()));
@@ -1136,7 +1154,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_watch_user(move |index| {
         with_app(&w, |app| {
             if let Some(id) = app.user_id_at(index)
-                && Some(id) != app.our_client_id
+                && Some(id) != app.session.our_client_id
             {
                 app.handle_watch_peer(id);
             }
@@ -1182,7 +1200,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, |app| {
             if let Some(user) = usize::try_from(index)
                 .ok()
-                .and_then(|i| app.dm_order.get(i).copied())
+                .and_then(|i| app.session.chat.dm_order.get(i).copied())
             {
                 if user == ADMIN_CHANNEL_KEY {
                     app.open_admin_channel();
@@ -1211,7 +1229,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
         with_app(&w, |app| {
             if let Some(user) = usize::try_from(index)
                 .ok()
-                .and_then(|i| app.dm_order.get(i).copied())
+                .and_then(|i| app.session.chat.dm_order.get(i).copied())
             {
                 app.close_dm(user);
             }
@@ -1396,7 +1414,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_preview_send(move || {
         with_app(&w, |app| {
             if let Some(png) = app.pending_preview.take() {
-                if let Some(TextMute { until }) = app.text_muted {
+                if let Some(TextMute { until }) = app.session.text_muted {
                     // The server would drop it; say so here instead.
                     let until = format!(" {}", describe_until(until));
                     app.show_toast(
@@ -1407,12 +1425,14 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                             "reason" => ""
                         ),
                     );
-                } else if app.active_dm.is_some() || app.server_persistent {
+                } else if app.session.chat.active_dm.is_some() || app.session.server_persistent {
                     // A picture is a file with a picture inside (spec §7):
                     // uploaded on the blob path, shown as a picture on
                     // both ends once it lands. Only a memory-mode server,
                     // which keeps no files, still gets the live relay.
-                    app.pending_picture_uploads
+                    app.session
+                        .transfers
+                        .pending_picture_uploads
                         .insert(app.next_file_upload_id, png.clone());
                     app.begin_file_upload("picture.png".into(), "image/png".into(), png);
                 } else {

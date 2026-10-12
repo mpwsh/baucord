@@ -21,15 +21,15 @@ impl AppState {
                 self.open_channel_prompt(channel_id, true);
             }
             client::ChannelDenyReason::ChannelFull => {
-                self.pending_channel_join = None;
+                self.session.pending_channel_join = None;
                 self.show_toast(ToastKind::Warning, &t!("channel-full"));
             }
             client::ChannelDenyReason::NoSuchChannel => {
-                self.pending_channel_join = None;
+                self.session.pending_channel_join = None;
                 self.show_error(&t!("channel-deny-missing"));
             }
             client::ChannelDenyReason::NotPermitted => {
-                self.pending_channel_join = None;
+                self.session.pending_channel_join = None;
                 self.show_error(&t!("channel-deny-not-permitted"));
             }
         }
@@ -37,7 +37,7 @@ impl AppState {
 
     /// Open the channel password prompt for `channel_id`.
     pub(super) fn open_channel_prompt(&mut self, channel_id: u16, wrong: bool) {
-        self.pending_channel_join = Some(channel_id);
+        self.session.pending_channel_join = Some(channel_id);
         let name = self.channel_name(channel_id);
         let state = self.main.global::<State>();
         state.set_channel_prompt_name(name.into());
@@ -56,11 +56,11 @@ impl AppState {
         if Some(channel_id) == self.our_channel() {
             return;
         }
-        let Some(meta) = self.channels.iter().find(|c| c.id == channel_id) else {
+        let Some(meta) = self.session.channels.iter().find(|c| c.id == channel_id) else {
             return;
         };
         if !meta.locked {
-            self.pending_channel_join = Some(channel_id);
+            self.session.pending_channel_join = Some(channel_id);
             self.network
                 .tx
                 .send(NetworkControl::JoinChannel {
@@ -79,7 +79,7 @@ impl AppState {
             .and_then(|server| server.channel_passwords.get(&name).cloned());
         match saved {
             Some(password) => {
-                self.pending_channel_join = Some(channel_id);
+                self.session.pending_channel_join = Some(channel_id);
                 self.network
                     .tx
                     .send(NetworkControl::JoinChannel {
@@ -96,7 +96,7 @@ impl AppState {
     /// entry, then retry the join. The prompt closes when the server
     /// echoes our move (or reopens on `WrongPassword`).
     pub(super) fn channel_password_ok(&mut self) {
-        let Some(channel_id) = self.pending_channel_join else {
+        let Some(channel_id) = self.session.pending_channel_join else {
             self.main.global::<State>().set_channel_prompt_open(false);
             return;
         };
@@ -124,7 +124,7 @@ impl AppState {
     }
 
     pub(super) fn channel_password_cancel(&mut self) {
-        self.pending_channel_join = None;
+        self.session.pending_channel_join = None;
         let state = self.main.global::<State>();
         state.set_channel_prompt_open(false);
         state.set_channel_password("".into());
@@ -138,32 +138,18 @@ impl AppState {
         if let Some(hotkeys) = &mut self.hotkeys {
             hotkeys.set_connected(false);
         }
-        self.permissions = 0;
-        self.our_user_id = None;
-        self.server_persistent = true;
-        self.details.clear();
-        self.pending_admin.clear();
-        self.server_muted = None;
-        self.text_muted = None;
-        self.oldest_history_id = None;
-        self.channel_details.clear();
-        self.telemetry_notes.clear();
-        self.moderation = None;
-        self.profiles.clear();
-        self.author_looks.clear();
-        self.lurkers.clear();
-        self.avatar_fetches.clear();
-        self.own_avatar_blob = None;
-        self.reset_safety();
         // Before the conversations go: their cards are repainted.
         self.clear_transfers();
         self.reset_chat_flow();
+        // Everything else the session held, in one step (review P2-51):
+        // who was here, what we may do, the server's channels and
+        // roles, our own mute and deafen. What follows only tells the
+        // window, the voice engine and the screen thread.
+        self.session = Session::default();
+        self.reset_safety();
         self.is_testing_mic = false;
-        self.channels.clear();
-        self.channel_infos.clear();
         self.main.global::<State>().set_moderation_open(false);
         self.push_permissions();
-        self.pending_channel_join = None;
         {
             let state = self.main.global::<State>();
             state.set_channel_prompt_open(false);
@@ -195,7 +181,6 @@ impl AppState {
         if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
             self.screen.tx.send(ScreenControl::StopSharing).ok();
         }
-        self.active_sharers.clear();
         // Closing a viewer only hides it: the screen thread must be told
         // too, or it keeps the stream's decoder, buffers and audio for
         // the rest of the process — the sharer's id is gone with the
@@ -210,14 +195,9 @@ impl AppState {
         crate::viewers::close_gallery(self);
         self.gifs.clear();
 
-        self.users.clear();
-        self.our_client_id = None;
         Self::clear_call_notice();
-        self.is_muted = false;
-        self.is_deafened = false;
         // A menu open on a row that is about to vanish.
         self.close_menu();
-        self.roles = builtin_role_table();
 
         let s = self.main.global::<State>();
         s.set_muted(false);
@@ -242,17 +222,13 @@ impl AppState {
     /// flight never loaded after the reconnect, and cards kept a ring
     /// that would never move (review P2-13).
     fn clear_transfers(&mut self) {
-        self.pending_downloads.clear();
-        self.pending_uploads.clear();
-        self.pending_files.clear();
-        self.pending_picture_uploads.clear();
-        self.pending_pictures.clear();
-        self.picture_acks.clear();
-        self.image_upload = None;
-        let shown: Vec<(Option<client::UserId>, u64)> = self.transfers.keys().copied().collect();
+        // The cards first: each loses its ring where it is shown.
+        let shown: Vec<(Option<client::UserId>, u64)> =
+            self.session.transfers.shown.keys().copied().collect();
         for (conv, msg_id) in shown {
             self.set_transfer(conv, msg_id, None);
         }
+        self.session.transfers = Transfers::default();
     }
 
     pub(super) fn handle_disconnect(&mut self) {
@@ -297,29 +273,29 @@ impl AppState {
     // ════════════════════════════════════════════════════════════════
 
     pub(crate) fn handle_toggle_mute(&mut self) {
-        if self.is_muted && self.server_muted.is_some() {
+        if self.session.is_muted && self.session.server_muted.is_some() {
             self.show_toast(ToastKind::Warning, &t!("chat-server-muted-locked"));
             return;
         }
-        self.set_muted(!self.is_muted);
+        self.set_muted(!self.session.is_muted);
     }
 
     /// Set the mute state and tell the voice thread, the server and
     /// the UI.
     pub(super) fn set_muted(&mut self, muted: bool) {
-        self.is_muted = muted;
+        self.session.is_muted = muted;
         self.voice
             .tx
-            .send(VoiceControl::SetMuted(self.is_muted))
+            .send(VoiceControl::SetMuted(self.session.is_muted))
             .ok();
         self.network
             .tx
             .send(NetworkControl::SendAudioState {
-                muted: self.is_muted,
-                deafened: self.is_deafened,
+                muted: self.session.is_muted,
+                deafened: self.session.is_deafened,
             })
             .ok();
-        self.main.global::<State>().set_muted(self.is_muted);
+        self.main.global::<State>().set_muted(self.session.is_muted);
         self.push_self_audio();
         self.update_user_list();
     }
@@ -327,24 +303,26 @@ impl AppState {
     /// Mute and deafen to every stream window's own buttons (D43).
     fn push_self_audio(&self) {
         for viewer in self.viewers.values() {
-            viewer.set_self_audio(self.is_muted, self.is_deafened);
+            viewer.set_self_audio(self.session.is_muted, self.session.is_deafened);
         }
     }
 
     pub(crate) fn handle_toggle_deafen(&mut self) {
-        self.is_deafened = !self.is_deafened;
+        self.session.is_deafened = !self.session.is_deafened;
         self.voice
             .tx
-            .send(VoiceControl::SetDeafened(self.is_deafened))
+            .send(VoiceControl::SetDeafened(self.session.is_deafened))
             .ok();
         self.network
             .tx
             .send(NetworkControl::SendAudioState {
-                muted: self.is_muted,
-                deafened: self.is_deafened,
+                muted: self.session.is_muted,
+                deafened: self.session.is_deafened,
             })
             .ok();
-        self.main.global::<State>().set_deafened(self.is_deafened);
+        self.main
+            .global::<State>()
+            .set_deafened(self.session.is_deafened);
         self.push_self_audio();
         self.update_user_list();
     }
@@ -490,7 +468,7 @@ impl AppState {
     /// brought back to the screen, where a room's microphone type that
     /// was refused in the background can now be granted.
     pub(super) fn sync_keep_alive(&mut self, force: bool) {
-        if !self.connected || self.our_client_id.is_none() {
+        if !self.connected || self.session.our_client_id.is_none() {
             return;
         }
         let in_room = !self.in_lobby() || self.is_testing_mic;
@@ -530,11 +508,11 @@ impl AppState {
             .chars()
             .take(app_core::chat::MAX_MESSAGE_CHARS)
             .collect();
-        if let Some(edit) = self.editing.take() {
+        if let Some(edit) = self.session.chat.editing.take() {
             // Rewriting one of ours: an empty result is a cancel, not
             // a deletion.
             self.main.global::<State>().set_editing(false);
-            if !text.is_empty() && self.own_texts.get(&edit.msg_id) != Some(&text) {
+            if !text.is_empty() && self.session.chat.own_texts.get(&edit.msg_id) != Some(&text) {
                 self.network
                     .tx
                     .send(NetworkControl::EditMessage {
@@ -542,7 +520,7 @@ impl AppState {
                         text,
                     })
                     .ok();
-                self.pending_edit = Some(edit.msg_id);
+                self.session.chat.pending_edit = Some(edit.msg_id);
                 Self::arm_apply_timeout(edit.msg_id, false);
             }
             self.main.global::<State>().set_draft("".into());
@@ -561,10 +539,10 @@ impl AppState {
             && let Some((command, args)) = split_command(rest)
         {
             self.handle_slash_command(command, args);
-        } else if let Some(to) = self.active_dm {
+        } else if let Some(to) = self.session.chat.active_dm {
             self.send_dm(to, text);
             self.main.invoke_chat_pin_bottom();
-        } else if let Some(TextMute { until }) = self.text_muted {
+        } else if let Some(TextMute { until }) = self.session.text_muted {
             // The server would drop it anyway; say so here instead.
             let until = format!(" {}", describe_until(until));
             self.show_toast(

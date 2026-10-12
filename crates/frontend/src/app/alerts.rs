@@ -124,7 +124,7 @@ impl AppState {
             || host_visible()
             || !self.settings.notifications.first_join
             || !crate::host::notices_allowed(NoticeKind::Activity)
-            || Some(joiner) == self.our_client_id
+            || Some(joiner) == self.session.our_client_id
             || self.is_quiet_room(channel_id)
         {
             return;
@@ -132,6 +132,7 @@ impl AppState {
         // Anyone already talking somewhere (us included) means the call
         // started earlier; this is just one more person.
         let busy = self
+            .session
             .users
             .iter()
             .any(|(id, u)| *id != joiner && !self.is_quiet_room(u.channel_id));
@@ -167,10 +168,12 @@ impl AppState {
             .is_some_and(|lobby| self.channel_name(channel_id) == lobby);
         lobby
             || self
+                .session
                 .channel_details
                 .get(&channel_id)
                 .is_some_and(|f| f.is_afk)
             || self
+                .session
                 .channels
                 .iter()
                 .find(|c| c.id == channel_id)
@@ -191,16 +194,15 @@ impl AppState {
     /// is the open conversation's.
     pub(super) fn clear_seen_notices(&self) {
         Self::clear_call_notice();
-        if let Some(user) = self.active_dm {
+        if let Some(user) = self.session.chat.active_dm {
             Self::clear_dm_notice(&user);
         }
     }
 
     /// A notification about the DM with `dm` (hex) was tapped: open that
     /// conversation, on the chat page.
-    // Reached from the phones' `host` only (`stubs/host.rs`), through
-    // `open_noticed_conversation`, which carries the desktop's
-    // dead-code expectation for both.
+    // Reached when a phone's host reports the tap
+    // (`host::open_conversation` → `open_noticed_conversation`).
     pub(super) fn open_noticed_dm(&mut self, dm: &str) {
         let Some(user) = user_id_from_hex(dm) else {
             info!("notice tapped with a malformed conversation id");
@@ -210,12 +212,15 @@ impl AppState {
         // it, a close hides it): its name from the record, else from
         // whoever is online with that id.
         let name = self
+            .session
+            .chat
             .dm_meta
             .get(&user)
             .map(|m| m.name.clone())
             .filter(|n| !n.is_empty())
             .or_else(|| {
-                self.details
+                self.session
+                    .details
                     .iter()
                     .find(|(_, (id, _))| *id == user)
                     .map(|(client, _)| self.username_of(*client))
