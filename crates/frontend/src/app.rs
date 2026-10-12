@@ -218,6 +218,9 @@ pub(crate) struct Session {
     pub(crate) details: HashMap<u64, (client::UserId, Vec<client::RoleId>)>,
     /// Admin requests in flight: what to do with the answer.
     pending_admin: HashMap<u32, PendingAdmin>,
+    /// The typed commands among them, as typed: what the activity log
+    /// says is done when the server answers so.
+    admin_typed: HashMap<u32, String>,
     /// A server voice mute stands (spec §4.2): the mute button is
     /// locked, and `Some(was_muted)` remembers what to restore.
     server_muted: Option<bool>,
@@ -286,6 +289,7 @@ impl Default for Session {
             our_user_id: None,
             details: HashMap::new(),
             pending_admin: HashMap::new(),
+            admin_typed: HashMap::new(),
             server_muted: None,
             text_muted: None,
             oldest_history_id: None,
@@ -443,6 +447,9 @@ pub struct AppState {
     /// (and the answer to the admin command it sent) lands there —
     /// the admin channel, a DM, or General.
     command_conv: Option<client::UserId>,
+    /// The slash command being run, as typed, until it asks the server
+    /// something (`send_admin` takes it) or ends.
+    typed_command: Option<String>,
     next_file_upload_id: u32,
     /// Files saved this session, by blob: the card offers Open.
     downloaded: HashMap<client::protocol::BlobId, std::path::PathBuf>,
@@ -776,6 +783,7 @@ pub fn run() {
         menu_target: None,
         menu_actions: Vec::new(),
         command_conv: None,
+        typed_command: None,
         next_file_upload_id: FILE_UPLOAD_BASE,
         downloaded: HashMap::new(),
         borrowed_conversation: false,
@@ -1475,6 +1483,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
             app.settings.share.monitor = u32::try_from(monitor_index).ok();
             app.settings.share.everyone = everyone;
             app.settings.save();
+            video::capture::set_pointer_shown(app.settings.share.pointer);
             app.screen
                 .tx
                 .send(ScreenControl::StartSharing {

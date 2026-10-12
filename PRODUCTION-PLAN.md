@@ -214,9 +214,9 @@ What stands between this and "production for strangers":
 - [ ] **CLI-16 [P2][M] Desktop voice latency: what is left.** The
   2026-10-08 review: native WASAPI cost nothing (event-driven, MMCSS,
   20 ms render buffer). Our code adds ~74 ms one way; the estimate
-  mouth to ear is 135–175 ms. Nine candidates, ranked, in
-  `LATENCY-SPEC.md`. First: measure (a clap test, and buffer depths
-  in the voice summary). Then LAT-1 (late packets push playback 20 ms
+  mouth to ear is 135–175 ms. First: measure (a clap test, and
+  buffer depths in the voice summary). Then LAT-1 (late packets push
+  playback 20 ms
   later) and LAT-3 (the 32 KiB datagram send buffer holds seconds, not
   ~200 ms). LAT-2 (share audio waited for the video tick) is done
   (§7, 1.2.1). Also seen:
@@ -566,10 +566,11 @@ Store is not decided yet.
 8. **A kick or a ban with the window in the tray** — *decided
    2026-10-12*: the window stays where it is (what review P2-17 left
    it doing).
-9. **The sharer's mouse pointer** (review P2-25) — open. It is not in
-   a share today. Built without a Windows screen to look at it, it
-   would be a guess drawn into every Windows share; it can be built
-   behind a switch that is off until someone has looked.
+9. **The sharer's mouse pointer** (review P2-25) — *decided
+   2026-10-12*: built, on, and to be looked at on Windows before the
+   release (§7; `DEVICE-CHECKLIST.md` §1.3). `"pointer": false` under
+   `share` in `settings.json` is the way back for a machine where it
+   draws wrong; there is no switch in the app.
 
 ## 7. Done
 
@@ -1240,8 +1241,9 @@ One line each; the spec decision named holds the detail.
     ask for the same page for ever (the default is 2000). The release
     builds `-p desktop -p server` together, so the server's
     certificate code is compiled into the desktop (P3-3's saving is
-    the phones'). `LATENCY-SPEC.md` is named by START-HERE and CLI-16
-    and is not in the repository.
+    the phones'). `LATENCY-SPEC.md` was named by START-HERE and CLI-16
+    and was not in the repository: old, and dropped the same day; what
+    CLI-16 still means to do is in its own lines.
   - *What a release still needs — none of it is code.* (1) `pr-check`
     green on the branch: it runs the app's own tests and the six this
     sandbox cannot. (2) A build on Windows and on a Mac: no workflow
@@ -1255,6 +1257,49 @@ One line each; the spec decision named holds the detail.
     download links at once, and they lead nowhere until the release's
     builds have uploaded; the APK's a little longer, its workflow
     being its own (P2-60).
+- **2026-10-12 — 1.2.1, the last asks before the release.** The user
+  has built and run the branch on Windows, macOS, Linux and an iPhone
+  ("works well"; Android and the server still to try), which is what
+  the entry above said a release was waiting for.
+  - *The mouse pointer in a Windows share* (P2-25, the last open id).
+    Desktop Duplication gives the desktop without it and describes it
+    beside each frame; `dxgi.rs` keeps the description and draws the
+    pointer into the copy (`video/src/pointer.rs`: the three kinds
+    Windows has — colour with alpha, masked colour, the two-mask
+    monochrome one of the text caret — clipped at the edges; 6 tests,
+    which run on Linux). A move with nothing else changing is a frame
+    of its own, read again from the staging texture, and one that
+    found the queue full is retried every 8 ms, so the pointer does
+    not stop a frame behind where it stopped. The silence probe
+    compares everything but the pointer's rectangle: a screenshot has
+    no pointer, and compared whole it would have replaced the picture
+    with one two seconds after every stop. Known edges: a share of a
+    screen where nothing at all changes shows the pointer from the
+    first change (the first picture is a screenshot); the screenshot
+    fallback (an HDR desktop) still has none. Type-checked and linted
+    for Windows; **never run**.
+  - *A phone's microphone test plays back half a second late* (it was
+    a second; `audio::LOOPBACK_DELAY`). The hint says so in the three
+    languages.
+  - *No "Done." in the chat.* A kick, a mute or a move from a menu
+    printed it into whatever conversation was open. A menu pick now
+    says nothing when it works (what it did shows where it was
+    picked); a typed command, which has no other answer, gets a line
+    in the activity log — `/unban bob: done`. Lists and refusals land
+    in the chat as before.
+  - *The image viewer is full screen on a phone* (and in any window
+    under 600 px): no margins, the picture edge to edge under the
+    title row, the two arrows on the picture's own edges and only
+    where there is a step to take, clear of the notch. It was under
+    two thirds of the width: 16 px each side and a 40 px arrow column
+    each side. Rendered at 375 × 812 and 1100 × 700; the wide layout
+    is as it was.
+  - *`LATENCY-SPEC.md`* is no longer named anywhere (old, the user).
+  - *Checked*: the tree builds, lints where it was and passes its
+    tests on Linux; `video` and `client` type-check for Windows and
+    Android. The pointer, the viewer on a real phone and the delay by
+    ear are the user's to look at; `DEVICE-CHECKLIST.md` has the
+    lines.
 
 ## 8. Facts this plan rests on
 

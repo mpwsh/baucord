@@ -373,6 +373,7 @@ impl AppState {
             "share hotkey pressed outside Baucord — starting immediately with saved \
              settings: {quality}, monitor {monitor_index}, everyone={everyone}"
         );
+        video::capture::set_pointer_shown(self.settings.share.pointer);
         self.screen
             .tx
             .send(ScreenControl::StartSharing {

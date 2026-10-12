@@ -27,6 +27,12 @@
 //!   as a permanent failure so the caller can fall back to screenshots
 //!   (GDI tone-maps) instead of streaming noise.
 //!
+//! - **The pointer.** The desktop comes without it; where it is and
+//!   what it looks like come beside each frame, and it is drawn into
+//!   the copy (`crate::pointer`; review P2-25). A move with nothing
+//!   else changing is a frame of its own: the desktop as last read,
+//!   with the pointer where it now is.
+//!
 //! Frame pacing note: DXGI only delivers frames when the screen
 //! *changes*; the desktop image present at duplication creation is
 //! reported with `LastPresentTime == 0` and skipped (matching xcap) —
@@ -58,7 +64,10 @@ use windows::{
             Dxgi::{
                 Common::DXGI_FORMAT_B8G8R8A8_UNORM, CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice,
                 IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
-                DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+                DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+                DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
+                DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+                DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
             },
             Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
         },
@@ -66,12 +75,21 @@ use windows::{
     },
 };
 
-use crate::CaptureError;
+use crate::{
+    pointer::{Kind, Rect, Shape},
+    CaptureError,
+};
 
 /// How long `AcquireNextFrame` waits before reporting "no change".
 /// Also bounds worker shutdown latency (the exit flag is checked each
 /// iteration).
 const ACQUIRE_TIMEOUT_MS: u32 = 200;
+
+/// …and how long while a pointer move is still owed a frame: it came
+/// when the queue was full, and the consumer takes one every 16 or 33
+/// ms. Without this the pointer's last position before it stopped could
+/// reach the viewers a whole [`ACQUIRE_TIMEOUT_MS`] late.
+const POINTER_OWED_TIMEOUT_MS: u32 = 8;
 
 // NOTE: there is deliberately no rebuild loop in this module. Field
 // evidence (see capture.rs) shows duplications created from the capture
@@ -100,6 +118,9 @@ pub struct CapturedFrame {
     pub height: u32,
     /// When it was read back from the desktop.
     pub at: Instant,
+    /// Where the pointer was drawn into it, if it was: the one part of
+    /// the picture a screenshot of the same desktop does not have.
+    pub pointer: Option<Rect>,
 }
 
 /// Worker health as published for the consumer.
@@ -251,19 +272,26 @@ fn worker_loop(
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 
     // Persistent staging texture, recreated only when the source
-    // dimensions change (mode switches).
+    // dimensions change (mode switches). It keeps the desktop as last
+    // read, which is what a pointer move is drawn onto.
     let mut staging: Option<(ID3D11Texture2D, u32, u32)> = None;
+    let mut pointer = Pointer::default();
 
     'outer: loop {
         if shared.exit.load(Ordering::Acquire) {
             break;
         }
 
+        let owed = pointer.owed && staging.is_some();
+        let timeout = if owed {
+            POINTER_OWED_TIMEOUT_MS
+        } else {
+            ACQUIRE_TIMEOUT_MS
+        };
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        let acquired = unsafe {
-            duplication.AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &raw mut info, &raw mut resource)
-        };
+        let acquired =
+            unsafe { duplication.AcquireNextFrame(timeout, &raw mut info, &raw mut resource) };
 
         match acquired {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -282,11 +310,18 @@ fn worker_loop(
                 break 'outer;
             }
             Ok(()) => {
+                // The pointer first: its shape can only be asked for
+                // while the frame is held.
+                unsafe { pointer.note(&duplication, &info) };
+
                 // The frame present at duplication creation reports
                 // LastPresentTime == 0 — skip it (callers seed the
-                // first picture from a screenshot instead).
+                // first picture from a screenshot instead). So does one
+                // in which only the pointer moved: nothing to read from
+                // the desktop, and the pointer's frame is made below.
                 if info.LastPresentTime == 0 {
                     let _ = unsafe { duplication.ReleaseFrame() };
+                    unsafe { pointer_frame(&shared, &context, staging.as_ref(), &mut pointer) };
                     continue;
                 }
 
@@ -310,7 +345,8 @@ fn worker_loop(
                 let grabbed =
                     unsafe { grab_frame(&device, &context, &duplication, resource, &mut staging) };
                 match grabbed {
-                    Ok(Some(frame)) => {
+                    Ok(Some(mut frame)) => {
+                        pointer.draw(&mut frame);
                         shared.slot.lock().unwrap().push_back(frame);
                     }
                     Ok(None) => {}
@@ -331,12 +367,161 @@ fn worker_loop(
                         break 'outer;
                     }
                 }
+                continue;
             }
         }
+
+        // Nothing new from the desktop: a pointer move that found the
+        // queue full is given its frame now, if there is room.
+        unsafe { pointer_frame(&shared, &context, staging.as_ref(), &mut pointer) };
     }
 
     if com.is_ok() {
         unsafe { CoUninitialize() };
+    }
+}
+
+// ── The pointer ─────────────────────────────────────────────────────────
+
+/// The pointer as the duplication last described it.
+#[derive(Default)]
+struct Pointer {
+    /// Its picture; `None` until the first one comes, or after one that
+    /// did not fit its own description.
+    shape: Option<Shape>,
+    /// Top-left corner of the picture on this output (the hot spot is
+    /// already taken off by the system).
+    x: i32,
+    y: i32,
+    /// On this output and shown (not hidden by a game, not on another
+    /// monitor).
+    visible: bool,
+    /// It moved, changed or went away since the last frame that was
+    /// queued: the viewers are owed one.
+    owed: bool,
+    /// Where the system writes a new shape, kept between shapes.
+    scratch: Vec<u8>,
+}
+
+impl Pointer {
+    /// Take what this frame says about the pointer. Must be called
+    /// before the frame is released.
+    unsafe fn note(
+        &mut self,
+        duplication: &IDXGIOutputDuplication,
+        info: &DXGI_OUTDUPL_FRAME_INFO,
+    ) {
+        // The share's own switch (`capture::set_pointer_shown`), and a
+        // frame that says nothing about the pointer.
+        if !crate::capture::pointer_shown() {
+            if self.visible {
+                self.visible = false;
+                self.owed = true;
+            }
+            return;
+        }
+        if info.LastMouseUpdateTime == 0 {
+            return;
+        }
+        let at = info.PointerPosition.Position;
+        let visible = info.PointerPosition.Visible.as_bool();
+        if visible != self.visible || (visible && (at.x, at.y) != (self.x, self.y)) {
+            self.owed = true;
+        }
+        self.visible = visible;
+        (self.x, self.y) = (at.x, at.y);
+
+        if info.PointerShapeBufferSize == 0 {
+            return;
+        }
+        self.scratch.resize(info.PointerShapeBufferSize as usize, 0);
+        let mut needed = 0u32;
+        let mut described = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        let read = unsafe {
+            duplication.GetFramePointerShape(
+                info.PointerShapeBufferSize,
+                self.scratch.as_mut_ptr().cast(),
+                &raw mut needed,
+                &raw mut described,
+            )
+        };
+        if let Err(e) = read {
+            // The old shape, if any, is better than none.
+            log::debug!("dxgi capture: pointer shape not read: {e}");
+            return;
+        }
+        let kind = match described.Type {
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 => Some(Kind::Monochrome),
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 => Some(Kind::Color),
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 => {
+                Some(Kind::MaskedColor)
+            }
+            _ => None,
+        };
+        let filled = (needed as usize).min(self.scratch.len());
+        self.shape = kind.and_then(|kind| {
+            Shape::new(
+                kind,
+                described.Width,
+                described.Height,
+                described.Pitch,
+                &self.scratch[..filled],
+            )
+        });
+        if self.shape.is_none() {
+            log::debug!(
+                "dxgi capture: a pointer shape that cannot be drawn (type {}, {}x{}, pitch {}, {} bytes)",
+                described.Type,
+                described.Width,
+                described.Height,
+                described.Pitch,
+                filled
+            );
+        }
+        self.owed = true;
+    }
+
+    /// Draw the pointer into a frame about to be queued, which settles
+    /// what was owed.
+    fn draw(&mut self, frame: &mut CapturedFrame) {
+        self.owed = false;
+        if !self.visible {
+            return;
+        }
+        if let Some(shape) = &self.shape {
+            frame.pointer = shape.draw(&mut frame.data, frame.width, frame.height, self.x, self.y);
+        }
+    }
+}
+
+/// The frame a pointer move is owed: the desktop as it was last read
+/// (it has not changed since, or that would have been a frame), with
+/// the pointer where it is now. Nothing if none is owed, the queue is
+/// full (the next pass asks again) or the desktop was never read (the
+/// first real frame will carry the pointer).
+unsafe fn pointer_frame(
+    shared: &Shared,
+    context: &ID3D11DeviceContext,
+    staging: Option<&(ID3D11Texture2D, u32, u32)>,
+    pointer: &mut Pointer,
+) {
+    let Some(staging) = staging else {
+        return;
+    };
+    if !pointer.owed || shared.slot.lock().unwrap().len() >= FRAME_QUEUE_DEPTH {
+        return;
+    }
+    match unsafe { read_staging(context, staging) } {
+        Ok(mut frame) => {
+            pointer.draw(&mut frame);
+            shared.slot.lock().unwrap().push_back(frame);
+        }
+        Err(e) => {
+            // Not worth the duplication: the pointer waits for the
+            // next frame of the desktop.
+            pointer.owed = false;
+            log::debug!("dxgi capture: the pointer's frame could not be read: {e}");
+        }
     }
 }
 
@@ -396,7 +581,8 @@ unsafe fn grab_frame(
         })?;
         *staging = Some((tex, width, height));
     }
-    let (staging_tex, _, _) = staging.as_ref().expect("built above");
+    let staging = staging.as_ref().expect("built above");
+    let (staging_tex, _, _) = staging;
 
     let region = D3D11_BOX {
         left: 0,
@@ -423,6 +609,20 @@ unsafe fn grab_frame(
 
     // GPU copy is queued — the duplication frame is no longer needed.
     let _ = unsafe { duplication.ReleaseFrame() };
+
+    Ok(Some(unsafe { read_staging(context, staging) }?))
+}
+
+/// Read the staging texture out into CPU memory (tightly packed BGRA):
+/// the frame just copied into it, or — for a pointer move — the same
+/// desktop once more.
+unsafe fn read_staging(
+    context: &ID3D11DeviceContext,
+    staging: &(ID3D11Texture2D, u32, u32),
+) -> Result<CapturedFrame, windows::core::Error> {
+    let (staging_tex, width, height) = staging;
+    let (width, height) = (*width, *height);
+    let staging_res: ID3D11Resource = staging_tex.cast()?;
 
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     unsafe {
@@ -451,12 +651,13 @@ unsafe fn grab_frame(
 
     unsafe { context.Unmap(Some(&staging_res), 0) };
 
-    Ok(Some(CapturedFrame {
+    Ok(CapturedFrame {
         data,
         width,
         height,
         at: Instant::now(),
-    }))
+        pointer: None,
+    })
 }
 
 // ── Setup ───────────────────────────────────────────────────────────────

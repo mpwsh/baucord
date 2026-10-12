@@ -1667,7 +1667,7 @@ pub(crate) fn test_ended(app: &AppState) {
 
 /// The line beside the Test microphone button. Where the test plays the
 /// voice back late (a phone, `audio::LOOPBACK_DELAY`), it says so:
-/// silence for a second after speaking reads as a test that is broken.
+/// silence after speaking reads as a test that is broken.
 fn test_hint(testing: bool) -> String {
     match (testing, audio::LOOPBACK_DELAY.is_zero()) {
         (false, _) => t!("audio-test-hint"),

@@ -236,6 +236,10 @@ Support/baucord`). The client's own identity key (`identity.key`) lives
 next to it; it signs the handshake so the server can derive a stable
 user id, and never leaves the machine.
 
+One setting has no switch in the app: `"pointer": false` under
+`"share"` in `settings.json` keeps the mouse pointer out of a Windows
+screen share (it is drawn in by default).
+
 A server entry holds the address, the pinned fingerprint, an invite
 code waiting to be used, and the channel passwords you saved. Paste an invite string into the identity field to verify
 a server up front; leave it empty and it is pinned on the first

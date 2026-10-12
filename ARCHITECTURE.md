@@ -836,7 +836,10 @@ stays live with its sound (MOB-18). Frame buffers go round
 `video::pool` instead of being allocated per frame — DXGI's captures
 too, and FFmpeg decodes straight into one when the width is a multiple
 of 16 (review P1-11); the pool is held (`retain`/`release`) only while
-something is shared or watched, and freed after (P2-43). Closing a viewer drops the stream's decoder,
+something is shared or watched, and freed after (P2-43). The sharer's
+mouse pointer is not in what Windows hands over: `dxgi.rs` draws it
+into each captured frame (`pointer.rs`), and a move with nothing else
+changing is a frame of its own (P2-25). Closing a viewer drops the stream's decoder,
 buffer and audio in the screen thread (`ScreenControl::StopWatching`);
 the next viewer starts from a keyframe. The screen thread sleeps until
 a capture tick, a frame's playout slot, a decoder poll or a log line

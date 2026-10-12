@@ -76,9 +76,22 @@ impl AppState {
     }
 
     /// One slash command from the composer. Moderation commands map
-    /// onto `AdminCommand` (spec §8): the server checks them, the
-    /// answer lands in chat.
+    /// onto `AdminCommand` (spec §8): the server checks them, a list
+    /// or a refusal lands in chat, and a plain "done" in the activity
+    /// log under what was typed ([`Self::send_admin`]).
     pub(super) fn handle_slash_command(&mut self, command: &str, args: &str) {
+        let shown = args.trim();
+        self.typed_command = Some(if shown.is_empty() {
+            format!("/{command}")
+        } else {
+            format!("/{command} {shown}")
+        });
+        self.run_slash_command(command, args);
+        // Not every command asks the server anything.
+        self.typed_command = None;
+    }
+
+    fn run_slash_command(&mut self, command: &str, args: &str) {
         // Output goes back where the command was typed.
         self.command_conv = self.session.chat.active_dm;
         match command {
@@ -678,11 +691,17 @@ impl AppState {
     pub(crate) fn send_admin(&mut self, command: AdminCommand, then: PendingAdmin) {
         // A printed answer lands in the conversation shown when it was
         // asked for — a menu pick as much as a typed command.
-        if matches!(then, PendingAdmin::Show) {
-            self.command_conv = self.session.chat.active_dm;
-        }
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        if matches!(then, PendingAdmin::Show) {
+            self.command_conv = self.session.chat.active_dm;
+            // A typed command is named in the activity log when the
+            // server says it is done. A menu pick is not: what it did
+            // shows where it was picked.
+            if let Some(typed) = self.typed_command.take() {
+                self.session.admin_typed.insert(request_id, typed);
+            }
+        }
         self.session.pending_admin.insert(request_id, then);
         self.network
             .tx
@@ -714,6 +733,7 @@ impl AppState {
             .pending_admin
             .remove(&request_id)
             .unwrap_or(PendingAdmin::Show);
+        let typed = self.session.admin_typed.remove(&request_id);
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -787,7 +807,15 @@ impl AppState {
             return;
         }
         match outcome {
-            client::AdminOutcome::Done => self.push_command_output(&t!("chat-admin-done")),
+            // Nothing to show but that it worked: not a line in
+            // whatever conversation is open (it read "Done." under
+            // every kick, mute and move), but one in the activity log
+            // for a command that was typed, which has no other answer.
+            client::AdminOutcome::Done => {
+                if let Some(typed) = typed {
+                    self.push_activity(&t!("activity-command-done", "command" => typed.as_str()));
+                }
+            }
             client::AdminOutcome::Users(users) => {
                 let total = users.len();
                 self.push_command_output(&t!("chat-admin-users-header", "count" => total));

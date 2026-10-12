@@ -21,9 +21,12 @@ use std::{
 use crate::PcmFrame;
 
 /// How long a microphone test holds the user's voice before playing it:
-/// a second on a phone, nothing on the desktop.
+/// half a second on a phone, nothing on the desktop. It was a second
+/// at first, which is long enough to be sure of and felt like waiting
+/// (the user, 2026-10-12); half is still past the end of a short word.
+/// If the hollow sound comes back on some phone, this is the number.
 pub const LOOPBACK_DELAY: Duration = if crate::RELEASES_MIC {
-    Duration::from_secs(1)
+    Duration::from_millis(500)
 } else {
     Duration::ZERO
 };

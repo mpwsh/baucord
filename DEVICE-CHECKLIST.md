@@ -145,8 +145,27 @@ Play music in another app first, at a steady volume.
   mid-share. The share's sound is back within about ten seconds, and
   the viewer's 5 s summary shows no absurd "skipped" count [P2-22].
 - [ ] **new** — a 144 Hz monitor shared at 30 fps looks smooth [P3-28].
-- [ ] **Known gap** — viewers do not see the sharer's mouse pointer
-  [P2-25, not done]. Say whether that is so on your machine.
+- [ ] **new** — **viewers see your mouse pointer** [P2-25], where it
+  is on your screen, and it moves smoothly while nothing else on the
+  screen does. Look at: the arrow; the text caret over a text field
+  (thin, and the right colour on dark and on light); the hand over a
+  link; a resize arrow at a window's edge; a large or coloured pointer
+  from Settings → Accessibility → Mouse pointer. None is a square
+  block, none has a black or white box around it.
+- [ ] **new** — stop the mouse and wait ten seconds: the pointer stays
+  where it stopped (it used to be at risk of vanishing two seconds
+  later). Move it off to another monitor: it leaves the share. Bring
+  it back: it is back. In a game that hides the pointer there is none.
+- [ ] **new** — the pointer at each edge and corner of the shared
+  screen: cut at the edge, no crash, no stripe on the opposite side.
+- [ ] **new** — a still screen for a minute with the pointer parked:
+  the sharer's stats line shows almost no bitrate, as before [P2-41].
+- [ ] **new** — `"share": { …, "pointer": false }` in `settings.json`
+  and a restart: no pointer in the share, everything else the same.
+- [ ] **Known** — started on a screen where nothing at all is moving,
+  the pointer shows from the first change on the screen (a clock
+  ticking, a hover), not before. On an HDR desktop (the screenshot
+  fallback, said in the log) there is still no pointer.
 
 ### 1.4 Doing nothing cheaply [P2-35, P2-37, P2-39]
 
@@ -168,6 +187,10 @@ Play music in another app first, at a steady volume.
   there, and so it does for a ban (decided 2026-10-12) [P2-17].
 - [ ] **new** — in the composer, select text, right-click: Cut and Copy
   work; with nothing selected they are greyed [P2-16].
+- [ ] **new** — kick, mute, move someone from the menu: no "Done." in
+  the chat. Type `/mute name` (or any command that only succeeds): the
+  line is in General's Activity view, `/mute name: done`, and not in
+  the chat. A command that is refused still says why in the chat.
 - [ ] **new** — drop two files on the chat at once (not pictures):
   both arrive. The second card waits at 0 % until the first is done;
   cancelling the first lets the second start, and cancelling the
@@ -347,7 +370,7 @@ agrees with it.
   dot comes on and the capture bar follows your voice, gliding. log:
   `settings: audio tab on screen`, then `microphone: no engine yet,
   starting one for this device alone`. Test microphone plays your
-  voice back a second late. Leaving the tab logs the summary line of
+  voice back half a second late. Leaving the tab logs the summary line of
   §3.1a.
 - [ ] **new** — back to the section list, close Settings, or press
   Home from the Audio tab: the dot goes after Android's few seconds.
@@ -373,6 +396,12 @@ agrees with it.
 - [ ] **same** — every dialog: Back closes it; the channel-password
   field has the keyboard, what is typed arrives, the keyboard's Enter
   joins [P2-58].
+- [ ] **new** — tap a picture in the chat: it fills the screen's width
+  (a tall one the height), under a title row with Save and Close and
+  no Copy. With several pictures in the conversation the arrows sit
+  on the picture's left and right edges, only where there is a next
+  or previous one. A tap on the black beside the picture, or Back,
+  closes it. Nothing is under the status bar or the notch.
 - [ ] **same** — hold a finger on a text, picture and file row: its
   menu opens, and lifting the finger from a picture does not also
   open the gallery [P2-58].
@@ -493,8 +522,9 @@ after it is the seventh batch's.
   indicator goes. Send the app to the background from the Audio tab:
   it goes too, and the app is suspended as any unconnected app is.
 - [ ] **new** — Test microphone there: say a word and it comes back
-  a second later, clean — not hollow, not about to howl; the hint
-  says it is late. With push-to-talk chosen as well.
+  half a second later, clean — not hollow, not about to howl; the hint
+  says it is late. (A second at first; if half brings the hollow sound
+  back, `audio::LOOPBACK_DELAY` is the number.) With push-to-talk chosen as well.
 - [ ] **new** — the tab alone, and how long it takes: not connected,
   open Settings → Audio, **do not touch Test**, talk for five seconds,
   go back to the section list, open Debug. One line answers it:

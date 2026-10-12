@@ -73,6 +73,22 @@ pub struct MonitorInfo {
     pub is_primary: bool,
 }
 
+/// Whether a share shows the sharer's mouse pointer (Windows, where the
+/// capture has to draw it in: `dxgi.rs`). On unless the settings file
+/// says otherwise (`share.pointer`): the way back if it draws wrong on
+/// some machine.
+static POINTER_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set before a share starts; a running one follows at its next frame.
+pub fn set_pointer_shown(shown: bool) {
+    POINTER_SHOWN.store(shown, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn pointer_shown() -> bool {
+    POINTER_SHOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Lists available monitors.
 ///
 /// # Errors
@@ -313,6 +329,9 @@ pub struct StreamCapturer {
     quality: Quality,
     /// Most recent frame (BGRA), retained for repeat-encodes.
     last: Option<Frame>,
+    /// Where the pointer is drawn in it, if it is: a screenshot never
+    /// has one, so the probe does not compare that part.
+    last_pointer: Option<crate::pointer::Rect>,
     /// `last` holds content the caller hasn't been handed as Fresh yet
     /// (the seed screenshot at startup, or a probe frame).
     fresh_pending: bool,
@@ -355,6 +374,7 @@ impl StreamCapturer {
             monitor_index,
             quality,
             last: None,
+            last_pointer: None,
             fresh_pending: false,
             start_time: Instant::now(),
             last_rx: Instant::now(),
@@ -417,6 +437,7 @@ impl StreamCapturer {
                     timestamp_ms: self.start_time.elapsed().as_millis() as u64,
                     format: PixelFormat::Bgra,
                 });
+                self.last_pointer = cf.pointer;
                 self.fresh_pending = false;
                 self.last_rx = Instant::now();
                 return CaptureStatus::Fresh;
@@ -513,10 +534,15 @@ impl StreamCapturer {
             }
         };
 
-        let unchanged = self
-            .last
-            .as_ref()
-            .is_some_and(|f| f.width == width && f.height == height && f.data == data);
+        // The held frame may have the pointer drawn in, which no
+        // screenshot has: that is not the screen changing. Compared
+        // whole, every probe after the mouse stopped found a "change"
+        // and put a picture without the pointer in its place.
+        let unchanged = self.last.as_ref().is_some_and(|f| {
+            f.width == width
+                && f.height == height
+                && crate::pointer::same_outside(&f.data, &data, width, height, self.last_pointer)
+        });
         self.probe_found_still = unchanged;
         if unchanged {
             return false;
@@ -534,6 +560,8 @@ impl StreamCapturer {
             timestamp_ms: self.start_time.elapsed().as_millis() as u64,
             format: PixelFormat::Bgra,
         });
+        // A screenshot: no pointer in it until the next streamed frame.
+        self.last_pointer = None;
         self.fresh_pending = false;
         self.last_rx = Instant::now();
         true

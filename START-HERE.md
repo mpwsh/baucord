@@ -83,7 +83,6 @@ for the work at hand (§3). Everything else is linked from here.
 | `ARCHITECTURE.md` | the runtime: threads, lanes, transport, the server tick, persistence, the client, the hosts | before server, protocol or client-core work |
 | `PERSISTENCE-SPEC.md` | the 1.1 design (accounts by device key, invites, roles, history, DMs, files, profiles, admin) — all shipped; §12 is every later decision | before touching admission, roles, history, DMs, files |
 | `AEC-SPEC.md` | echo cancellation on every platform; §12 the decisions (E1…) | before audio-path work |
-| `LATENCY-SPEC.md` | the desktop voice latency budget and what could still be cut (LAT-1…9), parked 2026-10-08 | before latency work |
 | `ANDROID-SPEC.md` | the Android client as it is (§0–§13); decisions D1…D9 in §1, D10…D70 in §14 (from D23 on, newest first) | before Android work |
 | `IOS-SPEC.md` | the iPhone client as it is (§0–§13); decisions D1…D13 in §1, D14…D60 in §14 (in order) | before iOS work |
 | `android/README.md`, `ios/README.md` | building, running and releasing each phone app | when the user builds |

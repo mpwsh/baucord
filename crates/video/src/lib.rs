@@ -42,6 +42,9 @@ pub mod held;
 #[cfg(target_os = "android")]
 pub mod mediacodec;
 pub mod pool;
+// Drawn by the Windows capture only; compiled for the tests everywhere.
+#[cfg(any(target_os = "windows", test))]
+pub mod pointer;
 #[cfg(target_os = "ios")]
 pub mod videotoolbox;
 pub mod yuv;

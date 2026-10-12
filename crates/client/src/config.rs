@@ -516,6 +516,11 @@ pub struct ShareSettings {
     /// Share visibility: `true` = everyone on the server, `false` =
     /// current voice channel only.
     pub everyone: bool,
+    /// Show the mouse pointer in the share (Windows draws it into the
+    /// picture itself, `video/src/dxgi.rs`). No switch in the app: on,
+    /// unless this file says `false`.
+    #[serde(default = "default_true")]
+    pub pointer: bool,
 }
 
 impl Default for ShareSettings {
@@ -524,6 +529,7 @@ impl Default for ShareSettings {
             quality: "fhd30".to_string(),
             monitor: None,
             everyone: false,
+            pointer: true,
         }
     }
 }
