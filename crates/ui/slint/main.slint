@@ -705,7 +705,10 @@ export component MainWindow inherits Window {
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
-                    IconBtn {
+                    // A phone has no image clipboard: the message menu
+                    // leaves Copy out there, and so does this (the rest
+                    // of review P3-31).
+                    if !State.touch-host : IconBtn {
                         icon: IconSet.Copy;
                         tooltip: Tr.menu-copy-image;
                         clicked => { Logic.viewer-copy(); }

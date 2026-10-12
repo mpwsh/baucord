@@ -643,6 +643,12 @@ impl ChatServer {
             // An address or key match can reach people the actor never
             // named: never the actor, never anyone at or above their
             // rank (the rank rule, spec §8, applied to the fallout).
+            // The person named goes whatever their rank: the command
+            // decided who may be named (`check_not_admin`: an equal or
+            // a higher rank short of an administrator), and admission
+            // refuses them from here on. Skipped with the fallout, a
+            // banned equal stayed in the room until they next
+            // reconnected.
             let actor_rank = stored.by.map(|a| self.policy.rank_of(&a));
             let hit: Vec<ClientId> = self
                 .user_of
@@ -651,13 +657,15 @@ impl ChatServer {
                     if stored.by.as_ref() == Some(*user) {
                         return false;
                     }
+                    if stored.user_id.as_ref() == Some(*user) {
+                        return true;
+                    }
                     if actor_rank.is_some_and(|rank| self.policy.rank_of(user) >= rank) {
                         return false;
                     }
                     let key = self.key_of.get(*client);
                     let ip = self.driver.remote_address(**client).map(|a| a.ip());
-                    stored.user_id.as_ref() == Some(*user)
-                        || (key.is_some() && stored.key_hash.as_ref() == key)
+                    (key.is_some() && stored.key_hash.as_ref() == key)
                         || (ip.is_some() && stored.ip == ip)
                 })
                 .map(|(client, _)| *client)

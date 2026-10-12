@@ -28,8 +28,8 @@ pub fn clipboard_file() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// Raw PNG bytes on the clipboard, if any (covers PNG-only sources
-/// FLTK's TIFF/PDF-side reader misses, e.g. macOS screenshot copies).
+/// Raw PNG bytes on the clipboard, if any (PNG-only sources, e.g.
+/// macOS screenshot copies).
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub fn clipboard_png() -> Option<Vec<u8>> {

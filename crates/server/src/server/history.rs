@@ -429,10 +429,12 @@ impl ChatServer {
             let after = self.policy.level_of(&user);
             self.persist.send(Command::AddProgress(delta));
             // Everyone's bar moves once a minute: each of this user's
-            // sessions, to every peer that renders it.
+            // sessions, to every peer that renders it — which for a
+            // session in the lobby is itself alone (review P2-1: this
+            // told every client it was there, by its id).
             for session in self.sessions_of(&user) {
                 let msg = self.user_progress(session, &user);
-                for peer in self.clients() {
+                for peer in self.audience_about(session) {
                     self.send_msg(peer, &msg);
                 }
             }
@@ -442,7 +444,7 @@ impl ChatServer {
                 for session in self.sessions_of(&user) {
                     self.send_msg(session, &ServerMessage::ProgressUpdate { xp, level: after });
                     let details = self.user_details(session, &user);
-                    for peer in self.clients() {
+                    for peer in self.audience_about(session) {
                         self.send_msg(peer, &details);
                     }
                 }

@@ -110,8 +110,7 @@ Working on the code? Start with [`START-HERE.md`](START-HERE.md).
 
 ### Prerequisites
 
-- Rust 1.95+ (`rust-toolchain.toml` pins it; edition 2024, except the
-  `audio` and `video` crates, still on 2021)
+- Rust 1.95+ (`rust-toolchain.toml` pins it; edition 2024)
 - FFmpeg shared libraries (for screen share encode/decode)
 - Formatting uses nightly-only options: `cargo +nightly fmt --all`
 

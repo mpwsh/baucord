@@ -53,6 +53,7 @@ use transport::{
 use crate::{
     inbound_wake::InboundWake,
     screen::{ScreenControl, ScreenTx},
+    upload_turns::{QueuedBlob, UploadTurns},
     voice::VoiceControl,
     WakeFn,
 };
@@ -891,9 +892,13 @@ pub(crate) struct NetworkClient {
     incoming_images: HashMap<(u64, u32), Reassembly>,
     /// Blobs being fetched, keyed by hash (spec §7).
     incoming_blobs: HashMap<[u8; 32], Reassembly>,
-    /// Blobs announced and waiting for the server's `UploadAccept`, by
-    /// upload id: two files dropped together both go.
+    /// The blob announced and waiting for the server's `UploadAccept`,
+    /// by upload id.
     pending_blobs: HashMap<u32, PendingBlob>,
+    /// Which blob is with the server, and those waiting for it to be
+    /// over: the server holds one announcement a session, so two files
+    /// dropped together go one after the other (`upload_turns`).
+    blob_turns: UploadTurns,
     /// Blobs whose fetch was cancelled: chunks still arriving are
     /// dropped until the blob is asked for again.
     ignored_blobs: HashSet<[u8; 32]>,
@@ -1008,6 +1013,7 @@ impl NetworkClient {
             incoming_images: HashMap::new(),
             incoming_blobs: HashMap::new(),
             pending_blobs: HashMap::new(),
+            blob_turns: UploadTurns::default(),
             ignored_blobs: HashSet::new(),
             admin_rows: AdminPages::default(),
             last_stats_check: now,
@@ -1965,6 +1971,7 @@ impl NetworkClient {
             ServerMessage::UploadDone { upload_id, blob_id } => {
                 self.message_queue
                     .push(NetworkMessage::UploadDone { upload_id, blob_id });
+                self.end_blob_turn(now, upload_id);
             }
             ServerMessage::UploadRejected { upload_id, reason } => {
                 info!("Upload {upload_id} rejected: {}", reason.describe());
@@ -2401,9 +2408,8 @@ impl NetworkClient {
         }
     }
 
-    /// Announce a blob (spec §7): the server answers whether it needs
-    /// the bytes, and `continue_blob_upload` sends them on one paced
-    /// Media stream.
+    /// Upload a blob (spec §7): at once if no other is with the
+    /// server, else when its turn comes (`upload_turns`).
     fn begin_blob_upload(
         &mut self,
         now: Instant,
@@ -2412,10 +2418,33 @@ impl NetworkClient {
         mime: String,
         data: Vec<u8>,
     ) {
-        let blob_id = transport::sha256::digest(&data);
-        let Ok(size) = u32::try_from(data.len()) else {
+        if u32::try_from(data.len()).is_err() {
             return;
+        }
+        let blob = QueuedBlob {
+            upload_id,
+            name,
+            mime,
+            data,
         };
+        if let Some(blob) = self.blob_turns.ask(blob) {
+            self.announce_blob(now, blob);
+        }
+    }
+
+    /// Announce a blob whose turn it is: the server answers whether it
+    /// needs the bytes, and `continue_blob_upload` sends them on one
+    /// paced Media stream.
+    fn announce_blob(&mut self, now: Instant, blob: QueuedBlob) {
+        let QueuedBlob {
+            upload_id,
+            name,
+            mime,
+            data,
+        } = blob;
+        let blob_id = transport::sha256::digest(&data);
+        // Checked when it was asked for.
+        let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
         self.send_control(
             now,
             &ClientMessage::UploadBegin {
@@ -2430,6 +2459,15 @@ impl NetworkClient {
             .insert(upload_id, PendingBlob { blob_id, data });
     }
 
+    /// `upload_id` is over — stored, refused, already known, cancelled:
+    /// if it was the one with the server, the next one waiting is
+    /// announced.
+    fn end_blob_turn(&mut self, now: Instant, upload_id: u32) {
+        if let Some(next) = self.blob_turns.over(upload_id) {
+            self.announce_blob(now, next);
+        }
+    }
+
     fn continue_blob_upload(&mut self, now: Instant, upload_id: u32, needed: bool) {
         let Some(pending) = self.pending_blobs.remove(&upload_id) else {
             return;
@@ -2441,6 +2479,7 @@ impl NetworkClient {
                 upload_id,
                 blob_id: pending.blob_id,
             });
+            self.end_blob_turn(now, upload_id);
             return;
         }
         let frames = chunk_upload(
@@ -2454,6 +2493,8 @@ impl NetworkClient {
             },
         );
         let Some(frames) = frames else {
+            // Nothing will come of it: the next one need not wait.
+            self.end_blob_turn(now, upload_id);
             return;
         };
         match self.driver.send_media(now, self.server, frames) {
@@ -2461,20 +2502,29 @@ impl NetworkClient {
                 self.blob_uploads.insert(upload_id, id);
                 self.report_upload_progress();
             }
-            Err(e) => warn!("Blob upload could not start: {e}"),
+            Err(e) => {
+                warn!("Blob upload could not start: {e}");
+                self.end_blob_turn(now, upload_id);
+            }
         }
     }
 
-    /// Stop a blob upload: not yet accepted → forgotten; in flight →
-    /// its media stream is reset, so the server drops the partial.
+    /// Stop a blob upload: still waiting for its turn → never
+    /// announced; not yet accepted → forgotten; in flight → its media
+    /// stream is reset, so the server drops the partial. The next one
+    /// waiting takes the turn (its announcement replaces this one on
+    /// the server).
     fn cancel_blob_upload(&mut self, now: Instant, upload_id: u32) {
-        if self.pending_blobs.remove(&upload_id).is_some() {
+        if self.blob_turns.forget(upload_id) {
             return;
         }
-        if let Some(id) = self.blob_uploads.remove(&upload_id) {
+        if self.pending_blobs.remove(&upload_id).is_none()
+            && let Some(id) = self.blob_uploads.remove(&upload_id)
+        {
             self.upload_pct.remove(&UploadKey::Blob(upload_id));
             let _ = self.driver.cancel_media(now, self.server, id);
         }
+        self.end_blob_turn(now, upload_id);
     }
 
     /// Stop the image in flight, if any: its stream is reset.

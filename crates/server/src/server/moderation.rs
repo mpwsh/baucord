@@ -426,6 +426,13 @@ impl ChatServer {
                 } else {
                     need(permissions::RESTRICT)?;
                 }
+                // A `server` restriction is a ban, whoever or whatever
+                // it names: a role that may restrict and not ban could
+                // ask for one on a person with a client of its own
+                // making (the rest of review P2-10).
+                if kind == RestrictionKind::Server {
+                    need(permissions::BAN)?;
+                }
                 let (user_id, key_hash, ip) = match target {
                     AdminTarget::User(_) | AdminTarget::Name(_) => {
                         let user = self.resolve_target(&target)?;
@@ -433,8 +440,8 @@ impl ChatServer {
                         (Some(user), None, None)
                     }
                     // A key or an address is not a person: it can only
-                    // be kept out of the server, which takes the ban
-                    // permission like any other ban. A mute or a text
+                    // be kept out of the server (with the ban permission,
+                    // above, like any other ban). A mute or a text
                     // restriction on one would name nobody, skipped the
                     // rank rule, and showed in no one's session (review
                     // P2-10).
@@ -446,14 +453,12 @@ impl ChatServer {
                         ));
                     }
                     AdminTarget::Key(key) => {
-                        need(permissions::BAN)?;
                         if let Some(owner) = self.policy.keys.get(&key).map(|k| k.user_id) {
                             self.check_target(actor, &owner)?;
                         }
                         (None, Some(key), None)
                     }
                     AdminTarget::Address(text) => {
-                        need(permissions::BAN)?;
                         let ip = text.trim().parse().map_err(|_| {
                             AdminError::Invalid(format!("'{text}' is not an address"))
                         })?;

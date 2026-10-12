@@ -4,9 +4,14 @@
 //! file upload, and cancelling a file stops that file, not the picture
 //! going out beside it.
 //!
-//! A bare QUIC endpoint on loopback stands in for the server: it
-//! accepts every announced upload and counts the chunks that reach it.
-//! The client is the real network thread, driven through its channels.
+//! A bare QUIC endpoint on loopback stands in for the server, and
+//! keeps the real one's rule (`server/src/server/profiles.rs`): one
+//! announced upload a session. A second `UploadBegin` replaces the
+//! first, whose chunks are then refused as never announced, and a
+//! finished upload is answered with `UploadDone`. It accepted every
+//! announcement at first, and so passed while two files dropped
+//! together still lost the first against a real server. The client is
+//! the real network thread, driven through its channels.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -23,7 +28,7 @@ use client::{
     network::{NetworkControl, NetworkMessage, NetworkThreadHandle, UploadKey},
     voice::VoiceControl,
 };
-use protocol::{ClientMessage, Lane, ServerMessage};
+use protocol::{ClientMessage, Lane, ServerMessage, UploadRejectReason};
 use transport::{Budget, ClientKey, Driver, Event, PeerId, ServerIdentity, UdpIo};
 
 /// What reached the stand-in server.
@@ -33,6 +38,10 @@ struct Seen {
     hello: bool,
     /// Blob uploads: upload id → (chunk count, chunk indexes received).
     blobs: HashMap<u32, (u32, BTreeSet<u32>)>,
+    /// The one upload announced now, as the real server keeps it.
+    announced: Option<u32>,
+    /// Uploads refused as never announced.
+    refused: BTreeSet<u32>,
     /// Picture chunks received since the last reset, and their count.
     image_chunks: u32,
     image_count: u32,
@@ -67,14 +76,17 @@ fn serve(stop: &AtomicBool, seen: &Mutex<Seen>, udp: &mut UdpIo, driver: &mut Dr
                     match protocol::decode_client_message(&frame) {
                         Some(ClientMessage::Hello { .. }) => s.hello = true,
                         Some(ClientMessage::UploadBegin { upload_id, .. }) => {
-                            let accept = ServerMessage::UploadAccept {
-                                upload_id,
-                                needed: true,
-                            };
-                            let bytes = protocol::encode_server_message(&accept).expect("encode");
-                            driver
-                                .send(now, peer, accept.lane(), &bytes)
-                                .expect("accept");
+                            // The newest announcement is the only one.
+                            s.announced = Some(upload_id);
+                            say(
+                                driver,
+                                now,
+                                peer,
+                                &ServerMessage::UploadAccept {
+                                    upload_id,
+                                    needed: true,
+                                },
+                            );
                         }
                         Some(ClientMessage::UploadChunk {
                             upload_id,
@@ -82,11 +94,36 @@ fn serve(stop: &AtomicBool, seen: &Mutex<Seen>, udp: &mut UdpIo, driver: &mut Dr
                             count,
                             ..
                         }) => {
+                            if s.announced != Some(upload_id) {
+                                s.refused.insert(upload_id);
+                                say(
+                                    driver,
+                                    now,
+                                    peer,
+                                    &ServerMessage::UploadRejected {
+                                        upload_id,
+                                        reason: UploadRejectReason::NotAnnounced,
+                                    },
+                                );
+                                continue;
+                            }
                             let entry = s
                                 .blobs
                                 .entry(upload_id)
                                 .or_insert_with(|| (count, BTreeSet::new()));
                             entry.1.insert(index);
+                            if entry.1.len() == count as usize {
+                                s.announced = None;
+                                say(
+                                    driver,
+                                    now,
+                                    peer,
+                                    &ServerMessage::UploadDone {
+                                        upload_id,
+                                        blob_id: [0; 32],
+                                    },
+                                );
+                            }
                         }
                         Some(ClientMessage::ChatImageChunk { count, .. }) => {
                             s.image_chunks += 1;
@@ -103,6 +140,12 @@ fn serve(stop: &AtomicBool, seen: &Mutex<Seen>, udp: &mut UdpIo, driver: &mut Dr
         }
         thread::sleep(Duration::from_micros(500));
     }
+}
+
+/// Send the client one message.
+fn say(driver: &mut Driver, now: Instant, peer: PeerId, msg: &ServerMessage) {
+    let bytes = protocol::encode_server_message(msg).expect("encode");
+    driver.send(now, peer, msg.lane(), &bytes).expect("send");
 }
 
 /// Wait up to `timeout` for `done`.
@@ -189,6 +232,10 @@ fn uploads_keep_their_own_state() {
         (s.blob_chunks(101), s.blob_chunks(102))
     };
     assert!(both, "not both files arrived: {got:?} chunks of 3 each");
+    assert!(
+        seen.lock().unwrap().refused.is_empty(),
+        "an upload was sent while another held the server's one slot"
+    );
 
     // Each file reported its own progress, under its own id, up to
     // 100 %. `UploadProgress` used to carry no id, so the UI could only

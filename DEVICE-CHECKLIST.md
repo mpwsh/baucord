@@ -168,6 +168,11 @@ Play music in another app first, at a steady volume.
   there, and so it does for a ban (decided 2026-10-12) [P2-17].
 - [ ] **new** — in the composer, select text, right-click: Cut and Copy
   work; with nothing selected they are greyed [P2-16].
+- [ ] **new** — drop two files on the chat at once (not pictures):
+  both arrive. The second card waits at 0 % until the first is done;
+  cancelling the first lets the second start, and cancelling the
+  second while it waits sends nothing. The first used to fail with a
+  refusal [P1-17].
 - [ ] **new** — PrintScreen, then Ctrl+V in the composer: the send
   preview opens. Copy cells in a spreadsheet: they paste as text
   [P2-18].
@@ -622,6 +627,12 @@ Not a client platform, but changed blind all the same.
   scripts/setup.sh` removes the drop-in an earlier run wrote and says
   so [P3-52].
 
+- [ ] **new** — two people with the same role that may ban: one bans
+  the other, who is removed at once (and cannot come back). They used
+  to stay in the room until they next reconnected.
+- [ ] **new** — a role with "restrict" and without "ban" can still
+  mute and text-restrict from the menu, as before.
+
 ### 5.1 The workflows **[7]**
 
 - [ ] The next push: `pr-check` is green. It installs neither
@@ -632,6 +643,9 @@ Not a client platform, but changed blind all the same.
   Xrender, pango and cairo headers and `libdbus-1-dev`; the last two
   steps upload the zips and then the `version` file, in that order
   [P2-60, P3-48].
+- [ ] A push to `main` that touches neither `web/` nor `Cargo.lock`:
+  "Build and Release" runs (its caches) and "Deploy Website" does not
+  follow it. After a published release it does.
 - [ ] The Android release: `Install cargo-ndk` takes seconds
   (`cargo-ndk 4.1.2`, prebuilt) and the Gradle build finds it [P3-48].
 

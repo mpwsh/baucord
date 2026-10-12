@@ -1180,6 +1180,81 @@ One line each; the spec decision named holds the detail.
     type-checked for Windows and Android. **Not run**: there is no
     audio device in the sandbox and the app's own tests do not fit on
     its disk. `DEVICE-CHECKLIST.md` marks the lines **[8]**.
+- **2026-10-12 — 1.2.1, the check before a release.** Every id of the
+  review (§2a) read against the code again, by four separate readers
+  told to judge the code and not this file; the documents against the
+  review's list of 24; and the whole tree built, linted and tested.
+  - *The numbers.* After what was fixed here, 127 of the 143 ids are
+    fixed as the review asked; 14 are fixed in part (below); P2-25 is
+    open; P2-29 is a decision (§6, 2). 802 tests pass in the sandbox
+    and the same six that need a real UDP socket do not; lint is where
+    it was; Windows, Android, macOS (`keywatch`) and iOS (`video`)
+    type-check.
+  - *Found, and fixed here.*
+    - **Two files dropped together lost the first** (P1-17, which
+      this file called done). The server holds one announced upload a
+      session; the client announced both at once, and the first was
+      refused. The client now takes turns (`client/src/upload_turns.rs`,
+      3 tests): one blob with the server, the rest waiting unannounced
+      — against every server shipped. The integration test's stand-in
+      server accepted every announcement, which is why it passed; it
+      keeps the real rule now, and fails without the queue (run here
+      with the loop forced onto its polling fallback).
+    - **A ban of an equal left them in the room** (as old as 1.1). The
+      ban command may name anyone short of an administrator; the rank
+      rule that spares whoever else shares the key or address spared
+      the person named too. They leave at once now (e2e test).
+    - **A `server` restriction takes the ban permission by any
+      command** (the rest of P2-10): `Restrict` asked for it only when
+      the target was a key or an address (e2e test).
+    - **The lobby's progress stays in the lobby** (the rest of P2-1):
+      the once-a-minute `UserProgress` and a level-up's `UserDetails`
+      go through `audience_about` like the rest.
+    - **No Copy in the image viewer on a phone** (the rest of P3-31).
+    - **The site is deployed after a release's build only**
+      (`web.yaml`): since P2-50 "Build and Release" also runs on every
+      push to `main`, and each of those runs deployed the site again.
+    - *Documents*: the readme's edition line, START-HERE's decision
+      ranges, IOS-SPEC's D57–D60 in order, three comments naming
+      toolkits long gone. P2-36, P3-19 and P3-32 were done in earlier
+      batches and had no line here; they are named now.
+  - *In part, and left so.* By decision: P2-40 (the glide is back, the
+    timer idles at 2 s off the Audio tab), P2-49 (5 s), P2-51 (the
+    server half), P2-60, P3-27, P3-52 (the hotplug switch is said and
+    can be kept). Not finished, and no user would see it: P2-11 (file
+    references are recounted at startup, not after a prune), P2-27
+    (a saved picture and an exported key are still written from the UI
+    thread on Android), P2-32 (about twenty broadcasts still encode per
+    recipient), P2-54 (three switches nothing turns are still read
+    every frame), P2-58 (the admin confirmation is its own dialog, and
+    does not hear Android's Back), P3-23 (the lobby's two threads tick
+    slowly where the review asked them to block), P3-48 (macOS still
+    installs opus; two `rustup` calls without `--profile minimal`),
+    P3-49 (the `objc2` family is declared per crate).
+  - *Seen, and not touched.* A DM store already running when its 2 s
+    deadline passes is stored after the sender was told it failed (a
+    second copy if they try again; it takes something holding the
+    database for 2 s). A share's sound that fails to restart once
+    stays off until the device changes or the share is restarted.
+    `limits.max_chat_bytes` above about 16 KiB makes "Load earlier"
+    ask for the same page for ever (the default is 2000). The release
+    builds `-p desktop -p server` together, so the server's
+    certificate code is compiled into the desktop (P3-3's saving is
+    the phones'). `LATENCY-SPEC.md` is named by START-HERE and CLI-16
+    and is not in the repository.
+  - *What a release still needs — none of it is code.* (1) `pr-check`
+    green on the branch: it runs the app's own tests and the six this
+    sandbox cannot. (2) A build on Windows and on a Mac: no workflow
+    compiles either before the release does, and the Windows and macOS
+    halves of the app itself were never type-checked here. (3)
+    `DEVICE-CHECKLIST.md`: 133 lines, none ticked — the voice,
+    ducking and keybind sections on Windows first. (4) The dry runs
+    the phone and Docker workflows have (`workflow_dispatch`). (5)
+    Merge and publish in one sitting: a push to `main` that changes
+    `Cargo.lock` or `web/` deploys the site with the new version's
+    download links at once, and they lead nowhere until the release's
+    builds have uploaded; the APK's a little longer, its workflow
+    being its own (P2-60).
 
 ## 8. Facts this plan rests on
 

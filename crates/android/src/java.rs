@@ -451,8 +451,9 @@ pub fn pick_file(mime: &str, max_bytes: u64) -> Result<(), String> {
 /// and the name the user will find it under (`Download/report (1).pdf`).
 ///
 /// The bytes do not cross into Java: they used to, whole, as a
-/// `byte[]` (review P2-27). Called off the UI thread
-/// (`frontend`'s save runs on a thread of its own).
+/// `byte[]` (review P2-27). A received file is saved off the UI thread
+/// (`frontend`'s save runs on a thread of its own); a picture saved
+/// from the viewer and an exported key are small and written from it.
 ///
 /// # Errors
 /// What `MediaStore` or the write said, or any JNI failure, as text.

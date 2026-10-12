@@ -10,9 +10,9 @@ workspace = true
 
 [dependencies]
 app-core = { path = "../app-core" }
-# Default features = winit backend + femtovg & software renderers.
-# Software is the footprint path (select at runtime via SLINT_BACKEND);
-# femtovg stays one env var away for A/B testing.
+# The workspace's features: the winit backend with the Skia and software
+# renderers. Software is the footprint path (select at runtime via
+# SLINT_BACKEND).
 slint.workspace = true
 log.workspace = true
 

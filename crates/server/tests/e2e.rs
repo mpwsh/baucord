@@ -3286,6 +3286,138 @@ fn a_key_or_an_address_can_only_be_banned_and_only_with_the_ban_permission() {
     assert_eq!(w.server().policy().restrictions.len(), 1);
 }
 
+/// Keeping a person out of the server is a ban by whatever command
+/// asks for it: a role that may restrict and not ban gets its mutes and
+/// no more (the rest of review P2-10).
+#[test]
+fn a_server_restriction_on_a_person_takes_the_ban_permission() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut alice = w.connect_member("alice");
+    let mut guest = w.connect("guest");
+    admin.admin(
+        &mut w,
+        1,
+        AdminCommand::CreateRole {
+            name: "warden".into(),
+            permissions: permissions::MEMBER_PERMISSIONS | permissions::RESTRICT,
+            icon: String::new(),
+            color: 0,
+        },
+    );
+    let Ok(AdminOutcome::RoleCreated(warden)) =
+        admin.admin_result(&mut w, &mut [&mut alice, &mut guest], 1)
+    else {
+        panic!("role not created");
+    };
+    admin.admin(
+        &mut w,
+        2,
+        AdminCommand::SetRoles {
+            target: AdminTarget::Name("alice".to_string()),
+            roles: vec![ROLE_MEMBER, warden],
+        },
+    );
+    assert_eq!(
+        admin.admin_result(&mut w, &mut [&mut alice, &mut guest], 2),
+        Ok(AdminOutcome::Done)
+    );
+    let on_guest = |kind| AdminCommand::Restrict {
+        target: AdminTarget::Name("guest".to_string()),
+        kind,
+        duration_secs: None,
+        reason: String::new(),
+    };
+    alice.admin(&mut w, 3, on_guest(RestrictionKind::Server));
+    assert_eq!(
+        alice.admin_result(&mut w, &mut [&mut admin, &mut guest], 3),
+        Err(AdminError::NoPermission)
+    );
+    assert!(w.server().policy().restrictions.is_empty());
+    // What the role is for still works.
+    alice.admin(&mut w, 4, on_guest(RestrictionKind::GeneralText));
+    assert_eq!(
+        alice.admin_result(&mut w, &mut [&mut admin, &mut guest], 4),
+        Ok(AdminOutcome::Done)
+    );
+}
+
+/// A ban may name an equal (spec §12: only an administrator is out of
+/// reach), and the person named leaves at once. The rank rule that
+/// protects whoever else shares their key or address used to protect
+/// them too: the ban was stored, the answer was `Done`, and they stayed
+/// in the room until they next reconnected.
+#[test]
+fn a_ban_of_an_equal_removes_them_at_once() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    admin.admin(
+        &mut w,
+        1,
+        AdminCommand::CreateRole {
+            name: "bouncer".into(),
+            permissions: permissions::MEMBER_PERMISSIONS | permissions::BAN,
+            icon: String::new(),
+            color: 0,
+        },
+    );
+    let Ok(AdminOutcome::RoleCreated(bouncer)) =
+        admin.admin_result(&mut w, &mut [&mut alice, &mut bob], 1)
+    else {
+        panic!("role not created");
+    };
+    for (request, name) in [(2, "alice"), (3, "bob")] {
+        admin.admin(
+            &mut w,
+            request,
+            AdminCommand::SetRoles {
+                target: AdminTarget::Name(name.to_string()),
+                roles: vec![ROLE_MEMBER, bouncer],
+            },
+        );
+        assert_eq!(
+            admin.admin_result(&mut w, &mut [&mut alice, &mut bob], request),
+            Ok(AdminOutcome::Done)
+        );
+    }
+    alice.admin(
+        &mut w,
+        4,
+        AdminCommand::Ban {
+            target: AdminTarget::Name("bob".to_string()),
+            duration_secs: None,
+            reason: "enough".to_string(),
+        },
+    );
+    bob.wait_for(&mut w, &mut [&mut admin, &mut alice], |m| match m {
+        ServerMessage::Removed {
+            kind: RemovedKind::Banned { until: None },
+            reason,
+            ..
+        } if reason == "enough" => Some(()),
+        _ => None,
+    });
+    // The administrator on the same address is still there, and still
+    // out of reach.
+    alice.admin(
+        &mut w,
+        5,
+        AdminCommand::Ban {
+            target: AdminTarget::Name("mpw".to_string()),
+            duration_secs: None,
+            reason: String::new(),
+        },
+    );
+    assert_eq!(
+        alice.admin_result(&mut w, &mut [&mut admin], 5),
+        Err(AdminError::Outranked)
+    );
+}
+
 /// A full server still shakes hands, and says why it refuses. The
 /// transport used to count the unadmitted against `max_clients` too,
 /// so the next connection was refused before it could say Hello and
