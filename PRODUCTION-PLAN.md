@@ -983,10 +983,57 @@ One line each; the spec decision named holds the detail.
     the tests hold is the *decisions*; the streams themselves
     (`input.rs`, `output.rs`, `native/`) were not touched.
 
+- **2026-10-12 — 1.2.1, the review's sixth batch** (§2a): what could
+  still be done in the sandbox, and `DEVICE-CHECKLIST.md` for what
+  could not.
+  - *Smaller.* `NetworkControl::Send(ClientMessage)` replaces the 17
+    variants that restated a wire message field for field, and their
+    17 arms (`network.rs` −201 lines; the rest of P2-53). The
+    encoder's twelve methods live in its `VideoEncoder`
+    implementation, without an inherent copy each and a forwarder
+    (P3-29). The microphone's chain is a struct with nine fields, not
+    a `Vec<Box<dyn AudioProcessor>>` built by `add` calls, and the
+    stages' unused names are gone (P2-54).
+  - *One of each.* SHA-256 is `transport::sha256` on `ring`; `sha2`
+    and what it brought are out of the tree (standard vectors tested;
+    stored hashes and pinned fingerprints are the same bytes). One
+    `pollster`. winit through `slint/unstable-winit-030`, not Slint's
+    internal backend crate (P3-50). `chrono`, `serde_json`,
+    `env_logger` and the `windows` version are
+    `[workspace.dependencies]`; Slint is `~1.18.1` (P3-49). *Left:*
+    `sysinfo` on the phones (the resource line and `/mem` use it
+    there), and `audio`/`video` on edition 2021 — the migration has to
+    be compiled for iOS and macOS, which the sandbox cannot.
+  - *Words.* The send preview is decoded at the size it is drawn
+    (P3-41). `/channel list`'s flags, the admin lists' "no roles",
+    "key …", "uses …", "(revoked)", and the nine fixed reasons an
+    admin command is refused are in the three catalogs (P3-30). Left
+    in English on purpose: the restriction kinds (`voice`, `text`, …),
+    which are what an admin types, and a reason the server wrote
+    itself.
+  - *Tests.* `tools/chat-scroll-sim` covers the row cap: appends at
+    500 rows at the bottom, the one trim above a reader who has just
+    scrolled up, the held list to 2,000 rows and past it, and 1,502
+    rows leaving at once after the jump back — the view never moves
+    (P3-43; no bug found). The transport simulator runs the four
+    things it never had: a session the server forgot is reset at the
+    client's next packet, a refused stream (STOP_SENDING) costs one
+    group, voice into a stalled link is dropped, counted and reported
+    once, two tracks over a reordering link each arrive whole and in
+    order (P3-4). `a_report_reaches_the_moderators…` no longer waits
+    500 ms of *simulated* time for a write the database thread does in
+    real time (it failed about one run in five on a busy disk).
+  - *The host script.* `setup.sh` no longer sets `net.core.*_default`
+    (every socket on the box; the server sizes its own) or mentions
+    0.5's `netcode.key`. The operator's guide is `web/deploy.html`
+    alone — the readme's copy is a pointer, and the two details it
+    had over the page moved there (P3-52). *Left:* the cloud-init
+    hotplug switch, which is a decision about the host, not a trim.
+
 ## 8. Facts this plan rests on
 
 - **Tests, 2026-10-12, Linux sandbox**: protocol 91 + the versions
-  test + 3 wire-pinning tests, transport 55, server 70 unit + 99 e2e,
+  test + 3 wire-pinning tests, transport 61, server 70 unit + 99 e2e,
   client 57, app-core 120, audio 164, video 77 + 6, i18n 2 — all
   green. Six more need a real machine:
   that sandbox does not signal UDP readiness, so the socket-wait tests

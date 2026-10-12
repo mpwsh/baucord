@@ -646,6 +646,18 @@ Memory-mode servers (persistence off) still use the legacy
   has to behave like the streams where the engine depends on it (a
   stream that starts clears its "failed" flag; the first version did
   not, and every tick reopened everything).
+- **Sending the server a message that needs nothing else is
+  `NetworkControl::Send(ClientMessage::…)`** — no new variant of
+  `NetworkControl`, no arm in `handle_control`. A variant of its own
+  is for a message the network thread has to do something about (an
+  upload to chunk, a state to remember).
+- **A hash is `transport::sha256`** (`digest`, or `Hasher` for bytes
+  that arrive in pieces). A dependency several crates share is
+  declared once, under `[workspace.dependencies]`.
+- **An e2e test that waits for the database waits in real time**: the
+  world's `settle` runs simulated time, which a busy machine gets
+  through before the persistence thread has done its write. Poll for
+  the thing itself (`rows_become`, or ask again in a loop).
 - **What belongs to one connection goes in `Session`** (`app.rs`; or
   its `Safety`, `Transfers`, `ChatFlow`), not in `AppState`: the
   teardown replaces it whole, so nothing has to be remembered there.

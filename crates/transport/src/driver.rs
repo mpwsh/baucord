@@ -972,6 +972,24 @@ impl Driver {
             .map(|p| p.video_tracks.get(&track).copied().unwrap_or_default())
     }
 
+    /// Tests: refuse every stream `peer` has open toward us, the way a
+    /// receiver does to one that broke the protocol (`STOP_SENDING`). No
+    /// well-behaved peer gets there, so the sender's side of it has no
+    /// other way to be run.
+    #[cfg(test)]
+    pub(crate) fn stop_incoming_streams(&mut self, now: Instant, peer: PeerId) {
+        let Some(handle) = self.ids.get(&peer).copied() else {
+            return;
+        };
+        if let Some(p) = self.peers.get_mut(&handle) {
+            for id in std::mem::take(&mut p.uni_in).into_keys() {
+                let _ = p.conn.recv_stream(id).stop(PROTOCOL_VIOLATION_CODE);
+            }
+        }
+        // The frame leaves with this peer's next pass.
+        self.touch(handle, now);
+    }
+
     /// The application is done with `track` toward `peer` (the viewer
     /// unsubscribed, the sharer stopped): its counters go.
     pub fn video_forget_track(&mut self, peer: PeerId, track: Track) {

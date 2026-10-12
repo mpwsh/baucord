@@ -1372,3 +1372,243 @@ fn stalled_groups_are_reset_at_their_deadlines_on_the_loops_schedule() {
         "abandoned after {took:?}, due at {due:?}"
     );
 }
+
+// ── What the simulator had never been made to do (review P3-4) ──────────
+
+/// The server closed the session while the client could not hear it,
+/// and has forgotten it by the time the link is back: the client's next
+/// packet is answered with a stateless reset, and the client knows at
+/// once instead of waiting out its idle timeout.
+#[test]
+fn a_session_the_server_forgot_is_reset_at_the_clients_next_packet() {
+    let mut p = pair(41, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, client_peer) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+    p.net.driver(client).drain_events().for_each(drop);
+
+    p.net.set_link(
+        server,
+        client,
+        LinkSpec::clean(Duration::from_millis(10)).with_loss(1.0),
+    );
+    let now = p.net.now();
+    p.net.driver(server).close(now, client_peer, "gone");
+    // Long enough for the server to finish closing and drop the state,
+    // well short of the client's own 30 s idle timeout.
+    p.net
+        .run_for(Duration::from_secs(5), Duration::from_millis(10));
+    assert!(
+        p.net.driver(client).is_connected(server_peer),
+        "the client heard nothing: it still thinks it is connected"
+    );
+    p.net
+        .set_link(server, client, LinkSpec::clean(Duration::from_millis(10)));
+
+    let back = p.net.now();
+    p.net
+        .driver(client)
+        .send(back, server_peer, Lane::Control, b"anyone there?")
+        .expect("send");
+    let mut reason = None;
+    let ok = p.net.run_until(Duration::from_secs(3), TICK, |net| {
+        for ev in net.driver(client).drain_events() {
+            if let Event::Disconnected { reason: r, .. } = ev {
+                reason = Some(r);
+            }
+        }
+        reason.is_some()
+    });
+    assert!(
+        ok,
+        "the client should learn within seconds, not at its idle timeout"
+    );
+    assert_eq!(reason, Some(DisconnectReason::Reset));
+}
+
+/// A receiver that refuses a stream (`STOP_SENDING`) costs the sender
+/// that group and nothing else: it is counted as reset, and the next
+/// group goes through.
+#[test]
+fn a_refused_stream_loses_its_group_and_the_next_one_flows() {
+    let mut p = pair(42, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, client_peer) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+
+    // A group left open, so its stream is still there to refuse.
+    let now = p.net.now();
+    p.net.driver(client).video_new_group(now, server_peer, 0);
+    p.net
+        .driver(client)
+        .send(now, server_peer, Lane::Video, &[1; 1000])
+        .expect("chunk");
+    p.net.run_for(Duration::from_millis(200), TICK);
+    while p.net.driver(server).recv_video(client_peer).is_some() {}
+    let before = p
+        .net
+        .driver(client)
+        .track_stats(server_peer, 0)
+        .expect("track");
+
+    let now = p.net.now();
+    p.net.driver(server).stop_incoming_streams(now, client_peer);
+    p.net.run_for(Duration::from_millis(200), TICK);
+    let after = p
+        .net
+        .driver(client)
+        .track_stats(server_peer, 0)
+        .expect("track");
+    assert_eq!(after.groups_reset, before.groups_reset + 1);
+    assert!(
+        !p.net.driver(client).video_group_open(server_peer, 0),
+        "the refused group is gone"
+    );
+    assert!(p.net.driver(client).is_connected(server_peer));
+
+    // Chunks for the lost group go nowhere; the next keyframe's group
+    // arrives whole.
+    let now = p.net.now();
+    p.net
+        .driver(client)
+        .send(now, server_peer, Lane::Video, &[2; 1000])
+        .expect("dropped quietly");
+    p.net.driver(client).video_new_group(now, server_peer, 0);
+    p.net
+        .driver(client)
+        .send(now, server_peer, Lane::Video, &[3; 1000])
+        .expect("chunk");
+    p.net.driver(client).video_finish_group(now, server_peer, 0);
+    let mut items = Vec::new();
+    p.net.run_until(Duration::from_secs(2), TICK, |net| {
+        while let Some((_, it)) = net.driver(server).recv_video(client_peer) {
+            items.push(it);
+        }
+        matches!(items.last(), Some(VideoItem::GroupEnd))
+    });
+    assert_eq!(
+        items,
+        [
+            VideoItem::GroupStart,
+            VideoItem::Chunk(Bytes::from(vec![3; 1000])),
+            VideoItem::GroupEnd
+        ]
+    );
+}
+
+/// More voice than a stalled link takes: the datagram queue fills, the
+/// surplus is dropped and counted, the application is told once per
+/// episode — and nothing panics. (quinn-proto 0.11.17's drop-oldest
+/// path did, the first time a real link stalled; the driver drops the
+/// newest instead.)
+#[test]
+fn voice_into_a_stalled_link_is_dropped_counted_and_reported_once() {
+    let mut p = pair(43, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, client_peer) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+    p.net.driver(client).drain_events().for_each(drop);
+
+    p.net.set_link(
+        server,
+        client,
+        LinkSpec::clean(Duration::from_millis(10)).with_loss(1.0),
+    );
+    // Ten seconds of voice at once: far past the client's 32 KiB.
+    let now = p.net.now();
+    for i in 0..500u32 {
+        p.net
+            .driver(client)
+            .send(now, server_peer, Lane::Voice, &[(i % 251) as u8; 300])
+            .expect("a full queue is not an error");
+    }
+    let stats = p.net.driver(client).stats(server_peer).expect("stats");
+    assert!(stats.datagram_send_drops > 0, "{stats:?}");
+    assert_eq!(stats.datagrams_blocked, 1, "one episode, however long");
+    let blocked = p
+        .net
+        .driver(client)
+        .drain_events()
+        .filter(|e| matches!(e, Event::DatagramsBlocked { .. }))
+        .count();
+    assert_eq!(blocked, 1);
+
+    // The link returns: voice flows again, and a new stall is a new
+    // episode.
+    p.net
+        .set_link(server, client, LinkSpec::clean(Duration::from_millis(10)));
+    p.net.run_for(Duration::from_secs(2), TICK);
+    while p
+        .net
+        .driver(server)
+        .recv(client_peer, Lane::Voice)
+        .is_some()
+    {}
+    let now = p.net.now();
+    p.net
+        .driver(client)
+        .send(now, server_peer, Lane::Voice, &[9; 100])
+        .expect("voice");
+    let mut got = None;
+    p.net.run_until(Duration::from_secs(2), TICK, |net| {
+        while let Some(d) = net.driver(server).recv(client_peer, Lane::Voice) {
+            got = Some(d);
+        }
+        got.as_ref().is_some_and(|d| d.len() == 100)
+    });
+    assert_eq!(got.map(|d| d.len()), Some(100));
+    assert!(p.net.driver(client).is_connected(server_peer));
+}
+
+/// Packets that overtake each other (jitter wider than the gap between
+/// them) on two video tracks at once: every group of each track still
+/// comes out whole and in order, and nothing of one track turns up in
+/// the other.
+#[test]
+fn two_tracks_over_a_reordering_link_each_arrive_whole_and_in_order() {
+    const GROUPS: u8 = 12;
+    const TRACKS: [u64; 2] = [5, 9];
+    let link = LinkSpec::clean(Duration::from_millis(10)).with_jitter(Duration::from_millis(25));
+    let mut p = pair(44, link);
+    let (server_peer, client_peer) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+
+    let mut seen: [Vec<VideoItem>; 2] = [Vec::new(), Vec::new()];
+    let collect = |net: &mut SimNet, seen: &mut [Vec<VideoItem>; 2]| {
+        while let Some((track, it)) = net.driver(client).recv_video(server_peer) {
+            let slot = TRACKS
+                .iter()
+                .position(|t| *t == track)
+                .expect("a known track");
+            seen[slot].push(it);
+        }
+    };
+    for g in 0..GROUPS {
+        let now = p.net.now();
+        for (slot, track) in TRACKS.into_iter().enumerate() {
+            let d = p.net.driver(server);
+            d.video_new_group(now, client_peer, track);
+            for i in 0..3u8 {
+                let byte = u8::try_from(slot).unwrap() * 100 + g * 4 + i;
+                d.send_video(now, client_peer, track, &[byte; 900])
+                    .expect("chunk");
+            }
+            d.video_finish_group(now, client_peer, track);
+        }
+        p.net.run_for(Duration::from_millis(60), TICK);
+        collect(&mut p.net, &mut seen);
+    }
+    p.net.run_for(Duration::from_millis(500), TICK);
+    collect(&mut p.net, &mut seen);
+
+    for (track, items) in seen.iter().enumerate() {
+        let mut expected = Vec::new();
+        for g in 0..GROUPS {
+            expected.push(VideoItem::GroupStart);
+            for i in 0..3u8 {
+                let byte = u8::try_from(track).unwrap() * 100 + g * 4 + i;
+                expected.push(VideoItem::Chunk(Bytes::from(vec![byte; 900])));
+            }
+            expected.push(VideoItem::GroupEnd);
+        }
+        assert_eq!(items.len(), expected.len(), "track {track}: {items:?}");
+        assert_eq!(*items, expected, "track {track}");
+    }
+}

@@ -6,7 +6,7 @@
 > type-checked there, the iOS code was not even compiled, and nothing
 > platform-specific was *run*. This is the list of what has to be seen
 > on the real thing before 1.2.1 ships. Tick a line when it holds; a
-> line that fails goes into `PRODUCTION-PLAN.md` with what §4 asks for.
+> line that fails goes into `PRODUCTION-PLAN.md` with what §5 asks for.
 
 Each line is *do this → expect that*. `log:` is a line to find in
 `baucord.log` (desktop: Settings → Debug shows it and copies it;
@@ -159,6 +159,21 @@ Play music in another app first, at a steady volume.
     opens its menu; a click on a picture opens the gallery [P2-58].
 - [ ] **same** — attach a file, save a received one, open it, open a
   link [P3-33].
+- [ ] **same** — connect to a server whose identity this machine had
+  already pinned: no "identity changed" warning. Send a picture and a
+  file both ways: they arrive (their hashes are checked). The one
+  SHA-256 in the tree is `ring`'s now [P3-50].
+- [ ] **same** — drop a file from Explorer onto the window (the overlay
+  shows, the file attaches); bring the window back from the tray (it
+  repaints, no blank surface). Both come through Slint's winit
+  feature now, not its internal crate [P3-50].
+- [ ] **same** — edit and delete a message, create, edit and delete a
+  channel, send a DM, block and unblock someone, report a message,
+  change your name and colour. Each of these is sent through one
+  `NetworkControl::Send` now [P2-53].
+- [ ] **same** — the microphone sounds as before with noise
+  suppression on and off, and the gate still closes on silence
+  [P2-54].
 - [ ] **same** — connect, disconnect and connect again twice, once in
   the middle of an upload: roster, conversations, mute and transfers
   start clean each time [P2-51].
@@ -322,7 +337,20 @@ VideoToolbox half of P2-43.
 
 ---
 
-## 4. When a line fails
+## 4. A server host
+
+Not a client platform, but changed blind all the same.
+
+- [ ] **new** — `scripts/setup.sh` on a fresh host and again on an
+  existing one: it runs through, and `/etc/sysctl.d/
+  99-baucord-udp.conf` no longer sets `net.core.rmem_default` /
+  `wmem_default` (the server sizes its own socket). log at start:
+  `UDP socket on …`; `scripts/monitor-net.sh` shows no new `RCVBUF` or
+  `SNDBUF` notes under a share with several viewers [P3-52].
+
+---
+
+## 5. When a line fails
 
 Send back: the platform and its version (Windows build number,
 Android version and phone model, iOS version), the line, and from the

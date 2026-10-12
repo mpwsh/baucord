@@ -5821,12 +5821,31 @@ fn a_report_reaches_the_moderators_and_waits_in_the_reports_tab() {
         bob.admin_result(&mut w, &mut [&mut admin, &mut alice], 1),
         Err(AdminError::NoPermission)
     );
-    admin.admin(&mut w, 2, AdminCommand::ListReports { resolved: false });
-    let Ok(AdminOutcome::Reports(list)) =
-        admin.admin_result(&mut w, &mut [&mut alice, &mut bob], 2)
-    else {
-        panic!("no reports");
-    };
+    // The reports are written by the persistence thread, in real time;
+    // the settle above is simulated time, which a loaded machine runs
+    // through before the second write is even queued. Ask until both
+    // are there (this was a flake: one report listed, about one run in
+    // four on a busy disk).
+    let mut list = Vec::new();
+    for attempt in 0..200u32 {
+        // Ids of their own: the requests further down are 3, 4 and 5.
+        let request = 100 + attempt;
+        admin.admin(
+            &mut w,
+            request,
+            AdminCommand::ListReports { resolved: false },
+        );
+        let Ok(AdminOutcome::Reports(now)) =
+            admin.admin_result(&mut w, &mut [&mut alice, &mut bob], request)
+        else {
+            panic!("no reports");
+        };
+        list = now;
+        if list.len() == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].msg_id, None);
     assert_eq!(list[1].msg_id, Some(msg_id));
