@@ -144,6 +144,15 @@ fn is_quiet(frame: &[f32]) -> bool {
     (sum_sq / frame.len() as f32).sqrt() <= QUIET_RMS
 }
 
+/// A decoded frame whose loudest sample is at or below this (−80 dBFS)
+/// is digital silence for every purpose here: a closed noise gate, a
+/// muted microphone that still sends.
+const SILENT_PEAK: f32 = 1e-4;
+
+fn is_silent(frame: &[f32]) -> bool {
+    frame.iter().all(|s| s.abs() <= SILENT_PEAK)
+}
+
 pub struct PacketBuffer {
     decoder: Decoder,
     /// Ascending by sequence (relative to the playhead). Tiny: a 200 ms
@@ -159,6 +168,11 @@ pub struct PacketBuffer {
     /// Gates dry-PLC (nothing worth extrapolating after silence) and
     /// enables comfort-noise continuation instead.
     last_real_quiet: bool,
+    /// The last decoded real frame was silence ([`SILENT_PEAK`]):
+    /// continuing it is continuing nothing, so [`Self::comfort_noise`]
+    /// does not run the decoder for it — it did, fifty times a second
+    /// for every peer sitting quiet in the room (review P2-34).
+    last_real_silent: bool,
     /// Duration of the last decoded real frame, for the caller's
     /// loss-protection floor.
     last_real_samples: usize,
@@ -178,6 +192,7 @@ impl PacketBuffer {
             next_ts: 0,
             dry_plc_used: 0,
             last_real_quiet: true,
+            last_real_silent: true,
             last_real_samples: FRAME_SIZE,
             staging: [0.0; MAX_FRAME],
             staged: 0,
@@ -290,6 +305,7 @@ impl PacketBuffer {
         self.started = false;
         self.dry_plc_used = 0;
         self.last_real_quiet = true;
+        self.last_real_silent = true;
         self.staged = 0;
         self.pos = 0;
     }
@@ -310,9 +326,11 @@ impl PacketBuffer {
     /// frame was quiet (a refresh, or a closed-gate frame) and the buffer
     /// is empty. Does **not** advance the playhead — the next real packet
     /// resyncs exactly as it would after silence. Returns `false` when not
-    /// applicable (the caller then contributes nothing).
+    /// applicable (the caller then contributes nothing) — which includes
+    /// a last frame that was silence: there is no floor to continue.
     pub fn comfort_noise(&mut self, out: &mut [f32]) -> bool {
-        if !self.started || !self.last_real_quiet || !self.slots.is_empty() {
+        if !self.started || !self.last_real_quiet || self.last_real_silent || !self.slots.is_empty()
+        {
             return false;
         }
         let mut filled = 0;
@@ -480,6 +498,7 @@ impl PacketBuffer {
                 self.staged = n;
                 self.dry_plc_used = 0;
                 self.last_real_quiet = is_quiet(&self.staging[..n]);
+                self.last_real_silent = is_silent(&self.staging[..n]);
                 self.last_real_samples = n;
                 self.next_seq = slot.seq.wrapping_add(1);
                 self.next_ts = slot.ts.wrapping_add(n as u32);
@@ -597,6 +616,47 @@ mod tests {
         let r = b.fill(&mut out, true, false);
         assert_eq!(r.dry_plc, DRY_PLC_SLOTS);
         assert_eq!(r.filled, FRAME_SIZE * 3);
+    }
+
+    /// Comfort noise continues a quiet floor — not silence: after a
+    /// frame that decoded to nothing the decoder is not run at all,
+    /// where it produced 20 ms of zeros fifty times a second for every
+    /// peer sitting quiet (review P2-34).
+    #[test]
+    fn comfort_noise_does_not_continue_silence() {
+        let mut e = enc();
+        let frame = |e: &mut opus::Encoder, seq: u32, level: f32| {
+            let pcm: Vec<f32> = (0..FRAME_SIZE)
+                .map(|i| ((i * 7919 + seq as usize * 31) % 200) as f32 / 100.0 - 1.0)
+                .map(|noise| noise * level)
+                .collect();
+            let mut buf = vec![0u8; 512];
+            let n = e.encode_float(&pcm, &mut buf).unwrap();
+            AudioPacket::new(seq, seq * FRAME_SIZE as u32, 1, buf[..n].to_vec())
+        };
+        let mut out = vec![0.0f32; FRAME_SIZE];
+
+        // Digital silence, played out: nothing to continue.
+        let mut b = PacketBuffer::new().unwrap();
+        b.push(frame(&mut e, 0, 0.0));
+        b.fill(&mut out, false, false);
+        assert!(b.last_real_quiet && b.last_real_silent);
+        assert!(!b.comfort_noise(&mut out));
+
+        // A faint room floor (under the quiet line, over silence): kept
+        // going between refreshes, as before.
+        let mut e = enc();
+        let mut b = PacketBuffer::new().unwrap();
+        for seq in 0..20 {
+            b.push(frame(&mut e, seq, 0.004));
+        }
+        let mut played = vec![0.0f32; FRAME_SIZE * 20];
+        b.fill(&mut played, false, false);
+        assert!(
+            b.last_real_quiet && !b.last_real_silent,
+            "a floor, not silence"
+        );
+        assert!(b.comfort_noise(&mut out));
     }
 
     #[test]

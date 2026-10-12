@@ -14,7 +14,7 @@ BAUCORD_BUNDLE_ID = dev.baucord
 DEVELOPMENT_TEAM =
 
 // The version and the build number. ios/run.sh writes Version.xcconfig
-// on every run: the crates' version (crates/ios/Cargo.toml — every
+// on every run: the workspace's version (the root Cargo.toml — every
 // platform ships the same number) and the commit count. These values
 // only stand in until it has run once; the cargo build phase refuses
 // to build while the version disagrees with the crate's.

@@ -41,6 +41,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_role_style.sql"),
     include_str!("migrations/0004_safety.sql"),
     include_str!("migrations/0005_message_counter.sql"),
+    include_str!("migrations/0006_file_references.sql"),
 ];
 
 /// The schema version this build produces.
@@ -76,6 +77,61 @@ pub struct Retention {
     pub telemetry_days: u32,
     /// Unreferenced blobs older than this go (spec §7).
     pub file_days: u32,
+}
+
+/// What one retention pass did ([`Sqlite::prune_with_files`]).
+#[derive(Debug, Default)]
+pub struct Pruned {
+    /// Rows removed, files included.
+    pub removed: u64,
+    /// Messages older than this left the store, when history has a
+    /// window: the tick's replay ring drops them too.
+    pub history_cutoff: Option<WallMs>,
+    /// File references the pruned messages held, per file — already
+    /// taken off the stored counts; the tick takes them off its own.
+    pub released: Vec<([u8; 32], u32)>,
+    /// Files deleted. The tick keeps an unreferenced file's metadata
+    /// to answer a re-announce with "already here", which for a
+    /// deleted file left the poster's picture missing for good (review
+    /// P0-4): it forgets these.
+    pub files: Vec<[u8; 32]>,
+}
+
+/// The transaction of one store operation — or nothing, when a
+/// group's is already open ([`Sqlite::begin`]): that one covers the
+/// operation, and `SQLite` has no transactions inside transactions. So
+/// every operation here can sit in a group. Dropped without
+/// [`Scope::commit`], its own transaction rolls back.
+struct Scope<'a> {
+    conn: &'a Connection,
+    /// This scope opened the transaction, and still has to end it.
+    open: bool,
+}
+
+impl Scope<'_> {
+    fn commit(mut self) -> Result<(), rusqlite::Error> {
+        if self.open {
+            self.open = false;
+            self.conn.execute_batch("COMMIT")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Scope<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+impl std::ops::Deref for Scope<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
 }
 
 /// An open database and the connection-local `data_version` used to
@@ -147,6 +203,10 @@ impl Sqlite {
         )?;
         migrate(&mut conn)?;
         sync_builtin_roles(&conn)?;
+        // The statements that run for every message, sample, login and
+        // audit line are prepared once and kept (review P3-9); room
+        // for all of them, with some to spare.
+        conn.set_prepared_statement_cache_capacity(32);
         // The counter row, not MAX(msg_id) of what is still stored: the
         // retention prune can empty the table, and ids must never be
         // handed out twice (review P3-12). The messages are consulted
@@ -295,8 +355,6 @@ impl Sqlite {
         Ok(())
     }
 
-    /// Adjust a blob's reference count (profiles pointing at it).
-    ///
     /// Remove a blob: its row and its bytes (a missing file is fine).
     ///
     /// # Errors
@@ -313,14 +371,54 @@ impl Sqlite {
         Ok(())
     }
 
+    /// Set a blob's reference count: the profiles and messages
+    /// pointing at it, as the tick counts them.
+    ///
     /// # Errors
     /// `SQLite` failure.
     pub fn set_blob_refs(&self, blob_id: &[u8; 32], refs: u32) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE blobs SET refs = ?2 WHERE blob_id = ?1",
-            params![blob_id, i64::from(refs)],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE blobs SET refs = ?2 WHERE blob_id = ?1")?
+            .execute(params![blob_id, i64::from(refs)])?;
         Ok(())
+    }
+
+    /// Count every file's references again from what points at it now
+    /// — messages that were not deleted, and avatars — and write the
+    /// counts that were off. Returns how many were.
+    ///
+    /// The tick keeps the counts as it goes, and they can drift from
+    /// the rows: a write dropped by a full queue, a crash between a
+    /// message and its count. A count too high keeps a file past its
+    /// retention for good; too low lets one in use be deleted. Only
+    /// for a database nothing else is writing to — at startup, before
+    /// the policy is loaded — since the tick holds the counts in memory
+    /// from then on (review P2-11).
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn recount_blob_refs(&self) -> Result<usize, rusqlite::Error> {
+        let off: Vec<([u8; 32], i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT blob_id, live FROM (
+                     SELECT b.blob_id AS blob_id, b.refs AS refs,
+                            (SELECT COUNT(*) FROM messages m
+                             WHERE m.blob_id = b.blob_id AND m.deleted_at IS NULL)
+                          + (SELECT COUNT(*) FROM users u
+                             WHERE u.avatar_blob = b.blob_id) AS live
+                     FROM blobs b)
+                 WHERE refs != live",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        for (blob, live) in &off {
+            self.conn.execute(
+                "UPDATE blobs SET refs = ?2 WHERE blob_id = ?1",
+                params![blob, live],
+            )?;
+        }
+        Ok(off.len())
     }
 
     /// A blob's bytes from disk, verified against its hash; `None`
@@ -393,9 +491,9 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn insert_telemetry(&mut self, rows: &[TelemetryRow]) -> Result<(), rusqlite::Error> {
-        let tx = self.conn.transaction()?;
+        let tx = self.scope()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO telemetry_samples
                  (ts, user_id, key_hash, rtt_ms, path_loss, voice_loss, groups_behind,
                   rung, input_device, output_device, sample)
@@ -425,11 +523,18 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn insert_telemetry_event(&self, e: &TelemetryEventRow) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "INSERT INTO telemetry_events (ts, user_id, key_hash, kind, event)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO telemetry_events (ts, user_id, key_hash, kind, event)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![ordered(e.ts), e.user_id, e.key_hash, e.kind, e.event],
-        )?;
+            )?
+            .execute(params![
+                ordered(e.ts),
+                e.user_id,
+                e.key_hash,
+                e.kind,
+                e.event
+            ])?;
         Ok(())
     }
 
@@ -537,12 +642,13 @@ impl Sqlite {
         let Some(conv_id) = self.conv_id(conv, false)? else {
             return Ok(());
         };
-        self.conn.execute(
-            "INSERT INTO message_reads (conv_id, user_id, last_read_msg_id) VALUES (?1, ?2, ?3)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO message_reads (conv_id, user_id, last_read_msg_id) VALUES (?1, ?2, ?3)
              ON CONFLICT(conv_id, user_id) DO UPDATE SET
                  last_read_msg_id = MAX(last_read_msg_id, excluded.last_read_msg_id)",
-            params![ordered(conv_id), user_id, ordered(msg_id)],
-        )?;
+            )?
+            .execute(params![ordered(conv_id), user_id, ordered(msg_id)])?;
         Ok(())
     }
 
@@ -584,6 +690,40 @@ impl Sqlite {
         rows.collect()
     }
 
+    /// See [`Scope`].
+    fn scope(&self) -> Result<Scope<'_>, rusqlite::Error> {
+        let open = self.conn.is_autocommit();
+        if open {
+            self.conn.execute_batch("BEGIN")?;
+        }
+        Ok(Scope {
+            conn: &self.conn,
+            open,
+        })
+    }
+
+    /// Start a transaction for a group of writes
+    /// (`Command::Together`); [`Self::commit`] or [`Self::rollback`]
+    /// ends it.
+    ///
+    /// # Errors
+    /// `SQLite` failure, or a transaction already open.
+    pub fn begin(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn commit(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch("COMMIT")
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn rollback(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch("ROLLBACK")
+    }
+
     /// Fold the WAL back into the main file without blocking writers.
     ///
     /// # Errors
@@ -592,10 +732,6 @@ impl Sqlite {
         self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
     }
 
-    /// Delete rows past their retention window. Returns rows removed.
-    ///
-    /// # Errors
-    /// `SQLite` failure.
     /// Unreferenced blobs older than the file window (spec §7): the
     /// rows go here, the bytes with them. Returns the ids removed.
     ///
@@ -614,15 +750,16 @@ impl Sqlite {
         Ok(ids)
     }
 
+    /// Delete rows past their retention window. Returns rows removed.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
     pub fn prune(&self, now: WallMs, retention: Retention) -> Result<u64, rusqlite::Error> {
-        self.prune_with_files(now, retention)
-            .map(|(removed, _)| removed)
+        self.prune_with_files(now, retention).map(|p| p.removed)
     }
 
-    /// [`Self::prune`], also naming the files it deleted, so the tick can
-    /// forget them: it keeps an unreferenced file's metadata to answer
-    /// a re-announce with "already here", which for a deleted file left
-    /// the poster's picture missing for good (review P0-4).
+    /// [`Self::prune`], also saying what it did to files, so the tick's
+    /// counts and tables follow (see [`Pruned`]).
     ///
     /// # Errors
     /// `SQLite` failure.
@@ -630,36 +767,64 @@ impl Sqlite {
         &self,
         now: WallMs,
         retention: Retention,
-    ) -> Result<(u64, Vec<[u8; 32]>), rusqlite::Error> {
-        let mut removed = 0u64;
-        let mut files = Vec::new();
+    ) -> Result<Pruned, rusqlite::Error> {
+        let mut pruned = Pruned::default();
         if let Some(cutoff) = cutoff(now, retention.history_days) {
-            removed += count(self.conn.execute(
+            pruned.history_cutoff = Some(cutoff);
+            // The messages take their file references with them, in
+            // the one transaction: nothing else ever released them, so
+            // a file posted once was kept for good (review P2-11). A
+            // deleted message gave its reference up when it was deleted.
+            let tx = self.scope()?;
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT blob_id, COUNT(*) FROM messages
+                     WHERE ts < ?1 AND blob_id IS NOT NULL AND deleted_at IS NULL
+                     GROUP BY blob_id",
+                )?;
+                let rows = stmt.query_map(params![ordered(cutoff)], |r| {
+                    Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, i64>(1)?))
+                })?;
+                for row in rows {
+                    let (blob, count) = row?;
+                    pruned
+                        .released
+                        .push((blob, u32::try_from(count).unwrap_or(u32::MAX)));
+                }
+            }
+            for (blob, count) in &pruned.released {
+                tx.execute(
+                    "UPDATE blobs SET refs = MAX(refs - ?2, 0) WHERE blob_id = ?1",
+                    params![blob, i64::from(*count)],
+                )?;
+            }
+            pruned.removed += count(tx.execute(
                 "DELETE FROM messages WHERE ts < ?1",
                 params![ordered(cutoff)],
             )?);
+            tx.commit()?;
             // Handled reports last as long as the messages they are
             // about would; open ones wait for a moderator.
-            removed += count(self.conn.execute(
+            pruned.removed += count(self.conn.execute(
                 "DELETE FROM reports WHERE resolved_at IS NOT NULL AND resolved_at < ?1",
                 params![ordered(cutoff)],
             )?);
         }
         if let Some(cutoff) = cutoff(now, retention.telemetry_days) {
-            removed += count(self.conn.execute(
+            pruned.removed += count(self.conn.execute(
                 "DELETE FROM telemetry_samples WHERE ts < ?1",
                 params![ordered(cutoff)],
             )?);
-            removed += count(self.conn.execute(
+            pruned.removed += count(self.conn.execute(
                 "DELETE FROM telemetry_events WHERE ts < ?1",
                 params![ordered(cutoff)],
             )?);
         }
         if let Some(cut) = cutoff(now, retention.file_days) {
-            files = self.prune_blobs(cut)?;
-            removed += files.len() as u64;
+            pruned.files = self.prune_blobs(cut)?;
+            pruned.removed += pruned.files.len() as u64;
         }
-        Ok((removed, files))
+        Ok(pruned)
     }
 
     /// Whether another connection committed to the database since the
@@ -1055,20 +1220,21 @@ impl Sqlite {
         user_id: &[u8; 32],
         user: &UserRecord,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "INSERT INTO users (user_id, name, created_at, last_seen, invited_with)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO users (user_id, name, created_at, last_seen, invited_with)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(user_id) DO UPDATE SET
                  name = excluded.name,
                  last_seen = excluded.last_seen",
-            params![
+            )?
+            .execute(params![
                 user_id,
                 user.name,
                 ordered(user.created_at),
                 ordered(user.last_seen),
                 user.invited_with
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -1077,21 +1243,22 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn upsert_key(&self, key_hash: &[u8; 32], key: &KeyRecord) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "INSERT INTO user_keys (key_hash, user_id, added_at, last_seen, retired_at)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO user_keys (key_hash, user_id, added_at, last_seen, retired_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(key_hash) DO UPDATE SET
                  user_id = excluded.user_id,
                  last_seen = excluded.last_seen,
                  retired_at = excluded.retired_at",
-            params![
+            )?
+            .execute(params![
                 key_hash,
                 key.user_id,
                 ordered(key.added_at),
                 ordered(key.last_seen),
                 key.retired_at.map(ordered)
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -1202,7 +1369,7 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn delete_role(&self, role_id: u32, now: WallMs) -> Result<(), rusqlite::Error> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.scope()?;
         tx.execute(
             "UPDATE invites SET revoked_at = COALESCE(revoked_at, ?2), grants_role = ?3
              WHERE grants_role = ?1",
@@ -1317,11 +1484,18 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn insert_audit(&self, a: &AuditRow) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "INSERT INTO audit (ts, actor_user_id, action, target, detail)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO audit (ts, actor_user_id, action, target, detail)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![ordered(a.ts), a.actor, a.action, a.target, a.detail],
-        )?;
+            )?
+            .execute(params![
+                ordered(a.ts),
+                a.actor,
+                a.action,
+                a.target,
+                a.detail
+            ])?;
         Ok(())
     }
 
@@ -1356,10 +1530,9 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn edit_message(&self, msg_id: u64, body: &str, ts: WallMs) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE messages SET body = ?2, edited_at = ?3 WHERE msg_id = ?1",
-            params![ordered(msg_id), body, ordered(ts)],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE messages SET body = ?2, edited_at = ?3 WHERE msg_id = ?1")?
+            .execute(params![ordered(msg_id), body, ordered(ts)])?;
         Ok(())
     }
 
@@ -1368,10 +1541,9 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn delete_message(&self, msg_id: u64, ts: WallMs) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE messages SET deleted_at = ?2 WHERE msg_id = ?1",
-            params![ordered(msg_id), ordered(ts)],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE messages SET deleted_at = ?2 WHERE msg_id = ?1")?
+            .execute(params![ordered(msg_id), ordered(ts)])?;
         Ok(())
     }
 
@@ -1419,8 +1591,8 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn add_progress(&self, p: &ProgressDelta) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "INSERT INTO user_progress (user_id, xp, talk_seconds, share_seconds, watch_seconds,
+        self.conn
+            .prepare_cached("INSERT INTO user_progress (user_id, xp, talk_seconds, share_seconds, watch_seconds,
                                         online_seconds, messages, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(user_id) DO UPDATE SET
@@ -1430,8 +1602,8 @@ impl Sqlite {
                  watch_seconds = watch_seconds + excluded.watch_seconds,
                  online_seconds = online_seconds + excluded.online_seconds,
                  messages = messages + excluded.messages,
-                 updated_at = excluded.updated_at",
-            params![
+                 updated_at = excluded.updated_at")?
+            .execute(params![
                 p.user_id,
                 ordered(p.xp),
                 ordered(p.talk_seconds),
@@ -1440,8 +1612,7 @@ impl Sqlite {
                 ordered(p.online_seconds),
                 ordered(p.messages),
                 ordered(p.ts)
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -1458,18 +1629,22 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn purge_user(&self, user_id: &[u8; 32]) -> Result<Vec<([u8; 32], u32)>, rusqlite::Error> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.scope()?;
         let dm_convs = "SELECT conv_id FROM conversations
                         WHERE kind = 1 AND (user_a = ?1 OR user_b = ?1)";
         // References this removes from files: the user's posts, every
         // file in their DM conversations (the other person's too: the
         // conversation goes whole), and their avatar. Files are shared
-        // by content, so their own uploads count like anyone's.
+        // by content, so their own uploads count like anyone's. A
+        // deleted post is not counted: it gave its reference up when it
+        // was deleted, and counting it took a second one off a file
+        // someone else may still be showing (review P2-11).
         let mut released: HashMap<[u8; 32], u32> = HashMap::new();
         {
             let mut stmt = tx.prepare(&format!(
                 "SELECT blob_id, COUNT(*) FROM messages
-                 WHERE blob_id IS NOT NULL AND (user_id = ?1 OR conv_id IN ({dm_convs}))
+                 WHERE blob_id IS NOT NULL AND deleted_at IS NULL
+                   AND (user_id = ?1 OR conv_id IN ({dm_convs}))
                  GROUP BY blob_id"
             ))?;
             let rows = stmt.query_map(params![user_id], |r| {
@@ -2723,6 +2898,175 @@ mod tests {
             .expect("read");
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].body, "new");
+    }
+
+    /// A stored file of `fill` bytes, created at `created_at`.
+    fn file(db: &Sqlite, fill: u8, created_at: WallMs) -> [u8; 32] {
+        use sha2::Digest;
+        let bytes = vec![fill; 64];
+        let blob_id: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        db.store_blob(&BlobRecord {
+            blob_id,
+            mime: "image/png".into(),
+            declared_mime: None,
+            size: 64,
+            name: format!("{fill}.png"),
+            created_by: Some([7u8; 32]),
+            created_at,
+            bytes,
+        })
+        .expect("blob");
+        blob_id
+    }
+
+    fn refs_of(db: &Sqlite, blob: &[u8; 32]) -> Option<i64> {
+        db.conn
+            .query_row(
+                "SELECT refs FROM blobs WHERE blob_id = ?1",
+                params![blob],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("refs")
+    }
+
+    fn person(db: &Sqlite, id: [u8; 32], name: &str) {
+        db.upsert_user(
+            &id,
+            &UserRecord {
+                name: name.into(),
+                created_at: 1,
+                last_seen: 1,
+                invited_with: None,
+                roles: BTreeSet::new(),
+                profile: protocol::Profile::default(),
+            },
+        )
+        .expect("user");
+    }
+
+    #[test]
+    fn a_recount_sets_every_file_to_what_points_at_it() {
+        let db = memory();
+        person(&db, [7u8; 32], "alice");
+        let (posted, avatar, unused, deleted) = (
+            file(&db, 1, 10),
+            file(&db, 2, 10),
+            file(&db, 3, 10),
+            file(&db, 4, 10),
+        );
+        // Two live posts of one file; an avatar; a post since deleted.
+        for msg_id in [1, 2] {
+            db.insert_message(&MessageRow {
+                blob_id: Some(posted),
+                ..row(msg_id, "")
+            })
+            .expect("insert");
+        }
+        db.insert_message(&MessageRow {
+            blob_id: Some(deleted),
+            ..row(3, "")
+        })
+        .expect("insert");
+        db.delete_message(3, 2_000).expect("delete");
+        db.conn
+            .execute(
+                "UPDATE users SET avatar_blob = ?1 WHERE user_id = ?2",
+                params![avatar, [7u8; 32]],
+            )
+            .expect("avatar");
+        // The counts as a drifted tick left them: one too low, one
+        // missing, two too high.
+        db.set_blob_refs(&posted, 1).expect("refs");
+        db.set_blob_refs(&unused, 5).expect("refs");
+        db.set_blob_refs(&deleted, 1).expect("refs");
+
+        assert_eq!(db.recount_blob_refs().expect("recount"), 4);
+        assert_eq!(refs_of(&db, &posted), Some(2));
+        assert_eq!(refs_of(&db, &avatar), Some(1));
+        assert_eq!(refs_of(&db, &unused), Some(0));
+        assert_eq!(refs_of(&db, &deleted), Some(0));
+        assert_eq!(db.recount_blob_refs().expect("recount"), 0, "now exact");
+        for blob in [posted, avatar, unused, deleted] {
+            db.delete_blob(&blob).expect("tidy");
+        }
+    }
+
+    /// A pruned message gives its file back, and a file nothing points
+    /// at any more goes in the same pass once it is old enough. The
+    /// count was never touched, so a file posted once stayed for good.
+    #[test]
+    fn a_pruned_message_releases_its_file() {
+        let db = memory();
+        let day = 24 * 60 * 60 * 1000;
+        let (old_only, still_used) = (file(&db, 11, 10 * day), file(&db, 12, 10 * day));
+        for (msg_id, ts, blob) in [
+            (1, 10 * day, old_only),
+            (2, 10 * day, still_used),
+            (3, 95 * day, still_used),
+        ] {
+            db.insert_message(&MessageRow {
+                ts,
+                blob_id: Some(blob),
+                ..row(msg_id, "")
+            })
+            .expect("insert");
+        }
+        db.set_blob_refs(&old_only, 1).expect("refs");
+        db.set_blob_refs(&still_used, 2).expect("refs");
+
+        let pruned = db
+            .prune_with_files(
+                100 * day,
+                Retention {
+                    history_days: 30,
+                    telemetry_days: 0,
+                    file_days: 30,
+                },
+            )
+            .expect("prune");
+        assert_eq!(pruned.history_cutoff, Some(70 * day));
+        let mut released = pruned.released.clone();
+        released.sort_unstable();
+        let mut expected = vec![(old_only, 1), (still_used, 1)];
+        expected.sort_unstable();
+        assert_eq!(released, expected);
+        assert_eq!(pruned.files, vec![old_only], "unreferenced and old");
+        assert_eq!(pruned.removed, 3, "two messages and a file");
+        assert_eq!(refs_of(&db, &old_only), None);
+        assert_eq!(refs_of(&db, &still_used), Some(1));
+        db.delete_blob(&still_used).expect("tidy");
+    }
+
+    /// A post deleted before its author was purged had already given
+    /// its reference up: the purge took a second one, off a file
+    /// someone else's post still showed.
+    #[test]
+    fn a_purge_does_not_release_a_deleted_post_twice() {
+        let db = memory();
+        let (alice, bob) = ([7u8; 32], [8u8; 32]);
+        person(&db, alice, "alice");
+        person(&db, bob, "bob");
+        let shared = file(&db, 21, 10);
+        db.insert_message(&MessageRow {
+            blob_id: Some(shared),
+            ..row(1, "")
+        })
+        .expect("alice posts it");
+        db.insert_message(&MessageRow {
+            user_id: bob,
+            blob_id: Some(shared),
+            ..row(2, "")
+        })
+        .expect("bob posts it");
+        // Alice deletes hers: one reference left, bob's.
+        db.delete_message(1, 2_000).expect("delete");
+        db.set_blob_refs(&shared, 1).expect("refs");
+
+        let released = db.purge_user(&alice).expect("purge");
+        assert!(released.is_empty(), "{released:?}");
+        assert_eq!(refs_of(&db, &shared), Some(1), "bob's post keeps it");
+        db.delete_blob(&shared).expect("tidy");
     }
 
     #[test]

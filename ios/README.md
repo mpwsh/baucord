@@ -213,8 +213,9 @@ is what users get, and the one to judge speed and battery by.
 
 ## 5. The version
 
-The app's version is the crates' — `crates/ios/Cargo.toml`, which moves
-together with every other platform's (1.2.0 now). `run.sh` writes it
+The app's version is the workspace's — `version` under
+`[workspace.package]` in the root `Cargo.toml`, the one number every
+platform ships. `run.sh` writes it
 into `Config/Version.xcconfig` on every run, with the commit count as
 the build number; the cargo build phase stops with an error if the two
 ever disagree (a bump, then a build from Xcode's window before

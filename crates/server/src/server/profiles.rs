@@ -20,9 +20,9 @@ use protocol::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{fold_upload, ChatServer, Folded};
+use super::{fold_upload, ChatServer, Folded, Waiting};
 use crate::{
-    persistence::{Answer, AskId, BlobRecord, Command, Outcome, Query},
+    persistence::{Answer, BlobRecord, Command, Outcome, Query},
     policy::{BlobMeta, Restriction},
 };
 
@@ -127,7 +127,7 @@ impl ChatServer {
         };
         for peer in targets {
             if *peer != sender {
-                self.send_if(*peer, features::SAFETY, &msg);
+                self.send_msg(*peer, &msg);
             }
         }
     }
@@ -157,20 +157,9 @@ impl ChatServer {
         }
     }
 
-    /// Send only to a session that negotiated `PROFILES`.
-    pub(super) fn send_if_profiles(&mut self, client: ClientId, msg: &ServerMessage) {
-        if self
-            .features_of
-            .get(&client)
-            .is_some_and(|f| f & features::PROFILES != 0)
-        {
-            self.send_msg(client, msg);
-        }
-    }
-
     fn broadcast_if_profiles(&mut self, msg: &ServerMessage) {
         for peer in self.clients() {
-            self.send_if_profiles(peer, msg);
+            self.send_msg(peer, msg);
         }
     }
 
@@ -370,7 +359,7 @@ impl ChatServer {
             name,
         };
         for peer in self.audience_about(client) {
-            self.send_if_profiles(peer, &msg);
+            self.send_msg(peer, &msg);
         }
     }
 
@@ -728,34 +717,22 @@ impl ChatServer {
             self.send_msg(client, &ServerMessage::BlobMissing { blob_id });
             return;
         }
-        if let Some((_, waiting)) = self.pending_blobs.get_mut(&blob_id) {
-            waiting.push(client);
+        // One read however many sessions want the file.
+        if let Some(fetchers) = self.pending_blobs.get_mut(&blob_id) {
+            fetchers.push(client);
             return;
         }
         let ask = self
             .persist
             .ask(Query::Blob { blob_id }, self.now + BLOB_DEADLINE);
-        self.pending_blobs.insert(blob_id, (ask, vec![client]));
-    }
-
-    /// Whether an answered ask belongs to a blob fetch (the
-    /// persistence poll routes by this).
-    pub(super) fn is_blob_ask(&self, ask: AskId) -> bool {
-        self.pending_blobs.values().any(|(a, _)| *a == ask)
+        self.waiting.insert(ask, Waiting::Blob(blob_id));
+        self.pending_blobs.insert(blob_id, vec![client]);
     }
 
     /// The persistence thread answered a blob read (or did not, in
     /// time): every waiting fetcher gets the bytes or `BlobMissing`.
-    pub(super) fn resolve_blob_answer(&mut self, ask: AskId, outcome: Outcome) {
-        let Some(blob_id) = self
-            .pending_blobs
-            .iter()
-            .find(|(_, (a, _))| *a == ask)
-            .map(|(id, _)| *id)
-        else {
-            return;
-        };
-        let Some((_, waiting)) = self.pending_blobs.remove(&blob_id) else {
+    pub(super) fn resolve_blob_answer(&mut self, blob_id: BlobId, outcome: Outcome) {
+        let Some(waiting) = self.pending_blobs.remove(&blob_id) else {
             return;
         };
         let bytes = match outcome {

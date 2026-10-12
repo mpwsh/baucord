@@ -5,7 +5,7 @@
 /Resources/Assets.xcassets/AppIcon.appiconset/icon-1024.png
 # Your signing team and bundle id (copy Config/Local.xcconfig.example).
 /Config/Local.xcconfig
-# The version and build number, written by run.sh from crates/ios/Cargo.toml.
+# The version and build number, written by run.sh from the workspace's Cargo.toml.
 /Config/Version.xcconfig
 # ios/run.sh's xcodebuild output.
 /build/

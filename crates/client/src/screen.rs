@@ -22,7 +22,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -209,31 +209,21 @@ pub enum ScreenEvent {
 pub struct SharedScreenState {
     /// Whether we are currently sharing.
     pub is_sharing: Arc<AtomicBool>,
-    /// Number of frames encoded so far.
-    pub frames_encoded: Arc<AtomicU64>,
     /// Size of the last encoded frame in bytes.
     pub last_frame_bytes: Arc<AtomicU32>,
     /// Encode time of the last frame in microseconds.
     pub last_encode_us: Arc<AtomicU32>,
-    /// Capture time of the last frame in microseconds.
-    pub last_capture_us: Arc<AtomicU32>,
     /// Selected quality by streamer
     pub current_quality: Arc<Mutex<Option<Quality>>>,
     /// Worst packet loss among our viewers, in percent, stored as f32
     /// bits — read with `f32::from_bits`. Updated ~1/s while sharing.
     pub stream_loss_pct: Arc<AtomicU32>,
-    /// Worst viewer RTT in milliseconds, stored as f32 bits.
-    pub stream_rtt_ms: Arc<AtomicU32>,
     /// Number of viewers currently subscribed to our stream.
     pub stream_viewers: Arc<AtomicU32>,
     /// Current capture pace as a percentage of the preset fps
     /// (100 / 75 / 50) — stepped down under viewer keyframe-request
     /// distress, see `PACE_SCALES`.
     pub fps_scale_pct: Arc<AtomicU32>,
-    /// Current encoder bitrate as a percentage of the preset (100 at
-    /// full rate) — stepped down under uplink loss, see
-    /// `RATE_LADDER_PCT`.
-    pub bitrate_scale_pct: Arc<AtomicU32>,
     /// Filled by the frontend as it shows watched streams; read by the
     /// viewer's summary line.
     pub present: PresentTallies,
@@ -253,16 +243,12 @@ impl SharedScreenState {
     pub fn new() -> Self {
         Self {
             is_sharing: Arc::new(AtomicBool::new(false)),
-            frames_encoded: Arc::new(AtomicU64::new(0)),
             last_frame_bytes: Arc::new(AtomicU32::new(0)),
             last_encode_us: Arc::new(AtomicU32::new(0)),
-            last_capture_us: Arc::new(AtomicU32::new(0)),
             current_quality: Arc::new(Mutex::new(None)),
             stream_loss_pct: Arc::new(AtomicU32::new(0)),
-            stream_rtt_ms: Arc::new(AtomicU32::new(0)),
             stream_viewers: Arc::new(AtomicU32::new(0)),
             fps_scale_pct: Arc::new(AtomicU32::new(100)),
-            bitrate_scale_pct: Arc::new(AtomicU32::new(100)),
             present: Arc::new(Mutex::new(HashMap::new())),
             stream_output: audio::stream::OutputSelection::default(),
         }
@@ -339,10 +325,11 @@ fn report_share_telemetry(
     shared: &SharedScreenState,
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
-    let preset = state.quality.to_string();
+    // Called on every capture tick: a name, not a `String` made for it
+    // each time (review P3-16).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a percentage
     let share = ShareState {
-        preset: &preset,
+        preset: state.quality.label(),
         bitrate_pct: state.ladder.pct(),
         fps_pct: (PACE_SCALES[state.pace_idx] * 100.0).round() as u32,
         viewers: shared.stream_viewers.load(Ordering::Relaxed),
@@ -375,7 +362,7 @@ fn report_share_telemetry(
     )]
     let _ = network_tx.try_send(NetworkControl::TelemetrySharing(Some(
         protocol::SharingSample {
-            preset: state.quality.to_string(),
+            preset: state.quality.label().to_string(),
             rung_pct: state.ladder.pct(),
             fps_encoded: encoded as f32 / secs,
             fps_scale_pct: (PACE_SCALES[state.pace_idx] * 100.0).round() as u32,
@@ -726,19 +713,11 @@ impl BitrateLadder {
 }
 
 /// Feed one uplink sample to the ladder and apply its decision.
-fn adapt_bitrate(
-    state: &mut CaptureState,
-    now: Instant,
-    link: LinkSample,
-    shared: &SharedScreenState,
-) {
+fn adapt_bitrate(state: &mut CaptureState, now: Instant, link: LinkSample) {
     state.uplink_loss_pct = link.loss_pct;
     let from = state.ladder.pct();
     if let Some(change) = state.ladder.sample(now, link) {
         state.encoder.set_bitrate_scale_pct(change.pct);
-        shared
-            .bitrate_scale_pct
-            .store(change.pct, Ordering::Relaxed);
         info!(
             "bitrate ladder: {from}% → {}% ({} kbit/s; {})",
             change.pct,
@@ -1067,7 +1046,6 @@ fn run_screen_loop(
         if let Some(state) = &mut st.capture
             && Instant::now() >= next_capture
         {
-            let cap_start = Instant::now();
             capture_and_encode(state, &network_tx, &media_tx, &shared);
 
             // Advance from the previous target (not from now) so the
@@ -1079,13 +1057,6 @@ fn run_screen_loop(
             if next_capture < Instant::now() {
                 next_capture = Instant::now();
             }
-
-            let cap_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
-            log::debug!(
-                "ENCODE seq={} {cap_ms:.0}ms (budget {:.1}ms)",
-                state.seq,
-                effective_frame_interval(state).as_secs_f32() * 1000.0
-            );
         }
     }
 
@@ -1227,7 +1198,8 @@ fn drain_and_decode(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("Decode error for peer {client_id} seq {seq}: {e}");
+                    log::debug!("Decode error for peer {client_id} seq {seq}: {e}");
+                    stream.log.on_decode_error(&e);
                 }
             }
             if pass_start.elapsed() >= DECODE_BUDGET {
@@ -1242,7 +1214,10 @@ fn drain_and_decode(
                     report_viewing |= emit_picture(client_id, stream, decoded, fed, None, event_tx);
                 }
                 Ok(None) => {}
-                Err(e) => warn!("Decode error for peer {client_id} (between frames): {e}"),
+                Err(e) => {
+                    log::debug!("Decode error for peer {client_id} (between frames): {e}");
+                    stream.log.on_decode_error(&e);
+                }
             }
         }
 
@@ -1390,11 +1365,8 @@ fn handle_control(
                 },
             ));
             shared.is_sharing.store(true, Ordering::Relaxed);
-            shared.frames_encoded.store(0, Ordering::Relaxed);
             shared.fps_scale_pct.store(100, Ordering::Relaxed);
-            shared.bitrate_scale_pct.store(100, Ordering::Relaxed);
             shared.stream_loss_pct.store(0, Ordering::Relaxed);
-            shared.stream_rtt_ms.store(0, Ordering::Relaxed);
             shared.stream_viewers.store(0, Ordering::Relaxed);
             *shared.current_quality.lock().unwrap() = Some(quality);
 
@@ -1414,9 +1386,7 @@ fn handle_control(
             if st.capture.take().is_some() {
                 shared.is_sharing.store(false, Ordering::Relaxed);
                 shared.fps_scale_pct.store(100, Ordering::Relaxed);
-                shared.bitrate_scale_pct.store(100, Ordering::Relaxed);
                 shared.stream_loss_pct.store(0, Ordering::Relaxed);
-                shared.stream_rtt_ms.store(0, Ordering::Relaxed);
                 shared.stream_viewers.store(0, Ordering::Relaxed);
                 let _ = network_tx.send(NetworkControl::ScreenShareStop);
                 let _ = network_tx.try_send(NetworkControl::TelemetrySharing(None));
@@ -1618,7 +1588,8 @@ fn handle_control(
 
         ScreenControl::ForceKeyframe => {
             if let Some(state) = &mut st.capture {
-                info!("Viewer requested keyframe — forcing IDR");
+                // Counted into the sharer's summary line.
+                state.log.on_keyframe_asked();
                 state.keyframe_requests += 1;
                 state.forced_keyframes += 1;
                 state.encoder.force_keyframe();
@@ -1642,9 +1613,6 @@ fn handle_control(
             shared
                 .stream_loss_pct
                 .store(worst_loss_pct.to_bits(), Ordering::Relaxed);
-            shared
-                .stream_rtt_ms
-                .store(worst_rtt_ms.to_bits(), Ordering::Relaxed);
             shared
                 .stream_viewers
                 .store(u32::from(viewers), Ordering::Relaxed);
@@ -1695,7 +1663,7 @@ fn handle_control(
                     kbps_up,
                     kbps_offered,
                 };
-                adapt_bitrate(state, now, link, shared);
+                adapt_bitrate(state, now, link);
                 recover_pace(state, now, shared);
             }
         }
@@ -1754,7 +1722,6 @@ fn capture_and_encode(
             if !state.encoder.keyframe_pending() && !bursting && !flush && now < state.next_refresh
             {
                 state.telemetry.2 += 1;
-                shared.last_capture_us.store(capture_us, Ordering::Relaxed);
                 // A hardware encoder may still hold the last frames of
                 // the change: they leave now, not with the next change or
                 // the 1 s refresh (review P1-13).
@@ -1772,7 +1739,6 @@ fn capture_and_encode(
         // Nothing captured yet (streaming backend rebuilding with no
         // held frame) — nothing to encode this tick.
         CaptureStatus::Empty => {
-            shared.last_capture_us.store(capture_us, Ordering::Relaxed);
             return;
         }
     };
@@ -1811,8 +1777,6 @@ fn capture_and_encode(
     // A change went in: if the encoder keeps its output until the next
     // submission, the first still tick repeats the frame once.
     state.flush_owed = !repeat && state.encoder.output_needs_input();
-
-    shared.last_capture_us.store(capture_us, Ordering::Relaxed);
     shared.last_encode_us.store(encode_us, Ordering::Relaxed);
     send_encoded(state, encoded_frames, media_tx, shared);
 }
@@ -1836,7 +1800,6 @@ fn send_encoded(
         shared
             .last_frame_bytes
             .store(encoded.data.len() as u32, Ordering::Relaxed);
-        shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
 
         // A frame the chunker can't carry is dropped before it takes a
         // sequence number: a number that never arrives is a gap, and

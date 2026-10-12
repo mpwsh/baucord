@@ -12,7 +12,10 @@ use rcgen::PublicKeyData;
 use super::{LinkSpec, NodeId, SimNet};
 use crate::{
     config::Budget,
-    driver::{DisconnectReason, Driver, Event, PeerId, VideoItem, OWN_TRACK, VIDEO_GROUP_DEADLINE},
+    driver::{
+        DisconnectReason, Driver, Event, PeerId, Shared, TrackStats, VideoItem, WaitingRoom,
+        OWN_TRACK, VIDEO_GROUP_DEADLINE,
+    },
     identity::{Fingerprint, Observation, ServerIdentity, Trust},
 };
 
@@ -302,6 +305,118 @@ fn starting_a_new_group_while_the_old_is_unsent_resets_it() {
     assert_eq!(tail[6], VideoItem::GroupEnd);
 }
 
+/// What the application queues in one pass leaves in one pass: five
+/// voice packets and a control frame for one peer are one drain of its
+/// connection and one UDP datagram, where each send used to be a drain
+/// and a datagram of its own (review P2-31). And a payload shared
+/// between sends arrives as the one built per send does (P2-32).
+#[test]
+fn one_pass_of_sends_is_one_packet_and_shared_bytes_arrive_whole() {
+    let mut p = pair(18, LinkSpec::clean(Duration::from_millis(10)));
+    let (server_peer, client_peer) = connect(&mut p);
+    let (server, client) = (p.server, p.client);
+    // Let the handshake's tail (acks, the lanes' streams) settle.
+    p.net.run_until(Duration::from_millis(300), TICK, |_| false);
+
+    let before = p.net.driver(server).stats(client_peer).expect("stats");
+    let now = p.net.now();
+    let voice = Shared::relayed(Lane::Voice, 7, &[9; 60]);
+    assert_eq!(voice.len(), 68, "the sender's id and the packet");
+    for _ in 0..5 {
+        p.net
+            .driver(server)
+            .send_shared(now, client_peer, &voice)
+            .expect("voice");
+    }
+    let hello = Shared::new(Lane::Control, b"hello");
+    p.net
+        .driver(server)
+        .send_shared(now, client_peer, &hello)
+        .expect("control");
+    // One pass of the loop.
+    p.net.step(TICK);
+    let after = p.net.driver(server).stats(client_peer).expect("stats");
+    assert_eq!(
+        after.sent_packets - before.sent_packets,
+        1,
+        "six sends, one packet"
+    );
+
+    let mut voices = Vec::new();
+    let mut control = None;
+    p.net.run_until(Duration::from_secs(1), TICK, |net| {
+        while let Some(packet) = net.driver(client).recv(server_peer, Lane::Voice) {
+            voices.push(packet);
+        }
+        if let Some(frame) = net.driver(client).recv(server_peer, Lane::Control) {
+            control = Some(frame);
+        }
+        voices.len() == 5 && control.is_some()
+    });
+    assert_eq!(voices.len(), 5);
+    for packet in &voices {
+        assert_eq!(packet[..], protocol::wrap_sender(7, &[9; 60])[..]);
+    }
+    assert_eq!(control.as_deref(), Some(&b"hello"[..]));
+
+    // A payload made for one lane does not go out as another's.
+    let now = p.net.now();
+    assert!(p
+        .net
+        .driver(server)
+        .send_video_shared(now, client_peer, 3, &voice)
+        .is_err());
+}
+
+#[test]
+fn group_counters_are_kept_per_track() {
+    let mut p = pair(16, LinkSpec::clean(Duration::from_millis(10)));
+    let (_, client_peer) = connect(&mut p);
+    let server = p.server;
+
+    // Three groups on one track, one on another, all delivered.
+    for (track, groups) in [(5u64, 3u64), (9, 1)] {
+        for _ in 0..groups {
+            let now = p.net.now();
+            p.net
+                .driver(server)
+                .video_new_group(now, client_peer, track);
+            let _ = p
+                .net
+                .driver(server)
+                .send_video(now, client_peer, track, &[7; 500]);
+            p.net.step(Duration::from_millis(50));
+            let now = p.net.now();
+            p.net
+                .driver(server)
+                .video_finish_group(now, client_peer, track);
+            p.net.step(Duration::from_millis(50));
+        }
+    }
+
+    let driver = p.net.driver(server);
+    let five = driver.track_stats(client_peer, 5).expect("peer");
+    let nine = driver.track_stats(client_peer, 9).expect("peer");
+    assert_eq!((five.groups_started, five.groups_reset), (3, 0));
+    assert_eq!((nine.groups_started, nine.groups_reset), (1, 0));
+    let link = driver.stats(client_peer).expect("stats");
+    assert_eq!(link.groups_started, 4);
+    // A track that never opened reads zero; an unknown peer has none.
+    assert_eq!(
+        driver.track_stats(client_peer, 1234),
+        Some(TrackStats::default())
+    );
+    assert_eq!(driver.track_stats(0xdead, 5), None);
+
+    // Forgetting a track drops its figures and leaves the other's.
+    driver.video_forget_track(client_peer, 5);
+    assert_eq!(
+        driver.track_stats(client_peer, 5),
+        Some(TrackStats::default())
+    );
+    assert_eq!(driver.track_stats(client_peer, 9), Some(nine));
+}
+
 #[test]
 fn behind_viewer_loses_groups_while_voice_keeps_flowing() {
     // Server → client at 0.5 Mbit/s, video offered at ~8 Mbit/s.
@@ -366,6 +481,15 @@ fn behind_viewer_loses_groups_while_voice_keeps_flowing() {
         stats.groups_reset > 10,
         "server should abandon groups: {stats:?}"
     );
+    // The one track carried every group, so its counters are the
+    // connection's.
+    let track = p
+        .net
+        .driver(server)
+        .track_stats(client_peer, 77)
+        .expect("track stats");
+    assert_eq!(track.groups_started, stats.groups_started);
+    assert_eq!(track.groups_reset, stats.groups_reset);
     // Voice rode ahead of the bulk: the bottleneck queue is 100 ms
     // deep, so the only voice loss is queue overflow.
     let voice_pct = f64::from(voice_got) * 100.0 / f64::from(voice_sent);
@@ -611,14 +735,17 @@ fn a_dead_peer_is_detected_by_the_idle_timeout() {
     let cut_at = p.net.now();
     let mut server_saw = None;
     let mut client_saw = None;
+    let (mut server_at, mut client_at) = (None, None);
     let ok = p
         .net
-        .run_until(Duration::from_secs(40), Duration::from_millis(10), |net| {
+        .run_until(Duration::from_secs(50), Duration::from_millis(10), |net| {
+            let now = net.now();
             for ev in net.driver(server).drain_events() {
                 if let Event::Disconnected { peer, reason } = ev
                     && peer == client_peer
                 {
                     server_saw = Some(reason);
+                    server_at = Some(now);
                 }
             }
             for ev in net.driver(client).drain_events() {
@@ -626,6 +753,7 @@ fn a_dead_peer_is_detected_by_the_idle_timeout() {
                     && peer == server_peer
                 {
                     client_saw = Some(reason);
+                    client_at = Some(now);
                 }
             }
             server_saw.is_some() && client_saw.is_some()
@@ -636,8 +764,24 @@ fn a_dead_peer_is_detected_by_the_idle_timeout() {
     assert!(server_saw
         .as_ref()
         .is_some_and(DisconnectReason::is_transient));
-    let took = p.net.now() - cut_at;
-    assert!(took < Duration::from_secs(35), "took {took:?}");
+    // The server hears nothing for the idle timeout. The client's
+    // timer starts again at the keep-alive it sends into the dead link
+    // (QUIC restarts it on the first packet sent after the last one
+    // received), so a client with nothing else to say takes the
+    // keep-alive interval longer — the price of the 10 s keep-alive
+    // (review P2-49); in a voice room it is sending all the time.
+    let idle = Budget::client().max_idle_timeout;
+    let slack = Duration::from_secs(5);
+    let server_took = server_at.expect("seen") - cut_at;
+    let client_took = client_at.expect("seen") - cut_at;
+    assert!(
+        server_took < idle + slack,
+        "the server took {server_took:?}"
+    );
+    assert!(
+        client_took < idle + crate::config::CLIENT_KEEP_ALIVE + slack,
+        "the client took {client_took:?}"
+    );
     // Both tables are eventually empty.
     p.net
         .run_for(Duration::from_secs(5), Duration::from_millis(10));
@@ -758,6 +902,70 @@ fn a_full_server_refuses_new_connections() {
     assert!(!net.driver(c2).is_connected(p2));
     assert_eq!(net.driver(server).refused_count(), 1);
     assert_eq!(net.driver(server).peer_count(), 1);
+}
+
+/// A server with a waiting room: connections the application has not
+/// admitted sit there, capped per address; once the room is half full
+/// a newcomer proves its address first; an admitted connection gives
+/// its seat back.
+#[test]
+fn a_waiting_room_holds_the_unadmitted_and_no_more() {
+    init_log();
+    let identity = ServerIdentity::generate();
+    let server_driver = Driver::new_server(&identity, 1, Budget::server())
+        .expect("server driver")
+        .with_waiting_room(WaitingRoom {
+            seats: 4,
+            per_address: 2,
+        });
+    let mut net = SimNet::new(17);
+    let server = net.add_node(server_driver, addr(SERVER_ADDR));
+    let dial = |net: &mut SimNet, from: &str| {
+        let node = net.add_node(
+            Driver::new_client(Some(identity.fingerprint()), Budget::client()).expect("client"),
+            addr(from),
+        );
+        net.set_link(server, node, LinkSpec::clean(Duration::from_millis(10)));
+        let now = net.now();
+        let peer = net
+            .driver(node)
+            .connect(now, addr(SERVER_ADDR))
+            .expect("connect");
+        // Long enough for a handshake, a Retry round trip included.
+        net.run_until(Duration::from_secs(2), TICK, |net| {
+            net.driver(node).is_connected(peer)
+        })
+    };
+
+    // Two from one address fit; the third from it is refused, though
+    // the room has seats left.
+    assert!(dial(&mut net, "10.0.0.2:5000"));
+    assert!(dial(&mut net, "10.0.0.2:5001"));
+    assert!(!dial(&mut net, "10.0.0.2:5002"));
+    assert_eq!(net.driver(server).refused_count(), 1);
+    assert_eq!(net.driver(server).retried_count(), 0);
+
+    // Half full: the next address is asked to prove itself, and gets in.
+    assert!(dial(&mut net, "10.0.0.3:5000"));
+    assert_eq!(net.driver(server).retried_count(), 1);
+    assert!(dial(&mut net, "10.0.0.4:5000"));
+    // Full: nobody else, from anywhere.
+    assert!(!dial(&mut net, "10.0.0.5:5000"));
+    assert_eq!(net.driver(server).peer_count(), 4);
+
+    // The application admits one: a seat opens, beyond `max_peers`
+    // for those still waiting.
+    let admitted = net
+        .driver(server)
+        .drain_events()
+        .find_map(|ev| match ev {
+            Event::Connected { peer, .. } => Some(peer),
+            _ => None,
+        })
+        .expect("a connected peer");
+    net.driver(server).admit(admitted);
+    assert!(dial(&mut net, "10.0.0.6:5000"));
+    assert_eq!(net.driver(server).peer_count(), 5);
 }
 
 #[test]
@@ -963,6 +1171,40 @@ fn an_idle_connection_is_due_only_at_its_next_timer() {
     assert!(wakes <= 20, "{wakes} wakes in two idle seconds");
 }
 
+/// The client's keep-alive is ten seconds, not two (review P2-49). An
+/// idle connection — nothing sent but the keep-alives — must still
+/// outlive a link losing four packets in ten, both ways: inside the
+/// 30 s idle timeout that is two pings and their retransmissions.
+#[test]
+fn an_idle_connection_survives_heavy_loss_on_the_slow_keep_alive() {
+    assert_eq!(
+        Budget::client().keep_alive_interval,
+        Some(crate::config::CLIENT_KEEP_ALIVE)
+    );
+    for seed in [31, 32, 33] {
+        let mut p = pair(seed, LinkSpec::clean(Duration::from_millis(40)));
+        let (server_peer, client_peer) = connect(&mut p);
+        let (server, client) = (p.server, p.client);
+        p.net.set_link(
+            server,
+            client,
+            LinkSpec::clean(Duration::from_millis(40)).with_loss(0.4),
+        );
+        let mut lost = false;
+        run_on_events(&mut p.net, Duration::from_mins(20), |net| {
+            for node in [server, client] {
+                for ev in net.driver(node).drain_events() {
+                    lost |= matches!(ev, Event::Disconnected { .. });
+                }
+            }
+            lost
+        });
+        assert!(!lost, "seed {seed}: the idle connection was dropped");
+        assert!(p.net.driver(client).is_connected(server_peer));
+        assert!(p.net.driver(server).is_connected(client_peer));
+    }
+}
+
 /// The pacer's refill is a deadline: a loop that only wakes for events
 /// still moves a paced upload, with about one wake per chunk beyond the
 /// datagrams themselves, and the connection is idle again once the
@@ -1003,6 +1245,10 @@ fn a_paced_upload_completes_on_the_loops_schedule() {
         timer_wakes < 100,
         "{timer_wakes} wakes besides {arrivals} arrivals"
     );
+    // The last acks cross (a probe timer can still be armed the moment
+    // the upload retires — about one run in twenty); then nothing of
+    // the upload is left on a clock.
+    run_on_events(&mut p.net, Duration::from_millis(300), |_| false);
     let now = p.net.now();
     let due = p.net.driver(client).next_deadline().expect("timers");
     assert!(

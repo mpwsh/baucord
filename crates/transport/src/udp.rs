@@ -20,9 +20,15 @@ use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState};
 
 use crate::driver::{InboundDatagram, Transmit};
 
-/// Buffers offered per `recv` call. Linux `recvmmsg` fills up to all of
-/// them; macOS and Windows return **one** datagram per call regardless.
-const RECV_BATCH: usize = 16;
+/// Buffers offered per `recv` call: as many as the platform fills.
+/// Linux `recvmmsg` takes up to sixteen; macOS and Windows return
+/// **one** datagram per call regardless, and sixteen 64 KiB buffers
+/// there were a megabyte nothing ever wrote to (review P3-2).
+const RECV_BATCH: usize = if quinn_udp::BATCH_SIZE < 16 {
+    quinn_udp::BATCH_SIZE
+} else {
+    16
+};
 /// One receive buffer: large enough for a full GRO batch.
 const RECV_BUF_BYTES: usize = 64 * 1024;
 /// Datagrams one [`UdpIo::recv_batch`] call will deliver before handing
@@ -144,8 +150,8 @@ impl UdpIo {
     }
 
     /// Datagrams the kernel refused to send so far.
-    #[must_use]
-    pub fn send_drops(&self) -> u64 {
+    #[cfg(test)]
+    fn send_drops(&self) -> u64 {
         self.send_drops
     }
 
@@ -171,11 +177,11 @@ impl UdpIo {
                     drained: false,
                 });
             }
-            let mut slices: Vec<IoSliceMut<'_>> = self
-                .bufs
-                .iter_mut()
-                .map(|b| IoSliceMut::new(b.as_mut_slice()))
-                .collect();
+            // On the stack: this runs for every wake of the loop.
+            let mut bufs = self.bufs.iter_mut();
+            let mut slices: [IoSliceMut<'_>; RECV_BATCH] = std::array::from_fn(|_| {
+                IoSliceMut::new(bufs.next().map_or(&mut [][..], |b| b.as_mut_slice()))
+            });
             let n =
                 match self
                     .state
@@ -191,15 +197,18 @@ impl UdpIo {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(e),
                 };
-            drop(slices);
             for (buf, meta) in self.bufs.iter().zip(&self.metas).take(n) {
                 if meta.len == 0 {
                     continue;
                 }
-                let data = &buf[..meta.len];
                 // A GRO batch arrives as one buffer with `stride`-sized
                 // segments; quinn-proto wants one datagram per call.
-                for segment in data.chunks(meta.stride.max(1)) {
+                // Copied out once and split: every segment used to be
+                // an allocation of its own.
+                let mut data = BytesMut::from(&buf[..meta.len]);
+                let stride = meta.stride.max(1);
+                while !data.is_empty() {
+                    let segment = data.split_to(stride.min(data.len()));
                     f(InboundDatagram {
                         remote: meta.addr,
                         local_ip: meta.dst_ip,
@@ -208,7 +217,7 @@ impl UdpIo {
                             quinn_udp::EcnCodepoint::Ect1 => quinn_proto::EcnCodepoint::Ect1,
                             quinn_udp::EcnCodepoint::Ce => quinn_proto::EcnCodepoint::Ce,
                         }),
-                        data: BytesMut::from(segment),
+                        data: segment,
                     });
                     delivered += 1;
                 }

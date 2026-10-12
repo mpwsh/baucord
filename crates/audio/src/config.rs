@@ -96,7 +96,7 @@ impl Default for VoiceChatConfig {
 /// Per-peer audio settings (volume, mute).
 ///
 /// Used by the jitter buffer / mixer on the output side.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PeerAudioSettings {
     /// Playback volume multiplier (0.0–2.0). Default 1.0.

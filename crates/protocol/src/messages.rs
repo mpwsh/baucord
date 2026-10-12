@@ -808,20 +808,43 @@ impl ClientMessage {
             ClientMessage::ChatImageChunk { .. }
             | ClientMessage::LogUploadChunk { .. }
             | ClientMessage::UploadChunk { .. } => Lane::Media,
-            _ => Lane::Control,
+            // Everything else, named: a new variant does not compile
+            // until its lane is chosen here.
+            ClientMessage::Hello { .. }
+            | ClientMessage::Chat(..)
+            | ClientMessage::Speaking(..)
+            | ClientMessage::AudioState { .. }
+            | ClientMessage::ScreenShareStart { .. }
+            | ClientMessage::ScreenShareStop
+            | ClientMessage::Telemetry(..)
+            | ClientMessage::TelemetryEvent(..)
+            | ClientMessage::CreateInvite { .. }
+            | ClientMessage::Admin { .. }
+            | ClientMessage::FetchHistory { .. }
+            | ClientMessage::EditMessage { .. }
+            | ClientMessage::DeleteMessage { .. }
+            | ClientMessage::CreateChannel(..)
+            | ClientMessage::EditChannel { .. }
+            | ClientMessage::DeleteChannel { .. }
+            | ClientMessage::ChannelKick { .. }
+            | ClientMessage::SetProfile(..)
+            | ClientMessage::SetNickname { .. }
+            | ClientMessage::DirectMessage { .. }
+            | ClientMessage::MarkRead { .. }
+            | ClientMessage::SendFile { .. }
+            | ClientMessage::Block { .. }
+            | ClientMessage::Unblock { .. }
+            | ClientMessage::Report { .. }
+            | ClientMessage::DeleteAccount => Lane::Control,
         }
     }
 
     /// Whether this message is a media-upload chunk (rides a Media
-    /// stream that the upload opens and finishes).
+    /// stream that the upload opens and finishes): what [`Self::lane`]
+    /// puts on the Media lane.
     #[must_use]
     pub fn is_upload_chunk(&self) -> bool {
-        matches!(
-            self,
-            ClientMessage::ChatImageChunk { .. }
-                | ClientMessage::LogUploadChunk { .. }
-                | ClientMessage::UploadChunk { .. }
-        )
+        self.lane() == Lane::Media
     }
 }
 
@@ -1515,24 +1538,154 @@ impl ServerMessage {
             | ServerMessage::UploadDone { .. }
             | ServerMessage::UploadRejected { .. }
             | ServerMessage::BlobMissing { .. } => Lane::Signal,
-            _ => Lane::Control,
+            // Everything else, named: a new variant does not compile
+            // until its lane is chosen here.
+            ServerMessage::Welcome { .. }
+            | ServerMessage::Refused { .. }
+            | ServerMessage::Init { .. }
+            | ServerMessage::UserJoined { .. }
+            | ServerMessage::UserLeft { .. }
+            | ServerMessage::Chat(..)
+            | ServerMessage::Speaking { .. }
+            | ServerMessage::AudioState { .. }
+            | ServerMessage::ScreenShareStarted { .. }
+            | ServerMessage::ScreenShareStopped { .. }
+            | ServerMessage::ShareDenied { .. }
+            | ServerMessage::SubscribeDenied { .. }
+            | ServerMessage::UserMovedChannel { .. }
+            | ServerMessage::JoinChannelDenied { .. }
+            | ServerMessage::ChannelListUpdated { .. }
+            | ServerMessage::VoiceReceiverReport { .. }
+            | ServerMessage::Session { .. }
+            | ServerMessage::Removed { .. }
+            | ServerMessage::InviteCreated { .. }
+            | ServerMessage::InviteDenied { .. }
+            | ServerMessage::UserDetails { .. }
+            | ServerMessage::Restricted { .. }
+            | ServerMessage::RestrictionLifted { .. }
+            | ServerMessage::AdminResult { .. }
+            | ServerMessage::History { .. }
+            | ServerMessage::HistoryUnavailable { .. }
+            | ServerMessage::MessageEdited { .. }
+            | ServerMessage::MessageDeleted { .. }
+            | ServerMessage::ChatRateLimited { .. }
+            | ServerMessage::ProgressUpdate { .. }
+            | ServerMessage::ChannelDetails { .. }
+            | ServerMessage::ChannelDenied { .. }
+            | ServerMessage::MovedIdle { .. }
+            | ServerMessage::UserProfile { .. }
+            | ServerMessage::ProfileUpdated { .. }
+            | ServerMessage::ProfileDenied { .. }
+            | ServerMessage::UserRenamed { .. }
+            | ServerMessage::RenameDenied { .. }
+            | ServerMessage::Direct { .. }
+            | ServerMessage::MessageAck { .. }
+            | ServerMessage::MessageFailed { .. }
+            | ServerMessage::Conversations { .. }
+            | ServerMessage::UserProgress { .. }
+            | ServerMessage::FileMessage { .. }
+            | ServerMessage::HistoryAttachments { .. }
+            | ServerMessage::AuditLine { .. }
+            | ServerMessage::RoleList { .. }
+            | ServerMessage::Blocks { .. }
+            | ServerMessage::ReportAck { .. }
+            | ServerMessage::AccountDeleted
+            | ServerMessage::AccountDeleteRefused { .. }
+            | ServerMessage::ChatFrom { .. }
+            | ServerMessage::Authors { .. } => Lane::Control,
         }
     }
 
     /// Whether this message is a media-upload chunk (rides a Media
-    /// stream that the relay opens and finishes per image).
+    /// stream that the relay opens and finishes per image): what
+    /// [`Self::lane`] puts on the Media lane.
     #[must_use]
     pub fn is_upload_chunk(&self) -> bool {
-        matches!(
-            self,
-            ServerMessage::ChatImageChunk { .. } | ServerMessage::BlobChunk { .. }
-        )
+        self.lane() == Lane::Media
+    }
+
+    /// The capability bit ([`crate::features`]) a session must have
+    /// negotiated to be sent this message; 0 for what every admitted
+    /// client decodes. A peer that never announced the bit cannot
+    /// decode the variant — it was added with the bit — so the server
+    /// checks this once, where it sends, instead of at each caller:
+    /// the callers disagreed (`Session` went out on `INVITES` at
+    /// `Hello` and on `ROLES` after a reload — review P3-6). Named
+    /// variant by variant: a new one does not compile until its bit is
+    /// chosen.
+    #[must_use]
+    pub const fn required_feature(&self) -> u64 {
+        use crate::features;
+        match self {
+            ServerMessage::Welcome { .. }
+            | ServerMessage::Refused { .. }
+            | ServerMessage::Init { .. }
+            | ServerMessage::UserJoined { .. }
+            | ServerMessage::UserLeft { .. }
+            | ServerMessage::Chat(..)
+            | ServerMessage::Speaking { .. }
+            | ServerMessage::AudioState { .. }
+            | ServerMessage::ScreenShareStarted { .. }
+            | ServerMessage::ScreenShareStopped { .. }
+            | ServerMessage::ShareDenied { .. }
+            | ServerMessage::SubscribeDenied { .. }
+            | ServerMessage::KeyframeRequested { .. }
+            | ServerMessage::StreamHealth { .. }
+            | ServerMessage::ChatImageChunk { .. }
+            | ServerMessage::UserMovedChannel { .. }
+            | ServerMessage::JoinChannelDenied { .. }
+            | ServerMessage::ChannelListUpdated { .. }
+            | ServerMessage::VoiceReceiverReport { .. } => 0,
+            ServerMessage::Session { .. }
+            | ServerMessage::Removed { .. }
+            | ServerMessage::InviteCreated { .. }
+            | ServerMessage::InviteDenied { .. } => features::INVITES,
+            ServerMessage::UserDetails { .. }
+            | ServerMessage::Restricted { .. }
+            | ServerMessage::RestrictionLifted { .. }
+            | ServerMessage::AdminResult { .. } => features::ROLES,
+            ServerMessage::History { .. }
+            | ServerMessage::HistoryUnavailable { .. }
+            | ServerMessage::MessageEdited { .. }
+            | ServerMessage::MessageDeleted { .. }
+            | ServerMessage::ChatRateLimited { .. } => features::HISTORY,
+            ServerMessage::ProgressUpdate { .. } => features::PROGRESS,
+            ServerMessage::ChannelDetails { .. }
+            | ServerMessage::ChannelDenied { .. }
+            | ServerMessage::MovedIdle { .. } => features::CHANNELS_UI,
+            ServerMessage::UserProfile { .. }
+            | ServerMessage::ProfileUpdated { .. }
+            | ServerMessage::ProfileDenied { .. }
+            | ServerMessage::UserRenamed { .. }
+            | ServerMessage::RenameDenied { .. } => features::PROFILES,
+            ServerMessage::UploadAccept { .. }
+            | ServerMessage::UploadDone { .. }
+            | ServerMessage::UploadRejected { .. }
+            | ServerMessage::BlobChunk { .. }
+            | ServerMessage::BlobMissing { .. } => features::BLOBS,
+            ServerMessage::Direct { .. }
+            | ServerMessage::MessageAck { .. }
+            | ServerMessage::MessageFailed { .. }
+            | ServerMessage::Conversations { .. } => features::DM,
+            ServerMessage::UserProgress { .. } => features::PROGRESS_ALL,
+            ServerMessage::FileMessage { .. } | ServerMessage::HistoryAttachments { .. } => {
+                features::FILES
+            }
+            ServerMessage::AuditLine { .. } => features::ADMIN_FEED,
+            ServerMessage::RoleList { .. } => features::ROLE_LIST,
+            ServerMessage::Blocks { .. }
+            | ServerMessage::ReportAck { .. }
+            | ServerMessage::AccountDeleted
+            | ServerMessage::AccountDeleteRefused { .. }
+            | ServerMessage::ChatFrom { .. }
+            | ServerMessage::Authors { .. } => features::SAFETY,
+        }
     }
 }
 
 // ── Codec ───────────────────────────────────────────────────────────────
 //
-// One encode/decode pair per direction, used by both binaries. Errors
+// One codec, used for both directions and by both binaries. Errors
 // are logged via the caller (these return Option so hot loops can just
 // skip malformed input).
 //
@@ -1543,64 +1696,79 @@ impl ServerMessage {
 // the same caps so a buggy caller fails locally instead of poisoning
 // the wire.
 
-/// Does this client message respect the length budget for its variant?
-fn client_message_len_ok(msg: &ClientMessage, wire_len: usize) -> bool {
-    match msg {
-        ClientMessage::ChatImageChunk { data, count, .. } => {
-            data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_IMAGE_CHUNKS
+/// A message enum on the wire: what the one codec below needs to know
+/// about a direction.
+trait Wire: Serialize + serde::de::DeserializeOwned {
+    /// Does this message respect the length budget for its variant?
+    fn len_ok(&self, wire_len: usize) -> bool;
+}
+
+impl Wire for ClientMessage {
+    fn len_ok(&self, wire_len: usize) -> bool {
+        match self {
+            ClientMessage::ChatImageChunk { data, count, .. } => {
+                data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_IMAGE_CHUNKS
+            }
+            ClientMessage::LogUploadChunk { data, count, .. } => {
+                data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_LOG_UPLOAD_CHUNKS
+            }
+            _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
         }
-        ClientMessage::LogUploadChunk { data, count, .. } => {
-            data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_LOG_UPLOAD_CHUNKS
-        }
-        _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
     }
 }
 
-/// Does this server message respect the length budget for its variant?
-fn server_message_len_ok(msg: &ServerMessage, wire_len: usize) -> bool {
-    match msg {
-        ServerMessage::ChatImageChunk { data, count, .. } => {
-            data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_IMAGE_CHUNKS
+impl Wire for ServerMessage {
+    fn len_ok(&self, wire_len: usize) -> bool {
+        match self {
+            ServerMessage::ChatImageChunk { data, count, .. } => {
+                data.len() <= IMAGE_CHUNK_BYTES && *count <= MAX_IMAGE_CHUNKS
+            }
+            _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
         }
-        _ => wire_len <= MAX_CONTROL_MESSAGE_BYTES,
     }
 }
 
-/// Serialize a [`ClientMessage`]. `None` on serializer failure (should
-/// never happen for these types; treated as a droppable event) or if the
+/// Serialize a message. `None` on serializer failure (should never
+/// happen for these types; treated as a droppable event) or if the
 /// message exceeds its variant's length budget.
+fn encode<M: Wire>(msg: &M) -> Option<Vec<u8>> {
+    let bytes = postcard::to_allocvec(msg).ok()?;
+    msg.len_ok(bytes.len()).then_some(bytes)
+}
+
+/// Deserialize a message from untrusted bytes.
+fn decode<M: Wire>(bytes: &[u8]) -> Option<M> {
+    if bytes.is_empty() || bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
+        return None;
+    }
+    let msg: M = postcard::from_bytes(bytes).ok()?;
+    msg.len_ok(bytes.len()).then_some(msg)
+}
+
+/// Serialize a [`ClientMessage`]. `None` on serializer failure or if
+/// the message exceeds its variant's length budget.
 #[must_use]
 pub fn encode_client_message(msg: &ClientMessage) -> Option<Vec<u8>> {
-    let bytes = postcard::to_allocvec(msg).ok()?;
-    client_message_len_ok(msg, bytes.len()).then_some(bytes)
+    encode(msg)
 }
 
 /// Deserialize a [`ClientMessage`] from untrusted bytes.
 #[must_use]
 pub fn decode_client_message(bytes: &[u8]) -> Option<ClientMessage> {
-    if bytes.is_empty() || bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
-        return None;
-    }
-    let msg: ClientMessage = postcard::from_bytes(bytes).ok()?;
-    client_message_len_ok(&msg, bytes.len()).then_some(msg)
+    decode(bytes)
 }
 
-/// Serialize a [`ServerMessage`]. `None` on serializer failure or if the
-/// message exceeds its variant's length budget.
+/// Serialize a [`ServerMessage`]. `None` on serializer failure or if
+/// the message exceeds its variant's length budget.
 #[must_use]
 pub fn encode_server_message(msg: &ServerMessage) -> Option<Vec<u8>> {
-    let bytes = postcard::to_allocvec(msg).ok()?;
-    server_message_len_ok(msg, bytes.len()).then_some(bytes)
+    encode(msg)
 }
 
 /// Deserialize a [`ServerMessage`] from untrusted bytes.
 #[must_use]
 pub fn decode_server_message(bytes: &[u8]) -> Option<ServerMessage> {
-    if bytes.is_empty() || bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
-        return None;
-    }
-    let msg: ServerMessage = postcard::from_bytes(bytes).ok()?;
-    server_message_len_ok(&msg, bytes.len()).then_some(msg)
+    decode(bytes)
 }
 
 // ── Fitting lists into one message ──────────────────────────────────

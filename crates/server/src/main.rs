@@ -723,7 +723,7 @@ fn invite_command(
             Ok(())
         }
         InviteCommand::Revoke { code } => {
-            let code = server::policy::normalize_invite_code(&code)
+            let code = protocol::invite::normalize_code(&code)
                 .ok_or_else(|| format!("'{code}' is not an invite code"))?;
             if persistence::cli_revoke_invite(&db, &code)? {
                 println!("revoked {code}");

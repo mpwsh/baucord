@@ -18,7 +18,7 @@ use protocol::{
     RestrictionKind, ServerMessage, UploadRejectReason, UserId,
 };
 
-use super::{dms::PendingDm, ChatServer};
+use super::{dms::PendingDm, ChatServer, Waiting};
 use crate::persistence::{Command, MessageRow, Query, GENERAL_CONV};
 
 /// A UTC day, for the allowance.
@@ -313,16 +313,16 @@ impl ChatServer {
                     },
                     self.now + super::dms::DM_STORE_DEADLINE,
                 );
-                self.pending_dms.insert(
+                self.waiting.insert(
                     ask,
-                    PendingDm {
+                    Waiting::Dm(Box::new(PendingDm {
                         sender: client,
                         from,
                         to,
                         client_ref,
                         msg,
                         attachment: Some(attachment),
-                    },
+                    })),
                 );
             }
         }

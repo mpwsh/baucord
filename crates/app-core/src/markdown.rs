@@ -180,28 +180,34 @@ pub fn to_commonmark(text: &str, code_color: Option<&str>) -> (String, bool) {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len() + 8);
     let mut styled = false;
-    let mut in_heading = false;
+    // Where in `out` the open heading's text begins (after its `**`).
+    let mut heading: Option<usize> = None;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         // `# text` at a line start renders as a bold line — StyledText
         // has no per-span sizes, so bold is the closest heading look.
-        if c == '#' && (i == 0 || chars[i - 1] == '\n') && !in_heading {
+        if c == '#' && (i == 0 || chars[i - 1] == '\n') && heading.is_none() {
             let mut level = 0;
             while i + level < chars.len() && chars[i + level] == '#' {
                 level += 1;
             }
             if level <= 6 && i + level < chars.len() && chars[i + level] == ' ' {
                 out.push_str("**");
-                in_heading = true;
+                heading = Some(out.len());
                 styled = true;
                 i += level + 1;
+                // The bold opens on the text: `** text` is not bold.
+                while i < chars.len() && chars[i] == ' ' {
+                    i += 1;
+                }
                 continue;
             }
         }
-        if in_heading && c == '\n' {
-            out.push_str("**");
-            in_heading = false;
+        if c == '\n'
+            && let Some(text_at) = heading.take()
+        {
+            close_heading(&mut out, text_at);
         }
         match c {
             // Inline code span: verbatim between single backticks, no
@@ -275,10 +281,24 @@ pub fn to_commonmark(text: &str, code_color: Option<&str>) -> (String, bool) {
             }
         }
     }
-    if in_heading {
-        out.push_str("**");
+    if let Some(text_at) = heading {
+        close_heading(&mut out, text_at);
     }
     (out, styled)
+}
+
+/// Close the bold of a heading whose text begins at `text_at` in
+/// `out`: before any trailing spaces — `**text **` is not bold in
+/// `CommonMark`, and a heading typed with a space after it showed its
+/// asterisks (review P3-39). A heading of nothing but spaces is no
+/// heading: its opening goes too.
+fn close_heading(out: &mut String, text_at: usize) {
+    let end = out.trim_end_matches([' ', '\t']).len();
+    if end <= text_at {
+        out.replace_range(text_at - 2..text_at, "");
+    } else {
+        out.insert_str(end, "**");
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +356,21 @@ mod tests {
         let (cm, styled) = to_commonmark_none("# Big news\nregular");
         assert!(styled);
         assert_eq!(cm, "**Big news**\\\nregular");
+    }
+
+    #[test]
+    fn a_heading_closes_its_bold_on_the_text_not_on_the_spaces_around_it() {
+        // A space after the title: the asterisks used to show.
+        assert_eq!(to_commonmark_none("# Big news ").0, "**Big news** ");
+        assert_eq!(
+            to_commonmark_none("# Big news  \nregular").0,
+            "**Big news**  \\\nregular"
+        );
+        // Spaces before it.
+        assert_eq!(to_commonmark_none("#   Big news").0, "**Big news**");
+        // Nothing but the marker and spaces: no bold at all.
+        assert_eq!(to_commonmark_none("#  ").0, "");
+        assert_eq!(to_commonmark_none("# \nregular").0, "\\\nregular");
     }
 
     #[test]

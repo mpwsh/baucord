@@ -5,9 +5,9 @@ name = "android"
 # directory and Slint's Android backend, then runs the same
 # `frontend::app::run()` the desktop binary runs. Versioned with the
 # public crates.
-version = "1.2.1"
-edition = "2024"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
 
 [lints]

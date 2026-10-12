@@ -407,11 +407,7 @@ impl ChatServer {
             self.get_username(client),
             reason.describe()
         );
-        self.send_if(
-            client,
-            features::CHANNELS_UI,
-            &ServerMessage::ChannelDenied { reason },
-        );
+        self.send_msg(client, &ServerMessage::ChannelDenied { reason });
     }
 
     // ── Sweeps (every 30 s) ─────────────────────────────────────────
@@ -490,11 +486,7 @@ impl ChatServer {
             );
             self.place_in_channel(client, afk);
             self.note_activity(client);
-            self.send_if(
-                client,
-                features::CHANNELS_UI,
-                &ServerMessage::MovedIdle { after_min },
-            );
+            self.send_msg(client, &ServerMessage::MovedIdle { after_min });
         }
     }
 }

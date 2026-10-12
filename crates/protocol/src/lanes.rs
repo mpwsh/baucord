@@ -56,19 +56,9 @@ pub enum Lane {
     Media = 5,
 }
 
-/// How a lane is carried on the QUIC connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Carrier {
-    /// One long-lived bidirectional stream, opened by the client.
-    Bidi,
-    /// DATAGRAM frames, one application packet per datagram.
-    Datagram,
-    /// A fresh unidirectional stream per group / upload.
-    Uni,
-}
-
 impl Lane {
     /// Every lane, in send-priority order (first = most urgent).
+    #[cfg(test)]
     pub const ALL: [Lane; 6] = [
         Lane::Voice,
         Lane::SystemAudio,
@@ -96,15 +86,6 @@ impl Lane {
             5 => Lane::Media,
             _ => return None,
         })
-    }
-
-    #[must_use]
-    pub const fn carrier(self) -> Carrier {
-        match self {
-            Lane::Control | Lane::Signal => Carrier::Bidi,
-            Lane::Voice | Lane::SystemAudio => Carrier::Datagram,
-            Lane::Video | Lane::Media => Carrier::Uni,
-        }
     }
 
     /// Stream priority handed to the transport (`set_priority`; higher

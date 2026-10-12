@@ -564,12 +564,24 @@ impl AppState {
         s.set_moderation_reason("".into());
     }
 
+    /// File a person's volume and mute under who they are (their user
+    /// id, once `UserDetails` said it), not under what they are called
+    /// today (review P2-24).
+    fn save_peer_audio(
+        &mut self,
+        client_id: u64,
+        username: &str,
+        audio: Option<PeerAudioSettings>,
+    ) {
+        let user = self.details.get(&client_id).map(|(user, _)| *user);
+        self.settings.set_peer_audio(user.as_ref(), username, audio);
+    }
+
     pub(super) fn handle_mute_user(&mut self, client_id: u64, username: &str, muted: bool) {
         if let Some(user) = self.users.get_mut(&client_id) {
             user.audio.is_muted = muted;
-            self.settings
-                .peer_settings
-                .insert(peer_key(username), peer_audio_to(user.audio));
+            let audio = peer_audio_to(user.audio);
+            self.save_peer_audio(client_id, username, Some(audio));
         }
         self.voice
             .tx
@@ -588,9 +600,8 @@ impl AppState {
     pub(super) fn handle_set_user_volume(&mut self, client_id: u64, username: &str, volume: f32) {
         if let Some(user) = self.users.get_mut(&client_id) {
             user.audio.volume = volume;
-            self.settings
-                .peer_settings
-                .insert(peer_key(username), peer_audio_to(user.audio));
+            let audio = peer_audio_to(user.audio);
+            self.save_peer_audio(client_id, username, Some(audio));
         }
         self.voice
             .tx
@@ -607,7 +618,7 @@ impl AppState {
     }
 
     pub(super) fn handle_reset_peer_audio(&mut self, client_id: u64, username: &str) {
-        self.settings.peer_settings.remove(&peer_key(username));
+        self.save_peer_audio(client_id, username, None);
         if let Some(user) = self.users.get_mut(&client_id) {
             user.audio = PeerAudio::default();
         }

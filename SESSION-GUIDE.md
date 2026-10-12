@@ -625,13 +625,14 @@ Memory-mode servers (persistence off) still use the legacy
   be fetched from the PowerShell GitHub releases to test `run.ps1`.
 - **The public crates move together.** `protocol`, `transport`,
   `client`, `server`, `frontend`, `desktop`, `android` and `ios` carry
-  one version — the release's — and every platform reads it from its
-  crate (the updater and About from `frontend`, the wire from
-  `protocol`, Android's `versionName` and iOS's `MARKETING_VERSION`
-  from their crates; IOS-SPEC.md D25). Bump all eight at once;
-  `cargo test -p protocol --test versions` fails otherwise. 1.1.6
-  bumped only the apps, and clients told the server they were 1.1.5.
-  The internal libraries keep their own numbers.
+  one version — the release's — and it is written once: `version`
+  under `[workspace.package]` in the root `Cargo.toml`, which the
+  eight inherit (`version.workspace = true`) and which the release
+  workflows, Android's Gradle script and the iOS scripts read
+  (IOS-SPEC.md D25). Bump that line; `cargo test -p protocol --test
+  versions` fails if a public crate sets its own. 1.1.6 bumped only
+  the apps, and clients told the server they were 1.1.5. The internal
+  libraries keep their own numbers.
 - **No early-leaving readers under `pipefail`.** `cmd | head -n 1` or
   `cmd | grep -q x` in a `set -euo pipefail` script ends it silently
   when `cmd` writes after the reader has left (SIGPIPE, 141) — a race

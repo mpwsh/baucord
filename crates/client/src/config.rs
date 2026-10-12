@@ -1,19 +1,36 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use audio::PeerAudioSettings;
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
-/// Key used to store per-peer audio settings.
-///
-/// Historically this hashed the username with `DefaultHasher`, but that
-/// hash is explicitly not guaranteed stable across Rust releases — a
-/// toolchain bump could silently orphan every saved per-peer setting.
-/// The username itself is the key now. Old hashed entries remain in
-/// settings.json but are simply never read again (harmless dead weight).
+/// The key per-person audio settings were filed under until 1.2.1: the
+/// display name. A rename lost them and a namesake inherited them
+/// (review P2-24); they are filed under the person's id now
+/// ([`peer_id_key`]), and an entry under a name is moved there the
+/// first time its owner is seen ([`Settings::claim_peer_audio`]). Still
+/// read for a session whose id is not known yet.
 #[must_use]
 pub fn peer_key(username: &str) -> String {
     username.to_string()
+}
+
+/// The key of a person's audio settings: who they are, whatever they
+/// are called today. A name cannot look like one — the colon is not a
+/// name character.
+#[must_use]
+pub fn peer_id_key(user: &protocol::UserId) -> String {
+    use std::fmt::Write;
+    let mut key = String::with_capacity(3 + 64);
+    key.push_str("id:");
+    for byte in user {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 
 // ── Bindable actions ────────────────────────────────────────────────────
@@ -337,15 +354,6 @@ pub struct ServerEntry {
     pub name: String,
     /// `ip:port` (or `[v6]:port`) — parsed as a `SocketAddr` on connect.
     pub address: String,
-    /// The 1.0 room password. Servers ignore it since 1.1 (the device
-    /// key is the login and invites are the door); kept so old files
-    /// load and old entries survive a round trip.
-    #[serde(
-        default,
-        alias = "token_password",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub password: Option<String>,
     /// The invite code to present on the first visit (spec §3.1),
     /// typed when the server asks. Sent once: cleared the moment the
     /// server admits us, because from then on the key is the login.
@@ -361,8 +369,8 @@ pub struct ServerEntry {
     /// *name* (channel ids are per-server-run indexes; names are the
     /// stable handle an operator gives a room). Filled when a join with
     /// a typed password succeeds path-wise (we save on OK — a wrong
-    /// password just re-opens the prompt). Same plain-text rationale as
-    /// `password` above.
+    /// password just re-opens the prompt). Plain text: they gate a room
+    /// among people already admitted, not the server.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub channel_passwords: HashMap<String, String>,
 }
@@ -375,7 +383,6 @@ impl ServerEntry {
         Self {
             name: "baucord".to_string(),
             address: OFFICIAL_ADDRESS.to_string(),
-            password: None,
             invite_code: None,
             fingerprint: None,
             channel_passwords: HashMap::new(),
@@ -407,7 +414,6 @@ impl ServerEntry {
         Some(Self {
             name: address.to_string(),
             address: address.to_string(),
-            password: None,
             invite_code: None,
             fingerprint,
             channel_passwords: HashMap::new(),
@@ -446,18 +452,6 @@ fn default_servers() -> Vec<ServerEntry> {
     vec![ServerEntry::official()]
 }
 
-/// The pre-0.3 single inline `server` object, kept so old settings.json
-/// files still deserialize (they migrate to a `servers` entry on load).
-#[derive(Debug, Deserialize)]
-struct LegacyServer {
-    address: String,
-    #[serde(default)]
-    token_password: Option<String>,
-}
-
-/// Address of the retired official server: a legacy file pointing there
-/// migrates to [`ServerEntry::official`] instead of keeping dead config.
-const LEGACY_OFFICIAL_ADDRESS: &str = "64.176.16.18:5000";
 /// The official server, on the port it moved to in 1.1.5.
 const OFFICIAL_ADDRESS: &str = "216.238.121.18:51000";
 /// The official server's old port: still answered (Docker publishes
@@ -590,13 +584,14 @@ fn default_keybinds() -> Vec<KeybindEntry> {
 // ── Root settings ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "SettingsDe")]
 pub struct Settings {
     #[serde(default)]
     pub user: UserSettings,
     /// Name of the default server in [`Self::servers`] — the entry
     /// preselected on the connect screen at startup.
+    #[serde(default, deserialize_with = "server_name")]
     pub server: String,
+    #[serde(default)]
     pub servers: Vec<ServerEntry>,
     #[serde(default)]
     pub audio: AudioSettings,
@@ -662,106 +657,19 @@ impl LoggingSettings {
     }
 }
 
-/// Deserialization shadow of [`Settings`]: `server` accepts both the
-/// current name string and the pre-0.3 inline object, so upgrading
-/// users keep their custom server instead of falling back to defaults
-/// (a parse failure would discard the whole file — nickname, keybinds,
-/// per-peer audio and all).
-#[derive(Deserialize)]
-struct SettingsDe {
-    #[serde(default)]
-    user: UserSettings,
-    #[serde(default)]
-    server: ServerField,
-    #[serde(default)]
-    servers: Vec<ServerEntry>,
-    #[serde(default)]
-    audio: AudioSettings,
-    #[serde(default)]
-    window: WindowSettings,
-    #[serde(default = "default_keybinds")]
-    keybinds: Vec<KeybindEntry>,
-    #[serde(default)]
-    peer_settings: HashMap<String, PeerAudioSettings>,
-    #[serde(default)]
-    language: Option<String>,
-    #[serde(default)]
-    share: ShareSettings,
-    #[serde(default)]
-    ui: UiSettings,
-    #[serde(default)]
-    profile: ProfileSettings,
-    #[serde(default)]
-    startup: StartupSettings,
-    #[serde(default)]
-    sounds: SoundSettings,
-    #[serde(default)]
-    logging: LoggingSettings,
-    #[serde(default)]
-    notifications: NotificationSettings,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum ServerField {
-    Name(String),
-    Legacy(LegacyServer),
-}
-
-impl Default for ServerField {
-    fn default() -> Self {
-        ServerField::Name(String::new())
-    }
-}
-
-impl From<SettingsDe> for Settings {
-    fn from(de: SettingsDe) -> Self {
-        let mut servers = de.servers;
-        let server = match de.server {
-            ServerField::Name(name) => name,
-            ServerField::Legacy(legacy) => {
-                // Pre-0.3 file. The retired official default becomes
-                // the new official entry; a custom server is preserved
-                // under its address as the name.
-                let entry = if legacy.address == LEGACY_OFFICIAL_ADDRESS {
-                    ServerEntry::official()
-                } else {
-                    ServerEntry {
-                        name: legacy.address.clone(),
-                        address: legacy.address,
-                        password: legacy.token_password,
-                        invite_code: None,
-                        fingerprint: None,
-                        channel_passwords: HashMap::new(),
-                    }
-                };
-                let name = entry.name.clone();
-                if !servers.iter().any(|s| s.name == entry.name) {
-                    servers.insert(0, entry);
-                }
-                name
-            }
-        };
-        let mut settings = Settings {
-            user: de.user,
-            server,
-            servers,
-            audio: de.audio,
-            window: de.window,
-            keybinds: de.keybinds,
-            peer_settings: de.peer_settings,
-            language: de.language,
-            share: de.share,
-            ui: de.ui,
-            profile: de.profile,
-            startup: de.startup,
-            sounds: de.sounds,
-            logging: de.logging,
-            notifications: de.notifications,
-        };
-        settings.normalize_servers();
-        settings
-    }
+/// `Settings::server` from a file: the name it is — or nothing, for
+/// anything else. Before 0.3 the field was an object (one inline
+/// server), and a field of the wrong type fails the whole file: the
+/// nickname, the keybinds and the audio settings of someone coming
+/// from that far back still load, with the default server. (A shadow
+/// of every field of [`Settings`] used to exist to carry that one
+/// server over — review P3-17; no server from then admits a 1.1
+/// client without a new invite anyway.)
+fn server_name<'de, D: serde::Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+    Ok(match serde_json::Value::deserialize(de)? {
+        serde_json::Value::String(name) => name,
+        _ => String::new(),
+    })
 }
 
 impl Default for Settings {
@@ -802,41 +710,125 @@ impl Settings {
         path
     }
 
-    fn read_from(path: &PathBuf) -> Option<Self> {
-        if !path.exists() {
-            return None;
+    /// The audio settings saved for the person `user`, called `name`
+    /// right now — moving an entry filed under that name (how they
+    /// were kept until 1.2.1) to the id. The flag says something moved
+    /// and the settings want saving.
+    pub fn claim_peer_audio(
+        &mut self,
+        user: &protocol::UserId,
+        name: &str,
+    ) -> (Option<PeerAudioSettings>, bool) {
+        let key = peer_id_key(user);
+        if let Some(saved) = self.peer_settings.get(&key) {
+            return (Some(saved.clone()), false);
         }
-        let contents = fs::read_to_string(path).ok()?;
-        serde_json::from_str(&contents).ok()
+        match self.peer_settings.remove(&peer_key(name)) {
+            Some(saved) => {
+                self.peer_settings.insert(key, saved.clone());
+                (Some(saved), true)
+            }
+            None => (None, false),
+        }
+    }
+
+    /// Save (`Some`) or forget (`None`) a person's audio settings: under
+    /// their id when it is known, under the name otherwise. Either way
+    /// nothing is left under the name for a namesake to pick up.
+    pub fn set_peer_audio(
+        &mut self,
+        user: Option<&protocol::UserId>,
+        name: &str,
+        audio: Option<PeerAudioSettings>,
+    ) {
+        let key = match user {
+            Some(user) => {
+                self.peer_settings.remove(&peer_key(name));
+                peer_id_key(user)
+            }
+            None => peer_key(name),
+        };
+        match audio {
+            Some(audio) => {
+                self.peer_settings.insert(key, audio);
+            }
+            None => {
+                self.peer_settings.remove(&key);
+            }
+        }
+    }
+
+    /// Settings from a file's text, with the server list's invariants
+    /// repaired ([`Self::normalize_servers`]): the one way in.
+    ///
+    /// # Errors
+    /// Not JSON, or not settings.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        let mut settings: Settings = serde_json::from_str(json)?;
+        settings.normalize_servers();
+        Ok(settings)
     }
 
     #[must_use]
     pub fn load() -> Self {
-        let path = Self::get_settings_path();
-        if let Some(settings) = Self::read_from(&path) {
-            info!("Loaded settings from {}", path.display());
-            return settings;
-        }
-
         // One-time migration from previous locations, newest scheme
         // first — the 0.2 platform config dir, then the pre-0.2
         // exe-adjacent file — so upgrading users keep their nickname,
         // keybinds, and per-peer audio settings.
-        let old_paths = [
+        let old_paths: Vec<PathBuf> = [
             platform_config_dir().map(|d| d.join("settings.json")),
             Some(Self::exe_adjacent_settings_path()),
-        ];
-        for old in old_paths.into_iter().flatten() {
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Self::load_at(&Self::get_settings_path(), &old_paths)
+    }
+
+    /// [`Self::load`] for the file at `path`, migrating from the first
+    /// of `old_paths` that loads — only when there is no file at
+    /// `path` at all.
+    fn load_at(path: &Path, old_paths: &[PathBuf]) -> Self {
+        match Stored::read(path) {
+            Stored::Loaded(settings) => {
+                info!("Loaded settings from {}", path.display());
+                return *settings;
+            }
+            Stored::Corrupt(why) => {
+                // A file that is there and does not parse is not "no
+                // file": the migration below used to run, and an older
+                // install's settings — its servers, its name — came
+                // back as if they were current (review P3-18). It is
+                // kept beside the new one, so the next save does not
+                // write over what a hand could still repair.
+                log::error!("{} could not be read: {why}", path.display());
+                let aside = with_suffix(path, ".corrupt");
+                match fs::rename(path, &aside) {
+                    Ok(()) => warn!("The unreadable settings are kept as {}", aside.display()),
+                    Err(e) => warn!("…and could not be set aside: {e}"),
+                }
+                return Self::from_backup(path).unwrap_or_else(|| {
+                    warn!("Using default settings");
+                    Settings::default()
+                });
+            }
+            Stored::Absent => {}
+        }
+        // A save interrupted between its two renames leaves only this.
+        if let Some(settings) = Self::from_backup(path) {
+            return settings;
+        }
+        for old in old_paths {
             if old != path
-                && let Some(settings) = Self::read_from(&old)
+                && let Stored::Loaded(settings) = Stored::read(old)
             {
                 info!(
                     "Migrating settings from {} to {}",
                     old.display(),
                     path.display()
                 );
-                settings.save();
-                return settings;
+                settings.save_at(path);
+                return *settings;
             }
         }
 
@@ -844,8 +836,25 @@ impl Settings {
         Settings::default()
     }
 
+    /// The last save before the current one, if it loads.
+    fn from_backup(path: &Path) -> Option<Self> {
+        let backup = with_suffix(path, ".bak");
+        let Stored::Loaded(settings) = Stored::read(&backup) else {
+            return None;
+        };
+        warn!("Settings restored from {}", backup.display());
+        Some(*settings)
+    }
+
     pub fn save(&self) {
-        let path = Self::get_settings_path();
+        self.save_at(&Self::get_settings_path());
+    }
+
+    /// Write the settings to `path` without ever leaving a torn file
+    /// there: the new contents go to a file beside it, the current file
+    /// becomes the backup, and the new one takes its place. Written in
+    /// place, a crash mid-write lost every server and pin (plan CLI-6).
+    fn save_at(&self, path: &Path) {
         if let Some(parent) = path.parent()
             && let Err(e) = fs::create_dir_all(parent)
         {
@@ -855,15 +864,31 @@ impl Settings {
             );
             return;
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(contents) => {
-                if let Err(e) = fs::write(&path, contents) {
-                    log::error!("Failed to save settings: {e}");
-                } else {
-                    info!("Settings saved to {}", path.display());
-                }
+        let contents = match serde_json::to_string_pretty(self) {
+            Ok(contents) => contents,
+            Err(e) => {
+                log::error!("Failed to serialize settings: {e}");
+                return;
             }
-            Err(e) => log::error!("Failed to serialize settings: {e}"),
+        };
+        let staged = with_suffix(path, ".tmp");
+        let written = fs::write(&staged, &contents).and_then(|()| {
+            if path.exists() {
+                // Best effort: without a backup the save still stands.
+                let _ = fs::rename(path, with_suffix(path, ".bak"));
+            }
+            fs::rename(&staged, path)
+        });
+        // Somewhere a rename is refused (a scanner holding the file):
+        // in place, as it always was.
+        let written = written.or_else(|e| {
+            let _ = fs::remove_file(&staged);
+            log::debug!("settings not replaced by rename ({e}); writing in place");
+            fs::write(path, &contents)
+        });
+        match written {
+            Ok(()) => info!("Settings saved to {}", path.display()),
+            Err(e) => log::error!("Failed to save settings: {e}"),
         }
     }
 
@@ -887,9 +912,6 @@ impl Settings {
                 entry.address = OFFICIAL_ADDRESS.to_string();
             }
             let blank = |v: &Option<String>| v.as_deref().is_some_and(|s| s.trim().is_empty());
-            if blank(&entry.password) {
-                entry.password = None;
-            }
             // Codes are stored canonical; anything else is not a code.
             entry.invite_code = entry
                 .invite_code
@@ -1127,6 +1149,35 @@ pub fn import_client_key(
         .map_err(|e| e.to_string())
 }
 
+/// What is at a settings path.
+enum Stored {
+    Absent,
+    Loaded(Box<Settings>),
+    /// There, and unreadable or not valid settings: why.
+    Corrupt(String),
+}
+
+impl Stored {
+    fn read(path: &Path) -> Self {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Stored::Absent,
+            Err(e) => return Stored::Corrupt(e.to_string()),
+        };
+        match Settings::from_json(&contents) {
+            Ok(settings) => Stored::Loaded(Box::new(settings)),
+            Err(e) => Stored::Corrupt(e.to_string()),
+        }
+    }
+}
+
+/// `path` with `suffix` after its whole name: `settings.json.bak`.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// Throw the identity key away and make a fresh one (Settings →
 /// Identity → Regenerate). The next connection is an unknown device
 /// that needs an invite: a new user, on purpose.
@@ -1148,12 +1199,117 @@ pub fn regenerate_client_key() -> Result<std::sync::Arc<transport::ClientKey>, S
 mod tests {
     use super::*;
 
-    fn parse(json: &str) -> Settings {
-        serde_json::from_str(json).expect("settings should deserialize")
+    /// A scratch directory for the load and save tests.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "baucord-settings-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        dir
     }
 
+    fn named(name: &str) -> Settings {
+        let mut settings = Settings::default();
+        settings.user.nickname = name.to_string();
+        settings
+    }
+
+    /// A file that is there and does not parse is kept aside and is
+    /// not replaced by another install's settings: those came back as
+    /// current, servers and name and all (review P3-18).
     #[test]
-    fn legacy_custom_server_migrates_to_entry_named_by_address() {
+    fn a_corrupt_file_is_set_aside_not_replaced_by_an_older_install() {
+        let dir = scratch("corrupt");
+        let path = dir.join("settings.json");
+        let old = dir.join("old-install.json");
+        named("from an old install").save_at(&old);
+        fs::write(&path, "{ \"username\": \"cut off mid-wri").expect("write");
+
+        let loaded = Settings::load_at(&path, std::slice::from_ref(&old));
+        assert_eq!(loaded.user.nickname, Settings::default().user.nickname);
+        assert!(!path.exists(), "moved out of the next save's way");
+        assert!(fs::read_to_string(dir.join("settings.json.corrupt"))
+            .expect("kept")
+            .contains("cut off mid-wri"));
+        // With no file at all, the old install is where settings come
+        // from, once.
+        let migrated = Settings::load_at(&path, std::slice::from_ref(&old));
+        assert_eq!(migrated.user.nickname, "from an old install");
+        assert!(path.exists(), "saved at the new place");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Each save keeps the one before it, and that is what loads when
+    /// the current file is torn or gone (plan CLI-6).
+    #[test]
+    fn a_save_keeps_the_previous_one_and_it_is_the_fallback() {
+        let dir = scratch("backup");
+        let path = dir.join("settings.json");
+        named("first").save_at(&path);
+        assert!(!dir.join("settings.json.bak").exists());
+        named("second").save_at(&path);
+        assert!(!dir.join("settings.json.tmp").exists());
+        assert_eq!(Settings::load_at(&path, &[]).user.nickname, "second");
+
+        // Torn: the save before it loads, not the defaults.
+        fs::write(&path, "{").expect("write");
+        assert_eq!(Settings::load_at(&path, &[]).user.nickname, "first");
+        // Gone (a save cut between its renames): the same.
+        let _ = fs::remove_file(&path);
+        assert_eq!(Settings::load_at(&path, &[]).user.nickname, "first");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Volume and mute follow the person, not the name: an entry kept
+    /// under a name moves to its owner's id the first time they are
+    /// seen, and from then on a namesake gets nothing and a rename
+    /// loses nothing (review P2-24).
+    #[test]
+    fn peer_audio_is_kept_by_who_not_by_what_they_are_called() {
+        let quiet = PeerAudioSettings {
+            volume: 0.4,
+            ..PeerAudioSettings::default()
+        };
+        let (ana, namesake) = ([1u8; 32], [2u8; 32]);
+        let mut s = Settings::default();
+        s.peer_settings.insert(peer_key("ana"), quiet.clone());
+
+        let (saved, moved) = s.claim_peer_audio(&ana, "ana");
+        assert_eq!(saved.map(|a| a.volume), Some(0.4));
+        assert!(moved, "from the name to the id: save");
+        assert!(!s.peer_settings.contains_key("ana"));
+        // Someone else by that name, later: nothing to inherit.
+        assert_eq!(s.claim_peer_audio(&namesake, "ana"), (None, false));
+        // Renamed: still hers, and nothing more to move.
+        let (saved, moved) = s.claim_peer_audio(&ana, "ana maria");
+        assert_eq!(saved.map(|a| a.volume), Some(0.4));
+        assert!(!moved);
+
+        s.set_peer_audio(Some(&ana), "ana maria", None);
+        assert!(s.peer_settings.is_empty());
+        // No id yet (a session whose details have not come): the name.
+        s.set_peer_audio(None, "bo", Some(quiet.clone()));
+        assert!(s.peer_settings.contains_key("bo"));
+        // Then the id is known: under it, and the name's entry goes.
+        s.set_peer_audio(Some(&namesake), "bo", Some(quiet));
+        assert_eq!(s.peer_settings.len(), 1);
+        assert!(s.peer_settings.contains_key(&peer_id_key(&namesake)));
+        assert!(peer_id_key(&namesake).starts_with("id:0202"));
+    }
+
+    fn parse(json: &str) -> Settings {
+        Settings::from_json(json).expect("settings should deserialize")
+    }
+
+    /// A file from before 0.3 — `server` an object, no list — still
+    /// loads: what it says about the person survives, and the server is
+    /// the default one.
+    #[test]
+    fn a_pre_0_3_file_keeps_everything_but_its_inline_server() {
         let s = parse(
             r#"{
             "user": { "nickname": "empe" },
@@ -1165,33 +1321,14 @@ mod tests {
             "keybinds": [ { "action": "toggle_mute", "bind": "F2" } ]
         }"#,
         );
-        assert_eq!(s.server, "10.0.0.7:6000");
-        assert_eq!(s.servers.len(), 1);
-        let e = &s.servers[0];
-        assert_eq!(e.address, "10.0.0.7:6000");
-        // The 0.5 token password becomes the room password; the issuer
-        // URL is gone with the issuer.
-        // The 0.5 token password still loads (a 1.1 server ignores it).
-        assert_eq!(e.password.as_deref(), Some("sekrit"));
-        assert_eq!(e.invite_code, None);
-        assert_eq!(e.fingerprint, None);
-        // Pre-existing settings survive the migration.
+        assert_eq!(s.server, "baucord");
+        assert_eq!(s.servers, vec![ServerEntry::official()]);
         assert_eq!(s.user.nickname, "empe");
         assert_eq!(s.keybinds[0].bind, "F2");
     }
 
     #[test]
-    fn legacy_official_server_becomes_new_official_entry() {
-        let s = parse(
-            r#"{ "server": { "address": "64.176.16.18:5000",
-                "token_url": "https://key.mpw.sh/token", "token_password": null } }"#,
-        );
-        assert_eq!(s.server, "baucord");
-        assert_eq!(s.servers, vec![ServerEntry::official()]);
-    }
-
-    #[test]
-    fn new_format_round_trips_and_normalizes_blank_password() {
+    fn the_current_format_round_trips_and_old_keys_are_ignored() {
         let s = parse(
             r#"{
             "server": "baucord",
@@ -1204,12 +1341,12 @@ mod tests {
         }"#,
         );
         assert_eq!(s.server, "baucord");
-        assert_eq!(s.servers[0].password, None);
         // The official server's old port is followed to the new one.
         assert_eq!(s.servers[0].address, OFFICIAL_ADDRESS);
 
         let json = serde_json::to_string_pretty(&s).expect("serialize");
-        let back: Settings = serde_json::from_str(&json).expect("re-parse");
+        assert!(!json.contains("password"), "the 1.0 room password is gone");
+        let back = parse(&json);
         assert_eq!(back.server, "baucord");
         assert_eq!(back.servers, s.servers);
     }
@@ -1243,9 +1380,9 @@ mod tests {
             Some("2.2.2.2:2")
         );
         if let Some(server) = s.default_server_mut() {
-            server.password = Some("pw".to_string());
+            server.address = "3.3.3.3:3".to_string();
         }
-        assert_eq!(s.servers[1].password.as_deref(), Some("pw"));
+        assert_eq!(s.servers[1].address, "3.3.3.3:3");
     }
 
     #[test]
@@ -1254,7 +1391,6 @@ mod tests {
             r#"{ "server": "x", "servers": [ { "name": "x", "address": "1.2.3.4:5000",
                 "password": "pw", "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" } ] }"#,
         );
-        assert_eq!(s.servers[0].password.as_deref(), Some("pw"));
         assert!(s.servers[0].fingerprint.is_some());
         assert_eq!(
             s.servers[0].pinned_address(),

@@ -21,8 +21,8 @@ use protocol::{
     RestrictionKind, ServerMessage, UserId,
 };
 
-use super::ChatServer;
-use crate::persistence::{Answer, AskId, Command, ConvKey, MessageRow, Outcome, Query};
+use super::{ChatServer, Waiting};
+use crate::persistence::{Answer, Command, ConvKey, MessageRow, Outcome, Query};
 
 /// How long the store may take to confirm a DM before the sender is
 /// told it failed (spec §6).
@@ -122,24 +122,21 @@ impl ChatServer {
             },
             self.now + DM_STORE_DEADLINE,
         );
-        self.pending_dms.insert(
+        self.waiting.insert(
             ask,
-            PendingDm {
+            Waiting::Dm(Box::new(PendingDm {
                 sender: client,
                 from,
                 to,
                 client_ref,
                 msg,
                 attachment: None,
-            },
+            })),
         );
     }
 
     /// The store answered a `StoreDm` (or did not, in time).
-    pub(super) fn resolve_dm_answer(&mut self, ask: AskId, outcome: Outcome) {
-        let Some(pending) = self.pending_dms.remove(&ask) else {
-            return;
-        };
+    pub(super) fn resolve_dm_answer(&mut self, pending: &PendingDm, outcome: Outcome) {
         match outcome {
             Outcome::Answered(Answer::Stored) => {
                 // Stored after one of the two deleted their account: not
@@ -184,12 +181,23 @@ impl ChatServer {
             }
             Outcome::Answered(Answer::Failed(e)) => {
                 warn!("DM store failed: {e}");
+                self.release_unsent_file(pending);
                 self.fail_dm(pending.sender, pending.client_ref, DmFailReason::Store);
             }
             _ => {
                 warn!("DM store did not answer in time");
+                self.release_unsent_file(pending);
                 self.fail_dm(pending.sender, pending.client_ref, DmFailReason::Store);
             }
+        }
+    }
+
+    /// A file DM was not stored: the reference taken for it when it
+    /// was sent goes back. It used to stay, and a file with a count
+    /// above zero is never deleted (review P2-11).
+    fn release_unsent_file(&mut self, pending: &PendingDm) {
+        if let Some(attachment) = &pending.attachment {
+            self.blob_ref(&attachment.blob_id, -1);
         }
     }
 
@@ -224,9 +232,7 @@ impl ChatServer {
         let sessions = self.sessions_of(to);
         self.introduce_author(sender, from, &sessions);
         for session in sessions {
-            if self.has_feature(session, features::DM) {
-                self.send_msg(session, &direct);
-            }
+            self.send_msg(session, &direct);
         }
     }
 
@@ -268,13 +274,10 @@ impl ChatServer {
             Query::Conversations { user_id: me },
             self.now + DM_STORE_DEADLINE,
         );
-        self.pending_convs.insert(ask, client);
+        self.waiting.insert(ask, Waiting::Conversations(client));
     }
 
-    pub(super) fn resolve_conversations_answer(&mut self, ask: AskId, outcome: Outcome) {
-        let Some(client) = self.pending_convs.remove(&ask) else {
-            return;
-        };
+    pub(super) fn resolve_conversations_answer(&mut self, client: ClientId, outcome: Outcome) {
         if let Outcome::Answered(Answer::Conversations(mut dms)) = outcome {
             // The client replaces its list with each one it gets: one
             // message, the conversations that fit (the store lists the
@@ -289,16 +292,6 @@ impl ChatServer {
             self.send_authors(client, dms.iter().map(|d| d.user_id));
             self.send_msg(client, &ServerMessage::Conversations { dms });
         }
-    }
-
-    /// Whether an answered ask belongs to a DM store or a conversation
-    /// list (the persistence poll routes by this).
-    pub(super) fn is_dm_ask(&self, ask: AskId) -> bool {
-        self.pending_dms.contains_key(&ask)
-    }
-
-    pub(super) fn is_conversations_ask(&self, ask: AskId) -> bool {
-        self.pending_convs.contains_key(&ask)
     }
 
     /// The store key for a DM history read by this session.

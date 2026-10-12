@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use transport::{
     identity::{verify_ed25519, CLIENT_AUTH_EXPORTER_BYTES, CLIENT_AUTH_EXPORTER_LABEL},
     Budget, DisconnectReason, Driver, DriverHost, Event, Fingerprint, LinkStats, ServerIdentity,
+    Shared, WaitingRoom,
 };
 
 mod admin;
@@ -152,6 +153,32 @@ struct PendingPeer {
     remote: SocketAddr,
 }
 
+/// What a read from the store was for, kept until its answer comes
+/// back or its deadline passes. One table, keyed by the ask: there were
+/// seven maps, searched one after another for whose answer it was — and
+/// an answer none of them knew fell through to the last, as a history
+/// page (review P2-52).
+enum Waiting {
+    /// A history page: who asked, for what, how much.
+    History {
+        client: ClientId,
+        conv: protocol::ConvRef,
+        limit: u16,
+    },
+    /// A DM being stored before anyone sees it (spec §6).
+    Dm(Box<PendingDm>),
+    /// The DM list of a session.
+    Conversations(ClientId),
+    /// An audit page for the panel, with the command's request id.
+    Audit { client: ClientId, request_id: u32 },
+    /// A report waiting for the store to find its message.
+    Report(safety::PendingReport),
+    /// The Reports tab, with the command's request id.
+    ReportList { client: ClientId, request_id: u32 },
+    /// A file's bytes from disk; who wants them is in `pending_blobs`.
+    Blob(protocol::BlobId),
+}
+
 pub struct ChatServer {
     config: Config,
     driver: Driver,
@@ -183,6 +210,10 @@ pub struct ChatServer {
     /// Recent failed admissions per source ([`failure_source`]).
     admission_failures: HashMap<IpAddr, VecDeque<Instant>>,
     usernames: HashMap<ClientId, String>,
+    /// The keys of `usernames` — every admitted session — kept as a
+    /// list: the relays and every broadcast walk it, and it was built
+    /// again from the map on each tick (review P2-31).
+    roster: Vec<ClientId>,
     /// Negotiated feature bits per admitted client.
     features_of: HashMap<ClientId, u64>,
     /// Latest self-reported audio state: client → (muted, deafened).
@@ -202,8 +233,8 @@ pub struct ChatServer {
     /// Chat rate limit (`limits.chat`): tokens left and when they were
     /// last topped up, per session.
     chat_tokens: HashMap<ClientId, (f64, Instant)>,
-    /// History reads in flight: who asked, for what, how much.
-    pending_history: HashMap<AskId, (ClientId, protocol::ConvRef, u16)>,
+    /// Reads from the store in flight, each with what it was for.
+    waiting: HashMap<AskId, Waiting>,
     /// Progress accrued this minute (spec §9.1), flushed once a minute.
     progress: HashMap<UserId, ProgressDelta>,
     /// Sessions that spoke since the last progress minute.
@@ -255,25 +286,16 @@ pub struct ChatServer {
     /// `blob_clock`.
     blob_used: HashMap<protocol::BlobId, u64>,
     blob_clock: u64,
-    /// Disk reads in flight: who asked for which blob.
-    pending_blobs: HashMap<protocol::BlobId, (AskId, Vec<ClientId>)>,
+    /// Who waits for which file's bytes: one disk read
+    /// ([`Waiting::Blob`]) serves them all.
+    pending_blobs: HashMap<protocol::BlobId, Vec<ClientId>>,
     /// Profile and rename rate limits (spec §7.1).
     profile_changed_at: HashMap<UserId, Instant>,
     renamed_at: HashMap<ClientId, Instant>,
-    /// DMs waiting for the store, and conversation-list reads (spec §6).
-    pending_dms: HashMap<AskId, PendingDm>,
-    /// Audit reads in flight for the panel: who asked, with which
-    /// request id.
-    pending_audits: HashMap<AskId, (ClientId, u32)>,
-    pending_convs: HashMap<AskId, ClientId>,
     /// (sender, receiver) sessions the relay keeps voice from: the
     /// receiver's user blocked the sender's (`protocol::safety`).
     /// Recomputed with `muted`.
     blocked_pairs: HashSet<(ClientId, ClientId)>,
-    /// Reports waiting for the store to find their message.
-    pending_reports: HashMap<AskId, safety::PendingReport>,
-    /// Reports-tab reads in flight: who asked, with which request id.
-    pending_report_lists: HashMap<AskId, (ClientId, u32)>,
     /// When each account last filed reports (rate limit).
     report_times: HashMap<UserId, VecDeque<Instant>>,
     /// When each account last changed its blocks, for their limit.
@@ -380,7 +402,8 @@ impl ChatServer {
         let mut budget = Budget::server();
         budget.media_pace_bytes_per_sec = config.limits.media_relay_kb_per_sec.max(64) * 1024;
         budget.socket_buffer_bytes = send_buffer_target(config.network.max_clients);
-        let driver = Driver::new_server(identity, config.network.max_clients, budget)?;
+        let driver = Driver::new_server(identity, config.network.max_clients, budget)?
+            .with_waiting_room(waiting_room(config.network.max_clients));
 
         let config_channels_for_list = crate::config::with_lobby(&config.channels);
         let mut server = Self {
@@ -400,6 +423,7 @@ impl ChatServer {
             pending: HashMap::new(),
             admission_failures: HashMap::new(),
             usernames: HashMap::new(),
+            roster: Vec::new(),
             features_of: HashMap::new(),
             audio_states: HashMap::new(),
             deafened: HashSet::new(),
@@ -407,7 +431,7 @@ impl ChatServer {
             last_restriction_sweep: now,
             recent: startup.recent.into_iter().collect(),
             chat_tokens: HashMap::new(),
-            pending_history: HashMap::new(),
+            waiting: HashMap::new(),
             progress: HashMap::new(),
             spoke: HashSet::new(),
             last_progress_minute: now,
@@ -433,12 +457,7 @@ impl ChatServer {
             pending_blobs: HashMap::new(),
             profile_changed_at: HashMap::new(),
             renamed_at: HashMap::new(),
-            pending_dms: HashMap::new(),
-            pending_audits: HashMap::new(),
-            pending_convs: HashMap::new(),
             blocked_pairs: HashSet::new(),
-            pending_reports: HashMap::new(),
-            pending_report_lists: HashMap::new(),
             report_times: HashMap::new(),
             block_times: HashMap::new(),
             log_uploads: HashMap::new(),
@@ -654,7 +673,7 @@ impl ChatServer {
                 reason: stored.reason.clone(),
             };
             for client in self.sessions_of(&user) {
-                self.send_if_roles(client, &msg);
+                self.send_msg(client, &msg);
             }
         }
         self.refresh_enforcement();
@@ -726,7 +745,7 @@ impl ChatServer {
         {
             let msg = ServerMessage::RestrictionLifted { kind: gone.kind };
             for client in self.sessions_of(&user) {
-                self.send_if_roles(client, &msg);
+                self.send_msg(client, &msg);
             }
         }
         self.refresh_enforcement();
@@ -773,7 +792,7 @@ impl ChatServer {
             .map(|(c, _)| *c)
             .collect();
         for peer in readers {
-            self.send_if(peer, features::ADMIN_FEED, &line);
+            self.send_msg(peer, &line);
         }
     }
 
@@ -802,7 +821,11 @@ impl ChatServer {
         self.driver.handle_timeouts(now);
 
         self.process_events();
-        self.process_control_messages();
+        // Who has anything to read: the only peers asked, for control
+        // messages here and for media below. Every client used to be
+        // asked for every lane on every tick (review P2-31).
+        let readable = self.driver.readable();
+        self.process_control_messages(&readable);
         self.expire_pending();
         self.poll_persistence();
         if now.duration_since(self.last_restriction_sweep) >= RESTRICTION_SWEEP_INTERVAL {
@@ -819,13 +842,17 @@ impl ChatServer {
             self.sweep_channels();
         }
 
-        let clients = self.clients();
+        let senders: Vec<ClientId> = readable
+            .into_iter()
+            .filter(|peer| self.usernames.contains_key(peer))
+            .collect();
         let afk = self.afk_channel();
         self.voice.process(
             &mut self.driver,
             now,
             &crate::relay::Room {
-                clients: &clients,
+                clients: &self.roster,
+                senders: &senders,
                 deafened: &self.deafened,
                 muted: &self.muted,
                 blocked: &self.blocked_pairs,
@@ -834,9 +861,9 @@ impl ChatServer {
                 channel_of: &self.channel_of,
             },
         );
-        self.video.process(&mut self.driver, now, &clients);
+        self.video.process(&mut self.driver, now, &senders);
         self.video
-            .process_system_audio(&mut self.driver, now, &clients);
+            .process_system_audio(&mut self.driver, now, &senders);
 
         if now.duration_since(self.last_health) >= STREAM_HEALTH_INTERVAL {
             self.send_stream_health();
@@ -953,7 +980,7 @@ impl ChatServer {
     /// Admitted clients, in no particular order.
     #[must_use]
     pub fn clients(&self) -> Vec<ClientId> {
-        self.usernames.keys().copied().collect()
+        self.roster.clone()
     }
 
     // ── Transport events ────────────────────────────────────────────
@@ -1131,7 +1158,7 @@ impl ChatServer {
                     );
                     return;
                 };
-                let checked = policy::normalize_invite_code(&raw_code)
+                let checked = protocol::invite::normalize_code(&raw_code)
                     .ok_or(InviteInvalidReason::Unknown)
                     .and_then(|code| self.policy.check_invite(&code, now).map(|_| code));
                 match checked {
@@ -1202,12 +1229,17 @@ impl ChatServer {
                 .policy
                 .invites
                 .get(code)
-                .map_or(policy::default_invite_role(), |i| i.grants_role);
+                .map_or(permissions::ROLE_GUEST, |i| i.grants_role);
             self.policy
                 .create_user(user_id, &username, now, Some(code.clone()));
             self.policy.link_key(key_hash, user_id, now);
             self.policy.grant_role(&user_id, role);
             self.policy.use_invite(code);
+            // One event, one transaction: the user, the key, the role,
+            // the invite's use and the audit line each took a commit of
+            // their own, and a crash between two left a user without a
+            // role or an invite used by nobody (review P3-9).
+            self.persist.begin_group();
             self.persist_user(&user_id);
             self.persist_key(&key_hash);
             self.persist.send(Command::GrantRole {
@@ -1226,6 +1258,7 @@ impl ChatServer {
                     self.role_name_for_audit(role)
                 )),
             );
+            self.persist.end_group();
             let role_name = self
                 .policy
                 .roles
@@ -1249,6 +1282,8 @@ impl ChatServer {
         self.features_of.insert(peer, negotiated);
         self.user_of.insert(peer, user_id);
         self.key_of.insert(peer, key_hash);
+        // Out of the waiting room: its seat is the next arrival's.
+        self.driver.admit(peer);
         self.stats.admitted += 1;
         info!(
             "{username} ({peer:#x}) admitted from {remote} (client {client_version}, features \
@@ -1330,20 +1365,14 @@ impl ChatServer {
             "{} ({client:#x}) removed ({kind:?}) by {by}: {reason}",
             self.get_username(client)
         );
-        if self
-            .features_of
-            .get(&client)
-            .is_some_and(|f| f & features::INVITES != 0)
-        {
-            self.send_msg(
-                client,
-                &ServerMessage::Removed {
-                    kind,
-                    reason: reason.to_string(),
-                    by: by.to_string(),
-                },
-            );
-        }
+        self.send_msg(
+            client,
+            &ServerMessage::Removed {
+                kind,
+                reason: reason.to_string(),
+                by: by.to_string(),
+            },
+        );
         self.driver
             .close_after(self.now, client, REFUSED_CLOSE_DELAY);
         self.handle_client_disconnected(client, &DisconnectReason::LocallyClosed);
@@ -1405,6 +1434,16 @@ impl ChatServer {
             !msg.is_upload_chunk(),
             "image chunks go through relay_image"
         );
+        // A session gets only what it said it can decode. Checked here,
+        // once, for every message: the table is the protocol's own
+        // (`ServerMessage::required_feature`), where each caller used
+        // to name a bit by hand and they did not all agree (review
+        // P3-6). A connection still at its `Hello` has negotiated
+        // nothing and gets the 1.0 messages only — `Refused`.
+        let needs = msg.required_feature();
+        if needs != 0 && !self.has_feature(client_id, needs) {
+            return;
+        }
         if let Some(encoded) = protocol::encode_server_message(msg) {
             self.stats.bytes_sent += encoded.len() as u64;
             if let Err(e) = self.driver.send(self.now, client_id, msg.lane(), &encoded) {
@@ -1440,18 +1479,50 @@ impl ChatServer {
         );
     }
 
-    fn broadcast_msg(&mut self, msg: &ServerMessage) {
-        for client in self.clients() {
-            self.send_msg(client, msg);
+    /// One message to many sessions, encoded and framed once: the
+    /// sends share the bytes. Each recipient used to get its own
+    /// encoding and its own copy (review P2-32).
+    fn send_to(&mut self, recipients: &[ClientId], msg: &ServerMessage) {
+        debug_assert!(
+            !msg.is_upload_chunk(),
+            "image chunks go through relay_image"
+        );
+        let Some(encoded) = protocol::encode_server_message(msg) else {
+            warn!(
+                "a {} message for {} sessions exceeds {} bytes and was not sent",
+                msg.lane(),
+                recipients.len(),
+                protocol::MAX_CONTROL_MESSAGE_BYTES
+            );
+            return;
+        };
+        let needs = msg.required_feature();
+        let shared = Shared::new(msg.lane(), &encoded);
+        for &client in recipients {
+            if needs != 0 && !self.has_feature(client, needs) {
+                continue;
+            }
+            self.stats.bytes_sent += encoded.len() as u64;
+            if let Err(e) = self.driver.send_shared(self.now, client, &shared) {
+                debug!("send to {client:#x} on {} failed: {e}", msg.lane());
+            }
         }
     }
 
+    fn broadcast_msg(&mut self, msg: &ServerMessage) {
+        let everyone = std::mem::take(&mut self.roster);
+        self.send_to(&everyone, msg);
+        self.roster = everyone;
+    }
+
     fn broadcast_msg_except(&mut self, except: ClientId, msg: &ServerMessage) {
-        for client in self.clients() {
-            if client != except {
-                self.send_msg(client, msg);
-            }
-        }
+        let others: Vec<ClientId> = self
+            .roster
+            .iter()
+            .copied()
+            .filter(|client| *client != except)
+            .collect();
+        self.send_to(&others, msg);
     }
 
     /// The next server-assigned chat message id and its wall-clock
@@ -1485,24 +1556,37 @@ impl ChatServer {
                     self.apply_reloaded_policy(*policy);
                 }
                 Notice::RefsReleased(released) => self.release_blob_refs(&released),
-                Notice::FilesPruned(files) => self.forget_pruned_files(&files),
+                Notice::Pruned {
+                    history_cutoff,
+                    released,
+                    files,
+                } => self.apply_prune(history_cutoff, &released, &files),
             }
         }
         for (id, outcome) in polled.answers {
-            if self.is_blob_ask(id) {
-                self.resolve_blob_answer(id, outcome);
-            } else if self.is_dm_ask(id) {
-                self.resolve_dm_answer(id, outcome);
-            } else if self.is_conversations_ask(id) {
-                self.resolve_conversations_answer(id, outcome);
-            } else if self.is_audit_ask(id) {
-                self.resolve_audit_answer(id, outcome);
-            } else if self.is_report_ask(id) {
-                self.resolve_report_answer(id, outcome);
-            } else if self.is_report_list_ask(id) {
-                self.resolve_report_list_answer(id, outcome);
-            } else {
-                self.resolve_history_answer(id, outcome);
+            // An answer to a read nobody noted is nobody's: it used to
+            // be taken for a history page.
+            let Some(waiting) = self.waiting.remove(&id) else {
+                continue;
+            };
+            match waiting {
+                Waiting::History {
+                    client,
+                    conv,
+                    limit,
+                } => self.resolve_history_answer(client, conv, limit, outcome),
+                Waiting::Dm(pending) => self.resolve_dm_answer(&pending, outcome),
+                Waiting::Conversations(client) => {
+                    self.resolve_conversations_answer(client, outcome);
+                }
+                Waiting::Audit { client, request_id } => {
+                    self.resolve_audit_answer(client, request_id, outcome);
+                }
+                Waiting::Report(pending) => self.resolve_report_answer(pending, outcome),
+                Waiting::ReportList { client, request_id } => {
+                    self.resolve_report_list_answer(client, request_id, outcome);
+                }
+                Waiting::Blob(blob_id) => self.resolve_blob_answer(blob_id, outcome),
             }
         }
     }
@@ -1786,7 +1870,9 @@ impl ChatServer {
 
     fn handle_client_connected(&mut self, client_id: ClientId, username: String) {
         info!("{username} ({client_id:#x}) connected (in the lobby)");
-        self.usernames.insert(client_id, username);
+        if self.usernames.insert(client_id, username).is_none() {
+            self.roster.push(client_id);
+        }
         // Everyone lands in the default channel (config guarantees it
         // is open and unlimited) — the lobby (spec §12, 1.1.5): nobody
         // is told until they join a channel, which is when `announce`
@@ -1824,28 +1910,9 @@ impl ChatServer {
         };
         self.send_msg(client_id, &init);
 
-        // Only announce streams the new client may actually watch:
-        // channel-scoped shares outside the default channel are
-        // invisible from where they land.
-        let sharers: Vec<(ClientId, ShareInfo)> = self
-            .video
-            .sharers()
-            .iter()
-            .map(|(id, info)| (*id, *info))
-            .collect();
-        for (sharer_id, info) in sharers {
-            if self.share_visible_from(info, sharer_id, self.default_channel) {
-                self.send_msg(
-                    client_id,
-                    &ServerMessage::ScreenShareStarted {
-                        client_id: sharer_id,
-                        width: info.width,
-                        height: info.height,
-                        scope: info.scope,
-                    },
-                );
-            }
-        }
+        // No streams are announced here: a session arrives in the
+        // lobby, which sees none (spec §12); `announce` tells it about
+        // the ones it can watch when it joins a channel.
 
         let states: Vec<(ClientId, (bool, bool))> = self
             .audio_states
@@ -1878,7 +1945,7 @@ impl ChatServer {
             .map(|(c, u)| self.user_details(*c, u))
             .collect();
         for msg in details {
-            self.send_if_roles(client_id, &msg);
+            self.send_msg(client_id, &msg);
         }
         // Everyone's look, ours included (the server's copy is the
         // one that follows the key), for sessions that render it.
@@ -1889,7 +1956,7 @@ impl ChatServer {
             .map(|(c, u)| self.user_profile(*c, u))
             .collect();
         for msg in profiles {
-            self.send_if_profiles(client_id, &msg);
+            self.send_msg(client_id, &msg);
         }
         // Everyone's progress, ours included (the newcomer's own bar
         // needs its xp too), for sessions that render it.
@@ -1900,7 +1967,7 @@ impl ChatServer {
             .map(|(c, u)| self.user_progress(*c, u))
             .collect();
         for msg in progress {
-            self.send_if(client_id, features::PROGRESS_ALL, &msg);
+            self.send_msg(client_id, &msg);
         }
         self.refresh_enforcement();
     }
@@ -1925,15 +1992,15 @@ impl ChatServer {
         if let Some(user_id) = self.user_of.get(&client_id).copied() {
             let msg = self.user_details(client_id, &user_id);
             for peer in self.clients() {
-                self.send_if_roles(peer, &msg);
+                self.send_msg(peer, &msg);
             }
             let msg = self.user_profile(client_id, &user_id);
             for peer in self.clients() {
-                self.send_if_profiles(peer, &msg);
+                self.send_msg(peer, &msg);
             }
             let msg = self.user_progress(client_id, &user_id);
             for peer in self.clients() {
-                self.send_if(peer, features::PROGRESS_ALL, &msg);
+                self.send_msg(peer, &msg);
             }
         }
         if let Some((muted, deafened)) = self.audio_states.get(&client_id).copied() {
@@ -2031,6 +2098,7 @@ impl ChatServer {
             .usernames
             .remove(&client_id)
             .unwrap_or_else(|| format!("User{client_id:x}"));
+        self.roster.retain(|c| *c != client_id);
         self.features_of.remove(&client_id);
         self.chat_tokens.remove(&client_id);
         self.last_activity.remove(&client_id);
@@ -2094,10 +2162,14 @@ impl ChatServer {
 
     // ── Control-plane messages ──────────────────────────────────────
 
-    fn process_control_messages(&mut self) {
+    fn process_control_messages(&mut self, readable: &[ClientId]) {
         // Pending connections: exactly one Control frame matters — the
         // Hello. Anything else they send before admission is discarded.
-        let pending: Vec<ClientId> = self.pending.keys().copied().collect();
+        let pending: Vec<ClientId> = readable
+            .iter()
+            .copied()
+            .filter(|peer| self.pending.contains_key(peer))
+            .collect();
         for peer in pending {
             if let Some(raw) = self.driver.recv(peer, Lane::Control) {
                 self.handle_hello(peer, &raw);
@@ -2108,7 +2180,11 @@ impl ChatServer {
             while self.driver.recv_video(peer).is_some() {}
         }
 
-        for client_id in self.clients() {
+        for &client_id in readable {
+            // Admitted — just now, by the Hello above, counts.
+            if !self.usernames.contains_key(&client_id) {
+                continue;
+            }
             for lane in [Lane::Control, Lane::Signal, Lane::Media] {
                 while let Some(message) = self.driver.recv(client_id, lane) {
                     self.stats.bytes_received += message.len() as u64;
@@ -2362,10 +2438,10 @@ impl ChatServer {
                     return;
                 };
                 let perms = self.effective_permissions(&user_id);
-                let role = grants_role.unwrap_or(policy::default_invite_role());
+                let role = grants_role.unwrap_or(permissions::ROLE_GUEST);
                 let manage = permissions::has(perms, permissions::MANAGE_INVITES);
                 if !permissions::has(perms, permissions::CREATE_INVITES)
-                    || (role != policy::default_invite_role() && !manage)
+                    || (role != permissions::ROLE_GUEST && !manage)
                 {
                     self.send_msg(
                         client_id,
@@ -2418,11 +2494,15 @@ impl ChatServer {
                     self.handle_list_reports(client_id, request_id, resolved);
                     return;
                 }
+                // What one command writes — a kick is the keys, each
+                // role and the audit line — is one transaction.
+                self.persist.begin_group();
                 let result = if let AdminCommand::ResolveReport { id } = command {
                     self.handle_resolve_report(client_id, id)
                 } else {
                     self.handle_admin(client_id, command)
                 };
+                self.persist.end_group();
                 self.send_admin_result(client_id, request_id, result);
             }
 
@@ -2947,17 +3027,6 @@ impl ChatServer {
             .collect()
     }
 
-    /// Can a client in `viewer_channel` see this stream?
-    fn share_visible_from(&self, info: ShareInfo, sharer: ClientId, viewer_channel: u16) -> bool {
-        if viewer_channel == self.default_channel {
-            return false; // the lobby sees no streams
-        }
-        match info.scope {
-            ShareScope::Everyone => true,
-            ShareScope::Channel => self.channel_of.get(&sharer).copied() == Some(viewer_channel),
-        }
-    }
-
     /// Unsubscribe every viewer of `sharer` who is not in `channel`,
     /// telling each their view of the stream ended.
     fn evict_out_of_channel_viewers(&mut self, sharer: ClientId, channel: Option<u16>) {
@@ -3150,16 +3219,25 @@ impl ChatServer {
             };
             let voice = self.voice.seq.take_window(client_id).unwrap_or_default();
             let rtt_ms = stats.rtt.as_millis().min(u128::from(u32::MAX)) as u32;
-            self.send_msg(
-                client_id,
-                &ServerMessage::VoiceReceiverReport {
-                    received: voice.received,
-                    expected: voice.expected,
-                    lost: voice.lost(),
-                    late: voice.late,
-                    rtt_ms,
-                },
-            );
+            // Nothing of its voice was due: a report of nothing, to a
+            // session that said it can do without (`QUIET_REPORTS`), is
+            // a packet every two seconds for as long as a phone sits in
+            // the lobby — and its radio never rests (review P2-49).
+            let quiet = voice.expected == 0
+                && voice.received == 0
+                && self.has_feature(client_id, features::QUIET_REPORTS);
+            if !quiet {
+                self.send_msg(
+                    client_id,
+                    &ServerMessage::VoiceReceiverReport {
+                        received: voice.received,
+                        expected: voice.expected,
+                        lost: voice.lost(),
+                        late: voice.late,
+                        rtt_ms,
+                    },
+                );
+            }
             if logging {
                 self.link_voice.entry(client_id).or_default().add(&voice);
             }
@@ -3245,11 +3323,13 @@ impl ChatServer {
     fn print_stats(&self) {
         info!("=== {} Statistics ===", self.config.server.name);
         info!(
-            "Connected clients: {} (admitted {}, refused {}, transport-refused {})",
+            "Connected clients: {} (admitted {}, refused {}, transport-refused {}, \
+             address checks {})",
             self.usernames.len(),
             self.stats.admitted,
             self.stats.refused,
             self.driver.refused_count(),
+            self.driver.retried_count(),
         );
         info!("Text messages: {}", self.stats.messages_count);
         info!("{}", self.persist.stats());
@@ -3555,6 +3635,25 @@ mod wake_tests {
         server.update(Instant::now());
         let wait = server.next_wake().saturating_duration_since(now);
         assert!(wait > ASK_POLL, "the answer was collected: {wait:?}");
+    }
+}
+
+/// Connections one address may hold in the waiting room at once: a
+/// household behind one NAT reconnecting together after a restart
+/// fits; one host opening connections in a loop does not fill the room.
+const WAITING_PER_ADDRESS: usize = 8;
+
+/// The seats for connections that have not said `Hello` yet, beside
+/// `max_clients` for the people who are in. The transport used to
+/// count both against `max_clients`: a full server refused the next
+/// handshake outright, so `ServerFull` never reached anyone, a user
+/// returning after a blackout could not replace their own stale
+/// session, and connections that never spoke took the seats of people
+/// (review P3-5, plan SEC-2). A quarter again, between 16 and 64.
+fn waiting_room(max_clients: usize) -> WaitingRoom {
+    WaitingRoom {
+        seats: (max_clients / 4).clamp(16, 64),
+        per_address: WAITING_PER_ADDRESS,
     }
 }
 

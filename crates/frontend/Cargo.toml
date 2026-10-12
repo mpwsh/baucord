@@ -6,9 +6,9 @@ name = "frontend"
 # no behaviour change; the host-specific modules (tray, hotkeys,
 # clipboard, single instance, updater, share windows) still live here
 # behind the `desktop` feature until the platform trait replaces them.
-version = "1.2.1"
-edition = "2024"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true

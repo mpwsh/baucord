@@ -83,8 +83,12 @@ lanes frame messages with a `u32` little-endian length prefix
 (`protocol::frame`); datagrams are one packet each.
 
 `ClientMessage::lane()` / `ServerMessage::lane()` is the single place
-that decides which lane a message rides. Adding a message means adding
-it there too — the match is exhaustive on purpose.
+that decides which lane a message rides. The match names every variant
+(no `_` arm), so a new message does not compile until its lane is
+chosen there; `is_upload_chunk()` is "rides the Media lane".
+`ServerMessage::required_feature()` is the same kind of table for the
+capability bit a session must have negotiated to be sent the message
+(below).
 
 ### Messages
 
@@ -106,23 +110,33 @@ feature bit. Chat messages carry a server-assigned `id` and `ts`;
 relayed images carry a SHA-256 of the whole image, verified on
 completion.
 
+The wire is pinned by `protocol/tests/wire_golden.rs`: every wire enum's
+variants in order, and every variant's and struct's layout (decoded
+from fixed byte patterns and compared with tables written when it
+shipped). A variant inserted mid-enum or a field added to a shipped
+message fails there, which no round-trip test can catch.
+
 ### Versioning
 
 - Breaking wire change → bump `protocol::ALPN` (`baucord/1`). Mismatched
   peers fail the TLS handshake and the client shows `OUTDATED_MESSAGE`.
 - Additive capability → a bit in `protocol::features`, offered in
   `Hello`, announced in `Welcome`, `negotiate()`d to the intersection.
-  Bits run up to `SAFETY` (17) in 1.2; every appended variant gets a
-  new one, since a client that negotiated an older bit cannot decode
-  it (PERSISTENCE-SPEC §12).
+  Bits run up to `QUIET_REPORTS` (18) in 1.2.1; every appended variant
+  gets a new one, since a client that negotiated an older bit cannot
+  decode it (PERSISTENCE-SPEC §12). The server enforces this in one
+  place: `send_msg` drops a message whose `required_feature()` the
+  session did not negotiate. `QUIET_REPORTS` adds no message: a client
+  with it is sent no `VoiceReceiverReport` for an interval in which
+  the relay expected none of its voice.
 
 ### Media packing
 
 `voice.rs`, `video.rs`, `system_audio.rs` define the packet headers the
 media threads produce and the relay validates (`parse_*`). The relay
 never decodes media; it prefixes each packet with the authenticated
-sender id (`relayed::wrap_sender` / `split_sender`) so a client cannot
-spoof another's audio.
+sender id (the layout of `relayed::wrap_sender` / `split_sender`) so a
+client cannot spoof another's audio.
 
 ## 4. Transport (`crates/transport`)
 
@@ -130,8 +144,10 @@ spoof another's audio.
 
 `Driver` wraps a `quinn_proto::Endpoint` plus a peer table. Both roles
 use it: `Driver::new_client(pin, Budget::client())` and
-`Driver::new_server(&identity, max_peers, Budget::server())`. The
-caller's loop is always the same four calls:
+`Driver::new_server(&identity, max_peers, Budget::server())` — the
+latter, with `ServerIdentity` and its `rcgen` dependency, behind the
+crate's `server` feature, which clients do not enable. The caller's
+loop is always the same four calls:
 
 ```rust
 udp.recv_batch(|d| driver.handle_datagram(now, d));   // in
@@ -154,8 +170,27 @@ Application-facing API, per peer: `send(now, peer, lane, bytes)`,
 `recv(peer, lane)`, `send_video` / `video_new_group` / `video_finish_group`
 / `video_reset_group` / `recv_video`, `send_media(frames)` with
 `upload_progress`, `close` / `close_after`, `export_keying_material`,
-`stats(peer) -> LinkStats`, and `drain_events()` yielding `Connected`,
-`Disconnected { reason }`, `DatagramsBlocked`.
+`stats(peer) -> LinkStats`, `track_stats(peer, track)`, and
+`drain_events()` yielding `Connected`, `Disconnected { reason }`,
+`DatagramsBlocked`. `readable()` lists the peers with anything to
+`recv`, so a server asks only those.
+
+A send queues and marks the peer; the peer's connection is drained
+once, when the loop next calls `poll_transmit` (or `handle_timeouts` /
+`next_deadline`). So what one pass queues for a peer — five voice
+packets and a control frame — leaves as one UDP datagram, and a
+keyframe relayed in thirty chunks is one drain, not thirty.
+`handle_timeouts` touches only peers that are marked or whose deadline
+has come. For a payload going to many peers, `Shared::new` /
+`Shared::relayed` puts it on the wire once and `send_shared` /
+`send_video_shared` share the bytes; stream data is handed to quinn by
+reference (`write_chunks`).
+
+A server driver built `with_waiting_room` keeps connections its
+application has not admitted (`Driver::admit`) apart from the
+admitted: a few seats of their own, a cap per address (an IPv6 /64
+counts as one), and a QUIC Retry — proof of the source address — once
+half are taken. `max_peers` is then for the application to enforce.
 
 `DisconnectReason` is the one type the app reasons about:
 `LocallyClosed`, `ApplicationClosed { code, reason }`, `TimedOut`,
@@ -210,7 +245,9 @@ bulk never fills the bottleneck queue that voice datagrams share.
 ### Budgets
 
 `config::Budget` holds every tunable: idle timeout (30 s both sides),
-client keep-alive (2 s), ACK delay, datagram buffers, stream/connection
+client keep-alive (10 s; it was 2 s until 1.2.1 — the simulator holds
+an idle connection through 40 % loss on it), ACK delay, datagram
+buffers, stream/connection
 receive windows, `send_window`, socket buffer sizes, media pace. Values
 are documented inline with their rationale; change them there, not at
 call sites.
@@ -272,7 +309,11 @@ policy.
 `ChatServer::update(now)`: transport timers → events → control messages
 → expire pending Hellos → voice relay → video relay → system audio →
 periodic reports (stream health 1 s, voice receiver reports 2 s, config
-watch 3 s, stats). The loop then waits on its socket until
+watch 3 s, stats). Only the peers `Driver::readable()` names are asked
+for messages and media; the relays send each packet as one
+`transport::Shared`, and a broadcast is encoded once. Stream health is
+per sharer (`Driver::track_stats`) over the last five reports, so a
+two-second group is never outside the window. The loop then waits on its socket until
 `next_wake()`: the transport's next deadline, a Hello's, the next
 periodic job, at most 1 s — 2 ms while a database read is out, whose
 answer comes on a channel the socket wait cannot see (review P1-2). A
@@ -283,8 +324,11 @@ times a second. The loop never sleeps on a socket backlog.
 
 The device key is the identity and invites are the door
 (PERSISTENCE-SPEC.md §3). A connection is `pending` from `Connected`
-until its first Control frame, which must be `Hello` within 10 s. Then,
-in order:
+until its first Control frame, which must be `Hello` within 10 s; until
+then it sits in the transport's waiting room (§4: a quarter of
+`max_clients` again, between 16 and 64 seats, eight per address), so a
+full server still shakes hands and a returning user can replace their
+own session. Then, in order:
 
 1. per-IP failure rate limit (5 per 60 s → `RateLimited`);
 2. `Auth::Shared` (a 1.0 client) → `BadHello`, not counted;
@@ -301,7 +345,8 @@ in order:
 6. names: unique among users online, case-insensitively, ignoring this
    user's own sessions; a guest cannot take a stored member's name while
    that member is offline → `NameInUse`;
-7. `ServerFull`, again not counting this user's own sessions;
+7. `ServerFull` when `max_clients` sessions are admitted, again not
+   counting this user's own;
 8. this user's own live sessions get `Removed { Replaced }` and yield
    (auto-reconnect after a blackout makes this routine);
 9. a first visit creates the user (`user_id` = the founding key's hash),
@@ -424,9 +469,22 @@ WAL, `synchronous=NORMAL`, `data/baucord/baucord.db`); the tick holds a
   and inserted after — a drop is a hole in history, never a lost
   delivery. Message ids come from the tick's counter, rebased on the
   database's watermark at startup.
-- **Reads** (`Query`) carry a reply channel and a deadline; `Persist::poll`
-  runs once per tick and resolves each as answered or `TimedOut`. A reply
-  that lands after its deadline is discarded.
+- **Reads** (`Query`) carry an id and a deadline; every answer comes
+  back on one channel with its id. `Persist::poll` runs once per tick
+  and resolves each as answered or `TimedOut`; a reply that lands after
+  its deadline is discarded. The tick keeps what each read was for in
+  one table (`Waiting`, keyed by the ask).
+- **Writes that are one event are one transaction.** A first visit
+  (the user, the key, the role, the invite's use, the audit line) and
+  every admin command are bracketed by `Persist::begin_group` /
+  `end_group` and reach the store as one `Command::Together`: all of it
+  lands, in one commit, or none of it.
+- **File reference counts** are kept by the tick and written as it
+  goes. The store recounts them from the rows at every start (live
+  messages and avatars; `messages_blob` index, migration 6), and a
+  retention pass takes off the references of the messages it removes
+  in the same transaction, then tells the tick (`Notice::Pruned`),
+  which drops those messages from its replay ring too.
 - **Telemetry** is coalesced per user on the tick (last wins) and handed
   over as a batch once a second; a full queue hands the batch back.
 - The thread checkpoints the WAL every 60 s, prunes retention windows
@@ -572,9 +630,14 @@ immediately as `TelemetryEvent`.
 ### Settings (`config.rs`)
 
 `Settings` persists to `settings.json`, next to the executable when
-writable (portable) else the platform config dir. `ServerEntry { name,
-address, invite_code, fingerprint, channel_passwords }`, plus the 1.0
-`password`, which is only kept so old files load (servers ignore it).
+writable (portable) else the platform config dir. A save writes a file
+beside it and renames it into place, keeping the previous one as
+`settings.json.bak`; a file that does not parse is set aside as
+`settings.json.corrupt` and the backup (else the defaults) is used —
+never another install's file. `ServerEntry { name, address,
+invite_code, fingerprint, channel_passwords }`. Per-person volume and
+mute are filed under the person's user id (`peer_id_key`), moved there
+from the display name the first time their `UserDetails` arrives.
 The connect card splits a typed `host:port#SHA256:…` into address and
 pin. Malformed pins
 are dropped on load rather than trusted. `load_client_key()` creates

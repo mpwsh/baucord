@@ -29,17 +29,18 @@ val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 // The Cargo workspace: the repo root, one level above android/.
 val workspaceDir = rootProject.layout.projectDirectory.dir("..")
 // The version every platform ships — the public crates move together
-// (SESSION-GUIDE.md §4) — as crates/android/Cargo.toml says it. Read
+// (SESSION-GUIDE.md §4) — as the workspace's Cargo.toml says it, under
+// `[workspace.package]` (its only line that starts so). Read
 // through `providers` so Gradle tracks the file as a configuration
 // input. Not named `versionName`/`version`, which a script val would
 // shadow (or be shadowed by) inside `android { }`.
 val baucordCrateVersion: String = providers
-    .fileContents(workspaceDir.file("crates/android/Cargo.toml"))
+    .fileContents(workspaceDir.file("Cargo.toml"))
     .asText.get()
     .lineSequence()
     .firstOrNull { it.startsWith("version = \"") }
     ?.substringAfter('"')?.substringBefore('"')
-    ?: throw GradleException("crates/android/Cargo.toml has no version line")
+    ?: throw GradleException("Cargo.toml has no version line")
 // One number for AGP's compileSdk and for the android.jar the Rust
 // build compiles Slint's Java helper against (see ANDROID_JAR below).
 // Not named like AGP's own deprecated String property on the android

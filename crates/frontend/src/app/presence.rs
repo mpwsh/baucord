@@ -115,6 +115,33 @@ impl AppState {
         }
     }
 
+    /// Now that we know who a session is: the volume and mute saved
+    /// for that person, whatever they were called when it was saved.
+    /// (At the join only the name is known, and only an entry still
+    /// filed under a name can be found by it — review P2-24.)
+    pub(super) fn apply_saved_peer_audio(&mut self, client_id: u64, user_id: &client::UserId) {
+        if Some(client_id) == self.our_client_id {
+            return;
+        }
+        let Some(name) = self.users.get(&client_id).map(|u| u.username.clone()) else {
+            return;
+        };
+        let (saved, moved) = self.settings.claim_peer_audio(user_id, &name);
+        if moved {
+            self.settings.save();
+        }
+        let Some(saved) = saved else {
+            return;
+        };
+        if let Some(user) = self.users.get_mut(&client_id) {
+            user.audio = peer_audio_from(&saved);
+        }
+        self.voice
+            .tx
+            .send(VoiceControl::SetPeerAudio(client_id, saved))
+            .ok();
+    }
+
     pub(super) fn handle_user_joined(&mut self, client_id: u64, username: String, channel_id: u16) {
         let saved = self
             .settings

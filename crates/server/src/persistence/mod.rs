@@ -420,16 +420,23 @@ pub enum Command {
         by: Option<UserId>,
         ts: WallMs,
     },
+    /// Several writes that are one event — a first visit is the user,
+    /// their key, their role, the invite's use and the audit line —
+    /// in one transaction: all of it lands or none of it, and in one
+    /// commit where each used to take its own (review P3-9). Built by
+    /// [`Persist::begin_group`] … [`Persist::end_group`].
+    Together(Vec<Command>),
 }
 
 impl Command {
     /// Policy writes are few and matter across restarts; a drop is
     /// logged, not just counted.
     fn is_policy(&self) -> bool {
-        !matches!(
-            self,
-            Command::InsertMessage(_) | Command::Telemetry(_) | Command::TelemetryEvent(_)
-        )
+        match self {
+            Command::InsertMessage(_) | Command::Telemetry(_) | Command::TelemetryEvent(_) => false,
+            Command::Together(parts) => parts.iter().any(Command::is_policy),
+            _ => true,
+        }
     }
 }
 
@@ -512,8 +519,10 @@ pub enum Outcome {
 #[expect(clippy::large_enum_variant)]
 enum Request {
     Query {
+        /// Echoed with the answer, on the one channel every answer
+        /// comes back on.
+        id: AskId,
         query: Query,
-        reply: Sender<Answer>,
         /// Set by the tick when the read's deadline passed: nobody
         /// waits for the answer any more.
         gave_up: Arc<AtomicBool>,
@@ -543,10 +552,19 @@ pub enum Notice {
     /// avatar). The tick takes them off its counts, and a file nothing
     /// points at any more goes.
     RefsReleased(Vec<(protocol::BlobId, u32)>),
-    /// The retention prune deleted these unreferenced files. The tick
-    /// drops their metadata, so a later announce of the same bytes is
-    /// asked to upload them again instead of being told they are here.
-    FilesPruned(Vec<protocol::BlobId>),
+    /// A retention pass removed messages or files: the replay ring
+    /// drops what the store no longer has, the file counts lose the
+    /// references those messages held, and the metadata of deleted
+    /// files goes — so a later announce of the same bytes is asked to
+    /// upload them again instead of being told they are here.
+    Pruned {
+        /// Messages older than this left the store.
+        history_cutoff: Option<WallMs>,
+        /// References released, per file.
+        released: Vec<(protocol::BlobId, u32)>,
+        /// Files deleted.
+        files: Vec<protocol::BlobId>,
+    },
 }
 
 /// Handle to a pending read, returned by [`Persist::ask`] and echoed by
@@ -556,7 +574,6 @@ pub struct AskId(u64);
 
 struct PendingAsk {
     id: AskId,
-    rx: Receiver<Answer>,
     deadline: Instant,
     /// Shared with the queued request: set when this read times out,
     /// so the thread skips it. A `StoreDm` reported as failed was
@@ -646,6 +663,12 @@ pub struct StartupInfo {
 pub struct Persist {
     writes: Sender<Envelope>,
     reads: Sender<Request>,
+    /// Every answer, with the ask it is for: one channel for all reads,
+    /// where each read used to make a channel of its own (review
+    /// P2-52). The sender here is for the answers given on the spot (no
+    /// database, a full queue).
+    answers: Receiver<(AskId, Answer)>,
+    answer_now: Sender<(AskId, Answer)>,
     notices: Receiver<Notice>,
     done: Receiver<()>,
     handle: Option<JoinHandle<()>>,
@@ -665,6 +688,10 @@ pub struct Persist {
     reload_due: Option<Instant>,
     /// Snapshots set aside in a row as older than the tick's writes.
     stale_reloads: u32,
+    /// Open [`Self::begin_group`] calls, and the writes sent since the
+    /// first of them.
+    group_depth: u32,
+    group: Vec<Command>,
 }
 
 impl Persist {
@@ -679,6 +706,12 @@ impl Persist {
         let (db, next_message_id, policy, recent) = if settings.enabled {
             let path = PathBuf::from(settings.path.trim());
             let (db, next) = Sqlite::open(&path)?;
+            // Before anything reads the counts: from here on the tick
+            // keeps them, and this is the one moment nothing else does.
+            match db.recount_blob_refs()? {
+                0 => {}
+                n => info!("File reference counts: {n} corrected from the stored messages"),
+            }
             let policy = db.load_policy()?;
             let recent = db.messages_before(ConvKey::General, None, RECENT_RING)?;
             info!(
@@ -700,6 +733,7 @@ impl Persist {
         let capacity = settings.write_queue.max(1);
         let (writes_tx, writes_rx) = bounded(capacity);
         let (reads_tx, reads_rx) = bounded(READ_QUEUE);
+        let (answers_tx, answers_rx) = unbounded();
         let (notices_tx, notices_rx) = unbounded();
         let (done_tx, done_rx) = bounded(1);
         let counters = Arc::new(Counters::default());
@@ -714,6 +748,7 @@ impl Persist {
                     db,
                     writes: writes_rx,
                     reads: reads_rx,
+                    answers: answers_tx.clone(),
                     notices: notices_tx,
                     counters: Arc::clone(&counters),
                     retention: Retention {
@@ -741,6 +776,8 @@ impl Persist {
             Self {
                 writes: writes_tx,
                 reads: reads_tx,
+                answers: answers_rx,
+                answer_now: answers_tx,
                 notices: notices_rx,
                 done: done_rx,
                 handle,
@@ -755,6 +792,8 @@ impl Persist {
                 reload_wanted: false,
                 reload_due: None,
                 stale_reloads: 0,
+                group_depth: 0,
+                group: Vec::new(),
             },
             StartupInfo {
                 next_message_id,
@@ -777,6 +816,10 @@ impl Persist {
         if !self.persistent {
             return;
         }
+        if self.group_depth > 0 {
+            self.group.push(command);
+            return;
+        }
         let policy = command.is_policy();
         if let Err(err) = self.writes.try_send(Envelope::Write(command)) {
             self.dropped_writes += 1;
@@ -788,6 +831,33 @@ impl Persist {
             }
         } else if policy {
             self.policy_sent += 1;
+        }
+    }
+
+    /// Everything [`Self::send`] is given from here to the matching
+    /// [`Self::end_group`] is one event and goes to the store as one
+    /// write ([`Command::Together`]). Calls nest; the outermost pair
+    /// decides.
+    pub fn begin_group(&mut self) {
+        self.group_depth += 1;
+    }
+
+    /// Close [`Self::begin_group`]: the outermost close queues what was
+    /// gathered.
+    pub fn end_group(&mut self) {
+        self.group_depth = self.group_depth.saturating_sub(1);
+        if self.group_depth > 0 {
+            return;
+        }
+        let mut parts = std::mem::take(&mut self.group);
+        match parts.len() {
+            0 => {}
+            1 => {
+                if let Some(only) = parts.pop() {
+                    self.send(only);
+                }
+            }
+            _ => self.send(Command::Together(parts)),
         }
     }
 
@@ -820,26 +890,27 @@ impl Persist {
     pub fn ask(&mut self, query: Query, deadline: Instant) -> AskId {
         let id = AskId(self.next_ask);
         self.next_ask += 1;
-        let (reply, rx) = bounded(1);
         let gave_up = Arc::new(AtomicBool::new(false));
         if self.persistent {
-            if let Err(
-                TrySendError::Full(Request::Query { reply, .. })
-                | TrySendError::Disconnected(Request::Query { reply, .. }),
-            ) = self.reads.try_send(Request::Query {
-                query,
-                reply,
-                gave_up: Arc::clone(&gave_up),
-            }) {
+            if self
+                .reads
+                .try_send(Request::Query {
+                    id,
+                    query,
+                    gave_up: Arc::clone(&gave_up),
+                })
+                .is_err()
+            {
                 // Answer now rather than sit out the deadline.
-                let _ = reply.send(Answer::Failed("read queue full".to_string()));
+                let _ = self
+                    .answer_now
+                    .send((id, Answer::Failed("read queue full".to_string())));
             }
         } else {
-            let _ = reply.send(Answer::Unavailable);
+            let _ = self.answer_now.send((id, Answer::Unavailable));
         }
         self.pending.push(PendingAsk {
             id,
-            rx,
             deadline,
             gave_up,
         });
@@ -850,27 +921,31 @@ impl Persist {
     /// and pick up notices. Called once per tick.
     pub fn poll(&mut self, now: Instant) -> Polled {
         let mut answers = Vec::new();
+        for (id, answer) in self.answers.try_iter() {
+            // An answer nobody waits for any more — it came after its
+            // deadline — is dropped.
+            if let Some(i) = self.pending.iter().position(|ask| ask.id == id) {
+                self.pending.swap_remove(i);
+                answers.push((id, Outcome::Answered(answer)));
+            }
+        }
+        // A thread that ended (it never should before `shutdown`)
+        // answers nothing more: say so now, not at each deadline.
+        let gone = self.handle.as_ref().is_some_and(JoinHandle::is_finished);
         let mut i = 0;
         while i < self.pending.len() {
-            let resolved = match self.pending[i].rx.try_recv() {
-                Ok(answer) => Some(Outcome::Answered(answer)),
-                Err(TryRecvError::Disconnected) => Some(Outcome::Answered(Answer::Failed(
-                    "persistence thread is gone".to_string(),
-                ))),
-                Err(TryRecvError::Empty) if now >= self.pending[i].deadline => {
-                    self.timed_out_reads += 1;
-                    self.pending[i].gave_up.store(true, Ordering::Relaxed);
-                    Some(Outcome::TimedOut)
-                }
-                Err(TryRecvError::Empty) => None,
+            let outcome = if gone {
+                Outcome::Answered(Answer::Failed("persistence thread is gone".to_string()))
+            } else if now >= self.pending[i].deadline {
+                self.timed_out_reads += 1;
+                self.pending[i].gave_up.store(true, Ordering::Relaxed);
+                Outcome::TimedOut
+            } else {
+                i += 1;
+                continue;
             };
-            match resolved {
-                Some(outcome) => {
-                    let ask = self.pending.swap_remove(i);
-                    answers.push((ask.id, outcome));
-                }
-                None => i += 1,
-            }
+            let ask = self.pending.swap_remove(i);
+            answers.push((ask.id, outcome));
         }
         let mut notices = Vec::new();
         for notice in self.notices.try_iter() {
@@ -1000,6 +1075,7 @@ struct Worker {
     db: Sqlite,
     writes: Receiver<Envelope>,
     reads: Receiver<Request>,
+    answers: Sender<(AskId, Answer)>,
     notices: Sender<Notice>,
     counters: Arc<Counters>,
     retention: Retention,
@@ -1064,18 +1140,14 @@ impl Worker {
 
     fn handle_request(&mut self, request: Request) {
         match request {
-            Request::Query {
-                query,
-                reply,
-                gave_up,
-            } => {
+            Request::Query { id, query, gave_up } => {
                 // Timed out while it waited in the queue: the tick has
                 // told the client it failed, so it must not happen now.
                 if gave_up.load(Ordering::Relaxed) {
                     return;
                 }
                 let answer = self.answer(&query);
-                if reply.send(answer).is_ok() {
+                if self.answers.send((id, answer)).is_ok() {
                     self.counters.answered.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1126,8 +1198,36 @@ impl Worker {
         if command.is_policy() {
             self.policy_seen += 1;
         }
+        match self.write(command) {
+            Ok(()) => {
+                self.counters.written.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                self.counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                warn!("persistence write failed: {e}");
+            }
+        }
+    }
+
+    /// A group, as one transaction: the first part that fails undoes
+    /// the ones before it.
+    fn write_together(&mut self, parts: &[Command]) -> Result<(), rusqlite::Error> {
+        self.db.begin()?;
+        match parts.iter().try_for_each(|part| self.write(part)) {
+            Ok(()) => self.db.commit(),
+            Err(e) => {
+                if let Err(undo) = self.db.rollback() {
+                    warn!("a failed group of writes was not rolled back: {undo}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn write(&mut self, command: &Command) -> Result<(), rusqlite::Error> {
         let db = &mut self.db;
-        let result = match command {
+        match command {
+            Command::Together(parts) => self.write_together(parts),
             Command::InsertMessage(row) => db.insert_message(row),
             Command::Telemetry(rows) => db.insert_telemetry(rows),
             Command::TelemetryEvent(row) => db.insert_telemetry_event(row),
@@ -1202,15 +1302,6 @@ impl Worker {
             Command::DeleteBlock { blocker, blocked } => db.delete_block(blocker, blocked),
             Command::InsertReport(row) => db.insert_report(row),
             Command::ResolveReport { id, by, ts } => db.resolve_report(*id, by.as_ref(), *ts),
-        };
-        match result {
-            Ok(()) => {
-                self.counters.written.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                self.counters.write_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("persistence write failed: {e}");
-            }
         }
     }
 
@@ -1230,13 +1321,17 @@ impl Worker {
         if now.duration_since(self.last_prune) >= PRUNE_INTERVAL {
             self.last_prune = now;
             match db.prune_with_files(wall_now(), self.retention) {
-                Ok((0, _)) => {}
-                Ok((removed, files)) => {
-                    self.counters.pruned.fetch_add(removed, Ordering::Relaxed);
-                    info!("Pruned {removed} rows past their retention window");
-                    if !files.is_empty() {
-                        let _ = self.notices.send(Notice::FilesPruned(files));
-                    }
+                Ok(pruned) if pruned.removed == 0 => {}
+                Ok(pruned) => {
+                    self.counters
+                        .pruned
+                        .fetch_add(pruned.removed, Ordering::Relaxed);
+                    info!("Pruned {} rows past their retention window", pruned.removed);
+                    let _ = self.notices.send(Notice::Pruned {
+                        history_cutoff: pruned.history_cutoff,
+                        released: pruned.released,
+                        files: pruned.files,
+                    });
                 }
                 Err(e) => warn!("retention prune failed: {e}"),
             }
@@ -1558,6 +1653,76 @@ mod tests {
         }
         let (db, next) = Sqlite::open(&path).expect("reopen");
         assert_eq!(next, 6);
+        db.close();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A group is one write: all of it lands, in one commit — or, when
+    /// a part fails, none of it does (review P3-9).
+    #[test]
+    fn a_group_of_writes_lands_whole_or_not_at_all() {
+        use protocol::permissions::ROLE_MEMBER;
+        let path = temp_db("group");
+        let path_str = path.to_string_lossy().into_owned();
+        let user = |name: &str| UserRecord {
+            name: name.to_string(),
+            created_at: 1,
+            last_seen: 1,
+            invited_with: None,
+            roles: std::collections::BTreeSet::new(),
+            profile: protocol::Profile::default(),
+        };
+        let (alice, bob, nobody) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        {
+            let (mut p, _) = Persist::spawn(&settings(true, &path_str, 16)).expect("spawn");
+            p.begin_group();
+            p.send(Command::UpsertUser {
+                user_id: alice,
+                user: user("alice"),
+            });
+            // Nested, as an admin command calling a helper that groups.
+            p.begin_group();
+            p.send(Command::GrantRole {
+                user_id: alice,
+                role_id: ROLE_MEMBER,
+                granted_by: None,
+                ts: 1,
+            });
+            p.end_group();
+            assert_eq!(p.stats().queued, 0, "held until the outermost close");
+            p.end_group();
+
+            // The second part names a user who does not exist: the
+            // first part must not survive it.
+            p.begin_group();
+            p.send(Command::UpsertUser {
+                user_id: bob,
+                user: user("bob"),
+            });
+            p.send(Command::GrantRole {
+                user_id: nobody,
+                role_id: ROLE_MEMBER,
+                granted_by: None,
+                ts: 1,
+            });
+            p.end_group();
+            wait_until(|| {
+                let stats = p.stats();
+                stats.written + stats.write_errors == 2
+            });
+            let stats = p.stats();
+            assert_eq!((stats.written, stats.write_errors), (1, 1), "{stats:?}");
+            p.shutdown();
+        }
+        let (db, _) = Sqlite::open(&path).expect("reopen");
+        let policy = db.load_policy().expect("policy");
+        assert!(policy.users[&alice].roles.contains(&ROLE_MEMBER));
+        assert!(
+            !policy.users.contains_key(&bob),
+            "rolled back with its group"
+        );
         db.close();
         if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir_all(dir);

@@ -972,7 +972,6 @@ fn wire(sf: &SettingsSurface<'_>) {
             app.settings.servers.push(ServerEntry {
                 name,
                 address: String::new(),
-                password: None,
                 invite_code: None,
                 fingerprint: None,
                 channel_passwords: std::collections::HashMap::new(),

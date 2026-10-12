@@ -3,9 +3,11 @@
 //! Both relays share the same trust model: media arriving from a client
 //! carries **no sender identity**. The relay validates the packet with
 //! the shared `protocol` parsers (the only parsers that exist — P2-1),
-//! then prepends the sender's authenticated transport id via
-//! [`protocol::wrap_sender`] before fan-out. A client cannot impersonate
-//! another client's voice or video, full stop.
+//! then prepends the sender's authenticated transport id — the layout
+//! of [`protocol::wrap_sender`], built once per packet as a
+//! [`transport::Shared`] that every recipient's send shares — before
+//! fan-out. A client cannot impersonate another client's voice or
+//! video, full stop.
 //!
 //! Video rides *groups* (spec §6.2): the sharer opens one stream per
 //! keyframe, and the relay mirrors each group onto every viewer's
@@ -18,15 +20,13 @@
 //! each viewer fell behind, and that is what `StreamHealth` reports.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
 use log::{debug, info};
-use protocol::{
-    parse_system_audio, parse_video_header, parse_voice, wrap_sender, ClientId, Lane, ShareScope,
-};
-use transport::{Driver, LinkStats, VideoItem};
+use protocol::{parse_system_audio, parse_video_header, parse_voice, ClientId, Lane, ShareScope};
+use transport::{Driver, Shared, TrackStats, VideoItem};
 
 use crate::link_stats::VoiceSeqTracker;
 
@@ -67,6 +67,9 @@ pub struct VoiceRelay {
 #[derive(Clone, Copy)]
 pub struct Room<'a> {
     pub clients: &'a [ClientId],
+    /// The admitted peers with something to read this tick
+    /// ([`Driver::readable`]): the only ones worth asking for voice.
+    pub senders: &'a [ClientId],
     pub deafened: &'a HashSet<ClientId>,
     pub muted: &'a HashSet<ClientId>,
     /// (sender, receiver) pairs whose voice is not relayed: the
@@ -111,6 +114,7 @@ impl VoiceRelay {
     pub fn process(&mut self, driver: &mut Driver, now: Instant, room: &Room<'_>) {
         let Room {
             clients,
+            senders,
             deafened,
             muted,
             blocked,
@@ -118,7 +122,7 @@ impl VoiceRelay {
             lobby,
             channel_of,
         } = *room;
-        for sender in clients {
+        for sender in senders {
             let sender_channel = channel_of.get(sender).copied();
             // A muted sender is told and stops; this is the backstop.
             // One set lookup per sender, before its packets. Voice in
@@ -149,8 +153,9 @@ impl VoiceRelay {
                     continue;
                 }
 
-                // Stamp the authenticated sender once; fan out.
-                let envelope = wrap_sender(*sender, &message);
+                // Stamp the authenticated sender once; fan out the
+                // same bytes.
+                let envelope = Shared::relayed(Lane::Voice, *sender, &message);
                 let mut sent = 0u64;
                 for recipient in clients {
                     if recipient == sender {
@@ -170,7 +175,7 @@ impl VoiceRelay {
                         self.stats.sends_skipped_blocked += 1;
                         continue;
                     }
-                    if driver.send(now, *recipient, Lane::Voice, &envelope).is_ok() {
+                    if driver.send_shared(now, *recipient, &envelope).is_ok() {
                         sent += 1;
                     }
                 }
@@ -246,15 +251,23 @@ pub struct VideoStats {
 /// to the sharer as `ServerMessage::StreamHealth`.
 pub struct StreamHealthReport {
     pub sharer: ClientId,
-    /// Worst "behind" ratio among connected viewers, 0.0–1.0: video
-    /// groups the relay had to abandon for that viewer over groups it
-    /// started, since the last report. Measured on the video itself,
-    /// never on transport ack accounting (spec §6.2).
+    /// Worst "behind" ratio among connected viewers, 0.0–1.0: groups
+    /// of *this* stream the relay had to abandon for that viewer over
+    /// groups it started, across the last [`HEALTH_WINDOW`] reports.
+    /// Measured on the video itself, never on transport ack accounting
+    /// (spec §6.2).
     pub worst_loss: f32,
     /// Worst path RTT among connected viewers, in milliseconds.
     pub worst_rtt_ms: f32,
     pub viewers: u16,
 }
+
+/// How many reports one health figure looks back over. A group is a
+/// whole GOP — two seconds of video on a still screen — so one
+/// one-second interval often saw no group start at all, and a viewer
+/// losing every group read as 0 % in it (review P2-3). Five seconds
+/// always holds at least two.
+const HEALTH_WINDOW: usize = 5;
 
 /// Minimum spacing between keyframe requests forwarded to one sharer.
 /// The **only** authoritative keyframe rate limit in the system: viewer
@@ -279,11 +292,11 @@ pub struct VideoRelay {
     subscribers: HashMap<ClientId, HashSet<ClientId>>,
     /// Last time a keyframe request was forwarded to each sharer.
     keyframe_request_gate: HashMap<ClientId, Instant>,
-    /// Sharers whose current group is open on their viewers' tracks.
-    group_open: HashSet<ClientId>,
-    /// Per-viewer transport counters at the last health report, so the
-    /// report covers one interval.
-    health_baseline: HashMap<ClientId, LinkStats>,
+    /// Each (viewer, sharer) track's group counters at the last
+    /// [`HEALTH_WINDOW`] reports, oldest first: a report is the change
+    /// since the oldest. Per track, so a viewer watching two streams
+    /// does not charge one sharer with the other's losses.
+    health_window: HashMap<(ClientId, ClientId), VecDeque<TrackStats>>,
     pub stats: VideoStats,
 }
 
@@ -300,8 +313,7 @@ impl VideoRelay {
             sharers: HashMap::new(),
             subscribers: HashMap::new(),
             keyframe_request_gate: HashMap::new(),
-            group_open: HashSet::new(),
-            health_baseline: HashMap::new(),
+            health_window: HashMap::new(),
             stats: VideoStats::default(),
         }
     }
@@ -341,10 +353,12 @@ impl VideoRelay {
         if let Some(viewers) = self.subscribers.remove(&client_id) {
             for viewer in viewers {
                 driver.video_finish_group(now, viewer, client_id);
+                driver.video_forget_track(viewer, client_id);
             }
         }
-        self.group_open.remove(&client_id);
         self.keyframe_request_gate.remove(&client_id);
+        self.health_window
+            .retain(|(_, sharer), _| *sharer != client_id);
     }
 
     /// A viewer wants to watch a streamer. Caller enforces caps first.
@@ -370,6 +384,8 @@ impl VideoRelay {
             && subs.remove(&viewer)
         {
             driver.video_reset_group(now, viewer, streamer);
+            driver.video_forget_track(viewer, streamer);
+            self.health_window.remove(&(viewer, streamer));
         }
     }
 
@@ -381,15 +397,16 @@ impl VideoRelay {
             if let Some(viewers) = self.subscribers.remove(&client_id) {
                 for viewer in viewers {
                     driver.video_reset_group(now, viewer, client_id);
+                    driver.video_forget_track(viewer, client_id);
                 }
             }
-            self.group_open.remove(&client_id);
             self.keyframe_request_gate.remove(&client_id);
         }
         for subs in self.subscribers.values_mut() {
             subs.remove(&client_id);
         }
-        self.health_baseline.remove(&client_id);
+        self.health_window
+            .retain(|(viewer, sharer), _| *viewer != client_id && *sharer != client_id);
     }
 
     #[must_use]
@@ -438,8 +455,9 @@ impl VideoRelay {
         &self.sharers
     }
 
-    /// Per-stream viewer health for the periodic `StreamHealth` report,
-    /// over the interval since the previous call.
+    /// Per-stream viewer health for the periodic `StreamHealth` report:
+    /// each viewer's groups of that stream over the last
+    /// [`HEALTH_WINDOW`] calls.
     pub fn stream_health(&mut self, driver: &Driver) -> Vec<StreamHealthReport> {
         let mut reports = Vec::new();
         for (sharer, subs) in &self.subscribers {
@@ -450,16 +468,17 @@ impl VideoRelay {
             let mut worst_rtt_ms = 0f32;
             let mut viewers = 0u16;
             for viewer in subs {
-                let Some(stats) = driver.stats(*viewer) else {
+                let (Some(link), Some(track)) =
+                    (driver.stats(*viewer), driver.track_stats(*viewer, *sharer))
+                else {
                     continue;
                 };
-                let base = self
-                    .health_baseline
-                    .get(viewer)
-                    .copied()
-                    .unwrap_or_default();
-                let started = stats.groups_started.saturating_sub(base.groups_started);
-                let reset = stats.groups_reset.saturating_sub(base.groups_reset);
+                let window = self.health_window.entry((*viewer, *sharer)).or_default();
+                // A viewer new to the stream is measured from zero: the
+                // track's counters started with its subscription.
+                let base = window.front().copied().unwrap_or_default();
+                let started = track.groups_started.saturating_sub(base.groups_started);
+                let reset = track.groups_reset.saturating_sub(base.groups_reset);
                 #[allow(clippy::cast_precision_loss)]
                 let behind = if started == 0 {
                     0.0
@@ -467,11 +486,12 @@ impl VideoRelay {
                     (reset as f32 / started as f32).min(1.0)
                 };
                 worst_loss = worst_loss.max(behind);
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    worst_rtt_ms = worst_rtt_ms.max(stats.rtt.as_secs_f32() * 1000.0);
-                }
+                worst_rtt_ms = worst_rtt_ms.max(link.rtt.as_secs_f32() * 1000.0);
                 viewers = viewers.saturating_add(1);
+                if window.len() == HEALTH_WINDOW {
+                    window.pop_front();
+                }
+                window.push_back(track);
             }
             if viewers > 0 {
                 reports.push(StreamHealthReport {
@@ -482,23 +502,15 @@ impl VideoRelay {
                 });
             }
         }
-        // Next interval starts now, for every viewer of anyone.
-        for subs in self.subscribers.values() {
-            for viewer in subs {
-                if let Some(stats) = driver.stats(*viewer) {
-                    self.health_baseline.insert(*viewer, stats);
-                }
-            }
-        }
         reports
     }
 
     // ── Group relay (called every tick) ─────────────────────────────
 
-    /// Read every sharer's incoming groups and mirror them onto their
-    /// viewers' tracks.
-    pub fn process(&mut self, driver: &mut Driver, now: Instant, clients: &[ClientId]) {
-        for sender in clients {
+    /// Read the incoming groups of `senders` — the admitted peers with
+    /// something to read — and mirror them onto their viewers' tracks.
+    pub fn process(&mut self, driver: &mut Driver, now: Instant, senders: &[ClientId]) {
+        for sender in senders {
             while let Some((_, item)) = driver.recv_video(*sender) {
                 self.relay_video_item(driver, now, *sender, item);
             }
@@ -527,7 +539,6 @@ impl VideoRelay {
         match item {
             VideoItem::GroupStart => {
                 self.stats.groups_received += 1;
-                self.group_open.insert(sender);
                 for viewer in &viewers {
                     driver.video_new_group(now, *viewer, sender);
                     self.stats.groups_relayed += 1;
@@ -545,13 +556,15 @@ impl VideoRelay {
                     self.stats.chunks_dropped_no_subscribers += 1;
                     return;
                 }
-                let envelope = wrap_sender(sender, &message);
+                let envelope = Shared::relayed(Lane::Video, sender, &message);
                 let mut sent = 0u64;
                 for viewer in &viewers {
                     // A viewer whose group was reset simply misses the
                     // rest of it; the next GroupStart reopens.
                     if driver.video_group_open(*viewer, sender)
-                        && driver.send_video(now, *viewer, sender, &envelope).is_ok()
+                        && driver
+                            .send_video_shared(now, *viewer, sender, &envelope)
+                            .is_ok()
                     {
                         sent += 1;
                     }
@@ -562,14 +575,12 @@ impl VideoRelay {
                 }
             }
             VideoItem::GroupEnd => {
-                self.group_open.remove(&sender);
                 for viewer in &viewers {
                     driver.video_finish_group(now, *viewer, sender);
                 }
             }
             VideoItem::GroupReset => {
                 self.stats.groups_reset_by_sharer += 1;
-                self.group_open.remove(&sender);
                 for viewer in &viewers {
                     driver.video_reset_group(now, *viewer, sender);
                 }
@@ -586,9 +597,9 @@ impl VideoRelay {
         &mut self,
         driver: &mut Driver,
         now: Instant,
-        clients: &[ClientId],
+        senders: &[ClientId],
     ) {
-        for client_id in clients {
+        for client_id in senders {
             while let Some(message) = driver.recv(*client_id, Lane::SystemAudio) {
                 self.relay_system_audio(driver, now, *client_id, &message);
             }
@@ -622,13 +633,10 @@ impl VideoRelay {
             }
         };
 
-        let envelope = wrap_sender(sender, message);
+        let envelope = Shared::relayed(Lane::SystemAudio, sender, message);
         let mut sent = 0u64;
         for viewer in viewers {
-            if driver
-                .send(now, viewer, Lane::SystemAudio, &envelope)
-                .is_ok()
-            {
+            if driver.send_shared(now, viewer, &envelope).is_ok() {
                 sent += 1;
             }
         }

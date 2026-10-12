@@ -107,8 +107,8 @@ fi
 # Base.xcconfig includes the file; it is rewritten on every run, so
 # builds from Xcode's window get it too, and the cargo phase refuses to
 # build with a version that disagrees with the crate's.
-VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' "$REPO/crates/ios/Cargo.toml")"
-[ -n "$VERSION" ] || die "no version line in crates/ios/Cargo.toml"
+VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' "$REPO/Cargo.toml")"
+[ -n "$VERSION" ] || die "no version line in Cargo.toml"
 BUILD_NUMBER="$(git -C "$REPO" rev-list --count HEAD 2>/dev/null || echo 1)"
 printf '%s\n' \
   "// Written by ios/run.sh from crates/ios/Cargo.toml and the commit count. Do not edit." \

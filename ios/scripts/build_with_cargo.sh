@@ -56,9 +56,9 @@ fi
 # after a bump, would otherwise ship a stale number.
 # awk reads the file itself and stops at the first match: no pipe into
 # `head`, which pipefail would turn into a silent exit (IOS-SPEC.md D27).
-CRATE_VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' "$REPO/crates/ios/Cargo.toml")"
+CRATE_VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' "$REPO/Cargo.toml")"
 if [ "${MARKETING_VERSION:-}" != "$CRATE_VERSION" ]; then
-  echo "error: the app's version is '${MARKETING_VERSION:-}' but crates/ios/Cargo.toml says $CRATE_VERSION — run ios/run.sh (or ios/run.sh --open) once to refresh Config/Version.xcconfig"
+  echo "error: the app's version is '${MARKETING_VERSION:-}' but Cargo.toml says $CRATE_VERSION — run ios/run.sh (or ios/run.sh --open) once to refresh Config/Version.xcconfig"
   exit 1
 fi
 

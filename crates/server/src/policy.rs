@@ -17,7 +17,7 @@ use std::{
 
 pub use protocol::RestrictionKind;
 use protocol::{
-    permissions::{self, Rank, RoleId, BUILTIN_ROLES, RANK_GUEST, ROLE_GUEST},
+    permissions::{self, Rank, RoleId, BUILTIN_ROLES, RANK_GUEST},
     BlobId, InviteInvalidReason, Profile, UserId,
 };
 
@@ -459,22 +459,9 @@ pub fn generate_invite_code() -> String {
     code
 }
 
-/// Canonical form of a code as a person typed or read it (see
-/// `protocol::invite::normalize_code`).
-#[must_use]
-pub fn normalize_invite_code(input: &str) -> Option<String> {
-    protocol::invite::normalize_code(input)
-}
-
-/// The role a code grants when its creator did not choose.
-#[must_use]
-pub const fn default_invite_role() -> RoleId {
-    ROLE_GUEST
-}
-
 #[cfg(test)]
 mod tests {
-    use protocol::permissions::{ROLE_ADMIN, ROLE_MEMBER, ROLE_ORGANIZER};
+    use protocol::permissions::{ROLE_ADMIN, ROLE_GUEST, ROLE_MEMBER, ROLE_ORGANIZER};
 
     use super::*;
 
@@ -662,15 +649,19 @@ mod tests {
         assert!(code.bytes().all(|b| INVITE_ALPHABET.contains(&b)));
         assert!(!code.contains(['0', 'O', '1', 'l', 'I']));
         assert_eq!(
-            normalize_invite_code("k7fq-2mx9 abcd").as_deref(),
+            protocol::invite::normalize_code("k7fq-2mx9 abcd").as_deref(),
             Some("K7FQ2MX9ABCD")
         );
         assert_eq!(
-            normalize_invite_code("K7FQ2MX9ABC0"),
+            protocol::invite::normalize_code("K7FQ2MX9ABC0"),
             None,
             "0 is not in the alphabet"
         );
-        assert_eq!(normalize_invite_code("K7FQ2MX9ABC"), None, "too short");
+        assert_eq!(
+            protocol::invite::normalize_code("K7FQ2MX9ABC"),
+            None,
+            "too short"
+        );
         assert_ne!(generate_invite_code(), generate_invite_code());
     }
 }

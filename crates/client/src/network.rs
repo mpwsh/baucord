@@ -113,6 +113,9 @@ const UPLINK_LOSS_CLAMP_PCT: f64 = 50.0;
 /// "all clear" (the 2026-09-03 05:07 log: ladder stepped *up* to 24 kbps
 /// during a 90 % loss blackout because the reports had gone stale).
 const REPORT_STALL: Duration = Duration::from_secs(6);
+/// A gap this long between voice packets ends a run of them: the
+/// server's report interval, so every interval of a run held voice.
+const VOICE_RUN_GAP: Duration = Duration::from_secs(2);
 
 /// Longest a relayed image may sit half-assembled before it is
 /// forgotten (its sender vanished or gave up mid-pace).
@@ -633,18 +636,86 @@ pub fn fallback_username(client_id: ClientId) -> String {
 //  NetworkClient — session state
 // ════════════════════════════════════════════════════════════════════════
 
-/// A relayed chat image being reassembled from paced chunks.
-struct IncomingImage {
+/// A relayed chat image or a fetched file, coming in as paced chunks on
+/// one stream — in order, so they are appended to one buffer and hashed
+/// as they come. Each chunk used to be kept apart and the whole joined
+/// and hashed at the end: a 50 MB file was held twice at that moment.
+/// One type for both; images and files each had a copy of this (review
+/// P3-14).
+struct Reassembly {
     count: u32,
-    received: u32,
-    bytes: usize,
+    /// The chunk that comes next.
+    next: u32,
+    bytes: Vec<u8>,
+    hasher: Sha256,
+    /// What the whole must hash to.
     hash: [u8; 32],
-    chunks: Vec<Option<Vec<u8>>>,
     started: Instant,
     /// The percent last reported (blob fetches only).
     last_pct: u8,
     /// When the last chunk came, for the idle window.
     last_chunk: Instant,
+}
+
+/// What a chunk did to its [`Reassembly`].
+enum Folded {
+    /// Taken; more to come.
+    More,
+    /// The last one, and the hash checks out: the bytes.
+    Whole(Vec<u8>),
+    /// Out of turn, over the size cap, or the whole fails its hash:
+    /// the transfer is dead.
+    Broken(&'static str),
+}
+
+impl Reassembly {
+    fn new(count: u32, hash: [u8; 32], now: Instant) -> Self {
+        Self {
+            count,
+            next: 0,
+            bytes: Vec::new(),
+            hasher: Sha256::new(),
+            hash,
+            started: now,
+            last_pct: 0,
+            last_chunk: now,
+        }
+    }
+
+    /// Take chunk `index` of `count`; the whole may be `cap` bytes.
+    fn push(&mut self, index: u32, count: u32, data: &[u8], cap: usize, now: Instant) -> Folded {
+        if count != self.count || index > self.next {
+            return Folded::Broken("a chunk out of turn");
+        }
+        if index < self.next {
+            // Had already: the same file asked for twice comes down two
+            // streams, and both are the same bytes.
+            return Folded::More;
+        }
+        if self.bytes.len() + data.len() > cap {
+            return Folded::Broken("larger than allowed");
+        }
+        self.hasher.update(data);
+        self.bytes.extend_from_slice(data);
+        self.next += 1;
+        self.last_chunk = now;
+        if self.next < self.count {
+            return Folded::More;
+        }
+        let digest: [u8; 32] = std::mem::take(&mut self.hasher).finalize().into();
+        if digest == self.hash {
+            Folded::Whole(std::mem::take(&mut self.bytes))
+        } else {
+            Folded::Broken("its content does not match its hash")
+        }
+    }
+
+    /// How far along, in percent.
+    fn pct(&self) -> u8 {
+        #[allow(clippy::cast_possible_truncation)] // ≤ 100
+        let pct = (u64::from(self.next) * 100 / u64::from(self.count.max(1))) as u8;
+        pct
+    }
 }
 
 /// An announced blob upload waiting for the server's `UploadAccept`.
@@ -721,9 +792,9 @@ pub(crate) struct NetworkClient {
     /// every one reports its own, under its key.
     upload_pct: HashMap<UploadKey, u8>,
     /// Reassembly of relayed images, keyed by (sender, upload id).
-    incoming_images: HashMap<(u64, u32), IncomingImage>,
+    incoming_images: HashMap<(u64, u32), Reassembly>,
     /// Blobs being fetched, keyed by hash (spec §7).
-    incoming_blobs: HashMap<[u8; 32], IncomingImage>,
+    incoming_blobs: HashMap<[u8; 32], Reassembly>,
     /// Blobs announced and waiting for the server's `UploadAccept`, by
     /// upload id: two files dropped together both go.
     pending_blobs: HashMap<u32, PendingBlob>,
@@ -756,6 +827,13 @@ pub(crate) struct NetworkClient {
     /// When the last voice receiver report arrived (admission counts as
     /// the first), for the stall detector.
     last_report: Instant,
+    /// The server sends no report for an interval without our voice
+    /// (`features::QUIET_REPORTS`): silence from it then means nothing.
+    quiet_reports: bool,
+    /// When voice last left, and when the run of it began: reports are
+    /// only missed while we have been sending for a while.
+    voice_sent: Option<Instant>,
+    voice_since: Option<Instant>,
     /// A stall has been reported; cleared when reports resume.
     reports_stalled: bool,
     /// Rings the loop when a datagram arrives, so it can sleep between
@@ -844,6 +922,9 @@ impl NetworkClient {
             datagrams_blocked: 0,
             backlog: false,
             last_report: now,
+            quiet_reports: false,
+            voice_sent: None,
+            voice_since: None,
             reports_stalled: false,
             inbound,
         })
@@ -977,8 +1058,8 @@ impl NetworkClient {
         if self.phase == Phase::Closed {
             return;
         }
+        // Not closed, so connecting or admitted: one flag says which.
         let was_connecting = matches!(self.phase, Phase::Connecting | Phase::AwaitingWelcome);
-        let was_admitted = self.phase == Phase::Admitted;
         self.phase = Phase::Closed;
         // The server closes a connection whose Hello never arrived: on a
         // link losing most packets the handshake can squeak through
@@ -1005,7 +1086,7 @@ impl NetworkClient {
                     detail: "hello not received".to_string(),
                 });
             }
-            transient if transient.is_transient() && (was_admitted || was_connecting) => {
+            transient if transient.is_transient() => {
                 let kind = match transient {
                     DisconnectReason::Reset => LossKind::Reset,
                     _ if was_connecting => LossKind::Unreachable,
@@ -1024,10 +1105,11 @@ impl NetworkClient {
                     observed: observed.to_string(),
                 });
             }
-            DisconnectReason::ApplicationClosed { .. } if was_connecting => {
-                // The server closed under a `Refused`; that verdict was
-                // already reported (or never arrived, in which case say
-                // so).
+            DisconnectReason::ApplicationClosed { .. } => {
+                // The server closed under a `Refused` (or, once
+                // admitted, a `Removed`, which closes the session before
+                // this arrives); that verdict was already reported — or
+                // never arrived, in which case say so.
                 if !self.message_queue.iter().any(|m| {
                     matches!(
                         m,
@@ -1107,6 +1189,7 @@ impl NetworkClient {
         }
         let interval = now.duration_since(self.last_stats_check).as_secs_f64();
         self.last_stats_check = now;
+        self.prune_transfers(now);
         if self.phase != Phase::Admitted {
             return;
         }
@@ -1149,8 +1232,18 @@ impl NetworkClient {
         // No receiver report for a while: the control stream is stalled
         // under loss. Feed the ladder a "bad link" reading so it holds
         // its lowest rung instead of decaying to clean and climbing.
+        // Unless none was due: a server with `QUIET_REPORTS` reports
+        // only on voice it expected, so its silence counts once we have
+        // been sending for as long as a stall takes to show.
         let since_report = now.duration_since(self.last_report);
-        if since_report >= REPORT_STALL {
+        let due = !self.quiet_reports
+            || (self
+                .voice_sent
+                .is_some_and(|at| now.duration_since(at) < VOICE_RUN_GAP)
+                && self
+                    .voice_since
+                    .is_some_and(|at| now.duration_since(at) >= REPORT_STALL));
+        if since_report >= REPORT_STALL && due {
             if !self.reports_stalled {
                 warn!(
                     "No receiver report for {:.0} s (path loss {loss_pct:.0}%); holding the audio ladder down",
@@ -1309,6 +1402,10 @@ impl NetworkClient {
                 );
                 self.last_telemetry = now;
                 self.last_report = now;
+                self.quiet_reports = features::has(
+                    features::negotiate(features::CLIENT_1_1, server_features),
+                    features::QUIET_REPORTS,
+                );
                 self.stats_baseline = self.driver.stats(self.server);
                 self.telemetry_baseline = self.stats_baseline;
                 info!(
@@ -1444,7 +1541,7 @@ impl NetworkClient {
                 // `id` / `ts` repeat on every chunk of one upload; the
                 // last one to land is as good as any.
                 if let Some(image) =
-                    self.accept_image_chunk(now, client_id, upload_id, index, count, hash, data)
+                    self.accept_image_chunk(now, client_id, upload_id, index, count, hash, &data)
                 {
                     let username = self.username_of(client_id);
                     self.message_queue.push(NetworkMessage::ImageMessage {
@@ -1777,7 +1874,7 @@ impl NetworkClient {
                 count,
                 data,
             } => {
-                if let Some(data) = self.accept_blob_chunk(now, blob_id, index, count, data) {
+                if let Some(data) = self.accept_blob_chunk(now, blob_id, index, count, &data) {
                     self.message_queue
                         .push(NetworkMessage::Blob { blob_id, data });
                 }
@@ -2083,9 +2180,8 @@ impl NetworkClient {
 
     /// Fold one relayed chunk into its image; `Some(bytes)` when the
     /// image completes and its content hash checks out. Bounds mirror
-    /// the codec's: chunk counts and total size are capped, a fresh
-    /// `upload_id` from the same sender abandons the old partial, and
-    /// partials older than two minutes are pruned.
+    /// the codec's: chunk counts and total size are capped, and a fresh
+    /// `upload_id` from the same sender abandons the old partial.
     #[allow(clippy::too_many_arguments)]
     fn accept_image_chunk(
         &mut self,
@@ -2095,66 +2191,51 @@ impl NetworkClient {
         index: u32,
         count: u32,
         hash: [u8; 32],
-        data: Vec<u8>,
+        data: &[u8],
     ) -> Option<Vec<u8>> {
         if count == 0 || count > protocol::MAX_IMAGE_CHUNKS || index >= count {
             return None;
         }
-        self.incoming_images
-            .retain(|_, img| now.duration_since(img.started) < IMAGE_PARTIAL_TTL);
         // A newer upload from the same sender obsoletes any partial.
         self.incoming_images
             .retain(|(sender, id), _| *sender != client_id || *id == upload_id);
-
-        let entry = self
-            .incoming_images
-            .entry((client_id, upload_id))
-            .or_insert_with(|| IncomingImage {
-                count,
-                received: 0,
-                bytes: 0,
-                hash,
-                chunks: vec![None; count as usize],
-                started: now,
-                last_pct: 0,
-                last_chunk: now,
-            });
-        if entry.count != count || entry.hash != hash || entry.chunks[index as usize].is_some() {
-            return None; // inconsistent or duplicate — drop
+        let key = (client_id, upload_id);
+        // Only a first chunk starts one: the rest of a transfer that
+        // was dropped must not begin it again from the middle.
+        if index == 0 {
+            self.incoming_images
+                .entry(key)
+                .or_insert_with(|| Reassembly::new(count, hash, now));
         }
-        entry.bytes += data.len();
-        if entry.bytes > protocol::MAX_CHAT_IMAGE_BYTES {
-            self.incoming_images.remove(&(client_id, upload_id));
+        let entry = self.incoming_images.get_mut(&key)?;
+        if entry.hash != hash {
+            self.incoming_images.remove(&key);
             return None;
         }
-        entry.chunks[index as usize] = Some(data);
-        entry.received += 1;
-        if entry.received < entry.count {
-            return None;
+        match entry.push(index, count, data, protocol::MAX_CHAT_IMAGE_BYTES, now) {
+            Folded::More => None,
+            Folded::Whole(image) => {
+                self.incoming_images.remove(&key);
+                Some(image)
+            }
+            Folded::Broken(why) => {
+                self.incoming_images.remove(&key);
+                warn!("Relayed image from {client_id:#x} dropped: {why}");
+                None
+            }
         }
-        let entry = self.incoming_images.remove(&(client_id, upload_id))?;
-        let mut image = Vec::with_capacity(entry.bytes);
-        for chunk in entry.chunks {
-            image.extend_from_slice(&chunk?);
-        }
-        let digest: [u8; 32] = Sha256::digest(&image).into();
-        if digest != entry.hash {
-            warn!("Relayed image from {client_id:#x} failed its content hash; dropped");
-            return None;
-        }
-        Some(image)
     }
 
     /// Fold one fetched chunk into its blob; `Some(bytes)` when whole
-    /// and the hash checks out. Same bounds as images; the hash is the
-    /// blob's id, so nothing else is trusted.
+    /// and the hash checks out. Same bounds as images, with the blob
+    /// ceiling; the hash is the blob's id, so nothing else is trusted.
     fn accept_blob_chunk(
         &mut self,
         now: Instant,
         blob_id: [u8; 32],
         index: u32,
         count: u32,
-        data: Vec<u8>,
+        data: &[u8],
     ) -> Option<Vec<u8>> {
         if count == 0 || count > protocol::MAX_BLOB_CHUNKS || index >= count {
             return None;
@@ -2162,62 +2243,57 @@ impl NetworkClient {
         if self.ignored_blobs.contains(&blob_id) {
             return None;
         }
-        // Idle, not age: a big blob over a slow link outlives the image
-        // window and must not be thrown away mid-transfer.
-        self.incoming_blobs
-            .retain(|_, blob| now.duration_since(blob.last_chunk) < IMAGE_PARTIAL_TTL);
-        let entry = self
-            .incoming_blobs
-            .entry(blob_id)
-            .or_insert_with(|| IncomingImage {
-                count,
-                received: 0,
-                bytes: 0,
-                hash: blob_id,
-                chunks: vec![None; count as usize],
-                started: now,
-                last_pct: 0,
-                last_chunk: now,
-            });
-        if entry.count != count || entry.chunks[index as usize].is_some() {
-            return None;
+        if index == 0 {
+            self.incoming_blobs
+                .entry(blob_id)
+                .or_insert_with(|| Reassembly::new(count, blob_id, now));
         }
-        entry.bytes += data.len();
-        entry.last_chunk = now;
-        // The blob ceiling, not the image one: a 25 MB file used to hit
-        // the image cap at 10 MiB, lose its partial, and start over
-        // from the next chunk — a counter that reset and never landed.
-        if entry.bytes > protocol::MAX_BLOB_BYTES {
-            self.incoming_blobs.remove(&blob_id);
-            self.message_queue
-                .push(NetworkMessage::BlobFailed { blob_id });
-            return None;
-        }
-        entry.chunks[index as usize] = Some(data);
-        entry.received += 1;
-        if entry.received < entry.count {
-            #[allow(clippy::cast_possible_truncation)] // ≤ 100
-            let pct = (u64::from(entry.received) * 100 / u64::from(entry.count)) as u8;
-            if pct != entry.last_pct {
-                entry.last_pct = pct;
-                self.message_queue
-                    .push(NetworkMessage::BlobProgress { blob_id, pct });
+        let entry = self.incoming_blobs.get_mut(&blob_id)?;
+        match entry.push(index, count, data, protocol::MAX_BLOB_BYTES, now) {
+            Folded::More => {
+                let pct = entry.pct();
+                if pct != entry.last_pct {
+                    entry.last_pct = pct;
+                    self.message_queue
+                        .push(NetworkMessage::BlobProgress { blob_id, pct });
+                }
+                None
             }
-            return None;
+            Folded::Whole(bytes) => {
+                self.incoming_blobs.remove(&blob_id);
+                Some(bytes)
+            }
+            Folded::Broken(why) => {
+                self.incoming_blobs.remove(&blob_id);
+                warn!("Fetched file dropped: {why}");
+                self.message_queue
+                    .push(NetworkMessage::BlobFailed { blob_id });
+                None
+            }
         }
-        let entry = self.incoming_blobs.remove(&blob_id)?;
-        let mut bytes = Vec::with_capacity(entry.bytes);
-        for chunk in entry.chunks {
-            bytes.extend_from_slice(&chunk?);
-        }
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        if digest != blob_id {
-            warn!("Fetched blob failed its hash; dropped");
+    }
+
+    /// Give up on transfers that stopped coming: an image two minutes
+    /// after it began, a file two minutes after its last chunk (idle,
+    /// not age: a big file over a slow link outlives the image window).
+    /// On the link-stats tick; this used to run only when a chunk of
+    /// some other transfer arrived, so a partial with no successor
+    /// stayed for the rest of the session.
+    fn prune_transfers(&mut self, now: Instant) {
+        self.incoming_images
+            .retain(|_, image| now.duration_since(image.started) < IMAGE_PARTIAL_TTL);
+        let stalled: Vec<[u8; 32]> = self
+            .incoming_blobs
+            .iter()
+            .filter(|(_, blob)| now.duration_since(blob.last_chunk) >= IMAGE_PARTIAL_TTL)
+            .map(|(id, _)| *id)
+            .collect();
+        for blob_id in stalled {
+            self.incoming_blobs.remove(&blob_id);
+            warn!("Fetched file dropped: nothing more of it came");
             self.message_queue
                 .push(NetworkMessage::BlobFailed { blob_id });
-            return None;
         }
-        Some(bytes)
     }
 
     /// Announce a blob (spec §7): the server answers whether it needs
@@ -2334,6 +2410,13 @@ impl NetworkClient {
     ) {
         match pack_voice_with_flags(seq, ts_48k, flags, payload) {
             Some(packet) => {
+                if self
+                    .voice_sent
+                    .is_none_or(|at| now.duration_since(at) >= VOICE_RUN_GAP)
+                {
+                    self.voice_since = Some(now);
+                }
+                self.voice_sent = Some(now);
                 if let Err(e) = self.driver.send(now, self.server, Lane::Voice, &packet) {
                     log::debug!("voice packet seq={seq} not sent: {e}");
                 }
@@ -3133,6 +3216,43 @@ fn handle_control(
     true
 }
 
+/// Whether anyone can see the app (`set_ui_visible`): what only feeds
+/// the screen is not sent to it otherwise.
+static UI_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The app went off screen (a phone in the background) or came back.
+/// Off screen the link stats are not handed to the UI: they were a wake
+/// of its thread every two seconds to redraw a line nobody could see
+/// (review P2-48). Any thread.
+pub fn set_ui_visible(visible: bool) {
+    UI_VISIBLE.store(visible, Ordering::Relaxed);
+}
+
+/// Events worth a warning, said once and then counted: at most a line
+/// every [`Self::EVERY`], with how many there were since the last.
+#[derive(Default)]
+struct Tally {
+    count: u32,
+    said: Option<Instant>,
+}
+
+impl Tally {
+    const EVERY: Duration = Duration::from_secs(5);
+
+    /// One more. The count to report, when a line is due.
+    fn note(&mut self, now: Instant) -> Option<u32> {
+        self.count += 1;
+        if self
+            .said
+            .is_some_and(|at| now.duration_since(at) < Self::EVERY)
+        {
+            return None;
+        }
+        self.said = Some(now);
+        Some(std::mem::take(&mut self.count))
+    }
+}
+
 /// Route one message from the session to whoever consumes it: media
 /// and link feedback to the voice/screen threads (hot paths, bypassing
 /// the app), everything else to the app.
@@ -3144,6 +3264,7 @@ fn route_message(
     voice_tx: &Sender<VoiceControl>,
     screen_tx: &Sender<ScreenControl>,
     wake: &WakeFn,
+    frames_dropped: &mut Tally,
 ) {
     match msg {
         // Voice → the engine, stamped here at the socket read (review
@@ -3185,7 +3306,12 @@ fn route_message(
                 timestamp_ms,
                 data,
             }) {
-                warn!("Screen channel full, dropped frame seq={seq} keyframe={is_keyframe} - {e}");
+                // Once, then counted: a screen thread that is behind
+                // drops every frame, and each was a line (review P3-15).
+                log::debug!("Screen channel: dropped frame seq={seq} keyframe={is_keyframe}: {e}");
+                if let Some(n) = frames_dropped.note(Instant::now()) {
+                    warn!("The screen thread is behind: {n} video frame(s) dropped before it");
+                }
             }
         }
 
@@ -3230,7 +3356,8 @@ fn route_message(
 
         // Keyframe request from a viewer → screen thread
         NetworkMessage::KeyframeRequested { viewer_id } => {
-            info!("Keyframe requested by viewer {viewer_id:#x}");
+            // The sharer's summary line counts these (review P3-15).
+            debug!("Keyframe requested by viewer {viewer_id:#x}");
             let _ = screen_tx.try_send(ScreenControl::ForceKeyframe);
         }
 
@@ -3269,10 +3396,13 @@ fn route_message(
             });
         }
 
-        // Link stats → app (UI only).
+        // Link stats → app (UI only): nothing to show them on while
+        // the app is off screen.
         NetworkMessage::NetworkStats { .. } => {
-            let _ = msg_tx.send(msg);
-            wake();
+            if UI_VISIBLE.load(Ordering::Relaxed) {
+                let _ = msg_tx.send(msg);
+                wake();
+            }
         }
 
         // Viewer health for our stream → screen thread (sharer's stats)
@@ -3354,6 +3484,7 @@ enum Woke {
     Gone,
 }
 
+#[allow(clippy::too_many_lines)] // one loop: wait, commands, media, voice, poll
 fn run_network_loop(
     control_rx: &Receiver<NetworkControl>,
     media_rx: &Receiver<MediaOut>,
@@ -3366,6 +3497,7 @@ fn run_network_loop(
     let mut voice: Option<VoiceLink> = None;
     let no_voice = crossbeam_channel::never::<AudioPacket>();
     let no_inbound = crossbeam_channel::never::<()>();
+    let mut frames_dropped = Tally::default();
     let mut running = true;
 
     while running {
@@ -3476,7 +3608,15 @@ fn run_network_loop(
         if let Some(c) = &mut client {
             c.update();
             for msg in c.poll_messages() {
-                route_message(msg, msg_tx, voice.as_ref(), voice_tx, screen_tx, wake);
+                route_message(
+                    msg,
+                    msg_tx,
+                    voice.as_ref(),
+                    voice_tx,
+                    screen_tx,
+                    wake,
+                    &mut frames_dropped,
+                );
             }
             if c.is_closed() {
                 // The reason was already reported by the session.
@@ -3532,4 +3672,85 @@ fn send_voice(client: Option<&mut NetworkClient>, link: Option<&VoiceLink>, pack
         flags,
         &packet.opus_data,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn whole(parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update(part);
+        }
+        hasher.finalize().into()
+    }
+
+    #[test]
+    fn chunks_in_order_make_the_whole_and_it_is_checked() {
+        let now = Instant::now();
+        let parts: [&[u8]; 3] = [&[1; 100], &[2; 100], &[3; 7]];
+        let mut r = Reassembly::new(3, whole(&parts), now);
+        assert!(matches!(r.push(0, 3, parts[0], 1000, now), Folded::More));
+        assert_eq!(r.pct(), 33);
+        assert!(matches!(r.push(1, 3, parts[1], 1000, now), Folded::More));
+        let Folded::Whole(bytes) = r.push(2, 3, parts[2], 1000, now) else {
+            panic!("the last chunk completes it");
+        };
+        assert_eq!(bytes, parts.concat());
+
+        // The same chunks under another hash: refused at the end.
+        let mut r = Reassembly::new(3, [0; 32], now);
+        let _ = r.push(0, 3, parts[0], 1000, now);
+        let _ = r.push(1, 3, parts[1], 1000, now);
+        assert!(matches!(
+            r.push(2, 3, parts[2], 1000, now),
+            Folded::Broken(_)
+        ));
+    }
+
+    #[test]
+    fn a_chunk_out_of_turn_or_past_the_cap_breaks_the_transfer() {
+        let now = Instant::now();
+        let mut r = Reassembly::new(3, [0; 32], now);
+        assert!(matches!(
+            r.push(1, 3, &[1; 10], 1000, now),
+            Folded::Broken(_)
+        ));
+        let mut r = Reassembly::new(3, [0; 32], now);
+        assert!(matches!(r.push(0, 3, &[1; 10], 1000, now), Folded::More));
+        // The same chunk again (a second stream of the same file) is
+        // passed over; a gap is the end.
+        assert!(matches!(r.push(0, 3, &[1; 10], 1000, now), Folded::More));
+        assert_eq!(r.bytes.len(), 10);
+        assert!(matches!(
+            r.push(2, 3, &[1; 10], 1000, now),
+            Folded::Broken(_)
+        ));
+        let mut r = Reassembly::new(3, [0; 32], now);
+        assert!(matches!(
+            r.push(0, 4, &[1; 10], 1000, now),
+            Folded::Broken(_)
+        ));
+        let mut r = Reassembly::new(3, [0; 32], now);
+        assert!(matches!(r.push(0, 3, &[1; 600], 1000, now), Folded::More));
+        assert!(matches!(
+            r.push(1, 3, &[1; 600], 1000, now),
+            Folded::Broken(_)
+        ));
+    }
+
+    #[test]
+    fn warnings_are_said_once_then_counted() {
+        let t0 = Instant::now();
+        let mut tally = Tally::default();
+        assert_eq!(tally.note(t0), Some(1), "the first, at once");
+        assert_eq!(tally.note(t0 + Duration::from_secs(1)), None);
+        assert_eq!(tally.note(t0 + Duration::from_secs(2)), None);
+        assert_eq!(
+            tally.note(t0 + Tally::EVERY),
+            Some(3),
+            "the two in between and this one"
+        );
+    }
 }

@@ -80,12 +80,6 @@ impl Decoder {
         self.buf.extend_from_slice(data);
     }
 
-    /// Bytes buffered but not yet yielded (partial frame).
-    #[must_use]
-    pub fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-
     /// The next complete frame, if one is buffered.
     ///
     /// # Errors

@@ -63,9 +63,9 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
-          CRATE=$(awk -F'"' '/^version *=/ { print $2; exit }' crates/server/Cargo.toml)
+          CRATE=$(awk -F'"' '/^version *=/ { print $2; exit }' Cargo.toml)
           if [ "$CRATE" != "$VERSION" ]; then
-            echo "::error::$TAG does not match crates/server version ($CRATE)"
+            echo "::error::$TAG does not match the version in Cargo.toml ($CRATE)"
             exit 1
           fi
           LATEST=true

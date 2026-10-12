@@ -17,7 +17,6 @@ use protocol::{
         AdminCommand, AdminError, AdminOutcome, AdminTarget, InviteSummary, KeySummary,
         RestrictionSummary, UserSummary,
     },
-    features,
     permissions::{self, RoleId},
     ClientId, RemovedKind, RestrictionKind, RoleInfo, ServerMessage, UserId,
 };
@@ -105,7 +104,7 @@ impl ChatServer {
                 reason.as_str()
             }
         );
-        self.send_if_roles(
+        self.send_msg(
             client,
             &ServerMessage::Restricted {
                 kind,
@@ -154,7 +153,7 @@ impl ChatServer {
             {
                 let msg = ServerMessage::RestrictionLifted { kind: r.kind };
                 for client in self.sessions_of(&user) {
-                    self.send_if_roles(client, &msg);
+                    self.send_msg(client, &msg);
                 }
             }
         }
@@ -241,7 +240,7 @@ impl ChatServer {
             .collect();
         for (subject, msg) in details {
             for peer in self.audience_about(subject) {
-                self.send_if_roles(peer, &msg);
+                self.send_msg(peer, &msg);
             }
         }
         // A session whose own permission set moved hears it, so its
@@ -263,13 +262,13 @@ impl ChatServer {
             })
             .collect();
         for (client, session) in sessions {
-            self.send_if_roles(client, &session);
+            self.send_msg(client, &session);
         }
         // The table itself, when it changed (`server role`).
         if old.roles != self.policy.roles {
             let roles = self.role_list();
             for peer in self.clients() {
-                self.send_if(peer, features::ROLE_LIST, &roles);
+                self.send_msg(peer, &roles);
             }
         }
     }
@@ -335,16 +334,6 @@ impl ChatServer {
             .iter()
             .find(|c| c.id == channel_id)
             .map_or_else(|| format!("channel {channel_id}"), |c| c.name.clone())
-    }
-
-    pub(super) fn send_if_roles(&mut self, client: ClientId, msg: &ServerMessage) {
-        if self
-            .features_of
-            .get(&client)
-            .is_some_and(|f| f & features::ROLES != 0)
-        {
-            self.send_msg(client, msg);
-        }
     }
 
     /// Live sessions of a user (normally one; a replacement in flight
@@ -1038,10 +1027,10 @@ impl ChatServer {
                 permissions: perms,
                 persistent,
             };
-            self.send_if_roles(*client, &session);
+            self.send_msg(*client, &session);
             let details = self.user_details(*client, user_id);
             for peer in self.audience_about(*client) {
-                self.send_if_roles(peer, &details);
+                self.send_msg(peer, &details);
             }
         }
     }

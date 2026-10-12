@@ -276,7 +276,7 @@ jobs:
       - name: Read version from crates/desktop
         id: version
         shell: bash
-        run: grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | xargs -I{} echo "version={}" >> "$GITHUB_OUTPUT"
+        run: grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | xargs -I{} echo "version={}" >> "$GITHUB_OUTPUT"
 
       - name: Package zip (Linux/macOS)
         if: runner.os != 'Windows' && github.event_name == 'release'
@@ -321,7 +321,7 @@ jobs:
           merge-multiple: true
       - name: Check tag matches crate version
         run: |
-          VERSION=$(grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           TAG="${{ github.event.release.tag_name }}"
           if [ "$TAG" != "v$VERSION" ]; then
             echo "::error::Release tag $TAG != crates/desktop version v$VERSION — retag or bump the crate."
@@ -334,7 +334,7 @@ jobs:
           files: artifacts/*.zip
       - name: Stage zips and version file for R2
         run: |
-          VERSION=$(grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           mkdir -p r2-upload
           cp artifacts/*.zip r2-upload/
           echo "$VERSION" > r2-upload/version

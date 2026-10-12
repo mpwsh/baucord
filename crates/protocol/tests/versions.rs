@@ -1,11 +1,14 @@
 //! The public crates move together (SESSION-GUIDE.md §4): their version
 //! is what users, the server and the app stores see. Every platform
-//! reads it from its own crate — the desktop's updater and About page
-//! from `frontend`, the wire's `client_version` from this crate, the
-//! server's from `server`, Android's `versionName` from `crates/android`,
-//! iOS's `MARKETING_VERSION` from `crates/ios` — so bumping one alone
-//! ships two numbers. 1.1.6 did: the apps said 1.1.6 and told the
-//! server 1.1.5.
+//! reads it — the desktop's updater and About page from `frontend`, the
+//! wire's `client_version` from this crate, the server's from `server`,
+//! Android's `versionName` and iOS's `MARKETING_VERSION` from the
+//! workspace manifest — so two numbers in the tree ship two numbers.
+//! 1.1.6 did: the apps said 1.1.6 and told the server 1.1.5.
+//!
+//! The number lives once, under `[workspace.package]` in the root
+//! `Cargo.toml` (review P2-61), and each public crate inherits it. This
+//! test holds them to that.
 
 use std::path::Path;
 
@@ -21,16 +24,8 @@ const PUBLIC: [&str; 8] = [
     "ios",
 ];
 
-/// The `[package]` version: the first line that sets `version`
-/// (dependencies say `version` only inside `{ … }`).
-fn package_version(manifest: &Path) -> String {
-    let text =
-        std::fs::read_to_string(manifest).unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
-    text.lines()
-        .find_map(|line| line.strip_prefix("version = \""))
-        .and_then(|rest| rest.split('"').next())
-        .unwrap_or_else(|| panic!("{}: no version line", manifest.display()))
-        .to_string()
+fn read(manifest: &Path) -> String {
+    std::fs::read_to_string(manifest).unwrap_or_else(|e| panic!("{}: {e}", manifest.display()))
 }
 
 #[test]
@@ -38,16 +33,30 @@ fn public_crates_share_one_version() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("protocol lives in crates/");
-    let ours = env!("CARGO_PKG_VERSION");
-    let off: Vec<String> = PUBLIC
+    let own: Vec<&str> = PUBLIC
         .iter()
-        .map(|name| (name, package_version(&crates.join(name).join("Cargo.toml"))))
-        .filter(|(_, version)| version != ours)
-        .map(|(name, version)| format!("{name} is {version}"))
+        .copied()
+        .filter(|name| {
+            !read(&crates.join(name).join("Cargo.toml"))
+                .lines()
+                .any(|line| line == "version.workspace = true")
+        })
         .collect();
     assert!(
-        off.is_empty(),
-        "the public crates move together (protocol is {ours}): {}",
-        off.join(", ")
+        own.is_empty(),
+        "these public crates set a version of their own instead of \
+         `version.workspace = true`: {own:?}"
     );
+
+    // The scripts and workflows that stamp a release (Gradle, the iOS
+    // scripts, the release, Docker and web workflows) take the first
+    // line of the root manifest that starts with `version = "`: there
+    // must be exactly one, and it is ours.
+    let root = read(&crates.parent().expect("the workspace").join("Cargo.toml"));
+    let versions: Vec<&str> = root
+        .lines()
+        .filter_map(|line| line.strip_prefix("version = \""))
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(versions, [env!("CARGO_PKG_VERSION")]);
 }

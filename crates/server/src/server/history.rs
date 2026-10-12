@@ -16,9 +16,9 @@ use protocol::{
     features, permissions, ConvRef, HistoryMessage, RestrictionKind, ServerMessage, UserId,
 };
 
-use super::{hex, ChatServer};
+use super::{hex, ChatServer, Waiting};
 use crate::persistence::{
-    Answer, AskId, Command, ConvKey, MessageRow, Outcome, ProgressDelta, Query, RECENT_RING,
+    Answer, Command, ConvKey, MessageRow, Outcome, ProgressDelta, Query, RECENT_RING,
 };
 
 /// How long a history read may take before the client is told to retry.
@@ -62,11 +62,7 @@ impl ChatServer {
             "{} ({client:#x}) chat rate limited; retry in {retry_ms} ms",
             self.get_username(client)
         );
-        self.send_if(
-            client,
-            features::HISTORY,
-            &ServerMessage::ChatRateLimited { retry_ms },
-        );
+        self.send_msg(client, &ServerMessage::ChatRateLimited { retry_ms });
         false
     }
 
@@ -174,7 +170,14 @@ impl ChatServer {
                 },
                 self.now + HISTORY_DEADLINE,
             );
-            self.pending_history.insert(ask, (client, conv, limit));
+            self.waiting.insert(
+                ask,
+                Waiting::History {
+                    client,
+                    conv,
+                    limit,
+                },
+            );
             return;
         }
         let oldest_in_ring = self.recent.front().map(|m| m.msg_id);
@@ -218,15 +221,25 @@ impl ChatServer {
             },
             self.now + HISTORY_DEADLINE,
         );
-        self.pending_history.insert(ask, (client, conv, limit));
+        self.waiting.insert(
+            ask,
+            Waiting::History {
+                client,
+                conv,
+                limit,
+            },
+        );
     }
 
     /// One history read the persistence thread answered (or did not,
     /// in time).
-    pub(super) fn resolve_history_answer(&mut self, ask: AskId, outcome: Outcome) {
-        let Some((client, conv, limit)) = self.pending_history.remove(&ask) else {
-            return;
-        };
+    pub(super) fn resolve_history_answer(
+        &mut self,
+        client: protocol::ClientId,
+        conv: protocol::ConvRef,
+        limit: u16,
+        outcome: Outcome,
+    ) {
         match outcome {
             Outcome::Answered(Answer::Messages(rows)) => {
                 let more = rows.len() >= usize::from(limit);
@@ -420,21 +433,17 @@ impl ChatServer {
             for session in self.sessions_of(&user) {
                 let msg = self.user_progress(session, &user);
                 for peer in self.clients() {
-                    self.send_if(peer, features::PROGRESS_ALL, &msg);
+                    self.send_msg(peer, &msg);
                 }
             }
             if after > before {
                 let xp = self.policy.xp.get(&user).copied().unwrap_or(0);
                 info!("{} reached level {after}", hex(&user[..8]));
                 for session in self.sessions_of(&user) {
-                    self.send_if(
-                        session,
-                        features::PROGRESS,
-                        &ServerMessage::ProgressUpdate { xp, level: after },
-                    );
+                    self.send_msg(session, &ServerMessage::ProgressUpdate { xp, level: after });
                     let details = self.user_details(session, &user);
                     for peer in self.clients() {
-                        self.send_if_roles(peer, &details);
+                        self.send_msg(peer, &details);
                     }
                 }
             }
@@ -449,13 +458,6 @@ impl ChatServer {
     /// Whether the session negotiated `bit`.
     pub(super) fn has_feature(&self, client: protocol::ClientId, bit: u64) -> bool {
         self.features_of.get(&client).is_some_and(|f| f & bit != 0)
-    }
-
-    /// Send only when the session negotiated `bit`.
-    pub(super) fn send_if(&mut self, client: protocol::ClientId, bit: u64, msg: &ServerMessage) {
-        if self.has_feature(client, bit) {
-            self.send_msg(client, msg);
-        }
     }
 
     /// Delete a person (spec §8): an admin's purge.
@@ -482,13 +484,35 @@ impl ChatServer {
         }
     }
 
-    /// The retention prune deleted these files (`Notice::FilesPruned`).
-    /// An unreferenced file's metadata stays here on purpose — a
-    /// re-announce of the same bytes is answered "already here" — so it
-    /// must go with the file, or the next post of it points at nothing
-    /// (review P0-4). One referenced again in the moment between the
-    /// prune's read and this notice has lost its file; say so.
-    pub(super) fn forget_pruned_files(&mut self, files: &[protocol::BlobId]) {
+    /// A retention pass ran (`Notice::Pruned`). Messages older than
+    /// `history_cutoff` left the store: they leave the replay ring too
+    /// (a quiet server's ring can reach back past the window, and
+    /// would replay what retention promised was gone), and the file
+    /// references they held come off the counts — the store has taken
+    /// them off its own (review P2-11). Then the files it deleted.
+    pub(super) fn apply_prune(
+        &mut self,
+        history_cutoff: Option<crate::clock::WallMs>,
+        released: &[(protocol::BlobId, u32)],
+        files: &[protocol::BlobId],
+    ) {
+        if let Some(cutoff) = history_cutoff {
+            // No count is touched here: `released` covers these rows.
+            self.recent.retain(|m| m.ts >= cutoff);
+        }
+        for (blob, count) in released {
+            self.blob_ref(blob, -i32::try_from(*count).unwrap_or(i32::MAX));
+        }
+        self.forget_pruned_files(files);
+    }
+
+    /// The retention prune deleted these files. An unreferenced file's
+    /// metadata stays here on purpose — a re-announce of the same bytes
+    /// is answered "already here" — so it must go with the file, or the
+    /// next post of it points at nothing (review P0-4). One referenced
+    /// again in the moment between the prune's read and this notice has
+    /// lost its file; say so.
+    fn forget_pruned_files(&mut self, files: &[protocol::BlobId]) {
         for blob in files {
             let Some(meta) = self.forget_blob(blob) else {
                 continue;

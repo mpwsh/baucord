@@ -43,7 +43,7 @@ jobs:
           path: .
       - name: Stamp version into pages
         run: |
-          VERSION=$(grep '^version' crates/desktop/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           sed -i "s/__VERSION__/$VERSION/g" web/index.html web/i18n/*.json
       - name: Stage hosting guide files
         run: |

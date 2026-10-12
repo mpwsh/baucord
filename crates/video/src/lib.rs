@@ -73,17 +73,23 @@ pub enum Quality {
 }
 impl std::fmt::Display for Quality {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::HD30 => write!(f, "720p 30fps"),
-            Self::HD60 => write!(f, "720p 60fps"),
-            Self::FHD30 => write!(f, "1080p 30fps"),
-            Self::FHD60 => write!(f, "1080p 60fps"),
-            Self::QHD30 => write!(f, "1440p 30fps"),
-        }
+        f.write_str(self.label())
     }
 }
 
 impl Quality {
+    /// The preset's name as the log and the telemetry write it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HD30 => "720p 30fps",
+            Self::HD60 => "720p 60fps",
+            Self::FHD30 => "1080p 30fps",
+            Self::FHD60 => "1080p 60fps",
+            Self::QHD30 => "1440p 30fps",
+        }
+    }
+
     /// Maximum encoded width. The actual encoded width may be smaller
     /// to preserve the source aspect ratio.
     #[must_use]

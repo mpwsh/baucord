@@ -48,9 +48,9 @@ jobs:
         if: startsWith(env.TAG, 'v')
         run: |
           set -eu
-          CRATE="$(awk -F'"' '/^version = "/ { print $2; exit }' crates/ios/Cargo.toml)"
+          CRATE="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
           if [ "${TAG#v}" != "$CRATE" ]; then
-            echo "::error::release tag $TAG, but crates/ios/Cargo.toml says $CRATE — bump the public crates together, then tag v$CRATE"
+            echo "::error::release tag $TAG, but Cargo.toml says $CRATE — bump `[workspace.package]`, then tag v$CRATE"
             exit 1
           fi
           echo "version $CRATE"
@@ -134,7 +134,7 @@ jobs:
         working-directory: ios
         run: |
           set -eux
-          VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' ../crates/ios/Cargo.toml)"
+          VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' ../Cargo.toml)"
           printf '%s\n' \
             "// Written by .github/workflows/ios-release.yml." \
             "MARKETING_VERSION = $VERSION" \

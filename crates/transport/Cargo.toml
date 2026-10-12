@@ -1,8 +1,8 @@
 [package]
 name = "transport"
-version = "1.2.1"
-edition = "2024"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Sans-IO QUIC transport for baucord: quinn-proto driven from the existing threads, lane mapping, identity pinning, and an in-process simulation harness."
 
 [lints]
@@ -10,9 +10,13 @@ workspace = true
 
 [features]
 default = []
+# The server's side: its identity (key files, the certificate, retired
+# keys) and `Driver::new_server`. The only user of `rcgen`, which a
+# client then does not compile (review P3-3).
+server = ["dep:rcgen"]
 # The in-memory network + fake clock harness (spec §4.7). Pulled in by
 # the transport's own tests and by the server's integration tests.
-sim = []
+sim = ["server"]
 
 [dependencies]
 protocol = { path = "../protocol" }
@@ -37,11 +41,12 @@ rustls = { version = "0.23.43", default-features = false, features = [
   "ring",
   "std",
 ] }
-# Self-signed Ed25519 identity certificates and the successor extension.
+# Self-signed Ed25519 identity certificates and the successor extension:
+# the `server` feature.
 rcgen = { version = "0.14.10", default-features = false, features = [
   "ring",
   "pem",
-] }
+], optional = true }
 # Ed25519 verification of successor proofs and client-key proofs; already
 # in the tree via rustls.
 ring = "0.17"
@@ -57,6 +62,11 @@ socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 env_logger = "0.11"
+# The crate's own tests always build the server side.
+rcgen = { version = "0.14.10", default-features = false, features = [
+  "ring",
+  "pem",
+] }
 
 [target.'cfg(unix)'.dependencies]
 # `poll(2)` on the socket (`udp::ReadWaiter`, `UdpIo::wait_readable`):

@@ -55,7 +55,13 @@ What stands between this and "production for strangers":
 ### Server, protocol, transport
 
 - [ ] **SEC-2 [P0][M] Connection slots can be exhausted from one
-  address.** `peer_count() >= max_peers` refuses new connections and
+  address.** *In part, 2026-10-12 (review P3-5):* unadmitted
+  connections have a budget of their own (a quarter of `max_clients`,
+  16–64 seats), capped at eight per address (an IPv6 /64 counts as
+  one), with a QUIC `Retry` once half the seats are taken;
+  `one_address_cannot_fill_the_waiting_room` is the test asked for
+  below. *Left:* a rate per address, and the Hello deadline (still
+  10 s, for lossy links). The original finding: `peer_count() >= max_peers` refuses new connections and
   counts handshaking, Hello-pending and closing peers alike
   (`transport/src/driver.rs` ~687, ~817); a connection that never says
   Hello lives 10 s (`server.rs` ~90, ~913); the per-IP limit only
@@ -160,7 +166,9 @@ What stands between this and "production for strangers":
   mute and deafen (`frontend/src/app/session.rs` ~196) and the
   automatic reconnect puts the user back in the room live. Keep both
   across reconnects and re-apply after `VoiceControl::Start`.
-- [ ] **CLI-6 [P1][S] `settings.json` is written in place**
+- [ ] **CLI-6 [P1][S] `settings.json` is written in place** *(done
+  2026-10-12 but for showing the parse error in the UI: it is logged,
+  the file is kept as `settings.json.corrupt`, and the `.bak` loads.)*
   (`client/src/config.rs` `Settings::save`) and a parse failure falls
   back to defaults silently, so a crash mid-write loses every server,
   password and pin (the next connect trusts on first use again). Write
@@ -691,12 +699,73 @@ One line each; the spec decision named holds the detail.
   - *Still open of P0 and P1*: paging for the admin lists (P0-1, needs
     a feature bit) and the keybind watcher's event sources (P1-3 step
     2, one test pass per OS).
+- **2026-10-12 — 1.2.1, the review's second batch** (§2a).
+  - *Protocol.* `lane()` names every variant, and so does the new
+    `ServerMessage::required_feature()`; one codec serves both
+    directions (P3-1). `protocol/tests/wire_golden.rs` pins every wire
+    enum's variant order and every message's and struct's layout
+    (P2-62). The video reassembler holds one in-order frame per sender
+    (P2-56).
+  - *Transport.* Sends queue and each peer is drained once per pass;
+    `handle_timeouts` touches only peers that are due; `readable()`
+    names the peers with something to read (P2-31). `Shared` payloads
+    are put on the wire once and handed to quinn by reference (P2-32).
+    The receive path sizes its buffers by the platform's batch, builds
+    its slices on the stack and splits one buffer per GRO batch (P3-2).
+    `ServerIdentity` and `rcgen` are behind a `server` feature (P3-3).
+    The client keep-alive is 10 s, held through 40 % loss in the
+    simulator, and a new bit, `QUIET_REPORTS`, stops the two-second
+    `VoiceReceiverReport` to sessions that send no voice (P2-49); an
+    idle client on a dead link now notices after up to 40 s, not 32.
+  - *Server.* Stream health is per sharer and spans five reports
+    (P2-3). File references: recounted from the rows at startup,
+    released with the messages a retention pass removes (which also
+    leave the replay ring), not released twice for a deleted post at a
+    purge, given back when a file DM is not stored — migration 6 adds
+    the index (P2-11). The transport keeps a waiting room for
+    connections that have not said Hello — its own seats, eight per
+    address, a QUIC Retry once half are taken — so `ServerFull` reaches
+    the client and a returning user replaces their own session on a
+    full server (P3-5; SEC-2 in part, below). Feature gates are one
+    table checked in `send_msg` (P3-6). A first visit and every admin
+    command are one transaction, and the hot statements are cached
+    (P3-9). A purged account's uploaded logs are deleted off the tick
+    (P3-13). Reads in flight are one `Waiting` table and their answers
+    one channel (P2-52).
+  - *Client.* Image and file reassembly is one type that hashes as it
+    goes, and stalled transfers are dropped on the two-second tick
+    (P3-14). Keyframe requests, decode errors and frames dropped before
+    the screen thread are counts on the 5 s summary lines (P3-15); the
+    share loop no longer allocates a preset name per tick or logs a
+    line per frame (P3-16). `settings.json` is saved through a rename
+    with a `.bak`, a corrupt file is set aside and never replaced by an
+    older install's, and the pre-0.3 shadow struct and the unused room
+    password are gone (P3-17, P3-18; CLI-6 but for showing the error
+    in the UI). Volume and mute per person are filed under the user id
+    (P2-24). The UI thread is woken once for however many messages are
+    queued, and not at all for link stats while the app is off screen
+    (P2-48). Two conditions that were always true are gone from
+    `on_disconnected` (P3-20). Comfort noise is not decoded for a peer
+    whose last frame was silence (P2-34). A heading with spaces around
+    its text renders bold (P3-39).
+  - *Build.* The product version, the edition and the licence live
+    under `[workspace.package]`; the release workflows, Gradle and the
+    iOS scripts read the version there (P2-61).
+  - *Dead code.* `Carrier` and `Lane::carrier`, `Driver::is_server` /
+    `is_connecting` / `has_transmits`, `frame::Decoder::buffered`, the
+    reassembler's statistics, the relay's `group_open`, the on-connect
+    stream announcement that could never fire (`share_visible_from`),
+    two one-line wrappers in `policy.rs`, and four fields of
+    `SharedScreenState` nothing read. The rest of the review's list
+    (audio and video surface, catalog entries, Slint properties, the
+    examples, `skills/`) is still to do.
 
 ## 8. Facts this plan rests on
 
-- **Tests, 2026-10-11, Linux sandbox**: protocol 91 + the versions
-  test, transport 51, server 65 unit + 94 e2e, client 48, app-core 111,
-  audio 105, video 73 + 5 — all green. Six more need a real machine:
+- **Tests, 2026-10-12, Linux sandbox**: protocol 91 + the versions
+  test + 3 wire-pinning tests, transport 55, server 70 unit + 99 e2e,
+  client 55, app-core 112, audio 106, video 73 + 5 — all green. Six
+  more need a real machine:
   that sandbox does not signal UDP readiness, so the socket-wait tests
   (`transport` `udp::read_waiter_tests`, 3; `client` `inbound_wake`,
   `network_idle.rs`, `network_uploads.rs`) cannot pass there. The

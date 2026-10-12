@@ -118,8 +118,10 @@ pub fn set_host_visible(visible: bool) {
         return;
     }
     info!("host: app {}", if visible { "shown" } else { "hidden" });
-    // Stream frames are not even decoded while hidden (review P1-7).
+    // Stream frames are not even decoded while hidden (review P1-7),
+    // and the link stats are not sent over (P2-48).
     crate::present::set_stream_visible(None, visible);
+    client::network::set_ui_visible(visible);
     if visible {
         let _ = slint::invoke_from_event_loop(|| with_current(AppState::host_shown));
     }
@@ -168,15 +170,30 @@ thread_local! {
     static APP: RefCell<Option<Rc<RefCell<AppState>>>> = const { RefCell::new(None) };
 }
 
-/// Schedule a drain on the UI thread. Cheap and coalescing: multiple
-/// wakes before the loop runs just queue multiple no-op-ish drains.
+/// A drain is posted to the UI thread and has not started yet.
+static WAKE_POSTED: AtomicBool = AtomicBool::new(false);
+
+/// Schedule a drain on the UI thread. One drain takes everything
+/// queued by then, so a wake while one is posted and has not started
+/// adds nothing: the workers call this once per message, and a join
+/// burst used to post a closure for each (review P2-48).
 fn wake() {
-    let _ = slint::invoke_from_event_loop(|| {
+    if WAKE_POSTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let posted = slint::invoke_from_event_loop(|| {
+        // Before the drain reads anything: a message queued from here
+        // on posts the next one.
+        WAKE_POSTED.store(false, Ordering::Release);
         let app = APP.with(|a| a.borrow().clone());
         if let Some(app) = app {
             AppState::drain(&app);
         }
     });
+    if posted.is_err() {
+        // No event loop to run it: nothing is posted after all.
+        WAKE_POSTED.store(false, Ordering::Release);
+    }
 }
 
 // struct_excessive_bools: connected/is_muted/is_deafened/is_testing_mic

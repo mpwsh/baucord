@@ -196,7 +196,11 @@ telemetry_events (ts, user_id, key_hash, kind, event BLOB)
 ```
 
 Indexes: `messages(conv_id, msg_id)`, `messages(ts)`, `restrictions(user_id)`,
-`restrictions(key_hash)`, `telemetry_samples(user_id, ts)`, `blobs(refs)`.
+`restrictions(key_hash)`, `telemetry_samples(user_id, ts)`, `blobs(refs)`;
+since 1.2.1 `messages(user_id)` and `conversations(user_b)` (migration
+5, with the `counters` table that keeps the message-id watermark) and
+`messages(blob_id)` (migration 6, for the reference recount at
+startup). The schema is at version 6.
 
 ### 2.1 Ids and keys
 
@@ -541,7 +545,11 @@ ServerMessage::Conversations { dms: Vec<{ user_id, name, unread, last_ts }> }
   right after `Init`; DMs on demand from the conversation list.
   Images and files in history are blob references.
 - Retention prunes messages older than `history.retain_days`; blobs
-  with `refs = 0` are deleted after `files.retain_days`.
+  with `refs = 0` are deleted after `files.retain_days`. A pruned
+  message gives its file reference back in the same transaction (it
+  used to keep it, so a file posted once was never deleted), and the
+  server recounts every file's references from the stored rows at
+  startup, so a count that drifted is corrected by a restart.
 
 ## 7. Files and images
 

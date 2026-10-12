@@ -56,6 +56,21 @@ pub struct Budget {
 /// with room to spare, video chunks were sized for it.
 pub const INITIAL_MTU: u16 = 1200;
 
+/// How long a client lets its connection sit silent before it pings.
+/// It was 2 s, which on a phone in the lobby — nothing to say, nothing
+/// to hear — was a packet every two seconds for hours, and a cellular
+/// radio that never idled (review P2-49). Ten seconds is well inside
+/// any NAT's UDP timeout (30 s at the tightest), and inside the 30 s
+/// idle timeout it is still two pings and their retransmissions: the
+/// simulator holds an idle connection through twenty minutes of 40 %
+/// loss (`an_idle_connection_survives_heavy_loss_on_the_slow_keep_alive`).
+/// In a voice room the connection is never silent and this never fires.
+/// The cost: QUIC restarts the idle timer at the first packet sent after
+/// the last one received, so a client with nothing to say notices a
+/// dead link up to this much after the idle timeout — 40 s, where it
+/// was 32 (`a_dead_peer_is_detected_by_the_idle_timeout`).
+pub const CLIENT_KEEP_ALIVE: Duration = Duration::from_secs(10);
+
 impl Budget {
     /// The desktop / mobile client: small buffers, keeps the connection
     /// alive itself.
@@ -64,10 +79,11 @@ impl Budget {
         Self {
             // 30 s (spec: 15 s): a Wi-Fi roam or ISP hiccup of 15–25 s
             // now survives instead of ending the session; the roster
-            // shows a dead peer for up to 30 s in exchange. Keep-alives
-            // every 2 s so a lossy link still lands some in the window.
+            // shows a dead peer for up to 30 s in exchange. A keep-alive
+            // every [`CLIENT_KEEP_ALIVE`], so a lossy link still lands
+            // some in the window.
             max_idle_timeout: Duration::from_secs(30),
-            keep_alive_interval: Some(Duration::from_secs(2)),
+            keep_alive_interval: Some(CLIENT_KEEP_ALIVE),
             max_ack_delay: Duration::from_millis(25),
             datagram_receive_buffer: 64 * 1024,
             datagram_send_buffer: 32 * 1024,

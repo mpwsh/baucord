@@ -583,6 +583,7 @@ impl AppState {
                     user.role = role_of(&roles);
                     user.level = level;
                 }
+                self.apply_saved_peer_audio(client_id, &user_id);
                 if self.dm_meta.contains_key(&user_id) {
                     self.rebuild_dms_model();
                 }

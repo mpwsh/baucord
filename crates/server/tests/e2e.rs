@@ -3229,24 +3229,73 @@ fn a_key_or_an_address_can_only_be_banned_and_only_with_the_ban_permission() {
     assert_eq!(w.server().policy().restrictions.len(), 1);
 }
 
+/// A full server still shakes hands, and says why it refuses. The
+/// transport used to count the unadmitted against `max_clients` too,
+/// so the next connection was refused before it could say Hello and
+/// `ServerFull` reached nobody (review P3-5).
 #[test]
 fn server_full_is_refused_at_hello() {
     let mut config = test_config(vec![open_channel("Lobby", true)]);
     config.network.max_clients = 1;
     let mut w = World::new(config);
     let _a = w.connect("alice");
-    // With one seat taken the transport already refuses the second
-    // handshake; the app-level check is the backstop.
-    let mut second = w.open_attempt();
-    let deadline = w.net.now() + WAIT;
-    while second.disconnected().is_none() && !w.net.driver(second.node).is_connected(second.peer) {
-        assert!(w.net.now() < deadline, "no verdict");
-        w.pump(&mut [&mut second]);
-    }
-    assert!(
-        second.disconnected().is_some(),
-        "second connection must be refused"
+    let code = w.guest_code.clone();
+    assert_eq!(
+        w.try_connect("bob", Auth::Invite { code }).unwrap_err(),
+        RefusedReason::ServerFull
     );
+}
+
+/// The seat a user holds is theirs: back after a blackout, with the
+/// old session still on the server's books, their new connection
+/// replaces it even on a full server.
+#[test]
+fn a_returning_user_replaces_their_session_on_a_full_server() {
+    let mut config = test_config(vec![open_channel("Lobby", true)]);
+    config.network.max_clients = 1;
+    let mut w = World::new(config);
+    let mut old = w.connect("alice");
+    let key = Arc::clone(&old.key);
+    let mut new = w
+        .try_connect_with_key("alice", Auth::Key, key)
+        .expect("the same user gets back in");
+    assert_ne!(new.id, old.id);
+    old.wait_for(&mut w, &mut [&mut new], |m| {
+        matches!(
+            m,
+            ServerMessage::Removed {
+                kind: RemovedKind::Replaced,
+                ..
+            }
+        )
+        .then_some(())
+    });
+}
+
+/// One address opening connections in a loop, never saying Hello: it
+/// holds its share of the waiting room and no more, and someone else
+/// still gets in (plan SEC-2).
+#[test]
+fn one_address_cannot_fill_the_waiting_room() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut hostile: Vec<TestClient> = (0..30u16)
+        .map(|i| {
+            let from: SocketAddr = format!("10.9.9.9:{}", 7000 + i).parse().expect("addr");
+            w.open_attempt_from(from)
+        })
+        .collect();
+    {
+        let mut refs: Vec<&mut TestClient> = hostile.iter_mut().collect();
+        w.settle(&mut refs, Duration::from_secs(1));
+    }
+    let connected = hostile
+        .iter()
+        .filter(|c| w.net.driver(c.node).is_connected(c.peer))
+        .count();
+    assert_eq!(connected, 8, "its share of the room, the rest refused");
+
+    let alice = w.connect("alice");
+    assert_ne!(alice.id, 0);
 }
 
 #[test]
@@ -4129,6 +4178,53 @@ fn voice_dropped_for_a_mute_is_not_reported_as_lost() {
     );
 }
 
+/// A session that sends no voice is sent no report of it — once it
+/// has said it can do without (`QUIET_REPORTS`): a report of nothing
+/// every two seconds kept a phone's radio up for as long as it sat in
+/// the lobby. A client from before the bit reads a missing report as a
+/// stalled link, and keeps getting them (review P2-49).
+#[test]
+fn a_silent_session_is_sent_no_voice_report_if_it_can_do_without() {
+    let reports = |c: &TestClient| {
+        c.inbox
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::VoiceReceiverReport { .. }))
+            .count()
+    };
+    let mut w = World::new(test_config(vec![
+        open_channel("Lobby", true),
+        open_channel("Room", false),
+    ]));
+    let mut quiet = w.connect("quiet");
+    let mut older = w.open();
+    older.features = features::CLIENT_1_1 & !features::QUIET_REPORTS;
+    let code = w.guest_code.clone();
+    w.admission(&mut older, "older", Auth::Invite { code })
+        .expect("admitted");
+    w.settle(&mut [&mut quiet, &mut older], Duration::from_secs(7));
+    assert_eq!(reports(&quiet), 0, "nothing said, nothing reported");
+    assert!(reports(&older) >= 3, "every two seconds, as it expects");
+
+    // It talks: the reports come, and stop again after the last
+    // interval that held any of its voice.
+    quiet.join(&mut w, 1, None);
+    for seq in 0..150u32 {
+        let pkt = protocol::pack_voice(seq, seq * 960, &[0xAB; 60]).expect("voice");
+        let now = w.net.now();
+        w.net
+            .driver(quiet.node)
+            .send(now, quiet.peer, Lane::Voice, &pkt)
+            .expect("send");
+        w.settle(&mut [&mut quiet, &mut older], Duration::from_millis(20));
+    }
+    let while_talking = reports(&quiet);
+    assert!(while_talking >= 1, "three seconds of voice, reported");
+    w.settle(&mut [&mut quiet, &mut older], Duration::from_secs(3));
+    let after = reports(&quiet);
+    w.settle(&mut [&mut quiet, &mut older], Duration::from_secs(7));
+    assert_eq!(reports(&quiet), after, "silent again, no more reports");
+}
+
 #[test]
 fn video_groups_are_mirrored_to_subscribers_on_the_sharers_track() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
@@ -4202,6 +4298,105 @@ fn video_groups_are_mirrored_to_subscribers_on_the_sharers_track() {
         assert_eq!(sender, sharer_id);
         assert!(protocol::parse_video_header(payload).is_some());
     }
+}
+
+/// A viewer on a narrow link watches two streams: one busy, one that
+/// has not sent a picture yet. Every group of the busy one is lost to
+/// that viewer, and its sharer hears so in every report — a group is
+/// two seconds long, so a one-second window read 0 % half the time —
+/// while the quiet stream's sharer is not charged with losses that are
+/// not its own (review P2-3).
+#[test]
+fn stream_health_is_per_stream_and_spans_whole_groups() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut busy = w.connect_member("busy");
+    let mut quiet = w.connect_member("quiet");
+    let mut viewer = w.connect_member("viewer");
+
+    for sharer in [&mut busy, &mut quiet] {
+        sharer.send(
+            &mut w,
+            &ClientMessage::ScreenShareStart {
+                width: 640,
+                height: 360,
+                scope: ShareScope::Everyone,
+            },
+        );
+    }
+    for target_id in [busy.id, quiet.id] {
+        viewer.wait_for(&mut w, &mut [&mut busy, &mut quiet], |m| {
+            matches!(m, ServerMessage::ScreenShareStarted { client_id, .. } if *client_id == target_id)
+                .then_some(())
+        });
+        viewer.send(&mut w, &ClientMessage::SubscribeScreen { target_id });
+    }
+    w.settle(
+        &mut [&mut busy, &mut quiet, &mut viewer],
+        Duration::from_millis(200),
+    );
+    busy.inbox.clear();
+    quiet.inbox.clear();
+
+    // The server reaches the viewer at 0.3 Mbit/s; the busy stream
+    // offers well over a megabit.
+    w.net.set_link_one_way(
+        w.server,
+        viewer.node,
+        LinkSpec::clean(Duration::from_millis(20)).with_bandwidth(300_000, 100),
+    );
+    let start = w.net.now();
+    let mut next_group = start;
+    let mut next_frame = start;
+    let mut seq = 0u32;
+    let payload = vec![3u8; 20_000];
+    while w.net.now() < start + Duration::from_secs(12) {
+        let now = w.net.now();
+        let drv = w.net.driver(busy.node);
+        if now >= next_group {
+            next_group = now + Duration::from_secs(2);
+            drv.video_new_group(now, busy.peer, OWN_TRACK);
+            next_frame = now;
+        }
+        if now >= next_frame {
+            next_frame = now + Duration::from_millis(100);
+            seq += 1;
+            let frame = protocol::pack_video_frame(seq, false, 640, 360, seq * 100, &payload)
+                .expect("frame");
+            for chunk in &frame {
+                let _ = drv.send(now, busy.peer, Lane::Video, chunk);
+            }
+        }
+        w.pump(&mut [&mut busy, &mut quiet, &mut viewer]);
+        while w.net.driver(viewer.node).recv_video(viewer.peer).is_some() {}
+    }
+
+    let health = |c: &TestClient| -> Vec<(f32, u16)> {
+        c.inbox
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::StreamHealth {
+                    worst_loss,
+                    viewers,
+                    ..
+                } => Some((*worst_loss, *viewers)),
+                _ => None,
+            })
+            .collect()
+    };
+    let busy_reports = health(&busy);
+    let quiet_reports = health(&quiet);
+    assert!(busy_reports.len() >= 10, "{busy_reports:?}");
+    assert!(quiet_reports.len() >= 10, "{quiet_reports:?}");
+    assert!(
+        quiet_reports.iter().all(|r| *r == (0.0, 1)),
+        "the quiet stream lost nothing: {quiet_reports:?}"
+    );
+    // The first group needs its half-second deadline to be given up
+    // on; from then on no report reads clean.
+    assert!(
+        busy_reports[3..].iter().all(|(loss, _)| *loss > 0.0),
+        "every later report shows the viewer behind: {busy_reports:?}"
+    );
 }
 
 // ── Persistence (spec §1, §11: the first test of 1.1) ───────────────────
@@ -5044,6 +5239,65 @@ fn a_stalled_store_fails_a_dm_within_the_deadline() {
         .iter()
         .any(|m| matches!(m, ServerMessage::Direct { .. })));
     drop(stalled);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file sent as a DM takes a reference when it is sent. A store that
+/// does not answer fails the DM — and the reference goes back: it used
+/// to stay, and a file with a count above zero is never deleted
+/// (review P2-11).
+#[test]
+fn a_file_dm_that_was_not_stored_gives_its_reference_back() {
+    let dir = temp_dir("dm-file-stall");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let bob_user = bob.key.user_id();
+    let (_, blob) = post_file(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob],
+        30,
+        "notes.txt",
+        "text/plain",
+        b"the same file, twice",
+        ConvRef::General,
+    )
+    .expect("posted in the room");
+    let refs = |w: &mut World| w.server().policy().blobs.get(&blob).map(|b| b.refs);
+    assert_eq!(refs(&mut w), Some(1));
+
+    let send_as_dm = |alice: &mut TestClient, w: &mut World, bob: &mut TestClient, client_ref| {
+        alice.send(
+            w,
+            &ClientMessage::SendFile {
+                conv: ConvRef::Dm(bob_user),
+                blob_id: blob,
+                client_ref,
+            },
+        );
+        alice.wait_for(w, &mut [bob], |m| match m {
+            ServerMessage::MessageAck { client_ref: r, .. } if *r == client_ref => Some(Ok(())),
+            ServerMessage::MessageFailed {
+                client_ref: r,
+                reason,
+            } if *r == client_ref => Some(Err(*reason)),
+            _ => None,
+        })
+    };
+
+    let stalled = w.server().persistence().stall();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        send_as_dm(&mut alice, &mut w, &mut bob, 71),
+        Err(DmFailReason::Store)
+    );
+    assert_eq!(refs(&mut w), Some(1), "the failed DM holds nothing");
+    drop(stalled);
+
+    assert_eq!(send_as_dm(&mut alice, &mut w, &mut bob, 72), Ok(()));
+    assert_eq!(refs(&mut w), Some(2), "the room's post and the DM");
     drop(w);
     let _ = std::fs::remove_dir_all(&dir);
 }

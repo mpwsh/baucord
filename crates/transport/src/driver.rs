@@ -25,15 +25,14 @@ use bytes::{Bytes, BytesMut};
 use log::{debug, info, warn};
 use protocol::{frame, Lane};
 use quinn_proto::{
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
-    ClientConfig, Connection, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Endpoint,
-    EndpointConfig, Event as QuicEvent, FinishError, ReadError, SendDatagramError, ServerConfig,
-    StreamEvent, StreamId, VarInt, WriteError,
+    crypto::rustls::QuicClientConfig, ClientConfig, Connection, ConnectionError, ConnectionHandle,
+    DatagramEvent, Dir, Endpoint, EndpointConfig, Event as QuicEvent, FinishError, ReadError,
+    SendDatagramError, StreamEvent, StreamId, VarInt, WriteError,
 };
 
 use crate::{
     config::Budget,
-    identity::{Fingerprint, IdentityError, Observation, PinnedVerifier, ServerIdentity},
+    identity::{Fingerprint, IdentityError, Observation, PinnedVerifier},
 };
 
 /// Transport-level identity of a connection. The server uses it as the
@@ -216,7 +215,8 @@ pub struct LinkStats {
     pub datagram_send_drops: u64,
     /// Episodes of send-buffer pressure.
     pub datagrams_blocked: u64,
-    /// Video groups this side opened.
+    /// Video groups this side opened — or could not, for want of
+    /// stream credit: such a group is counted here and as reset.
     pub groups_started: u64,
     /// Video groups this side abandoned because the *peer was behind*:
     /// the sum of the three causes below plus groups the peer stopped
@@ -238,6 +238,19 @@ pub struct LinkStats {
     /// Media uploads this side abandoned because the peer stopped
     /// reading or the connection closed.
     pub uploads_dropped: u64,
+}
+
+/// Video group counters for one outgoing track, cumulative since the
+/// track's first group. [`LinkStats`] sums these over every track of a
+/// connection; a relay reporting on one sharer wants only that
+/// sharer's (review P2-3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackStats {
+    /// Groups opened on this track.
+    pub groups_started: u64,
+    /// Groups abandoned because the peer was behind — the rule of
+    /// [`LinkStats::groups_reset`].
+    pub groups_reset: u64,
 }
 
 impl LinkStats {
@@ -329,9 +342,13 @@ impl OutQueue {
     /// gone (stopped by the peer / unknown) and the queue was dropped.
     fn flush(&mut self, conn: &mut Connection, id: StreamId, now: Instant) -> bool {
         while let Some(front) = self.pending.front() {
-            let slice = &front[self.offset..];
-            match conn.send_stream(id).write(slice) {
-                Ok(n) => {
+            // Handed over, not copied: the transport keeps a reference
+            // to the same bytes — the ones a relay queued for every
+            // other viewer too (review P2-32).
+            let mut chunk = [front.slice(self.offset..)];
+            match conn.send_stream(id).write_chunks(&mut chunk) {
+                Ok(written) => {
+                    let n = written.bytes;
                     self.offset += n;
                     self.bytes -= n;
                     self.written += n;
@@ -412,6 +429,7 @@ struct GroupOut {
 #[derive(Debug)]
 struct FinishingGroup {
     stream: StreamId,
+    track: Track,
     finished_at: Instant,
 }
 
@@ -448,6 +466,9 @@ struct Counters {
     uploads_dropped: u64,
 }
 
+// connected / lost / admitted / dirty are four separate facts about a
+// connection, each read on its own; none is a state of the others.
+#[allow(clippy::struct_excessive_bools)]
 struct Peer {
     id: PeerId,
     conn: Connection,
@@ -455,6 +476,12 @@ struct Peer {
     /// Set once `ConnectionLost` was seen; the peer lingers until the
     /// connection is drained so the endpoint can retire its ids.
     lost: bool,
+    /// The application admitted this connection ([`Driver::admit`]):
+    /// it no longer sits in the waiting room.
+    admitted: bool,
+    /// The application queued something since the last drain; listed
+    /// in [`Driver::dirty`].
+    dirty: bool,
     close_at: Option<Instant>,
     control: Option<BidiLane>,
     signal: Option<BidiLane>,
@@ -470,6 +497,9 @@ struct Peer {
     video_out: HashMap<Track, GroupOut>,
     /// Groups finished but not yet acknowledged.
     video_finishing: Vec<FinishingGroup>,
+    /// Group counters per outgoing track, kept until the application
+    /// forgets the track.
+    video_tracks: HashMap<Track, TrackStats>,
     uploads: Vec<UploadOut>,
     next_upload: UploadId,
     /// Media pacing token bucket, bytes.
@@ -485,6 +515,8 @@ impl Peer {
             conn,
             connected: false,
             lost: false,
+            admitted: false,
+            dirty: false,
             close_at: None,
             control: None,
             signal: None,
@@ -498,6 +530,7 @@ impl Peer {
             inbox_video: VecDeque::new(),
             video_out: HashMap::new(),
             video_finishing: Vec::new(),
+            video_tracks: HashMap::new(),
             uploads: Vec::new(),
             next_upload: 1,
             media_tokens: 0.0,
@@ -578,6 +611,74 @@ impl Peer {
     }
 }
 
+// ── A payload for many peers ────────────────────────────────────────────
+
+/// One payload, put the way its lane carries it once, for sending to
+/// many peers ([`Driver::send_shared`]): each send shares the bytes
+/// where [`Driver::send`] builds them again — a relayed voice packet
+/// was copied twice per listener, a broadcast framed once per session
+/// (review P2-32).
+#[derive(Debug, Clone)]
+pub struct Shared {
+    lane: Lane,
+    /// A datagram's tag byte and payload, or a stream frame's length
+    /// prefix and payload.
+    wire: Bytes,
+    /// The payload's own length, for the lane's budget.
+    len: usize,
+}
+
+impl Shared {
+    /// `payload` for `lane`.
+    #[must_use]
+    pub fn new(lane: Lane, payload: &[u8]) -> Self {
+        Self::of(lane, &[payload])
+    }
+
+    /// A relayed media packet for `lane`: `sender`'s id, then the
+    /// packet as it arrived — [`protocol::wrap_sender`]'s layout,
+    /// without the copy in between.
+    #[must_use]
+    pub fn relayed(lane: Lane, sender: u64, packet: &[u8]) -> Self {
+        Self::of(lane, &[&sender.to_le_bytes(), packet])
+    }
+
+    fn of(lane: Lane, parts: &[&[u8]]) -> Self {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        let mut wire = match lane {
+            Lane::Voice | Lane::SystemAudio => {
+                let mut wire = BytesMut::with_capacity(1 + len);
+                wire.extend_from_slice(&[lane.tag()]);
+                wire
+            }
+            Lane::Control | Lane::Signal | Lane::Video | Lane::Media => {
+                let mut wire = BytesMut::with_capacity(frame::PREFIX_BYTES + len);
+                wire.extend_from_slice(&frame::prefix(len));
+                wire
+            }
+        };
+        for part in parts {
+            wire.extend_from_slice(part);
+        }
+        Self {
+            lane,
+            wire: wire.freeze(),
+            len,
+        }
+    }
+
+    /// The payload's length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 // ── The driver ──────────────────────────────────────────────────────────
 
 enum Role {
@@ -585,9 +686,61 @@ enum Role {
         config: ClientConfig,
         verifier: Arc<PinnedVerifier>,
     },
+    // Made by `Driver::new_server`, which a client build leaves out.
+    #[cfg_attr(not(any(test, feature = "server")), allow(dead_code))]
     Server {
         max_peers: usize,
+        /// Room for connections the application has not admitted yet,
+        /// on top of `max_peers`; `None` counts every connection
+        /// against `max_peers` alike.
+        waiting: Option<WaitingRoom>,
     },
+}
+
+/// Where a server keeps connections its application has not admitted
+/// yet ([`Driver::admit`]): a few seats of their own, so a full server
+/// can still shake hands and say *why* it refuses — or let a returning
+/// user's new connection replace their old one — and so the seats of
+/// the admitted cannot be taken by connections that never say a word
+/// (review P3-5, plan SEC-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitingRoom {
+    /// Unadmitted connections at once, from anywhere.
+    pub seats: usize,
+    /// …and from one address (an IPv6 /64 counts as one): one host
+    /// opening connections in a loop cannot fill the room.
+    pub per_address: usize,
+}
+
+impl WaitingRoom {
+    /// Above this many waiting connections a new one must prove its
+    /// source address first (a QUIC Retry): half the room. A forged
+    /// source cannot answer one, so a flood of forged first packets
+    /// stops taking seats here.
+    fn retry_above(self) -> usize {
+        self.seats / 2
+    }
+}
+
+/// What one address is counted under in the waiting room: an IPv4
+/// address as it is, an IPv6 address by its /64 (one subscriber holds
+/// a whole /64).
+fn address_group(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+            IpAddr::V4,
+        ),
+    }
+}
+
+/// What to do with a first packet.
+enum Gate {
+    Accept,
+    /// Answer with a Retry: come back with proof of the address.
+    Retry,
+    Refuse,
 }
 
 /// One `quinn-proto` endpoint per socket, driven by the caller.
@@ -602,9 +755,18 @@ pub struct Driver {
     buf: Vec<u8>,
     /// GSO segments the socket can send per call (1 without GSO).
     max_gso_segments: usize,
-    /// Peers whose `ConnectionLost` was reported but that are not yet
-    /// drained; polled for timers only.
+    /// Peers the application queued something for since their last
+    /// drain, and the latest time it did: they are drained once, when
+    /// the host next asks for transmits or timers — not once per send.
+    /// A keyframe relayed to a viewer was thirty sends and thirty
+    /// drains of that viewer's connection; several speakers' packets in
+    /// one pass now leave in one UDP datagram (review P2-31).
+    dirty: Vec<ConnectionHandle>,
+    dirty_at: Option<Instant>,
+    /// Connections refused for want of a seat.
     refused: u64,
+    /// First packets answered with a Retry (see [`WaitingRoom`]).
+    retried: u64,
 }
 
 impl Driver {
@@ -660,11 +822,13 @@ impl Driver {
     ///
     /// # Errors
     /// rustls configuration failure.
+    #[cfg(any(test, feature = "server"))]
     pub fn new_server(
-        identity: &ServerIdentity,
+        identity: &crate::identity::ServerIdentity,
         max_peers: usize,
         budget: Budget,
     ) -> Result<Self, IdentityError> {
+        use quinn_proto::{crypto::rustls::QuicServerConfig, ServerConfig};
         let crypto = identity.server_crypto()?;
         let quic = QuicServerConfig::try_from(crypto).map_err(|e| {
             IdentityError::Tls(rustls::Error::General(format!("quic server config: {e}")))
@@ -680,9 +844,66 @@ impl Driver {
         );
         Ok(Self::with_endpoint(
             endpoint,
-            Role::Server { max_peers },
+            Role::Server {
+                max_peers,
+                waiting: None,
+            },
             budget,
         ))
+    }
+
+    /// Give a server a [`WaitingRoom`]: `max_peers` then bounds the
+    /// connections the application admitted — which it enforces, with
+    /// [`Self::admit`] — and the room bounds the rest. No effect on a
+    /// client.
+    #[must_use]
+    pub fn with_waiting_room(mut self, room: WaitingRoom) -> Self {
+        if let Role::Server { waiting, .. } = &mut self.role {
+            *waiting = Some(room);
+        }
+        self
+    }
+
+    /// The application let `peer` in: its seat in the waiting room is
+    /// free for the next arrival.
+    pub fn admit(&mut self, peer: PeerId) {
+        if let Some(handle) = self.ids.get(&peer)
+            && let Some(p) = self.peers.get_mut(handle)
+        {
+            p.admitted = true;
+        }
+    }
+
+    /// Whether a first packet from `remote` gets a connection.
+    fn gate(&self, remote: SocketAddr, validated: bool, may_retry: bool) -> Gate {
+        let Role::Server { max_peers, waiting } = &self.role else {
+            return Gate::Refuse;
+        };
+        let Some(room) = waiting else {
+            return if self.peer_count() >= *max_peers {
+                Gate::Refuse
+            } else {
+                Gate::Accept
+            };
+        };
+        let group = address_group(remote.ip());
+        let (mut waiting, mut from_here) = (0usize, 0usize);
+        for p in self.peers.values().filter(|p| !p.lost && !p.admitted) {
+            waiting += 1;
+            if address_group(p.conn.remote_address().ip()) == group {
+                from_here += 1;
+            }
+        }
+        if waiting >= room.seats
+            || from_here >= room.per_address
+            || self.peer_count() >= max_peers.saturating_add(room.seats)
+        {
+            Gate::Refuse
+        } else if waiting >= room.retry_above() && !validated && may_retry {
+            Gate::Retry
+        } else {
+            Gate::Accept
+        }
     }
 
     fn with_endpoint(endpoint: Endpoint, role: Role, budget: Budget) -> Self {
@@ -696,7 +917,10 @@ impl Driver {
             transmits: VecDeque::new(),
             buf: Vec::with_capacity(64 * 1024),
             max_gso_segments: 1,
+            dirty: Vec::new(),
+            dirty_at: None,
             refused: 0,
+            retried: 0,
         }
     }
 
@@ -708,11 +932,6 @@ impl Driver {
     #[must_use]
     pub fn budget(&self) -> &Budget {
         &self.budget
-    }
-
-    #[must_use]
-    pub fn is_server(&self) -> bool {
-        matches!(self.role, Role::Server { .. })
     }
 
     /// Connected peers (handshake complete, not lost), in no order.
@@ -735,12 +954,6 @@ impl Driver {
         self.peer(peer).is_some_and(|p| p.connected && !p.lost)
     }
 
-    /// Whether any peer is still handshaking.
-    #[must_use]
-    pub fn is_connecting(&self, peer: PeerId) -> bool {
-        self.peer(peer).is_some_and(|p| !p.connected && !p.lost)
-    }
-
     #[must_use]
     pub fn remote_address(&self, peer: PeerId) -> Option<SocketAddr> {
         self.peer(peer).map(|p| p.conn.remote_address())
@@ -751,10 +964,37 @@ impl Driver {
         self.peer(peer).map(Peer::stats)
     }
 
-    /// Connections refused because the server was full.
+    /// The group counters of one outgoing video track toward `peer`;
+    /// zeroes for a track that has not opened a group yet.
+    #[must_use]
+    pub fn track_stats(&self, peer: PeerId, track: Track) -> Option<TrackStats> {
+        self.peer(peer)
+            .map(|p| p.video_tracks.get(&track).copied().unwrap_or_default())
+    }
+
+    /// The application is done with `track` toward `peer` (the viewer
+    /// unsubscribed, the sharer stopped): its counters go.
+    pub fn video_forget_track(&mut self, peer: PeerId, track: Track) {
+        let Some(handle) = self.ids.get(&peer).copied() else {
+            return;
+        };
+        if let Some(p) = self.peers.get_mut(&handle) {
+            p.video_tracks.remove(&track);
+        }
+    }
+
+    /// Connections refused because the server, or its waiting room,
+    /// was full.
     #[must_use]
     pub fn refused_count(&self) -> u64 {
         self.refused
+    }
+
+    /// First packets asked to prove their source address before
+    /// getting a seat.
+    #[must_use]
+    pub fn retried_count(&self) -> u64 {
+        self.retried
     }
 
     fn peer(&self, id: PeerId) -> Option<&Peer> {
@@ -794,6 +1034,10 @@ impl Driver {
         let Some(handle) = self.ids.get(&peer).copied() else {
             return;
         };
+        // What was queued for it goes to the transport first.
+        if self.peers.get(&handle).is_some_and(|p| p.dirty) {
+            self.drain_peer(handle, now);
+        }
         if let Some(p) = self.peers.get_mut(&handle) {
             p.conn.close(
                 now,
@@ -857,16 +1101,31 @@ impl Driver {
                 }
             }
             DatagramEvent::NewConnection(incoming) => {
-                let full = match &self.role {
-                    Role::Server { max_peers } => self.peer_count() >= *max_peers,
-                    Role::Client { .. } => true,
+                let gate = self.gate(
+                    remote,
+                    incoming.remote_address_validated(),
+                    incoming.may_retry(),
+                );
+                let incoming = match gate {
+                    Gate::Accept => incoming,
+                    Gate::Refuse => {
+                        self.refused += 1;
+                        let t = self.endpoint.refuse(incoming, &mut self.buf);
+                        self.push_transmit(&t);
+                        return;
+                    }
+                    Gate::Retry => {
+                        self.retried += 1;
+                        let t = match self.endpoint.retry(incoming, &mut self.buf) {
+                            Ok(t) => t,
+                            // Unreachable — the gate asked `may_retry`
+                            // — and a refusal is the safe answer.
+                            Err(e) => self.endpoint.refuse(e.into_incoming(), &mut self.buf),
+                        };
+                        self.push_transmit(&t);
+                        return;
+                    }
                 };
-                if full {
-                    self.refused += 1;
-                    let t = self.endpoint.refuse(incoming, &mut self.buf);
-                    self.push_transmit(&t);
-                    return;
-                }
                 match self.endpoint.accept(incoming, now, &mut self.buf, None) {
                     Ok((handle, conn)) => {
                         let id = fresh_peer_id(&self.ids);
@@ -908,17 +1167,33 @@ impl Driver {
     /// not a deadline.
     #[must_use]
     pub fn next_deadline(&mut self) -> Option<Instant> {
+        self.flush_dirty();
         let pace = self.budget.media_pace_bytes_per_sec;
         self.peers
             .values_mut()
             .fold(None, |at, p| earliest(at, p.next_deadline(pace)))
     }
 
-    /// Fire every timer at or before `now`, and run the per-tick work
-    /// (deadline resets, media pacing, deferred closes).
+    /// Fire every timer at or before `now`, and run the work that is
+    /// due (deadline resets, media pacing, deferred closes) — for the
+    /// peers that have any: one whose next deadline is still ahead and
+    /// that nothing was queued for is not touched. Every peer used to
+    /// be drained on every call (review P2-31); what moves a peer
+    /// between its deadlines is a datagram from it, and
+    /// [`Self::handle_datagram`] drains it then.
     pub fn handle_timeouts(&mut self, now: Instant) {
-        let handles: Vec<ConnectionHandle> = self.peers.keys().copied().collect();
-        for handle in handles {
+        let pace = self.budget.media_pace_bytes_per_sec;
+        let due: Vec<ConnectionHandle> = self
+            .peers
+            .iter_mut()
+            .filter_map(|(handle, p)| {
+                (p.dirty || p.next_deadline(pace).is_some_and(|at| at <= now)).then_some(*handle)
+            })
+            .collect();
+        // Every dirty peer is among them.
+        self.dirty.clear();
+        self.dirty_at = None;
+        for handle in due {
             let Some(p) = self.peers.get_mut(&handle) else {
                 continue;
             };
@@ -933,17 +1208,41 @@ impl Driver {
         }
     }
 
+    /// The application queued something for this peer: drain it once,
+    /// when the host next asks for transmits or timers.
+    fn touch(&mut self, handle: ConnectionHandle, now: Instant) {
+        if let Some(p) = self.peers.get_mut(&handle)
+            && !p.dirty
+        {
+            p.dirty = true;
+            self.dirty.push(handle);
+        }
+        self.dirty_at = Some(self.dirty_at.map_or(now, |at| at.max(now)));
+    }
+
+    /// Drain the peers [`Self::touch`] listed.
+    fn flush_dirty(&mut self) {
+        let Some(now) = self.dirty_at.take() else {
+            return;
+        };
+        for handle in std::mem::take(&mut self.dirty) {
+            // Drained since for another reason (a datagram from it): done.
+            if self.peers.get(&handle).is_some_and(|p| p.dirty) {
+                self.drain_peer(handle, now);
+            }
+        }
+    }
+
     // ── Outbound datagrams ──────────────────────────────────────────
 
     /// The next datagram (batch) to put on the wire, if any.
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
+        // What the application queued since the last pass becomes
+        // packets here, once per peer.
+        if self.transmits.is_empty() {
+            self.flush_dirty();
+        }
         self.transmits.pop_front()
-    }
-
-    /// Whether transmits are waiting.
-    #[must_use]
-    pub fn has_transmits(&self) -> bool {
-        !self.transmits.is_empty()
     }
 
     fn push_transmit(&mut self, t: &quinn_proto::Transmit) {
@@ -996,12 +1295,49 @@ impl Driver {
                 Ok(())
             }
             Lane::Video => {
-                video_send(p, OWN_TRACK, bytes, now);
+                video_send(p, OWN_TRACK, frame::encode(bytes), now);
                 Ok(())
             }
             Lane::Media => Err(SendError::NotAStreamLane(lane)),
         };
-        self.drain_peer(handle, now);
+        self.touch(handle, now);
+        result
+    }
+
+    /// [`Self::send`] for a payload going to many peers: `shared` was
+    /// put on the wire once ([`Shared`]) and each call shares its
+    /// bytes.
+    ///
+    /// # Errors
+    /// As [`Self::send`].
+    pub fn send_shared(
+        &mut self,
+        now: Instant,
+        peer: PeerId,
+        shared: &Shared,
+    ) -> Result<(), SendError> {
+        let lane = shared.lane;
+        let handle = *self.ids.get(&peer).ok_or(SendError::UnknownPeer)?;
+        let p = self.peers.get_mut(&handle).ok_or(SendError::UnknownPeer)?;
+        if !p.connected || p.lost {
+            return Err(SendError::NotConnected);
+        }
+        let result = match lane {
+            Lane::Voice | Lane::SystemAudio => {
+                send_datagram_wire(p, lane, shared.wire.clone(), shared.len, &mut self.events)
+            }
+            Lane::Control | Lane::Signal => {
+                let bidi = p.bidi_mut(lane).ok_or(SendError::NoStream(lane))?;
+                bidi.out.push(shared.wire.clone(), now);
+                Ok(())
+            }
+            Lane::Video => {
+                video_send(p, OWN_TRACK, shared.wire.clone(), now);
+                Ok(())
+            }
+            Lane::Media => Err(SendError::NotAStreamLane(lane)),
+        };
+        self.touch(handle, now);
         result
     }
 
@@ -1027,14 +1363,20 @@ impl Driver {
                     .set_priority(Lane::Video.priority());
                 p.video_out.insert(track, GroupOut { stream, out });
                 p.counters.groups_started += 1;
+                p.video_tracks.entry(track).or_default().groups_started += 1;
             } else {
                 // Stream credit exhausted: the peer holds too many
-                // groups open — behave as behind and skip this one.
+                // groups open — behave as behind and skip this one. It
+                // counts as started too, or a track that never opens
+                // would read as healthy.
                 p.counters.groups_reset_deadline += 1;
-                p.counters.groups_reset += 1;
+                p.counters.groups_started += 1;
+                let stats = p.video_tracks.entry(track).or_default();
+                stats.groups_started += 1;
+                note_group_reset(p, track);
             }
         }
-        self.drain_peer(handle, now);
+        self.touch(handle, now);
     }
 
     /// Video: end the track's current group cleanly (sharer stopped, or
@@ -1046,7 +1388,7 @@ impl Driver {
         if let Some(p) = self.peers.get_mut(&handle) {
             video_close_current(p, track, now, None);
         }
-        self.drain_peer(handle, now);
+        self.touch(handle, now);
     }
 
     /// Video: abandon the track's current group at the application's
@@ -1059,7 +1401,7 @@ impl Driver {
         if let Some(p) = self.peers.get_mut(&handle) {
             video_close_current(p, track, now, Some(ResetCause::Upstream));
         }
-        self.drain_peer(handle, now);
+        self.touch(handle, now);
     }
 
     /// Video: send one chunk on the track's current group. Dropped
@@ -1079,9 +1421,54 @@ impl Driver {
         if !p.connected || p.lost {
             return Err(SendError::NotConnected);
         }
-        video_send(p, track, bytes, now);
-        self.drain_peer(handle, now);
+        video_send(p, track, frame::encode(bytes), now);
+        self.touch(handle, now);
         Ok(())
+    }
+
+    /// [`Self::send_video`] for a chunk going to many viewers: `shared`
+    /// (a [`Shared`] for [`Lane::Video`]) is framed once.
+    ///
+    /// # Errors
+    /// Unknown or unconnected peer, or a payload made for another lane.
+    pub fn send_video_shared(
+        &mut self,
+        now: Instant,
+        peer: PeerId,
+        track: Track,
+        shared: &Shared,
+    ) -> Result<(), SendError> {
+        if shared.lane != Lane::Video {
+            return Err(SendError::NotAStreamLane(shared.lane));
+        }
+        let handle = *self.ids.get(&peer).ok_or(SendError::UnknownPeer)?;
+        let p = self.peers.get_mut(&handle).ok_or(SendError::UnknownPeer)?;
+        if !p.connected || p.lost {
+            return Err(SendError::NotConnected);
+        }
+        video_send(p, track, shared.wire.clone(), now);
+        self.touch(handle, now);
+        Ok(())
+    }
+
+    /// The peers with something to read ([`Self::recv`],
+    /// [`Self::recv_video`]). A server asked every client for every
+    /// lane on every pass: six queue lookups a client, nearly all of
+    /// them empty (review P2-31).
+    #[must_use]
+    pub fn readable(&self) -> Vec<PeerId> {
+        self.peers
+            .values()
+            .filter(|p| {
+                !(p.inbox_control.is_empty()
+                    && p.inbox_signal.is_empty()
+                    && p.inbox_voice.is_empty()
+                    && p.inbox_system_audio.is_empty()
+                    && p.inbox_media.is_empty()
+                    && p.inbox_video.is_empty())
+            })
+            .map(|p| p.id)
+            .collect()
     }
 
     /// Whether `peer` currently has an open outgoing video group on
@@ -1133,7 +1520,7 @@ impl Driver {
             total,
             finishing: false,
         });
-        self.drain_peer(handle, now);
+        self.touch(handle, now);
         Ok(id)
     }
 
@@ -1153,9 +1540,9 @@ impl Driver {
         let u = p.uploads.remove(i);
         let _ = p.conn.send_stream(u.stream).reset(GROUP_RESET_CODE);
         p.counters.uploads_dropped += 1;
-        // The reset frame goes out now, and the lanes get the send
-        // window it gave back.
-        self.drain_peer(handle, now);
+        // The reset frame goes out with this pass, and the lanes get
+        // the send window it gave back.
+        self.touch(handle, now);
         true
     }
 
@@ -1196,6 +1583,9 @@ impl Driver {
     /// events, process application events, flush writes, poll
     /// transmits, and retire the peer once drained.
     fn drain_peer(&mut self, handle: ConnectionHandle, now: Instant) {
+        if let Some(p) = self.peers.get_mut(&handle) {
+            p.dirty = false;
+        }
         // Endpoint events may loop back connection events.
         loop {
             let Some(p) = self.peers.get_mut(&handle) else {
@@ -1324,9 +1714,16 @@ impl Driver {
                 QuicEvent::Stream(StreamEvent::Stopped { id, .. }) => {
                     // The peer stopped reading: whatever we queued for
                     // that stream is garbage now.
-                    let before = p.video_out.len();
-                    p.video_out.retain(|_, g| g.stream != id);
-                    p.counters.groups_reset += (before - p.video_out.len()) as u64;
+                    let stopped: Vec<Track> = p
+                        .video_out
+                        .iter()
+                        .filter(|(_, g)| g.stream == id)
+                        .map(|(track, _)| *track)
+                        .collect();
+                    for track in stopped {
+                        p.video_out.remove(&track);
+                        note_group_reset(p, track);
+                    }
                     p.video_finishing.retain(|g| g.stream != id);
                     let before = p.uploads.len();
                     p.uploads.retain(|u| u.stream != id);
@@ -1392,12 +1789,26 @@ fn send_datagram(
     let mut d = BytesMut::with_capacity(1 + bytes.len());
     d.extend_from_slice(&[lane.tag()]);
     d.extend_from_slice(bytes);
-    let d = d.freeze();
+    send_datagram_wire(p, lane, d.freeze(), bytes.len(), events)
+}
+
+/// Send one datagram already carrying its lane tag; `len` is the
+/// payload's own length.
+fn send_datagram_wire(
+    p: &mut Peer,
+    lane: Lane,
+    d: Bytes,
+    len: usize,
+    events: &mut VecDeque<Event>,
+) -> Result<(), SendError> {
+    if len > lane.max_frame_bytes() {
+        return Err(SendError::TooLarge(lane, len));
+    }
     let mut datagrams = p.conn.datagrams();
     if let Some(max) = datagrams.max_size()
         && d.len() > max
     {
-        return Err(SendError::TooLarge(lane, bytes.len()));
+        return Err(SendError::TooLarge(lane, len));
     }
     // Time bound (§6.1): the send buffer is ~200 ms of voice; when it is
     // full the packet is dropped and counted. `drop = false` on purpose:
@@ -1423,7 +1834,7 @@ fn send_datagram(
             }
             Ok(())
         }
-        Err(SendDatagramError::TooLarge) => Err(SendError::TooLarge(lane, bytes.len())),
+        Err(SendDatagramError::TooLarge) => Err(SendError::TooLarge(lane, len)),
         Err(SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled) => {
             Err(SendError::NotConnected)
         }
@@ -1440,7 +1851,18 @@ enum ResetCause {
     Upstream,
 }
 
-fn video_send(p: &mut Peer, track: Track, bytes: &[u8], now: Instant) {
+/// One group on `track` was abandoned because the peer was behind:
+/// counted for the connection and for the track. A track the
+/// application has forgotten is not brought back by a late reset.
+fn note_group_reset(p: &mut Peer, track: Track) {
+    p.counters.groups_reset += 1;
+    if let Some(stats) = p.video_tracks.get_mut(&track) {
+        stats.groups_reset += 1;
+    }
+}
+
+/// Queue one chunk, already framed, on the track's current group.
+fn video_send(p: &mut Peer, track: Track, frame: Bytes, now: Instant) {
     let Some(group) = p.video_out.get_mut(&track) else {
         return; // group was reset; wait for the next keyframe
     };
@@ -1450,7 +1872,12 @@ fn video_send(p: &mut Peer, track: Track, bytes: &[u8], now: Instant) {
         video_close_current(p, track, now, Some(ResetCause::Deadline));
         return;
     }
-    group.out.push(frame::encode(bytes), now);
+    group.out.push(frame, now);
+    // Into the transport as far as it takes them, now: what stays
+    // queued here is what the peer is behind by, and the bounds above
+    // and the "newer keyframe" rule are measured on it. (A stream that
+    // is gone is found by the pass's flush.)
+    let _ = group.out.flush(&mut p.conn, group.stream, now);
 }
 
 /// Finish the track's current outgoing group, or reset it for `cause`.
@@ -1458,14 +1885,19 @@ fn video_send(p: &mut Peer, track: Track, bytes: &[u8], now: Instant) {
 /// anyway — that is the "newer keyframe exists" rule — and counted as
 /// superseded.
 fn video_close_current(p: &mut Peer, track: Track, now: Instant, cause: Option<ResetCause>) {
-    let Some(group) = p.video_out.remove(&track) else {
+    let Some(mut group) = p.video_out.remove(&track) else {
         return;
     };
+    if cause.is_none() {
+        // A last try: only bytes the transport will not take count as
+        // unsent.
+        let _ = group.out.flush(&mut p.conn, group.stream, now);
+    }
     let cause = match cause {
         Some(c) => Some(c),
         None if !group.out.is_empty() => {
             p.counters.groups_reset_superseded += 1;
-            p.counters.groups_reset += 1;
+            note_group_reset(p, track);
             let _ = p.conn.send_stream(group.stream).reset(GROUP_RESET_CODE);
             return;
         }
@@ -1475,7 +1907,7 @@ fn video_close_current(p: &mut Peer, track: Track, now: Instant, cause: Option<R
         match cause {
             ResetCause::Deadline => {
                 p.counters.groups_reset_deadline += 1;
-                p.counters.groups_reset += 1;
+                note_group_reset(p, track);
             }
             ResetCause::Upstream => p.counters.groups_reset_upstream += 1,
         }
@@ -1488,6 +1920,7 @@ fn video_close_current(p: &mut Peer, track: Track, now: Instant, cause: Option<R
     }
     p.video_finishing.push(FinishingGroup {
         stream: group.stream,
+        track,
         finished_at: now,
     });
 }
@@ -1579,9 +2012,10 @@ fn flush_lanes(p: &mut Peer, now: Instant) -> bool {
     while i < p.video_finishing.len() {
         let g = &p.video_finishing[i];
         if now >= g.due_at(rtt) {
+            let track = g.track;
             let _ = p.conn.send_stream(g.stream).reset(GROUP_RESET_CODE);
             p.counters.groups_reset_unacked += 1;
-            p.counters.groups_reset += 1;
+            note_group_reset(p, track);
             p.video_finishing.remove(i);
             reset = true;
             continue;

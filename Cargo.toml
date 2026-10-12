@@ -22,6 +22,19 @@ default-members = [
 # elsewhere.
 exclude = ["third_party"]
 resolver = "2"
+
+# ── The product's version ───────────────────────────────────────────────
+# One line for the eight public crates (protocol, transport, client,
+# server, frontend, desktop, android, ios — they say
+# `version.workspace = true`), and the line the release workflows,
+# Android's Gradle script and the iOS scripts read: bump it here, and
+# nowhere else. It was eight manifests kept equal by hand (review P2-61).
+# Keep `version = "…"` at the start of its line: those readers match it.
+[workspace.package]
+version = "1.2.1"
+edition = "2024"
+license = "Apache-2.0"
+
 # ── Shared dependency versions ──────────────────────────────────────────
 # Crates opt in per dependency with `dep.workspace = true`. Only deps
 # used by two or more crates live here; single-user deps stay local.

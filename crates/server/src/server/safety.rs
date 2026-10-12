@@ -30,10 +30,9 @@ use protocol::{
     MAX_REPORT_EXCERPT_BYTES, MAX_REPORT_NOTE_BYTES,
 };
 
-use super::{hex, ChatServer};
+use super::{hex, ChatServer, Waiting};
 use crate::persistence::{
-    Answer, AskId, AuditRow, Command, ConvKey, MessageRow, Outcome, Query, ReportRow,
-    ReportedMessage,
+    Answer, AuditRow, Command, ConvKey, MessageRow, Outcome, Query, ReportRow, ReportedMessage,
 };
 
 /// Most people one account may block (bounds memory and the list).
@@ -139,7 +138,7 @@ impl ChatServer {
         let msg = ServerMessage::Blocks {
             users: self.blocks_of(&me),
         };
-        self.send_if(client, features::SAFETY, &msg);
+        self.send_msg(client, &msg);
     }
 
     fn send_blocks_to_user(&mut self, user: &UserId) {
@@ -147,7 +146,7 @@ impl ChatServer {
             users: self.blocks_of(user),
         };
         for session in self.sessions_of(user) {
-            self.send_if(session, features::SAFETY, &msg);
+            self.send_msg(session, &msg);
         }
     }
 
@@ -264,29 +263,22 @@ impl ChatServer {
                     Query::ReportedMessage { msg_id },
                     self.now + REPORT_DEADLINE,
                 );
-                self.pending_reports.insert(
+                self.waiting.insert(
                     ask,
-                    PendingReport {
+                    Waiting::Report(PendingReport {
                         client,
                         reporter: me,
                         conv,
                         reason,
                         note,
-                    },
+                    }),
                 );
             }
         }
     }
 
-    pub(super) fn is_report_ask(&self, ask: AskId) -> bool {
-        self.pending_reports.contains_key(&ask)
-    }
-
     /// The store found (or did not) the message a report is about.
-    pub(super) fn resolve_report_answer(&mut self, ask: AskId, outcome: Outcome) {
-        let Some(pending) = self.pending_reports.remove(&ask) else {
-            return;
-        };
+    pub(super) fn resolve_report_answer(&mut self, pending: PendingReport, outcome: Outcome) {
         let found = match outcome {
             Outcome::Answered(Answer::ReportedMessage(Some(found))) => found,
             Outcome::Answered(Answer::ReportedMessage(None)) => {
@@ -444,18 +436,14 @@ impl ChatServer {
             .map(|(c, _)| *c)
             .collect();
         for peer in readers {
-            self.send_if(peer, features::ADMIN_FEED, &line);
+            self.send_msg(peer, &line);
         }
         self.persist.send(Command::InsertReport(Box::new(report)));
         self.answer_report(client, Ok(()));
     }
 
     fn answer_report(&mut self, client: ClientId, result: Result<(), ReportRefusal>) {
-        self.send_if(
-            client,
-            features::SAFETY,
-            &ServerMessage::ReportAck { result },
-        );
+        self.send_msg(client, &ServerMessage::ReportAck { result });
     }
 
     /// At most [`MAX_BLOCK_CHANGES_PER_WINDOW`] per account per window;
@@ -529,17 +517,16 @@ impl ChatServer {
             },
             self.now + REPORT_DEADLINE,
         );
-        self.pending_report_lists.insert(ask, (client, request_id));
+        self.waiting
+            .insert(ask, Waiting::ReportList { client, request_id });
     }
 
-    pub(super) fn is_report_list_ask(&self, ask: AskId) -> bool {
-        self.pending_report_lists.contains_key(&ask)
-    }
-
-    pub(super) fn resolve_report_list_answer(&mut self, ask: AskId, outcome: Outcome) {
-        let Some((client, request_id)) = self.pending_report_lists.remove(&ask) else {
-            return;
-        };
+    pub(super) fn resolve_report_list_answer(
+        &mut self,
+        client: ClientId,
+        request_id: u32,
+        outcome: Outcome,
+    ) {
         let result = match outcome {
             Outcome::Answered(Answer::Reports(list)) => {
                 Ok(AdminOutcome::Reports(fit_reports(list)))
@@ -582,9 +569,8 @@ impl ChatServer {
             *u != me && permissions::has(self.policy.permissions_of(u), permissions::ADMIN)
         });
         if is_admin && !other_admins {
-            self.send_if(
+            self.send_msg(
                 client,
-                features::SAFETY,
                 &ServerMessage::AccountDeleteRefused {
                     reason: DeleteRefusal::LastAdmin,
                 },
@@ -596,53 +582,68 @@ impl ChatServer {
             self.get_username(client),
             hex(&me[..8])
         );
-        self.send_if(client, features::SAFETY, &ServerMessage::AccountDeleted);
+        self.send_msg(client, &ServerMessage::AccountDeleted);
         // No actor: the record keeps that an account went at its
         // owner's request, not who they were.
         self.erase_user(None, &me, "account deleted", "user.delete");
     }
 
-    /// The client logs a user uploaded (`<identity.dir>/logs`), for
-    /// their account's deletion. Names are `<name>-<user id>-<session>-
-    /// <time>.log` since 1.2, `<name>-<session>-<time>.log` before:
-    /// those go by the name.
+    /// The client logs a user uploaded (`<identity.dir>/logs`) go with
+    /// their account — on a thread of their own, not on the tick:
+    /// listing a directory of every log ever uploaded and deleting
+    /// from it waits on the disk, and voice waits behind the tick
+    /// (review P3-13). Not the persistence thread: without a database
+    /// there is none, and the logs are there all the same.
     pub(super) fn delete_uploaded_logs(&self, user: &UserId, name: &str) {
         let dir = PathBuf::from(&self.config.identity.dir).join("logs");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
+        let (user, name) = (*user, name.to_string());
+        let spawned = std::thread::Builder::new()
+            .name("log-cleanup".to_string())
+            .spawn(move || remove_logs_of(&dir, &user, &name));
+        if let Err(e) = spawned {
+            warn!("uploaded logs not removed: no thread to do it on ({e})");
+        }
+    }
+}
+
+/// Delete the uploaded logs of `user` in `dir`. Names are `<name>-<user
+/// id>-<session>-<time>.log` since 1.2, `<name>-<session>-<time>.log`
+/// before: those go by the name.
+fn remove_logs_of(dir: &std::path::Path, user: &UserId, name: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let id = hex(&user[..8]);
+    let safe = log_safe_name(name);
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(stem) = file_name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".log"))
+            .map(str::to_string)
+        else {
+            continue;
         };
-        let id = hex(&user[..8]);
-        let safe = log_safe_name(name);
-        let mut removed = 0usize;
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(stem) = file_name
-                .to_str()
-                .and_then(|n| n.strip_suffix(".log"))
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            let parts: Vec<&str> = stem.split('-').collect();
-            // Before 1.2 the name was all a log said of its author: a
-            // name with no letter or digit in it says nothing at all.
-            let theirs = match parts.as_slice() {
-                [_, user_part, _, _] => *user_part == id,
-                [name_part, _, _] => {
-                    *name_part == safe && safe.chars().any(|c| c.is_ascii_alphanumeric())
-                }
-                _ => false,
-            };
-            if theirs {
-                match std::fs::remove_file(entry.path()) {
-                    Ok(()) => removed += 1,
-                    Err(e) => warn!("uploaded log {} not removed: {e}", entry.path().display()),
-                }
+        let parts: Vec<&str> = stem.split('-').collect();
+        // Before 1.2 the name was all a log said of its author: a
+        // name with no letter or digit in it says nothing at all.
+        let theirs = match parts.as_slice() {
+            [_, user_part, _, _] => *user_part == id,
+            [name_part, _, _] => {
+                *name_part == safe && safe.chars().any(|c| c.is_ascii_alphanumeric())
+            }
+            _ => false,
+        };
+        if theirs {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) => warn!("uploaded log {} not removed: {e}", entry.path().display()),
             }
         }
-        if removed > 0 {
-            info!("removed {removed} uploaded log(s) of {id}");
-        }
+    }
+    if removed > 0 {
+        info!("removed {removed} uploaded log(s) of {id}");
     }
 }
 
@@ -666,6 +667,44 @@ pub(super) fn log_safe_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_accounts_logs_go_and_nobody_elses() {
+        let dir = std::env::temp_dir().join(format!(
+            "baucord-logs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let user = [0xabu8; 32];
+        let id = hex(&user[..8]);
+        let other = hex(&[0xcdu8; 8]);
+        let theirs = [
+            format!("ana-{id}-12-1700000000.log"),
+            // Renamed since: the id still says whose it is.
+            format!("someone_else-{id}-13-1700000001.log"),
+            // Before 1.2 the name was all there was.
+            "ana-9-1600000000.log".to_string(),
+        ];
+        let kept = [
+            format!("ana-{other}-12-1700000000.log"),
+            "bob-9-1600000000.log".to_string(),
+            "notes.txt".to_string(),
+        ];
+        for name in theirs.iter().chain(&kept) {
+            std::fs::write(dir.join(name), b"log").expect("write");
+        }
+        remove_logs_of(&dir, &user, "ana");
+        for name in &theirs {
+            assert!(!dir.join(name).exists(), "{name} should be gone");
+        }
+        for name in &kept {
+            assert!(dir.join(name).exists(), "{name} should be kept");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_reports_list_always_fits_one_message() {

@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use log::{info, warn};
 use protocol::{
-    features, permissions, AdminCommand, AdminError, AdminOutcome, AuditEntry, BlobSummary,
-    ClientId, ServerMessage, StatsSummary, UserId,
+    permissions, AdminCommand, AdminError, AdminOutcome, AuditEntry, BlobSummary, ClientId,
+    ServerMessage, StatsSummary, UserId,
 };
 
-use super::{hex, ChatServer};
+use super::{hex, ChatServer, Waiting};
 use crate::{
-    persistence::{Answer, AskId, Command, Outcome, Query},
+    persistence::{Answer, Command, Outcome, Query},
     policy::RoleRecord,
 };
 
@@ -63,18 +63,17 @@ impl ChatServer {
             },
             self.now + AUDIT_DEADLINE,
         );
-        self.pending_audits.insert(ask, (client, request_id));
-    }
-
-    pub(super) fn is_audit_ask(&self, ask: AskId) -> bool {
-        self.pending_audits.contains_key(&ask)
+        self.waiting
+            .insert(ask, Waiting::Audit { client, request_id });
     }
 
     /// The store answered an audit read (or did not, in time).
-    pub(super) fn resolve_audit_answer(&mut self, ask: AskId, outcome: Outcome) {
-        let Some((client, request_id)) = self.pending_audits.remove(&ask) else {
-            return;
-        };
+    pub(super) fn resolve_audit_answer(
+        &mut self,
+        client: ClientId,
+        request_id: u32,
+        outcome: Outcome,
+    ) {
         let result = match outcome {
             Outcome::Answered(Answer::Audit(rows)) => Ok(AdminOutcome::Audit(
                 rows.into_iter()
@@ -470,7 +469,7 @@ impl ChatServer {
     fn broadcast_roles(&mut self) {
         let roles = self.role_list();
         for peer in self.clients() {
-            self.send_if(peer, features::ROLE_LIST, &roles);
+            self.send_msg(peer, &roles);
         }
     }
 }

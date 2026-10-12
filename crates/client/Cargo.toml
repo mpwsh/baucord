@@ -1,8 +1,8 @@
 [package]
 name = "client"
-version = "1.2.1"
-edition = "2024"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true
@@ -20,3 +20,8 @@ log.workspace = true
 crossbeam-channel.workspace = true
 # Per-platform config directory for settings.json and the identity key.
 dirs = "6"
+
+[dev-dependencies]
+# The integration tests run a real server driver against the client's
+# network thread; the client itself never builds the server side.
+transport = { path = "../transport", features = ["server"] }
