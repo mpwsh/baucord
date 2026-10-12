@@ -1141,11 +1141,26 @@ One line each; the spec decision named holds the detail.
     push-to-talk chosen was silent for the same reason, and is not
     now. On Windows 10 the tab's streams are a room's, so other apps
     may get quieter while it shows.
-  - *The meters are eased.* 30 readings a second while the Audio tab
-    shows, up at once and down over 150 ms (`app_core::meter`, 6
-    tests), a bar set only when it moved; 8 readings a second drawn
-    as read stepped. The echo-cancellation line beside them is looked
-    at 4 times a second.
+  - *The meters are eased.* 20 readings a second while the Audio tab
+    shows, a rise taken at once and a fall over 300 ms
+    (`app_core::meter`, 6 tests), a bar set only when it moved, and
+    the bar gliding to each value over 80 ms (`animate width` is back,
+    now that it only draws while a bar moves on that one tab); 8
+    readings a second drawn as read stepped. The first cut of this
+    (30 readings, 150 ms, no glide) was reported from the phone as
+    jumping, and a bar seen to step. The echo-cancellation line beside
+    them is looked at 4 times a second.
+  - *A phone's microphone test plays back a second late*
+    (`audio::LOOPBACK_DELAY`, 4 tests on the delay line). Live through
+    the loudspeaker it sounded about to feed back: the canceller was
+    taking the user's voice out of the microphone while they were
+    still saying it. The desktop's is live as it was.
+  - *Open from the phone*: the report was also that the Test button,
+    not the tab, opened the microphone. Both reach the engine through
+    the same function with the same commands, so either the phone ran
+    the build before this one or something is not yet understood;
+    the log's `settings: audio tab on screen` and `microphone: …`
+    lines tell which.
   - *Checked*: Linux type-check and lint of all of it; the ease and
     the engine's mute rule by unit test; the client and `app-core`
     type-checked for Windows and Android. **Not run**: there is no

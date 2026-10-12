@@ -339,8 +339,9 @@ agrees with it.
 ### 2.1a Settings → Audio without a room **[8]** [ANDROID-SPEC D70]
 
 - [ ] **new** — not connected, Settings → Audio: the green microphone
-  dot comes on and the capture bar follows your voice, smoothly. log:
-  `settings: audio tab on screen`.
+  dot comes on and the capture bar follows your voice, gliding. log:
+  `settings: audio tab on screen`, a `microphone: …` line. Test
+  microphone plays your voice back a second late.
 - [ ] **new** — back to the section list, close Settings, or press
   Home from the Audio tab: the dot goes after Android's few seconds.
 - [ ] **new** — connected, in the lobby, Settings → Audio: the bar
@@ -475,16 +476,23 @@ after it is the seventh batch's.
   indicator comes on (the first time, after the system's microphone
   question) and the capture bar follows your voice. log: `settings:
   audio tab on screen`, `Voice started for client None`.
-- [ ] **new** — the bars move smoothly: up at once, down over about a
-  quarter of a second, no steps. Back on the section list, log:
-  `settings: meters read N times and drawn M in T s` — N should be
-  about 30 × T. Far fewer means the timer is not reaching its pace on
-  the phone, and that line is what to send back.
+- [ ] **new** — the bars glide: up within a tenth of a second, down
+  over about half a second, no steps and no jumping with each
+  syllable. Back on the section list, log: `settings: meters read N
+  times and drawn M in T s` — N should be about 20 × T. Far fewer
+  means the timer is not reaching its pace on the phone, and that
+  line is what to send back.
 - [ ] **new** — back to the section list, or close Settings: the
   indicator goes. Send the app to the background from the Audio tab:
   it goes too, and the app is suspended as any unconnected app is.
-- [ ] **new** — Test microphone there: you hear yourself; with
-  push-to-talk chosen as well.
+- [ ] **new** — Test microphone there: say a word and it comes back
+  a second later, clean — not hollow, not about to howl; the hint
+  says it is late. With push-to-talk chosen as well.
+- [ ] **new** — if the tab alone does not move the bar: Settings →
+  Debug, and the log must show `settings: audio tab on screen` and a
+  `microphone: …` line after it, then `Voice started for client None`
+  (not connected) or `Reopening voice streams (in a voice room)`
+  (lobby). No first line: the phone is running an older build.
 - [ ] **new** — connected, in the lobby, Settings → Audio: indicator
   and meter as above; nobody sees you speaking; leaving the tab closes
   the microphone again. Muted, the bar stays empty, as in a room.

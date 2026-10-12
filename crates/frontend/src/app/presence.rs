@@ -68,9 +68,11 @@ impl AppState {
         // Start voice engine. With the lobby we arrive in it, and a
         // phone opens no microphone there (ANDROID-SPEC.md D53) —
         // unless Settings is showing its meter, which then stays on
-        // this device.
-        self.voice_in_room = self.voice_room_wanted();
-        self.sync_voice_room();
+        // this device. From the server's word that it has a lobby, not
+        // from the roster: a list without us in it must not open a
+        // microphone. `update_user_list` below settles the rest.
+        self.voice_in_room = !self.lobby || self.mic_previewing();
+        self.sync_mic_local();
         // Streams play on the voice output (review P1-19).
         self.sync_stream_output();
         self.voice

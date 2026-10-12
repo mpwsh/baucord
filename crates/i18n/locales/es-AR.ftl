@@ -187,6 +187,7 @@ audio-test-mic = Probar micrófono
 audio-stop-testing = Detener prueba
 audio-test-hint = Escuchá tu propio micrófono (los demás no te escuchan)
 audio-testing-hint = Escuchando tu micrófono... los demás no te escuchan
+audio-testing-hint-delayed = Decí algo: lo vas a escuchar un segundo después. Los demás no te escuchan
 audio-output-header = SALIDA
 audio-master-volume = Volumen principal
 audio-system-default = Predeterminado del sistema

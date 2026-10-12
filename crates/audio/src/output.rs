@@ -27,6 +27,7 @@ use rubato::{Async, Resampler};
 use crate::{
     config::PeerAudioSettings,
     latch::{Ring, Wait},
+    loopback::{LoopbackDelay, LOOPBACK_DELAY},
     processor::limiter::Limiter,
     resampler::build_output_resampler,
     sounds::{SoundBank, SoundType},
@@ -634,6 +635,8 @@ fn worker_loop(parts: WorkerParts) {
     let mut resample_accum: Vec<f32> = Vec::with_capacity(2048);
     let mut output_limiter = Limiter::new();
     let mut next_tick = Instant::now();
+    // A microphone test's voice waits here on a phone (`loopback`).
+    let mut loopback = LoopbackDelay::new(LOOPBACK_DELAY);
 
     // Audio-class scheduling: MMCSS "Pro Audio" on Windows, real-time
     // policy on macOS/Linux, nice −16 on Android. This thread now
@@ -648,7 +651,11 @@ fn worker_loop(parts: WorkerParts) {
         while let Ok((packet, arrival)) = packet_rx.try_recv() {
             jitter_buffer.push_packet(packet, arrival);
         }
+        let now = Instant::now();
         while let Ok(frame) = loopback_rx.try_recv() {
+            loopback.push(&frame, now);
+        }
+        while let Some(frame) = loopback.pop_due(now) {
             jitter_buffer.push_loopback(&frame);
         }
 

@@ -495,10 +495,23 @@ impl AppState {
     fn mic_preview_changed(&mut self, was_running: bool) {
         let wanted = self.engine_wanted();
         self.sync_voice_room();
+        // One line a change: with the voice thread's own (`Voice
+        // started`, `Voice stopped`) it says in a pasted log which of
+        // the two did not do its part.
         if wanted && !was_running {
+            log::info!("microphone: no session, starting an engine for it alone");
             self.start_sessionless_engine();
         } else if was_running && !wanted {
+            log::info!("microphone: nothing needs it, stopping the engine");
             self.voice.tx.send(VoiceControl::Stop).ok();
+        } else {
+            log::info!(
+                "microphone: the session's engine keeps it (connected {}, in a voice room {}, \
+                 open for the tab or a test {})",
+                self.connected,
+                self.in_voice_room(),
+                self.mic_previewing()
+            );
         }
     }
 
@@ -545,8 +558,7 @@ impl AppState {
     /// — the lobby and the AFK room, where the relay would drop it too,
     /// and nothing lights us up as speaking for it.
     pub(super) fn sync_voice_room(&mut self) {
-        let local = self.is_testing_mic || (self.audio_tab_open && !self.in_voice_room());
-        self.is_testing_mic_shared.store(local, Ordering::Relaxed);
+        self.sync_mic_local();
         // Disconnected with no test and no meter, the engine is on its
         // way out (the deferred Stop): leave it as it is.
         if !self.engine_wanted() {
@@ -557,6 +569,14 @@ impl AppState {
             self.voice_in_room = in_room;
             self.voice.tx.send(VoiceControl::SetInRoom(in_room)).ok();
         }
+    }
+
+    /// What the network thread reads before it sends a voice packet:
+    /// what the microphone hears stays here during a test, and while
+    /// the Audio tab's meter has it open out of a voice room.
+    pub(super) fn sync_mic_local(&self) {
+        let local = self.is_testing_mic || (self.audio_tab_open && !self.in_voice_room());
+        self.is_testing_mic_shared.store(local, Ordering::Relaxed);
     }
 
     /// Send the composer draft: shortcodes rendered, control chars

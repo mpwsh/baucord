@@ -1,17 +1,23 @@
-//! How a level meter moves: up at once, down eased.
+//! How a level meter moves: up at once, down slowly.
 //!
 //! The voice engine publishes the level of its last 20 ms frame. Drawn
-//! as read, a bar jumps between unrelated samples and looks choppy at
-//! any rate a UI can afford. [`Meter`] holds what the bar shows between
-//! reads — a rise shows at once, a fall takes [`RELEASE`] — and says
-//! when it has moved far enough to be worth a redraw, so a quiet
-//! microphone draws nothing.
+//! as read, a bar jumps between unrelated samples: speech falls to
+//! nothing between syllables, several times a second. [`Meter`] holds
+//! what the bar shows between reads — a rise is taken at once, a fall
+//! takes [`RELEASE`] — and says when it has moved far enough to be
+//! worth a redraw, so a quiet microphone draws nothing.
+//!
+//! The UI glides the bar to each value it is given (`animate width` in
+//! `widgets.slint`), so the rise is not a jump on screen either.
 
 use std::time::Duration;
 
-/// How long a fall takes to cover 63% of the way down: quick enough to
-/// set a gate against, slow enough that the eye follows it.
-pub const RELEASE: Duration = Duration::from_millis(150);
+/// How long a fall takes to cover 63% of the way down. At 150 ms the
+/// bar followed every syllable to the floor and back and read as
+/// jumping (first phone look, 2026-10-12); at twice that it rides over
+/// the gaps inside a word and comes down between words, which is what
+/// a gate threshold is set against.
+pub const RELEASE: Duration = Duration::from_millis(300);
 
 /// The least movement worth a redraw: about a pixel of a phone's bar.
 pub const STEP: f32 = 0.004;
@@ -72,7 +78,7 @@ impl Meter {
 mod tests {
     use super::*;
 
-    const TICK: Duration = Duration::from_millis(33);
+    const TICK: Duration = Duration::from_millis(50);
 
     #[test]
     fn a_rise_shows_at_once() {
@@ -102,17 +108,17 @@ mod tests {
         m.read(1.0, TICK);
         let mut last = 1.0;
         let mut draws = 0;
-        for _ in 0..60 {
+        for _ in 0..90 {
             if let Some(v) = m.read(0.0, TICK) {
                 assert!(v < last, "{v} after {last}");
                 last = v;
                 draws += 1;
             }
         }
-        // Two seconds of ticks: the bar came down in steps and is empty.
+        // The bar came down in steps, not at once, and is empty.
         assert!(last == 0.0, "ended at {last}");
-        assert!(draws > 10, "{draws} steps is not a smooth fall");
-        assert!(draws < 40, "{draws} draws for one fall");
+        assert!(draws > 20, "{draws} steps is not a smooth fall");
+        assert!(draws < 60, "{draws} draws for one fall");
         assert_eq!(m.read(0.0, TICK), None);
     }
 

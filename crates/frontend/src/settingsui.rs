@@ -173,11 +173,11 @@ const TAB_DEBUG: i32 = 8;
 const LOG_TAIL_LINES: usize = 100;
 /// …read from at most the log's last this many bytes.
 const LOG_TAIL_BYTES: usize = 128 * 1024;
-/// The settings timer on the Audio tab: the meters' 30 readings a
-/// second, eased by `app_core::meter` and drawn only when a bar moved.
-/// At 8 a second and drawn as read they stepped (first iPhone look,
-/// 2026-10-12).
-const METER_TICK: Duration = Duration::from_millis(33);
+/// The settings timer on the Audio tab: the meters' 20 readings a
+/// second, held by `app_core::meter` and set only when a bar moved; the
+/// bar itself glides to each one (`widgets.slint`). At 8 a second and
+/// drawn as read they stepped (first iPhone look, 2026-10-12).
+const METER_TICK: Duration = Duration::from_millis(50);
 /// The Audio tab's echo-cancellation line, which changes when streams
 /// reopen: looked at this often, not with every meter reading.
 const AEC_TICK: Duration = Duration::from_millis(250);
@@ -730,14 +730,7 @@ pub fn populate(app: &mut AppState) {
     s.set_gate_threshold(settings.audio.gate_threshold);
     s.set_sensitivity_line(format_sensitivity(settings.audio.gate_threshold).into());
     s.set_testing_mic(app.is_testing_mic);
-    s.set_test_hint(
-        if app.is_testing_mic {
-            t!("audio-testing-hint")
-        } else {
-            t!("audio-test-hint")
-        }
-        .into(),
-    );
+    s.set_test_hint(test_hint(app.is_testing_mic).into());
     s.set_mic_level(0.0);
     s.set_out_level(0.0);
     s.set_capturing(false);
@@ -1297,14 +1290,7 @@ fn wire(sf: &SettingsSurface<'_>) {
             if let Some(sf) = surface(app) {
                 let s = sf.state();
                 s.set_testing_mic(enable);
-                s.set_test_hint(
-                    if enable {
-                        t!("audio-testing-hint")
-                    } else {
-                        t!("audio-test-hint")
-                    }
-                    .into(),
-                );
+                s.set_test_hint(test_hint(enable).into());
             }
         });
     });
@@ -1540,7 +1526,7 @@ fn populate_binds_only(app: &mut AppState) {
     app.apply_push_to_talk();
 }
 
-/// The settings timer: the Audio tab's meters 30 times a second and
+/// The settings timer: the Audio tab's meters 20 times a second and
 /// its echo-cancellation line 4 times, the Debug tab's log view every
 /// 2 s — and nothing but a 2 s look elsewhere, minimized, or with the
 /// app in the background. It ran at 8 Hz on every tab for as long as
@@ -1683,7 +1669,18 @@ pub(crate) fn test_ended(app: &AppState) {
     if let Some(sf) = surface(app) {
         let s = sf.state();
         s.set_testing_mic(false);
-        s.set_test_hint(t!("audio-test-hint").into());
+        s.set_test_hint(test_hint(false).into());
+    }
+}
+
+/// The line beside the Test microphone button. Where the test plays the
+/// voice back late (a phone, `audio::LOOPBACK_DELAY`), it says so:
+/// silence for a second after speaking reads as a test that is broken.
+fn test_hint(testing: bool) -> String {
+    match (testing, audio::LOOPBACK_DELAY.is_zero()) {
+        (false, _) => t!("audio-test-hint"),
+        (true, true) => t!("audio-testing-hint"),
+        (true, false) => t!("audio-testing-hint-delayed"),
     }
 }
 

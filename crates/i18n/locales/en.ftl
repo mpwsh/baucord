@@ -186,6 +186,7 @@ audio-test-mic = Test Microphone
 audio-stop-testing = Stop Testing
 audio-test-hint = Listen to your own mic (others won't hear you)
 audio-testing-hint = Listening to your mic... others can't hear you
+audio-testing-hint-delayed = Say something: you'll hear it a second later. Others can't hear you
 audio-output-header = OUTPUT
 audio-master-volume = Master Volume
 audio-system-default = System Default

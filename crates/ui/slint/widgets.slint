@@ -299,10 +299,14 @@ export component VuMeter inherits Rectangle {
         background: root.lv > 0.9 ? Theme.danger
             : root.lv > 0.7 ? Theme.warning
             : root.accent;
-        // No `animate width`: the app eases the level itself
-        // (`app_core::meter`) and sets it only when the bar moved, so
-        // an animation here would add redraws to a bar already smooth
-        // (review P2-40).
+        // The glide between two readings, at the display's own rate:
+        // without it the bar is seen stepping at the timer's rate,
+        // whatever that comes to on the device. It costs frames only
+        // while a bar is moving on the Audio tab — the app sets the
+        // level when it changed and not otherwise (`app_core::meter`).
+        // It was taken out when the timer ran on every tab and drew
+        // every reading (review P2-40), and the bar stepped.
+        animate width { duration: 80ms; easing: linear; }
     }
 }
 
@@ -331,6 +335,8 @@ export component GateMeter inherits Rectangle {
         width: (root.width - 4px) * root.lv;
         border-radius: Theme.radius-sm - 2px;
         background: root.lv > root.thr ? Theme.success : Theme.subtle;
+        // As the VuMeter's.
+        animate width { duration: 80ms; easing: linear; }
     }
     marker := Rectangle {
         x: 2px + (root.width - 4px) * root.thr - 1px;
