@@ -1157,10 +1157,24 @@ One line each; the spec decision named holds the detail.
     still saying it. The desktop's is live as it was.
   - *Open from the phone*: the report was also that the Test button,
     not the tab, opened the microphone. Both reach the engine through
-    the same function with the same commands, so either the phone ran
-    the build before this one or something is not yet understood;
-    the log's `settings: audio tab on screen` and `microphone: …`
-    lines tell which.
+    the same function with the same commands. A second look with this
+    build gave one log line — the tab and a test both on, not
+    connected, an engine already running — which rules out an old
+    build and a tab that is never noticed, and does not say whether
+    the bar moved before the test. Read again from the tab to the
+    bar (the page's `changed` handlers, the timer's pace, the engine's
+    start, the voice unit, the capture pump, the level, the network
+    thread's unbounded queue): no fault found. What is left is the
+    voice unit's start-up, a second or so in which the bar is dead
+    and a test gets pressed — a guess until measured. The line logged
+    when the tab leaves now measures it (`app_core::meter::Run`, 2
+    tests): when an engine stood behind the meters, when the
+    microphone was first heard with no test running, and the peaks
+    with and without one. The `microphone:` lines name which engine
+    they are about; the one sent back said "the session's engine" of
+    an engine with no session. An engine is counted as the session's
+    from `Init`, not `Connected`, so a tab opened between the two is
+    not left without one.
   - *Checked*: Linux type-check and lint of all of it; the ease and
     the engine's mute rule by unit test; the client and `app-core`
     type-checked for Windows and Android. **Not run**: there is no

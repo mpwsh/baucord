@@ -132,11 +132,12 @@ impl SharedAudioState {
         }
     }
 
-    /// The meters: the microphone after denoising and the playback,
-    /// both 0 without an engine.
+    /// The meters: the microphone after denoising and the playback.
+    /// `None` without an engine, which is not the same as silence to
+    /// whoever is asking why a bar does not move.
     #[must_use]
-    pub fn levels(&self) -> (f32, f32) {
-        self.engine_stats().map_or((0.0, 0.0), |s| {
+    pub fn meters(&self) -> Option<(f32, f32)> {
+        self.engine_stats().map(|s| {
             (
                 f32::from_bits(s.denoised_level.load(Relaxed)),
                 f32::from_bits(s.output_level.load(Relaxed)),

@@ -340,8 +340,10 @@ agrees with it.
 
 - [ ] **new** — not connected, Settings → Audio: the green microphone
   dot comes on and the capture bar follows your voice, gliding. log:
-  `settings: audio tab on screen`, a `microphone: …` line. Test
-  microphone plays your voice back a second late.
+  `settings: audio tab on screen`, then `microphone: no engine yet,
+  starting one for this device alone`. Test microphone plays your
+  voice back a second late. Leaving the tab logs the summary line of
+  §3.1a.
 - [ ] **new** — back to the section list, close Settings, or press
   Home from the Audio tab: the dot goes after Android's few seconds.
 - [ ] **new** — connected, in the lobby, Settings → Audio: the bar
@@ -478,21 +480,34 @@ after it is the seventh batch's.
   audio tab on screen`, `Voice started for client None`.
 - [ ] **new** — the bars glide: up within a tenth of a second, down
   over about half a second, no steps and no jumping with each
-  syllable. Back on the section list, log: `settings: meters read N
-  times and drawn M in T s` — N should be about 20 × T. Far fewer
-  means the timer is not reaching its pace on the phone, and that
-  line is what to send back.
+  syllable. Back on the section list, log: `settings: audio tab on
+  screen T s: meters read N times and drawn M; …` — N should be about
+  20 × T. Far fewer means the timer is not reaching its pace on the
+  phone, and that line is what to send back.
 - [ ] **new** — back to the section list, or close Settings: the
   indicator goes. Send the app to the background from the Audio tab:
   it goes too, and the app is suspended as any unconnected app is.
 - [ ] **new** — Test microphone there: say a word and it comes back
   a second later, clean — not hollow, not about to howl; the hint
   says it is late. With push-to-talk chosen as well.
-- [ ] **new** — if the tab alone does not move the bar: Settings →
-  Debug, and the log must show `settings: audio tab on screen` and a
-  `microphone: …` line after it, then `Voice started for client None`
-  (not connected) or `Reopening voice streams (in a voice room)`
-  (lobby). No first line: the phone is running an older build.
+- [ ] **new** — the tab alone, and how long it takes: not connected,
+  open Settings → Audio, **do not touch Test**, talk for five seconds,
+  go back to the section list, open Debug. One line answers it:
+  `settings: audio tab on screen 5.3 s: meters read 104 times and
+  drawn 61; an engine behind them 0.4 s in; microphone with no test
+  running first heard 0.9 s in, peak 0.31; during a test, peak 0.00`.
+  - `an engine behind them never`: nothing started; the `microphone:`
+    line above it says what the app decided.
+  - an engine, and `first heard never, peak 0.00`: the engine ran and
+    its microphone gave silence — the unit, the permission, or the
+    session, not the app's bookkeeping.
+  - `first heard` a second or more in: it works, late. That is the
+    voice unit starting, and a bar that looks dead until then.
+  - The `microphone:` lines name the engine: `no engine yet, starting
+    one for this device alone`, `the engine started for this device
+    alone carries on` (a test pressed with the tab open, or the tab
+    left with a test running), `the session's engine has it`
+    (connected), `nothing needs it, stopping the engine`.
 - [ ] **new** — connected, in the lobby, Settings → Audio: indicator
   and meter as above; nobody sees you speaking; leaving the tab closes
   the microphone again. Muted, the bar stays empty, as in a room.

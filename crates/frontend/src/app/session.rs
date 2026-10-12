@@ -483,10 +483,12 @@ impl AppState {
         self.is_testing_mic || self.audio_tab_open
     }
 
-    /// An engine should be running: for a session, or for a preview
-    /// without one.
+    /// An engine should be running: a session's, which it gets with
+    /// its client id (`Init`) — not on `Connected`, a moment earlier,
+    /// when there is none to hand the microphone to yet — or one for a
+    /// preview without a session.
     fn engine_wanted(&self) -> bool {
-        self.connected || self.mic_previewing()
+        self.session.our_client_id.is_some() || self.mic_previewing()
     }
 
     /// A test or the Audio tab's meter began or ended: start the engine
@@ -495,23 +497,32 @@ impl AppState {
     fn mic_preview_changed(&mut self, was_running: bool) {
         let wanted = self.engine_wanted();
         self.sync_voice_room();
-        // One line a change: with the voice thread's own (`Voice
-        // started`, `Voice stopped`) it says in a pasted log which of
-        // the two did not do its part.
-        if wanted && !was_running {
-            log::info!("microphone: no session, starting an engine for it alone");
-            self.start_sessionless_engine();
-        } else if was_running && !wanted {
-            log::info!("microphone: nothing needs it, stopping the engine");
-            self.voice.tx.send(VoiceControl::Stop).ok();
-        } else {
-            log::info!(
-                "microphone: the session's engine keeps it (connected {}, in a voice room {}, \
-                 open for the tab or a test {})",
-                self.connected,
-                self.in_voice_room(),
-                self.mic_previewing()
-            );
+        // One line a change, each saying which engine and why: with
+        // the voice thread's own (`Voice started`, `Voice stopped`) a
+        // pasted log shows which of the two did not do its part.
+        let (tab, test) = (self.audio_tab_open, self.is_testing_mic);
+        match (was_running, wanted) {
+            (false, true) => {
+                log::info!(
+                    "microphone: no engine yet, starting one for this device alone \
+                     (Audio tab {tab}, test {test})"
+                );
+                self.start_sessionless_engine();
+            }
+            (true, false) => {
+                log::info!("microphone: nothing needs it, stopping the engine");
+                self.voice.tx.send(VoiceControl::Stop).ok();
+            }
+            (true, true) if self.session.our_client_id.is_some() => log::info!(
+                "microphone: the session's engine has it (in a voice room {}, Audio tab {tab}, \
+                 test {test})",
+                self.in_voice_room()
+            ),
+            (true, true) => log::info!(
+                "microphone: the engine started for this device alone carries on \
+                 (Audio tab {tab}, test {test})"
+            ),
+            (false, false) => {}
         }
     }
 
@@ -559,8 +570,9 @@ impl AppState {
     /// and nothing lights us up as speaking for it.
     pub(super) fn sync_voice_room(&mut self) {
         self.sync_mic_local();
-        // Disconnected with no test and no meter, the engine is on its
-        // way out (the deferred Stop): leave it as it is.
+        // No session's engine, no test and no meter: there is none yet
+        // (`Connected`, before `Init` starts it with where we are), or
+        // it is on its way out (the deferred Stop). Leave it as it is.
         if !self.engine_wanted() {
             return;
         }

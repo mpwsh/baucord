@@ -7,7 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use app_core::{chat::human_size, logfile, meter::Meter};
+use app_core::{
+    chat::human_size,
+    logfile,
+    meter::{Meter, Run as MeterRun},
+};
 use client::{
     config::{build_bind_string, BindableAction, ServerEntry},
     network::{NetworkControl, LOG_UPLOAD_MIN_INTERVAL},
@@ -185,19 +189,10 @@ const AEC_TICK: Duration = Duration::from_millis(250);
 /// reads the file again this often.
 const IDLE_TICK: Duration = Duration::from_secs(2);
 
-/// The meters' time on screen, for the log line when it ends: what
-/// tells a timer that never reached its pace on some host from bars
-/// that were read and not drawn.
-#[derive(Clone, Copy)]
-struct MeterRun {
-    since: Instant,
-    readings: u32,
-    draws: u32,
-}
-
 thread_local! {
-    /// The Audio tab's meters are on screen, since when and how busy.
-    static METER_RUN: Cell<Option<MeterRun>> = const { Cell::new(None) };
+    /// The Audio tab's meters are on screen: since when, and what was
+    /// seen of them, for the log line when they leave.
+    static METER_RUN: Cell<Option<(Instant, MeterRun)>> = const { Cell::new(None) };
     /// When this run last sent its log: the server takes one per
     /// `LOG_UPLOAD_MIN_INTERVAL`, and the network thread drops a second
     /// one silently, so the button says so instead.
@@ -1569,7 +1564,9 @@ fn start_meter_timer(app: &mut AppState) {
                         let now = Instant::now();
                         let since = now.duration_since(read_at);
                         read_at = now;
-                        let (mic, out) = levels.levels();
+                        // No engine reads as silence on the bars.
+                        let heard = levels.meters();
+                        let (mic, out) = heard.unwrap_or((0.0, 0.0));
                         let s = sf.state();
                         // A bar that did not move is not drawn again:
                         // a quiet room costs no frames.
@@ -1581,10 +1578,14 @@ fn start_meter_timer(app: &mut AppState) {
                         if let Some(level) = out {
                             s.set_out_level(level);
                         }
-                        if let Some(mut run) = METER_RUN.get() {
-                            run.readings += 1;
-                            run.draws += u32::from(mic.is_some() || out.is_some());
-                            METER_RUN.set(Some(run));
+                        if let Some((began, mut run)) = METER_RUN.get() {
+                            run.note(
+                                now.duration_since(began),
+                                heard.map(|(mic, _)| mic),
+                                app.is_testing_mic,
+                                mic.is_some() || out.is_some(),
+                            );
+                            METER_RUN.set(Some((began, run)));
                         }
                         if aec_at.is_some_and(|at| now.duration_since(at) < AEC_TICK) {
                             return;
@@ -1638,19 +1639,10 @@ fn pace_meter_timer(app: &mut AppState) -> bool {
 /// the run came to.
 fn note_meter_run(on_screen: bool) {
     match (on_screen, METER_RUN.get()) {
-        (true, None) => METER_RUN.set(Some(MeterRun {
-            since: Instant::now(),
-            readings: 0,
-            draws: 0,
-        })),
-        (false, Some(run)) => {
+        (true, None) => METER_RUN.set(Some((Instant::now(), MeterRun::default()))),
+        (false, Some((began, run))) => {
             METER_RUN.set(None);
-            log::info!(
-                "settings: meters read {} times and drawn {} in {:.1} s",
-                run.readings,
-                run.draws,
-                run.since.elapsed().as_secs_f32()
-            );
+            log::info!("settings: {}", run.summary(began.elapsed()));
         }
         _ => {}
     }
