@@ -39,7 +39,14 @@ pub enum VoiceControl {
     /// and every other message would pay for it otherwise.
     Start {
         settings: Box<Settings>,
-        our_client_id: u64,
+        /// The session's client id. `None` is an engine with no session
+        /// behind it — Settings' meter or a microphone test while not
+        /// connected: nothing it hears can leave the device for as long
+        /// as it lives (`VoiceLink::local_only`), so mute and
+        /// push-to-talk have nothing to keep in and do not close its
+        /// microphone. A push-to-talk user's meter would stay dead
+        /// otherwise, with no session to hold the key in.
+        our_client_id: Option<u64>,
         /// In a voice room (or testing the microphone). Out of one a
         /// phone opens no microphone (`audio::RELEASES_MIC`), and the
         /// desktop drops what its microphone hears (review P1-6).
@@ -254,6 +261,9 @@ struct VoiceLoopState {
     /// In a voice room (`SetInRoom`); out of one a phone keeps its
     /// microphone closed and the desktop drops the samples.
     in_room: bool,
+    /// The engine has no session behind it (`Start` without a client
+    /// id): what it hears stays here, and mute and push-to-talk wait.
+    sessionless: bool,
     running: bool,
     /// The engine was started, replaced or stopped: the network thread
     /// and the UI are told after this pass's commands.
@@ -273,6 +283,7 @@ impl VoiceLoopState {
             ptt_mode: false,
             ptt_held: false,
             in_room: true,
+            sessionless: false,
             running: true,
             relink: false,
             last_stats_log: Instant::now(),
@@ -327,8 +338,12 @@ impl VoiceLoopState {
     }
 
     /// Whether the mic should be muted: user-muted, deafened, or in
-    /// push-to-talk mode with the key up.
+    /// push-to-talk mode with the key up — and never without a
+    /// session, where nothing leaves the device.
     fn effective_mute(&self) -> bool {
+        if self.sessionless {
+            return false;
+        }
         let ptt_closed = self.ptt_mode && !self.ptt_held;
         if let Some(v) = &self.vc {
             self.user_muted || ptt_closed || v.is_deafened()
@@ -370,6 +385,7 @@ impl VoiceLoopState {
                 self.user_muted = false;
                 self.ptt_held = false;
                 self.in_room = in_room;
+                self.sessionless = id.is_none();
                 let mut voice = VoiceChat::new(config);
                 voice.set_presence(in_room, !self.effective_mute());
                 match voice.start() {
@@ -564,6 +580,7 @@ fn run_voice_loop(
                 incoming: v.incoming_sender(),
                 outgoing: v.outgoing_receiver(),
                 testing: is_testing_mic.clone(),
+                local_only: state.sessionless,
             });
             let _ = network_tx.send(NetworkControl::VoiceLink(link));
             shared.publish(state.vc.as_ref().map(|v| v.stats().clone()));
@@ -590,7 +607,9 @@ fn run_voice_loop(
             // test mid-sentence emits a clean false edge, stopping it
             // while still talking emits a clean true edge. A test starts
             // and stops with a command, which wakes this loop.
-            let speaking = voice.is_speaking() && !is_testing_mic.load(Ordering::Relaxed);
+            let speaking = voice.is_speaking()
+                && !state.sessionless
+                && !is_testing_mic.load(Ordering::Relaxed);
             if speaking != state.was_speaking {
                 state.was_speaking = speaking;
                 let _ = network_tx.send(NetworkControl::SendSpeakingStatus(speaking));
@@ -614,5 +633,39 @@ fn run_voice_loop(
         }
 
         state.maybe_log_stats(&network_tx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tell(state: &mut VoiceLoopState, ctrl: VoiceControl) {
+        let (event_tx, _event_rx) = bounded::<VoiceEvent>(4);
+        let wake: WakeFn = Arc::new(|| {});
+        state.handle_control(ctrl, &event_tx, &wake);
+    }
+
+    /// The meter on Settings' Audio tab, not connected: a push-to-talk
+    /// user has no session to hold the key in, and nothing the engine
+    /// hears can leave. With a session both rule again.
+    #[test]
+    fn mute_and_push_to_talk_wait_only_while_there_is_no_session() {
+        let mut state = VoiceLoopState::new();
+        tell(&mut state, VoiceControl::SetPushToTalk(true));
+        assert!(state.effective_mute(), "key up");
+
+        // What `Start` records, without the devices it would open.
+        state.sessionless = true;
+        assert!(!state.effective_mute());
+        tell(&mut state, VoiceControl::SetMuted(true));
+        assert!(!state.effective_mute());
+
+        state.sessionless = false;
+        assert!(state.effective_mute());
+        tell(&mut state, VoiceControl::SetPushToTalk(false));
+        assert!(state.effective_mute(), "still muted by hand");
+        tell(&mut state, VoiceControl::SetMuted(false));
+        assert!(!state.effective_mute());
     }
 }

@@ -1,5 +1,5 @@
 // settingsui.rs — the settings window: populate, wire, and the two
-// live loops (8 Hz level meters, keybind capture).
+// live loops (the level meters, keybind capture).
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use app_core::{chat::human_size, logfile};
+use app_core::{chat::human_size, logfile, meter::Meter};
 use client::{
     config::{build_bind_string, BindableAction, ServerEntry},
     network::{NetworkControl, LOG_UPLOAD_MIN_INTERVAL},
@@ -87,6 +87,16 @@ impl<'a> SettingsSurface<'a> {
         }
     }
 
+    /// Whether the selected tab's contents are what shows. The narrow
+    /// page (D28) is either its section list or one section: the tab
+    /// stays selected behind the list.
+    fn section_showing(&self) -> bool {
+        match self {
+            Self::Window(_) => true,
+            Self::Page(m) => !m.get_narrow() || m.global::<State>().get_settings_section_open(),
+        }
+    }
+
     /// Give the keybind-capture scope focus. The page never records a
     /// keybind (no global hotkeys on a phone), so nothing to focus.
     fn focus_capture(&self) {
@@ -163,13 +173,31 @@ const TAB_DEBUG: i32 = 8;
 const LOG_TAIL_LINES: usize = 100;
 /// …read from at most the log's last this many bytes.
 const LOG_TAIL_BYTES: usize = 128 * 1024;
-/// The settings timer on the Audio tab: the meters' 8 samples a second.
-const METER_TICK: Duration = Duration::from_millis(125);
+/// The settings timer on the Audio tab: the meters' 30 readings a
+/// second, eased by `app_core::meter` and drawn only when a bar moved.
+/// At 8 a second and drawn as read they stepped (first iPhone look,
+/// 2026-10-12).
+const METER_TICK: Duration = Duration::from_millis(33);
+/// The Audio tab's echo-cancellation line, which changes when streams
+/// reopen: looked at this often, not with every meter reading.
+const AEC_TICK: Duration = Duration::from_millis(250);
 /// …and on every other tab, or off screen: the Debug tab's log view
 /// reads the file again this often.
 const IDLE_TICK: Duration = Duration::from_secs(2);
 
+/// The meters' time on screen, for the log line when it ends: what
+/// tells a timer that never reached its pace on some host from bars
+/// that were read and not drawn.
+#[derive(Clone, Copy)]
+struct MeterRun {
+    since: Instant,
+    readings: u32,
+    draws: u32,
+}
+
 thread_local! {
+    /// The Audio tab's meters are on screen, since when and how busy.
+    static METER_RUN: Cell<Option<MeterRun>> = const { Cell::new(None) };
     /// When this run last sent its log: the server takes one per
     /// `LOG_UPLOAD_MIN_INTERVAL`, and the network thread drops a second
     /// one silently, so the button says so instead.
@@ -467,9 +495,14 @@ fn format_sensitivity(threshold: f32) -> String {
         "threshold" => format!("{threshold:.3}"))
 }
 
-/// Open the settings UI: the window (created on first use) on
-/// desktop, the page on a single-window host.
+/// Open the settings UI where it was left: the window (created on
+/// first use) on desktop, the page on a single-window host.
 pub fn open(app: &mut AppState) {
+    open_on(app, None);
+}
+
+/// Open the settings UI, on `tab` (`TAB_*`) if one is asked for.
+pub fn open_on(app: &mut AppState, tab: Option<i32>) {
     if !app::SINGLE_WINDOW_HOST && app.settings_win.is_none() {
         let win = match SettingsWindow::new() {
             Ok(w) => w,
@@ -498,7 +531,15 @@ pub fn open(app: &mut AppState) {
 
     if let Some(sf) = surface(app) {
         sf.show();
+        if let Some(tab) = tab {
+            sf.set_tab(tab);
+        }
     }
+    // Opened on the Audio tab: its microphone now, not a tick later —
+    // and only once the tab asked for is the one selected, or a look
+    // at the servers would open the microphone the Audio tab was left
+    // with.
+    sync_audio_tab(app);
 }
 
 /// Wire the page's callbacks on a single-window host — once, at
@@ -1229,7 +1270,7 @@ fn wire(sf: &SettingsSurface<'_>) {
             app.voice_tx().send(VoiceControl::SetInputGain(gain)).ok();
         });
     });
-    logic.on_tab_shown(|| app::with_current(|app| _ = pace_meter_timer(app)));
+    logic.on_tab_shown(|| app::with_current(sync_audio_tab));
     logic.on_output_gain_changed(|gain| {
         app::with_current(move |app| {
             app.settings.audio.output.gain = gain;
@@ -1499,16 +1540,19 @@ fn populate_binds_only(app: &mut AppState) {
     app.apply_push_to_talk();
 }
 
-/// The settings timer: the Audio tab's meters and echo-cancellation
-/// line 8 times a second, the Debug tab's log view every 2 s — and
-/// nothing but a 2 s look elsewhere, minimized, or with the app in the
-/// background. It ran at 8 Hz on every tab for as long as Settings was
-/// open (review P2-40). `tab-shown` re-paces it at once on a tab change
-/// ([`pace_meter_timer`]); coming back on screen is noticed by the
-/// next slow tick.
+/// The settings timer: the Audio tab's meters 30 times a second and
+/// its echo-cancellation line 4 times, the Debug tab's log view every
+/// 2 s — and nothing but a 2 s look elsewhere, minimized, or with the
+/// app in the background. It ran at 8 Hz on every tab for as long as
+/// Settings was open (review P2-40). `tab-shown` re-paces it at once on
+/// a tab change ([`pace_meter_timer`]); coming back on screen is
+/// noticed by the next slow tick.
 fn start_meter_timer(app: &mut AppState) {
     let levels = app.voice_levels();
     let aec = app.voice_aec();
+    let (mut mic_bar, mut out_bar) = (Meter::new(), Meter::new());
+    let mut read_at = Instant::now();
+    let mut aec_at: Option<Instant> = None;
     app.meter_timer
         .start(slint::TimerMode::Repeated, METER_TICK, move || {
             app::with_current(|app| {
@@ -1530,10 +1574,36 @@ fn start_meter_timer(app: &mut AppState) {
                     app.rearm_hotkeys();
                 }
                 let Some(sf) = surface(app) else { return };
+                if !sf.section_showing() {
+                    return;
+                }
                 match sf.tab() {
                     TAB_DEBUG => refresh_log(app),
                     TAB_AUDIO => {
+                        let now = Instant::now();
+                        let since = now.duration_since(read_at);
+                        read_at = now;
                         let (mic, out) = levels.levels();
+                        let s = sf.state();
+                        // A bar that did not move is not drawn again:
+                        // a quiet room costs no frames.
+                        let mic = mic_bar.read(mic, since);
+                        let out = out_bar.read(out, since);
+                        if let Some(level) = mic {
+                            s.set_mic_level(level);
+                        }
+                        if let Some(level) = out {
+                            s.set_out_level(level);
+                        }
+                        if let Some(mut run) = METER_RUN.get() {
+                            run.readings += 1;
+                            run.draws += u32::from(mic.is_some() || out.is_some());
+                            METER_RUN.set(Some(run));
+                        }
+                        if aec_at.is_some_and(|at| now.duration_since(at) < AEC_TICK) {
+                            return;
+                        }
+                        aec_at = Some(now);
                         // Reopening the streams (a headset plugged in,
                         // the setting changed) changes this; property
                         // sets of an equal string cost nothing visible.
@@ -1545,9 +1615,6 @@ fn start_meter_timer(app: &mut AppState) {
                         let lowering = report
                             .as_ref()
                             .is_some_and(audio::AecReport::lowering_others);
-                        let s = sf.state();
-                        s.set_mic_level(mic);
-                        s.set_out_level(out);
                         if s.get_aec_status() != aec_line.as_str() {
                             s.set_aec_status(aec_line.into());
                         }
@@ -1561,22 +1628,63 @@ fn start_meter_timer(app: &mut AppState) {
         });
 }
 
-/// Set the settings timer's pace for what is showing now, and say
-/// whether Settings is on screen at all.
-fn pace_meter_timer(app: &AppState) -> bool {
+/// Set the settings timer's pace for what is showing now, open or
+/// close the Audio tab's microphone to match, and say whether Settings
+/// is on screen at all.
+fn pace_meter_timer(app: &mut AppState) -> bool {
     let Some(sf) = surface(app) else {
         return false;
     };
     let showing = app::host_visible() && sf.showing();
-    let pace = if showing && sf.tab() == TAB_AUDIO {
-        METER_TICK
-    } else {
-        IDLE_TICK
-    };
+    let audio = showing && sf.tab() == TAB_AUDIO && sf.section_showing();
+    let pace = if audio { METER_TICK } else { IDLE_TICK };
     if app.meter_timer.running() && app.meter_timer.interval() != pace {
         app.meter_timer.set_interval(pace);
     }
+    // The meter is the microphone's: while the tab shows, it is open —
+    // not connected and in the lobby too (`set_audio_tab_open`).
+    app.set_audio_tab_open(audio);
+    note_meter_run(audio);
     showing
+}
+
+/// The meters came on screen or left it: start counting, or log what
+/// the run came to.
+fn note_meter_run(on_screen: bool) {
+    match (on_screen, METER_RUN.get()) {
+        (true, None) => METER_RUN.set(Some(MeterRun {
+            since: Instant::now(),
+            readings: 0,
+            draws: 0,
+        })),
+        (false, Some(run)) => {
+            METER_RUN.set(None);
+            log::info!(
+                "settings: meters read {} times and drawn {} in {:.1} s",
+                run.readings,
+                run.draws,
+                run.since.elapsed().as_secs_f32()
+            );
+        }
+        _ => {}
+    }
+}
+
+/// What is on screen changed — a tab, the narrow page's section, the
+/// app back from the background: the meter's pace and its microphone
+/// follow now.
+pub(crate) fn sync_audio_tab(app: &mut AppState) {
+    pace_meter_timer(app);
+}
+
+/// A microphone test ended without its button (the session it ran in
+/// closed): the button and its hint say so.
+pub(crate) fn test_ended(app: &AppState) {
+    if let Some(sf) = surface(app) {
+        let s = sf.state();
+        s.set_testing_mic(false);
+        s.set_test_hint(t!("audio-test-hint").into());
+    }
 }
 
 // ── Debug ───────────────────────────────────────────────────────────────
@@ -1749,6 +1857,9 @@ fn close(app: &mut AppState) {
         }
     }
     app.meter_timer.stop();
+    // Nothing shows the meter any more: its microphone closes.
+    app.set_audio_tab_open(false);
+    note_meter_run(false);
     // Collapse blank token fields and repair the default pointer
     // before the edits hit disk.
     app.settings.normalize_servers();

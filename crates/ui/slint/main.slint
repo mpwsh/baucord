@@ -131,7 +131,9 @@ export component MainWindow inherits Window {
     // (or Android's Back) slides the list back. The width alone
     // decides, so a phone turned sideways or a desktop window made
     // narrow follows.
-    property <bool> narrow: root.width < 600px;
+    // `out`: the app asks which settings section is on screen
+    // (`settingsui::SettingsSurface::section_showing`).
+    out property <bool> narrow: root.width < 600px;
     // 0 = the list, 1 = the chat; animated, so the pages slide.
     property <float> chat-shown: State.narrow-chat-open ? 1 : 0;
     animate chat-shown { duration: 220ms; easing: ease-out; }

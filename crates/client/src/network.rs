@@ -2720,8 +2720,15 @@ fn chunk_upload(
 pub struct VoiceLink {
     pub incoming: IncomingSender,
     pub outgoing: Receiver<AudioPacket>,
-    /// A microphone test: our packets are dropped, not sent.
+    /// A microphone test, or Settings' meter out of a voice room: our
+    /// packets are dropped, not sent.
     pub testing: Arc<AtomicBool>,
+    /// An engine started with no session (`VoiceControl::Start` without
+    /// a client id): none of its packets is ever sent. Fixed for the
+    /// link's life — a session brings a new engine and a new link — so
+    /// what a microphone heard for a meter cannot follow the user into
+    /// a room.
+    pub local_only: bool,
 }
 
 impl std::fmt::Debug for VoiceLink {
@@ -3574,13 +3581,14 @@ fn send_media(client: Option<&mut NetworkClient>, media: MediaOut) {
 }
 
 /// One of our voice packets onto the wire, unless a microphone test
-/// owns the engine or there is no session. The packet's ssrc is not
+/// owns the engine, the engine was started for no session, or there
+/// is no session. The packet's ssrc is not
 /// sent: the server stamps the authenticated sender id on relay.
 fn send_voice(client: Option<&mut NetworkClient>, link: Option<&VoiceLink>, packet: &AudioPacket) {
     let (Some(c), Some(link)) = (client, link) else {
         return;
     };
-    if link.testing.load(Ordering::Relaxed) {
+    if link.local_only || link.testing.load(Ordering::Relaxed) {
         return;
     }
     let flags = match packet.header.payload_type {

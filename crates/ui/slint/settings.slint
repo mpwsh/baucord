@@ -1594,6 +1594,8 @@ export component SettingsPanel inherits FocusScope {
     in property <bool> narrow: false;
     /// Narrow only: a section's page is showing, not the list.
     in-out property <bool> section-open: false;
+    // The Audio section's meter and microphone run while it shows.
+    changed section-open => { SettingsLogic.tab-shown(); }
 
     public function focus-capture() { root.focus(); }
 

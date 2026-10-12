@@ -103,6 +103,7 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
             incoming: engine.incoming_sender(),
             outgoing: engine.outgoing_receiver(),
             testing: Arc::new(AtomicBool::new(false)),
+            local_only: false,
         })))
         .expect("link");
     net.tx

@@ -120,9 +120,13 @@ pub fn set_host_visible(visible: bool) {
     // and the link stats are not sent over (P2-48).
     crate::present::set_stream_visible(None, visible);
     client::network::set_ui_visible(visible);
-    if visible {
-        let _ = slint::invoke_from_event_loop(|| with_current(AppState::host_shown));
-    }
+    let _ = slint::invoke_from_event_loop(move || {
+        with_current(if visible {
+            AppState::host_shown
+        } else {
+            AppState::host_hidden
+        });
+    });
 }
 
 /// A notification about the DM with `dm` (the user id in hex) was
@@ -464,7 +468,13 @@ pub struct AppState {
     /// Decoded pictures by hash: the on-disk cache, warmed on demand.
     avatar_images: HashMap<client::protocol::BlobId, slint::Image>,
     pub is_testing_mic: bool,
+    /// What the network thread reads: what the microphone hears stays
+    /// on this device — a test, or the Audio tab's meter out of a voice
+    /// room (`sync_voice_room`).
     is_testing_mic_shared: Arc<AtomicBool>,
+    /// Settings' Audio tab is on screen: the microphone is open for its
+    /// meter wherever we are, connected or not (`set_audio_tab_open`).
+    audio_tab_open: bool,
 
     /// How many were watching our stream at the last stats tick: a
     /// rise plays the viewer-joined sound (`StreamHealth` is the only
@@ -508,8 +518,8 @@ pub struct AppState {
     /// per ten minutes at most.
     last_join_notice: Option<Instant>,
     /// What the voice engine was last told: in a voice room (or testing
-    /// the microphone). A phone keeps no microphone open otherwise
-    /// (`sync_voice_room`).
+    /// the microphone, or showing its meter). A phone keeps no
+    /// microphone open otherwise (`sync_voice_room`).
     voice_in_room: bool,
     /// What the host was last told keeps the session alive: `Some(in
     /// a room)` while connected (`sync_keep_alive`, D63).
@@ -779,6 +789,7 @@ pub fn run() {
         settings,
         is_testing_mic: false,
         is_testing_mic_shared,
+        audio_tab_open: false,
         stream_viewers_seen: 0,
         history: ChatHistory::new(),
         chat_model,
@@ -1076,10 +1087,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_edit_servers(move || {
         with_app(&w, |app| {
-            crate::settingsui::open(app);
-            if let Some(sf) = crate::settingsui::surface(app) {
-                sf.set_tab(crate::settingsui::TAB_SERVERS);
-            }
+            crate::settingsui::open_on(app, Some(crate::settingsui::TAB_SERVERS));
         });
     });
     let w = Rc::downgrade(state);

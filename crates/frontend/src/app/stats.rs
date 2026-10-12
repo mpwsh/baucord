@@ -126,6 +126,18 @@ impl AppState {
             self.sync_keep_alive(true);
         }
         self.resume_gifs();
+        // Settings' Audio tab, if that is what comes back: its meter
+        // and the microphone behind it, without waiting for the
+        // settings timer's slow tick.
+        crate::settingsui::sync_audio_tab(self);
+    }
+
+    /// A phone app left the screen (`set_host_visible`). The Audio
+    /// tab's microphone goes with it, at once: out of a room nothing
+    /// may record behind the user's back, and an open microphone would
+    /// keep iOS from suspending an app that is not even connected.
+    pub(super) fn host_hidden(&mut self) {
+        self.set_audio_tab_open(false);
     }
 
     /// The desktop's main window is back in view (out of the tray,

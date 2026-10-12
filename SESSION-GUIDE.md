@@ -284,8 +284,9 @@ otherwise).
   `emoji.rs`, `composer.rs`, `devices.rs`, `update.rs`, `stats.rs`,
   `fps.rs`, `logfile.rs` (also the hosts' log writer and panic hook),
   `files.rs` (safe names, the pick slot), `usage.rs` (the phones' own
-  CPU and memory). What two hosts need and no UI does goes here: it
-  is the one crate that type-checks for every target from the sandbox.
+  CPU and memory), `meter.rs` (how a level bar moves). What two hosts
+  need and no UI does goes here: it is the one crate that type-checks
+  for every target from the sandbox.
 - `keywatch` — the keybind watcher: key state and key events per
   desktop OS behind one `Watcher`, no dependency on the rest. Pure
   Rust, so `cargo check --target` covers its Windows and macOS halves.

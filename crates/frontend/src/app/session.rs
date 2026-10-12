@@ -134,6 +134,8 @@ impl AppState {
     /// disconnects.
     pub(super) fn teardown_connection(&mut self) {
         self.connected = false;
+        // The session got as far as an engine of its own (`Init`).
+        let session_engine = self.session.our_client_id.is_some();
         // No session, no keybinds: the key watcher stops (review P1-3).
         if let Some(hotkeys) = &mut self.hotkeys {
             hotkeys.set_connected(false);
@@ -147,7 +149,10 @@ impl AppState {
         // window, the voice engine and the screen thread.
         self.session = Session::default();
         self.reset_safety();
-        self.is_testing_mic = false;
+        // A test ends with the session it may have started in.
+        if std::mem::take(&mut self.is_testing_mic) {
+            crate::settingsui::test_ended(self);
+        }
         self.main.global::<State>().set_moderation_open(false);
         self.push_permissions();
         {
@@ -155,22 +160,28 @@ impl AppState {
             state.set_channel_prompt_open(false);
             state.set_channel_password("".into());
         }
-        // Also clear the shared flag the voice loop reads — leaving it
-        // set (disconnect during a mic test) kept the loop gating
-        // outgoing audio after the next connect.
-        self.is_testing_mic_shared.store(false, Ordering::Relaxed);
+        // Also bring the shared flag the voice loop reads up to date —
+        // leaving it set (disconnect during a mic test) kept the loop
+        // gating outgoing audio after the next connect.
+        self.sync_voice_room();
+        // The Audio tab's meter is showing: it goes on, on an engine of
+        // its own — the session's would carry the session's mute into
+        // a meter with nothing left to mute for.
+        if self.audio_tab_open && session_engine {
+            self.start_sessionless_engine();
+        }
 
         // Play the leave sound for ourselves too. The server's UserLeft
         // broadcast is never sent to the leaver — and stopping the
         // engine immediately would cut the sound off, so the Stop is
-        // deferred. Its closure skips the Stop if a new session or mic
-        // test started in the meantime.
+        // deferred. Its closure skips the Stop if a new session, a mic
+        // test or the Audio tab's meter started in the meantime.
         self.play_chime(SoundType::UserLeft);
         let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
         if let Some(weak) = weak {
             slint::Timer::single_shot(Duration::from_millis(900), move || {
                 with_app(&weak, |app| {
-                    if !app.connected && !app.is_testing_mic {
+                    if !app.connected && !app.mic_previewing() {
                         app.voice.tx.send(VoiceControl::Stop).ok();
                     }
                 });
@@ -433,33 +444,76 @@ impl AppState {
         // Capture this BEFORE flipping is_testing_mic — checking
         // afterwards made the "start the engine for a mic test while
         // disconnected" branch unreachable.
-        let voice_already_running = self.connected || self.is_testing_mic;
-
+        let voice_already_running = self.engine_wanted();
         self.is_testing_mic = enabled;
-        self.is_testing_mic_shared.store(enabled, Ordering::Relaxed);
-
-        if enabled {
-            if !voice_already_running {
-                self.voice_in_room = true;
-                self.voice
-                    .tx
-                    .send(VoiceControl::Start {
-                        settings: Box::new(self.settings.clone()),
-                        our_client_id: 0,
-                        in_room: true,
-                    })
-                    .ok();
-            }
-            self.voice.tx.send(VoiceControl::SetLoopback(true)).ok();
-        } else {
-            self.voice.tx.send(VoiceControl::SetLoopback(false)).ok();
-            if !self.connected {
-                self.voice.tx.send(VoiceControl::Stop).ok();
-            }
-        }
         // A test needs the microphone, in the lobby too.
-        self.sync_voice_room();
+        self.mic_preview_changed(voice_already_running);
+        // Behind a Start on the same channel; nothing to tell an engine
+        // that was just stopped.
+        self.voice.tx.send(VoiceControl::SetLoopback(enabled)).ok();
         self.sync_keep_alive(false);
+    }
+
+    /// Settings' Audio tab came on screen or left it. While it shows
+    /// the microphone is open for its meter wherever we are — not
+    /// connected, in the lobby, on a phone that otherwise records
+    /// nothing there — so the microphone can be set up before there is
+    /// anyone to talk to. Out of a voice room nothing it hears leaves
+    /// the device; in one, nothing changes. Not connected, mute and
+    /// push-to-talk do not hold it shut either (an engine with no
+    /// session, `VoiceControl::Start`); in a session they do, as in a
+    /// room. Unlike a test it never outlives the screen: a hidden app
+    /// or a closed tab ends it.
+    pub fn set_audio_tab_open(&mut self, open: bool) {
+        if open == self.audio_tab_open {
+            return;
+        }
+        let voice_already_running = self.engine_wanted();
+        self.audio_tab_open = open;
+        log::info!(
+            "settings: audio tab {}",
+            if open { "on screen" } else { "off screen" }
+        );
+        self.mic_preview_changed(voice_already_running);
+    }
+
+    /// The microphone is open for this device's own sake: a test, or
+    /// the Audio tab's meter.
+    pub(super) fn mic_previewing(&self) -> bool {
+        self.is_testing_mic || self.audio_tab_open
+    }
+
+    /// An engine should be running: for a session, or for a preview
+    /// without one.
+    fn engine_wanted(&self) -> bool {
+        self.connected || self.mic_previewing()
+    }
+
+    /// A test or the Audio tab's meter began or ended: start the engine
+    /// for it where no session has one running, stop it when the last
+    /// reason for it went, and tell a running one where it stands.
+    fn mic_preview_changed(&mut self, was_running: bool) {
+        let wanted = self.engine_wanted();
+        self.sync_voice_room();
+        if wanted && !was_running {
+            self.start_sessionless_engine();
+        } else if was_running && !wanted {
+            self.voice.tx.send(VoiceControl::Stop).ok();
+        }
+    }
+
+    /// An engine for the microphone alone, with no session: what it
+    /// hears is never sent.
+    fn start_sessionless_engine(&mut self) {
+        self.voice_in_room = true;
+        self.voice
+            .tx
+            .send(VoiceControl::Start {
+                settings: Box::new(self.settings.clone()),
+                our_client_id: None,
+                in_room: true,
+            })
+            .ok();
     }
 
     /// Tell the host what keeps the session alive off screen, when that
@@ -479,15 +533,23 @@ impl AppState {
     }
 
     /// Tell the voice engine whether we are in a voice room (or testing
-    /// the microphone), when that changes. On a phone the microphone
-    /// and the call path go with it: nothing records in the lobby
-    /// (ANDROID-SPEC.md D53, IOS-SPEC.md D51). The desktop keeps its
-    /// streams and drops what the microphone hears, so nothing is
-    /// encoded and sent for the relay to throw away (review P1-6).
+    /// the microphone, or showing its meter), when that changes. On a
+    /// phone the microphone and the call path go with it: nothing
+    /// records in the lobby (ANDROID-SPEC.md D53, IOS-SPEC.md D51). The
+    /// desktop keeps its streams and drops what the microphone hears,
+    /// so nothing is encoded and sent for the relay to throw away
+    /// (review P1-6).
+    ///
+    /// And where what it hears may go: a test keeps it on this device
+    /// anywhere, the meter does wherever there is no room to talk into
+    /// — the lobby and the AFK room, where the relay would drop it too,
+    /// and nothing lights us up as speaking for it.
     pub(super) fn sync_voice_room(&mut self) {
-        // Disconnected, the engine is on its way out (the deferred
-        // Stop) or a microphone test owns it: leave it as it is.
-        if !self.connected && !self.is_testing_mic {
+        let local = self.is_testing_mic || (self.audio_tab_open && !self.in_voice_room());
+        self.is_testing_mic_shared.store(local, Ordering::Relaxed);
+        // Disconnected with no test and no meter, the engine is on its
+        // way out (the deferred Stop): leave it as it is.
+        if !self.engine_wanted() {
             return;
         }
         let in_room = self.voice_room_wanted();

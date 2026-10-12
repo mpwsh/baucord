@@ -299,8 +299,10 @@ export component VuMeter inherits Rectangle {
         background: root.lv > 0.9 ? Theme.danger
             : root.lv > 0.7 ? Theme.warning
             : root.accent;
-        // No `animate width`: at the meter's 8 samples a second it
-        // made every sample ~5 redraws (review P2-40).
+        // No `animate width`: the app eases the level itself
+        // (`app_core::meter`) and sets it only when the bar moved, so
+        // an animation here would add redraws to a bar already smooth
+        // (review P2-40).
     }
 }
 

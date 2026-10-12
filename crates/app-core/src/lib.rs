@@ -28,6 +28,7 @@ pub mod images;
 pub mod logfile;
 pub mod markdown;
 pub mod menu;
+pub mod meter;
 pub mod roster;
 pub mod stats;
 pub mod update;

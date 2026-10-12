@@ -12,6 +12,12 @@
 > compiles (the user, before that batch). That batch changed platform code
 > again; its lines are marked **[7]** and each platform's §x.0 says
 > what was type-checked in the sandbox and what was not.
+>
+> **After the first iPhone look (same day):** Settings → Audio opens
+> the microphone for its meter without a connection, and the meters
+> are eased. Lines marked **[8]**; the app's own code for it was
+> type-checked on Linux only (it is the same on every platform), the
+> engine's rule for it is unit-tested.
 
 Each line is *do this → expect that*. `log:` is a line to find in
 `baucord.log` (desktop: Settings → Debug shows it and copies it;
@@ -87,6 +93,16 @@ built-in speakers is the machine that matters most.
 - [ ] **same** — mute, deafen, push-to-talk; two hours in a room with
   no growing delay. log every 10 s: `audio stats:` — note what
   `Drift a/b` says after an hour [P3-22].
+
+- [ ] **new [8]** — not connected, Settings → Audio: the capture bar
+  follows your voice, with push-to-talk chosen too, and the
+  echo-cancellation line says what the streams got. Another tab, or
+  Settings closed: log `Voice stopped`. The streams it opens are the
+  ones a room opens, so on Windows 10 other apps may get quieter while
+  the tab shows (§1.2).
+- [ ] **new [8]** — the bars are smooth, and with a silent microphone
+  Task Manager shows the client idle with the Audio tab open (a bar
+  that did not move is not drawn).
 
 ### 1.2 Ducking — other apps getting quieter [CLI-11, AEC-SPEC E14, E15]
 
@@ -320,6 +336,17 @@ agrees with it.
 - [ ] **same** — a phone call during a room; ten minutes with the
   screen off; Wi-Fi to cellular and back [TST-4].
 
+### 2.1a Settings → Audio without a room **[8]** [ANDROID-SPEC D70]
+
+- [ ] **new** — not connected, Settings → Audio: the green microphone
+  dot comes on and the capture bar follows your voice, smoothly. log:
+  `settings: audio tab on screen`.
+- [ ] **new** — back to the section list, close Settings, or press
+  Home from the Audio tab: the dot goes after Android's few seconds.
+- [ ] **new** — connected, in the lobby, Settings → Audio: the bar
+  moves, nobody sees you speaking, and leaving the tab closes the
+  microphone again.
+
 ### 2.2 What the app asks of the phone [P3-33, P3-47]
 
 - [ ] **same** — attach a picture and a file; save a received file (it
@@ -441,6 +468,28 @@ after it is the seventh batch's.
 - [ ] **same** — connect AirPods in a room: log `plain streams`; take
   them off: back to `voice-call path`.
 - [ ] **same** — leave the room: the app still survives the background.
+
+### 3.1a Settings → Audio without a room **[8]** [IOS-SPEC D60]
+
+- [ ] **new** — **not connected**, Settings → Audio: the orange
+  indicator comes on (the first time, after the system's microphone
+  question) and the capture bar follows your voice. log: `settings:
+  audio tab on screen`, `Voice started for client None`.
+- [ ] **new** — the bars move smoothly: up at once, down over about a
+  quarter of a second, no steps. Back on the section list, log:
+  `settings: meters read N times and drawn M in T s` — N should be
+  about 30 × T. Far fewer means the timer is not reaching its pace on
+  the phone, and that line is what to send back.
+- [ ] **new** — back to the section list, or close Settings: the
+  indicator goes. Send the app to the background from the Audio tab:
+  it goes too, and the app is suspended as any unconnected app is.
+- [ ] **new** — Test microphone there: you hear yourself; with
+  push-to-talk chosen as well.
+- [ ] **new** — connected, in the lobby, Settings → Audio: indicator
+  and meter as above; nobody sees you speaking; leaving the tab closes
+  the microphone again. Muted, the bar stays empty, as in a room.
+- [ ] **same** — in a room, Settings → Audio: nothing about the call
+  changes; the others still hear you.
 
 ### 3.2 Notifications and the chime [P3-47, IOS-SPEC D50]
 

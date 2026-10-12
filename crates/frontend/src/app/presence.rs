@@ -66,15 +66,18 @@ impl AppState {
         }
 
         // Start voice engine. With the lobby we arrive in it, and a
-        // phone opens no microphone there (ANDROID-SPEC.md D53).
-        self.voice_in_room = !self.lobby || self.is_testing_mic;
+        // phone opens no microphone there (ANDROID-SPEC.md D53) —
+        // unless Settings is showing its meter, which then stays on
+        // this device.
+        self.voice_in_room = self.voice_room_wanted();
+        self.sync_voice_room();
         // Streams play on the voice output (review P1-19).
         self.sync_stream_output();
         self.voice
             .tx
             .send(VoiceControl::Start {
                 settings: Box::new(self.settings.clone()),
-                our_client_id: client_id,
+                our_client_id: Some(client_id),
                 in_room: self.voice_in_room,
             })
             .ok();
@@ -235,8 +238,14 @@ impl AppState {
 
     /// Where voice is wanted: a voice room — not the lobby, not the AFK
     /// room, where the relay drops it (review P1-6) — or a microphone
-    /// test, which needs it anywhere.
+    /// test or Settings' meter, which need it anywhere.
     pub(super) fn voice_room_wanted(&self) -> bool {
+        self.mic_previewing() || !self.out_of_voice()
+    }
+
+    /// In the lobby or the AFK room: connected where the relay drops
+    /// voice.
+    fn out_of_voice(&self) -> bool {
         let afk = self.our_channel().is_some_and(|id| {
             self.session
                 .channel_details
@@ -244,7 +253,12 @@ impl AppState {
                 .is_some_and(|f| f.is_afk)
                 || self.session.channels.iter().any(|c| c.id == id && c.is_afk)
         });
-        self.is_testing_mic || !(self.in_lobby() || afk)
+        self.in_lobby() || afk
+    }
+
+    /// In a voice room: a session, and a room in it that carries voice.
+    pub(super) fn in_voice_room(&self) -> bool {
+        self.session.our_client_id.is_some() && !self.out_of_voice()
     }
 
     /// The channel we are currently in, per server echo.

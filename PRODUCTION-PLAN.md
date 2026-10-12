@@ -1126,6 +1126,31 @@ One line each; the spec decision named holds the detail.
     P2-51 (decided against: its teardown is one function already).
     The migration that drops unused telemetry columns (it deletes
     data). App Store questions (§6, 2).
+- **2026-10-12 — 1.2.1, after the first iPhone look.** Two things
+  the phone showed, both the same on every platform.
+  - *Settings → Audio opens the microphone.* The capture bar was dead
+    unless in a room (and on the desktop unless connected), so there
+    was no setting a microphone up before a call. While the tab is on
+    screen the microphone is open: not connected, on an engine with
+    no session, whose packets are never sent and which mute and
+    push-to-talk do not close (`VoiceControl::Start` without a client
+    id, `VoiceLink::local_only`); in the lobby or the AFK room, on the
+    session's engine with the packets and the speaking light kept
+    here. It ends with the tab, with Settings, and with a phone app
+    leaving the screen. A microphone test not connected with
+    push-to-talk chosen was silent for the same reason, and is not
+    now. On Windows 10 the tab's streams are a room's, so other apps
+    may get quieter while it shows.
+  - *The meters are eased.* 30 readings a second while the Audio tab
+    shows, up at once and down over 150 ms (`app_core::meter`, 6
+    tests), a bar set only when it moved; 8 readings a second drawn
+    as read stepped. The echo-cancellation line beside them is looked
+    at 4 times a second.
+  - *Checked*: Linux type-check and lint of all of it; the ease and
+    the engine's mute rule by unit test; the client and `app-core`
+    type-checked for Windows and Android. **Not run**: there is no
+    audio device in the sandbox and the app's own tests do not fit on
+    its disk. `DEVICE-CHECKLIST.md` marks the lines **[8]**.
 
 ## 8. Facts this plan rests on
 
