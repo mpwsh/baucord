@@ -517,9 +517,11 @@ Store is not decided yet.
   (3.2k lines, one idle test) — loss classification, reassembly
   limits, session phases; `frontend` has no tests — reconnect and
   backoff, mute across reconnect, updater extraction, settings
-  corruption; `audio` device supervision (`service()`) against a mock
-  backend. (The chat pane's scrolling has its harness,
-  `tools/chat-scroll-sim`.)
+  corruption. (The chat pane's scrolling has its harness,
+  `tools/chat-scroll-sim`.) **Done of it, 2026-10-12:** `audio`
+  device supervision against a stand-in machine — `audio/src/fake.rs`
+  and the 51 scenarios of `supervision_tests.rs`, each run under the
+  rules of the desktop, Windows, Android or iOS (review P2-55).
 - [ ] **TST-3 [P2][M] A load scenario in the simulator**: 200 clients,
   5 sharers, mixed links; assert voice loss and RTT spread.
 - [ ] **TST-4 [P1] Device passes the sandbox cannot do**, before each
@@ -943,15 +945,46 @@ One line each; the spec decision named holds the detail.
     not a second enum describing it (P3-34). Settings' thirteen plain
     switches are one table that `populate` and `wire` both expand
     (P3-35).
-  - Left of the list: one audio `reconcile()` (P2-55) — real-time
-    code on four platforms, three of which cannot be run here; it
-    wants TST-2's tests first.
+  - Left of the list then: one audio `reconcile()` (P2-55); see the
+    next entry.
+- **2026-10-12 — 1.2.1, the audio engine's device handling in one
+  place** (review P2-55, and TST-2's audio part), in two steps so the
+  second could be held to the first.
+  - *A machine that is not there.* The rules that differ by platform
+    (`PLATFORM_VOICE_PATH`, `RELEASES_MIC`, `SHARED_VOICE_UNIT`, and
+    what were `cfg` branches for Android's routes and Windows'
+    reference and two defaults) are a `Traits` value the engine
+    carries — the build's, or in a test any platform's. The platform
+    is asked through four small functions (`survey`,
+    `engage_call_path`, `open_playback`, `open_capture`) which
+    `audio/src/fake.rs` answers in tests, with sides that hold no
+    stream and a log of every plan, open and close. 43 scenarios were
+    written against the engine *as it was* (42 as predicted from
+    reading it; the one surprise was the reading), then eight more.
+  - *One `reconcile`.* `start`, the presence, the two device picks,
+    the setting and `service` each decided what to close and open,
+    with their own copies of doing it. Now each records what it was
+    told and calls `VoiceChat::reconcile(cause)`: `decide` holds every
+    rule side by side and returns keep / re-plan both / these sides;
+    `plan_and_open`, `apply_sides`, `open_output` and `open_input`
+    are the only places a stream is opened or closed. All 43 traces
+    came out identical on the first run, and the old engine still
+    passes 50 of the final 51.
+  - *The one difference, on purpose:* a microphone pick that fails to
+    open now clears the echo-cancellation report (Settings showed "the
+    canceller is running" for a microphone that was closed); every
+    other failed reopen already did.
+  - **Not run on any real device.** The Windows- and Android-only
+    lines type-check; the eight iOS-only blocks were compared with
+    the old ones text for text (identical) but are not compiled. What
+    the tests hold is the *decisions*; the streams themselves
+    (`input.rs`, `output.rs`, `native/`) were not touched.
 
 ## 8. Facts this plan rests on
 
 - **Tests, 2026-10-12, Linux sandbox**: protocol 91 + the versions
   test + 3 wire-pinning tests, transport 55, server 70 unit + 99 e2e,
-  client 57, app-core 120, audio 113, video 77 + 6, i18n 2 — all
+  client 57, app-core 120, audio 164, video 77 + 6, i18n 2 — all
   green. Six more need a real machine:
   that sandbox does not signal UDP readiness, so the socket-wait tests
   (`transport` `udp::read_waiter_tests`, 3; `client` `inbound_wake`,

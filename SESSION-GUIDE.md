@@ -634,6 +634,18 @@ Memory-mode servers (persistence off) still use the legacy
   `top` and where the name line goes and puts its body inside. In a
   component that inherits another, the base's properties are not in
   scope unqualified: `root.data`, not `data`.
+- **Which audio streams are open is decided in one function**,
+  `VoiceChat::decide` (`audio/src/lib.rs`), and done in four
+  (`plan_and_open`, `apply_sides`, `open_output`, `open_input`). A new
+  rule — "on Windows open the call streams only in a room" — is a
+  branch there and a scenario in `audio/src/supervision_tests.rs`,
+  run under that platform's `Traits` on the stand-in machine
+  (`fake.rs`): the test reads the log of plans, opens and closes.
+  Platform differences in *decisions* are `Traits` fields, never
+  `cfg` — a `cfg` branch cannot be tested on another host. The fake
+  has to behave like the streams where the engine depends on it (a
+  stream that starts clears its "failed" flag; the first version did
+  not, and every tick reopened everything).
 - **What belongs to one connection goes in `Session`** (`app.rs`; or
   its `Safety`, `Transfers`, `ChatFlow`), not in `AppState`: the
   teardown replaces it whole, so nothing has to be remembered there.
