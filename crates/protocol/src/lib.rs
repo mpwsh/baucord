@@ -34,7 +34,7 @@ pub mod voice;
 // Explicit re-exports: everything a consumer needs, nothing more.
 pub use admin::{
     AdminCommand, AdminError, AdminOutcome, AdminTarget, AuditEntry, BlobSummary, RestrictionKind,
-    StatsSummary, TelemetrySummary,
+    StatsSummary, TelemetrySummary, MAX_ADMIN_REASON_BYTES,
 };
 pub use bytes::Bytes;
 pub use lanes::{

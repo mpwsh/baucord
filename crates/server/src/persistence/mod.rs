@@ -84,6 +84,16 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
 const MAX_STALE_RELOADS: u32 = 4;
 /// How long the tick keeps its short poll for a snapshot it asked for.
 const RELOAD_WAIT: Duration = Duration::from_secs(5);
+/// After [`MAX_STALE_RELOADS`] stale snapshots in a row the tick keeps
+/// the policy it has and asks again this much later, off its short
+/// poll, when the writes may have let up; it used to take the stale
+/// one at once, dropping from memory whatever it had just changed (a
+/// ban from the panel, say).
+const RELOAD_BACKOFF: Duration = Duration::from_secs(1);
+/// How many such pauses before a stale snapshot is taken after all: a
+/// server that writes policy without a break for seconds on end still
+/// gets the other process's change, a few seconds late.
+const MAX_RELOAD_BACKOFFS: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
@@ -438,6 +448,49 @@ impl Command {
             _ => true,
         }
     }
+
+    /// Whether this writes a table [`store::Sqlite::load_policy`] reads:
+    /// what makes a snapshot read before it stale. Counting every write
+    /// but messages and telemetry — a read mark, an audit line, a
+    /// report — made snapshots stale for nothing on a busy server.
+    /// Spelled out, so a new command has to be placed.
+    fn changes_policy(&self) -> bool {
+        match self {
+            Command::UpsertUser { .. }
+            | Command::UpsertKey { .. }
+            | Command::GrantRole { .. }
+            | Command::RevokeRole { .. }
+            | Command::DeleteUserKeys { .. }
+            | Command::UpsertChannel(_)
+            | Command::DeleteChannel { .. }
+            | Command::AddProgress(_)
+            | Command::PurgeUser { .. }
+            | Command::InsertInvite { .. }
+            | Command::UseInvite { .. }
+            | Command::RevokeInvite { .. }
+            | Command::InsertRestriction(_)
+            | Command::DeleteRestriction { .. }
+            | Command::SetProfile { .. }
+            | Command::StoreBlob(_)
+            | Command::DeleteBlob { .. }
+            | Command::InsertRole { .. }
+            | Command::UpdateRole { .. }
+            | Command::DeleteRole { .. }
+            | Command::BlobRefs { .. }
+            | Command::InsertBlock { .. }
+            | Command::DeleteBlock { .. } => true,
+            Command::InsertMessage(_)
+            | Command::Telemetry(_)
+            | Command::TelemetryEvent(_)
+            | Command::EditMessage { .. }
+            | Command::DeleteMessage { .. }
+            | Command::Audit(_)
+            | Command::MarkRead { .. }
+            | Command::InsertReport(_)
+            | Command::ResolveReport { .. } => false,
+            Command::Together(parts) => parts.iter().any(Command::changes_policy),
+        }
+    }
 }
 
 enum Envelope {
@@ -688,6 +741,11 @@ pub struct Persist {
     reload_due: Option<Instant>,
     /// Snapshots set aside in a row as older than the tick's writes.
     stale_reloads: u32,
+    /// The next snapshot is asked for no sooner than this (after a run
+    /// of stale ones, [`RELOAD_BACKOFF`]).
+    reload_after: Option<Instant>,
+    /// Pauses taken since the last snapshot that was used.
+    reload_backoffs: u32,
     /// Open [`Self::begin_group`] calls, and the writes sent since the
     /// first of them.
     group_depth: u32,
@@ -792,6 +850,8 @@ impl Persist {
                 reload_wanted: false,
                 reload_due: None,
                 stale_reloads: 0,
+                reload_after: None,
+                reload_backoffs: 0,
                 group_depth: 0,
                 group: Vec::new(),
             },
@@ -820,7 +880,7 @@ impl Persist {
             self.group.push(command);
             return;
         }
-        let policy = command.is_policy();
+        let policy = command.changes_policy();
         if let Err(err) = self.writes.try_send(Envelope::Write(command)) {
             self.dropped_writes += 1;
             if let TrySendError::Full(Envelope::Write(cmd))
@@ -956,6 +1016,7 @@ impl Persist {
             self.reload_due = None;
             if *writes_seen >= self.policy_sent {
                 self.stale_reloads = 0;
+                self.reload_backoffs = 0;
             } else if self.stale_reloads < MAX_STALE_RELOADS {
                 // The tick changed policy after this was read: swapping
                 // it in would undo that change in memory. The next one
@@ -964,20 +1025,40 @@ impl Persist {
                 self.stale_reloads += 1;
                 self.reload_wanted = true;
                 continue;
-            } else {
-                warn!(
+            } else if self.reload_backoffs < MAX_RELOAD_BACKOFFS {
+                // Taking it would drop from memory what the tick just
+                // changed. Keep what is in memory and ask again a
+                // little later, when the writes may have let up.
+                info!(
                     "policy reload: {} snapshots in a row were older than this server's own \
-                     writes; taking this one, a change made in the last moments may be \
-                     missing from memory until the next reload",
-                    self.stale_reloads + 1
+                     writes; asking again in {} s",
+                    self.stale_reloads + 1,
+                    RELOAD_BACKOFF.as_secs()
                 );
                 self.stale_reloads = 0;
+                self.reload_backoffs += 1;
+                self.reload_wanted = true;
+                self.reload_after = Some(now + RELOAD_BACKOFF);
+                continue;
+            } else {
+                warn!(
+                    "policy reload: snapshots stayed older than this server's own writes \
+                     for {} s; taking this one, a change made in the last moments may be \
+                     missing from memory until the next reload",
+                    u64::from(MAX_RELOAD_BACKOFFS) * RELOAD_BACKOFF.as_secs()
+                );
+                self.stale_reloads = 0;
+                self.reload_backoffs = 0;
             }
             self.reload_wanted = false;
             notices.push(notice);
         }
-        if self.reload_wanted && self.writes.try_send(Envelope::Reload).is_ok() {
+        if self.reload_wanted
+            && self.reload_after.is_none_or(|t| now >= t)
+            && self.writes.try_send(Envelope::Reload).is_ok()
+        {
             self.reload_wanted = false;
+            self.reload_after = None;
             self.reload_due = Some(now + RELOAD_WAIT);
         }
         if self.reload_due.is_some_and(|due| now >= due) {
@@ -991,7 +1072,7 @@ impl Persist {
     /// polls on its short interval, as for a read ([`Self::reads_in_flight`]).
     #[must_use]
     pub fn reload_in_flight(&self) -> bool {
-        self.reload_wanted || self.reload_due.is_some()
+        (self.reload_wanted && self.reload_after.is_none()) || self.reload_due.is_some()
     }
 
     /// Park the thread until the guard is dropped. For tests: this is
@@ -1195,7 +1276,7 @@ impl Worker {
     }
 
     fn apply(&mut self, command: &Command) {
-        if command.is_policy() {
+        if command.changes_policy() {
             self.policy_seen += 1;
         }
         match self.write(command) {
@@ -1833,11 +1914,14 @@ mod tests {
         assert!(!p.reload_in_flight());
 
         // A server that never stops writing policy still gets a
-        // snapshot: after a few stale ones it takes what it has.
+        // snapshot: after a few stale ones and a few pauses (about
+        // `MAX_RELOAD_BACKOFFS` seconds) it takes what it has.
         cli_create_invite(&path, protocol::permissions::ROLE_GUEST, None, None).expect("cli");
         let mut next_id = 100;
         let mut taken = None;
-        wait_until(|| {
+        let deadline = Instant::now() + RELOAD_BACKOFF * (MAX_RELOAD_BACKOFFS + 5);
+        while taken.is_none() {
+            assert!(Instant::now() < deadline, "no snapshot was ever taken");
             p.send(ban(next_id));
             next_id += 1;
             for notice in p.poll(Instant::now()).notices {
@@ -1845,8 +1929,8 @@ mod tests {
                     taken = Some(policy);
                 }
             }
-            taken.is_some()
-        });
+            thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(taken.expect("a reload").invites.len(), 2);
         p.shutdown();
         if let Some(dir) = path.parent() {

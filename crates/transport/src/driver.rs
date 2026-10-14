@@ -284,6 +284,10 @@ const GROUP_RESET_CODE: VarInt = VarInt::from_u32(1);
 const PROTOCOL_VIOLATION_CODE: VarInt = VarInt::from_u32(2);
 /// Close code for application-initiated closes.
 const APP_CLOSE_CODE: VarInt = VarInt::from_u32(0);
+/// How long an accepted connection may take to finish its handshake.
+/// As long as the server's Hello deadline: a handshake on a lossy link
+/// was seen to take 9 s.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// TLS alert `no_application_protocol`, as a QUIC `CRYPTO_ERROR` code.
 const ALPN_MISMATCH_CODE: u64 = 0x100 + 120;
 
@@ -479,6 +483,11 @@ struct Peer {
     /// The application admitted this connection ([`Driver::admit`]):
     /// it no longer sits in the waiting room.
     admitted: bool,
+    /// The address group ([`address_group`]) it arrived from. The
+    /// waiting room counts a connection under this, not its current
+    /// path: one that migrated before saying a word freed its first
+    /// address's count and let that address open more.
+    arrived_from: IpAddr,
     /// The application queued something since the last drain; listed
     /// in [`Driver::dirty`].
     dirty: bool,
@@ -512,6 +521,7 @@ impl Peer {
     fn new(id: PeerId, conn: Connection, now: Instant) -> Self {
         Self {
             id,
+            arrived_from: address_group(conn.remote_address().ip()),
             conn,
             connected: false,
             lost: false,
@@ -887,16 +897,21 @@ impl Driver {
             };
         };
         let group = address_group(remote.ip());
-        let (mut waiting, mut from_here) = (0usize, 0usize);
-        for p in self.peers.values().filter(|p| !p.lost && !p.admitted) {
-            waiting += 1;
-            if address_group(p.conn.remote_address().ip()) == group {
-                from_here += 1;
+        // One pass for all three counts: this runs for every first
+        // packet, a forged flood's included.
+        let (mut live, mut waiting, mut from_here) = (0usize, 0usize, 0usize);
+        for p in self.peers.values().filter(|p| !p.lost) {
+            live += 1;
+            if !p.admitted {
+                waiting += 1;
+                if p.arrived_from == group {
+                    from_here += 1;
+                }
             }
         }
         if waiting >= room.seats
             || from_here >= room.per_address
-            || self.peer_count() >= max_peers.saturating_add(room.seats)
+            || live >= max_peers.saturating_add(room.seats)
         {
             Gate::Refuse
         } else if waiting >= room.retry_above() && !validated && may_retry {
@@ -1148,7 +1163,13 @@ impl Driver {
                     Ok((handle, conn)) => {
                         let id = fresh_peer_id(&self.ids);
                         debug!("accepted connection from {remote} as peer {id:#x}");
-                        self.peers.insert(handle, Peer::new(id, conn, now));
+                        let mut peer = Peer::new(id, conn, now);
+                        // A handshake that never finishes held its seat
+                        // in the waiting room for quinn's 30 s idle
+                        // timeout; the application's Hello deadline only
+                        // starts at `Connected`.
+                        peer.close_at = Some(now + HANDSHAKE_DEADLINE);
+                        self.peers.insert(handle, peer);
                         self.ids.insert(id, handle);
                         self.drain_peer(handle, now);
                     }
@@ -1513,6 +1534,23 @@ impl Driver {
         peer: PeerId,
         frames: impl IntoIterator<Item = Bytes>,
     ) -> Result<UploadId, SendError> {
+        self.send_media_framed(now, peer, frames.into_iter().map(|f| frame::encode(&f)))
+    }
+
+    /// [`Self::send_media`] for frames already length-prefixed
+    /// ([`frame_media`]): the same bytes go to every peer they are
+    /// queued for. A relayed picture was framed again for each receiver
+    /// — a 10 MiB picture to 64 people held 640 MiB of copies until the
+    /// paced streams drained.
+    ///
+    /// # Errors
+    /// Unknown/unconnected peer, or no stream credit left.
+    pub fn send_media_framed(
+        &mut self,
+        now: Instant,
+        peer: PeerId,
+        framed: impl IntoIterator<Item = Bytes>,
+    ) -> Result<UploadId, SendError> {
         let handle = *self.ids.get(&peer).ok_or(SendError::UnknownPeer)?;
         let p = self.peers.get_mut(&handle).ok_or(SendError::UnknownPeer)?;
         if !p.connected || p.lost {
@@ -1528,9 +1566,9 @@ impl Driver {
             .send_stream(stream)
             .set_priority(Lane::Media.priority());
         let mut out = OutQueue::default();
-        out.push(Bytes::copy_from_slice(&[Lane::Media.tag()]), now);
-        for f in frames {
-            out.push(frame::encode(&f), now);
+        out.push(Bytes::from_static(MEDIA_TAG), now);
+        for f in framed {
+            out.push(f, now);
         }
         let total = out.bytes;
         let id = p.next_upload;
@@ -1681,6 +1719,10 @@ impl Driver {
                     {}
                 QuicEvent::Connected => {
                     p.connected = true;
+                    // The handshake deadline, if any, is met; nothing
+                    // else sets `close_at` before the application knows
+                    // the peer.
+                    p.close_at = None;
                     let identity = match &self.role {
                         Role::Client { verifier, .. } => {
                             open_bidi_lanes(p, now);
@@ -1833,15 +1875,18 @@ fn send_datagram_wire(
         return Err(SendError::TooLarge(lane, len));
     }
     // Time bound (§6.1): the send buffer is ~200 ms of voice; when it is
-    // full the packet is dropped and counted. `drop = false` on purpose:
-    // quinn-proto 0.11.17's drop-oldest path (`send(_, true)`) decrements
-    // its `payload_bytes` accounting twice per evicted datagram, the
-    // counter wraps, and the next eviction panics with
-    // "datagrams.outgoing.payload_bytes desynchronized" — which killed
-    // the client's network thread the first time a link stalled. Until
-    // the fix (quinn's `make_space_for`) is released, the newest packet
-    // is the one that goes; the buffer is short enough that the
-    // difference is a few frames of audio during a stall either way.
+    // full the packet is dropped and counted. `drop = false`: the newest
+    // packet is the one that goes. This was forced: quinn-proto
+    // 0.11.17's drop-oldest path (`send(_, true)`) decremented its
+    // `payload_bytes` twice per evicted datagram and the next eviction
+    // panicked ("datagrams.outgoing.payload_bytes desynchronized"),
+    // killing the client's network thread on the first stall. 0.11.19,
+    // the version locked, fixes that (`make_space_for`, with tests), so
+    // drop-oldest — after a stall the listener hears the latest audio
+    // rather than the oldest — is a choice now, to make with LAT-3
+    // (PRODUCTION-PLAN CLI-16), which shortens this buffer anyway. With
+    // drop-oldest `Blocked` never comes back, so the count below would
+    // have to read the buffer's space before and after instead.
     match datagrams.send(d, false) {
         Ok(()) => {
             p.counters.blocked_episode = false;
@@ -2047,6 +2092,15 @@ fn flush_lanes(p: &mut Peer, now: Instant) -> bool {
     reset
 }
 
+/// The first byte of every media upload stream.
+const MEDIA_TAG: &[u8] = &[Lane::Media.tag()];
+
+/// Length-prefix media payloads once, for [`Driver::send_media_framed`]
+/// to queue the same bytes for every receiver.
+pub fn frame_media(payloads: impl IntoIterator<Item = Bytes>) -> Vec<Bytes> {
+    payloads.into_iter().map(|p| frame::encode(&p)).collect()
+}
+
 /// The media bucket's cap: two frames, so an idle bucket cannot blast a
 /// backlog we were pacing to avoid.
 fn media_burst() -> f64 {
@@ -2084,9 +2138,12 @@ impl OutQueue {
         let Some(front) = self.pending.front() else {
             return false;
         };
-        let slice = &front[self.offset..];
-        match conn.send_stream(id).write(slice) {
-            Ok(n) => {
+        // By reference, as `flush` does: `write` copied each chunk into
+        // quinn, on top of the copy it is (review PT-2).
+        let mut chunk = [front.slice(self.offset..)];
+        match conn.send_stream(id).write_chunks(&mut chunk) {
+            Ok(written) => {
+                let n = written.bytes;
                 self.offset += n;
                 self.bytes -= n;
                 self.written += n;

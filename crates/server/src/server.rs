@@ -148,7 +148,15 @@ struct IncomingUpload {
     received: u32,
     bytes: usize,
     chunks: Vec<Option<Vec<u8>>>,
-    started: Instant,
+    /// When the last chunk came: a 50 MB file on a slow uplink takes
+    /// minutes, so a stalled upload is one that stopped arriving, not
+    /// one that started long ago.
+    last: Instant,
+    /// The digest of chunks `0..hashed`, fed as they become contiguous,
+    /// so completion costs no pass over the whole file on the tick
+    /// (a 50 MB file was 60–125 ms of hashing with voice waiting).
+    hasher: transport::sha256::Hasher,
+    hashed: u32,
 }
 
 /// A connection past the handshake, waiting for its `Hello`.
@@ -186,7 +194,6 @@ enum Waiting {
 pub struct ChatServer {
     config: Config,
     driver: Driver,
-    fingerprint: Fingerprint,
     /// The clock of the current tick; every timestamp in this file
     /// comes from here so the simulation harness controls it.
     now: Instant,
@@ -256,6 +263,13 @@ pub struct ChatServer {
     /// Voice-channel membership: client → channel id (index into
     /// `channel_infos`). Every admitted client has an entry.
     channel_of: HashMap<ClientId, u16>,
+    /// `channel_of` turned around: who is in each channel, in roster
+    /// order. The voice relay reads it per packet; scanning every
+    /// session to find the handful in the speaker's room was ~250
+    /// lookups a packet at 256 sessions. Rebuilt by `index_rooms`
+    /// whenever `channel_of` changes (a join, a move, a leave, a new
+    /// channel list) — events, not packets.
+    room_members: HashMap<u16, Vec<ClientId>>,
     /// The channel list announced to clients, built once from config.
     channel_infos: Vec<ChannelInfo>,
     /// Where new clients land (config `default: true`).
@@ -413,7 +427,6 @@ impl ChatServer {
         let mut server = Self {
             config,
             driver,
-            fingerprint: identity.fingerprint(),
             now,
             started: now,
             clock,
@@ -444,6 +457,7 @@ impl ChatServer {
             last_telemetry: HashMap::new(),
             channel_list: config_channels_for_list,
             channel_of: HashMap::new(),
+            room_members: HashMap::new(),
             channel_infos,
             default_channel,
             config_path: None,
@@ -498,12 +512,6 @@ impl ChatServer {
             );
         }
         Ok(server)
-    }
-
-    /// The identity clients pin.
-    #[must_use]
-    pub fn fingerprint(&self) -> Fingerprint {
-        self.fingerprint
     }
 
     /// The transport budget in force (the binary sizes the socket
@@ -684,9 +692,8 @@ impl ChatServer {
                 until: stored.until,
                 reason: stored.reason.clone(),
             };
-            for client in self.sessions_of(&user) {
-                self.send_msg(client, &msg);
-            }
+            let recipients = self.sessions_of(&user);
+            self.send_to(&recipients, &msg);
         }
         self.refresh_enforcement();
         stored
@@ -756,9 +763,8 @@ impl ChatServer {
             && gone.kind != RestrictionKind::Server
         {
             let msg = ServerMessage::RestrictionLifted { kind: gone.kind };
-            for client in self.sessions_of(&user) {
-                self.send_msg(client, &msg);
-            }
+            let recipients = self.sessions_of(&user);
+            self.send_to(&recipients, &msg);
         }
         self.refresh_enforcement();
         true
@@ -803,9 +809,7 @@ impl ChatServer {
             })
             .map(|(c, _)| *c)
             .collect();
-        for peer in readers {
-            self.send_msg(peer, &line);
-        }
+        self.send_to(&readers, &line);
     }
 
     /// Mutable access to the persistence handle, for this file's tests.
@@ -842,6 +846,9 @@ impl ChatServer {
         self.poll_persistence();
         if now.duration_since(self.last_restriction_sweep) >= RESTRICTION_SWEEP_INTERVAL {
             self.last_restriction_sweep = now;
+            if let Some(ms) = self.clock.catch_up(now) {
+                info!("wall clock moved forward {ms} ms (the machine was paused, or its clock was set)");
+            }
             self.sweep_restrictions();
             self.prune_admission_failures();
         }
@@ -864,6 +871,7 @@ impl ChatServer {
             now,
             &crate::relay::Room {
                 clients: &self.roster,
+                members: &self.room_members,
                 senders: &senders,
                 deafened: &self.deafened,
                 muted: &self.muted,
@@ -897,9 +905,20 @@ impl ChatServer {
             // Same lazy cadence: drop uploads whose sender stalled
             // mid-pace for two minutes (crashed, gave up, vanished).
             self.uploads
-                .retain(|_, u| now.duration_since(u.started) < UPLOAD_STALL);
+                .retain(|_, u| now.duration_since(u.last) < UPLOAD_STALL);
             self.log_uploads
-                .retain(|_, u| now.duration_since(u.started) < UPLOAD_STALL);
+                .retain(|_, u| now.duration_since(u.last) < UPLOAD_STALL);
+            // Files too, the largest partials of all (up to
+            // `files.max_mb` each): before, they lived until the
+            // sender disconnected.
+            let announced = &mut self.announced_uploads;
+            self.blob_uploads.retain(|client, u| {
+                let alive = now.duration_since(u.last) < UPLOAD_STALL;
+                if !alive {
+                    announced.remove(client);
+                }
+                alive
+            });
             self.last_config_check = now;
         }
 
@@ -1519,13 +1538,23 @@ impl ChatServer {
         for rows in pages {
             self.send_msg(client_id, &ServerMessage::AdminRows { request_id, rows });
         }
-        self.send_msg(
-            client_id,
-            &ServerMessage::AdminResult {
+        let mut closing = ServerMessage::AdminResult {
+            request_id,
+            result: Ok(last),
+        };
+        // A row too large for any page leaves the page that holds it
+        // unsendable; the answer must still close, or the panel waits
+        // for it for good.
+        if protocol::encode_server_message(&closing).is_none() {
+            warn!("admin answer for {client_id:#x}: its last page does not fit a message");
+            closing = ServerMessage::AdminResult {
                 request_id,
-                result: Ok(last),
-            },
-        );
+                result: Err(protocol::AdminError::Invalid(
+                    "the answer is too large to send".to_string(),
+                )),
+            };
+        }
+        self.send_msg(client_id, &closing);
     }
 
     /// One message to many sessions, encoded and framed once: the
@@ -1685,8 +1714,8 @@ impl ChatServer {
         ) else {
             return;
         };
-        let image = match image {
-            Folded::Complete(image) => image,
+        let (image, hash) = match image {
+            Folded::Complete(image, hash) => (image, hash),
             Folded::Malformed => {
                 warn!(
                     "Dropping malformed image chunk from {} (count {count}, index {index})",
@@ -1729,7 +1758,7 @@ impl ChatServer {
             image.len() / 1024,
         );
         self.stats.messages_count += 1;
-        self.relay_image(client_id, upload_id, &image);
+        self.relay_image(client_id, upload_id, &image, hash);
     }
 
     /// Queue a validated image for relay: re-chunk, pre-encode each
@@ -1737,9 +1766,8 @@ impl ChatServer {
     /// all of them. The transport paces each stream at
     /// `limits.media_relay_kb_per_sec` so a big image never floods a
     /// receiver's downlink queue — voice shares that queue.
-    fn relay_image(&mut self, client_id: ClientId, upload_id: u32, image: &[u8]) {
+    fn relay_image(&mut self, client_id: ClientId, upload_id: u32, image: &[u8], hash: [u8; 32]) {
         let (id, ts) = self.stamp();
-        let hash = transport::sha256::digest(image);
         #[allow(clippy::cast_possible_truncation)] // bounded by MAX_IMAGE_CHUNKS
         let count = image.len().div_ceil(protocol::IMAGE_CHUNK_BYTES) as u32;
         let mut encoded: Vec<protocol::Bytes> = Vec::with_capacity(count as usize);
@@ -1771,11 +1799,13 @@ impl ChatServer {
             }
             None => self.clients(),
         };
+        // Framed once: every receiver's stream queues the same bytes.
+        let framed = transport::frame_media(encoded);
         for peer in audience {
             self.stats.bytes_sent += image.len() as u64;
             if let Err(e) = self
                 .driver
-                .send_media(self.now, peer, encoded.iter().cloned())
+                .send_media_framed(self.now, peer, framed.iter().cloned())
             {
                 debug!("image relay to {peer:#x} failed: {e}");
             }
@@ -1798,10 +1828,15 @@ impl ChatServer {
         let now = self.now;
         let window = Duration::from_mins(1);
 
+        // A minute with nothing in it takes any one upload, however
+        // large: the bytes are charged in full, so the next one waits
+        // until they leave the window. Without this a file larger than
+        // the per-minute budget (4 MiB by default, under the 50 MB file
+        // cap) could never be sent at all.
         let entries = self.image_bytes.entry(client_id).or_default();
         entries.retain(|(t, _)| now.duration_since(*t) < window);
         let client_used: usize = entries.iter().map(|(_, b)| b).sum();
-        if client_used + len > per_client {
+        if client_used > 0 && client_used + len > per_client {
             warn!(
                 "Image bandwidth limit for {}: {} KB used of {} KB/min, dropping a {} KB image",
                 self.usernames
@@ -1817,7 +1852,7 @@ impl ChatServer {
         self.image_bytes_global
             .retain(|(t, _)| now.duration_since(*t) < window);
         let global_used: usize = self.image_bytes_global.iter().map(|(_, b)| b).sum();
-        if global_used + len > global {
+        if global_used > 0 && global_used + len > global {
             warn!(
                 "Server-wide image bandwidth limit: {} KB used of {} KB/min, \
                  dropping a {} KB image from {}",
@@ -1878,7 +1913,7 @@ impl ChatServer {
             return;
         };
         let log = match folded {
-            Folded::Complete(log) => log,
+            Folded::Complete(log, _) => log,
             Folded::Malformed | Folded::Oversized(_) => {
                 warn!(
                     "Dropping malformed or oversized log upload from {}",
@@ -1927,6 +1962,7 @@ impl ChatServer {
         // is told until they join a channel, which is when `announce`
         // does everything a connect used to.
         self.channel_of.insert(client_id, self.default_channel);
+        self.index_rooms();
 
         // Full state snapshot for the new client: user list, channel
         // roster and memberships, active shares, and current audio
@@ -2040,17 +2076,14 @@ impl ChatServer {
         );
         if let Some(user_id) = self.user_of.get(&client_id).copied() {
             let msg = self.user_details(client_id, &user_id);
-            for peer in self.clients() {
-                self.send_msg(peer, &msg);
-            }
+            let recipients = self.clients();
+            self.send_to(&recipients, &msg);
             let msg = self.user_profile(client_id, &user_id);
-            for peer in self.clients() {
-                self.send_msg(peer, &msg);
-            }
+            let recipients = self.clients();
+            self.send_to(&recipients, &msg);
             let msg = self.user_progress(client_id, &user_id);
-            for peer in self.clients() {
-                self.send_msg(peer, &msg);
-            }
+            let recipients = self.clients();
+            self.send_to(&recipients, &msg);
         }
         if let Some((muted, deafened)) = self.audio_states.get(&client_id).copied() {
             self.broadcast_msg_except(
@@ -2175,6 +2208,7 @@ impl ChatServer {
             .channel_of
             .remove(&client_id)
             .is_some_and(|ch| ch != self.default_channel);
+        self.index_rooms();
         self.image_bytes.remove(&client_id);
         self.uploads.remove(&client_id);
         self.log_uploads.remove(&client_id);
@@ -2290,13 +2324,11 @@ impl ChatServer {
                         let plain = ServerMessage::Chat(msg);
                         let audience = self.audience_of(&author);
                         self.introduce_author(client_id, &author, &audience);
-                        for peer in audience {
-                            if self.has_feature(peer, features::SAFETY) {
-                                self.send_msg(peer, &rich);
-                            } else {
-                                self.send_msg(peer, &plain);
-                            }
-                        }
+                        let (rich_to, plain_to): (Vec<ClientId>, Vec<ClientId>) = audience
+                            .into_iter()
+                            .partition(|peer| self.has_feature(*peer, features::SAFETY));
+                        self.send_to(&rich_to, &rich);
+                        self.send_to(&plain_to, &plain);
                     }
                     None => self.broadcast_msg(&ServerMessage::Chat(msg)),
                 }
@@ -2409,9 +2441,8 @@ impl ChatServer {
                     client_id,
                     is_speaking,
                 };
-                for peer in self.audience_about(client_id) {
-                    self.send_msg(peer, &msg);
-                }
+                let recipients = self.audience_about(client_id);
+                self.send_to(&recipients, &msg);
             }
             ClientMessage::AudioState { muted, deafened } => {
                 self.audio_states.insert(client_id, (muted, deafened));
@@ -2425,11 +2456,9 @@ impl ChatServer {
                     muted,
                     deafened,
                 };
-                for peer in self.audience_about(client_id) {
-                    if peer != client_id {
-                        self.send_msg(peer, &msg);
-                    }
-                }
+                let mut recipients = self.audience_about(client_id);
+                recipients.retain(|peer| *peer != client_id);
+                self.send_to(&recipients, &msg);
             }
 
             // ── Screen share signaling ──────────────────────────────
@@ -2442,6 +2471,12 @@ impl ChatServer {
                 self.handle_share_start(client_id, width, height, scope);
             }
             ClientMessage::ScreenShareStop => {
+                // Only a share that exists ends: an unguarded stop was a
+                // log line and a message to everyone, as often as a
+                // client cared to send it.
+                if !self.video.is_sharing(client_id) {
+                    return;
+                }
                 let username = self.get_username(client_id);
                 info!("{username} stopped screen share");
                 self.video
@@ -2530,8 +2565,12 @@ impl ChatServer {
             // ── Administration (spec §8) ────────────────────────────
             ClientMessage::Admin {
                 request_id,
-                command,
+                mut command,
             } => {
+                // Reasons go to the target, into the audit log and into
+                // the lists; one as long as a whole message made those
+                // lists undeliverable.
+                command.clip_reason();
                 // The audit log is a disk read: answered when the store
                 // does (`resolve_audit_answer`), everything else now.
                 if let AdminCommand::AuditLog { before, limit } = command {
@@ -2712,20 +2751,17 @@ impl ChatServer {
         };
         match scope {
             ShareScope::Everyone => {
-                for peer in self.clients() {
-                    if !self.in_lobby(peer) {
-                        self.send_msg(peer, &started);
-                    }
-                }
+                let mut recipients = self.clients();
+                recipients.retain(|peer| !self.in_lobby(*peer));
+                self.send_to(&recipients, &started);
             }
             ShareScope::Channel => {
                 // Only the sharer's channel learns about the stream —
                 // for everyone else it doesn't exist. The sharer is a
                 // member of their own channel, so this covers them too.
                 let channel = self.channel_of.get(&client_id).copied();
-                for peer in self.peers_in_channel(channel) {
-                    self.send_msg(peer, &started);
-                }
+                let recipients = self.peers_in_channel(channel);
+                self.send_to(&recipients, &started);
                 if previous_scope == Some(ShareScope::Everyone) {
                     self.evict_out_of_channel_viewers(client_id, channel);
                     // Other channels saw this stream while it was
@@ -2738,9 +2774,7 @@ impl ChatServer {
                             *peer != client_id && self.channel_of.get(peer).copied() != channel
                         })
                         .collect();
-                    for peer in outside {
-                        self.send_msg(peer, &stopped);
-                    }
+                    self.send_to(&outside, &stopped);
                 }
             }
         }
@@ -2899,6 +2933,7 @@ impl ChatServer {
         self.channel_infos = channel_infos_of(&self.channel_list);
         self.default_channel = new_default;
         self.channel_of = new_channel_of;
+        self.index_rooms();
 
         info!(
             "Channel list updated: {} (plus the lobby); {} member(s) moved to the lobby",
@@ -2965,6 +3000,7 @@ impl ChatServer {
                 scope: info.scope,
             };
             let stopped = ServerMessage::ScreenShareStopped { client_id: sharer };
+            let (mut now_see, mut no_longer) = (Vec::new(), Vec::new());
             for peer in self.clients() {
                 if peer == sharer {
                     continue;
@@ -2972,11 +3008,13 @@ impl ChatServer {
                 let saw_before = old_name_of.get(&peer) == Some(&sharer_old_name);
                 let sees_now = self.channel_of.get(&peer).copied() == Some(sharer_channel);
                 if sees_now && !saw_before {
-                    self.send_msg(peer, &started);
+                    now_see.push(peer);
                 } else if saw_before && !sees_now {
-                    self.send_msg(peer, &stopped);
+                    no_longer.push(peer);
                 }
             }
+            self.send_to(&now_see, &started);
+            self.send_to(&no_longer, &stopped);
         }
         Ok(())
     }
@@ -3042,6 +3080,7 @@ impl ChatServer {
         let lobby = self.default_channel;
         let was_visible = old_channel.is_some_and(|c| c != lobby);
         self.channel_of.insert(client_id, channel_id);
+        self.index_rooms();
         match (was_visible, channel_id != lobby) {
             (false, true) => self.announce(client_id, channel_id),
             (true, false) => self.withdraw(client_id),
@@ -3060,12 +3099,22 @@ impl ChatServer {
         );
     }
 
+    /// Rebuild `room_members` from `channel_of`, in roster order.
+    fn index_rooms(&mut self) {
+        for members in self.room_members.values_mut() {
+            members.clear();
+        }
+        for client in &self.roster {
+            if let Some(channel) = self.channel_of.get(client) {
+                self.room_members.entry(*channel).or_default().push(*client);
+            }
+        }
+        self.room_members.retain(|_, members| !members.is_empty());
+    }
+
     /// Members currently in `channel_id`.
     fn members_in(&self, channel_id: u16) -> usize {
-        self.channel_of
-            .values()
-            .filter(|c| **c == channel_id)
-            .count()
+        self.room_members.get(&channel_id).map_or(0, Vec::len)
     }
 
     /// Admitted clients in `channel` (None never matches anyone).
@@ -3107,11 +3156,9 @@ impl ChatServer {
             // Old channel: stream gone (this also reaches evicted
             // viewers, closing their windows).
             let stopped = ServerMessage::ScreenShareStopped { client_id: mover };
-            for peer in self.peers_in_channel(old) {
-                if peer != mover {
-                    self.send_msg(peer, &stopped);
-                }
-            }
+            let mut recipients = self.peers_in_channel(old);
+            recipients.retain(|peer| *peer != mover);
+            self.send_to(&recipients, &stopped);
             self.evict_out_of_channel_viewers(mover, Some(new));
             // New channel: stream appears.
             let started = ServerMessage::ScreenShareStarted {
@@ -3120,11 +3167,9 @@ impl ChatServer {
                 height: info.height,
                 scope: info.scope,
             };
-            for peer in self.peers_in_channel(Some(new)) {
-                if peer != mover {
-                    self.send_msg(peer, &started);
-                }
-            }
+            let mut recipients = self.peers_in_channel(Some(new));
+            recipients.retain(|peer| *peer != mover);
+            self.send_to(&recipients, &started);
         }
 
         // ── The mover as a viewer / potential viewer ────────────────
@@ -3179,9 +3224,12 @@ impl ChatServer {
 
         // Channel-scoped streams are watchable only from the sharer's
         // channel. (The stream is normally invisible from elsewhere —
-        // this closes the modified-client path.)
-        if info.scope == ShareScope::Channel
-            && self.channel_of.get(&client_id) != self.channel_of.get(&target_id)
+        // this closes the modified-client path.) Nothing is watchable
+        // from the lobby, which is shown no shares at all (spec §12):
+        // an unseen viewer there still counted in the sharer's health.
+        if self.in_lobby(client_id)
+            || (info.scope == ShareScope::Channel
+                && self.channel_of.get(&client_id) != self.channel_of.get(&target_id))
         {
             self.send_msg(
                 client_id,
@@ -3419,7 +3467,8 @@ impl ChatServer {
 
 /// Outcome of folding one chunk into an upload.
 enum Folded {
-    Complete(Vec<u8>),
+    /// The whole upload and its SHA-256.
+    Complete(Vec<u8>, [u8; 32]),
     Malformed,
     Oversized(usize),
 }
@@ -3459,7 +3508,9 @@ fn fold_upload(
         received: 0,
         bytes: 0,
         chunks: vec![None; count as usize],
-        started: now,
+        last: now,
+        hasher: transport::sha256::Hasher::new(),
+        hashed: 0,
     });
     if upload.count != count || upload.chunks[index as usize].is_some() {
         return None; // inconsistent or duplicate — drop silently
@@ -3472,16 +3523,24 @@ fn fold_upload(
     }
     upload.chunks[index as usize] = Some(data);
     upload.received += 1;
+    upload.last = now;
+    // Hash whatever is now contiguous from the front (chunks arrive in
+    // order on one stream, so normally exactly this one).
+    while let Some(Some(chunk)) = upload.chunks.get(upload.hashed as usize) {
+        upload.hasher.update(chunk);
+        upload.hashed += 1;
+    }
     if upload.received < upload.count {
         return None;
     }
 
     let upload = uploads.remove(&client_id)?;
+    let digest = upload.hasher.finish();
     let mut whole = Vec::with_capacity(upload.bytes);
     for chunk in upload.chunks {
         whole.extend_from_slice(&chunk?);
     }
-    Some(Folded::Complete(whole))
+    Some(Folded::Complete(whole, digest))
 }
 
 /// One-line rendering of a telemetry sample for the log.

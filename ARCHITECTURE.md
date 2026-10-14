@@ -321,7 +321,10 @@ policy.
 periodic reports (stream health 1 s, voice receiver reports 2 s, config
 watch 3 s, stats). Only the peers `Driver::readable()` names are asked
 for messages and media; the relays send each packet as one
-`transport::Shared`, and a broadcast is encoded once. Stream health is
+`transport::Shared`, and a broadcast is encoded once (`send_to`; a
+relayed picture is framed once, `transport::frame_media`). Voice is
+offered only to the speaker's room (`room_members`, rebuilt when
+membership changes, never per packet). Stream health is
 per sharer (`Driver::track_stats`) over the last five reports, so a
 two-second group is never outside the window. The loop then waits on its socket until
 `next_wake()`: the transport's next deadline, a Hello's, the next

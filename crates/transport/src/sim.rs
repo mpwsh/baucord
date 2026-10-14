@@ -154,11 +154,6 @@ impl SimNet {
         NodeId(self.nodes.len() - 1)
     }
 
-    #[must_use]
-    pub fn addr(&self, node: NodeId) -> SocketAddr {
-        self.nodes[node.0].addr
-    }
-
     /// Move a node to a new address (the client behind a NAT rebinding,
     /// or switching networks). Existing in-flight datagrams keep their
     /// old source.

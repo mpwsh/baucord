@@ -164,6 +164,7 @@ impl ServerIdentity {
         self.fingerprint
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn cert_der(&self) -> &[u8] {
         &self.cert_der
@@ -200,8 +201,8 @@ impl ServerIdentity {
             .collect()
     }
 
-    /// The rustls server configuration: TLS 1.3 only, our ALPN, key log
-    /// honoring `SSLKEYLOGFILE`.
+    /// The rustls server configuration: TLS 1.3 only, our ALPN, the key
+    /// log only when asked ([`super::key_log`]).
     ///
     /// # Errors
     /// rustls rejects the key/certificate pair (cannot happen for a key
@@ -217,7 +218,7 @@ impl ServerIdentity {
             .with_single_cert(vec![CertificateDer::from(self.cert_der.clone())], key)
             .map_err(IdentityError::Tls)?;
         config.alpn_protocols = vec![protocol::ALPN.to_vec()];
-        config.key_log = Arc::new(rustls::KeyLogFile::new());
+        config.key_log = super::key_log();
         config.max_early_data_size = 0;
         Ok(Arc::new(config))
     }

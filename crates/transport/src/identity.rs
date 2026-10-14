@@ -39,6 +39,24 @@ use rustls::{
 
 use crate::der;
 
+/// The variable that turns the TLS key log on, for a packet capture.
+const KEY_LOG_SWITCH: &str = "BAUCORD_TLS_KEYLOG";
+
+/// Where TLS session secrets go: nowhere, unless `BAUCORD_TLS_KEYLOG=1`
+/// is set as well as `SSLKEYLOGFILE` (rustls's own variable, which
+/// then names the file). Honouring `SSLKEYLOGFILE` alone meant
+/// anything that could set one environment variable for the process —
+/// a launcher, a shell profile, the host's service file — could
+/// decrypt every session.
+pub(crate) fn key_log() -> Arc<dyn rustls::KeyLog> {
+    if std::env::var_os(KEY_LOG_SWITCH).is_some_and(|v| v == "1") {
+        info!("TLS key log on ({KEY_LOG_SWITCH}=1): session secrets go to SSLKEYLOGFILE");
+        Arc::new(rustls::KeyLogFile::new())
+    } else {
+        Arc::new(rustls::NoKeyLog)
+    }
+}
+
 // The server's side — its key files, its certificate, its retired keys
 // — is its own module behind the `server` feature: it is the only user
 // of `rcgen` (and through it `yasna` and `pem`), which every client
@@ -367,12 +385,6 @@ impl PinnedVerifier {
         })
     }
 
-    /// The pin this verifier enforces.
-    #[must_use]
-    pub fn pin(&self) -> Option<Fingerprint> {
-        self.pin
-    }
-
     /// What the last handshake presented (set once per handshake).
     #[must_use]
     pub fn observation(&self) -> Option<Observation> {
@@ -383,7 +395,7 @@ impl PinnedVerifier {
     }
 
     /// The rustls client configuration built around this verifier: TLS
-    /// 1.3 only, our ALPN, key log honoring `SSLKEYLOGFILE`.
+    /// 1.3 only, our ALPN, the key log only when asked ([`key_log`]).
     ///
     /// # Errors
     /// Only if rustls refuses the protocol-version selection.
@@ -395,7 +407,7 @@ impl PinnedVerifier {
             .with_custom_certificate_verifier(self.clone())
             .with_no_client_auth();
         config.alpn_protocols = vec![protocol::ALPN.to_vec()];
-        config.key_log = Arc::new(rustls::KeyLogFile::new());
+        config.key_log = key_log();
         config.enable_early_data = false;
         Ok(Arc::new(config))
     }

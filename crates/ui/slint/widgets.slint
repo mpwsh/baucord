@@ -7,7 +7,139 @@
 
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
-import { MenuEntry } from "globals.slint";
+import { MenuEntry, State } from "globals.slint";
+
+// ── Tooltips ────────────────────────────────────────────────────────────
+
+/// The one tooltip a window shows. A hovered control writes it here and
+/// the window's `TipLayer`, declared last, draws it above every pane.
+/// Each control used to draw its own tip as a child of itself, under
+/// whatever was declared after it: the sidebar covered the chat's
+/// tips, the channel list the sidebar header's. Globals are per
+/// window, so every window that has tips also has a `TipLayer`.
+export global Tip {
+    out property <string> text;
+    /// The control the tip is about, in window coordinates.
+    out property <length> anchor-x;
+    out property <length> anchor-y;
+    out property <length> anchor-w;
+    out property <length> anchor-h;
+    /// Under the control rather than over it (a control along the top).
+    out property <bool> below;
+
+    public function show(text: string, x: length, y: length, w: length, h: length, below: bool) {
+        self.anchor-x = x;
+        self.anchor-y = y;
+        self.anchor-w = w;
+        self.anchor-h = h;
+        self.below = below;
+        self.text = text;
+    }
+    /// Clear the tip if it is still `text`'s: a hover that ended after
+    /// another began must not take the newer one down.
+    public function hide(text: string) {
+        if (self.text == text) {
+            self.text = "";
+        }
+    }
+}
+
+/// Draws `Tip`: after a short dwell, at once while another tip was just
+/// showing (moving along a row of buttons), gone after a while like a
+/// native one, flipped and clamped to stay inside the window. Put it
+/// last in the window, the window's full size; it takes no input.
+export component TipLayer inherits Rectangle {
+    /// Off on touch screens, where a hover is a finger.
+    in property <bool> enabled: true;
+    property <string> text: root.enabled ? Tip.text : "";
+    property <bool> dwelled: false;
+    /// A tip showed a moment ago: the next one comes without the dwell.
+    property <bool> warm: false;
+    property <bool> shown: root.text != "" && (root.dwelled || root.warm);
+    changed text => {
+        if (root.text == "") {
+            root.dwelled = false;
+        }
+    }
+    Timer {
+        interval: 400ms;
+        running: root.text != "" && !root.dwelled && !root.warm;
+        triggered => {
+            root.dwelled = true;
+            root.warm = true;
+        }
+    }
+    Timer {
+        interval: 500ms;
+        running: root.text == "" && root.warm;
+        triggered => { root.warm = false; }
+    }
+    // A tip whose control vanished under the pointer (no exit comes)
+    // does not stay up for good.
+    Timer {
+        interval: 8s;
+        running: root.shown;
+        triggered => { Tip.hide(root.text); }
+    }
+
+    if root.shown : bubble := Rectangle {
+        property <length> pad: Theme.gap-sm;
+        property <length> room: 6px;
+        property <bool> fits-above: Tip.anchor-y - self.height - self.room >= 4px;
+        property <bool> fits-below: Tip.anchor-y + Tip.anchor-h + self.room + self.height
+            <= root.height - 4px;
+        property <bool> place-below: Tip.below ? self.fits-below || !self.fits-above
+            : !self.fits-above && self.fits-below;
+        width: Math.min(label.preferred-width, 280px) + 2 * self.pad;
+        height: label.height + 8px;
+        x: Math.clamp(Tip.anchor-x + (Tip.anchor-w - self.width) / 2,
+            4px, Math.max(4px, root.width - self.width - 4px));
+        y: self.place-below ? Tip.anchor-y + Tip.anchor-h + self.room
+            : Tip.anchor-y - self.height - self.room;
+        border-radius: Theme.radius-sm;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-color: #00000040;
+        drop-shadow-blur: 6px;
+        drop-shadow-offset-y: 2px;
+        label := Text {
+            x: bubble.pad;
+            y: 4px;
+            width: bubble.width - 2 * bubble.pad;
+            text: root.text;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// ── Touch ───────────────────────────────────────────────────────────────
+
+/// Touch hosts: a finger held still on something does its long-press
+/// action (a row's menu, as a right-click on the desktop). `pressing`
+/// is the target's TouchArea hover, which on touch means "a finger is
+/// down here": Slint sends an exit after every release, and a scroll
+/// taking over sends one too. `fired` holds until the finger lifts:
+/// every tap handler under it checks it, so letting go after a long
+/// press never also counts as a tap.
+export component LongPress {
+    in property <bool> pressing;
+    out property <bool> fired: false;
+    callback long-pressed();
+    changed pressing => {
+        if (!self.pressing) { self.fired = false; }
+    }
+    Timer {
+        interval: 500ms;
+        running: State.touch-host && root.pressing && !root.fired;
+        triggered => {
+            root.fired = true;
+            root.long-pressed();
+        }
+    }
+}
 
 // ── Buttons ─────────────────────────────────────────────────────────────
 
@@ -105,25 +237,32 @@ export component IconBtn inherits Rectangle {
         animate stroke { duration: 150ms; }
     }
 
-    touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+    /// Tell the window's tip layer about this button's tip, or that
+    /// it is no longer wanted.
+    function post-tip() {
+        if (touch.has-hover && root.tooltip != "") {
+            Tip.show(root.tooltip, self.absolute-position.x, self.absolute-position.y,
+                self.width, self.height, root.tooltip-below);
+        } else {
+            Tip.hide(root.tooltip);
+        }
+    }
+    // The words change under the pointer (Mute becomes Unmute).
+    changed tooltip => {
+        if (touch.has-hover) {
+            Tip.hide(Tip.text);
+            root.post-tip();
+        }
     }
 
-    if touch.has-hover && tooltip != "" : Rectangle {
-        y: root.tooltip-below ? root.height + 6px : -28px;
-        x: root.tooltip-below ? root.width - self.width : (root.width - self.width) / 2;
-        height: 22px;
-        width: tip.preferred-width + 16px;
-        border-radius: Theme.radius-sm;
-        background: Theme.surface;
-        border-width: 1px;
-        border-color: Theme.border;
-        tip := Text {
-            text: root.tooltip;
-            color: Theme.text-secondary;
-            font-size: Theme.font-sm;
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            // A native tip goes with the click.
+            Tip.hide(root.tooltip);
+            root.clicked();
         }
+        changed has-hover => { root.post-tip(); }
     }
 }
 

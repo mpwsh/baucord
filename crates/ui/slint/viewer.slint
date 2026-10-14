@@ -42,7 +42,7 @@
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { Btn, IconBtn, HSlider } from "widgets.slint";
+import { Btn, IconBtn, HSlider, TipLayer } from "widgets.slint";
 
 export component StreamViewerPanel inherits FocusScope {
     in property <string> peer-name;
@@ -644,5 +644,9 @@ export component StreamViewerWindow inherits Window {
         stop-watching => { root.stop-watching(); }
         self-mute-toggled => { root.self-mute-toggled(); }
         self-deafen-toggled => { root.self-deafen-toggled(); }
+    }
+    TipLayer {
+        width: 100%;
+        height: 100%;
     }
 }

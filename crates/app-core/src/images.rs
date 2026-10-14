@@ -285,6 +285,19 @@ pub fn decode_received(bytes: &[u8]) -> Result<image::DynamicImage, ImageError> 
         .map_err(|e| ImageError::Codec(e.to_string()))
 }
 
+/// A received picture's size from its header, without decoding it:
+/// what a chat row lays out before its pixels are wanted. `None` for
+/// anything [`decode_received`] would refuse by its magic, or a header
+/// that does not parse.
+#[must_use]
+pub fn received_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let format = received_format(bytes)?;
+    image::ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
+        .ok()
+        .filter(|&(w, h)| w > 0 && h > 0)
+}
+
 /// Size of the profile avatar the client keeps and uploads (spec §7.1).
 pub const AVATAR_SIDE: u32 = 128;
 

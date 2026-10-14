@@ -334,9 +334,8 @@ impl ChatServer {
         // Not to whoever blocked the author: they never saw the message,
         // and an edit of one off screen is shown with its text.
         let edited = ServerMessage::MessageEdited { msg_id, text };
-        for peer in self.audience_of(&user) {
-            self.send_msg(peer, &edited);
-        }
+        let recipients = self.audience_of(&user);
+        self.send_to(&recipients, &edited);
     }
 
     /// Your own recent message removed; `by_admin` skips the ownership
@@ -434,9 +433,8 @@ impl ChatServer {
             // told every client it was there, by its id).
             for session in self.sessions_of(&user) {
                 let msg = self.user_progress(session, &user);
-                for peer in self.audience_about(session) {
-                    self.send_msg(peer, &msg);
-                }
+                let recipients = self.audience_about(session);
+                self.send_to(&recipients, &msg);
             }
             if after > before {
                 let xp = self.policy.xp.get(&user).copied().unwrap_or(0);
@@ -444,9 +442,8 @@ impl ChatServer {
                 for session in self.sessions_of(&user) {
                     self.send_msg(session, &ServerMessage::ProgressUpdate { xp, level: after });
                     let details = self.user_details(session, &user);
-                    for peer in self.audience_about(session) {
-                        self.send_msg(peer, &details);
-                    }
+                    let recipients = self.audience_about(session);
+                    self.send_to(&recipients, &details);
                 }
             }
         }

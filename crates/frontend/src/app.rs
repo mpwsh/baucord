@@ -496,8 +496,8 @@ pub struct AppState {
     activity_model: Rc<VecModel<ChatRow>>,
     /// General shows its activity rather than its conversation.
     showing_activity: bool,
-    /// Image bytes per chat row-id (save / viewer / GIF replay).
-    pub images: HashMap<i32, media::ImageEntry>,
+    /// GIF players per chat row id (the pictures themselves are in
+    /// `pictures.rs`).
     gifs: HashMap<i32, GifPlayer>,
     /// Pending outgoing image awaiting Send/Cancel in the preview.
     pending_preview: Option<Vec<u8>>,
@@ -803,7 +803,6 @@ pub fn run() {
         chat_model,
         activity_model: Rc::new(VecModel::default()),
         showing_activity: false,
-        images: HashMap::new(),
         gifs: HashMap::new(),
         pending_preview: None,
         users_model,
@@ -1375,6 +1374,9 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     });
     let w = Rc::downgrade(state);
     logic.on_file_save(move |row_id| with_app(&w, |app| app.file_save(row_id)));
+    // Called from the pane's bindings, while it lays out or draws: the
+    // store is not the app, which may be mid-call.
+    logic.on_chat_picture(|row_id, _rev| crate::pictures::preview(row_id));
     let w = Rc::downgrade(state);
     logic.on_row_open_image(move |row_id| {
         with_app(&w, |app| crate::viewers::open_gallery(app, row_id));
@@ -2467,19 +2469,87 @@ pub mod tray {
     //! — no cross-thread event hop like the old `tray-icon` crate,
     //! and a visible tray icon by itself keeps
     //! `run_event_loop_until_quit` alive.
+    //!
+    //! While connected the menu also carries our own mute and deafen,
+    //! and the voice room's people, each to mute for us alone; the
+    //! icon goes red while nobody hears us. [`sync`] keeps it current
+    //! from `update_user_list`, whether or not the window is shown.
     use i18n::t;
     use log::warn;
+    use slint::{Model, ModelRc, VecModel};
 
     use super::{with_current, AppState};
+
+    /// What the tray shows; pushed to it only when it changed, since
+    /// every change rebuilds the platform menu. A snapshot compared
+    /// whole, not a state machine: the flags are what the menu reads.
+    #[allow(clippy::struct_excessive_bools)]
+    #[derive(Debug, Default, Clone, PartialEq)]
+    struct View {
+        connected: bool,
+        muted: bool,
+        deafened: bool,
+        quiet: bool,
+        room: String,
+        /// Client id, name, muted for us.
+        people: Vec<(u64, String, bool)>,
+    }
+
+    impl View {
+        fn of(app: &AppState) -> Self {
+            let connected = app.connected && app.session.our_client_id.is_some();
+            if !connected {
+                return Self::default();
+            }
+            let muted = app.session.is_muted;
+            let deafened = app.session.is_deafened;
+            let quiet = muted || deafened || app.session.server_muted.is_some();
+            let ours = app.session.our_client_id;
+            let (room, people) = match app.our_channel() {
+                Some(channel) if app.in_voice_room() => {
+                    let mut people: Vec<(u64, String, bool)> = app
+                        .session
+                        .users
+                        .iter()
+                        .filter(|(id, u)| Some(**id) != ours && u.channel_id == channel)
+                        // A blocked person's voice never reaches us:
+                        // nothing to mute (as in their menu).
+                        .filter(|(id, _)| {
+                            app.account_of(**id)
+                                .is_none_or(|user| !app.is_blocked(&user))
+                        })
+                        .map(|(id, u)| (*id, u.username.clone(), u.audio.is_muted))
+                        .collect();
+                    people.sort_by(|a, b| {
+                        a.1.to_lowercase()
+                            .cmp(&b.1.to_lowercase())
+                            .then(a.0.cmp(&b.0))
+                    });
+                    (app.channel_name(channel), people)
+                }
+                _ => (String::new(), Vec::new()),
+            };
+            Self {
+                connected,
+                muted,
+                deafened,
+                quiet,
+                room,
+                people,
+            }
+        }
+    }
 
     thread_local! {
         /// Keeps the OS tray item alive for the app's lifetime —
         /// dropping the component removes the icon.
         static TRAY: std::cell::RefCell<Option<ui::BaucordTray>> =
             const { std::cell::RefCell::new(None) };
+        /// What it shows now.
+        static SHOWN: std::cell::RefCell<View> = std::cell::RefCell::new(View::default());
     }
 
-    pub fn setup(_app: &mut AppState) {
+    pub fn setup(app: &mut AppState) {
         let tray = match ui::BaucordTray::new() {
             Ok(tray) => tray,
             Err(e) => {
@@ -2496,6 +2566,70 @@ pub mod tray {
             with_current(AppState::save_settings_now);
             let _ = slint::quit_event_loop();
         });
+        tray.on_toggle_mute(|| with_current(AppState::handle_toggle_mute));
+        tray.on_toggle_deafen(|| with_current(AppState::handle_toggle_deafen));
+        tray.on_toggle_person(|index| {
+            let person = SHOWN.with(|shown| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|i| shown.borrow().people.get(i).cloned())
+            });
+            if let Some((id, name, muted)) = person {
+                with_current(|app| app.handle_mute_user(id, &name, !muted));
+            }
+        });
         TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
+        // Already connected by now (auto-connect): show it.
+        sync(app);
+    }
+
+    /// Bring the tray in line with the session: cheap when nothing it
+    /// shows changed, which is most calls.
+    pub fn sync(app: &AppState) {
+        let view = View::of(app);
+        if SHOWN.with(|shown| *shown.borrow() == view) {
+            return;
+        }
+        TRAY.with(|slot| {
+            // Setting properties calls nothing back: the borrow is safe
+            // to hold.
+            let slot = slot.borrow();
+            let Some(tray) = slot.as_ref() else {
+                return;
+            };
+            tray.set_connected(view.connected);
+            tray.set_quiet(view.quiet);
+            tray.set_mute_label(t!(if view.muted { "unmute" } else { "mute" }).into());
+            tray.set_deafen_label(t!(if view.deafened { "undeafen" } else { "deafen" }).into());
+            tray.set_tip(
+                if view.deafened {
+                    t!("tray-tip-deafened")
+                } else if view.quiet {
+                    t!("tray-tip-muted")
+                } else {
+                    "baucord".to_string()
+                }
+                .into(),
+            );
+            tray.set_room(view.room.clone().into());
+            let people: Vec<ui::TrayPerson> = view
+                .people
+                .iter()
+                .map(|(_, name, muted)| ui::TrayPerson {
+                    title: if *muted {
+                        t!("tray-unmute-person", "name" => name.as_str())
+                    } else {
+                        t!("tray-mute-person", "name" => name.as_str())
+                    }
+                    .into(),
+                })
+                .collect();
+            let model = tray.get_people();
+            match model.as_any().downcast_ref::<VecModel<ui::TrayPerson>>() {
+                Some(rows) => rows.set_vec(people),
+                None => tray.set_people(ModelRc::new(VecModel::from(people))),
+            }
+        });
+        SHOWN.with(|shown| *shown.borrow_mut() = view);
     }
 }

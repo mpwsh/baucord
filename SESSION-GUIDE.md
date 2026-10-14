@@ -944,6 +944,56 @@ Memory-mode servers (persistence off) still use the legacy
   voice into empty rooms is "X joined Y". Notifications exist only while
   the app is connected — nothing reaches a phone whose app is closed
   until push exists (PRODUCTION-PLAN.md PRD-1).
+- **One message to several sessions is `send_to`** (`server.rs`):
+  encoded and framed once, the bytes shared. `send_msg` in a loop over
+  an audience encoded it once per person (twenty such loops were left
+  after P2-32; review 2026-10-14 SRV-9). Two audiences that read
+  different variants (`ChatFrom` / `Chat`, `FileMessage` / its plain
+  form) are split with `partition` and get one `send_to` each. A
+  relayed upload is framed once too: `transport::frame_media`, then
+  `send_media_framed` per receiver.
+- **The voice relay reads `room_members`**, `channel_of` turned around:
+  whatever changes `channel_of` calls `index_rooms()` after it (a
+  connect, a leave, a move, a new channel list). Rebuilt on those
+  events, never per packet.
+- **A list sent as one message has a cap the wire can carry, and a
+  test that holds the two together** (`MAX_BLOCKS` in `safety.rs`,
+  `MAX_ROLES` in `admin.rs`): at the longest names the whole list must
+  encode under 17 KiB, or it never arrives. A free-text field that
+  travels in such lists has a byte cap too (`MAX_ADMIN_REASON_BYTES`,
+  cut by `AdminCommand::clip_reason` on both sides).
+- **A persistence command that writes a table `load_policy` reads says
+  so in `Command::changes_policy`** (an exhaustive match): only those
+  make a policy snapshot stale. Counting every write made snapshots
+  stale for a read mark or an audit line.
+- **The TLS key log is off unless `BAUCORD_TLS_KEYLOG=1`** is set beside
+  `SSLKEYLOGFILE`, on either side: for a packet capture, on purpose.
+
+- **A chat row carries no picture** (`pictures.rs`): `ChatRow.image`
+  is only a playing GIF's frame. The pane asks
+  `Logic.chat-picture(row-id, image-rev)` for the rows it built; the
+  store answers from its previews or queues a decode and the app bumps
+  `image-rev` when it lands (`AppState::picture_ready`). Its handler
+  runs inside Slint's layout and drawing: it touches the store only,
+  never `AppState`. Bytes go in with `pictures::insert` and out with
+  `pictures::remove` wherever a row does; parked conversations keep
+  theirs.
+- **A tooltip is posted, not drawn** (`Tip` / `TipLayer`,
+  `widgets.slint`): a control calls `Tip.show(text, its window
+  rectangle, below)` on hover and `Tip.hide(text)` on leave and click;
+  each window has one `TipLayer` as its last child. A tooltip drawn
+  as the control's own child goes under every sibling that comes after
+  it in the tree — the sidebar, the channel names.
+- **A hold is not also a tap.** A touch target with a long press
+  (`LongPress`, `widgets.slint`) returns from its `clicked` while
+  `fired` (`held` on a chat row): the finger's release comes after
+  the hold's action and would run the tap's too. A nested target (a
+  picture, a link, a file button in a row) checks the row's `held`.
+- **The tray's menu says a state in words** (`tray.slint`): no native
+  backend draws a check mark, and a `checkable` item sets its own
+  `checked` on activation, which breaks the binding. Its labels and
+  people come from `tray::sync`, which returns early when nothing it
+  shows changed (every change rebuilds the platform menu).
 
 ### Memory (the "RAM tripled" pass)
 What the app retains is now measurable: **`/mem`** prints (and logs)
@@ -962,7 +1012,10 @@ the next one) — both clear it now; chat preview textures follow the
 window's scale factor (`preview_max_edge`: 360² on a 1× display,
 720² only at 2×, a quarter of the memory per picture for most
 Windows users); avatars from other clients are clamped to 128² at
-decode (ours already are at pick time). Since 1.1.9 the stream
+decode (ours already are at pick time). Since 2026-10-14 a chat
+picture is decoded only while its row is on screen, off the UI
+thread, and kept in a 16 MB LRU after (`pictures.rs`); `/mem` reports
+how many are decoded. Since 1.1.9 the stream
 viewer reuses a ring of three `SharedPixelBuffer`s per stream and the
 decoders' buffers go round `video::pool` (ANDROID-SPEC D57), so the
 8 MB allocation per 1080p frame is gone too. Left to measure: the `StyledText`

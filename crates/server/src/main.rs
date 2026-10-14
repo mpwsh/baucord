@@ -13,7 +13,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use env_logger::Builder;
 use log::{info, warn};
-use server::{config::Config, persistence, server::ChatServer};
+use server::{clock::Clock, config::Config, persistence, server::ChatServer};
 use transport::{DriverHost, ServerIdentity, UdpIo};
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
@@ -388,6 +388,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ── Socket + server ─────────────────────────────────────────────
     let addr = config.socket_addr()?;
     let mut server = ChatServer::new(config, &identity)?;
+    // A real server's wall clock keeps up with the system's after the
+    // machine was paused (review SRV-13); the simulator's does not.
+    server.set_clock(Clock::following_system(Instant::now()));
     let mut udp = UdpIo::bind(addr, server.budget().socket_buffer_bytes)?;
     server.driver().set_max_gso_segments(udp.max_gso_segments());
     // Hot reload: edits to the [channels] section of the config file

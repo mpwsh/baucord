@@ -171,6 +171,11 @@ unknown-device = dispositivo desconocido
 # ── Bandeja y visor ─────────────────────────────────────────────────────
 tray-show = Mostrar
 tray-quit = Salir
+tray-tip-muted = baucord — muteado
+tray-tip-deafened = baucord — ensordecido
+# In the tray's menu, under the voice room's name: muting is for you alone.
+tray-mute-person = Silenciar a { $name }
+tray-unmute-person = Dejar de silenciar a { $name }
 viewer-title = Pantalla de { $name } ({ $width }x{ $height })
 stop-watching = Dejar de ver
 viewer-stats = { $res } { $fps }fps { $kbps }KB/s { $mb }MB | búfer { $depth }/{ $target }ms jitter { $jitter }ms
@@ -504,6 +509,8 @@ sounds-lead = Qué eventos hacen sonar algo.
 sounds-share-started = Alguien en tu canal empieza a compartir
 sounds-viewer-joined = Alguien empieza a ver tu transmisión
 sounds-viewer-joined-hint = Más suave, y solo lo escuchás vos.
+sounds-mute-toggle = Te silenciás o ensordecés
+sounds-mute-toggle-hint = Una nota suave: más grave al silenciarte, más aguda al volver.
 sounds-enabled = Activar sonidos
 sounds-enabled-hint = Apagado, silencia todos los sonidos.
 sounds-join-leave = Alguien entra o sale de tu canal

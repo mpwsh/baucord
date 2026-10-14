@@ -37,6 +37,10 @@ pub enum SoundType {
     /// Someone started watching the stream we share (softer: it is
     /// for the sharer alone, and viewers come and go).
     ViewerJoined,
+    /// We muted or deafened ourselves: one soft, lower note.
+    WentQuiet,
+    /// We unmuted or undeafened: the same, a third higher.
+    BackLive,
 }
 
 // ── Sound bank ──────────────────────────────────────────────────────────
@@ -49,6 +53,8 @@ pub struct SoundBank {
     direct: Vec<f32>,
     share_started: Vec<f32>,
     viewer_joined: Vec<f32>,
+    went_quiet: Vec<f32>,
+    back_live: Vec<f32>,
 }
 impl Default for SoundBank {
     fn default() -> Self {
@@ -72,6 +78,12 @@ impl SoundBank {
             // arpeggio. A short, quieter pair for a viewer arriving.
             share_started: synth_notes(&[(392.0, 0.12), (587.0, 0.22)], 0.30),
             viewer_joined: synth_notes(&[(784.0, 0.06), (988.0, 0.10)], 0.16),
+            // The join chime's two notes, G4 and B♭4 (it rises from one
+            // to the other), one at a time and calmer: a single soft
+            // mallet note each, about a quarter of the chime's level.
+            // Lower going quiet, higher coming back.
+            went_quiet: synth_soft_note(392.0, 0.32, 0.17),
+            back_live: synth_soft_note(466.2, 0.32, 0.17),
         }
     }
 
@@ -85,6 +97,8 @@ impl SoundBank {
             SoundType::DirectMessage => &self.direct,
             SoundType::ShareStarted => &self.share_started,
             SoundType::ViewerJoined => &self.viewer_joined,
+            SoundType::WentQuiet => &self.went_quiet,
+            SoundType::BackLive => &self.back_live,
         }
     }
 }
@@ -143,6 +157,35 @@ fn synth_notes(notes: &[(f32, f32)], gain: f32) -> Vec<f32> {
         }
     }
     out
+}
+
+/// One soft note at 48 kHz mono: a sine with a faint octave above it
+/// (a mallet's warmth rather than a beep), an 8 ms rounded attack, and
+/// an exponential fade that is all but gone by `secs`, ending in a
+/// short linear taper so it never clicks. Peaks at about `gain`.
+fn synth_soft_note(hz: f32, secs: f32, gain: f32) -> Vec<f32> {
+    const RATE: f32 = 48_000.0;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let len = (secs * RATE) as usize;
+    let attack = 0.008;
+    let taper = 0.012;
+    // Down to about 1 % (-40 dB) at the end.
+    let tau = secs / 4.6;
+    (0..len)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let t = i as f32 / RATE;
+            let rise = if t < attack {
+                0.5 - 0.5 * (std::f32::consts::PI * t / attack).cos()
+            } else {
+                1.0
+            };
+            let tail = ((secs - t) / taper).clamp(0.0, 1.0);
+            let phase = t * hz * std::f32::consts::TAU;
+            let tone = phase.sin() + 0.15 * (2.0 * phase).sin() * (-t / (tau * 0.5)).exp();
+            tone / 1.15 * (-t / tau).exp() * rise * tail * gain
+        })
+        .collect()
 }
 
 // ── WAV decoding ────────────────────────────────────────────────────────
@@ -282,5 +325,27 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
         assert!(worst < 1e-3, "16-bit rounding only, got {worst}");
+    }
+
+    #[test]
+    fn the_mute_notes_are_soft_and_end_in_silence() {
+        let bank = SoundBank::new();
+        let chime = bank.get(SoundType::UserJoined);
+        let chime_peak = chime.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        for sound in [SoundType::WentQuiet, SoundType::BackLive] {
+            let note = bank.get(sound);
+            let peak = note.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+            assert!(peak > 0.05 && peak < 0.2, "{sound:?} peaks at {peak}");
+            // Calmer than the chime it borrows its notes from (whose
+            // level depends on the WAV shipped; absent in a sandbox
+            // with a placeholder, skip the comparison).
+            if chime_peak > 0.3 {
+                assert!(peak < chime_peak / 2.0, "{sound:?} {peak} vs {chime_peak}");
+            }
+            // No click at either end.
+            assert!(note[0].abs() < 1e-3 && note[note.len() - 1].abs() < 1e-3);
+            // A third of a second, no more.
+            assert!(note.len() <= 48_000 / 3 + 1, "{}", note.len());
+        }
     }
 }

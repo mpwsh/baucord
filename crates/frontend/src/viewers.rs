@@ -372,11 +372,9 @@ pub fn open_gallery(app: &mut AppState, row_id: i32) {
         .filter_map(|i| model.row_data(i))
         .find(|r| r.row_id == row_id);
     let Some(row) = row else { return };
-    let Some(entry) = app.images.get(&row_id) else {
+    let Some((bytes, is_gif)) = crate::pictures::bytes(row_id) else {
         return;
     };
-    let bytes = entry.bytes.clone();
-    let is_gif = entry.is_gif;
 
     let ids = image_row_ids(app);
     let pos = ids.iter().position(|&id| id == row_id).unwrap_or(0);

@@ -124,11 +124,12 @@ impl ChatServer {
         let msg = ServerMessage::Authors {
             authors: vec![info],
         };
-        for peer in targets {
-            if *peer != sender {
-                self.send_msg(*peer, &msg);
-            }
-        }
+        let recipients: Vec<ClientId> = targets
+            .iter()
+            .copied()
+            .filter(|peer| *peer != sender)
+            .collect();
+        self.send_to(&recipients, &msg);
     }
 
     /// Before a history page or a conversation list: the name and look
@@ -157,9 +158,9 @@ impl ChatServer {
     }
 
     fn broadcast_if_profiles(&mut self, msg: &ServerMessage) {
-        for peer in self.clients() {
-            self.send_msg(peer, msg);
-        }
+        // `send_to` keeps the message to sessions that read it.
+        let everyone = self.clients();
+        self.send_to(&everyone, msg);
     }
 
     // ── SetProfile ──────────────────────────────────────────────────
@@ -357,9 +358,8 @@ impl ChatServer {
             client_id: client,
             name,
         };
-        for peer in self.audience_about(client) {
-            self.send_msg(peer, &msg);
-        }
+        let recipients = self.audience_about(client);
+        self.send_to(&recipients, &msg);
     }
 
     // ── Blobs: upload ───────────────────────────────────────────────
@@ -461,11 +461,15 @@ impl ChatServer {
             self.reject_upload(client, upload_id, UploadRejectReason::NotAnnounced);
             return;
         }
+        // No more than was announced: the hash and size are checked
+        // only at the end, and a 1 KB announcement must not be able to
+        // park 50 MB here first.
         let cap = if announced.is_file {
             self.file_cap()
         } else {
             self.avatar_cap()
-        };
+        }
+        .min(announced.size as usize);
         #[allow(clippy::cast_possible_truncation)] // cap / chunk fits
         let max_chunks = cap.div_ceil(protocol::IMAGE_CHUNK_BYTES) as u32;
         let Some(folded) = fold_upload(
@@ -481,8 +485,8 @@ impl ChatServer {
         ) else {
             return;
         };
-        let bytes = match folded {
-            Folded::Complete(bytes) => bytes,
+        let (bytes, digest) = match folded {
+            Folded::Complete(bytes, digest) => (bytes, digest),
             Folded::Malformed => {
                 self.announced_uploads.remove(&client);
                 self.reject_upload(client, upload_id, UploadRejectReason::Refused);
@@ -497,7 +501,6 @@ impl ChatServer {
         let Some(announced) = self.announced_uploads.remove(&client) else {
             return;
         };
-        let digest: BlobId = transport::sha256::digest(&bytes);
         if digest != announced.sha256 || bytes.len() != announced.size as usize {
             self.reject_upload(client, upload_id, UploadRejectReason::HashMismatch);
             return;

@@ -21,7 +21,7 @@ import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, KeybindRow, ServerRow, LicenseRow } from "globals.slint";
-import { Btn, IconBtn, Field, FieldLabel, Hint, SectionHeader, Sep, HSlider, VuMeter, GateMeter, Dropdown, CheckRow } from "widgets.slint";
+import { Btn, IconBtn, Field, FieldLabel, Hint, SectionHeader, Sep, HSlider, VuMeter, GateMeter, Dropdown, CheckRow, TipLayer } from "widgets.slint";
 
 /// Someone this account blocked on the connected server (1.2).
 export struct BlockedRow {
@@ -84,6 +84,7 @@ export global SettingsState {
     in-out property <bool> dm-sound: true;
     in-out property <bool> share-started-sound: true;
     in-out property <bool> viewer-joined-sound: true;
+    in-out property <bool> mute-toggle-sound: true;
     // Notifications (phones only: ANDROID-SPEC.md D52, IOS-SPEC.md D50)
     in property <bool> notifications-available: false;
     in-out property <bool> notify-messages: true;
@@ -194,6 +195,7 @@ export global SettingsLogic {
     callback dm-sound-changed(bool);
     callback share-started-sound-changed(bool);
     callback viewer-joined-sound-changed(bool);
+    callback mute-toggle-sound-changed(bool);
     callback notify-messages-changed(bool);
     callback notify-first-join-changed(bool);
     callback show-timestamps-changed(bool);
@@ -936,6 +938,13 @@ component SoundsPanel inherits VerticalLayout {
             enabled: SettingsState.sounds-enabled;
             checked <=> SettingsState.viewer-joined-sound;
             toggled(on) => { SettingsLogic.viewer-joined-sound-changed(on); }
+        }
+        CheckRow {
+            text: Tr.sounds-mute-toggle;
+            hint: Tr.sounds-mute-toggle-hint;
+            enabled: SettingsState.sounds-enabled;
+            checked <=> SettingsState.mute-toggle-sound;
+            toggled(on) => { SettingsLogic.mute-toggle-sound-changed(on); }
         }
         CheckRow {
             text: Tr.sounds-dm;
@@ -1717,6 +1726,10 @@ export component SettingsWindow inherits Window {
     public function focus-capture() { panel.focus-capture(); }
 
     panel := SettingsPanel { }
+    TipLayer {
+        width: 100%;
+        height: 100%;
+    }
 }
 
 // Shared with the admin window (admin.slint).

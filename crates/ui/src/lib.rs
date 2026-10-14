@@ -127,9 +127,10 @@ pub mod convert {
         }
     }
 
-    /// Chat item → chat model row. Image rows get a placeholder image
-    /// here; the shell installs the decoded frame (and drives GIF frame
-    /// swaps) via `VecModel::set_row_data`.
+    /// Chat item → chat model row. An image row's picture is not in
+    /// the row: the pane asks for it (`Logic.chat-picture`) while the
+    /// row is on screen, and `image` carries only a playing GIF's
+    /// frame (the shell swaps it via `VecModel::set_row_data`).
     #[must_use]
     pub fn chat_row(item: &ChatItem, row_id: i32) -> ChatRow {
         // Every field a system row has no use for, in one place.
@@ -143,6 +144,7 @@ pub mod convert {
                 styled: false,
                 body_styled: Default::default(),
                 image: slint::Image::default(),
+                image_rev: 0,
                 img_w: 0.0,
                 img_h: 0.0,
                 row_id,
@@ -293,18 +295,29 @@ pub mod convert {
         edge
     }
 
-    /// Decode for a chat row: the returned dimensions are the
-    /// *original* image's (the row's layout box is computed from
+    /// Decode for a picture box: the returned dimensions are the
+    /// *original* image's (a chat row's layout box is computed from
     /// them), but the texture is downscaled to `max_edge` (see
-    /// [`preview_max_edge`]) — a 1280² PNG is 6.5 MB of RGBA that
-    /// would otherwise stay resident for the row's whole life just to
-    /// be drawn at 360 px. The full-resolution decode happens only
-    /// while the gallery viewer is open. PNG, JPEG and GIF only, as
-    /// [`decode_to_image`].
+    /// [`preview_max_edge`]) — a 1280² PNG is 6.5 MB of RGBA, drawn at
+    /// 360 px. The full resolution is decoded only while the gallery
+    /// viewer is open. PNG, JPEG and GIF only, as [`decode_to_image`].
     pub fn decode_to_preview(
         bytes: &[u8],
         max_edge: u32,
     ) -> Result<(slint::Image, u32, u32), app_core::images::ImageError> {
+        let (pixels, w, h) = decode_preview_pixels(bytes, max_edge)?;
+        Ok((slint::Image::from_rgba8(pixels), w, h))
+    }
+
+    /// [`decode_to_preview`]'s pixels, before they become an image: a
+    /// `SharedPixelBuffer` is `Send`, so a worker thread can decode and
+    /// hand the buffer to the UI thread, which wraps it (a chat row's
+    /// picture, `pictures.rs`). Also the original dimensions.
+    pub fn decode_preview_pixels(
+        bytes: &[u8],
+        max_edge: u32,
+    ) -> Result<(slint::SharedPixelBuffer<slint::Rgba8Pixel>, u32, u32), app_core::images::ImageError>
+    {
         let decoded = app_core::images::decode_received(bytes)?;
         let (w, h) = (decoded.width(), decoded.height());
         let rgba = if w.max(h) > max_edge {
@@ -312,7 +325,11 @@ pub mod convert {
         } else {
             decoded.into_rgba8()
         };
-        let (tw, th) = (rgba.width(), rgba.height());
-        Ok((rgba_image(rgba.as_raw(), tw, th), w, h))
+        let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+        );
+        Ok((pixels, w, h))
     }
 }

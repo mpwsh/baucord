@@ -93,18 +93,28 @@ impl ChatServer {
             user_limit: c.user_limit,
         }));
         self.apply_channel_list(channels)?;
-        for client in self.clients() {
-            self.send_channel_details(client);
+        // The same messages for everyone: built and encoded once each.
+        let mut recipients = self.clients();
+        recipients.retain(|client| self.has_feature(*client, features::CHANNELS_UI));
+        for msg in self.channel_details() {
+            self.send_to(&recipients, &msg);
         }
         Ok(())
     }
 
     /// `ChannelDetails` for every channel, to one session (after
-    /// `Init` and after every list change).
+    /// `Init`).
     pub(super) fn send_channel_details(&mut self, client: ClientId) {
         if !self.has_feature(client, features::CHANNELS_UI) {
             return;
         }
+        for msg in self.channel_details() {
+            self.send_msg(client, &msg);
+        }
+    }
+
+    /// One `ChannelDetails` per channel, as they stand.
+    fn channel_details(&self) -> Vec<ServerMessage> {
         let afk = self.afk_channel();
         let config_len = self.config.channels.len();
         let mut details = Vec::with_capacity(self.channel_list.len());
@@ -125,9 +135,7 @@ impl ChatServer {
                 is_afk: afk == Some(channel_id),
             });
         }
-        for msg in details {
-            self.send_msg(client, &msg);
-        }
+        details
     }
 
     // ── Gates at join ───────────────────────────────────────────────

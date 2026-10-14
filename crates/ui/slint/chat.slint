@@ -30,7 +30,7 @@ import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, ChatRow } from "globals.slint";
-import { IconBtn, AvatarTile, ProgressRing } from "widgets.slint";
+import { IconBtn, AvatarTile, ProgressRing, LongPress } from "widgets.slint";
 
 // ── Rows ────────────────────────────────────────────────────────────────
 //
@@ -49,6 +49,8 @@ component Gutter inherits Rectangle {
     /// A right-click on the picture: the row opens its menu there
     /// (the tile's own TouchArea would otherwise swallow it).
     callback context(x: length, y: length);
+    /// The pointer (on touch: a finger) is on the picture.
+    callback hovered(bool);
     width: Theme.chat-gutter;
     if head : tile := Rectangle {
         x: Theme.gap-sm;
@@ -78,30 +80,8 @@ component Gutter inherits Rectangle {
                     State.card-anchor-h = tile.height;
                 }
                 Logic.author-hovered(data.user, self.has-hover);
+                root.hovered(self.has-hover);
             }
-        }
-    }
-}
-
-/// Touch hosts: a finger held still on a row opens its menu, as a
-/// right-click does on the desktop. `pressing` is the row's TouchArea
-/// hover, which on touch means "a finger is down here": Slint sends an
-/// exit after every release, and a scroll taking over sends one too.
-/// `fired` holds until the finger lifts, so a release after the menu
-/// opened does not also count as a tap.
-component LongPress {
-    in property <bool> pressing;
-    out property <bool> fired: false;
-    callback long-pressed();
-    changed pressing => {
-        if (!self.pressing) { self.fired = false; }
-    }
-    Timer {
-        interval: 500ms;
-        running: State.touch-host && root.pressing && !root.fired;
-        triggered => {
-            root.fired = true;
-            root.long-pressed();
         }
     }
 }
@@ -162,10 +142,14 @@ component RowFrame inherits Rectangle {
     background: ctx.has-hover ? Theme.hover : transparent;
     animate background { duration: 100ms; }
 
+    /// A finger on the author's picture: holding it is the person's
+    /// card (as on a roster row), not the message's menu.
+    property <bool> on-avatar: false;
+
     // Under everything: a read-only body ignores right-clicks, so
     // they land here.
     lp := LongPress {
-        pressing: ctx.has-hover;
+        pressing: ctx.has-hover && !root.on-avatar;
         long-pressed => {
             root.context-menu(ctx.absolute-position.x + ctx.mouse-x,
                 ctx.absolute-position.y + ctx.mouse-y);
@@ -178,6 +162,11 @@ component RowFrame inherits Rectangle {
                     self.absolute-position.y + self.mouse-y);
             }
         }
+        // A row reused for another message, or a picture that went
+        // away under the pointer, never sends its own exit.
+        changed has-hover => {
+            if (!self.has-hover) { root.on-avatar = false; }
+        }
         Rectangle {
             if root.cozy : Gutter {
                 x: 0px;
@@ -186,6 +175,7 @@ component RowFrame inherits Rectangle {
                 data: root.data;
                 head: root.head;
                 context(x, y) => { root.context-menu(x, y); }
+                hovered(on) => { root.on-avatar = on; }
             }
             if root.header-shown : RowHeader {
                 x: root.header-x;
@@ -293,7 +283,7 @@ component MessageRow inherits RowFrame {
             default-color: Theme.text-secondary;
             default-font-size: Theme.font-body;
             link-color: Theme.accent-text;
-            link-clicked(url) => { Logic.link-clicked(url); }
+            link-clicked(url) => { if (!root.held) { Logic.link-clicked(url); } }
         }
         gone := Text {
             x: 0;
@@ -442,7 +432,7 @@ component FileRow inherits RowFrame {
                         }
                         open-t := TouchArea {
                             mouse-cursor: pointer;
-                            clicked => { Logic.file-open(root.data.row-id); }
+                            clicked => { if (!root.held) { Logic.file-open(root.data.row-id); } }
                         }
                     }
                 }
@@ -454,7 +444,7 @@ component FileRow inherits RowFrame {
                         icon-size: 14px;
                         icon: IconSet.Download;
                         tooltip: Tr.file-save-again;
-                        clicked => { Logic.file-save(root.data.row-id); }
+                        clicked => { if (!root.held) { Logic.file-save(root.data.row-id); } }
                     }
                 }
             }
@@ -480,7 +470,7 @@ component FileRow inherits RowFrame {
                     save-t := TouchArea {
                         enabled: !root.data.pending;
                         mouse-cursor: pointer;
-                        clicked => { Logic.file-save(root.data.row-id); }
+                        clicked => { if (!root.held) { Logic.file-save(root.data.row-id); } }
                     }
                 }
                 // A ring that fills with the percent: determinate,
@@ -497,7 +487,7 @@ component FileRow inherits RowFrame {
                     icon-size: 14px;
                     icon: IconSet.X;
                     tooltip: Tr.file-cancel;
-                    clicked => { Logic.file-cancel(root.data.row-id); }
+                    clicked => { if (!root.held) { Logic.file-cancel(root.data.row-id); } }
                 }
                 // Measured off-screen so the slot keeps its width
                 // whichever face shows.
@@ -644,11 +634,19 @@ component ImageRow inherits RowFrame {
                 border-radius: Theme.radius-md;
                 background: Theme.surface;
                 clip: true;
+                // A playing GIF's frame, or the picture as the host
+                // decoded it for this row (only rows on screen are
+                // built, so only they hold pixels). One decoded while
+                // the row shows fades in over its empty frame; one
+                // already decoded is simply there.
                 Image {
                     width: 100%;
                     height: 100%;
-                    source: root.data.image;
+                    source: root.data.image.width > 0 ? root.data.image
+                        : Logic.chat-picture(root.data.row-id, root.data.image-rev);
                     image-fit: contain;
+                    opacity: self.source.width > 0 ? 1 : 0;
+                    animate opacity { duration: 120ms; }
                 }
                 // On its way up: muted, with the ring, the percent
                 // and a ✕ over the picture (the file card's look).
@@ -679,7 +677,7 @@ component ImageRow inherits RowFrame {
                                     icon-size: 14px;
                                     icon: IconSet.X;
                                     tooltip: Tr.file-cancel;
-                                    clicked => { Logic.file-cancel(root.data.row-id); }
+                                    clicked => { if (!root.held) { Logic.file-cancel(root.data.row-id); } }
                                 }
                             }
                         }

@@ -27,7 +27,7 @@ import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, UserRow } from "globals.slint";
-import { IconBtn, Btn, AvatarTile, RoleGlyph } from "widgets.slint";
+import { IconBtn, Btn, AvatarTile, RoleGlyph, Tip, LongPress } from "widgets.slint";
 
 component UserRowView inherits Rectangle {
     in property <UserRow> user;
@@ -58,6 +58,18 @@ component UserRowView inherits Rectangle {
             touch.absolute-position.y + touch.mouse-y);
     }
 
+    // On touch a held finger is the right-click: a channel's menu (no
+    // other way to reach it there). A person's card is already up by
+    // then — the hover's dwell — and stays the answer: the release
+    // opens nothing.
+    lp := LongPress {
+        pressing: touch.has-hover;
+        long-pressed => {
+            if (user.is-channel) {
+                root.open-menu();
+            }
+        }
+    }
     touch := TouchArea {
         mouse-cursor: (user.is-channel && !user.is-our-channel) || (!user.is-channel && !user.is-us)
             ? MouseCursor.pointer : MouseCursor.default;
@@ -67,6 +79,10 @@ component UserRowView inherits Rectangle {
             }
         }
         clicked => {
+            // The release of a long press is not a tap.
+            if (lp.fired) {
+                return;
+            }
             if (user.is-channel) {
                 if (!user.is-our-channel) { Logic.channel-clicked(user.channel-id); }
             } else if (!user.is-us) {
@@ -242,7 +258,11 @@ component UserRowView inherits Rectangle {
             live-t := TouchArea {
                 enabled: !user.is-us;
                 mouse-cursor: MouseCursor.pointer;
-                clicked => { Logic.watch-user(root.index); }
+                clicked => {
+                    if (!lp.fired) {
+                        Logic.watch-user(root.index);
+                    }
+                }
             }
         }
         // Pure affordance — clicks land on the row's own TouchArea.
@@ -292,24 +312,24 @@ component ChipButton inherits Rectangle {
             vertical-alignment: center;
         }
     }
+    // The word as a tip, through the window's tip layer, when the chip
+    // shows the icon alone.
+    function post-tip() {
+        if (chip-t.has-hover && !root.show-text) {
+            Tip.show(root.text, self.absolute-position.x, self.absolute-position.y,
+                self.width, self.height, true);
+        } else {
+            Tip.hide(root.text);
+        }
+    }
+    changed show-text => { root.post-tip(); }
     chip-t := TouchArea {
         mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-    if !root.show-text && chip-t.has-hover : Rectangle {
-        y: root.height + 6px;
-        x: root.width - self.width;
-        height: 22px;
-        width: tip.preferred-width + 16px;
-        border-radius: Theme.radius-sm;
-        background: Theme.surface;
-        border-width: 1px;
-        border-color: Theme.border;
-        tip := Text {
-            text: root.text;
-            color: Theme.text-secondary;
-            font-size: Theme.font-sm;
+        clicked => {
+            Tip.hide(root.text);
+            root.clicked();
         }
+        changed has-hover => { root.post-tip(); }
     }
 }
 

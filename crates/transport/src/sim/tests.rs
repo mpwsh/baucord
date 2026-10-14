@@ -968,6 +968,41 @@ fn a_waiting_room_holds_the_unadmitted_and_no_more() {
     assert_eq!(net.driver(server).peer_count(), 5);
 }
 
+/// A connection whose handshake never finishes gives its seat back
+/// after the handshake deadline, not after quinn's 30 s idle timeout.
+#[test]
+fn a_handshake_that_never_finishes_leaves_the_waiting_room() {
+    init_log();
+    let identity = ServerIdentity::generate();
+    let server_driver = Driver::new_server(&identity, 1, Budget::server())
+        .expect("server driver")
+        .with_waiting_room(WaitingRoom {
+            seats: 4,
+            per_address: 2,
+        });
+    let mut net = SimNet::new(23);
+    let server = net.add_node(server_driver, addr(SERVER_ADDR));
+    let node = net.add_node(
+        Driver::new_client(Some(identity.fingerprint()), Budget::client()).expect("client"),
+        addr("10.0.0.9:5000"),
+    );
+    // The client's first packets arrive; nothing comes back to it.
+    net.set_link_one_way(node, server, LinkSpec::clean(Duration::from_millis(10)));
+    let mut blackhole = LinkSpec::clean(Duration::from_millis(10));
+    blackhole.loss = 1.0;
+    net.set_link_one_way(server, node, blackhole);
+    let now = net.now();
+    net.driver(node)
+        .connect(now, addr(SERVER_ADDR))
+        .expect("connect");
+    net.run_for(Duration::from_secs(1), TICK);
+    assert_eq!(net.driver(server).peer_count(), 1, "the seat is taken");
+    let freed = net.run_until(Duration::from_secs(12), TICK, |net| {
+        net.driver(server).peer_count() == 0
+    });
+    assert!(freed, "the half-open connection kept its seat");
+}
+
 #[test]
 fn close_after_delivers_the_last_frame_first() {
     let mut p = pair(16, LinkSpec::clean(Duration::from_millis(20)));

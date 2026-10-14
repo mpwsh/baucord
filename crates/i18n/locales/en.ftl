@@ -170,6 +170,11 @@ unknown-device = unknown device
 # ── Tray & viewer ───────────────────────────────────────────────────────
 tray-show = Show
 tray-quit = Quit
+tray-tip-muted = baucord — muted
+tray-tip-deafened = baucord — deafened
+# In the tray's menu, under the voice room's name: muting is for you alone.
+tray-mute-person = Mute { $name }
+tray-unmute-person = Unmute { $name }
 viewer-title = { $name }'s screen ({ $width }x{ $height })
 stop-watching = Stop Watching
 viewer-stats = { $res } { $fps }fps { $kbps }KB/s { $mb }MB | buf { $depth }/{ $target }ms jit { $jitter }ms
@@ -503,6 +508,8 @@ sounds-lead = Which events play a sound.
 sounds-share-started = Someone in your channel starts sharing
 sounds-viewer-joined = Someone starts watching your stream
 sounds-viewer-joined-hint = Softer, and only you hear it.
+sounds-mute-toggle = You mute or deafen yourself
+sounds-mute-toggle-hint = A soft note: lower going quiet, higher coming back.
 sounds-enabled = Enable sounds
 sounds-enabled-hint = Off silences all sounds.
 sounds-join-leave = Someone joins or leaves your channel

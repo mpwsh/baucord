@@ -624,7 +624,7 @@ impl AppState {
         self.chat_model.remove(index);
         if let Some(old) = old {
             self.gifs.remove(&old.row_id);
-            self.images.remove(&old.row_id);
+            crate::pictures::remove(old.row_id);
         }
     }
 
@@ -639,9 +639,9 @@ impl AppState {
         let mut row = ui::convert::chat_row(&self.history.rows()[index], row_id);
         row.continuation = self.history.is_continuation(index);
         // An image row rebuilt in place keeps its row id and picture:
-        // the texture is installed once by `push_image_row`, and the
-        // `images`/`gifs` maps are keyed by that id. A fresh id here
-        // orphaned the GIF player and blanked the picture.
+        // the bytes are registered once by `push_image_row`, and the
+        // pictures and GIF players are keyed by that id. A fresh id
+        // here orphaned the GIF player and blanked the picture.
         if row.kind == 2
             && let Some(old) = self.chat_model.row_data(index)
             && old.kind == 2
@@ -650,6 +650,7 @@ impl AppState {
         {
             row.row_id = old.row_id;
             row.image = old.image;
+            row.image_rev = old.image_rev;
         }
         if row.kind == 5 || row.kind == 2 {
             if let Some(id) = self.history.rows()[index].message_id()

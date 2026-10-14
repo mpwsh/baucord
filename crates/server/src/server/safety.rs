@@ -18,7 +18,7 @@
 //!   one difference: the last admin is told to hand over first.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -35,8 +35,13 @@ use crate::persistence::{
     Answer, AuditRow, Command, ConvKey, MessageRow, Outcome, Query, ReportRow, ReportedMessage,
 };
 
-/// Most people one account may block (bounds memory and the list).
-const MAX_BLOCKS: usize = 1000;
+/// Most people one account may block: as many as fit the one `Blocks`
+/// message with every name at its longest (32 + 1 + 32 bytes a row
+/// under the 16 KiB list budget is 252). It was 1,000, and past about
+/// 270 the list no longer fitted and never arrived — the client then
+/// showed every blocked person again. The test below holds the two
+/// together.
+const MAX_BLOCKS: usize = 250;
 /// Block or unblock changes one account may make per [`BLOCK_WINDOW`]:
 /// each is a write, an enforcement pass and the list to every device.
 const MAX_BLOCK_CHANGES_PER_WINDOW: usize = 30;
@@ -127,6 +132,18 @@ impl ChatServer {
             })
             .collect();
         list.sort_by_key(|b| b.name.to_lowercase());
+        // An account that blocked more than fits before the cap came
+        // down (or a name longer than names are now) still gets a list:
+        // the part that fits, rather than none at all. The server's
+        // own enforcement keeps the whole set.
+        let dropped = protocol::keep_prefix_that_fits(&mut list, protocol::LIST_ITEMS_BUDGET);
+        if dropped > 0 {
+            warn!(
+                "block list of {} cut to the {} that fit one message ({dropped} left out)",
+                hex(&user[..8]),
+                list.len()
+            );
+        }
         list
     }
 
@@ -145,9 +162,8 @@ impl ChatServer {
         let msg = ServerMessage::Blocks {
             users: self.blocks_of(user),
         };
-        for session in self.sessions_of(user) {
-            self.send_msg(session, &msg);
-        }
+        let recipients = self.sessions_of(user);
+        self.send_to(&recipients, &msg);
     }
 
     /// Whether either of two users blocked the other: no DMs then.
@@ -180,12 +196,20 @@ impl ChatServer {
         if self.policy.blocks.is_empty() {
             return pairs;
         }
+        // Who is online as whom, once: then each receiver looks up only
+        // the people it blocked. Walking every session for every
+        // receiver was O(sessions²) on every connect (65,536 steps at
+        // 256 sessions) once anyone had a block.
+        let mut sessions_of: HashMap<&UserId, Vec<ClientId>> = HashMap::new();
+        for (client, user) in &self.user_of {
+            sessions_of.entry(user).or_default().push(*client);
+        }
         for (receiver, receiver_user) in &self.user_of {
             let Some(blocked) = self.policy.blocks.get(receiver_user) else {
                 continue;
             };
-            for (sender, sender_user) in &self.user_of {
-                if blocked.contains(sender_user) {
+            for blocked_user in blocked {
+                for sender in sessions_of.get(blocked_user).into_iter().flatten() {
                     pairs.insert((*sender, *receiver));
                 }
             }
@@ -435,9 +459,7 @@ impl ChatServer {
             })
             .map(|(c, _)| *c)
             .collect();
-        for peer in readers {
-            self.send_msg(peer, &line);
-        }
+        self.send_to(&readers, &line);
         self.persist.send(Command::InsertReport(Box::new(report)));
         self.answer_report(client, Ok(()));
     }
@@ -659,6 +681,22 @@ pub(super) fn log_safe_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_block_list_fits_one_message() {
+        let users = (0..MAX_BLOCKS)
+            .map(|i| BlockedUser {
+                user_id: [u8::try_from(i % 256).unwrap_or(0); 32],
+                name: "x".repeat(protocol::MAX_USERNAME_BYTES),
+            })
+            .collect();
+        let msg = ServerMessage::Blocks { users };
+        let len = protocol::encode_server_message(&msg).map_or(usize::MAX, |b| b.len());
+        assert!(
+            len <= protocol::MAX_CONTROL_MESSAGE_BYTES,
+            "{MAX_BLOCKS} blocks at the longest names are {len} bytes"
+        );
+    }
 
     #[test]
     fn an_accounts_logs_go_and_nobody_elses() {

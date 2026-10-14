@@ -14,6 +14,7 @@ pub mod host;
 pub mod media;
 /// What the app asks a phone's notification system for (`host::notify`).
 pub mod notice;
+pub mod pictures;
 pub mod present;
 pub mod resources;
 pub mod settingsui;

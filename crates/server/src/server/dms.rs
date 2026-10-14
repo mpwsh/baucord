@@ -231,9 +231,7 @@ impl ChatServer {
         };
         let sessions = self.sessions_of(to);
         self.introduce_author(sender, from, &sessions);
-        for session in sessions {
-            self.send_msg(session, &direct);
-        }
+        self.send_to(&sessions, &direct);
     }
 
     fn fail_dm(&mut self, client: ClientId, client_ref: u32, reason: DmFailReason) {

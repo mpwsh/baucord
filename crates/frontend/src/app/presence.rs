@@ -24,7 +24,7 @@ impl AppState {
         // rebuild-the-main-view path.
         self.history.clear();
         self.chat_model.set_vec(Vec::new());
-        self.images.clear();
+        crate::pictures::clear();
         self.gifs.clear();
         self.reset_chat_flow();
 
@@ -261,6 +261,13 @@ impl AppState {
     /// In a voice room: a session, and a room in it that carries voice.
     pub(super) fn in_voice_room(&self) -> bool {
         self.session.our_client_id.is_some() && !self.out_of_voice()
+    }
+
+    /// The tray's icon and menu, after anything they show may have
+    /// moved (the desktop with the `tray` feature; nothing elsewhere).
+    pub(super) fn sync_tray(&self) {
+        #[cfg(feature = "tray")]
+        super::tray::sync(self);
     }
 
     /// The channel we are currently in, per server echo.

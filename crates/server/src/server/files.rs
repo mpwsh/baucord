@@ -110,24 +110,22 @@ impl ChatServer {
             .get(&user)
             .filter(|d| d.day == today)
             .map_or(0, |d| d.bytes);
-        if !permissions::has(
+        let bypass = permissions::has(
             self.effective_permissions(&user),
             permissions::BYPASS_LIMITS,
-        ) && used + u64::from(size) > allowance
-        {
+        );
+        if !bypass && used + u64::from(size) > allowance {
             return Err(UploadRejectReason::Quota);
+        }
+        // The same sliding-minute transfer budget the chat-image relay
+        // keeps: per client and server-wide. Checked before the store
+        // makes room, so a refusal here evicts nothing. It is not the
+        // day's allowance (`Quota` says that), so it answers `Refused`.
+        if !bypass && !self.allow_image(client, usize::try_from(size).unwrap_or(usize::MAX)) {
+            return Err(UploadRejectReason::Refused);
         }
         if !self.make_room_for(u64::from(size)) {
             return Err(UploadRejectReason::Full);
-        }
-        // The same sliding-minute transfer budget the chat-image relay
-        // keeps: per client and server-wide.
-        if !permissions::has(
-            self.effective_permissions(&user),
-            permissions::BYPASS_LIMITS,
-        ) && !self.allow_image(client, usize::try_from(size).unwrap_or(usize::MAX))
-        {
-            return Err(UploadRejectReason::Quota);
         }
         Ok(())
     }
@@ -366,13 +364,11 @@ impl ChatServer {
             None => self.audience_of(&from),
         };
         self.introduce_author(msg.client_id, &from, &targets);
-        for peer in targets {
-            if self.has_feature(peer, features::FILES) {
-                self.send_msg(peer, &rich);
-            } else {
-                self.send_msg(peer, &plain);
-            }
-        }
+        let (rich_to, plain_to): (Vec<ClientId>, Vec<ClientId>) = targets
+            .into_iter()
+            .partition(|peer| self.has_feature(*peer, features::FILES));
+        self.send_to(&rich_to, &rich);
+        self.send_to(&plain_to, &plain);
     }
 
     /// The attachments of a history page, for a session with the bit,

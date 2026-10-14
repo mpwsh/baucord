@@ -9,9 +9,9 @@
 //! control messages and cached only where the media path needs it
 //! (the relay's `muted` set).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use log::info;
+use log::{info, warn};
 use protocol::{
     admin::{
         AdminCommand, AdminError, AdminOutcome, AdminTarget, InviteSummary, KeySummary,
@@ -152,9 +152,8 @@ impl ChatServer {
                 && r.kind != RestrictionKind::Server
             {
                 let msg = ServerMessage::RestrictionLifted { kind: r.kind };
-                for client in self.sessions_of(&user) {
-                    self.send_msg(client, &msg);
-                }
+                let recipients = self.sessions_of(&user);
+                self.send_to(&recipients, &msg);
             }
         }
         self.refresh_enforcement();
@@ -239,9 +238,8 @@ impl ChatServer {
             .map(|(c, u)| (*c, self.user_details(*c, u)))
             .collect();
         for (subject, msg) in details {
-            for peer in self.audience_about(subject) {
-                self.send_msg(peer, &msg);
-            }
+            let recipients = self.audience_about(subject);
+            self.send_to(&recipients, &msg);
         }
         // A session whose own permission set moved hears it, so its
         // gates follow a `server user grant` without a reconnect.
@@ -267,8 +265,64 @@ impl ChatServer {
         // The table itself, when it changed (`server role`).
         if old.roles != self.policy.roles {
             let roles = self.role_list();
-            for peer in self.clients() {
-                self.send_msg(peer, &roles);
+            let recipients = self.clients();
+            self.send_to(&recipients, &roles);
+        }
+        self.announce_reloaded_restrictions(&old.restrictions);
+        // The UI channels, when another process changed one (`server
+        // role delete` clears a channel's `min_role`): the list, the
+        // gates and every client's `ChannelDetails` follow, as after a
+        // change from the panel. Before, only the policy's copy moved
+        // and the gates kept the old rule until a restart.
+        if old.channels != self.policy.channels
+            && let Err(e) = self.rebuild_channel_list()
+        {
+            warn!("policy reload: the channel list did not rebuild: {e}");
+        }
+    }
+
+    /// Tell each person a restriction the other process added or lifted
+    /// (`server user mute`, `server restriction lift`): their client
+    /// learns a mute only from `Restricted`, so a CLI mute silenced
+    /// them without a word, and a lift left them showing muted. Bans
+    /// (`server` restrictions) are handled above, by closing sessions.
+    fn announce_reloaded_restrictions(&mut self, old: &[Restriction]) {
+        let ids = |list: &[Restriction]| list.iter().map(|r| r.id).collect::<HashSet<u64>>();
+        let (before, after) = (ids(old), ids(&self.policy.restrictions));
+        let added: Vec<Restriction> = self
+            .policy
+            .restrictions
+            .iter()
+            .filter(|r| r.kind != RestrictionKind::Server && !before.contains(&r.id))
+            .cloned()
+            .collect();
+        let lifted: Vec<Restriction> = old
+            .iter()
+            .filter(|r| r.kind != RestrictionKind::Server && !after.contains(&r.id))
+            .cloned()
+            .collect();
+        for r in added {
+            let Some(user) = r.user_id else { continue };
+            let msg = ServerMessage::Restricted {
+                kind: r.kind,
+                until: r.until,
+                reason: r.reason,
+            };
+            let recipients = self.sessions_of(&user);
+            self.send_to(&recipients, &msg);
+        }
+        for r in lifted {
+            let Some(user) = r.user_id else { continue };
+            // Another restriction of the same kind may still hold.
+            let still = self
+                .policy
+                .restrictions
+                .iter()
+                .any(|other| other.kind == r.kind && other.user_id == Some(user));
+            if !still {
+                let msg = ServerMessage::RestrictionLifted { kind: r.kind };
+                let recipients = self.sessions_of(&user);
+                self.send_to(&recipients, &msg);
             }
         }
     }
@@ -1034,9 +1088,8 @@ impl ChatServer {
             };
             self.send_msg(*client, &session);
             let details = self.user_details(*client, user_id);
-            for peer in self.audience_about(*client) {
-                self.send_msg(peer, &details);
-            }
+            let recipients = self.audience_about(*client);
+            self.send_to(&recipients, &details);
         }
     }
 
@@ -1052,6 +1105,22 @@ impl ChatServer {
     }
 
     fn list_users(&self) -> Vec<UserSummary> {
+        // Sessions and keys by user, once: looked up per user they were
+        // a pass over every session and every key for each of the
+        // users, about two million steps on the tick for a panel open
+        // at 1,000 users.
+        let mut session_of: HashMap<&UserId, ClientId> = HashMap::new();
+        for (client, user) in &self.user_of {
+            session_of.entry(user).or_insert(*client);
+        }
+        let mut keys_of: HashMap<UserId, Vec<KeySummary>> = HashMap::new();
+        for (hash, k) in &self.policy.keys {
+            keys_of.entry(k.user_id).or_default().push(KeySummary {
+                key_hash: *hash,
+                retired: k.retired_at.is_some(),
+                last_seen: k.last_seen,
+            });
+        }
         let mut users: Vec<UserSummary> = self
             .policy
             .users
@@ -1060,19 +1129,9 @@ impl ChatServer {
                 user_id: *id,
                 name: u.name.clone(),
                 roles: u.roles.iter().copied().collect(),
-                client_id: self.sessions_of(id).first().copied(),
+                client_id: session_of.get(id).copied(),
                 last_seen: u.last_seen,
-                keys: self
-                    .policy
-                    .keys
-                    .iter()
-                    .filter(|(_, k)| k.user_id == *id)
-                    .map(|(hash, k)| KeySummary {
-                        key_hash: *hash,
-                        retired: k.retired_at.is_some(),
-                        last_seen: k.last_seen,
-                    })
-                    .collect(),
+                keys: keys_of.remove(id).unwrap_or_default(),
             })
             .collect();
         users.sort_by(|a, b| {

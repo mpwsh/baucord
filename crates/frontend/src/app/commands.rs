@@ -688,7 +688,10 @@ impl AppState {
             )
     }
 
-    pub(crate) fn send_admin(&mut self, command: AdminCommand, then: PendingAdmin) {
+    pub(crate) fn send_admin(&mut self, mut command: AdminCommand, then: PendingAdmin) {
+        // What the server keeps of a reason (it cuts the same way); a
+        // longer one could not even be sent as one message.
+        command.clip_reason();
         // A printed answer lands in the conversation shown when it was
         // asked for — a menu pick as much as a typed command.
         let request_id = self.next_request_id;

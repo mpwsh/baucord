@@ -579,10 +579,13 @@ ServerMessage::Blob… on a Media stream (existing paced relay), sha verified by
   `ImageMessage` relay) and refuses other files; nothing is stored.
 - **Caps, server-enforced:** `files.max_mb` (50) per file,
   `per_user_daily_mb` (500), `total_cap_gb` (20; oldest unreferenced
-  blobs evicted first, then a hard refusal). These replace the 1.0
-  per-minute image budgets: images are files, the same quota applies,
-  and the paced relay still bounds the instantaneous rate. Guests: no
-  `UPLOAD`.
+  blobs evicted first, then a hard refusal), and the per-minute
+  transfer budget (`limits.max_transfer_kb_per_minute[_global]`) on top:
+  a minute with nothing in it takes any one upload whole, and the next
+  waits until those bytes leave the window — a file larger than the
+  budget used to be refused for good, as "today's allowance" (review
+  2026-10-14 SRV-1). A refusal by the budget is `Refused`, not `Quota`.
+  The paced relay bounds the instantaneous rate. Guests: no `UPLOAD`.
 - **What is stored:** bytes on disk by hash, metadata in `blobs`. The
   server sniffs the first bytes and stores *its* MIME next to the
   declared one; the card shows the sniffed type. Filenames are
@@ -972,7 +975,9 @@ voice unaffected, writes counted as dropped".
   (PRODUCTION-PLAN MOB-4, MOB-14).
   - *Block* is per account, on every device of it, until undone:
     `Block`/`Unblock { user }` → the whole list back as `Blocks`
-    (also on join, after `RoleList`), at most 1,000. The relay skips
+    (also on join, after `RoleList`), at most 250 — what fits that
+    one message at the longest names (it was 1,000, and past about
+    270 the list stopped arriving; review 2026-10-14 SRV-4). The relay skips
     the blocked person's voice to the blocker's sessions
     (`blocked_pairs`, recomputed with the rest of enforcement); DMs
     and files between the two are refused both ways with
@@ -1083,7 +1088,7 @@ sees only its own uplink, and when the relay's outbound link saturates
 every viewer goes behind at once and nobody slows down. `max_sharers`
 (8) and `max_viewers_per_stream` (16) are the operator's blunt cap on
 that multiplication; `BYPASS_LIMITS` lifts them for admins. The
-per-minute image budgets are gone (files quotas cover them). The right
+per-minute transfer budget limits uploads, not the relay's egress. The right
 replacement, later, is an egress budget — `limits.relay_egress_mbit` —
 against which the relay refuses new subscriptions and asks the busiest
 sharer to step a rung down; that needs relay-side rung control the

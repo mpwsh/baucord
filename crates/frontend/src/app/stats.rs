@@ -166,32 +166,25 @@ impl AppState {
             .or_else(|| self.usage.resident())
             .map_or_else(|| "?".to_string(), |b| format!("{:.0} MB", mb(b as usize)));
 
-        // Chat rows and their pictures, over every conversation.
-        let mut rows = self.chat_model.row_count();
-        let mut preview_bytes = 0usize;
-        let mut preview_count = 0usize;
-        for i in 0..self.chat_model.row_count() {
-            if let Some(row) = self.chat_model.row_data(i)
-                && row.kind == 2
-            {
-                preview_count += 1;
-                preview_bytes += texture(&row.image);
-            }
-        }
-        let mut parked_rows = 0usize;
-        for conv in self.session.chat.parked.values() {
-            parked_rows += conv.model.row_count();
-            for i in 0..conv.model.row_count() {
-                if let Some(row) = conv.model.row_data(i)
-                    && row.kind == 2
-                {
-                    preview_count += 1;
-                    preview_bytes += texture(&row.image);
-                }
-            }
-        }
-        rows += parked_rows;
-        let compressed: usize = self.images.values().map(|e| e.bytes.len()).sum();
+        // Chat rows over every conversation; their pictures are in the
+        // store (wire bytes, and previews of those recently on screen)
+        // but for a playing GIF's frame, which its row holds.
+        let parked_rows: usize = self
+            .session
+            .chat
+            .parked
+            .values()
+            .map(|conv| conv.model.row_count())
+            .sum();
+        let rows = self.chat_model.row_count() + parked_rows;
+        let frame_bytes: usize = self
+            .chat_model
+            .iter()
+            .filter(|row| row.kind == 2)
+            .map(|row| texture(&row.image))
+            .sum();
+        let (picture_count, compressed, preview_count, preview_bytes) = crate::pictures::stats();
+        let preview_bytes = preview_bytes + frame_bytes;
         let gifs_playing = self.gifs.values().filter(|g| g.playing()).count();
         let avatars: usize = self.avatar_images.values().map(texture).sum();
         let own_avatar = self.own_avatar.as_ref().map_or(0, texture);
@@ -200,7 +193,8 @@ impl AppState {
         format!(
             "Memory — process {rss}\n\
              chat: {rows} rows ({parked_rows} parked in {} conversations), \
-             {preview_count} pictures: {:.1} MB of previews, {:.1} MB compressed, \
+             {picture_count} pictures: {preview_count} decoded, {:.1} MB, \
+             {:.1} MB compressed, \
              {} GIF players ({gifs_playing} playing)\n\
              avatars: {} decoded, {:.1} MB (+{:.1} MB ours)\n\
              roster: {} users, {} profiles; {viewers} stream viewers open",

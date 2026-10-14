@@ -11,5 +11,4 @@ workspace = true
 [dependencies]
 bytes.workspace = true
 serde = { version = "1", features = ["derive"] }
-log = "0.4"
 postcard = { version = "1", features = ["use-std"] }

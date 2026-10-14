@@ -225,6 +225,7 @@ impl AppState {
         s.set_resource_line(" ".into());
         s.set_users_count_label(t!("users-count", "count" => 0u32).into());
         self.users_model.set_vec(Vec::new());
+        self.sync_tray();
     }
 
     /// Transfers end with the session: nothing more arrives for them.
@@ -289,6 +290,22 @@ impl AppState {
             return;
         }
         self.set_muted(!self.session.is_muted);
+        self.toggle_tone(self.session.is_muted);
+    }
+
+    /// The soft note for our own mute or deafen, from wherever it was
+    /// toggled (the button, a keybind, the tray, a stream's bar): lower
+    /// going quiet, higher coming back. It plays where the room plays —
+    /// a phone in the lobby has no playback and stays silent.
+    fn toggle_tone(&self, quiet: bool) {
+        if self.settings.sounds.mute_toggle_on() {
+            let sound = if quiet {
+                SoundType::WentQuiet
+            } else {
+                SoundType::BackLive
+            };
+            self.voice.tx.send(VoiceControl::PlaySound(sound)).ok();
+        }
     }
 
     /// Set the mute state and tell the voice thread, the server and
@@ -336,6 +353,7 @@ impl AppState {
             .set_deafened(self.session.is_deafened);
         self.push_self_audio();
         self.update_user_list();
+        self.toggle_tone(self.session.is_deafened);
     }
 
     pub(super) fn handle_toggle_screenshare(&mut self) {

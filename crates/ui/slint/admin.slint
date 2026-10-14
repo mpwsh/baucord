@@ -10,7 +10,7 @@ import { ScrollView } from "std-widgets.slint";
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { Btn, IconBtn, Field, FieldLabel, Hint, Sep, Dropdown, CheckRow, RoleGlyph } from "widgets.slint";
+import { Btn, IconBtn, Field, FieldLabel, Hint, Sep, Dropdown, CheckRow, RoleGlyph, TipLayer } from "widgets.slint";
 import { NavItem, PanelHeader } from "settings.slint";
 
 export struct AdminUserRow {
@@ -890,5 +890,9 @@ export component AdminWindow inherits Window {
                 }
             }
         }
+    }
+    TipLayer {
+        width: 100%;
+        height: 100%;
     }
 }

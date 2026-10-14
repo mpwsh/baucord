@@ -67,6 +67,9 @@ pub struct VoiceRelay {
 #[derive(Clone, Copy)]
 pub struct Room<'a> {
     pub clients: &'a [ClientId],
+    /// Who is in each channel (admitted sessions only), so a packet is
+    /// offered to its room and not to every session.
+    pub members: &'a HashMap<u16, Vec<ClientId>>,
     /// The admitted peers with something to read this tick
     /// ([`Driver::readable`]): the only ones worth asking for voice.
     pub senders: &'a [ClientId],
@@ -114,6 +117,7 @@ impl VoiceRelay {
     pub fn process(&mut self, driver: &mut Driver, now: Instant, room: &Room<'_>) {
         let Room {
             clients,
+            members,
             senders,
             deafened,
             muted,
@@ -157,14 +161,15 @@ impl VoiceRelay {
                 // same bytes.
                 let envelope = Shared::relayed(Lane::Voice, *sender, &message);
                 let mut sent = 0u64;
-                for recipient in clients {
+                // Only the speaker's room; a sender in no channel
+                // reaches nobody (fail closed).
+                let room_members: &[ClientId] = sender_channel
+                    .and_then(|ch| members.get(&ch))
+                    .map_or(&[], Vec::as_slice);
+                self.stats.sends_skipped_other_channel +=
+                    clients.len().saturating_sub(room_members.len().max(1)) as u64;
+                for recipient in room_members {
                     if recipient == sender {
-                        continue;
-                    }
-                    if sender_channel.is_none()
-                        || channel_of.get(recipient).copied() != sender_channel
-                    {
-                        self.stats.sends_skipped_other_channel += 1;
                         continue;
                     }
                     if deafened.contains(recipient) {

@@ -113,7 +113,12 @@ export struct ChatRow {
     body: string,        // message text / system text / code (kind 3)
     styled: bool,        // kind 0 — body carries *bold*/_italic_/`code` markup
     body-styled: styled-text, // kind 0 when styled — pre-parsed by the shell
-    image: image,        // kind 2 — current frame (Rust swaps for GIFs)
+    image: image,        // kind 2 — a playing GIF's frame; empty otherwise
+    /// kind 2 — the picture itself is not in the row (a row would keep
+    /// it for its whole life): the pane asks `Logic.chat-picture` for
+    /// it while the row is on screen, and the host bumps this when a
+    /// picture asked for is ready.
+    image-rev: int,
     img-w: float,        // native px, for aspect layout
     img-h: float,
     row-id: int,         // stable id for gif hover/click callbacks
@@ -543,6 +548,10 @@ export global Logic {
     callback paste-rich();                // Ctrl/Cmd+V — host runs the paste chain
     callback link-clicked(string);
     callback row-open-image(int);
+    /// Row `row-id`'s picture, as decoded for the screen: empty until
+    /// it is ready (the host then bumps the row's `image-rev`, which is
+    /// here only so the pane asks again).
+    pure callback chat-picture(row-id: int, rev: int) -> image;
     callback edit-cancel();
     callback load-earlier();
     callback confirm-accept();

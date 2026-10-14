@@ -1702,10 +1702,12 @@ impl ServerMessage {
 //
 // Length discipline lives here so client and server can't drift:
 // pre-decode, anything over MAX_CONTROL_MESSAGE_BYTES is dropped unread
-// (bounding the worst transient allocation); post-decode, upload chunks
-// must also carry at most one IMAGE_CHUNK_BYTES chunk. Encode applies
-// the same caps so a buggy caller fails locally instead of poisoning
-// the wire.
+// (bounding the worst transient allocation); post-decode, chat-image
+// and log chunks must also carry at most one IMAGE_CHUNK_BYTES chunk.
+// Blob chunks (`UploadChunk`, `BlobChunk`) have only the message cap
+// here; their reassembly bounds the running total. Encode applies the
+// same caps so a buggy caller fails locally instead of poisoning the
+// wire.
 
 /// A message enum on the wire: what the one codec below needs to know
 /// about a direction.
@@ -1790,7 +1792,13 @@ pub fn decode_server_message(bytes: &[u8]) -> Option<ServerMessage> {
 
 /// The encoded size of one list item; `usize::MAX` if it cannot encode.
 fn item_len<T: Serialize>(item: &T) -> usize {
-    postcard::to_allocvec(item).map_or(usize::MAX, |bytes| bytes.len())
+    // Counted, not written: a page of a few hundred rows was encoded
+    // row by row into throwaway buffers just to measure them.
+    postcard::serialize_with_flavor::<T, postcard::ser_flavors::Size, usize>(
+        item,
+        postcard::ser_flavors::Size::default(),
+    )
+    .unwrap_or(usize::MAX)
 }
 
 /// Keep the longest prefix of `items` whose encoding fits `budget`

@@ -21,6 +21,12 @@ use crate::{
 
 /// How long the panel waits for the audit read.
 const AUDIT_DEADLINE: Duration = Duration::from_secs(2);
+/// Most roles a server holds, built-in ones included. Every session
+/// gets the whole list as one `RoleList`, which a few hundred roles
+/// would push past the 17 KiB a message may be — and then nobody gets
+/// roles at all. A hundred at the longest names is under half of it
+/// (the test below).
+const MAX_ROLES: usize = 100;
 
 impl ChatServer {
     /// `AuditLog`: ask the store; the answer goes out as the command's
@@ -299,6 +305,11 @@ impl ChatServer {
         icon: &str,
         color: u32,
     ) -> Result<AdminOutcome, AdminError> {
+        if self.policy.roles.len() >= MAX_ROLES {
+            return Err(AdminError::Invalid(format!(
+                "a server has at most {MAX_ROLES} roles"
+            )));
+        }
         let rank = self.check_role_for(actor, name, perms, icon, None)?;
         let id = self.policy.roles.keys().max().map_or(1, |m| m + 1);
         self.policy.roles.insert(
@@ -468,9 +479,8 @@ impl ChatServer {
     /// The table to every session that reads it.
     fn broadcast_roles(&mut self) {
         let roles = self.role_list();
-        for peer in self.clients() {
-            self.send_msg(peer, &roles);
-        }
+        let recipients = self.clients();
+        self.send_to(&recipients, &roles);
     }
 }
 
@@ -488,6 +498,31 @@ fn short_id(target: &str) -> Option<[u8; 8]> {
         *byte = u8::try_from(high * 16 + low).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod role_list_tests {
+    use protocol::{RoleInfo, ServerMessage};
+
+    use super::MAX_ROLES;
+
+    #[test]
+    fn the_most_roles_fit_one_role_list() {
+        let roles = (0..MAX_ROLES)
+            .map(|i| RoleInfo {
+                id: u32::MAX - u32::try_from(i).unwrap_or(0),
+                name: "r".repeat(32),
+                rank: u16::MAX,
+                permissions: u64::MAX,
+                builtin: false,
+                icon: "gamepad".into(),
+                color: u32::MAX,
+            })
+            .collect();
+        let len = protocol::encode_server_message(&ServerMessage::RoleList { roles })
+            .map_or(usize::MAX, |b| b.len());
+        assert!(len <= protocol::LIST_ITEMS_BUDGET, "{len} bytes");
+    }
 }
 
 #[cfg(test)]

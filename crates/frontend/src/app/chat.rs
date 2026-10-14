@@ -157,7 +157,7 @@ impl AppState {
             if let Some(i) = at
                 && let Some(row) = app.chat_model.row_data(i)
             {
-                app.images.remove(&row.row_id);
+                crate::pictures::remove(row.row_id);
                 app.gifs.remove(&row.row_id);
             }
             if let Some(delta) = app.history.discard_message(placeholder) {
@@ -751,6 +751,24 @@ impl AppState {
         s.set_preview_image(slint::Image::default());
     }
 
+    /// A picture the pane asked for is decoded (`pictures.rs`): its
+    /// row asks again. Only the conversation shown asks for pictures;
+    /// one decoded for a conversation since parked waits in the store
+    /// until that conversation is shown, and its rows are built anew.
+    pub(crate) fn picture_ready(&mut self, row_id: i32) {
+        let model = &self.chat_model;
+        // Pictures on screen are mostly the newest rows.
+        for i in (0..model.row_count()).rev() {
+            if let Some(mut row) = model.row_data(i)
+                && row.row_id == row_id
+            {
+                row.image_rev = row.image_rev.wrapping_add(1);
+                model.set_row_data(i, row);
+                return;
+            }
+        }
+    }
+
     pub(super) fn gif_hover(&mut self, row_id: i32, entering: bool) {
         let needs_ticker = self
             .gifs
@@ -797,11 +815,24 @@ impl AppState {
             self.activity_model.set_vec(Vec::new());
             return;
         }
+        // This conversation's pictures and players: the parked ones
+        // keep theirs (all of them went before, and a DM's pictures
+        // could no longer be opened or saved after General was
+        // cleared).
+        let pictures: Vec<i32> = self
+            .chat_model
+            .iter()
+            .filter(|row| row.kind == 2)
+            .map(|row| row.row_id)
+            .collect();
         self.history_mut().clear();
         self.chat_model.set_vec(Vec::new());
-        self.images.clear();
-        self.gifs.clear();
+        for row_id in pictures {
+            crate::pictures::remove(row_id);
+            self.gifs.remove(&row_id);
+        }
         self.gif_ticker.stop();
+        self.resume_gifs();
     }
 
     /// At most [`AUTOPLAY_GIFS`] chat GIFs autoplay at once, the newest

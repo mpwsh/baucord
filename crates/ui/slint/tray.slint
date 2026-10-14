@@ -4,17 +4,47 @@
 // A SystemTrayIcon is a top-level component: the shell instantiates it
 // alongside MainWindow, and the icon lives exactly as long as the
 // instance. A tray component gets its OWN copy of every global (it
-// shares nothing with MainWindow), so the localized labels arrive
-// through plain properties instead of Tr.
+// shares nothing with MainWindow), so every label arrives through a
+// plain property instead of Tr, already worded by the host.
+//
+// The menu is rebuilt by Slint whenever a property it reads changes,
+// so the host sets these only when something it shows moved (a mute,
+// someone joining the room), never on a speaking edge. The native
+// menus draw no check marks (none of the three backends does), so a
+// state is said in the words: Mute / Unmute.
+
+/// One person in our voice room, as the menu offers them.
+export struct TrayPerson {
+    /// "Mute Ana" or "Unmute Ana": muting is for us alone.
+    title: string,
+}
 
 export component BaucordTray inherits SystemTrayIcon {
     in property <string> show-label: "Show";
     in property <string> quit-label: "Quit";
+    in property <string> mute-label: "Mute";
+    in property <string> deafen-label: "Deafen";
+    in property <string> tip: "baucord";
+    /// Connected: our own mute and deafen are offered.
+    in property <bool> connected: false;
+    /// Nobody hears us (our mute, our deafen, or the server's mute):
+    /// the icon goes red.
+    in property <bool> quiet: false;
+    /// The voice room we are in, and its other people; "" outside one.
+    in property <string> room;
+    in property <[TrayPerson]> people;
     callback show-app();
     callback quit-app();
+    callback toggle-mute();
+    callback toggle-deafen();
+    /// `people[index]`, muted or unmuted for us.
+    callback toggle-person(int);
 
-    icon: @image-url("../../../assets/icons/icon-256.png");
-    tooltip: "baucord";
+    // A flat glyph that still reads at 16 px (scripts/tray-icons.py),
+    // red while nobody hears us.
+    icon: root.quiet ? @image-url("../../../assets/icons/tray-quiet.png")
+        : @image-url("../../../assets/icons/tray.png");
+    tooltip: root.tip;
 
     // Left-click restores the window (Windows: WM_LBUTTONUP, Linux:
     // StatusNotifier Activate, macOS: AppKit click); right-click opens
@@ -23,6 +53,23 @@ export component BaucordTray inherits SystemTrayIcon {
 
     Menu {
         MenuItem { title: root.show-label; activated => { root.show-app(); } }
+        if root.connected : MenuSeparator { }
+        if root.connected : MenuItem {
+            title: root.mute-label;
+            activated => { root.toggle-mute(); }
+        }
+        if root.connected : MenuItem {
+            title: root.deafen-label;
+            activated => { root.toggle-deafen(); }
+        }
+        if root.connected && root.room != "" && root.people.length > 0 : Menu {
+            title: root.room;
+            for person[i] in root.people : MenuItem {
+                title: person.title;
+                activated => { root.toggle-person(i); }
+            }
+        }
+        MenuSeparator { }
         MenuItem { title: root.quit-label; activated => { root.quit-app(); } }
     }
 }

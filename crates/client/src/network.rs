@@ -130,6 +130,10 @@ const IMAGE_PARTIAL_TTL: Duration = Duration::from_mins(2);
 /// (`AdminRows`). A server sends at most a megabyte for one answer;
 /// this is far past what that holds.
 const MAX_HELD_ADMIN_ROWS: usize = 50_000;
+/// Answers held open at once. The panel asks one thing at a time; pages
+/// for answers whose result never comes (a request id this client did
+/// not send) would otherwise stay for the whole session.
+const MAX_OPEN_ADMIN_ANSWERS: usize = 8;
 
 /// The pages of admin listings that arrived ahead of their
 /// `AdminResult`, by request id (feature bit `ADMIN_PAGES`). The
@@ -147,6 +151,13 @@ impl AdminPages {
         if held.saturating_add(rows.rows()) > MAX_HELD_ADMIN_ROWS {
             warn!("admin rows for request {request_id} dropped: {held} already held");
             return;
+        }
+        if !self.held.contains_key(&request_id)
+            && self.held.len() >= MAX_OPEN_ADMIN_ANSWERS
+            && let Some(oldest) = self.held.keys().min().copied()
+        {
+            warn!("admin rows for request {oldest} dropped: its result never came");
+            self.held.remove(&oldest);
         }
         // `prepend` puts its argument in front: the new page takes
         // what is held and replaces it.
@@ -3692,6 +3703,18 @@ mod tests {
         let mut single = Ok(audit(0..2));
         pages.close(9, &mut single);
         assert_eq!(single, Ok(audit(0..2)));
+    }
+
+    #[test]
+    fn answers_that_never_close_do_not_pile_up() {
+        let mut pages = AdminPages::default();
+        for id in 0..20 {
+            pages.hold(id, audit(0..1));
+        }
+        assert_eq!(pages.held.len(), MAX_OPEN_ADMIN_ANSWERS);
+        // The newest are the ones kept.
+        assert!(pages.held.contains_key(&19));
+        assert!(!pages.held.contains_key(&0));
     }
 
     #[test]

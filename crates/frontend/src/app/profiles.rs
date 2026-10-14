@@ -40,6 +40,8 @@ impl AppState {
         // keeps it alive off screen (D63). Both at once, never deferred.
         self.sync_voice_room();
         self.sync_keep_alive(false);
+        // The tray follows whether or not the window shows.
+        self.sync_tray();
         self.roster_sync.dirty = true;
         if self.roster_sync.queued {
             return;

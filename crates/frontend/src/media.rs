@@ -24,13 +24,6 @@ use ui::State;
 
 use crate::app::AppState;
 
-/// Original wire bytes of a chat image row, kept for save / gallery /
-/// GIF replay.
-pub struct ImageEntry {
-    pub bytes: Rc<Vec<u8>>,
-    pub is_gif: bool,
-}
-
 /// Localize an app-core image error (keys from the real i18n catalog).
 fn describe(err: &ImageError) -> String {
     match err {
@@ -49,14 +42,15 @@ fn describe(err: &ImageError) -> String {
 
 // ── Incoming images → chat rows ─────────────────────────────────────────
 
-/// Append an image message to chat. Returns false if the bytes don't
-/// decode (the caller posts a system-row notice instead).
+/// Append an image message to chat. Returns false if the bytes are
+/// not a picture (the caller posts a system-row notice instead).
+///
+/// Nothing is decoded here: the row is laid out from the size in the
+/// picture's header, and its pixels are decoded when the pane first
+/// shows it (`pictures.rs`). A history page of pictures used to decode
+/// every one of them on the UI thread, and keep them all.
 pub fn push_image_row(app: &mut AppState, meta: &app_core::chat::Meta, data: Vec<u8>) -> bool {
-    // Preview-sized texture for the row (the layout box still comes
-    // from the original dimensions); the gallery viewer decodes the
-    // full resolution from `app.images` on demand.
-    let max_edge = ui::convert::preview_max_edge(app.main.window().scale_factor());
-    let Ok((frame, w, h)) = ui::convert::decode_to_preview(&data, max_edge) else {
+    let Some((w, h)) = images::received_dimensions(&data) else {
         return false;
     };
     let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);
@@ -67,44 +61,30 @@ pub fn push_image_row(app: &mut AppState, meta: &app_core::chat::Meta, data: Vec
     // them (push_image appends exactly one row and may drop from front).
     app.sync_delta(&delta);
 
-    // The freshly appended row is the last one — install the decoded
-    // frame (convert::chat_row only sets a placeholder).
+    // The freshly appended row is the last one.
     let last = app.chat_model().row_count() - 1;
-    install_image(app, last, frame, data, is_gif);
+    install_image(app, last, data, is_gif);
     true
 }
 
-/// Put a decoded picture on the image row at `index` and register its
-/// bytes (and player, for a GIF) under that row's id.
-fn install_image(
-    app: &mut AppState,
-    index: usize,
-    frame: slint::Image,
-    data: Vec<u8>,
-    is_gif: bool,
-) {
-    let model = app.chat_model().clone();
-    let Some(mut row) = model.row_data(index) else {
+/// Register a picture's bytes (and player, for a GIF) under the row id
+/// of the image row at `index`.
+fn install_image(app: &mut AppState, index: usize, data: Vec<u8>, is_gif: bool) {
+    let Some(row) = app.chat_model().row_data(index) else {
         return;
     };
-    let preview = frame.clone();
-    row.image = frame;
-    let row_id = row.row_id;
-    model.set_row_data(index, row);
-
+    crate::pictures::set_max_edge(ui::convert::preview_max_edge(
+        app.main.window().scale_factor(),
+    ));
     let bytes = Rc::new(data);
-    app.images.insert(
-        row_id,
-        ImageEntry {
-            bytes: bytes.clone(),
-            is_gif,
-        },
-    );
+    crate::pictures::insert(row.row_id, Rc::clone(&bytes), is_gif);
 
     if is_gif {
-        let mut player = GifPlayer::new(bytes, preview);
+        // Frozen, the row shows its picture again: an empty frame is
+        // what puts it back (`ImageRow` draws `image` only when set).
+        let mut player = GifPlayer::new(bytes, slint::Image::default());
         player.start_autoplay();
-        app.gifs_mut().insert(row_id, player);
+        app.gifs_mut().insert(row.row_id, player);
         app.cap_gif_autoplay();
         app.ensure_gif_ticker();
     }
@@ -114,8 +94,7 @@ fn install_image(
 /// for message `msg_id` in the shown conversation becomes an image row
 /// with `data`. `false` when the bytes are not a picture after all.
 pub fn picture_from_file(app: &mut AppState, msg_id: u64, data: Vec<u8>) -> bool {
-    let max_edge = ui::convert::preview_max_edge(app.main.window().scale_factor());
-    let Ok((frame, w, h)) = ui::convert::decode_to_preview(&data, max_edge) else {
+    let Some((w, h)) = images::received_dimensions(&data) else {
         return false;
     };
     let is_gif = data.starts_with(b"GIF8") && images::gif_is_animated(&data);
@@ -124,7 +103,7 @@ pub fn picture_from_file(app: &mut AppState, msg_id: u64, data: Vec<u8>) -> bool
     };
     let row = app.chat_row_at(index);
     app.chat_model().set_row_data(index, row);
-    install_image(app, index, frame, data, is_gif);
+    install_image(app, index, data, is_gif);
     // A card became a picture: taller. A reader pinned to the bottom
     // stays there (the follow only ran on appends before, which left
     // the view a few rows short after a replay's pictures landed).
@@ -172,9 +151,10 @@ pub enum GifStep {
 /// the viewer map) and the row's preview texture handle.
 pub struct GifPlayer {
     bytes: Rc<Vec<u8>>,
-    /// The row's static preview — the freeze target. Cloning a
-    /// `slint::Image` clones a handle, not pixels, and this buffer is
-    /// alive anyway (it's what the frozen row displays).
+    /// What a freeze puts back: the gallery's and the send preview's
+    /// first frame; for a chat row an empty image, which hands the row
+    /// back to its picture (`pictures.rs`). Cloning a `slint::Image`
+    /// clones a handle, not pixels.
     first: slint::Image,
     /// Present only while playing.
     stream: Option<gif::GifStream>,
@@ -625,18 +605,18 @@ fn show_preview(app: &mut AppState, bytes: Vec<u8>) {
 }
 
 /// "Copy image": the row's picture onto the clipboard as pixels.
-pub fn copy_image(app: &AppState, row_id: i32) {
-    if let Some(entry) = app.images.get(&row_id) {
-        crate::clipboard::set_clipboard_image(entry.bytes.as_slice());
+pub fn copy_image(_app: &AppState, row_id: i32) {
+    if let Some((bytes, _)) = crate::pictures::bytes(row_id) {
+        crate::clipboard::set_clipboard_image(bytes.as_slice());
     }
 }
 
 /// Save an image row to disk via the native save dialog.
 pub fn save_image_dialog(app: &mut AppState, row_id: i32) {
-    let Some(entry) = app.images.get(&row_id) else {
+    let Some((bytes, _)) = crate::pictures::bytes(row_id) else {
         return;
     };
-    let bytes: Arc<Vec<u8>> = Arc::new(entry.bytes.as_ref().clone());
+    let bytes: Arc<Vec<u8>> = Arc::new(bytes.as_ref().clone());
     // Named for what the bytes are: they are written as received.
     let ext = images::extension_for(&bytes);
     // Timestamped so several saves land side by side without renaming.

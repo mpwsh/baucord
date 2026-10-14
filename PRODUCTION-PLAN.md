@@ -60,8 +60,11 @@ What stands between this and "production for strangers":
   16–64 seats), capped at eight per address (an IPv6 /64 counts as
   one), with a QUIC `Retry` once half the seats are taken;
   `one_address_cannot_fill_the_waiting_room` is the test asked for
-  below. *Left:* a rate per address, and the Hello deadline (still
-  10 s, for lossy links). The original finding: `peer_count() >= max_peers` refuses new connections and
+  below. *2026-10-14:* a handshake that never finishes gives its seat
+  back after 10 s (it held it for quinn's 30 s idle timeout), and a
+  connection is counted under the address it arrived from, not one it
+  migrated to before saying a word. *Left:* a rate per address, and
+  the Hello deadline (still 10 s, for lossy links). The original finding: `peer_count() >= max_peers` refuses new connections and
   counts handshaking, Hello-pending and closing peers alike
   (`transport/src/driver.rs` ~687, ~817); a connection that never says
   Hello lives 10 s (`server.rs` ~90, ~913); the per-IP limit only
@@ -105,8 +108,10 @@ What stands between this and "production for strangers":
   packets/s) before fan-out, system audio too.
 - [ ] **SEC-7 [P1][S] Chat images are copied once per recipient** in
   `send_media` (`driver.rs` ~1085): a 10 MiB image to 256 clients holds
-  ~2.5 GiB. Write the length prefix separately and share the `Bytes`;
-  cap queued media bytes per peer.
+  ~2.5 GiB. *In part, 2026-10-14:* the relay frames a picture once
+  (`transport::frame_media`) and every receiver's stream queues the
+  same bytes, which go to quinn by reference. *Left:* cap queued media
+  bytes per peer.
 - [ ] **SEC-8 [P1][S] Members can mint unlimited-use invites at will**
   (`server.rs` ~2167–2214; members hold `CREATE_INVITES`). Cap
   `max_uses` and live invites per member, rate-limit new users per
@@ -135,12 +140,11 @@ What stands between this and "production for strangers":
   rows past about 140 entries (paging them needs a feature bit;
   review P0-1); pruning messages never
   decrements blob refs, the telemetry prune scans without an index,
-  audit rows and invites are never pruned; wall time is anchored once
-  at start (`clock.rs`); `server restore` joins archive paths without
-  `unpack_in`;
-  `SSLKEYLOGFILE` is honoured (`identity.rs` ~449); look-alike and
+  audit rows and invites are never pruned; look-alike and
   zero-width names pass; creating a channel past the cap stores it
-  before failing.
+  before failing. (Done 2026-10-14: the wall clock catches up after a
+  pause, `server restore` takes only plain relative blob paths, and
+  the TLS key log needs `BAUCORD_TLS_KEYLOG=1` beside `SSLKEYLOGFILE`.)
 
 ### Client
 
@@ -571,6 +575,14 @@ Store is not decided yet.
    release (§7; `DEVICE-CHECKLIST.md` §1.3). `"pointer": false` under
    `share` in `settings.json` is the way back for a machine where it
    draws wrong; there is no switch in the app.
+10. **Chat pictures' bytes on disk** (2026-10-14, open). Decoded
+   pictures are now kept only for what is on screen (§7), but each
+   picture's wire bytes stay in memory for as long as its row (0.2–2
+   MB, up to 10 MB a GIF): General's 500 rows of a picture-heavy
+   evening can still hold tens of MB. Spilling the older ones to a
+   cache folder (emptied at start, like the avatars' cache beside it)
+   would bound that — but DM pictures would then sit on disk,
+   unencrypted, until the next start. Assumed no until you say.
 
 ## 7. Done
 
@@ -1300,6 +1312,120 @@ One line each; the spec decision named holds the detail.
     Android. The pointer, the viewer on a real phone and the delay by
     ear are the user's to look at; `DEVICE-CHECKLIST.md` has the
     lines.
+
+- **2026-10-14 — the second review's first two areas** (server core
+  `SRV-n`, protocol and transport `PT-n`; [baucord — staff engineering
+  review, October 2026](https://claude.ai/code/artifact/3679c79a-0419-46f3-b4c1-f708bff49621),
+  the "Interim" section; the other twelve areas are not reviewed yet).
+  - *Bugs users could hit.* A file larger than the per-minute transfer
+    budget (4 MiB by default, 20 MiB on the official server) was
+    refused for good, as "today's allowance": an empty minute now takes
+    any one upload whole, the budget refuses as `Refused`, and it is
+    checked before the store evicts anything (SRV-1, e2e test). A
+    stalled file upload held up to 50 MB until its sender left: files
+    are pruned like pictures, by the last chunk's time, and capped at
+    the announced size (SRV-2). A block list past about 270 never
+    arrived: at most 250 now, the part that fits for anyone over, and
+    roles at most 100 so `RoleList` always fits (SRV-4, tests). An
+    admin reason is cut to 500 bytes on both sides, and an answer
+    whose last page cannot be sent still closes (SRV-5). `server
+    restore` takes only plain relative blob paths (SRV-6, test). A CLI
+    mute and its lift are told to the person, and a reload that changed
+    the UI channels rebuilds the list (SRV-12, e2e test). The lobby
+    cannot watch a share, and a stop with no share behind it is
+    ignored (SRV-11, e2e test).
+  - *The policy set-aside* (P1-22, SRV-8): only writes to tables
+    `load_policy` reads count (`Command::changes_policy`); after four
+    stale snapshots the tick keeps its policy and asks again a second
+    later, three times, before taking one.
+  - *Work on the tick.* Uploads are hashed as their chunks arrive, not
+    whole at the end (SRV-3: 50 MB was 60–125 ms with voice waiting).
+    Voice is offered to the speaker's room only (`room_members`,
+    SRV-7). Twenty broadcast loops are one `send_to` each (SRV-9,
+    PT-3), and a relayed picture is framed once for every receiver,
+    handed to quinn by reference (PT-2; SEC-7 in part). Blocked pairs
+    are found per blocked person, not per pair of sessions (SRV-10);
+    the panel's user list builds its maps once (SRV-14); the waiting
+    room counts in one pass (PT-5).
+  - *Transport.* A handshake that never finishes leaves the waiting
+    room after 10 s, not quinn's 30 s (PT-7, simulator test); a
+    connection counts under the address it arrived from (PT-6). The
+    client holds at most eight admin answers open (PT-12, test).
+    Fit-to-size helpers count bytes without encoding (PT-14).
+  - *Small.* The wall clock catches up after a pause (SRV-13, test);
+    the TLS key log needs `BAUCORD_TLS_KEYLOG=1` (PT-17); `protocol`
+    drops `log`; `ChatServer::fingerprint`, `AdminOutcome::fit_to`,
+    `PinnedVerifier::pin` and `SimNet::addr` are gone,
+    `ServerIdentity::cert_der` is test-only; the quinn 0.11.17 comment
+    is now the decision it is (PT-20: drop-oldest waits for LAT-3).
+  - *Not done, and why.* PT-1 (a deadline heap in the driver) and PT-8
+    (a copy-free frame decoder): M each, on the hot path, and their
+    gain is unmeasured — measure the server at 100+ peers first. PT-9
+    needs a NIC that refuses segmentation offload to test. PT-10,
+    PT-15: small allocations. PT-16 and the rest of SRV-15: test
+    scenarios, not fixes. The `BlobChunk` length check (PT-13): only
+    the comment was corrected, since tightening a decode check could
+    refuse a shipped peer's chunks. SEC-7's per-peer media cap and
+    SEC-3's coalescing of speaking edges stay where they are.
+  - *Checked*: protocol, transport, server, client and frontend lint
+    where they were (no new warning kinds), and the phones' build of
+    `frontend` type-checks; every test of protocol (98), transport
+    (65), server (74 + 105 e2e) and client (65 + 2) passes in the
+    sandbox, the socket-wait ones included this time. Nothing was run
+    against a real client or a real deployment: `DEVICE-CHECKLIST.md`
+    §5 has the lines, marked **[10-14]**.
+- **2026-10-14 — the client asks after the review** (the user's list:
+  pictures and memory, tooltips, long press, the tray, a sound for
+  mute).
+  - *Pictures* (PRD-6 in part). A chat row held its decoded preview for
+    its whole life — up to 2 MB of RGBA a picture at 2×, every picture
+    in every conversation — and each one was decoded on the UI thread
+    as it arrived, a history page's worth at once. Now a row holds no
+    pixels (`ChatRow.image` is only a playing GIF's frame): the pane
+    asks `Logic.chat-picture(row-id, image-rev)` for the rows its
+    `ListView` built, which are the ones on screen; `pictures.rs`
+    keeps the wire bytes per row and an LRU of previews (16 MB of
+    RGBA beyond what is on screen), decodes a missing one on one
+    worker thread (newest request first), and bumps the row's
+    `image-rev` when it is ready; it fades in over the empty frame.
+    Rows are laid out from the header's size (`received_dimensions`),
+    so "Load earlier" decodes nothing. Clear chat now drops only the
+    shown conversation's pictures (it dropped every DM's bytes too).
+    `/mem` reports pictures, decoded previews and their bytes. The
+    wire bytes themselves stay in memory (0.2–2 MB a picture, 10 MB at
+    most): spilling them to disk would cut that too, but would write
+    DM pictures to disk — a decision for §6, not taken here.
+  - *Tooltips* are drawn by one layer per window (`Tip` global,
+    `TipLayer` in `widgets.slint`, last child of each window): a
+    tooltip that was a child of its button was drawn under whatever
+    came later in the tree — the chat's under the sidebar, the
+    sidebar's under the channel names. 400 ms to show, then quick
+    while moving between buttons; kept inside the window, flipped
+    above or below; off on the phones (no hover).
+  - *Long press* (phones): the release of a hold is never also a tap.
+    A held person shows their card and opens nothing on release; a
+    held channel opens its menu instead of joining; a picture opens
+    the viewer on a tap and the menu on a hold; a hold on an avatar
+    in chat is the author's card, not the row's menu. `LongPress`
+    moved to `widgets.slint`; every tap target inside a chat row is
+    guarded by `held`.
+  - *The tray*: a flat 64 px icon that reads at 16 px
+    (`scripts/tray-icons.py`), red while nobody hears us (muted,
+    deafened or muted by the server). Connected, the menu has Mute /
+    Unmute and Deafen / Undeafen, and the voice room's people, each to
+    mute or unmute for us alone; blocked people are left out. Labels
+    say the state: the native menus draw no check marks.
+  - *A sound for mute and deafen*: one soft note, G4 going quiet and
+    B♭4 coming back (the join chime's two notes, quieter and shorter);
+    Settings → Sounds → "Mute and deafen", on by default.
+  - *The hover card* wraps a long name instead of cutting it: the rows
+    elide it, and the card is where it is read in full.
+  - *Checked*: the tooltip and long-press behaviour on the real
+    `MainWindow` in a headless harness (Slint's software renderer, a
+    mocked clock, touch and mouse); desktop and phone renders;
+    `tools/chat-scroll-sim`; lint, the phones' type-check and tests as
+    the commit says. Not run on a device: `DEVICE-CHECKLIST.md` lines
+    marked **[10-14c]**.
 
 ## 8. Facts this plan rests on
 

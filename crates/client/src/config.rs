@@ -229,6 +229,9 @@ pub struct SoundSettings {
     /// to the sharer alone).
     #[serde(default = "default_true")]
     pub viewer_joined: bool,
+    /// We mute, unmute, deafen or undeafen ourselves: one soft note.
+    #[serde(default = "default_true")]
+    pub mute_toggle: bool,
 }
 
 impl Default for SoundSettings {
@@ -240,6 +243,7 @@ impl Default for SoundSettings {
             direct_message: true,
             share_started: true,
             viewer_joined: true,
+            mute_toggle: true,
         }
     }
 }
@@ -269,6 +273,11 @@ impl SoundSettings {
     #[must_use]
     pub fn viewer_joined_on(&self) -> bool {
         self.enabled && self.viewer_joined
+    }
+
+    #[must_use]
+    pub fn mute_toggle_on(&self) -> bool {
+        self.enabled && self.mute_toggle
     }
 }
 

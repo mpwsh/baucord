@@ -91,6 +91,12 @@ pub enum AdminTarget {
     Name(String),
 }
 
+/// Longest `reason` an admin command keeps, in bytes (cut on a
+/// character boundary). A reason travels in `Restricted`, the
+/// restriction list and the audit page; one near the 17 KiB message
+/// limit made those lists undeliverable.
+pub const MAX_ADMIN_REASON_BYTES: usize = 500;
+
 /// One administrative action (spec §8). `reason` texts are shown to the
 /// affected user and kept in the audit log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +249,23 @@ pub enum AdminCommand {
     },
 }
 
+impl AdminCommand {
+    /// Cut the command's `reason`, if it has one, to
+    /// [`MAX_ADMIN_REASON_BYTES`] on a character boundary. The server
+    /// does this to every command it receives; a client may do it
+    /// before sending so the user sees what is kept.
+    pub fn clip_reason(&mut self) {
+        if let Self::Restrict { reason, .. }
+        | Self::Disconnect { reason, .. }
+        | Self::Kick { reason, .. }
+        | Self::Ban { reason, .. } = self
+            && reason.len() > MAX_ADMIN_REASON_BYTES
+        {
+            *reason = crate::truncate_on_char_boundary(reason, MAX_ADMIN_REASON_BYTES);
+        }
+    }
+}
+
 /// One audit line (spec §8), as the panel shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -352,23 +375,6 @@ pub enum AdminOutcome {
 }
 
 impl AdminOutcome {
-    /// Cut a listing to what one message carries (the first rows the
-    /// server put in order); returns how many rows were left out. A
-    /// shipped client dropped a larger answer unread, so the panel came
-    /// back empty (review P0-1).
-    pub fn fit_to(&mut self, budget: usize) -> usize {
-        use crate::messages::keep_prefix_that_fits as fit;
-        match self {
-            Self::Users(rows) => fit(rows, budget),
-            Self::Restrictions(rows) => fit(rows, budget),
-            Self::Invites(rows) => fit(rows, budget),
-            Self::Audit(rows) => fit(rows, budget),
-            Self::Blobs(rows) => fit(rows, budget),
-            Self::Reports(rows) => fit(rows, budget),
-            Self::Done | Self::Telemetry(_) | Self::Stats(_) | Self::RoleCreated(_) => 0,
-        }
-    }
-
     /// A listing as the messages that carry it, in order: each holds
     /// the rows that fit `budget`. One page for what is not a listing,
     /// and for a listing with no rows.
@@ -572,5 +578,26 @@ mod tests {
         assert_eq!(RestrictionKind::from_db(7), None);
         assert_eq!(RestrictionKind::parse("mute"), Some(RestrictionKind::Voice));
         assert_eq!(RestrictionKind::parse("nope"), None);
+    }
+
+    #[test]
+    fn a_reason_is_cut_on_a_character_boundary() {
+        let mut ban = AdminCommand::Ban {
+            target: AdminTarget::Name("x".into()),
+            duration_secs: None,
+            reason: "é".repeat(MAX_ADMIN_REASON_BYTES),
+        };
+        ban.clip_reason();
+        let AdminCommand::Ban { reason, .. } = &ban else {
+            unreachable!()
+        };
+        assert!(reason.len() <= MAX_ADMIN_REASON_BYTES);
+        assert_eq!(reason.chars().count(), MAX_ADMIN_REASON_BYTES / 2);
+        let mut short = AdminCommand::Kick {
+            target: AdminTarget::Name("x".into()),
+            reason: "spam".into(),
+        };
+        short.clip_reason();
+        assert!(matches!(short, AdminCommand::Kick { reason, .. } if reason == "spam"));
     }
 }

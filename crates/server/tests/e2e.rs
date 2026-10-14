@@ -1795,6 +1795,71 @@ fn a_ban_written_by_the_cli_lands_on_a_live_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A mute from the CLI is told to the person, and so is its lift: the
+/// client learns a mute only from `Restricted`, and the reload used to
+/// apply it without a word.
+#[test]
+fn a_cli_mute_and_its_lift_are_told_to_the_session() {
+    let dir = temp_dir("cli-mute");
+    let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
+    let mut alice = w.connect("alice");
+    let alice_user = alice.key.user_id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.server().persistence().stats().queued > 0 {
+        assert!(Instant::now() < deadline, "rows never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let db = dir.join("baucord.db");
+    let id = server::persistence::cli_restrict(
+        &db,
+        Restriction {
+            id: 0,
+            user_id: Some(alice_user),
+            key_hash: None,
+            ip: None,
+            kind: RestrictionKind::Voice,
+            until: None,
+            reason: "too loud".to_string(),
+            by: None,
+            created_at: 0,
+        },
+    )
+    .expect("cli restrict");
+    let wait = |alice: &mut TestClient,
+                w: &mut World,
+                what: &str,
+                hit: &dyn Fn(&ServerMessage) -> bool| {
+        // The running server polls data_version every 2 s of real time.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            w.pump(&mut [&mut *alice]);
+            if alice.inbox.iter().any(hit) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} never reached the session"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    wait(&mut alice, &mut w, "the mute", &|m| {
+        matches!(m, ServerMessage::Restricted { kind: RestrictionKind::Voice, reason, .. }
+            if reason == "too loud")
+    });
+    assert!(server::persistence::cli_lift_restriction(&db, id).expect("lift"));
+    wait(&mut alice, &mut w, "the lift", &|m| {
+        matches!(
+            m,
+            ServerMessage::RestrictionLifted {
+                kind: RestrictionKind::Voice
+            }
+        )
+    });
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_admin_moves_a_user_past_a_channel_password() {
     let mut w = World::new(test_config(vec![
@@ -3739,6 +3804,63 @@ fn channel_scoped_share_visibility_follows_membership() {
     });
 }
 
+/// The lobby is shown no shares, and cannot watch one either: an
+/// unseen viewer there still counted in the sharer's stream health.
+/// A stop from someone who is not sharing reaches nobody.
+#[test]
+fn the_lobby_cannot_watch_and_a_stray_stop_says_nothing() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut sharer = w.connect_member("sharer");
+    let mut other = w.connect_member("other");
+    let sharer_id = sharer.id;
+    let other_id = other.id;
+    let code = w.member_code.clone();
+    let mut lurker = w.connect_lobby_with_key(
+        "lurker",
+        Auth::Invite { code },
+        Arc::new(ClientKey::generate()),
+    );
+    sharer.send(
+        &mut w,
+        &ClientMessage::ScreenShareStart {
+            width: 1280,
+            height: 720,
+            scope: ShareScope::Everyone,
+        },
+    );
+    other.wait_for(&mut w, &mut [&mut sharer, &mut lurker], |m| {
+        matches!(m, ServerMessage::ScreenShareStarted { client_id, .. } if *client_id == sharer_id)
+            .then_some(())
+    });
+    lurker.send(
+        &mut w,
+        &ClientMessage::SubscribeScreen {
+            target_id: sharer_id,
+        },
+    );
+    lurker.wait_for(&mut w, &mut [&mut sharer, &mut other], |m| {
+        matches!(
+            m,
+            ServerMessage::SubscribeDenied {
+                reason: DenyReason::NotInChannel,
+                ..
+            }
+        )
+        .then_some(())
+    });
+
+    other.send(&mut w, &ClientMessage::ScreenShareStop);
+    w.settle(
+        &mut [&mut sharer, &mut other, &mut lurker],
+        Duration::from_millis(500),
+    );
+    assert!(
+        !sharer.inbox.iter().any(|m| matches!(m,
+            ServerMessage::ScreenShareStopped { client_id } if *client_id == other_id)),
+        "a stop with no share behind it went out"
+    );
+}
+
 /// What a session does in the lobby stays there (review P2-1): its
 /// speaking edges, its mute, a rename and a role change used to reach
 /// every client, each one naming the session nobody was told about.
@@ -4154,6 +4276,59 @@ fn per_client_image_byte_budget_brakes_one_spammer() {
         )
     });
     assert!(hashed);
+}
+
+/// One file larger than the whole per-minute budget goes when the
+/// minute is empty (it used to be refused for good, as "today's
+/// allowance"); the next one in that minute is refused as `Refused`,
+/// not `Quota`.
+#[test]
+fn a_file_larger_than_the_minute_budget_goes_alone() {
+    let dir = temp_dir("minute-budget");
+    let mut config = persistent_config(vec![open_channel("Lobby", true)], &dir);
+    config.limits.max_transfer_kb_per_minute = 1; // 1 KiB/min per client
+    let mut w = World::new(config);
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+
+    let big = b"three kilobytes of notes, one budget of one".repeat(70);
+    assert!(big.len() > 1024);
+    post_file(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob],
+        1,
+        "big.txt",
+        "text/plain",
+        &big,
+        ConvRef::General,
+    )
+    .expect("an empty minute takes one file of any size under the cap");
+
+    let second = b"a second file inside the same minute".repeat(10);
+    alice.send(
+        &mut w,
+        &ClientMessage::UploadBegin {
+            upload_id: 2,
+            name: "second.txt".into(),
+            mime: "text/plain".into(),
+            size: u32::try_from(second.len()).unwrap(),
+            sha256: transport::sha256::digest(&second),
+        },
+    );
+    let reason = alice.wait_for(&mut w, &mut [&mut bob], |m| match m {
+        ServerMessage::UploadRejected {
+            upload_id: 2,
+            reason,
+        } => Some(*reason),
+        ServerMessage::UploadAccept { upload_id: 2, .. } => {
+            panic!("the minute's budget is spent")
+        }
+        _ => None,
+    });
+    assert_eq!(reason, UploadRejectReason::Refused);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

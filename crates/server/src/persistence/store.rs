@@ -1874,13 +1874,20 @@ fn count(rows: usize) -> u64 {
 
 // ── Offline operations (CLI) ────────────────────────────────────────────
 
-/// `server backup <file.tar>`: a consistent snapshot of the database
-/// through `SQLite`'s online backup API (a plain copy of a WAL database
-/// is not safe) plus the `blobs/` directory, in one archive — either
-/// half alone restores to dangling references.
-///
-/// # Errors
-/// No database at `db_path`, a `SQLite` failure, or an archive I/O error.
+/// `rest` as a path that stays inside the folder it is joined to: only
+/// plain names, no root, no `..`, no `.`, nothing empty. A `..` check
+/// alone let `blobs//etc/x` through — `Path::join` with an absolute
+/// path replaces the base, and `restore` wrote wherever the archive
+/// said.
+fn plain_relative(rest: &str) -> Option<&Path> {
+    let path = Path::new(rest);
+    let mut parts = path.components().peekable();
+    parts.peek()?;
+    parts
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+        .then_some(path)
+}
+
 /// `server restore`: unpack a `server backup` archive over the data
 /// directory — the database and the blobs. Refuses while the server
 /// holds the database (the `-wal` file exists) unless forced. The
@@ -1927,8 +1934,7 @@ pub fn restore_from_tar(
                 entry.unpack(staging.join("baucord.db")).map_err(io_err)?;
                 report.database = true;
             } else if let Some(rest) = name.strip_prefix("blobs/")
-                && !rest.is_empty()
-                && !rest.contains("..")
+                && let Some(rest) = plain_relative(rest)
             {
                 let target = staging.join("blobs").join(rest);
                 if let Some(parent) = target.parent() {
@@ -1995,6 +2001,13 @@ pub fn cli_prune(db_path: &Path, retention: Retention) -> Result<u64, PersistErr
     Ok(removed)
 }
 
+/// `server backup <file.tar>`: a consistent snapshot of the database
+/// through `SQLite`'s online backup API (a plain copy of a WAL database
+/// is not safe) plus the `blobs/` directory, in one archive — either
+/// half alone restores to dangling references.
+///
+/// # Errors
+/// No database at `db_path`, a `SQLite` failure, or an archive I/O error.
 pub fn backup_to_tar(db_path: &Path, out: &Path) -> Result<BackupReport, PersistError> {
     if !db_path.is_file() {
         return Err(PersistError::Missing(db_path.to_path_buf()));
@@ -2751,6 +2764,21 @@ impl CheckReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restored_blob_path_stays_in_its_folder() {
+        assert!(plain_relative("ab/abcdef").is_some());
+        assert!(plain_relative("abcdef").is_some());
+        for bad in ["", "/etc/x", "/", "../x", "ab/../../x", "./x", "ab//"] {
+            let ok = plain_relative(bad).is_some_and(|p| !p.as_os_str().is_empty());
+            // "ab//" normalises to "ab": still inside, still fine.
+            if bad == "ab//" {
+                assert!(ok);
+            } else {
+                assert!(!ok, "{bad:?} must be refused");
+            }
+        }
+    }
 
     fn memory() -> Sqlite {
         Sqlite::open(Path::new(":memory:")).expect("open").0

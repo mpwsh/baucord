@@ -563,6 +563,7 @@ macro_rules! switches {
             set_dm_sound, on_dm_sound_changed => sounds.direct_message;
             set_share_started_sound, on_share_started_sound_changed => sounds.share_started;
             set_viewer_joined_sound, on_viewer_joined_sound_changed => sounds.viewer_joined;
+            set_mute_toggle_sound, on_mute_toggle_sound_changed => sounds.mute_toggle;
             set_notify_messages, on_notify_messages_changed => notifications.messages;
             set_notify_first_join, on_notify_first_join_changed => notifications.first_join;
             set_show_timestamps, on_show_timestamps_changed => ui.show_timestamps, push_ui_prefs;
