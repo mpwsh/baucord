@@ -993,6 +993,14 @@ Memory-mode servers (persistence off) still use the legacy
   `fired` (`held` on a chat row): the finger's release comes after
   the hold's action and would run the tap's too. A nested target (a
   picture, a link, a file button in a row) checks the row's `held`.
+- **A window's `icon` is its taskbar icon too, on Windows**: Slint
+  gives the one image to both `WM_SETICON` slots (title bar and
+  taskbar/Alt-Tab; `i-slint-backend-winit` `set_window_icon`). The
+  windows load the tray's glyph (`tray.png`); the exe's own icon is
+  `icon.ico`, embedded by `desktop/build.rs`. Slint 1.18.1 multiplies
+  an icon's colours by alpha twice (decoded premultiplied, then again
+  in `icon_to_winit`), so soft edges come out a little dark on a light
+  title bar — upstream's to fix, not worth a workaround here.
 - **The tray's menu says a state in words** (`tray.slint`): no native
   backend draws a check mark, and a `checkable` item sets its own
   `checked` on activation, which breaks the binding. Its labels and

@@ -324,6 +324,12 @@ Play music in another app first, at a steady volume.
   under about 830 px the rows stack (a person's actions on two lines,
   the audit as two-line entries); under 600 px Settings and the panel
   become a list and a page with an arrow back, as on the phone.
+- [ ] **new [10-15]** — the main window's title bar and a stream
+  viewer's (which had none) show the tray's flat dog, as do their
+  taskbar buttons and Alt-Tab while the app runs; the exe in Explorer,
+  the Start menu and a pinned shortcut keep the painted icon. At 100 %
+  and 150 % scaling. (Linux on X11: the same glyph in the title bar
+  and the task list.)
 
 ### 1.6 Keybinds without polling [P1-3 step 2] **[7]**
 

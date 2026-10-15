@@ -2,12 +2,10 @@
 """The desktop's small icons from the app icon (review P2-45).
 
 `assets/icons/icon.png` is 1254 px a side: right for the phones' stores,
-but the desktop window and the tray each decoded it whole — 6 MiB of
-pixels apiece, over Slint's image cache, so both stayed resident — and
-the Windows `.ico` built from it carried an uncompressed 256 px bitmap
-(726 KB). This writes:
+but the Windows `.ico` built from it carried an uncompressed 256 px
+bitmap (726 KB). (The windows and the tray load the flat glyph that
+`scripts/tray-icons.py` draws, not this icon.) This writes:
 
-- `assets/icons/icon-256.png`: what `main.slint` and `tray.slint` load;
 - `assets/icons/icon.ico`: 16–64 px as bitmaps (what old shell code
   reads) and 256 px as a PNG (Windows scales that one for the sizes in
   between), embedded in the exe by `crates/desktop/build.rs`;
@@ -46,7 +44,6 @@ def bitmap_entry(image):
 def main():
     source = Image.open(ICONS / "icon.png").convert("RGBA")
     small = source.resize((256, 256), Image.LANCZOS)
-    small.save(ICONS / "icon-256.png", optimize=True)
 
     entries = [
         (size, bitmap_entry(source.resize((size, size), Image.LANCZOS)))
@@ -66,7 +63,6 @@ def main():
     for path in (ICONS / "icon.ico", ROOT / "web" / "img" / "favicon.ico"):
         path.write_bytes(ico)
         print(f"{path.relative_to(ROOT)}: {len(ico)} bytes")
-    print(f"assets/icons/icon-256.png: {(ICONS / 'icon-256.png').stat().st_size} bytes")
 
 
 if __name__ == "__main__":

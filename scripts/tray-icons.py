@@ -8,7 +8,8 @@ white head, dark headphones — with the eyes and nose only where there
 are pixels for them (32 px and up). No ears: under the band, at tray
 size, they were stray white specks. Two of them:
 
-- `assets/icons/tray.png`: the disc in the app icon's slate;
+- `assets/icons/tray.png`: the disc in the app icon's slate — also
+  the desktop windows' icon (`main.slint`, `viewer.slint`);
 - `assets/icons/tray-quiet.png`: the disc red — we are muted or
   deafened (`tray.slint` switches between the two).
 

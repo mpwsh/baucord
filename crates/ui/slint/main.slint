@@ -36,7 +36,11 @@ export component MainWindow inherits Window {
     preferred-height: 640px;
     min-width: 500px;
     min-height: 400px;
-    icon: @image-url("../../../assets/icons/icon-256.png");   // app icon (workspace assets/), 256 px: the 1254 px original is 6 MiB decoded, over Slint's image cache, and stayed resident once for the window and once for the tray (review P2-45). Windows exe/taskbar icon is embedded by desktop/build.rs
+    // The tray's flat glyph (scripts/tray-icons.py), which reads at a
+    // title bar's 16 px where the painted app icon was a grey blur. On
+    // Windows Slint gives it to the taskbar button and Alt-Tab too; the
+    // exe's own icon (desktop/build.rs, icon.ico) stays the painted one.
+    icon: @image-url("../../../assets/icons/tray.png");
 
     // Share-dialog local state
     in-out property <bool> share-dialog-open: false;
