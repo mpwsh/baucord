@@ -47,7 +47,9 @@ for the work at hand (§3). Everything else is linked from here.
   `assets/` must be in it: the build embeds `assets/sounds/*.wav` and
   every platform's icon comes from `assets/icons/icon.png` — the
   desktop's through `scripts/desktop-icons.py`, whose output
-  (`icon-256.png`, `icon.ico`, the website's favicon) is committed.)
+  (`icon.ico`, the website's favicon) is committed; the tray's and the
+  desktop windows' flat glyph (`tray.png`, `tray-quiet.png`) is drawn
+  by `scripts/tray-icons.py`, committed too.)
 - **Work:** the assistant unpacks it into its sandbox, edits,
   compile-checks every platform it can (host, Android, iOS — see
   SESSION-GUIDE §1), runs the tests, renders every `.slint` change at

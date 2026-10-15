@@ -189,34 +189,38 @@ impl AppState {
         let _ = std::fs::remove_file(client::config::avatar_path());
         self.forget_avatar_blob();
         self.profile_dirty = true;
+        self.apply_settings_live();
+    }
+
+    /// Push every setting the Settings page edits to the running app,
+    /// so it behaves as the settings say at once: after Reset to
+    /// defaults, and after the page's Close puts back what it changed
+    /// (`settingsui::discard_and_close`).
+    pub(crate) fn apply_settings_live(&mut self) {
         self.apply_text_scale();
         self.push_ui_prefs();
         self.apply_push_to_talk();
-        // Push the defaults to the running subsystems so behavior
-        // matches the file immediately.
-        self.voice
-            .tx
-            .send(VoiceControl::SetGateThreshold(
-                self.settings.audio.gate_threshold,
-            ))
-            .ok();
-        self.voice
-            .tx
-            .send(VoiceControl::SetInputGain(self.settings.audio.input.gain))
-            .ok();
-        self.voice
-            .tx
-            .send(VoiceControl::SetOutputGain(self.settings.audio.output.gain))
-            .ok();
-        self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
-        self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
-        self.sync_stream_output();
-        if let Some(hotkeys) = &mut self.hotkeys {
-            hotkeys.update(&self.settings);
+        let audio = &self.settings.audio;
+        for control in [
+            VoiceControl::SetGateThreshold(audio.gate_threshold),
+            VoiceControl::SetInputGain(audio.input.gain),
+            VoiceControl::SetOutputGain(audio.output.gain),
+            VoiceControl::SetInputDevice(audio.input.device.clone()),
+            VoiceControl::SetOutputDevice(audio.output.device.clone()),
+            VoiceControl::SetEchoCancellation(audio.echo_cancellation),
+        ] {
+            self.voice.tx.send(control).ok();
         }
+        self.sync_stream_output();
+        self.refresh_hotkeys();
+        super::apply_log_level(&self.settings);
         i18n::set_locale(self.settings.language.as_deref());
         self.push_tr();
         self.push_connect_fields();
+        self.push_connect_servers();
+        // Our name's colour and style, in the roster and our own rows.
+        self.update_user_list();
+        self.refresh_own_rows();
         self.refresh_device_warning();
     }
 

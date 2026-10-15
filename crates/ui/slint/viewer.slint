@@ -599,6 +599,9 @@ export component StreamViewerPanel inherits FocusScope {
 /// the window adds the OS title, the fullscreen state and the Windows
 /// reveal workaround.
 export component StreamViewerWindow inherits Window {
+    // The main window's icon (main.slint): without one the title bar
+    // and Alt-Tab showed Windows' blank window.
+    icon: @image-url("../../../assets/icons/tray.png");
     in property <string> peer-name;
     in property <image> frame;
     in property <string> stats: "--";

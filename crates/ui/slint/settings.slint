@@ -243,6 +243,10 @@ export global SettingsLogic {
     callback clear-log();
 
     callback save-and-close();
+    /// The footer's Close: put back what was changed since the page
+    /// opened, then close. (Escape, Back and the arrow save, as Save
+    /// and close does.)
+    callback discard-and-close();
     callback reset-defaults();
     callback closed();
     // Another tab is showing: the meters run on Audio only.
@@ -261,6 +265,9 @@ component NavItem inherits Rectangle {
     /// The narrow layout's list: a finger-sized row with a chevron
     /// (the row opens a page there rather than selecting a tab).
     in property <bool> tall: false;
+    /// Takes something away (the phone list's Reset to defaults): the
+    /// danger color, no chevron.
+    in property <bool> danger: false;
     callback clicked;
     height: root.tall ? 48px : 36px;
     border-radius: Theme.radius-md;
@@ -275,18 +282,18 @@ component NavItem inherits Rectangle {
             IconDisplay {
                 icon: root.icon;
                 size: 16px;
-                stroke: root.active ? Theme.on-accent : Theme.text-muted;
+                stroke: root.active ? Theme.on-accent : root.danger ? Theme.danger-text : Theme.text-muted;
             }
         }
         Text {
             vertical-alignment: center;
             text: root.text;
-            color: root.active ? Theme.on-accent : Theme.text-secondary;
+            color: root.active ? Theme.on-accent : root.danger ? Theme.danger-text : Theme.text-secondary;
             font-size: Theme.font-body;
             font-weight: root.active ? 600 : 400;
             horizontal-stretch: 1;
         }
-        if root.tall : Rectangle {
+        if root.tall && !root.danger : Rectangle {
             width: 16px;
             IconDisplay {
                 icon: IconSet.ChevronRight;
@@ -1488,6 +1495,8 @@ component SettingsNav inherits VerticalLayout {
     in property <int> tab;
     in property <bool> narrow: false;
     callback picked(int);
+    /// Narrow: the list's Reset to defaults row was tapped.
+    callback reset-asked();
     padding: Theme.gap-md;
     spacing: Theme.gap-xs;
     // Indices are mirrored by `settingsui::TAB_*`. The narrow list
@@ -1508,6 +1517,17 @@ component SettingsNav inherits VerticalLayout {
     NavItem { text: Tr.tab-credits;   icon: IconSet.Heart;             tall: root.narrow; active: !root.narrow && root.tab == 6; clicked => { root.picked(6); } }
     NavItem { text: Tr.tab-about;     icon: IconSet.Info;              tall: root.narrow; active: !root.narrow && root.tab == 7; clicked => { root.picked(7); } }
     NavItem { text: Tr.tab-licenses;  icon: IconSet.Scale;             tall: root.narrow; active: !root.narrow && root.tab == 9; clicked => { root.picked(9); } }
+    // Narrow: Reset to defaults ends the list, a group gap under the
+    // rest — the phone's footer has room for Close and Save and close
+    // only. The footer still asks first.
+    if root.narrow : Rectangle { height: Theme.gap-lg; }
+    if root.narrow : NavItem {
+        text: Tr.reset-defaults;
+        icon: IconSet.RotateCcw;
+        tall: true;
+        danger: true;
+        clicked => { root.reset-asked(); }
+    }
     if root.narrow : Rectangle { }
 }
 
@@ -1548,7 +1568,10 @@ component SettingsContent inherits ScrollView {
 /// the footer turns into the question (one place for the wide page
 /// and the phone's, no dialog on top of a dialog).
 component SettingsFooter inherits Rectangle {
-    property <bool> confirming: false;
+    /// Asking whether to reset: the footer is the question.
+    in-out property <bool> confirming: false;
+    /// Narrow: Reset to defaults is the section list's last row.
+    in property <bool> narrow: false;
     height: footer.preferred-height;
     background: Theme.bg-primary;
     Rectangle { y: 0; height: 1px; width: 100%; background: Theme.border; }
@@ -1561,12 +1584,19 @@ component SettingsFooter inherits Rectangle {
             font-size: Theme.font-sm;
             wrap: word-wrap;
         }
+        // Reset apart on the left, the two ways out together on the
+        // right: Close puts back what was changed, Save and close keeps
+        // it.
         HorizontalLayout {
             spacing: Theme.gap-sm;
-            Rectangle { }
-            if !root.confirming : Btn {
+            if !root.confirming && !root.narrow : Btn {
                 text: Tr.reset-defaults;
                 clicked => { root.confirming = true; }
+            }
+            Rectangle { }
+            if !root.confirming : Btn {
+                text: Tr.settings-close;
+                clicked => { SettingsLogic.discard-and-close(); }
             }
             if !root.confirming : Btn {
                 text: Tr.save-and-close;
@@ -1636,6 +1666,15 @@ export component SettingsPanel inherits FocusScope {
         accept
     }
 
+    // The footer's question (Reset to defaults?), shared by both
+    // layouts: narrow, the list's last row asks it.
+    property <bool> reset-asking: false;
+    // The section and its footer share one column beside the nav, at
+    // most the content's 560 px measure plus its padding: on a
+    // maximized window Save and close stays under the form it saves,
+    // not at the far edge.
+    property <length> column: Math.min(root.width - 188px, 560px + 2 * Theme.gap-xl);
+
     if !root.narrow : HorizontalLayout {
         width: 100%;
         height: 100%;
@@ -1648,10 +1687,13 @@ export component SettingsPanel inherits FocusScope {
             }
         }
         VerticalLayout {
+            width: root.column;
             if root.tab != 9 : SettingsContent { tab: root.tab; }
             if root.tab == 9 : LicensesView { pad: Theme.gap-xl; }
-            SettingsFooter { }
+            SettingsFooter { confirming <=> root.reset-asking; }
         }
+        // The rest of a wide window.
+        Rectangle { }
     }
 
     if root.narrow : VerticalLayout {
@@ -1694,13 +1736,17 @@ export component SettingsPanel inherits FocusScope {
                 root.tab = i;
                 root.section-open = true;
             }
+            reset-asked => { root.reset-asking = true; }
         }
         if root.section-open && root.tab != 9 : SettingsContent {
             tab: root.tab;
             pad: Theme.gap-lg;
         }
         if root.section-open && root.tab == 9 : LicensesView { pad: Theme.gap-lg; }
-        SettingsFooter { }
+        SettingsFooter {
+            narrow: true;
+            confirming <=> root.reset-asking;
+        }
     }
 }
 

@@ -36,7 +36,11 @@ export component MainWindow inherits Window {
     preferred-height: 640px;
     min-width: 500px;
     min-height: 400px;
-    icon: @image-url("../../../assets/icons/icon-256.png");   // app icon (workspace assets/), 256 px: the 1254 px original is 6 MiB decoded, over Slint's image cache, and stayed resident once for the window and once for the tray (review P2-45). Windows exe/taskbar icon is embedded by desktop/build.rs
+    // The tray's flat glyph (scripts/tray-icons.py), which reads at a
+    // title bar's 16 px where the painted app icon was a grey blur. On
+    // Windows Slint gives it to the taskbar button and Alt-Tab too; the
+    // exe's own icon (desktop/build.rs, icon.ico) stays the painted one.
+    icon: @image-url("../../../assets/icons/tray.png");
 
     // Share-dialog local state
     in-out property <bool> share-dialog-open: false;
@@ -417,54 +421,6 @@ export component MainWindow inherits Window {
         }
     }
 
-    // ── Context menu ───────────────────────────────────────────────
-    // The host fills `State.menu-*` and opens it; a click anywhere
-    // outside the columns (consumed, as a native menu would) or
-    // Escape closes it. A second column opens beside an entry with a
-    // submenu while the pointer rests on it, to the right when there
-    // is room, else to the left; both columns stay inside the window.
-    if State.menu-open : menu-layer := Rectangle {
-        property <int> open-entry: -1;
-        property <int> open-model: -1;
-        property <length> open-y;
-        TouchArea {
-            pointer-event(ev) => {
-                if (ev.kind == PointerEventKind.down) { Logic.menu-closed(); }
-            }
-        }
-        menu-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.menu-closed(); return accept; }
-                reject
-            }
-        }
-        main-column := MenuPanel {
-            entries: State.menu-entries;
-            open-entry: menu-layer.open-entry;
-            volume <=> State.menu-volume;
-            volume-changed(v) => { Logic.menu-volume-changed(v); }
-            volume-released(v) => { Logic.menu-volume-released(v); }
-            x: Math.max(Theme.gap-sm, Math.min(State.menu-x, root.width - self.width - Theme.gap-sm));
-            y: Math.max(Theme.gap-sm, Math.min(State.menu-y, root.height - self.height - Theme.gap-sm));
-            submenu-hovered(entry, model, y) => {
-                menu-layer.open-entry = model >= 0 ? entry : -1;
-                menu-layer.open-model = model;
-                menu-layer.open-y = y;
-            }
-            activated(id) => { Logic.menu-activated(id); }
-        }
-        if menu-layer.open-model >= 0 && menu-layer.open-model < State.menu-submenus.length : MenuPanel {
-            entries: State.menu-submenus[menu-layer.open-model];
-            x: main-column.x + main-column.width - 4px + self.width <= root.width - Theme.gap-sm
-                ? main-column.x + main-column.width - 4px
-                : Math.max(Theme.gap-sm, main-column.x - self.width + 4px);
-            y: Math.max(Theme.gap-sm, Math.min(main-column.y + menu-layer.open-y - 4px,
-                root.height - self.height - Theme.gap-sm));
-            activated(id) => { Logic.menu-activated(id); }
-        }
-    }
-
     // ── Stream viewer as a page (single-window hosts; ANDROID-SPEC.md D23)
     // The desktop never sets State.watch-open (it opens a
     // StreamViewerWindow per peer). Above the main screen, below the
@@ -515,9 +471,10 @@ export component MainWindow inherits Window {
 
     // ── Settings and the admin panel as pages (ANDROID-SPEC.md D22, D71)
     // Each covers the whole window on every host, its own tab list
-    // where the sidebar was. Above the main screen and the context
-    // menu, below the toast and the dialogs (an admin action can open
-    // the invite or channel dialog over its page).
+    // where the sidebar was. Above the main screen, below the context
+    // menu (the admin panel's Actions open it), the toast and the
+    // dialogs (an admin action can open the invite or channel dialog
+    // over its page).
     // Back steps back (a section → the list → out, as the arrow does),
     // taken in the capture phase, before any field inside sees it; so
     // does Escape on the desktop, in the bubble phase, after whatever
@@ -604,6 +561,55 @@ export component MainWindow inherits Window {
                 section-open <=> State.admin-section-open;
                 narrow: root.narrow;
             }
+        }
+    }
+
+    // ── Context menu ───────────────────────────────────────────────
+    // Above the pages: the admin panel's Actions buttons open it.
+    // The host fills `State.menu-*` and opens it; a click anywhere
+    // outside the columns (consumed, as a native menu would) or
+    // Escape closes it. A second column opens beside an entry with a
+    // submenu while the pointer rests on it, to the right when there
+    // is room, else to the left; both columns stay inside the window.
+    if State.menu-open : menu-layer := Rectangle {
+        property <int> open-entry: -1;
+        property <int> open-model: -1;
+        property <length> open-y;
+        TouchArea {
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.down) { Logic.menu-closed(); }
+            }
+        }
+        menu-keys := FocusScope {
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape || ev.text == Key.Back) { Logic.menu-closed(); return accept; }
+                reject
+            }
+        }
+        main-column := MenuPanel {
+            entries: State.menu-entries;
+            open-entry: menu-layer.open-entry;
+            volume <=> State.menu-volume;
+            volume-changed(v) => { Logic.menu-volume-changed(v); }
+            volume-released(v) => { Logic.menu-volume-released(v); }
+            x: Math.max(Theme.gap-sm, Math.min(State.menu-x, root.width - self.width - Theme.gap-sm));
+            y: Math.max(Theme.gap-sm, Math.min(State.menu-y, root.height - self.height - Theme.gap-sm));
+            submenu-hovered(entry, model, y) => {
+                menu-layer.open-entry = model >= 0 ? entry : -1;
+                menu-layer.open-model = model;
+                menu-layer.open-y = y;
+            }
+            activated(id) => { Logic.menu-activated(id); }
+        }
+        if menu-layer.open-model >= 0 && menu-layer.open-model < State.menu-submenus.length : MenuPanel {
+            entries: State.menu-submenus[menu-layer.open-model];
+            x: main-column.x + main-column.width - 4px + self.width <= root.width - Theme.gap-sm
+                ? main-column.x + main-column.width - 4px
+                : Math.max(Theme.gap-sm, main-column.x - self.width + 4px);
+            y: Math.max(Theme.gap-sm, Math.min(main-column.y + menu-layer.open-y - 4px,
+                root.height - self.height - Theme.gap-sm));
+            activated(id) => { Logic.menu-activated(id); }
         }
     }
 
