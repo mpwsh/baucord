@@ -215,13 +215,11 @@ impl AppState {
         s.set_deafened(false);
         s.set_sharing(false);
         s.set_stream_stats("".into());
-        s.set_status_text(format!("●  {}", t!("status-disconnected")).into());
+        s.set_status_text(t!("status-disconnected").into());
         s.set_status_color(slint::Color::from_rgb_u8(0xE0, 0x1E, 0x5A));
-        s.set_latency_line(
-            t!("latency-line",
-                "audio" => "--", "network" => "--", "up" => "--", "down" => "--")
-            .into(),
-        );
+        s.set_latency_line(t!("latency-line", "audio" => "--", "network" => "--").into());
+        s.set_latency_up("--".into());
+        s.set_latency_down("--".into());
         s.set_resource_line(" ".into());
         s.set_users_count_label(t!("users-count", "count" => 0u32).into());
         self.users_model.set_vec(Vec::new());

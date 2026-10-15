@@ -9,7 +9,7 @@ error-nickname-empty = O apelido não pode ficar vazio
 # ── Missing-device warning ──────────────────────────────────────────────
 device-missing-mic = microfone "{ $name }"
 device-missing-output = saída "{ $name }"
-device-warning = ⚠ { $devices } salvo(s) não conectado(s)
+device-warning = { $devices } salvo(s) não conectado(s)
 device-warning-hint = Abra as Configurações para escolher outro dispositivo
 list-and = e
 
@@ -94,7 +94,7 @@ chat-server-muted-locked = O servidor silenciou você; poderá reativar o microf
 chat-your-roles-changed = Seus cargos agora são: { $roles }
 roles-none = nenhum
 reason-none = (sem motivo)
-chat-admin-users-header = { $count } usuário(s) registrados (● online):
+chat-admin-users-header = { $count } usuário(s) registrados:
 chat-admin-list-more = … e mais { $count }. O painel de administração mostra todos.
 chat-admin-restrictions-header = { $count } restrição(ões):
 chat-admin-invites-header = { $count } convite(s):
@@ -142,7 +142,9 @@ live = Ao vivo
 stream-stats-quality = { $quality } · { $viewers } assistindo
 stream-stats-frame = { $kb }KB · { $ms }ms cod
 stream-stats-degraded = { $fps }% fps · perda { $loss }%
-latency-line = Áudio: { $audio } | Rede: { $network } | ↑{ $up } ↓{ $down } Mb
+latency-line = Áudio: { $audio } | Rede: { $network }
+# The transfer rates' unit, after the download rate (the arrows are drawn).
+latency-unit = Mb
 
 # ── Chat ────────────────────────────────────────────────────────────────
 send = Enviar
@@ -880,6 +882,8 @@ admin-act-report-user = denunciou
 admin-act-report-resolve = tratou a denúncia
 admin-act-user-delete = excluiu, a pedido do dono, a conta
 chat-admin-reports-header = { $count } denúncias, mais recentes primeiro
+# After a report /reports lists that was already dealt with.
+chat-admin-report-handled = tratada
 chat-command-usage-resolve = Uso: /resolve <número da denúncia> (veja /reports)
 # ── A linha de termos do cartão de conexão (1.2) ─────────────────────
 terms-notice = Ao conectar, você concorda com os

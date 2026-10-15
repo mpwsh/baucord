@@ -9,7 +9,7 @@ error-nickname-empty = Nickname cannot be empty
 # ── Missing-device warning ──────────────────────────────────────────────
 device-missing-mic = mic "{ $name }"
 device-missing-output = output "{ $name }"
-device-warning = ⚠ Saved { $devices } not connected
+device-warning = Saved { $devices } not connected
 device-warning-hint = Open Settings to pick another device
 list-and = and
 
@@ -94,7 +94,7 @@ chat-server-muted-locked = You are muted by the server; you can unmute once it l
 chat-your-roles-changed = Your roles are now: { $roles }
 roles-none = none
 reason-none = (no reason given)
-chat-admin-users-header = { $count } user(s) of record (● online):
+chat-admin-users-header = { $count } user(s) of record:
 chat-admin-list-more = … and { $count } more. The admin panel lists them all.
 chat-admin-restrictions-header = { $count } restriction(s):
 chat-admin-invites-header = { $count } invite(s):
@@ -142,7 +142,9 @@ live = Live
 stream-stats-quality = { $quality } · { $viewers } watching
 stream-stats-frame = { $kb }KB · { $ms }ms enc
 stream-stats-degraded = { $fps }% fps · loss { $loss }%
-latency-line = Audio: { $audio } | Net: { $network } | ↑{ $up } ↓{ $down } Mb
+latency-line = Audio: { $audio } | Net: { $network }
+# The transfer rates' unit, after the download rate (the arrows are drawn).
+latency-unit = Mb
 
 # ── Chat ────────────────────────────────────────────────────────────────
 send = Send
@@ -882,6 +884,8 @@ admin-act-report-user = reported
 admin-act-report-resolve = handled report
 admin-act-user-delete = deleted, at its owner's request, the account
 chat-admin-reports-header = { $count } reports, newest first
+# After a report /reports lists that was already dealt with.
+chat-admin-report-handled = handled
 chat-command-usage-resolve = Usage: /resolve <report number> (see /reports)
 # ── The connect card's terms line (1.2): the lead-in, then the link ──
 terms-notice = By connecting you agree to the

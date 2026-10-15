@@ -321,7 +321,7 @@ component RolePick inherits Rectangle {
 /// panel first. Drawn like the role picker beside it, a dropdown.
 component ActionsButton inherits Rectangle {
     in property <AdminUserRow> u;
-    width: label.preferred-width + Theme.gap-md + Theme.gap-sm + Theme.gap-sm + caret.preferred-width;
+    width: label.preferred-width + Theme.gap-md + Theme.gap-sm + Theme.gap-sm + 14px;
     height: 36px;
     border-radius: Theme.radius-md;
     background: Theme.surface;
@@ -345,11 +345,14 @@ component ActionsButton inherits Rectangle {
             font-size: Theme.font-body;
             vertical-alignment: center;
         }
-        caret := Text {
-            text: "▾";
-            color: Theme.text-muted;
-            font-size: Theme.font-body;
-            vertical-alignment: center;
+        // The Dropdown's caret (widgets.slint): an icon, not a "▾".
+        Rectangle {
+            width: 14px;
+            IconDisplay {
+                icon: IconSet.ChevronDown;
+                size: 14px;
+                stroke: Theme.text-muted;
+            }
         }
     }
     touch := TouchArea {

@@ -237,9 +237,13 @@ export global State {
     in property <bool> show-timestamps: true;
     in property <bool> compact-rows: false;
     in property <bool> sharing;
-    in property <string> status-text;      // "● Connected"
+    in property <string> status-text;      // "Connected" (the dot is drawn, in status-color)
     in property <color> status-color: #2BAC76;
-    in property <string> latency-line;
+    in property <string> latency-line;     // "Audio: 42ms | Net: 38ms"
+    // The transfer rates after it, in Mb, beside drawn arrows (no
+    // "↑"/"↓": Android's system font has neither).
+    in property <string> latency-up: "--";
+    in property <string> latency-down: "--";
     in property <string> resource-line;
     in property <string> stream-stats;     // "" hides the block
     in property <bool> stream-degraded;

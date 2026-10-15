@@ -934,11 +934,15 @@ export component Dropdown inherits Rectangle {
             overflow: elide;
             horizontal-stretch: 1;
         }
-        Text {
-            text: "▾";
-            color: Theme.text-muted;
-            font-size: Theme.font-body;
-            vertical-alignment: center;
+        // An icon, not a "▾": Windows' and Android's system fonts have
+        // no such character, and Slint draws a square for it there.
+        Rectangle {
+            width: 14px;
+            IconDisplay {
+                icon: IconSet.ChevronDown;
+                size: 14px;
+                stroke: Theme.text-muted;
+            }
         }
     }
     touch := TouchArea {

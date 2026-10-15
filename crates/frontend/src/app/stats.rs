@@ -19,7 +19,7 @@ impl AppState {
     ) {
         use app_core::stats::{latency_grade, net_str, LatencyGrade};
         let s = self.main.global::<State>();
-        s.set_status_text(format!("●  {}", t!("status-connected")).into());
+        s.set_status_text(t!("status-connected").into());
         s.set_status_color(match latency_grade(rtt_ms) {
             LatencyGrade::Good => slint::Color::from_rgb_u8(0x2B, 0xAC, 0x76),
             LatencyGrade::Fair => slint::Color::from_rgb_u8(0xEC, 0xB2, 0x2E),
@@ -32,11 +32,12 @@ impl AppState {
         s.set_latency_line(
             t!("latency-line",
                 "audio" => audio_str,
-                "network" => net_str(rtt_ms, loss_pct),
-                "up" => format!("{:.1}", kbps_up / 1000.0),
-                "down" => format!("{:.1}", kbps_down / 1000.0))
+                "network" => net_str(rtt_ms, loss_pct))
             .into(),
         );
+        // In Mb, beside the arrows the sidebar draws.
+        s.set_latency_up(format!("{:.1}", kbps_up / 1000.0).into());
+        s.set_latency_down(format!("{:.1}", kbps_down / 1000.0).into());
     }
 
     #[allow(clippy::cast_precision_loss)]

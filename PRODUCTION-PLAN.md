@@ -1457,6 +1457,15 @@ One line each; the spec decision named holds the detail.
   their content and buttons in one column beside the tabs. Reset to
   defaults now also re-applies the echo canceller's mode, the log level
   and the name's colour. `DEVICE-CHECKLIST.md` **[10-15]**.
+- **2026-10-15 — no squares for symbols on Windows and Android**: the
+  dropdowns' "▾" (a square on both) is a Lucide chevron; the status
+  dot is drawn and the transfer rates' "↑"/"↓" are icons; `/users`
+  says "now" instead of "●"/"○", `/reports` "handled" instead of "✓",
+  and the device warning drops its "⚠". The app ships no font and
+  Slint does not fall back for a character Segoe UI or Roboto lacks
+  (SESSION-GUIDE §4 has the rule and how to see it here).
+  User-typed symbols in chat can still show as squares on a phone: a
+  bundled fallback font would cover them, not done.
 - **2026-10-15 — the windows' icon is the tray's glyph**: the main
   window loads `tray.png` (it shrank the painted icon, a grey blur at
   a title bar's 16 px) and the stream viewer, which had no icon, too;

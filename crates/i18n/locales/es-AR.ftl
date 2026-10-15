@@ -95,7 +95,7 @@ chat-server-muted-locked = El servidor te silenció; vas a poder activar el micr
 chat-your-roles-changed = Tus roles ahora son: { $roles }
 roles-none = ninguno
 reason-none = (sin motivo)
-chat-admin-users-header = { $count } usuario(s) registrados (● conectados):
+chat-admin-users-header = { $count } usuario(s) registrados:
 chat-admin-list-more = … y { $count } más. El panel de administración los muestra todos.
 chat-admin-restrictions-header = { $count } restricción(es):
 chat-admin-invites-header = { $count } invitación(es):
@@ -143,7 +143,9 @@ live = En vivo
 stream-stats-quality = { $quality } · { $viewers } viendo
 stream-stats-frame = { $kb }KB · { $ms }ms cod
 stream-stats-degraded = { $fps }% fps · pérdida { $loss }%
-latency-line = Audio: { $audio } | Server: { $network } | ↑{ $up } ↓{ $down } Mb
+latency-line = Audio: { $audio } | Server: { $network }
+# The transfer rates' unit, after the download rate (the arrows are drawn).
+latency-unit = Mb
 
 # ── Chat ────────────────────────────────────────────────────────────────
 send = Enviar
@@ -881,6 +883,8 @@ admin-act-report-user = denunció a
 admin-act-report-resolve = atendió la denuncia
 admin-act-user-delete = borró, a pedido de su dueño, la cuenta
 chat-admin-reports-header = { $count } denuncias, las más nuevas primero
+# After a report /reports lists that was already dealt with.
+chat-admin-report-handled = atendida
 chat-command-usage-resolve = Uso: /resolve <número de denuncia> (ver /reports)
 # ── La línea de términos de la tarjeta de conexión (1.2) ──────────────
 terms-notice = Al conectarte aceptás los

@@ -999,6 +999,18 @@ Memory-mode servers (persistence off) still use the legacy
   `fired` (`held` on a chat row): the finger's release comes after
   the hold's action and would run the tap's too. A nested target (a
   picture, a link, a file button in a row) checks the row's `held`.
+- **No symbol characters in what the app draws as text.** The app
+  ships no font: Windows draws with Segoe UI, Android with Roboto, and
+  Slint 1.18 does not fall back to another font for a character they
+  lack — Android shows a square (Skia's missing glyph), as Windows did
+  for the dropdowns' "▾". Roboto has none of ▾ ▼ ● ○ → ↑ ↓ ⚠ ✓
+  (checked with fontTools, 2026-10-15); Segoe UI has the WGL4 set (●
+  ○ arrows ≥) but not ▾ ⚠ ✓. Draw it instead — a Lucide icon
+  (`IconSet.ChevronDown` for a caret), a `Rectangle` for a dot — or say
+  it in words. Latin-1 and general punctuation (· × — … “ ”) are safe.
+  To see it here: run the page simulator with a `FONTCONFIG_FILE` that
+  lists only `/usr/share/fonts/truetype/roboto` (`fonts-roboto-unhinted`):
+  a missing character then draws as nothing.
 - **A window's `icon` is its taskbar icon too, on Windows**: Slint
   gives the one image to both `WM_SETICON` slots (title bar and
   taskbar/Alt-Tab; `i-slint-backend-winit` `set_window_icon`). The

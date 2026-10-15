@@ -334,6 +334,11 @@ Play music in another app first, at a steady volume.
   buttons right under it (Save and close under the form, a person's
   Actions and role beside their name, the panel's Close under the
   list).
+- [ ] **new [10-15]** — every dropdown (Settings → General's Language,
+  the admin panel's role picker and Actions) shows a chevron at its
+  right, not a square; the sidebar's status reads "● Connected" with a
+  round dot, and the line under it "… | ↑0.1 ↓0.3 Mb" with arrows. On
+  the phone too (§2.3).
 - [ ] **new [10-15]** — make the window narrower with the panel open:
   under about 830 px the rows stack (a person's actions on two lines,
   the audit as two-line entries); under 600 px Settings and the panel
@@ -527,6 +532,10 @@ agrees with it.
   close; Reset to defaults is the list's last row, in red, and turns
   the footer into the question. Change something, then Close: it goes
   back.
+- [ ] **new [10-15]** — no squares where a symbol should be: the
+  dropdowns' chevrons, the dot before "Connected", the arrows by the
+  transfer rates; `/users` says "now" for whoever is online and
+  `/reports` "handled" after a dealt-with report.
 - [ ] **new [10-15]** — Roles → New role: the badge's glyphs and
   colours wrap into rows; pick one of each, Save; the role shows with
   its badge.

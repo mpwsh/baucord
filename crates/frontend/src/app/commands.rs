@@ -825,13 +825,10 @@ impl AppState {
                 for u in users.into_iter().take(COMMAND_LIST_ROWS) {
                     let roles: Vec<String> =
                         u.roles.iter().map(|r| self.role_name_of(*r)).collect();
+                    // Online is said in words: no "●", which Android's
+                    // system font cannot draw.
                     let line = format!(
-                        "{}{} — {} — {} — {}",
-                        if u.client_id.is_some() {
-                            "● "
-                        } else {
-                            "○ "
-                        },
+                        "{} — {} — {} — {}",
                         u.name,
                         if roles.is_empty() {
                             t!("admin-list-no-roles")
@@ -839,7 +836,11 @@ impl AppState {
                             roles.join(", ")
                         },
                         short_id(&u.user_id),
-                        describe_ago(u.last_seen)
+                        if u.client_id.is_some() {
+                            t!("admin-now")
+                        } else {
+                            describe_ago(u.last_seen)
+                        }
                     );
                     self.push_command_output(&line);
                 }
@@ -934,7 +935,8 @@ impl AppState {
                         line.push(')');
                     }
                     if r.resolved {
-                        line.push_str(" ✓");
+                        line.push_str(" — ");
+                        line.push_str(&t!("chat-admin-report-handled"));
                     }
                     self.push_command_output(&line);
                 }

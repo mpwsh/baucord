@@ -102,7 +102,7 @@ impl AppState {
         }
 
         let s = self.main.global::<State>();
-        s.set_status_text(format!("●  {}", t!("status-connected")).into());
+        s.set_status_text(t!("status-connected").into());
         s.set_status_color(slint::Color::from_rgb_u8(0x2B, 0xAC, 0x76));
         // The name is the sidebar's title and the greeting the General
         // header's second line: neither repeats in chat on every login.
