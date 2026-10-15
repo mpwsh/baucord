@@ -59,6 +59,9 @@ pub enum Label {
     /// Block whoever wrote this message (a row's menu: they may be
     /// gone from the roster).
     BlockAuthor,
+    /// The admin panel's account actions (its Users tab).
+    ResetProfile,
+    Purge,
 }
 
 /// What activating an entry does, against the target the shell
@@ -108,6 +111,10 @@ pub enum Action {
     Report,
     ReportMessage,
     BlockAuthor,
+    /// The admin panel's account actions: put a person's name, colour
+    /// and picture back to the defaults; erase the account.
+    ResetProfile,
+    Purge,
 }
 
 /// One row of a menu.
@@ -470,6 +477,28 @@ pub fn message_menu(m: &MessageFacts) -> Vec<Entry> {
     entries
 }
 
+/// A person's actions in the admin panel's Users tab: the session ones
+/// (Disconnect needs one to end: only while they are `online`), then
+/// the account ones. Every one asks for confirmation in the panel, so
+/// each label ends in an ellipsis; the ones that take something away
+/// are in the danger color. Who may do what is the panel's door
+/// (`PANEL`) and the server's answer, as in the panel's buttons before.
+#[must_use]
+pub fn admin_user_menu(online: bool) -> Vec<Entry> {
+    let disconnect = if online {
+        Entry::new(Label::Disconnect, Action::Disconnect)
+    } else {
+        Entry::disabled(Label::Disconnect)
+    };
+    vec![
+        disconnect,
+        Entry::new(Label::Kick, Action::Kick).danger(),
+        Entry::new(Label::Ban, Action::Ban).danger(),
+        Entry::new(Label::ResetProfile, Action::ResetProfile).with_separator(),
+        Entry::new(Label::Purge, Action::Purge).danger(),
+    ]
+}
+
 /// The composer's menu. Cut and Copy need a `selection` to work on.
 #[must_use]
 pub fn composer_menu(selection: bool) -> Vec<Entry> {
@@ -493,6 +522,34 @@ mod tests {
 
     fn labels(entries: &[Entry]) -> Vec<Label> {
         entries.iter().map(|e| e.label.clone()).collect()
+    }
+
+    #[test]
+    fn the_admin_user_menu_lists_the_session_actions_then_the_account_ones() {
+        assert_eq!(
+            labels(&admin_user_menu(true)),
+            vec![
+                Label::Disconnect,
+                Label::Kick,
+                Label::Ban,
+                Label::ResetProfile,
+                Label::Purge
+            ]
+        );
+    }
+
+    #[test]
+    fn the_admin_user_menu_offers_disconnect_only_while_online() {
+        let disconnect = |online| admin_user_menu(online)[0].clone();
+        assert!(disconnect(true).enabled && disconnect(true).action == Action::Disconnect);
+        assert!(!disconnect(false).enabled && disconnect(false).action == Action::None);
+    }
+
+    #[test]
+    fn the_admin_user_menu_marks_what_takes_something_away() {
+        let danger: Vec<bool> = admin_user_menu(true).iter().map(|e| e.danger).collect();
+        assert_eq!(danger, vec![false, true, true, false, true]);
+        assert!(admin_user_menu(true)[3].separator);
     }
 
     #[test]

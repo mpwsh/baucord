@@ -296,6 +296,17 @@ impl AppState {
         self.menu_actions = actions;
     }
 
+    /// A person's Actions menu in the admin panel's Users tab, under
+    /// the button at window coordinates `x`, `y`.
+    pub(crate) fn open_admin_user_menu(&mut self, user_id: String, online: bool, x: f32, y: f32) {
+        self.show_menu(
+            menu::admin_user_menu(online),
+            MenuTarget::AdminUser(user_id),
+            x,
+            y,
+        );
+    }
+
     /// Escape, a click outside, or a pick: the overlay goes, and the
     /// composer takes back the focus the overlay's key scope held.
     pub(super) fn close_menu(&mut self) {
@@ -356,6 +367,9 @@ impl AppState {
                 self.composer_take(cursor, anchor, false);
             }
             (MenuTarget::Composer { .. }, A::Paste) => media::paste_into_chat(self),
+            (MenuTarget::AdminUser(user_id), action) => {
+                crate::adminui::user_action(self, &user_id, action);
+            }
             _ => {}
         }
     }

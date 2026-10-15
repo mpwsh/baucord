@@ -542,6 +542,9 @@ pub struct AppState {
     pub(crate) admin_blob_cap: u64,
     /// The panel's action awaiting its confirmation.
     pub(crate) admin_pending: Option<crate::adminui::PanelAction>,
+    /// The Settings page's state when it opened, for its Close; `None`
+    /// while it is shut.
+    pub(crate) settings_opened: Option<crate::settingsui::OpenedWith>,
 
     /// The server entry this session connected with (its name): what
     /// an account deletion clears, whatever the default is by then.
@@ -816,6 +819,7 @@ pub fn run() {
         admin_audit_oldest: None,
         admin_blob_cap: 0,
         admin_pending: None,
+        settings_opened: None,
         session_server: None,
         account_deleted: false,
         viewers: HashMap::new(),
@@ -1841,6 +1845,8 @@ enum MenuTarget {
         cursor: usize,
         anchor: usize,
     },
+    /// A person in the admin panel's Users tab, by their user id (hex).
+    AdminUser(String),
 }
 
 /// The first bytes of a user id, for log lines and the identity panel.
@@ -2312,6 +2318,8 @@ fn menu_label(label: &menu::Label) -> slint::SharedString {
         L::Report => "menu-report",
         L::ReportMessage => "menu-report-message",
         L::BlockAuthor => "menu-block-author",
+        L::ResetProfile => "menu-reset-profile",
+        L::Purge => "menu-purge",
     };
     t!(key).into()
 }

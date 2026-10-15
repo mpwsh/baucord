@@ -558,7 +558,13 @@ Memory-mode servers (persistence off) still use the legacy
   focused on open and again whenever `focus-composer` runs while it
   is open, so a main-window dialog closed over it hands the keyboard
   back. Only one page at a time (`adminui::open` saves and closes
-  Settings, `settingsui::open_on` closes the panel). The stream viewer
+  Settings, `settingsui::open_on` closes the panel). Settings' Close
+  puts back what the page changed (ANDROID-SPEC D72): **a setting the
+  page applies live must also be pushed by
+  `AppState::apply_settings_live`** (devices.rs), which Close and
+  Reset to defaults both end with, and a field of `Settings` the page
+  does not own must be carried over in `OpenedWith::restored_onto`, or
+  Close will undo it too. The stream viewer
   is the one window left on the desktop: `viewers::Viewer` owns a
   private `Surface::{Window, Page}` and the rest of the app only calls
   its methods (`raise`, `update_frame`, `close`, `apply_text_scale`) —

@@ -315,11 +315,25 @@ Play music in another app first, at a steady volume.
   the tray: the microphone closes (Windows' microphone icon goes);
   Show from the tray: Settings is still open and the meter moves.
 - [ ] **new [10-15]** — the Admin chip: the panel covers the window,
-  its tabs on the left; every tab fills. Ban someone: the
-  confirmation asks; Escape closes only it, a second Escape the
-  panel. Invites → Create invite: the invite dialog shows over the
+  its tabs on the left; every tab fills. Users: each person has
+  "Actions ▾" beside the role picker; it opens a menu under it
+  (Disconnect…, greyed while they are offline; Kick…, Ban…; Reset
+  profile…, Purge…). Ban someone from it: the confirmation asks;
+  Escape closes only it, a second Escape the panel. Escape with the
+  menu open closes only the menu. Invites → Create invite: the invite dialog shows over the
   panel; close it and press Escape: the panel closes (the keyboard
   came back to it).
+- [ ] **new [10-15]** — Settings: change the language, the text size,
+  the microphone and a keybind, then press Close (not Save and
+  close): each goes back to what it was, at once, and after a restart
+  too. Change one again and press Save and close: it stays. Escape
+  saves, as before. Pick a new picture, then Close: the old one is
+  back, and nobody else saw the new one.
+- [ ] **new [10-15]** — maximize the window with Settings, then the
+  panel open: the content keeps to a column beside the tabs, its
+  buttons right under it (Save and close under the form, a person's
+  Actions and role beside their name, the panel's Close under the
+  list).
 - [ ] **new [10-15]** — make the window narrower with the panel open:
   under about 830 px the rows stack (a person's actions on two lines,
   the audit as two-line entries); under 600 px Settings and the panel
@@ -504,10 +518,15 @@ agrees with it.
   Back: the chat. Every tab reads at 360 dp without anything cut
   that matters (a long name, a ban's reason, a reported message in
   full), and the row buttons are easy to hit.
-- [ ] **new [10-15]** — Users: change someone's role with the picker
-  beside Reset profile / Purge. Ban: the confirmation's reason field
-  stays above the keyboard; Back closes only the confirmation, the
-  next Back the tab.
+- [ ] **new [10-15]** — Users: each person's name across the width,
+  "Actions ▾" and the role picker under it. Tap Actions: the menu
+  opens under it; Ban…: the confirmation's reason field stays above
+  the keyboard; Back closes only the confirmation, the next Back the
+  tab. Change someone's role with the picker.
+- [ ] **new [10-15]** — Settings: the footer is Close and Save and
+  close; Reset to defaults is the list's last row, in red, and turns
+  the footer into the question. Change something, then Close: it goes
+  back.
 - [ ] **new [10-15]** — Roles → New role: the badge's glyphs and
   colours wrap into rows; pick one of each, Save; the role shows with
   its badge.

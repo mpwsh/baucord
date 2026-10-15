@@ -5,6 +5,7 @@
 //! tab's model, and every row action is the same `AdminCommand` the
 //! slash command sends — after which the tab refreshes itself.
 
+use app_core::menu::Action;
 use client::{network::NetworkControl, AdminCommand, AdminOutcome, AdminTarget};
 use i18n::t;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
@@ -107,8 +108,9 @@ pub(crate) fn wire_page(main: &MainWindow) {
 fn wire(main: &MainWindow) {
     let logic = main.global::<AdminLogic>();
     logic.on_refresh(|tab| app::with_current(move |app| refresh(app, tab)));
-    logic.on_user_action(|user_id, action| {
-        app::with_current(move |app| user_action(app, &user_id, action));
+    // A person's Actions button: the app's own menu, at the button.
+    logic.on_user_actions(|user_id, online, x, y| {
+        app::with_current(move |app| app.open_admin_user_menu(user_id.to_string(), online, x, y));
     });
     logic.on_user_set_role(|user_id, index| {
         app::with_current(move |app| {
@@ -139,9 +141,9 @@ fn wire(main: &MainWindow) {
             if let Some(model) = app
                 .main
                 .global::<AdminState>()
-                    .get_perm_on()
-                    .as_any()
-                    .downcast_ref::<VecModel<bool>>()
+                .get_perm_on()
+                .as_any()
+                .downcast_ref::<VecModel<bool>>()
                 && let Ok(i) = usize::try_from(index)
                 && i < model.row_count()
             {
@@ -731,10 +733,11 @@ fn role_save(app: &mut AppState) {
     app.send_admin(command, PendingAdmin::Panel(TAB_ROLES));
 }
 
-/// A row button on the Users tab: every one of them asks first. The
-/// dialog says what the action does; the ones that carry a reason to
-/// the person ask for it there.
-fn user_action(app: &mut AppState, user_id: &str, action: i32) {
+/// A pick from a person's Actions menu on the Users tab
+/// (`menu::admin_user_menu`): every one of them asks first. The dialog
+/// says what the action does; the ones that carry a reason to the
+/// person ask for it there.
+pub(crate) fn user_action(app: &mut AppState, user_id: &str, action: Action) {
     let Some(target) = target_of(user_id) else {
         return;
     };
@@ -746,7 +749,7 @@ fn user_action(app: &mut AppState, user_id: &str, action: i32) {
         .unwrap_or_default();
     let n = name.as_str();
     let (pending, title, text, label, reason) = match action {
-        1 => (
+        Action::Disconnect => (
             PanelAction::on_users(AdminCommand::Disconnect {
                 target,
                 reason: String::new(),
@@ -756,7 +759,7 @@ fn user_action(app: &mut AppState, user_id: &str, action: i32) {
             t!("admin-disconnect"),
             true,
         ),
-        2 => (
+        Action::Kick => (
             PanelAction::on_users(AdminCommand::Kick {
                 target,
                 reason: String::new(),
@@ -766,7 +769,7 @@ fn user_action(app: &mut AppState, user_id: &str, action: i32) {
             t!("admin-kick"),
             true,
         ),
-        3 => (
+        Action::Ban => (
             PanelAction::on_users(AdminCommand::Ban {
                 target,
                 duration_secs: None,
@@ -777,14 +780,14 @@ fn user_action(app: &mut AppState, user_id: &str, action: i32) {
             t!("admin-ban"),
             true,
         ),
-        4 => (
+        Action::Purge => (
             PanelAction::on_users(AdminCommand::PurgeUser { target }),
             t!("admin-confirm-purge", "name" => n),
             t!("admin-confirm-purge-text"),
             t!("admin-purge"),
             false,
         ),
-        5 => (
+        Action::ResetProfile => (
             PanelAction::on_users(AdminCommand::ResetProfile {
                 target,
                 lock: false,

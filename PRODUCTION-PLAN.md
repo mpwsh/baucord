@@ -1446,6 +1446,17 @@ One line each; the spec decision named holds the detail.
   room's people are items of the tray menu, not of a submenu named
   after the room (still only our room's); read back from Slint's Linux
   tray over D-Bus.
+- **2026-10-15 — Settings' Close; Actions; the pages' column**
+  (ANDROID-SPEC D72, IOS-SPEC D62; the user's asks). Settings' footer
+  has Close beside Save and close: it puts back what the page changed,
+  in the running app too, and keeps nothing (Escape and Back still
+  save); on a phone Reset to defaults moved to the end of the section
+  list. The admin panel's Users tab has one "Actions ▾" per person (the
+  app's menu: Disconnect, Kick, Ban, Reset profile, Purge, each still
+  confirmed) instead of five buttons. On a wide window both pages keep
+  their content and buttons in one column beside the tabs. Reset to
+  defaults now also re-applies the echo canceller's mode, the log level
+  and the name's colour. `DEVICE-CHECKLIST.md` **[10-15]**.
 - **2026-10-15 — the windows' icon is the tray's glyph**: the main
   window loads `tray.png` (it shrank the painted icon, a grey blur at
   a title bar's 16 px) and the stream viewer, which had no icon, too;

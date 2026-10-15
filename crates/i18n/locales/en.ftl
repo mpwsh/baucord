@@ -21,6 +21,8 @@ tab-keyboard = Keyboard
 tab-credits = Credits
 tab-about = About
 save-and-close = Save and close
+# Settings' footer: leave without keeping what was changed since it opened.
+settings-close = Close
 reset-defaults = Reset to defaults
 reset-confirm-body = Every setting goes back to its default, including your saved servers, nickname and picture.
 reset-confirm = Reset everything
@@ -360,6 +362,9 @@ menu-unmute-chat = Unmute chat
 menu-disconnect = Disconnect…
 menu-kick = Kick…
 menu-ban = Ban…
+# The admin panel's Actions menu (Users tab): each asks first.
+menu-reset-profile = Reset profile…
+menu-purge = Purge…
 role-guest = Guest
 role-member = Member
 role-organizer = Organizer
@@ -698,6 +703,8 @@ admin-ban = Ban
 admin-reset-profile = Reset profile
 admin-purge = Purge
 admin-set-role = Set role…
+# A person's row in the admin panel: the button that opens their actions.
+admin-actions = Actions
 admin-roles = Roles
 admin-roles-lead = Permission sets. A role's standing follows what it can do.
 admin-holders = holder(s)

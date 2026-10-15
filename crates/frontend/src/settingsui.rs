@@ -13,7 +13,7 @@ use app_core::{
     meter::{Meter, Run as MeterRun},
 };
 use client::{
-    config::{build_bind_string, BindableAction, ServerEntry},
+    config::{build_bind_string, BindableAction, ServerEntry, Settings},
     network::{NetworkControl, LOG_UPLOAD_MIN_INTERVAL},
     protocol::MAX_LOG_UPLOAD_BYTES,
     voice::VoiceControl,
@@ -59,7 +59,9 @@ impl<'a> SettingsSurface<'a> {
     /// and not minimized (or in the tray).
     fn showing(self) -> bool {
         let window = self.0.window();
-        self.0.global::<State>().get_settings_open() && window.is_visible() && !window.is_minimized()
+        self.0.global::<State>().get_settings_open()
+            && window.is_visible()
+            && !window.is_minimized()
     }
 
     /// The selected nav tab (`TAB_*`).
@@ -94,6 +96,61 @@ impl<'a> SettingsSurface<'a> {
 /// The surface to drive: always the main window's page.
 pub(crate) fn surface(app: &AppState) -> SettingsSurface<'_> {
     SettingsSurface(&app.main)
+}
+
+/// What the page found when it opened (`open_on`); its Close puts the
+/// page's part of it back (`discard_and_close`). Every control applies
+/// at once, so closing without saving has to undo, not only skip the
+/// save.
+pub(crate) struct OpenedWith {
+    settings: Settings,
+    /// The picture file's bytes (`None`: no picture). Picking or
+    /// clearing one writes the file at once.
+    avatar: Option<Vec<u8>>,
+    profile_dirty: bool,
+    /// The page edited the server list: its list at open is put back.
+    /// Untouched, the list stays as it is now, with whatever a
+    /// connection pinned or spent meanwhile (`events.rs`).
+    servers_edited: bool,
+}
+
+impl OpenedWith {
+    fn now(app: &AppState) -> Self {
+        Self {
+            settings: app.settings.clone(),
+            avatar: std::fs::read(client::config::avatar_path()).ok(),
+            profile_dirty: app.profile_dirty,
+            servers_edited: false,
+        }
+    }
+
+    /// `now` with the page's fields as they were at open. What is not
+    /// the page's stays as it is: the main window's layout (sidebar
+    /// width, the Messages divider, hidden DMs), per-person volumes,
+    /// the share dialog's defaults, the ducking notice's flag.
+    fn restored_onto(&self, now: &Settings) -> Settings {
+        let mut restored = self.settings.clone();
+        restored.window.clone_from(&now.window);
+        restored.peer_settings.clone_from(&now.peer_settings);
+        restored.share.clone_from(&now.share);
+        restored.audio.lowering_told = now.audio.lowering_told;
+        restored.ui.messages_collapsed = now.ui.messages_collapsed;
+        restored.ui.sidebar_width = now.ui.sidebar_width;
+        restored.ui.messages_height = now.ui.messages_height;
+        restored.ui.hidden_dms.clone_from(&now.ui.hidden_dms);
+        if !self.servers_edited {
+            restored.servers.clone_from(&now.servers);
+            restored.server.clone_from(&now.server);
+        }
+        restored
+    }
+}
+
+/// A server entry was added, removed or edited on the page.
+fn note_servers_edited(app: &mut AppState) {
+    if let Some(opened) = &mut app.settings_opened {
+        opened.servers_edited = true;
+    }
 }
 
 /// A route's name as the picker shows it: the engine's English names
@@ -439,6 +496,11 @@ pub fn open(app: &mut AppState) {
 pub fn open_on(app: &mut AppState, tab: Option<i32>) {
     // One page at a time: the admin panel's (`adminui`) gives way.
     crate::adminui::close(app);
+    // What Close goes back to: taken when the page opens, not when it
+    // is asked for again while open (the connect view's pencil).
+    if app.settings_opened.is_none() {
+        app.settings_opened = Some(OpenedWith::now(app));
+    }
     populate(app);
     start_meter_timer(app);
 
@@ -931,6 +993,7 @@ fn wire(sf: SettingsSurface<'_>) {
 
     logic.on_server_set_default(|index| {
         app::with_current(move |app| {
+            note_servers_edited(app);
             if let Some(entry) = usize::try_from(index)
                 .ok()
                 .and_then(|i| app.settings.servers.get(i))
@@ -946,6 +1009,7 @@ fn wire(sf: SettingsSurface<'_>) {
 
     logic.on_server_add(|| {
         app::with_current(|app| {
+            note_servers_edited(app);
             // Unique display name: "New server", "New server 2", …
             let base = t!("server-new-name");
             let mut name = base.clone();
@@ -974,6 +1038,7 @@ fn wire(sf: SettingsSurface<'_>) {
 
     logic.on_server_remove(|| {
         app::with_current(|app| {
+            note_servers_edited(app);
             // Never below one entry — connect needs a server to point at.
             if app.settings.servers.len() <= 1 {
                 return;
@@ -999,6 +1064,7 @@ fn wire(sf: SettingsSurface<'_>) {
 
     logic.on_server_name_edited(|text| {
         app::with_current(move |app| {
+            note_servers_edited(app);
             let Some(index) = selected_server(app) else {
                 return;
             };
@@ -1030,6 +1096,7 @@ fn wire(sf: SettingsSurface<'_>) {
 
     logic.on_server_fingerprint_edited(|text| {
         app::with_current(move |app| {
+            note_servers_edited(app);
             let Some(index) = selected_server(app) else {
                 return;
             };
@@ -1046,6 +1113,7 @@ fn wire(sf: SettingsSurface<'_>) {
     });
     logic.on_server_invite_edited(|text| {
         app::with_current(move |app| {
+            note_servers_edited(app);
             let Some(index) = selected_server(app) else {
                 return;
             };
@@ -1253,11 +1321,15 @@ fn wire(sf: SettingsSurface<'_>) {
     logic.on_save_and_close(|| {
         app::with_current(close);
     });
+    logic.on_discard_and_close(|| {
+        app::with_current(discard_and_close);
+    });
 }
 
 /// Recompute the selected entry's `address` from the editor's IP and
 /// port fields (both are read fresh — either one may have changed).
 fn update_selected_address(app: &mut AppState) {
+    note_servers_edited(app);
     let Some(index) = selected_server(app) else {
         return;
     };
@@ -1444,8 +1516,7 @@ fn start_meter_timer(app: &mut AppState) {
                 // here: while the note about it shows, look whether it
                 // has been, and watch the keys from then on.
                 let state = surface(app).state();
-                let granted =
-                    state.get_keybinds_need_access() && crate::hotkeys::access_granted();
+                let granted = state.get_keybinds_need_access() && crate::hotkeys::access_granted();
                 if granted {
                     state.set_keybinds_need_access(false);
                 }
@@ -1733,16 +1804,8 @@ fn aec_status(report: Option<&audio::AecReport>) -> String {
 /// Close semantics (the Save button, the arrow, Escape and Back):
 /// cancel any recording, stop a running mic test, persist, hide.
 fn close(app: &mut AppState) {
-    cancel_capture(app);
-    if app.is_testing_mic {
-        app.handle_test_microphone(false);
-        let sf = surface(app);
-        sf.state().set_testing_mic(false);
-    }
-    app.meter_timer.stop();
-    // Nothing shows the meter any more: its microphone closes.
-    app.set_audio_tab_open(false);
-    note_meter_run(false);
+    app.settings_opened = None;
+    leave(app);
     // Collapse blank token fields and repair the default pointer
     // before the edits hit disk.
     app.settings.normalize_servers();
@@ -1761,6 +1824,60 @@ fn close(app: &mut AppState) {
     }
     let sf = surface(app);
     sf.hide();
+}
+
+/// What both ways out do first: cancel a recording, stop a running mic
+/// test, and close the microphone the Audio tab's meter held.
+fn leave(app: &mut AppState) {
+    cancel_capture(app);
+    if app.is_testing_mic {
+        app.handle_test_microphone(false);
+        let sf = surface(app);
+        sf.state().set_testing_mic(false);
+    }
+    app.meter_timer.stop();
+    // Nothing shows the meter any more: its microphone closes.
+    app.set_audio_tab_open(false);
+    note_meter_run(false);
+}
+
+/// The footer's Close: what the page changed goes back to how it was
+/// when it opened — in the running app as well, since every control
+/// applied at once — and the page closes. The settings file is written
+/// with that state when anything changed: the page's server and
+/// keybind edits save as they happen, so skipping the write would keep
+/// them on disk.
+fn discard_and_close(app: &mut AppState) {
+    leave(app);
+    let Some(opened) = app.settings_opened.take() else {
+        surface(app).hide();
+        return;
+    };
+    let restored = opened.restored_onto(&app.settings);
+    let avatar_now = std::fs::read(client::config::avatar_path()).ok();
+    let avatar_changed = avatar_now != opened.avatar;
+    let settings_changed =
+        serde_json::to_value(&restored).ok() != serde_json::to_value(&app.settings).ok();
+    if settings_changed || avatar_changed {
+        app.settings = restored;
+        if avatar_changed {
+            let path = client::config::avatar_path();
+            let put_back = match &opened.avatar {
+                Some(bytes) => std::fs::write(&path, bytes),
+                None => std::fs::remove_file(&path),
+            };
+            if let Err(e) = put_back {
+                log::warn!("settings: could not put the picture back: {e}");
+            }
+            app.forget_avatar_blob();
+            app.reload_own_avatar();
+        }
+        app.profile_dirty = opened.profile_dirty;
+        app.apply_settings_live();
+        app.settings.save();
+        log::info!("settings: closed without keeping the page's changes");
+    }
+    surface(app).hide();
 }
 
 /// Push the Credits tab roster (same names the FLTK panel carried).
