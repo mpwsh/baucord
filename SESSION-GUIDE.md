@@ -173,17 +173,17 @@ V=/tmp/sv/slint-viewer/slint-viewer; L="-L lucide=/tmp/lucide/lucide-slint-1.35.
 
 $V --check $L main.slint                                   # every .slint change
 $V --screenshot out.png --load-data props.json $L main.slint          # render the main window
-$V --screenshot out.png --component SettingsWindow --load-data p.json $L settings.slint
-$V --screenshot out.png --component AdminWindow --load-data p.json $L admin.slint
+# Settings and the admin panel are pages of the main window: render
+# main.slint with State.settings-open / State.admin-open (and -tab).
 SLINT_SCALE_FACTOR=2 $V --screenshot out.png ...          # 2× for site screenshots
 ```
 
 `--load-data` takes JSON: top-level keys are the window's own
 properties (`tab`, `phase` lives in `State`) and globals by name
 (`State`, `SettingsState`, `AdminState`, `Tr`). The globals are only
-visible through `main.slint`, which exports them: render the other
-windows as `--component SettingsWindow ... main.slint` too, or `Tr` is
-"unknown" and every string comes out empty. A `PopupWindow` never
+visible through `main.slint`, which exports them: render the stream
+viewer's window as `--component StreamViewerWindow ... main.slint` too,
+or `Tr` is "unknown" and every string comes out empty. A `PopupWindow` never
 shows in a still frame; to look at one (the emoji palette), render a
 scratch copy of the tree with it turned into a `Rectangle`. Two
 renders of the same fixture, before and after a change, diffed pixel
@@ -548,17 +548,21 @@ Memory-mode servers (persistence off) still use the legacy
 - Nothing in the app layer knew the negotiated feature set until the
   lobby; `NetworkMessage::Connected { lobby }` is the pattern for the
   next bit a client must gate on (add a field, not a new message).
-- Settings code talks to `settingsui::surface(app)` (an enum over
-  the desktop `SettingsWindow` and Android's in-window page), never
-  to `app.settings_win` directly — the field is the desktop window's
-  storage only. The page is wired once in `app::run`; the window when
-  first created. The stream viewer is the same shape: `viewers::Viewer`
-  owns a private `Surface::{Window, Page}` and the rest of the app
-  only calls its methods (`raise`, `update_frame`, `close`,
-  `apply_text_scale`) — never a `.win`. Anything that opens its own
-  `Window` on the desktop gets a `*Panel` component + `State.*-open`
-  page on Android (ANDROID-SPEC.md D22/D23); that is the pattern for
-  the admin panel too.
+- **Settings and the admin panel are pages on every host**
+  (ANDROID-SPEC.md D71): a `*Panel` component under `State.*-open` in
+  `main.slint`, wired once in `app::run`; Settings code talks to
+  `settingsui::surface(app)`, admin code to the main window's
+  `AdminState`. A page's key scope takes Back in the capture phase and
+  Escape in the bubble phase (so what has the keyboard inside — a
+  keybind being recorded, a confirmation — answers first); it is
+  focused on open and again whenever `focus-composer` runs while it
+  is open, so a main-window dialog closed over it hands the keyboard
+  back. Only one page at a time (`adminui::open` saves and closes
+  Settings, `settingsui::open_on` closes the panel). The stream viewer
+  is the one window left on the desktop: `viewers::Viewer` owns a
+  private `Surface::{Window, Page}` and the rest of the app only calls
+  its methods (`raise`, `update_frame`, `close`, `apply_text_scale`) —
+  never a `.win`.
 - **`VideoDecoder::flush()` is advisory.** The client calls it before
   every IDR; FFmpeg honours it (cheap), MediaCodec deliberately does
   not (it would discard the pipeline's pictures every 2 s, see
@@ -729,9 +733,9 @@ Memory-mode servers (persistence off) still use the legacy
   `min-height`), then render; `State.narrow-chat-open: true` shows
   the chat page, `State.touch-host: true` the touch-only affordances
   (the DM ✕); `State.settings-open: true` the Settings page, with
-  `settings-tab` and `settings-section-open` picking list or section.
-  `--component SettingsWindow ... settings.slint` with `{"tab": 2}`
-  checks the desktop window didn't move. The slide itself (a `Timer`-free `animate`) cannot be
+  `settings-tab` and `settings-section-open` picking list or section
+  (`admin-open`, `admin-tab`, `admin-section-open` the same for the
+  admin panel); at 1000×640 the same keys show the wide pages. The slide itself (a `Timer`-free `animate`) cannot be
   captured. Check 1000×640 after any change there: the wide layout
   must not move.
 - **Drive the real `MainWindow` headless** when a fix is about

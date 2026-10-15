@@ -8,6 +8,6 @@ fn main() {
     let config = slint_build::CompilerConfiguration::new().with_library_paths(libraries);
 
     // Compile the whole scene graph from the root file; it re-exports
-    // the auxiliary windows (Settings, StreamViewer) and the tray.
+    // the stream viewer's window and the tray.
     slint_build::compile_with_config("slint/main.slint", config).expect("slint build failed");
 }

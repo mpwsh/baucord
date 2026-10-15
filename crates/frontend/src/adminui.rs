@@ -1,17 +1,16 @@
-//! The admin panel (spec §8): a window like settings, driven by the
-//! admin wire. Each tab asks for its list (`AdminLogic.refresh` →
+//! The admin panel (spec §8): a page over the main window like
+//! Settings (ANDROID-SPEC.md D71), driven by the admin wire. Each tab
+//! asks for its list (`AdminLogic.refresh` →
 //! `send_admin(.., PendingAdmin::Panel(tab))`), the outcome fills the
 //! tab's model, and every row action is the same `AdminCommand` the
 //! slash command sends — after which the tab refreshes itself.
-
-use std::rc::Rc;
 
 use client::{network::NetworkControl, AdminCommand, AdminOutcome, AdminTarget};
 use i18n::t;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use ui::{
     AdminAuditRow, AdminBlobRow, AdminChannelRow, AdminInviteRow, AdminLogic, AdminReportRow,
-    AdminRestrictionRow, AdminRoleRow, AdminState, AdminUserRow, AdminWindow,
+    AdminRestrictionRow, AdminRoleRow, AdminState, AdminUserRow, MainWindow, State,
 };
 
 use crate::app::{self, AppState, PendingAdmin};
@@ -50,65 +49,63 @@ impl PanelAction {
     }
 }
 
-/// Open the panel (creating it on first use) on `tab`.
+/// Open the panel's page on `tab` (`TAB_*`). Settings gives way: one
+/// page at a time.
 pub fn open(app: &mut AppState, tab: i32) {
-    if app::SINGLE_WINDOW_HOST {
-        app.show_error(&t!("host-single-window"));
-        return;
-    }
-    if app.admin_win.is_none() {
-        let win = match AdminWindow::new() {
-            Ok(w) => w,
-            Err(e) => {
-                app.show_error(&e.to_string());
-                return;
-            }
-        };
-        wire(&win);
-        app::fill_tr(&win.global::<ui::Tr>());
-        win.global::<ui::Theme>()
-            .set_scale(app.settings.ui.text_scale);
-        let weak = win.as_weak();
-        let armed = Rc::new(std::cell::Cell::new(false));
-        app::repaint_on_reveal(win.window(), armed, move || {
-            if let Some(w) = weak.upgrade() {
-                w.set_repaint_flip(!w.get_repaint_flip());
-            }
-        });
-        app.admin_win = Some(win);
-    }
-    if let Some(win) = &app.admin_win {
-        let s = win.global::<AdminState>();
-        s.set_notice("".into());
-        s.set_confirm_open(false);
-        s.set_perm_names(ModelRc::new(VecModel::from(
-            client::permissions::PERMISSION_NAMES
-                .iter()
-                .filter(|(_, bit)| *bit != client::permissions::ADMIN)
-                .map(|(n, _)| SharedString::from(*n))
-                .collect::<Vec<_>>(),
-        )));
-        s.set_role_icons(ModelRc::new(VecModel::from(
-            client::permissions::ROLE_ICONS
-                .iter()
-                .map(|n| SharedString::from(*n))
-                .collect::<Vec<_>>(),
-        )));
-        // Badges may be gold (spec §12, 1.1.5): the *name band* is the
-        // permission, a badge's colour is whatever the admin says.
-        s.set_role_colors(ModelRc::new(VecModel::from(
-            badge_palette()
-                .map(|c| slint::Color::from_argb_encoded(0xFF00_0000 | c))
-                .collect::<Vec<_>>(),
-        )));
-        win.set_tab(tab);
-        let _ = win.show();
-    }
+    crate::settingsui::close_if_open(app);
+    app.admin_pending = None;
+    let s = app.main.global::<AdminState>();
+    s.set_notice("".into());
+    s.set_confirm_open(false);
+    s.set_perm_names(ModelRc::new(VecModel::from(
+        client::permissions::PERMISSION_NAMES
+            .iter()
+            .filter(|(_, bit)| *bit != client::permissions::ADMIN)
+            .map(|(n, _)| SharedString::from(*n))
+            .collect::<Vec<_>>(),
+    )));
+    s.set_role_icons(ModelRc::new(VecModel::from(
+        client::permissions::ROLE_ICONS
+            .iter()
+            .map(|n| SharedString::from(*n))
+            .collect::<Vec<_>>(),
+    )));
+    // Badges may be gold (spec §12, 1.1.5): the *name band* is the
+    // permission, a badge's colour is whatever the admin says.
+    s.set_role_colors(ModelRc::new(VecModel::from(
+        badge_palette()
+            .map(|c| slint::Color::from_argb_encoded(0xFF00_0000 | c))
+            .collect::<Vec<_>>(),
+    )));
+    let state = app.main.global::<State>();
+    state.set_admin_tab(tab);
+    // The narrow page opens on its tab list, as Settings does.
+    state.set_admin_section_open(false);
+    state.set_admin_open(true);
     refresh(app, tab);
 }
 
-fn wire(win: &AdminWindow) {
-    let logic = win.global::<AdminLogic>();
+/// Close the page (Close, the arrow, Escape, Back; Settings opening),
+/// with whatever it was about to ask dropped. Nothing when it is shut.
+pub(crate) fn close(app: &mut AppState) {
+    let state = app.main.global::<State>();
+    if !state.get_admin_open() {
+        return;
+    }
+    app.admin_pending = None;
+    app.main.global::<AdminState>().set_confirm_open(false);
+    state.set_admin_open(false);
+    // The page held the keyboard (see `settingsui::SettingsSurface::hide`).
+    app.main.invoke_focus_composer();
+}
+
+/// Wire the panel's callbacks — once, at startup (`app::run`).
+pub(crate) fn wire_page(main: &MainWindow) {
+    wire(main);
+}
+
+fn wire(main: &MainWindow) {
+    let logic = main.global::<AdminLogic>();
     logic.on_refresh(|tab| app::with_current(move |app| refresh(app, tab)));
     logic.on_user_action(|user_id, action| {
         app::with_current(move |app| user_action(app, &user_id, action));
@@ -139,9 +136,9 @@ fn wire(win: &AdminWindow) {
     logic.on_role_new(|| app::with_current(|app| role_select(app, -1)));
     logic.on_role_perm_toggled(|index, on| {
         app::with_current(move |app| {
-            if let Some(win) = &app.admin_win
-                && let Some(model) = win
-                    .global::<AdminState>()
+            if let Some(model) = app
+                .main
+                .global::<AdminState>()
                     .get_perm_on()
                     .as_any()
                     .downcast_ref::<VecModel<bool>>()
@@ -170,9 +167,7 @@ fn wire(win: &AdminWindow) {
     });
     logic.on_role_edit_cancel(|| {
         app::with_current(|app| {
-            if let Some(win) = &app.admin_win {
-                win.global::<AdminState>().set_role_edit_open(false);
-            }
+            app.main.global::<AdminState>().set_role_edit_open(false);
         });
     });
     logic.on_restriction_lift(|id| {
@@ -206,17 +201,13 @@ fn wire(win: &AdminWindow) {
             );
         });
     });
-    logic.on_invite_new(|| {
-        app::with_current(|app| {
-            app.open_invite_dialog();
-            app.show_main();
-        });
-    });
+    // The main window's dialogs, drawn over the page; closing one hands
+    // the keyboard back to it (`focus-composer`).
+    logic.on_invite_new(|| app::with_current(AppState::open_invite_dialog));
     logic.on_channel_edit(|id| {
         app::with_current(move |app| {
             if let Ok(id) = u16::try_from(id) {
                 app.channel_edit(id);
-                app.show_main();
             }
         });
     });
@@ -309,9 +300,7 @@ fn wire(win: &AdminWindow) {
     logic.on_confirm_cancel(|| {
         app::with_current(|app| {
             app.admin_pending = None;
-            if let Some(win) = &app.admin_win {
-                win.global::<AdminState>().set_confirm_open(false);
-            }
+            app.main.global::<AdminState>().set_confirm_open(false);
         });
     });
     logic.on_audit_more(|| {
@@ -326,21 +315,13 @@ fn wire(win: &AdminWindow) {
             );
         });
     });
-    logic.on_close(|| {
-        app::with_current(|app| {
-            if let Some(win) = &app.admin_win {
-                let _ = win.hide();
-            }
-        });
-    });
+    logic.on_close(|| app::with_current(close));
 }
 
 /// Ask the server for what `tab` shows. Channels come from what the
 /// client already knows; the rest are admin commands.
 pub fn refresh(app: &mut AppState, tab: i32) {
-    let Some(win) = &app.admin_win else {
-        return;
-    };
+    let win = &app.main;
     let s = win.global::<AdminState>();
     s.set_notice("".into());
     match tab {
@@ -397,9 +378,7 @@ pub fn refresh(app: &mut AppState, tab: i32) {
 
 /// An outcome the panel asked for.
 pub fn take_outcome(app: &mut AppState, tab: i32, outcome: AdminOutcome) {
-    let Some(win) = &app.admin_win else {
-        return;
-    };
+    let win = &app.main;
     let s = win.global::<AdminState>();
     s.set_busy(false);
     match outcome {
@@ -610,18 +589,14 @@ fn report_by_id(app: &AppState, id: i32) -> Option<&client::protocol::ReportSumm
 
 /// A refusal the panel asked for.
 pub fn take_error(app: &mut AppState, why: &str) {
-    if let Some(win) = &app.admin_win {
-        let s = win.global::<AdminState>();
-        s.set_busy(false);
-        s.set_notice(t!("chat-admin-refused", "why" => why).into());
-    }
+    let s = app.main.global::<AdminState>();
+    s.set_busy(false);
+    s.set_notice(t!("chat-admin-refused", "why" => why).into());
 }
 
 /// The roles tab is the client's own table.
 fn fill_roles(app: &mut AppState) {
-    let Some(win) = &app.admin_win else {
-        return;
-    };
+    let win = &app.main;
     let holders = |id: client::RoleId| {
         app.session
             .details
@@ -664,9 +639,7 @@ fn badge_palette() -> impl Iterator<Item = u32> {
 }
 
 fn fill_channels(app: &mut AppState) {
-    let Some(win) = &app.admin_win else {
-        return;
-    };
+    let win = &app.main;
     let rows: Vec<AdminChannelRow> = app
         .session
         .channels
@@ -697,9 +670,7 @@ fn fill_channels(app: &mut AppState) {
 
 /// Open the editor on role `id` (-1: a new one).
 fn role_select(app: &mut AppState, id: i32) {
-    let Some(win) = &app.admin_win else {
-        return;
-    };
+    let win = &app.main;
     let s = win.global::<AdminState>();
     let current = u32::try_from(id)
         .ok()
@@ -725,9 +696,7 @@ fn role_select(app: &mut AppState, id: i32) {
 }
 
 fn role_save(app: &mut AppState) {
-    let Some(win) = &app.admin_win else {
-        return;
-    };
+    let win = &app.main;
     let s = win.global::<AdminState>();
     let name = s.get_role_edit_name().trim().to_string();
     let on = s.get_perm_on();
@@ -769,16 +738,11 @@ fn user_action(app: &mut AppState, user_id: &str, action: i32) {
     let Some(target) = target_of(user_id) else {
         return;
     };
-    let name = app
-        .admin_win
-        .as_ref()
-        .and_then(|w| {
-            let users = w.global::<AdminState>().get_users();
-            (0..users.row_count())
-                .filter_map(|i| users.row_data(i))
-                .find(|u| u.user_id.as_str() == user_id)
-                .map(|u| u.name.to_string())
-        })
+    let users = app.main.global::<AdminState>().get_users();
+    let name = (0..users.row_count())
+        .filter_map(|i| users.row_data(i))
+        .find(|u| u.user_id.as_str() == user_id)
+        .map(|u| u.name.to_string())
         .unwrap_or_default();
     let n = name.as_str();
     let (pending, title, text, label, reason) = match action {
@@ -844,9 +808,7 @@ fn ask(
     label: String,
     asks_reason: bool,
 ) {
-    let Some(win) = &app.admin_win else {
-        return;
-    };
+    let win = &app.main;
     let s = win.global::<AdminState>();
     s.set_confirm_title(title.into());
     s.set_confirm_text(text.into());
@@ -868,15 +830,9 @@ fn confirm_accept(app: &mut AppState) {
     let Some(action) = app.admin_pending.take() else {
         return;
     };
-    let reason = app
-        .admin_win
-        .as_ref()
-        .map(|w| {
-            let s = w.global::<AdminState>();
-            s.set_confirm_open(false);
-            s.get_confirm_reason().trim().to_string()
-        })
-        .unwrap_or_default();
+    let s = app.main.global::<AdminState>();
+    s.set_confirm_open(false);
+    let reason = s.get_confirm_reason().trim().to_string();
     match action {
         PanelAction::Admin(mut command, tab) => {
             if let AdminCommand::Restrict { reason: slot, .. }

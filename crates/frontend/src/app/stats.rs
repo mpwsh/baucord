@@ -328,15 +328,10 @@ impl AppState {
     /// switching, no rebuilds).
     #[allow(clippy::too_many_lines)]
     pub fn push_tr(&self) {
+        // Settings and the admin panel are pages of the main window:
+        // its Tr is theirs. (A stream viewer window fills its own when
+        // it opens.)
         fill_tr(&self.main.global::<Tr>());
-        if let Some(win) = &self.settings_win {
-            fill_tr(&win.global::<Tr>());
-        }
-        // The panel is created once and kept: it follows a language
-        // change like the others.
-        if let Some(win) = &self.admin_win {
-            fill_tr(&win.global::<Tr>());
-        }
     }
 
     pub(super) fn push_connect_fields(&self) {

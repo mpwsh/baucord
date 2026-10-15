@@ -259,16 +259,23 @@ export global State {
     /// row id; -1 = none). The row's menu and a double-click toggle it.
     in-out property <int> selecting-row: -1;
 
-    // ── Settings as a page (single-window hosts; ANDROID-SPEC.md D22) ──
-    // The desktop opens SettingsWindow; Android shows the same
-    // SettingsPanel inside MainWindow while this is set. The tab is
-    // what SettingsWindow.tab is there (settingsui::TAB_*).
+    // ── Settings as a page (every host; ANDROID-SPEC.md D22, D71) ──
+    // SettingsPanel covers the main window while this is set: its
+    // section list where the sidebar was. The tab is `settingsui::TAB_*`.
     in property <bool> settings-open: false;
     in-out property <int> settings-tab: 0;
     /// The narrow page shows that tab's section rather than the list
     /// (D28): cleared when the page opens, set by picking a section —
     /// or by the shell when it opens Settings at a tab.
     in-out property <bool> settings-section-open: false;
+
+    // ── The admin panel as a page (every host; ANDROID-SPEC.md D71) ──
+    // AdminPanel covers the main window while this is set, as Settings
+    // does. The tab is `adminui::TAB_*`; narrow, the tab list and one
+    // tab's page are two pages, as Settings' are.
+    in property <bool> admin-open: false;
+    in-out property <int> admin-tab: 0;
+    in-out property <bool> admin-section-open: false;
 
     // ── Stream viewer as a page (single-window hosts; ANDROID-SPEC.md D23)
     // The desktop opens one StreamViewerWindow per watched peer;

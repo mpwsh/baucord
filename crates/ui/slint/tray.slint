@@ -12,6 +12,10 @@
 // someone joining the room), never on a speaking edge. The native
 // menus draw no check marks (none of the three backends does), so a
 // state is said in the words: Mute / Unmute.
+//
+// The room's people are items of the menu itself, not of a submenu
+// named after the room: muting someone is one click from the icon, and
+// the list is short — only the people in our voice room.
 
 /// One person in our voice room, as the menu offers them.
 export struct TrayPerson {
@@ -30,8 +34,7 @@ export component BaucordTray inherits SystemTrayIcon {
     /// Nobody hears us (our mute, our deafen, or the server's mute):
     /// the icon goes red.
     in property <bool> quiet: false;
-    /// The voice room we are in, and its other people; "" outside one.
-    in property <string> room;
+    /// The other people in our voice room; empty outside one.
     in property <[TrayPerson]> people;
     callback show-app();
     callback quit-app();
@@ -62,12 +65,10 @@ export component BaucordTray inherits SystemTrayIcon {
             title: root.deafen-label;
             activated => { root.toggle-deafen(); }
         }
-        if root.connected && root.room != "" && root.people.length > 0 : Menu {
-            title: root.room;
-            for person[i] in root.people : MenuItem {
-                title: person.title;
-                activated => { root.toggle-person(i); }
-            }
+        if root.people.length > 0 : MenuSeparator { }
+        for person[i] in root.people : MenuItem {
+            title: person.title;
+            activated => { root.toggle-person(i); }
         }
         MenuSeparator { }
         MenuItem { title: root.quit-label; activated => { root.quit-app(); } }

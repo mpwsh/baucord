@@ -641,16 +641,11 @@ impl AppState {
     }
 
     /// Push the "Text size" setting to every window's Theme (globals
-    /// are per window instance).
+    /// are per window instance): the main window's, which Settings and
+    /// the admin panel share, and each stream viewer's.
     pub fn apply_text_scale(&self) {
         let scale = self.settings.ui.text_scale;
         self.main.global::<ui::Theme>().set_scale(scale);
-        if let Some(win) = &self.settings_win {
-            win.global::<ui::Theme>().set_scale(scale);
-        }
-        if let Some(win) = &self.admin_win {
-            win.global::<ui::Theme>().set_scale(scale);
-        }
         for viewer in self.viewers.values() {
             viewer.apply_text_scale(scale);
         }

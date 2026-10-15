@@ -1427,6 +1427,26 @@ One line each; the spec decision named holds the detail.
     the commit says. Not run on a device: `DEVICE-CHECKLIST.md` lines
     marked **[10-14c]**.
 
+- **2026-10-15 — Settings and the admin panel are pages; the admin
+  panel on the phones** (ANDROID-SPEC D71, IOS-SPEC D61; the user's
+  ask). On the desktop both were windows of their own; they now cover
+  the main window as Settings already did on the phones, their tab
+  list where the sidebar was, Escape stepping back as Back does (after
+  a keybind being recorded or a confirmation has had it). The phones
+  get the admin panel — the Admin chip, a list of its nine tabs, one
+  tab as a page — with every tab laid out for 360 dp: rows stack under
+  600 px of content (a desktop window that narrow too), the badge
+  pickers wrap, a restriction's reason and a report's message are no
+  longer cut. `SettingsWindow`, `AdminWindow` and the
+  `host-single-window` toast are gone; the stream viewer stays a
+  window on the desktop. Driven headless at three sizes in the three
+  languages; lint and both `frontend` builds type-check; not run on a
+  device or a desktop OS: `DEVICE-CHECKLIST.md` lines **[10-15]**.
+- **2026-10-15 — the tray's people in the menu itself**: the voice
+  room's people are items of the tray menu, not of a submenu named
+  after the room (still only our room's); read back from Slint's Linux
+  tray over D-Bus.
+
 ## 8. Facts this plan rests on
 
 - **Tests, 2026-10-12, Linux sandbox**: protocol 91 + the versions

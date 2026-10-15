@@ -80,13 +80,13 @@ mod stats;
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Slint's Android backend has one window per process (every `Window`
-/// component is handed the same window adapter), so the auxiliary
-/// windows — Settings, the admin panel, the stream viewer — cannot open
-/// there until they become in-window pages (ANDROID-SPEC.md §9). Their
-/// `open` paths check this and say so instead of colliding with the
-/// main window. An iPhone app is one full-screen window too (winit on
-/// `UIKit`, IOS-SPEC.md §4), so iOS takes every page Android has — the
-/// Settings and stream pages, the narrow layout, the touch rules.
+/// component is handed the same window adapter), so a second window
+/// would collide with the main one: the stream viewer, the one
+/// auxiliary window left on the desktop, is a page there
+/// (ANDROID-SPEC.md D23). Settings and the admin panel are pages on
+/// every host (D71). An iPhone app is one full-screen window too
+/// (winit on `UIKit`, IOS-SPEC.md §4), so iOS takes every page Android
+/// has — the stream page, the narrow layout, the touch rules.
 pub(crate) const SINGLE_WINDOW_HOST: bool = cfg!(any(target_os = "android", target_os = "ios"));
 
 /// Whether the app may end its own process. Not on iOS: winit ignores
@@ -535,9 +535,6 @@ pub struct AppState {
     /// the connection drops, spent by the next `Init`, cleared by a
     /// deliberate connect or disconnect.
     rejoin_channel: Option<String>,
-    pub settings_win: Option<ui::SettingsWindow>,
-    /// The admin panel (spec §8), created on first open.
-    pub(crate) admin_win: Option<ui::AdminWindow>,
     /// The oldest audit id the panel has shown ("Load older" pages
     /// before it).
     pub(crate) admin_audit_oldest: Option<u64>,
@@ -816,8 +813,6 @@ pub fn run() {
         voice_in_room: true,
         kept_alive: None,
         rejoin_channel: None,
-        settings_win: None,
-        admin_win: None,
         admin_audit_oldest: None,
         admin_blob_cap: 0,
         admin_pending: None,
@@ -875,14 +870,16 @@ pub fn run() {
 
     wire_logic(&state);
     start_timers(&state);
-    // A single-window host shows Settings as a page in the main window
-    // (ANDROID-SPEC.md D22): its callbacks are wired once here, where
-    // the desktop wires its SettingsWindow when that is first created.
+    // Settings and the admin panel are pages of the main window on
+    // every host (ANDROID-SPEC.md D22, D71): their callbacks are wired
+    // once, here.
+    crate::settingsui::wire_page(&state.borrow().main);
+    crate::adminui::wire_page(&state.borrow().main);
     if SINGLE_WINDOW_HOST {
         // One window means a phone: touch, a soft keyboard, Back.
         state.borrow().main.global::<State>().set_touch_host(true);
-        crate::settingsui::wire_page(&state.borrow().main);
-        // Same for the stream viewer page (D23).
+        // The stream viewer is a page there too (D23); the desktop
+        // keeps its windows.
         crate::viewers::wire_page(&state.borrow().main);
     }
     // iOS apps never end themselves (IOS-SPEC.md §14 D29).
@@ -2471,9 +2468,10 @@ pub mod tray {
     //! `run_event_loop_until_quit` alive.
     //!
     //! While connected the menu also carries our own mute and deafen,
-    //! and the voice room's people, each to mute for us alone; the
-    //! icon goes red while nobody hears us. [`sync`] keeps it current
-    //! from `update_user_list`, whether or not the window is shown.
+    //! and, as items of the menu itself, the people in our voice room,
+    //! each to mute for us alone; the icon goes red while nobody hears
+    //! us. [`sync`] keeps it current from `update_user_list`, whether
+    //! or not the window is shown.
     use i18n::t;
     use log::warn;
     use slint::{Model, ModelRc, VecModel};
@@ -2490,8 +2488,8 @@ pub mod tray {
         muted: bool,
         deafened: bool,
         quiet: bool,
-        room: String,
-        /// Client id, name, muted for us.
+        /// The others in our voice room (none in the lobby or the AFK
+        /// room): client id, name, muted for us.
         people: Vec<(u64, String, bool)>,
     }
 
@@ -2505,7 +2503,7 @@ pub mod tray {
             let deafened = app.session.is_deafened;
             let quiet = muted || deafened || app.session.server_muted.is_some();
             let ours = app.session.our_client_id;
-            let (room, people) = match app.our_channel() {
+            let people = match app.our_channel() {
                 Some(channel) if app.in_voice_room() => {
                     let mut people: Vec<(u64, String, bool)> = app
                         .session
@@ -2525,16 +2523,15 @@ pub mod tray {
                             .cmp(&b.1.to_lowercase())
                             .then(a.0.cmp(&b.0))
                     });
-                    (app.channel_name(channel), people)
+                    people
                 }
-                _ => (String::new(), Vec::new()),
+                _ => Vec::new(),
             };
             Self {
                 connected,
                 muted,
                 deafened,
                 quiet,
-                room,
                 people,
             }
         }
@@ -2611,7 +2608,6 @@ pub mod tray {
                 }
                 .into(),
             );
-            tray.set_room(view.room.clone().into());
             let people: Vec<ui::TrayPerson> = view
                 .people
                 .iter()

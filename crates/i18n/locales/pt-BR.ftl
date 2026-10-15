@@ -172,7 +172,7 @@ tray-show = Mostrar
 tray-quit = Sair
 tray-tip-muted = baucord — silenciado
 tray-tip-deafened = baucord — ensurdecido
-# In the tray's menu, under the voice room's name: muting is for you alone.
+# In the tray's menu, one item per person in our voice room: muting is for you alone.
 tray-mute-person = Silenciar { $name }
 tray-unmute-person = Reativar som de { $name }
 viewer-title = Tela de { $name } ({ $width }x{ $height })
@@ -808,7 +808,6 @@ admin-channel-lead = A auditoria, ao vivo. Os comandos funcionam aqui: /kick, /b
 admin-channel-commands-only = Este canal só aceita comandos — comece com /
 
 # ── Hosts de celular (ANDROID-SPEC.md, IOS-SPEC.md; uma janela por processo) ──
-host-single-window = Ainda não disponível no celular — no desktop isto abre na sua própria janela.
 quit-ios = No iPhone, os apps são fechados pelo seletor de apps: deslize para cima a partir da borda inferior, pare um instante e deslize o baucord para cima.
 pick-from-photos = Fotos
 pick-from-files = Arquivos

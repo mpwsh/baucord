@@ -1,10 +1,10 @@
 //! The baucord UI crate.
 //!
 //! `.slint` sources live in `slint/`; `build.rs` compiles them and this
-//! crate re-exports the generated components (`MainWindow`,
-//! `SettingsWindow`, `StreamViewerWindow`, `BaucordTray`) plus the
-//! `State` / `Logic` / `Tr` / `SettingsState` / `SettingsLogic`
-//! globals. Icons come from the `@lucide` library that `build.rs`
+//! crate re-exports the generated components (`MainWindow`, which
+//! carries the Settings and admin pages, `StreamViewerWindow`,
+//! `BaucordTray`) plus the `State` / `Logic` / `Tr` / `SettingsState` /
+//! `SettingsLogic` / `AdminState` / `AdminLogic` globals. Icons come from the `@lucide` library that `build.rs`
 //! mounts (the `lucide-slint` build dependency). The [`convert`] module maps `app-core` view-model types
 //! onto the generated row structs.
 //!

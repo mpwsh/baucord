@@ -16,14 +16,14 @@ import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
 import { Btn, IconBtn, Modal, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph, TipLayer } from "widgets.slint";
-import { SettingsWindow, SettingsPanel, SettingsState, SettingsLogic } from "settings.slint";
-import { AdminWindow, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow } from "admin.slint";
+import { SettingsPanel, SettingsState, SettingsLogic } from "settings.slint";
+import { AdminPanel, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow } from "admin.slint";
 import { StreamViewerWindow, StreamViewerPanel } from "viewer.slint";
 
 import { BaucordTray, TrayPerson } from "tray.slint";
 
-export { SettingsWindow, SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, TrayPerson, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuEntry }
-export { AdminWindow, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow }
+export { SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, TrayPerson, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuEntry }
+export { AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow }
 
 export component MainWindow inherits Window {
     title: "baucord";
@@ -52,13 +52,27 @@ export component MainWindow inherits Window {
     // tapped, never on the app's own initiative — so the composer
     // keeps focus if it has it, and otherwise `nav-keys` takes it, so
     // Android's Back still finds a handler (ANDROID-SPEC.md D26).
+    // Under the Settings or admin page the composer is hidden: the page
+    // takes the keyboard back instead (a dialog over it closed), or
+    // Escape and Back would find nothing and typing would go to a chat
+    // nobody sees (D71).
     public function focus-composer() {
-        if (!State.touch-host) {
+        if (State.settings-open || State.admin-open) {
+            root.page-focus-tick += 1;
+        } else if (State.phase != Phase.main) {
+            // The connect or startup view (a page closed over it): no
+            // composer on screen to type into; `nav-keys` keeps a
+            // holder for Back.
+            nav-keys.focus();
+        } else if (!State.touch-host) {
             chat-pane.focus-composer();
         } else if (!chat-pane.composer-focused()) {
             nav-keys.focus();
         }
     }
+    // Bumped by `focus-composer` while a page is open; the open page's
+    // key scope takes the focus on every change.
+    property <int> page-focus-tick: 0;
     public function composer-set-cursor(pos: int) { chat-pane.composer-set-cursor(pos); }
     // The composer's menu entries (the host dispatches the pick).
 
@@ -188,7 +202,8 @@ export component MainWindow inherits Window {
             // chat underneath (review P1-10). Hidden is not removed:
             // the chat pane keeps its rows and scroll, and a page
             // closing hands the focus back as before.
-            visible: State.phase == Phase.main && !State.watch-open && !State.settings-open;
+            visible: State.phase == Phase.main && !State.watch-open && !State.settings-open
+                && !State.admin-open;
             // The chat pane is a persistent instance (the shell drives
             // its scroll and composer at any time), so both pages are
             // placed by hand rather than swapped with `if`.
@@ -498,21 +513,24 @@ export component MainWindow inherits Window {
         }
     }
 
-    // ── Settings as a page (single-window hosts; ANDROID-SPEC.md D22) ──
-    // The desktop never sets State.settings-open (it opens
-    // SettingsWindow), so this is not instantiated there. Above the
-    // main screen and the context menu, below the toast and dialogs.
+    // ── Settings and the admin panel as pages (ANDROID-SPEC.md D22, D71)
+    // Each covers the whole window on every host, its own tab list
+    // where the sidebar was. Above the main screen and the context
+    // menu, below the toast and the dialogs (an admin action can open
+    // the invite or channel dialog over its page).
+    // Back steps back (a section → the list → out, as the arrow does),
+    // taken in the capture phase, before any field inside sees it; so
+    // does Escape on the desktop, in the bubble phase, after whatever
+    // has the keyboard (a keybind being recorded, the admin panel's
+    // confirmation) had its turn. Each page's key scope is focused on
+    // open, so it is in the focus chain from the start, and again when
+    // a dialog over it closes (`focus-composer`).
     if State.settings-open : Rectangle {
         background: Theme.bg-primary;
-        // Swallow taps on the page's empty areas so nothing reaches
+        // Swallow clicks on the page's empty areas so nothing reaches
         // the roster and chat underneath (the other overlays do the
         // same with their scrims).
         TouchArea { }
-        // Android's Back steps back (a section → the list → out, saved,
-        // as the button does): taken in the capture phase, before any
-        // field inside sees it.
-        // Focused on open so it is in the focus chain from the start
-        // (the shell hands focus back when the page closes).
         FocusScope {
             x: root.inset-left;
             y: root.inset-top;
@@ -521,8 +539,17 @@ export component MainWindow inherits Window {
             focus-on-click: false;
             focus-on-tab-navigation: false;
             init => { self.focus(); }
+            property <int> focus-tick: root.page-focus-tick;
+            changed focus-tick => { self.focus(); }
             capture-key-pressed(ev) => {
                 if (ev.text == Key.Back) {
+                    settings-panel.back();
+                    return accept;
+                }
+                reject
+            }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) {
                     settings-panel.back();
                     return accept;
                 }
@@ -531,6 +558,50 @@ export component MainWindow inherits Window {
             settings-panel := SettingsPanel {
                 tab <=> State.settings-tab;
                 section-open <=> State.settings-section-open;
+                narrow: root.narrow;
+            }
+        }
+    }
+    if State.admin-open : Rectangle {
+        background: Theme.bg-primary;
+        TouchArea { }
+        FocusScope {
+            x: root.inset-left;
+            y: root.inset-top;
+            width: root.page-width;
+            height: root.page-height;
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+            init => { self.focus(); }
+            property <int> focus-tick: root.page-focus-tick;
+            changed focus-tick => { self.focus(); }
+            // The confirmation took the keyboard; closing it removes
+            // the scope that had it.
+            property <bool> confirming: AdminState.confirm-open;
+            changed confirming => {
+                if (!self.confirming) { self.focus(); }
+            }
+            capture-key-pressed(ev) => {
+                if (ev.text == Key.Back) {
+                    if (AdminState.confirm-open) {
+                        AdminLogic.confirm-cancel();
+                    } else {
+                        admin-panel.back();
+                    }
+                    return accept;
+                }
+                reject
+            }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) {
+                    admin-panel.back();
+                    return accept;
+                }
+                reject
+            }
+            admin-panel := AdminPanel {
+                tab <=> State.admin-tab;
+                section-open <=> State.admin-section-open;
                 narrow: root.narrow;
             }
         }

@@ -1,5 +1,5 @@
-// settingsui.rs — the settings window: populate, wire, and the two
-// live loops (the level meters, keybind capture).
+// settingsui.rs — the Settings page: populate, wire, and the two live
+// loops (the level meters, keybind capture).
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -21,134 +21,79 @@ use client::{
 use i18n::t;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use ui::{
-    BlockedRow, KeybindRow, LicenseRow, MainWindow, ServerRow, SettingsLogic, SettingsState,
-    SettingsWindow, State,
+    BlockedRow, KeybindRow, LicenseRow, MainWindow, ServerRow, SettingsLogic, SettingsState, State,
 };
 
 use crate::app::{self, AppState};
 
-/// Where the settings UI lives: its own `SettingsWindow` on desktop,
-/// or the main window's settings page on a single-window host
-/// (Android — `State.settings-open`, ANDROID-SPEC.md D22). Both carry
-/// the same `SettingsState` / `SettingsLogic` globals; everything in
-/// this module reaches them through here, so the rest of the file does
-/// not know which host it is on.
-pub(crate) enum SettingsSurface<'a> {
-    Window(&'a SettingsWindow),
-    Page(&'a MainWindow),
-}
+/// The Settings page: the main window's `SettingsPanel`, shown while
+/// `State.settings-open` on every host (ANDROID-SPEC.md D22, D71).
+/// Everything in this module reaches the `SettingsState` /
+/// `SettingsLogic` globals through here.
+#[derive(Clone, Copy)]
+pub(crate) struct SettingsSurface<'a>(&'a MainWindow);
 
 impl<'a> SettingsSurface<'a> {
-    fn state(&self) -> SettingsState<'a> {
-        match self {
-            Self::Window(w) => w.global::<SettingsState>(),
-            Self::Page(m) => m.global::<SettingsState>(),
-        }
+    fn state(self) -> SettingsState<'a> {
+        self.0.global::<SettingsState>()
     }
 
-    fn logic(&self) -> SettingsLogic<'a> {
-        match self {
-            Self::Window(w) => w.global::<SettingsLogic>(),
-            Self::Page(m) => m.global::<SettingsLogic>(),
-        }
+    fn logic(self) -> SettingsLogic<'a> {
+        self.0.global::<SettingsLogic>()
     }
 
-    fn tr(&self) -> ui::Tr<'a> {
-        match self {
-            Self::Window(w) => w.global::<ui::Tr>(),
-            Self::Page(m) => m.global::<ui::Tr>(),
-        }
+    fn tr(self) -> ui::Tr<'a> {
+        self.0.global::<ui::Tr>()
     }
 
     /// Select a nav tab (`TAB_*`).
-    pub(crate) fn set_tab(&self, tab: i32) {
-        match self {
-            Self::Window(w) => w.set_tab(tab),
-            Self::Page(m) => {
-                let s = m.global::<State>();
-                s.set_settings_tab(tab);
-                // Asked for a tab (the connect view's pencil): the
-                // narrow page goes straight to that section (D28).
-                s.set_settings_section_open(true);
-            }
-        }
+    pub(crate) fn set_tab(self, tab: i32) {
+        let s = self.0.global::<State>();
+        s.set_settings_tab(tab);
+        // Asked for a tab (the connect view's pencil): the narrow page
+        // goes straight to that section (D28).
+        s.set_settings_section_open(true);
     }
 
-    /// Whether anyone can see it: the window up and not minimized, or
-    /// the page open.
-    fn showing(&self) -> bool {
-        match self {
-            Self::Window(w) => w.window().is_visible() && !w.window().is_minimized(),
-            Self::Page(m) => m.global::<State>().get_settings_open(),
-        }
+    /// Whether anyone can see it: the page open in a window that is up
+    /// and not minimized (or in the tray).
+    fn showing(self) -> bool {
+        let window = self.0.window();
+        self.0.global::<State>().get_settings_open() && window.is_visible() && !window.is_minimized()
     }
 
     /// The selected nav tab (`TAB_*`).
-    fn tab(&self) -> i32 {
-        match self {
-            Self::Window(w) => w.get_tab(),
-            Self::Page(m) => m.global::<State>().get_settings_tab(),
-        }
+    fn tab(self) -> i32 {
+        self.0.global::<State>().get_settings_tab()
     }
 
     /// Whether the selected tab's contents are what shows. The narrow
     /// page (D28) is either its section list or one section: the tab
     /// stays selected behind the list.
-    fn section_showing(&self) -> bool {
-        match self {
-            Self::Window(_) => true,
-            Self::Page(m) => !m.get_narrow() || m.global::<State>().get_settings_section_open(),
-        }
+    fn section_showing(self) -> bool {
+        !self.0.get_narrow() || self.0.global::<State>().get_settings_section_open()
     }
 
-    /// Give the keybind-capture scope focus. The page never records a
-    /// keybind (no global hotkeys on a phone), so nothing to focus.
-    fn focus_capture(&self) {
-        if let Self::Window(w) = self {
-            w.invoke_focus_capture();
-        }
+    fn show(self) {
+        let s = self.0.global::<State>();
+        // The narrow page opens on its section list (D28).
+        s.set_settings_section_open(false);
+        s.set_settings_open(true);
     }
 
-    fn show(&self) {
-        match self {
-            Self::Window(w) => {
-                let _ = w.show();
-            }
-            Self::Page(m) => {
-                let s = m.global::<State>();
-                // The narrow page opens on its section list (D28).
-                s.set_settings_section_open(false);
-                s.set_settings_open(true);
-            }
-        }
-    }
-
-    fn hide(&self) {
-        match self {
-            Self::Window(w) => {
-                let _ = w.hide();
-            }
-            Self::Page(m) => {
-                m.global::<State>().set_settings_open(false);
-                // The page held the keyboard focus; without a holder,
-                // Android's Back would find no handler and close the
-                // app (on a touch host this hands it to the main
-                // screen's Back handler, not the composer).
-                m.invoke_focus_composer();
-            }
-        }
+    fn hide(self) {
+        self.0.global::<State>().set_settings_open(false);
+        // The page held the keyboard focus: the composer takes it back
+        // on the desktop; on a touch host the main screen's Back
+        // handler does, or Android's Back would find none and close
+        // the app.
+        self.0.invoke_focus_composer();
     }
 }
 
-/// The surface to drive, if there is one yet: on desktop `None` until
-/// the window has been created (updates before that are skipped, as
-/// before); on a single-window host always the main window's page.
-pub(crate) fn surface(app: &AppState) -> Option<SettingsSurface<'_>> {
-    if app::SINGLE_WINDOW_HOST {
-        Some(SettingsSurface::Page(&app.main))
-    } else {
-        app.settings_win.as_ref().map(SettingsSurface::Window)
-    }
+/// The surface to drive: always the main window's page.
+pub(crate) fn surface(app: &AppState) -> SettingsSurface<'_> {
+    SettingsSurface(&app.main)
 }
 
 /// A route's name as the picker shows it: the engine's English names
@@ -287,14 +232,14 @@ fn join_address(ip: &str, port: &str) -> String {
 
 /// The Servers tab's selected row as a usable index, if any.
 fn selected_server(app: &AppState) -> Option<usize> {
-    let sf = surface(app)?;
+    let sf = surface(app);
     let index = usize::try_from(sf.state().get_server_index()).ok()?;
     (index < app.settings.servers.len()).then_some(index)
 }
 
 /// Rebuild the Servers tab's row model from settings.
 fn push_server_rows(app: &AppState) {
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let default_pos = app
         .settings
         .servers
@@ -317,9 +262,8 @@ fn push_server_rows(app: &AppState) {
 
 /// One line under the identity buttons: what just happened.
 fn set_identity_status(app: &AppState, text: &str) {
-    if let Some(sf) = surface(app) {
-        sf.state().set_identity_status(text.into());
-    }
+    let sf = surface(app);
+    sf.state().set_identity_status(text.into());
 }
 
 /// Load `avatar.png` into the preview, or clear it.
@@ -328,7 +272,7 @@ pub fn refresh_avatar(app: &mut AppState) {
     app.reload_own_avatar();
     app.update_user_list();
     app.refresh_own_rows();
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let s = sf.state();
     s.set_has_avatar(app.own_avatar.is_some());
     s.set_avatar(app.own_avatar.clone().unwrap_or_default());
@@ -336,7 +280,7 @@ pub fn refresh_avatar(app: &mut AppState) {
 
 /// "On <server>: Member · Level 3", from what the session knows.
 pub fn refresh_role_line(app: &AppState) {
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let s = sf.state();
     s.set_connected(app.connected);
     let line = if app.connected {
@@ -372,7 +316,7 @@ pub fn refresh_role_line(app: &AppState) {
 /// on the connected server, and deleting the account there. Shown only
 /// on a server that takes them.
 pub fn refresh_safety(app: &AppState) {
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let s = sf.state();
     let on = app.connected && app.session.safety.on;
     s.set_safety(on);
@@ -404,17 +348,16 @@ pub fn refresh_safety(app: &AppState) {
 
 /// The line under the delete button: what the server said.
 pub fn set_account_status(app: &AppState, text: &str) {
-    if let Some(sf) = surface(app) {
-        let s = sf.state();
-        s.set_account_delete_armed(false);
-        s.set_account_status(text.into());
-    }
+    let sf = surface(app);
+    let s = sf.state();
+    s.set_account_delete_armed(false);
+    s.set_account_status(text.into());
 }
 
 /// The identity line: this device's user id (its key's hash) and
 /// where the key file lives.
 pub fn refresh_identity(app: &AppState) {
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let s = sf.state();
     let id = app.client_key.as_ref().map_or_else(
         || t!("identity-missing"),
@@ -431,7 +374,7 @@ pub fn refresh_identity(app: &AppState) {
 
 /// Fill the editor fields from the selected entry.
 fn fill_server_editor(app: &AppState) {
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let s = sf.state();
     let entry = selected_server(app).and_then(|i| app.settings.servers.get(i));
     let (ip, port) = entry.map_or_else(Default::default, |e| split_address(&e.address));
@@ -453,13 +396,10 @@ fn fill_server_editor(app: &AppState) {
 }
 
 /// Refresh the Servers tab (rows + editor) after an external change —
-/// the connect view's dropdown pick or an invite code used. No-op while
-/// the settings window was never created.
+/// the connect view's dropdown pick or an invite code used.
 pub fn refresh_servers(app: &AppState) {
-    if surface(app).is_some() {
-        push_server_rows(app);
-        fill_server_editor(app);
-    }
+    push_server_rows(app);
+    fill_server_editor(app);
 }
 
 /// Localized label for a bindable action.
@@ -490,45 +430,22 @@ fn format_sensitivity(threshold: f32) -> String {
         "threshold" => format!("{threshold:.3}"))
 }
 
-/// Open the settings UI where it was left: the window (created on
-/// first use) on desktop, the page on a single-window host.
+/// Open the Settings page where it was left.
 pub fn open(app: &mut AppState) {
     open_on(app, None);
 }
 
-/// Open the settings UI, on `tab` (`TAB_*`) if one is asked for.
+/// Open the Settings page, on `tab` (`TAB_*`) if one is asked for.
 pub fn open_on(app: &mut AppState, tab: Option<i32>) {
-    if !app::SINGLE_WINDOW_HOST && app.settings_win.is_none() {
-        let win = match SettingsWindow::new() {
-            Ok(w) => w,
-            Err(e) => {
-                app.show_error(&e.to_string());
-                return;
-            }
-        };
-        wire(&SettingsSurface::Window(&win));
-        win.global::<ui::Theme>()
-            .set_scale(app.settings.ui.text_scale);
-        let weak = win.as_weak();
-        // Never armed: this window gains focus on every (re)open, so
-        // the Focused trigger suffices.
-        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
-        crate::app::repaint_on_reveal(win.window(), armed, move || {
-            if let Some(w) = weak.upgrade() {
-                w.set_repaint_flip(!w.get_repaint_flip());
-            }
-        });
-        app.settings_win = Some(win);
-    }
-
+    // One page at a time: the admin panel's (`adminui`) gives way.
+    crate::adminui::close(app);
     populate(app);
     start_meter_timer(app);
 
-    if let Some(sf) = surface(app) {
-        sf.show();
-        if let Some(tab) = tab {
-            sf.set_tab(tab);
-        }
+    let sf = surface(app);
+    sf.show();
+    if let Some(tab) = tab {
+        sf.set_tab(tab);
     }
     // Opened on the Audio tab: its microphone now, not a tick later —
     // and only once the tab asked for is the one selected, or a look
@@ -537,11 +454,17 @@ pub fn open_on(app: &mut AppState, tab: Option<i32>) {
     sync_audio_tab(app);
 }
 
-/// Wire the page's callbacks on a single-window host — once, at
-/// startup (`app::run`), where the desktop wires its window when it
-/// is first created.
+/// Wire the page's callbacks — once, at startup (`app::run`).
 pub(crate) fn wire_page(main: &MainWindow) {
-    wire(&SettingsSurface::Page(main));
+    wire(SettingsSurface(main));
+}
+
+/// Close the page (saved, as its button does) if it is open: another
+/// page is taking the window.
+pub(crate) fn close_if_open(app: &mut AppState) {
+    if app.main.global::<State>().get_settings_open() {
+        close(app);
+    }
 }
 
 /// The page's plain switches, one row each: the `SettingsState`
@@ -574,7 +497,7 @@ macro_rules! switches {
 
 /// Fill every `SettingsState` property from current settings + devices.
 pub fn populate(app: &mut AppState) {
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     app::fill_tr(&sf.tr());
     let s = sf.state();
     let settings = &app.settings;
@@ -762,47 +685,46 @@ pub fn populate(app: &mut AppState) {
 /// device the user clicked once something had been plugged in with
 /// Settings open (review P3-35).
 pub fn refresh_devices(app: &mut AppState, inputs: Vec<String>, outputs: Vec<String>) {
-    if let Some(sf) = surface(app) {
-        let s = sf.state();
-        let sys_default = t!("audio-system-default");
-        let dev_model = |devices: &[String]| -> Vec<slint::SharedString> {
-            std::iter::once(sys_default.as_str().into())
-                .chain(devices.iter().map(|n| n.as_str().into()))
-                .collect()
-        };
-        // A phone's outputs are routes (audio::route): "Automatic"
-        // first, the built-in ones in the user's language. The setting
-        // keeps the engine's names; only the shown text changes.
-        let output_model: Vec<slint::SharedString> = if app::SINGLE_WINDOW_HOST {
-            std::iter::once(t!("audio-route-auto").into())
-                .chain(outputs.iter().map(|n| route_label(n).into()))
-                .collect()
-        } else {
-            dev_model(&outputs)
-        };
-        let dev_index = |devices: &[String], saved: Option<&str>| -> i32 {
-            saved
-                .and_then(|name| devices.iter().position(|n| n == name))
-                .map_or(0, |i| i32::try_from(i + 1).unwrap_or(0))
-        };
-        s.set_input_devices(ModelRc::new(VecModel::from(dev_model(&inputs))));
-        s.set_output_devices(ModelRc::new(VecModel::from(output_model)));
-        s.set_input_index(dev_index(
-            &inputs,
-            app.settings.audio.input.device.as_deref(),
-        ));
-        s.set_output_index(dev_index(
-            &outputs,
-            app.settings.audio.output.device.as_deref(),
-        ));
-    }
+    let sf = surface(app);
+    let s = sf.state();
+    let sys_default = t!("audio-system-default");
+    let dev_model = |devices: &[String]| -> Vec<slint::SharedString> {
+        std::iter::once(sys_default.as_str().into())
+            .chain(devices.iter().map(|n| n.as_str().into()))
+            .collect()
+    };
+    // A phone's outputs are routes (audio::route): "Automatic"
+    // first, the built-in ones in the user's language. The setting
+    // keeps the engine's names; only the shown text changes.
+    let output_model: Vec<slint::SharedString> = if app::SINGLE_WINDOW_HOST {
+        std::iter::once(t!("audio-route-auto").into())
+            .chain(outputs.iter().map(|n| route_label(n).into()))
+            .collect()
+    } else {
+        dev_model(&outputs)
+    };
+    let dev_index = |devices: &[String], saved: Option<&str>| -> i32 {
+        saved
+            .and_then(|name| devices.iter().position(|n| n == name))
+            .map_or(0, |i| i32::try_from(i + 1).unwrap_or(0))
+    };
+    s.set_input_devices(ModelRc::new(VecModel::from(dev_model(&inputs))));
+    s.set_output_devices(ModelRc::new(VecModel::from(output_model)));
+    s.set_input_index(dev_index(
+        &inputs,
+        app.settings.audio.input.device.as_deref(),
+    ));
+    s.set_output_index(dev_index(
+        &outputs,
+        app.settings.audio.output.device.as_deref(),
+    ));
     app.picker_inputs = inputs;
     app.picker_outputs = outputs;
 }
 
 /// Wire `SettingsLogic` callbacks (once per surface).
 #[allow(clippy::too_many_lines)]
-fn wire(sf: &SettingsSurface<'_>) {
+fn wire(sf: SettingsSurface<'_>) {
     let logic = sf.logic();
 
     logic.on_language_selected(|index| {
@@ -812,8 +734,8 @@ fn wire(sf: &SettingsSurface<'_>) {
                 .and_then(|i| i18n::LOCALES.get(i))
                 .map(|l| l.code.to_string());
             app.set_language(lang);
-            // Re-fill this window's labels too (fill_tr covers the
-            // main window; populate refreshes localized rows here).
+            // Re-fill the labels the page builds itself (fill_tr covers the
+            // Tr global; populate refreshes localized rows here).
             populate(app);
         });
     });
@@ -822,10 +744,9 @@ fn wire(sf: &SettingsSurface<'_>) {
     logic.on_nickname_edited(|text| {
         app::with_current(move |app| {
             app.settings.user.nickname = text.to_string();
-            if let Some(sf) = surface(app) {
-                sf.state()
-                    .set_initial(app_core::roster::initial_of(&text).into());
-            }
+            let sf = surface(app);
+            sf.state()
+                .set_initial(app_core::roster::initial_of(&text).into());
             // The connect screen shows the same name.
             app.main
                 .global::<ui::State>()
@@ -860,8 +781,8 @@ fn wire(sf: &SettingsSurface<'_>) {
     });
     logic.on_license_toggled(|entry| {
         app::with_current(move |app| {
-            if let (Some(sf), Ok(entry)) = (surface(app), usize::try_from(entry)) {
-                toggle_license(&sf.state(), entry);
+            if let Ok(entry) = usize::try_from(entry) {
+                toggle_license(&surface(app).state(), entry);
             }
         });
     });
@@ -935,27 +856,24 @@ fn wire(sf: &SettingsSurface<'_>) {
     logic.on_send_log(|| {
         app::with_current(|app| {
             let status = send_log(app);
-            if let Some(sf) = surface(app) {
-                sf.state().set_debug_status(status.into());
-            }
+            let sf = surface(app);
+            sf.state().set_debug_status(status.into());
             refresh_log(app);
         });
     });
     logic.on_copy_log(|| {
         app::with_current(|app| {
             let status = copy_log();
-            if let Some(sf) = surface(app) {
-                sf.state().set_debug_status(status.into());
-            }
+            let sf = surface(app);
+            sf.state().set_debug_status(status.into());
             refresh_log(app);
         });
     });
     logic.on_clear_log(|| {
         app::with_current(|app| {
             let status = clear_log();
-            if let Some(sf) = surface(app) {
-                sf.state().set_debug_status(status.into());
-            }
+            let sf = surface(app);
+            sf.state().set_debug_status(status.into());
             refresh_log(app);
         });
     });
@@ -1044,11 +962,10 @@ fn wire(sf: &SettingsSurface<'_>) {
                 channel_passwords: std::collections::HashMap::new(),
             });
             app.settings.save();
-            if let Some(sf) = surface(app) {
-                let last = app.settings.servers.len() - 1;
-                sf.state()
-                    .set_server_index(i32::try_from(last).unwrap_or(0));
-            }
+            let sf = surface(app);
+            let last = app.settings.servers.len() - 1;
+            sf.state()
+                .set_server_index(i32::try_from(last).unwrap_or(0));
             push_server_rows(app);
             fill_server_editor(app);
             app.push_connect_servers();
@@ -1070,11 +987,10 @@ fn wire(sf: &SettingsSurface<'_>) {
             }
             app.settings.normalize_servers();
             app.settings.save();
-            if let Some(sf) = surface(app) {
-                let clamped = index.min(app.settings.servers.len() - 1);
-                sf.state()
-                    .set_server_index(i32::try_from(clamped).unwrap_or(0));
-            }
+            let sf = surface(app);
+            let clamped = index.min(app.settings.servers.len() - 1);
+            sf.state()
+                .set_server_index(i32::try_from(clamped).unwrap_or(0));
             push_server_rows(app);
             fill_server_editor(app);
             app.push_connect_servers();
@@ -1185,7 +1101,7 @@ fn wire(sf: &SettingsSurface<'_>) {
     });
     logic.on_identity_regenerate(|| {
         app::with_current(|app| {
-            let Some(sf) = surface(app) else { return };
+            let sf = surface(app);
             let s = sf.state();
             // First click arms, second acts: a new key is a new user.
             if !s.get_identity_regenerate_armed() {
@@ -1213,7 +1129,7 @@ fn wire(sf: &SettingsSurface<'_>) {
     });
     logic.on_account_delete(|| {
         app::with_current(|app| {
-            let Some(sf) = surface(app) else { return };
+            let sf = surface(app);
             let s = sf.state();
             if !s.get_account_delete_armed() {
                 s.set_account_delete_armed(true);
@@ -1227,16 +1143,14 @@ fn wire(sf: &SettingsSurface<'_>) {
     });
     logic.on_account_delete_disarm(|| {
         app::with_current(|app| {
-            if let Some(sf) = surface(app) {
-                sf.state().set_account_delete_armed(false);
-            }
+            let sf = surface(app);
+            sf.state().set_account_delete_armed(false);
         });
     });
     logic.on_identity_regenerate_disarm(|| {
         app::with_current(|app| {
-            if let Some(sf) = surface(app) {
-                sf.state().set_identity_regenerate_armed(false);
-            }
+            let sf = surface(app);
+            sf.state().set_identity_regenerate_armed(false);
         });
     });
 
@@ -1272,10 +1186,9 @@ fn wire(sf: &SettingsSurface<'_>) {
             app.voice_tx()
                 .send(VoiceControl::SetGateThreshold(threshold))
                 .ok();
-            if let Some(sf) = surface(app) {
-                sf.state()
-                    .set_sensitivity_line(format_sensitivity(threshold).into());
-            }
+            let sf = surface(app);
+            sf.state()
+                .set_sensitivity_line(format_sensitivity(threshold).into());
         });
     });
 
@@ -1283,11 +1196,10 @@ fn wire(sf: &SettingsSurface<'_>) {
         app::with_current(|app| {
             let enable = !app.is_testing_mic;
             app.handle_test_microphone(enable);
-            if let Some(sf) = surface(app) {
-                let s = sf.state();
-                s.set_testing_mic(enable);
-                s.set_test_hint(test_hint(enable).into());
-            }
+            let sf = surface(app);
+            let s = sf.state();
+            s.set_testing_mic(enable);
+            s.set_test_hint(test_hint(enable).into());
         });
     });
 
@@ -1295,12 +1207,11 @@ fn wire(sf: &SettingsSurface<'_>) {
     logic.on_record_keybind(|index| {
         app::with_current(move |app| {
             app.keybind_recording = usize::try_from(index).ok();
-            if let Some(sf) = surface(app) {
-                let s = sf.state();
-                set_row_recording(&s, index, true);
-                s.set_capturing(true);
-                sf.focus_capture();
-            }
+            let sf = surface(app);
+            let s = sf.state();
+            set_row_recording(&s, index, true);
+            // The panel takes the keyboard itself when this flips.
+            s.set_capturing(true);
         });
     });
     logic.on_capture_key(|text, ctrl, alt, shift| {
@@ -1342,17 +1253,6 @@ fn wire(sf: &SettingsSurface<'_>) {
     logic.on_save_and_close(|| {
         app::with_current(close);
     });
-
-    // The OS close box is the window's alone; the page has only the
-    // button.
-    if let SettingsSurface::Window(win) = sf {
-        let weak = win.as_weak();
-        win.window().on_close_requested(move || {
-            let _ = &weak;
-            app::with_current(close);
-            slint::CloseRequestResponse::HideWindow
-        });
-    }
 }
 
 /// Recompute the selected entry's `address` from the editor's IP and
@@ -1361,7 +1261,7 @@ fn update_selected_address(app: &mut AppState) {
     let Some(index) = selected_server(app) else {
         return;
     };
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let s = sf.state();
     let address = join_address(&s.get_server_ip(), &s.get_server_port());
     app.settings.servers[index].address = address;
@@ -1488,24 +1388,23 @@ fn finish_capture(app: &mut AppState, text: &str, ctrl: bool, alt: bool, shift: 
 /// Leave recording mode without changing the bind.
 fn cancel_capture(app: &mut AppState) {
     app.keybind_recording = None;
-    if let Some(sf) = surface(app) {
-        let s = sf.state();
-        s.set_capturing(false);
-        let rows = s.get_keybinds();
-        for i in 0..rows.row_count() {
-            if let Some(mut row) = rows.row_data(i)
-                && row.recording
-            {
-                row.recording = false;
-                rows.set_row_data(i, row);
-            }
+    let sf = surface(app);
+    let s = sf.state();
+    s.set_capturing(false);
+    let rows = s.get_keybinds();
+    for i in 0..rows.row_count() {
+        if let Some(mut row) = rows.row_data(i)
+            && row.recording
+        {
+            row.recording = false;
+            rows.set_row_data(i, row);
         }
     }
 }
 
 /// Refresh just the keybind rows (after a capture or clear).
 fn populate_binds_only(app: &mut AppState) {
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let rows: Vec<KeybindRow> = BindableAction::ALL
         .iter()
         .map(|&action| KeybindRow {
@@ -1544,18 +1443,16 @@ fn start_meter_timer(app: &mut AppState) {
                 // The permission is granted in System Settings, not
                 // here: while the note about it shows, look whether it
                 // has been, and watch the keys from then on.
-                let granted = surface(app).is_some_and(|sf| {
-                    let waiting = sf.state().get_keybinds_need_access();
-                    if waiting && crate::hotkeys::access_granted() {
-                        sf.state().set_keybinds_need_access(false);
-                        return true;
-                    }
-                    false
-                });
+                let state = surface(app).state();
+                let granted =
+                    state.get_keybinds_need_access() && crate::hotkeys::access_granted();
+                if granted {
+                    state.set_keybinds_need_access(false);
+                }
                 if granted {
                     app.rearm_hotkeys();
                 }
-                let Some(sf) = surface(app) else { return };
+                let sf = surface(app);
                 if !sf.section_showing() {
                     return;
                 }
@@ -1620,9 +1517,7 @@ fn start_meter_timer(app: &mut AppState) {
 /// close the Audio tab's microphone to match, and say whether Settings
 /// is on screen at all.
 fn pace_meter_timer(app: &mut AppState) -> bool {
-    let Some(sf) = surface(app) else {
-        return false;
-    };
+    let sf = surface(app);
     let showing = app::host_visible() && sf.showing();
     let audio = showing && sf.tab() == TAB_AUDIO && sf.section_showing();
     let pace = if audio { METER_TICK } else { IDLE_TICK };
@@ -1659,11 +1554,10 @@ pub(crate) fn sync_audio_tab(app: &mut AppState) {
 /// A microphone test ended without its button (the session it ran in
 /// closed): the button and its hint say so.
 pub(crate) fn test_ended(app: &AppState) {
-    if let Some(sf) = surface(app) {
-        let s = sf.state();
-        s.set_testing_mic(false);
-        s.set_test_hint(test_hint(false).into());
-    }
+    let sf = surface(app);
+    let s = sf.state();
+    s.set_testing_mic(false);
+    s.set_test_hint(test_hint(false).into());
 }
 
 /// The line beside the Test microphone button. Where the test plays the
@@ -1683,7 +1577,7 @@ fn test_hint(testing: bool) -> String {
 /// lines. A read of the file's last 128 KB; properties are set only
 /// when they changed, so an idle log redraws nothing.
 pub fn refresh_log(app: &AppState) {
-    let Some(sf) = surface(app) else { return };
+    let sf = surface(app);
     let s = sf.state();
     let Some(path) = logfile::path() else {
         s.set_log_file_available(false);
@@ -1836,15 +1730,14 @@ fn aec_status(report: Option<&audio::AecReport>) -> String {
     }
 }
 
-/// Close semantics (both the Save button and the OS close box):
+/// Close semantics (the Save button, the arrow, Escape and Back):
 /// cancel any recording, stop a running mic test, persist, hide.
 fn close(app: &mut AppState) {
     cancel_capture(app);
     if app.is_testing_mic {
         app.handle_test_microphone(false);
-        if let Some(sf) = surface(app) {
-            sf.state().set_testing_mic(false);
-        }
+        let sf = surface(app);
+        sf.state().set_testing_mic(false);
     }
     app.meter_timer.stop();
     // Nothing shows the meter any more: its microphone closes.
@@ -1866,9 +1759,8 @@ fn close(app: &mut AppState) {
         app.profile_dirty = false;
         app.send_own_profile();
     }
-    if let Some(sf) = surface(app) {
-        sf.hide();
-    }
+    let sf = surface(app);
+    sf.hide();
 }
 
 /// Push the Credits tab roster (same names the FLTK panel carried).

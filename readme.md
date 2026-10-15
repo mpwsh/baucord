@@ -25,7 +25,7 @@ Working on the code? Start with [`START-HERE.md`](START-HERE.md).
 | `client`    | networking, settings, and the voice/screen worker threads           |
 | `app-core`  | platform-agnostic app logic: roster/chat view models, image pipes   |
 | `frontend`  | the UI logic every host shares: `AppState`, the Slint models, the   |
-|             | settings/admin windows; host-only bits behind the `desktop` feature |
+|             | settings/admin pages; host-only bits behind the `desktop` feature   |
 | `desktop`   | the desktop host (binary: `baucord`): `main.rs` and nothing else    |
 | `ui`        | the Slint UI and its Rust glue                                      |
 | `i18n`      | Fluent translations — English, Español (AR), Português (BR)         |

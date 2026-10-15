@@ -1,5 +1,7 @@
-// The admin panel (spec §8): a settings-shaped window — tabs on the
-// left, one list per tab on the right — over the admin commands the
+// The admin panel (spec §8): a settings-shaped page over the main
+// window — tabs on the left, one list per tab on the right; on a phone
+// the tab list and one tab are two pages, as Settings' are
+// (ANDROID-SPEC.md D71) — over the admin commands the
 // slash commands already send. Every row action goes through the
 // host (`AdminLogic`), which sends the same `AdminCommand` the
 // command line would: one authorization path, three front ends.
@@ -10,7 +12,8 @@ import { ScrollView } from "std-widgets.slint";
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { Btn, IconBtn, Field, FieldLabel, Hint, Sep, Dropdown, CheckRow, RoleGlyph, TipLayer } from "widgets.slint";
+import { State } from "globals.slint";
+import { Btn, IconBtn, Field, FieldLabel, Hint, Sep, Dropdown, CheckRow, RoleGlyph } from "widgets.slint";
 import { NavItem, PanelHeader } from "settings.slint";
 
 export struct AdminUserRow {
@@ -180,14 +183,15 @@ export global AdminLogic {
 
 // ── Small pieces ────────────────────────────────────────────────────────
 
-/// A compact text chip that acts: the panel's row buttons.
+/// A compact text chip that acts: the panel's row buttons. A finger
+/// gets a taller one (a phone has no pointer to aim).
 component Chip inherits Rectangle {
     in property <string> text;
     in property <bool> danger;
     in property <bool> enabled: true;
     callback clicked;
-    width: lbl.preferred-width + 2 * Theme.gap-sm;
-    height: 24px;
+    width: lbl.preferred-width + 2 * (State.touch-host ? Theme.gap-md : Theme.gap-sm);
+    height: State.touch-host ? 32px : 24px;
     border-radius: Theme.radius-sm;
     background: !root.enabled ? transparent
         : t.has-hover ? Theme.hover : Theme.bg-tertiary;
@@ -280,78 +284,155 @@ component Muted inherits Text {
 }
 
 // ── Tabs ────────────────────────────────────────────────────────────────
+// Every tab takes `compact`: the page is narrow (a phone, or a window
+// made small). Compact rows stack what a wide row lines up, and size
+// themselves to what they hold (`body.preferred-height`: a layout alone
+// under-reports wrapped text, as WarningNote's comment says).
 
-component UsersTab inherits VerticalLayout {
-    spacing: Theme.gap-md;
-    TabHead { title: Tr.admin-users; lead: Tr.admin-users-lead; tab: 0; }
-    if AdminState.users.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
-    VerticalLayout {
-        for u in AdminState.users : Row {
-            row-height: 60px;
-            HorizontalLayout {
-                padding-left: Theme.gap-xs;
-                padding-right: Theme.gap-xs;
-                spacing: Theme.gap-sm;
-                Rectangle {
-                    width: 10px;
-                    Rectangle {
-                        width: 8px;
-                        height: 8px;
-                        border-radius: 4px;
-                        background: u.online ? Theme.success : Theme.subtle;
-                    }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 2px;
-                    horizontal-stretch: 1;
-                    Cell { text: u.name; font-weight: 600; }
-                    Muted { text: u.roles + " · " + u.last-seen; }
-                    HorizontalLayout {
-                        spacing: Theme.gap-xs;
-                        Chip { text: Tr.admin-disconnect; enabled: u.online;
-                            clicked => { AdminLogic.user-action(u.user-id, 1); } }
-                        Chip { text: Tr.admin-kick; danger: true;
-                            clicked => { AdminLogic.user-action(u.user-id, 2); } }
-                        Chip { text: Tr.admin-ban; danger: true;
-                            clicked => { AdminLogic.user-action(u.user-id, 3); } }
-                        Chip { text: Tr.admin-reset-profile;
-                            clicked => { AdminLogic.user-action(u.user-id, 5); } }
-                        Chip { text: Tr.admin-purge; danger: true;
-                            clicked => { AdminLogic.user-action(u.user-id, 4); } }
-                        Rectangle { }
-                    }
-                }
-                // Their highest role; picking another one sets it.
-                Rectangle {
-                    width: 136px;
-                    Dropdown {
-                        y: (parent.height - self.height) / 2;
-                        options: AdminState.role-names;
-                        current: u.role-index;
-                        placeholder: Tr.admin-set-role;
-                        selected(i) => {
-                            if (i != u.role-index) { AdminLogic.user-set-role(u.user-id, i); }
-                        }
-                    }
-                }
-            }
+component OnlineDot inherits Rectangle {
+    in property <bool> online;
+    width: 10px;
+    Rectangle {
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: root.online ? Theme.success : Theme.subtle;
+    }
+}
+
+/// Their highest role; picking another one sets it.
+component RolePick inherits Rectangle {
+    in property <AdminUserRow> u;
+    width: 136px;
+    Dropdown {
+        y: (parent.height - self.height) / 2;
+        options: AdminState.role-names;
+        current: root.u.role-index;
+        placeholder: Tr.admin-set-role;
+        selected(i) => {
+            if (i != root.u.role-index) { AdminLogic.user-set-role(root.u.user-id, i); }
         }
     }
 }
 
+/// A person's actions, every one confirmed by the host first. `part`
+/// splits them over two lines on a narrow page: 1 the session ones,
+/// 2 the account ones; 0 is all of them on one line.
+component UserChips inherits HorizontalLayout {
+    in property <AdminUserRow> u;
+    in property <int> part: 0;
+    spacing: Theme.gap-xs;
+    if root.part != 2 : Chip { text: Tr.admin-disconnect; enabled: root.u.online;
+        clicked => { AdminLogic.user-action(root.u.user-id, 1); } }
+    if root.part != 2 : Chip { text: Tr.admin-kick; danger: true;
+        clicked => { AdminLogic.user-action(root.u.user-id, 2); } }
+    if root.part != 2 : Chip { text: Tr.admin-ban; danger: true;
+        clicked => { AdminLogic.user-action(root.u.user-id, 3); } }
+    if root.part != 1 : Chip { text: Tr.admin-reset-profile;
+        clicked => { AdminLogic.user-action(root.u.user-id, 5); } }
+    if root.part != 1 : Chip { text: Tr.admin-purge; danger: true;
+        clicked => { AdminLogic.user-action(root.u.user-id, 4); } }
+    Rectangle { }
+}
+
+component UserLine inherits Row {
+    in property <AdminUserRow> u;
+    row-height: 60px;
+    HorizontalLayout {
+        padding-left: Theme.gap-xs;
+        padding-right: Theme.gap-xs;
+        spacing: Theme.gap-sm;
+        OnlineDot { online: root.u.online; }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Cell { text: root.u.name; font-weight: 600; }
+            Muted { text: root.u.roles + " · " + root.u.last-seen; }
+            UserChips { u: root.u; }
+        }
+        RolePick { u: root.u; }
+    }
+}
+
+/// A person on a narrow page: who they are across the whole width (a
+/// long name is not cut for a picker beside it), the session actions,
+/// then the account ones with the role picker.
+component UserCard inherits Row {
+    in property <AdminUserRow> u;
+    row-height: body.preferred-height;
+    body := VerticalLayout {
+        padding-left: Theme.gap-xs;
+        padding-right: Theme.gap-xs;
+        padding-top: Theme.gap-sm;
+        padding-bottom: Theme.gap-sm;
+        spacing: Theme.gap-sm;
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            OnlineDot { online: root.u.online; }
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Cell { text: root.u.name; font-weight: 600; }
+                Muted { text: root.u.roles + " · " + root.u.last-seen; }
+            }
+        }
+        UserChips { u: root.u; part: 1; }
+        HorizontalLayout {
+            UserChips { u: root.u; part: 2; }
+            RolePick { u: root.u; }
+        }
+    }
+}
+
+component UsersTab inherits VerticalLayout {
+    in property <bool> compact;
+    spacing: Theme.gap-md;
+    TabHead { title: Tr.admin-users; lead: Tr.admin-users-lead; tab: 0; }
+    if AdminState.users.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
+    VerticalLayout {
+        for u in AdminState.users : VerticalLayout {
+            if !root.compact : UserLine { u: u; }
+            if root.compact : UserCard { u: u; }
+        }
+    }
+}
+
+/// Fixed tiles in rows that wrap at the width there is — a layout
+/// Slint does not have: the role badge's glyphs and colors. Tile `i`
+/// sits at `x-of(i)`, `y-of(i)`; the box is as tall as its rows.
+component TileFlow inherits Rectangle {
+    in property <int> count;
+    in property <length> tile;
+    in property <length> gap: Theme.gap-xs;
+    property <int> per-row: Math.max(1, Math.floor((root.width + root.gap) / (root.tile + root.gap)));
+    height: Math.ceil(root.count / root.per-row) * (root.tile + root.gap) - root.gap;
+    pure public function x-of(i: int) -> length {
+        return Math.mod(i, root.per-row) * (root.tile + root.gap);
+    }
+    pure public function y-of(i: int) -> length {
+        return Math.floor(i / root.per-row) * (root.tile + root.gap);
+    }
+}
+
 component RolesTab inherits VerticalLayout {
+    in property <bool> compact;
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-roles; lead: Tr.admin-roles-lead; tab: 1; }
     VerticalLayout {
         for r in AdminState.roles : Row {
-            row-height: 52px;
+            // Narrow: the standing goes under the name, so the name is
+            // never the part that gets cut.
+            row-height: root.compact ? role-body.preferred-height : 52px;
             HorizontalLayout {
                 padding-left: Theme.gap-xs;
                 padding-right: Theme.gap-xs;
                 spacing: Theme.gap-sm;
-                VerticalLayout {
+                role-body := VerticalLayout {
                     alignment: center;
+                    padding-top: root.compact ? Theme.gap-sm : 0px;
+                    padding-bottom: root.compact ? Theme.gap-sm : 0px;
                     spacing: 2px;
                     horizontal-stretch: 1;
                     HorizontalLayout {
@@ -361,11 +442,20 @@ component RolesTab inherits VerticalLayout {
                             size: 14px;
                             stroke: r.has-color ? r.color : Theme.text-secondary;
                         }
-                        Cell { text: r.name; font-weight: 600;
+                        // The name keeps its width; the rest follows it.
+                        Cell { text: r.name; font-weight: 600; horizontal-stretch: 0;
                             color: r.has-color ? r.color : Theme.text-primary; }
-                        Muted { text: "· " + r.standing + " · " + r.holders + " " + Tr.admin-holders; }
+                        if !root.compact : Muted {
+                            text: "· " + r.standing + " · " + r.holders + " " + Tr.admin-holders;
+                            horizontal-stretch: 1;
+                        }
                     }
-                    Muted { text: r.permissions; }
+                    if root.compact : Muted { text: r.standing + " · " + r.holders + " " + Tr.admin-holders; }
+                    // Narrow: every permission, wrapped (the row grows).
+                    Muted {
+                        text: r.permissions;
+                        wrap: root.compact ? TextWrap.word-wrap : TextWrap.no-wrap;
+                    }
                 }
                 if !r.builtin : Chip { text: Tr.admin-edit; clicked => { AdminLogic.role-select(r.id); } }
                 if !r.builtin : Chip { text: Tr.admin-delete; danger: true;
@@ -400,23 +490,30 @@ component RolesTab inherits VerticalLayout {
                 Field { text <=> AdminState.role-edit-name; placeholder: "streamer"; }
                 Hint { text: Tr.admin-role-name-hint; }
             }
-            // The badge: a glyph and a color, both optional.
+            // The badge: a glyph and a color, both optional. Seventeen of
+            // each, so they wrap where the page is narrower than a row.
+            // A finger gets bigger tiles.
             VerticalLayout {
                 spacing: Theme.gap-xs;
                 FieldLabel { text: Tr.admin-role-badge; }
-                HorizontalLayout {
-                    spacing: Theme.gap-xs;
+                glyphs := TileFlow {
+                    count: AdminState.role-icons.length + 1;
+                    tile: State.touch-host ? 40px : 30px;
                     Rectangle {
-                        width: 30px;
-                        height: 30px;
+                        x: glyphs.x-of(0);
+                        y: glyphs.y-of(0);
+                        width: glyphs.tile;
+                        height: glyphs.tile;
                         border-radius: Theme.radius-sm;
                         background: AdminState.role-edit-icon == "" ? Theme.accent : Theme.bg-tertiary;
                         Text { text: "—"; color: Theme.text-secondary; font-size: Theme.font-sm; }
                         TouchArea { mouse-cursor: pointer; clicked => { AdminState.role-edit-icon = ""; } }
                     }
-                    for icon in AdminState.role-icons : Rectangle {
-                        width: 30px;
-                        height: 30px;
+                    for icon[i] in AdminState.role-icons : Rectangle {
+                        x: glyphs.x-of(i + 1);
+                        y: glyphs.y-of(i + 1);
+                        width: glyphs.tile;
+                        height: glyphs.tile;
                         border-radius: Theme.radius-sm;
                         background: AdminState.role-edit-icon == icon ? Theme.accent : Theme.bg-tertiary;
                         animate background { duration: 100ms; }
@@ -427,14 +524,16 @@ component RolesTab inherits VerticalLayout {
                         }
                         TouchArea { mouse-cursor: pointer; clicked => { AdminState.role-edit-icon = icon; } }
                     }
-                    Rectangle { }
                 }
-                HorizontalLayout {
-                    spacing: Theme.gap-xs;
+                swatches := TileFlow {
+                    count: AdminState.role-colors.length + 1;
+                    tile: State.touch-host ? 32px : 22px;
                     Rectangle {
-                        width: 22px;
-                        height: 22px;
-                        border-radius: 11px;
+                        x: swatches.x-of(0);
+                        y: swatches.y-of(0);
+                        width: swatches.tile;
+                        height: swatches.tile;
+                        border-radius: self.width / 2;
                         border-width: AdminState.role-edit-color < 0 ? 2px : 1px;
                         border-color: AdminState.role-edit-color < 0 ? Theme.text-primary : Theme.border;
                         background: Theme.bg-tertiary;
@@ -442,15 +541,16 @@ component RolesTab inherits VerticalLayout {
                         TouchArea { mouse-cursor: pointer; clicked => { AdminState.role-edit-color = -1; } }
                     }
                     for c[i] in AdminState.role-colors : Rectangle {
-                        width: 22px;
-                        height: 22px;
-                        border-radius: 11px;
+                        x: swatches.x-of(i + 1);
+                        y: swatches.y-of(i + 1);
+                        width: swatches.tile;
+                        height: swatches.tile;
+                        border-radius: self.width / 2;
                         background: c;
                         border-width: AdminState.role-edit-color == i ? 2px : 0px;
                         border-color: Theme.text-primary;
                         TouchArea { mouse-cursor: pointer; clicked => { AdminState.role-edit-color = i; } }
                     }
-                    Rectangle { }
                 }
             }
             VerticalLayout {
@@ -473,27 +573,44 @@ component RolesTab inherits VerticalLayout {
 }
 
 component RestrictionsTab inherits VerticalLayout {
+    in property <bool> compact;
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-restrictions; lead: Tr.admin-restrictions-lead; tab: 2; }
     if AdminState.restrictions.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
     VerticalLayout {
         for r in AdminState.restrictions : Row {
-            row-height: 52px;
+            // The reason wraps instead of being cut: it is what the
+            // person was told (up to 500 bytes).
+            row-height: Math.max(52px, lift-body.preferred-height);
             HorizontalLayout {
                 padding-left: Theme.gap-xs;
                 padding-right: Theme.gap-xs;
                 spacing: Theme.gap-sm;
-                VerticalLayout {
+                lift-body := VerticalLayout {
                     alignment: center;
+                    padding-top: Theme.gap-sm;
+                    padding-bottom: Theme.gap-sm;
                     spacing: 2px;
                     horizontal-stretch: 1;
-                    HorizontalLayout {
+                    // What and for how long are never the part that
+                    // gets cut; narrow, the person has a line of their
+                    // own (a name can be 32 characters).
+                    if !root.compact : HorizontalLayout {
                         spacing: Theme.gap-xs;
-                        Cell { text: r.kind; font-weight: 600; }
-                        Cell { text: r.who; }
-                        Muted { text: "· " + r.until; }
+                        Cell { text: r.kind; font-weight: 600; horizontal-stretch: 0; min-width: self.preferred-width; }
+                        Cell { text: r.who; horizontal-stretch: 0; }
+                        Muted { text: "· " + r.until; horizontal-stretch: 1; min-width: self.preferred-width; }
                     }
-                    Muted { text: r.reason + " — " + r.by; }
+                    if root.compact : HorizontalLayout {
+                        spacing: Theme.gap-xs;
+                        Cell { text: r.kind; font-weight: 600; horizontal-stretch: 0; }
+                        Muted { text: "· " + r.until; horizontal-stretch: 1; }
+                    }
+                    if root.compact : Cell { text: r.who; wrap: word-wrap; }
+                    Muted {
+                        text: r.reason + " — " + r.by;
+                        wrap: word-wrap;
+                    }
                 }
                 Chip { text: Tr.admin-lift; clicked => { AdminLogic.restriction-lift(r.id); } }
             }
@@ -621,13 +738,43 @@ component ColHead inherits Text {
     overflow: elide;
 }
 
+/// One audit entry on a narrow page: who did what to whom, then when
+/// and the details, wrapped — the table's five columns do not fit.
+component AuditCard inherits Row {
+    in property <AdminAuditRow> e;
+    row-height: body.preferred-height;
+    body := VerticalLayout {
+        padding-left: Theme.gap-xs;
+        padding-right: Theme.gap-xs;
+        padding-top: Theme.gap-sm;
+        padding-bottom: Theme.gap-sm;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: Theme.gap-xs;
+            Cell { text: root.e.actor; font-weight: 600; horizontal-stretch: 0; }
+            Cell { text: root.e.action; color: Theme.accent-text; horizontal-stretch: 0; }
+            Cell { text: root.e.target; color: Theme.text-secondary; horizontal-stretch: 1; }
+        }
+        Text {
+            text: root.e.detail == "" ? root.e.when : root.e.when + " · " + root.e.detail;
+            color: Theme.text-muted;
+            font-size: Theme.font-xs;
+            wrap: word-wrap;
+        }
+    }
+}
+
 component AuditTab inherits VerticalLayout {
+    in property <bool> compact;
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-audit; lead: Tr.admin-audit-lead; tab: 6; }
     if AdminState.audit.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
+    if root.compact && AdminState.audit.length > 0 : VerticalLayout {
+        for e in AdminState.audit : AuditCard { e: e; }
+    }
     // A table: fixed columns for when, who and what; the target and
     // the details share the rest. Headers say what each is.
-    if AdminState.audit.length > 0 : VerticalLayout {
+    if !root.compact && AdminState.audit.length > 0 : VerticalLayout {
         HorizontalLayout {
             height: 28px;
             padding-left: Theme.gap-xs;
@@ -670,6 +817,7 @@ component AuditTab inherits VerticalLayout {
 }
 
 component ReportsTab inherits VerticalLayout {
+    in property <bool> compact;
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-reports; lead: Tr.admin-reports-lead; tab: 8; }
     CheckRow {
@@ -682,21 +830,34 @@ component ReportsTab inherits VerticalLayout {
     }
     VerticalLayout {
         for r in AdminState.reports : Row {
-            row-height: r.excerpt != "" ? 118px : 84px;
-            VerticalLayout {
+            // Narrow: who and when on one line, why and what on the
+            // next, and the reported message in full.
+            row-height: root.compact ? report-body.preferred-height
+                : r.excerpt != "" ? 118px : 84px;
+            report-body := VerticalLayout {
                 padding-left: Theme.gap-xs;
                 padding-right: Theme.gap-xs;
-                padding-top: Theme.gap-xs;
-                padding-bottom: Theme.gap-xs;
-                spacing: 2px;
-                HorizontalLayout {
+                padding-top: root.compact ? Theme.gap-sm : Theme.gap-xs;
+                padding-bottom: root.compact ? Theme.gap-sm : Theme.gap-xs;
+                spacing: root.compact ? Theme.gap-xs : 2px;
+                if !root.compact : HorizontalLayout {
                     spacing: Theme.gap-sm;
                     Cell { text: r.target; font-weight: 600; horizontal-stretch: 0; }
                     Cell { text: r.reason; color: Theme.danger-text; horizontal-stretch: 0; }
                     Muted { text: r.what; horizontal-stretch: 1; }
                     Muted { text: r.when; horizontal-stretch: 0; }
                 }
-                if r.excerpt != "" : Text {
+                if root.compact : HorizontalLayout {
+                    spacing: Theme.gap-sm;
+                    Cell { text: r.target; font-weight: 600; horizontal-stretch: 1; }
+                    Muted { text: r.when; horizontal-stretch: 0; }
+                }
+                if root.compact : HorizontalLayout {
+                    spacing: Theme.gap-sm;
+                    Cell { text: r.reason; color: Theme.danger-text; horizontal-stretch: 0; }
+                    Muted { text: r.what; horizontal-stretch: 1; }
+                }
+                if r.excerpt != "" && !root.compact : Text {
                     text: "“" + r.excerpt + "”";
                     color: Theme.text-secondary;
                     font-size: Theme.font-sm;
@@ -704,9 +865,16 @@ component ReportsTab inherits VerticalLayout {
                     overflow: elide;
                     height: 36px;
                 }
+                if r.excerpt != "" && root.compact : Text {
+                    text: "“" + r.excerpt + "”";
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    wrap: word-wrap;
+                }
                 Muted {
                     text: (r.reporter == "" ? Tr.admin-reports-by-gone : Tr.admin-reports-by + " " + r.reporter)
                         + (r.note == "" ? "" : " — " + r.note);
+                    wrap: root.compact ? TextWrap.word-wrap : TextWrap.no-wrap;
                 }
                 HorizontalLayout {
                     spacing: Theme.gap-xs;
@@ -726,91 +894,124 @@ component ReportsTab inherits VerticalLayout {
 component StatLine inherits HorizontalLayout {
     in property <string> label;
     in property <string> value;
+    in property <length> label-width: 140px;
     spacing: Theme.gap-md;
-    Muted { text: root.label; width: 140px; }
+    Muted { text: root.label; width: root.label-width; }
     Cell { text: root.value; horizontal-stretch: 1; }
 }
 
 component ServerTab inherits VerticalLayout {
+    in property <bool> compact;
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-server; lead: Tr.admin-server-lead; tab: 7; }
     VerticalLayout {
         spacing: Theme.gap-xs;
-        StatLine { label: Tr.admin-stat-version;     value: AdminState.stat-version; }
-        StatLine { label: Tr.admin-stat-uptime;      value: AdminState.stat-uptime; }
-        StatLine { label: Tr.admin-stat-online;      value: AdminState.stat-online; }
-        StatLine { label: Tr.admin-stat-users;       value: AdminState.stat-users; }
-        StatLine { label: Tr.admin-stat-messages;    value: AdminState.stat-messages; }
-        StatLine { label: Tr.admin-stat-blobs;       value: AdminState.stat-blobs; }
+        StatLine { label: Tr.admin-stat-version;     value: AdminState.stat-version; label-width: root.compact ? 112px : 140px; }
+        StatLine { label: Tr.admin-stat-uptime;      value: AdminState.stat-uptime; label-width: root.compact ? 112px : 140px; }
+        StatLine { label: Tr.admin-stat-online;      value: AdminState.stat-online; label-width: root.compact ? 112px : 140px; }
+        StatLine { label: Tr.admin-stat-users;       value: AdminState.stat-users; label-width: root.compact ? 112px : 140px; }
+        StatLine { label: Tr.admin-stat-messages;    value: AdminState.stat-messages; label-width: root.compact ? 112px : 140px; }
+        StatLine { label: Tr.admin-stat-blobs;       value: AdminState.stat-blobs; label-width: root.compact ? 112px : 140px; }
         Sep { }
-        StatLine { label: Tr.admin-stat-persistence; value: AdminState.stat-persistence; }
-        StatLine { label: Tr.admin-stat-queue;       value: AdminState.stat-queue; }
-        StatLine { label: Tr.admin-stat-dropped;     value: AdminState.stat-dropped; }
-        StatLine { label: Tr.admin-stat-errors;      value: AdminState.stat-errors; }
+        StatLine { label: Tr.admin-stat-persistence; value: AdminState.stat-persistence; label-width: root.compact ? 112px : 140px; }
+        StatLine { label: Tr.admin-stat-queue;       value: AdminState.stat-queue; label-width: root.compact ? 112px : 140px; }
+        StatLine { label: Tr.admin-stat-dropped;     value: AdminState.stat-dropped; label-width: root.compact ? 112px : 140px; }
+        StatLine { label: Tr.admin-stat-errors;      value: AdminState.stat-errors; label-width: root.compact ? 112px : 140px; }
     }
 }
 
-// ── The window ──────────────────────────────────────────────────────────
+// ── The panel ───────────────────────────────────────────────────────────
 
-export component AdminWindow inherits Window {
-    title: Tr.admin-title;
-    background: Theme.bg-primary;
-    preferred-width: 820px;
-    preferred-height: 660px;
-    min-width: 680px;
-    min-height: 520px;
+/// The tabs: the wide panel's left column, the narrow page's first
+/// list (which highlights nothing — a row there opens its tab).
+component AdminNav inherits VerticalLayout {
+    in property <int> tab;
+    in property <bool> narrow: false;
+    callback picked(int);
+    padding: Theme.gap-md;
+    spacing: Theme.gap-xs;
+    NavItem { text: Tr.admin-users;        icon: IconSet.Users;      tall: root.narrow; active: !root.narrow && root.tab == 0; clicked => { root.picked(0); } }
+    NavItem { text: Tr.admin-reports;      icon: IconSet.Flag;       tall: root.narrow; active: !root.narrow && root.tab == 8; clicked => { root.picked(8); } }
+    NavItem { text: Tr.admin-roles;        icon: IconSet.Shield;     tall: root.narrow; active: !root.narrow && root.tab == 1; clicked => { root.picked(1); } }
+    NavItem { text: Tr.admin-restrictions; icon: IconSet.Ban;        tall: root.narrow; active: !root.narrow && root.tab == 2; clicked => { root.picked(2); } }
+    NavItem { text: Tr.admin-invites;      icon: IconSet.Ticket;     tall: root.narrow; active: !root.narrow && root.tab == 3; clicked => { root.picked(3); } }
+    NavItem { text: Tr.admin-channels;     icon: IconSet.Hash;       tall: root.narrow; active: !root.narrow && root.tab == 4; clicked => { root.picked(4); } }
+    NavItem { text: Tr.admin-files;        icon: IconSet.Paperclip;  tall: root.narrow; active: !root.narrow && root.tab == 5; clicked => { root.picked(5); } }
+    NavItem { text: Tr.admin-audit;        icon: IconSet.ScrollText; tall: root.narrow; active: !root.narrow && root.tab == 6; clicked => { root.picked(6); } }
+    // The server's own figures: their own group, at the bottom of the
+    // column, a group gap under the rest in the phone's list.
+    if !root.narrow : Rectangle { }
+    if root.narrow : Rectangle { height: Theme.gap-lg; }
+    NavItem { text: Tr.admin-server;       icon: IconSet.Server;     tall: root.narrow; active: !root.narrow && root.tab == 7; clicked => { root.picked(7); } }
+    if root.narrow : Rectangle { }
+}
 
-    /// 0 users, 1 roles, 2 restrictions, 3 invites, 4 channels,
-    /// 5 files, 6 audit, 7 server, 8 reports.
-    in-out property <int> tab: 0;
-    in property <bool> repaint-flip;
-    Rectangle {
-        width: 100%;
-        height: 100%;
-        background: root.repaint-flip ? #FFFFFF01 : transparent;
+/// The selected tab, scrolling: the wide panel's right column, the
+/// narrow page's second page.
+component AdminContent inherits ScrollView {
+    in property <int> tab;
+    in property <bool> compact;
+    in property <length> pad: Theme.gap-xl;
+    vertical-stretch: 1;
+    // Fluent's ScrollView does not pan on a drag; a finger needs it to
+    // (ANDROID-SPEC.md D27).
+    mouse-drag-pan-enabled: State.touch-host;
+    VerticalLayout {
+        padding: root.pad;
+        alignment: start;
+        if root.tab == 0 : UsersTab { compact: root.compact; }
+        if root.tab == 1 : RolesTab { compact: root.compact; }
+        if root.tab == 2 : RestrictionsTab { compact: root.compact; }
+        if root.tab == 3 : InvitesTab { }
+        if root.tab == 4 : ChannelsTab { }
+        if root.tab == 5 : FilesTab { }
+        if root.tab == 6 : AuditTab { compact: root.compact; }
+        if root.tab == 7 : ServerTab { compact: root.compact; }
+        if root.tab == 8 : ReportsTab { compact: root.compact; }
     }
+}
+
+/// The admin panel as a page of the main window (`State.admin-open`):
+/// wide, the tabs where the sidebar was and the tab beside them; narrow
+/// (a phone), the tab list and one tab as two pages, as Settings.
+export component AdminPanel inherits Rectangle {
+    /// 0 users, 1 roles, 2 restrictions, 3 invites, 4 channels,
+    /// 5 files, 6 audit, 7 server, 8 reports (`adminui::TAB_*`).
+    in-out property <int> tab: 0;
+    in property <bool> narrow: false;
+    /// Narrow only: a tab's page is showing, not the list.
+    in-out property <bool> section-open: false;
+    // The tab's column is narrower than a wide row needs (the Users
+    // row's five actions and role picker; the audit table's columns):
+    // rows stack instead.
+    property <bool> compact: root.narrow || root.width - 188px - 2 * Theme.gap-xl < 600px;
 
     function open-tab(t: int) {
         root.tab = t;
         AdminLogic.refresh(t);
     }
 
-    HorizontalLayout {
+    /// One step back: from a tab to the list (narrow), else out of the
+    /// panel. The top bar's arrow, Escape and Android's Back.
+    public function back() {
+        if (root.narrow && root.section-open) {
+            root.section-open = false;
+        } else {
+            AdminLogic.close();
+        }
+    }
+
+    if !root.narrow : HorizontalLayout {
         Rectangle {
             width: 188px;
             background: Theme.surface;
-            VerticalLayout {
-                padding: Theme.gap-md;
-                spacing: Theme.gap-xs;
-                NavItem { text: Tr.admin-users;        icon: IconSet.Users;        active: root.tab == 0; clicked => { root.open-tab(0); } }
-                NavItem { text: Tr.admin-reports;      icon: IconSet.Flag;         active: root.tab == 8; clicked => { root.open-tab(8); } }
-                NavItem { text: Tr.admin-roles;        icon: IconSet.Shield;       active: root.tab == 1; clicked => { root.open-tab(1); } }
-                NavItem { text: Tr.admin-restrictions; icon: IconSet.Ban;          active: root.tab == 2; clicked => { root.open-tab(2); } }
-                NavItem { text: Tr.admin-invites;      icon: IconSet.Ticket;       active: root.tab == 3; clicked => { root.open-tab(3); } }
-                NavItem { text: Tr.admin-channels;     icon: IconSet.Hash;         active: root.tab == 4; clicked => { root.open-tab(4); } }
-                NavItem { text: Tr.admin-files;        icon: IconSet.Paperclip;    active: root.tab == 5; clicked => { root.open-tab(5); } }
-                NavItem { text: Tr.admin-audit;        icon: IconSet.ScrollText;   active: root.tab == 6; clicked => { root.open-tab(6); } }
-                Rectangle { }
-                NavItem { text: Tr.admin-server;       icon: IconSet.Server;       active: root.tab == 7; clicked => { root.open-tab(7); } }
+            AdminNav {
+                tab: root.tab;
+                picked(t) => { root.open-tab(t); }
             }
         }
         VerticalLayout {
-            ScrollView {
-                vertical-stretch: 1;
-                VerticalLayout {
-                    padding: Theme.gap-xl;
-                    alignment: start;
-                    if root.tab == 0 : UsersTab { }
-                    if root.tab == 1 : RolesTab { }
-                    if root.tab == 2 : RestrictionsTab { }
-                    if root.tab == 3 : InvitesTab { }
-                    if root.tab == 4 : ChannelsTab { }
-                    if root.tab == 5 : FilesTab { }
-                    if root.tab == 6 : AuditTab { }
-                    if root.tab == 7 : ServerTab { }
-                    if root.tab == 8 : ReportsTab { }
-                }
-            }
+            AdminContent { tab: root.tab; compact: root.compact; }
             Rectangle {
                 height: 64px;
                 background: Theme.bg-primary;
@@ -825,10 +1026,56 @@ export component AdminWindow inherits Window {
         }
     }
 
+    if root.narrow : VerticalLayout {
+        // The way back, and where you are.
+        Rectangle {
+            height: 52px;
+            background: Theme.surface;
+            HorizontalLayout {
+                padding-left: Theme.gap-sm;
+                padding-right: Theme.gap-md;
+                spacing: Theme.gap-xs;
+                Rectangle {
+                    width: 40px;
+                    IconBtn {
+                        size: 40px;
+                        icon-size: 20px;
+                        icon: IconSet.ArrowLeft;
+                        idle-color: Theme.text-primary;
+                        clicked => { root.back(); }
+                    }
+                }
+                Text {
+                    text: Tr.admin-title;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+        if !root.section-open : AdminNav {
+            vertical-stretch: 1;
+            narrow: true;
+            tab: root.tab;
+            picked(t) => {
+                root.open-tab(t);
+                root.section-open = true;
+            }
+        }
+        if root.section-open : AdminContent {
+            tab: root.tab;
+            compact: true;
+            pad: Theme.gap-lg;
+        }
+    }
+
     // ── Confirmation (every action that bites goes through it) ─────
     // What it is about, what it does, a reason when the action takes
-    // one (kept in the audit and shown to the person), Escape or
-    // Cancel to back out.
+    // one (kept in the audit and shown to the person), Escape, Back or
+    // Cancel to back out (the page's key handler hands Back here).
     if AdminState.confirm-open : Rectangle {
         background: Theme.scrim;
         TouchArea { clicked => { AdminLogic.confirm-cancel(); } }
@@ -890,9 +1137,5 @@ export component AdminWindow inherits Window {
                 }
             }
         }
-    }
-    TipLayer {
-        width: 100%;
-        height: 100%;
     }
 }

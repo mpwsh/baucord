@@ -172,7 +172,7 @@ tray-show = Show
 tray-quit = Quit
 tray-tip-muted = baucord — muted
 tray-tip-deafened = baucord — deafened
-# In the tray's menu, under the voice room's name: muting is for you alone.
+# In the tray's menu, one item per person in our voice room: muting is for you alone.
 tray-mute-person = Mute { $name }
 tray-unmute-person = Unmute { $name }
 viewer-title = { $name }'s screen ({ $width }x{ $height })
@@ -808,7 +808,6 @@ admin-channel-lead = The audit, as it happens. Slash commands work here: /kick, 
 admin-channel-commands-only = This channel takes commands only — start with /
 
 # ── Phone hosts (ANDROID-SPEC.md, IOS-SPEC.md; one window per process) ──
-host-single-window = Not available on phones yet — this opens in its own window on desktop.
 # iOS has no Quit (apps never close themselves there): what /quit says.
 quit-ios = On iPhone, apps close from the app switcher: swipe up from the bottom edge and pause, then swipe baucord away.
 # The attach sheet on iOS: where to pick from.

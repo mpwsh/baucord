@@ -26,6 +26,15 @@
 > the Rust type-checked there (desktop with the tray, and the phones'
 > `frontend`), nothing run on a device.
 
+> **2026-10-15:** Settings and the admin panel are pages over the
+> main window on every host (no more windows of their own), and the
+> admin panel works on the phones. Lines marked **[10-15]**; the real
+> main window was driven headless on Linux (Escape, Back, recording a
+> key, the confirmation, taps) at desktop, small-window and phone
+> sizes in the three languages; the Rust type-checked (desktop with
+> the tray, the phones' `frontend`); nothing run on a device or a
+> desktop OS.
+
 Each line is *do this → expect that*. `log:` is a line to find in
 `baucord.log` (desktop: Settings → Debug shows it and copies it;
 phones: `adb logcat -s baucord`, `ios/run.sh`'s stream). The tag in
@@ -282,12 +291,39 @@ Play music in another app first, at a steady volume.
   red, unmute back. Deafened, red too.
 - [ ] **new [10-14c]** — right-click the tray icon while in a voice
   room: Mute / Deafen (they read Unmute / Undeafen when on, and act),
-  then the room's name with its people, "Mute Ana" / "Unmute Ana";
-  picking one mutes them for us only (the roster shows the local-mute
-  tint). Out of a room, no people; disconnected, only Show and Quit.
+  then, after a separator and in the menu itself (no submenu), one
+  item per other person in our room, "Mute Ana" / "Unmute Ana" —
+  nobody from another room; picking one mutes them for us only (the
+  roster shows the local-mute tint) and the item turns to "Unmute
+  Ana". Someone joining or leaving our room appears or goes from the
+  menu. In the lobby or the AFK room, no people; disconnected, only
+  Show and Quit. **[10-15]**: the people were in a submenu named
+  after the room.
 - [ ] **new [10-14c]** — mute and unmute: one soft low note, then a
   slightly higher one; deafen the same. Settings → Sounds → "Mute and
   deafen" off silences only those.
+- [ ] **new [10-15]** — open Settings (the gear, or the connect
+  page's pencil): it covers the window, its sections where the
+  sidebar was; no second window opens. Escape, or Save and close,
+  brings the chat back as it was (its scroll, a half-typed message).
+  Change the language or the text size there: the page follows at
+  once.
+- [ ] **new [10-15]** — Settings → Keyboard: Record, press a combo:
+  it is taken; Record again and press Escape: only the recording is
+  cancelled; Escape again closes Settings. The new bind works.
+- [ ] **new [10-15]** — Settings on Audio, then close the window to
+  the tray: the microphone closes (Windows' microphone icon goes);
+  Show from the tray: Settings is still open and the meter moves.
+- [ ] **new [10-15]** — the Admin chip: the panel covers the window,
+  its tabs on the left; every tab fills. Ban someone: the
+  confirmation asks; Escape closes only it, a second Escape the
+  panel. Invites → Create invite: the invite dialog shows over the
+  panel; close it and press Escape: the panel closes (the keyboard
+  came back to it).
+- [ ] **new [10-15]** — make the window narrower with the panel open:
+  under about 830 px the rows stack (a person's actions on two lines,
+  the audit as two-line entries); under 600 px Settings and the panel
+  become a list and a page with an arrow back, as on the phone.
 
 ### 1.6 Keybinds without polling [P1-3 step 2] **[7]**
 
@@ -457,6 +493,18 @@ agrees with it.
   and lifting does not open the gallery. Hold an avatar in chat: the
   author's card, no menu.
 - [ ] **new [10-14c]** — no tooltip ever shows on the phone.
+- [ ] **new [10-15]** — as an admin, tap the Admin chip: a list of
+  the panel's nine tabs. Tap one: its page, filled; Back: the list;
+  Back: the chat. Every tab reads at 360 dp without anything cut
+  that matters (a long name, a ban's reason, a reported message in
+  full), and the row buttons are easy to hit.
+- [ ] **new [10-15]** — Users: change someone's role with the picker
+  beside Reset profile / Purge. Ban: the confirmation's reason field
+  stays above the keyboard; Back closes only the confirmation, the
+  next Back the tab.
+- [ ] **new [10-15]** — Roles → New role: the badge's glyphs and
+  colours wrap into rows; pick one of each, Save; the role shows with
+  its badge.
 
 ### 2.4 The seventh batch, written without a phone **[7]**
 
@@ -604,6 +652,8 @@ after it is the seventh batch's.
 - [ ] Everything under §2.3 but Back: dialogs close on Cancel and on a
   tap outside.
 - [ ] **same** — watch a stream: picture, sound, pinch, rotate.
+- [ ] **new [10-15]** — the admin panel as in §2.3, the top bar's
+  arrow standing in for Back.
 
 ### 3.4 The seventh batch **[7]**
 
@@ -689,6 +739,11 @@ silicon, and an Intel one if there is one.
   over them, "Load earlier" twice: Activity Monitor's memory stays
   within ~20–30 MB of where it started instead of doubling; `/mem`
   says how many pictures are decoded.
+
+### 4.3 Settings and the admin panel as pages **[10-15]**
+
+- [ ] **new [10-15]** — the five §1.5 lines marked **[10-15]** on the
+  Mac; recording a keybind there with Accessibility granted (§4.1).
 
 ---
 
