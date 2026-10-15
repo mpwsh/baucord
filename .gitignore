@@ -12,3 +12,4 @@ baucord.db
 baucord.db-shm
 baucord.db-wal
 /tools/*/target
+/assets/icons/*~
