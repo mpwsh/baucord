@@ -15,7 +15,7 @@ import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
-import { Btn, IconBtn, Modal, PageRect, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph, TipLayer } from "widgets.slint";
+import { Btn, IconBtn, Modal, PageRect, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph, TipLayer, Toast } from "widgets.slint";
 import { SettingsPanel, SettingsState, SettingsLogic } from "settings.slint";
 import { AdminPanel, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow } from "admin.slint";
 import { StreamViewerWindow, StreamViewerPanel } from "viewer.slint";
@@ -152,16 +152,12 @@ export component MainWindow inherits Window {
         width: root.page-width;
         height: root.page-height;
     }
-    // The connect view's surface is the whole window, under the system
-    // bars and the keyboard too; its form keeps clear of them.
-    if State.phase == Phase.connect : Rectangle {
-        background: Theme.bg-secondary;
-        ConnectView {
-            x: root.inset-left;
-            y: root.inset-top;
-            width: root.page-width;
-            height: root.page-height;
-        }
+    if State.phase == Phase.connect : ConnectView {
+        x: root.inset-left;
+        y: root.inset-top;
+        width: root.page-width;
+        height: root.page-height;
+        top-clearance: root.connect-notices-height;
     }
     // ── Wide and narrow (ANDROID-SPEC.md D26) ──────────────────────
     // Wide: the sidebar and the chat side by side, the edge between
@@ -654,10 +650,6 @@ export component MainWindow inherits Window {
         }
     }
 
-    // ── Toast (any phase; the connect view also shows it inline) ───
-    // One register per kind: the glyph and the border carry the color,
-    // the message stays in primary text so it reads on the tint. A
-    // click dismisses it before the 5 s timer does.
     // A file dragged in from the OS: the whole window says where it
     // will go. No TouchArea, so a stale hover (a cancel the platform
     // never sent) still lets clicks through.
@@ -692,52 +684,49 @@ export component MainWindow inherits Window {
         }
     }
 
-    if State.error-text != "" && State.phase == Phase.main : toast-box := Rectangle {
-        property <color> tone: State.toast-kind == ToastKind.error ? Theme.danger
-            : State.toast-kind == ToastKind.warning ? Theme.warning
-            : State.toast-kind == ToastKind.success ? Theme.success
-            : Theme.accent-text;
-        // In the page, under a phone's status bar and notch, not on them
-        // (review 2026-10, P2-22).
+    // ── Toasts (connect and main) ──────────────────────────────────
+    // On the connect view, the two that stay: the verdict until the
+    // next attempt, the missing device until it is back (a click opens
+    // Settings to pick another). The card centres below them, so they
+    // never cover it. Under them, or at the top alone, the 5 s notice a
+    // click dismisses before the timer does. The connect card holds only
+    // the form. All in the page, under a phone's status bar and notch,
+    // not on them (review 2026-10, P2-22).
+    property <bool> connect-notices-shown: State.phase == Phase.connect
+        && !State.settings-open && !State.admin-open;
+    property <length> toast-text-width: root.width - 2 * Theme.gap-lg - 48px;
+    property <length> toast-max-width: root.page-width - 2 * Theme.gap-lg;
+    // How far down the page the two that stay reach.
+    property <length> connect-notices-height: device-toast.visible
+        ? device-toast.y + device-toast.height - root.inset-top
+        : notice-toast.visible ? notice-toast.y + notice-toast.height - root.inset-top : 0;
+    notice-toast := Toast {
+        text: root.connect-notices-shown ? State.connect-notice : "";
+        kind: ToastKind.error;
+        clickable: false;
+        max-text-width: root.toast-text-width;
+        width: Math.min(self.preferred-width, root.toast-max-width);
         x: root.inset-left + (root.page-width - self.width) / 2;
         y: root.inset-top + Theme.gap-lg;
-        width: Math.min(toast-row.preferred-width + 2 * Theme.gap-md, root.page-width - 2 * Theme.gap-lg);
-        height: toast-row.preferred-height + 2 * Theme.gap-sm + 4px;
-        border-radius: Theme.radius-md;
-        background: Theme.bg-tertiary;
-        border-width: 1px;
-        border-color: self.tone.with-alpha(0.6);
-        drop-shadow-color: #00000066;
-        drop-shadow-blur: 12px;
-        drop-shadow-offset-y: 4px;
-        toast-row := HorizontalLayout {
-            padding-left: Theme.gap-md;
-            padding-right: Theme.gap-md;
-            spacing: Theme.gap-sm;
-            Rectangle {
-                width: 16px;
-                IconDisplay {
-                    icon: State.toast-kind == ToastKind.error ? IconSet.CircleX
-                        : State.toast-kind == ToastKind.warning ? IconSet.TriangleAlert
-                        : State.toast-kind == ToastKind.success ? IconSet.CircleCheck
-                        : IconSet.Info;
-                    size: 16px;
-                    stroke: toast-box.tone;
-                }
-            }
-            toast := Text {
-                text: State.error-text;
-                color: Theme.text-primary;
-                font-size: Theme.font-body;
-                vertical-alignment: center;
-                wrap: word-wrap;
-                max-width: root.width - 2 * Theme.gap-lg - 48px;
-            }
-        }
-        TouchArea {
-            mouse-cursor: pointer;
-            clicked => { Logic.toast-dismiss(); }
-        }
+    }
+    device-toast := Toast {
+        text: root.connect-notices-shown ? State.device-warning : "";
+        kind: ToastKind.warning;
+        max-text-width: root.toast-text-width;
+        width: Math.min(self.preferred-width, root.toast-max-width);
+        x: root.inset-left + (root.page-width - self.width) / 2;
+        y: notice-toast.y + (notice-toast.visible ? notice-toast.height + Theme.gap-sm : 0);
+        clicked => { Logic.open-settings(); }
+    }
+    Toast {
+        text: State.phase == Phase.main || State.phase == Phase.connect ? State.error-text : "";
+        kind: State.toast-kind;
+        max-text-width: root.toast-text-width;
+        width: Math.min(self.preferred-width, root.toast-max-width);
+        x: root.inset-left + (root.page-width - self.width) / 2;
+        y: root.inset-top + Theme.gap-lg + (root.connect-notices-height > 0
+            ? root.connect-notices-height - Theme.gap-lg + Theme.gap-sm : 0);
+        clicked => { Logic.toast-dismiss(); }
     }
 
     // ── Image send preview (modal overlay) ─────────────────────────

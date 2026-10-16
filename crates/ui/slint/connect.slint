@@ -2,10 +2,11 @@
 //
 // Nickname + the saved-server dropdown (which server to join, shown by
 // name; the pencil jumps to Settings → Servers), Connect,
-// Settings/Quit, the terms line, error + device-warning lines — one
-// centered column on a surface that fills the window (main.slint paints
-// it under the system bars too). A window shorter than the form scrolls.
-// Values live in State so they survive failed attempts and reconnects.
+// Settings/Quit and the terms line, as a centered rounded card. What
+// the card has to say — the 5 s notice, a verdict, a missing device —
+// is a toast at the top of the window (main.slint), so the form never
+// moves. A window shorter than the card scrolls. Values live in State
+// so they survive failed attempts and reconnects.
 //
 // The device key is the login; an invite code is only needed on the
 // first visit. When the server asks for one (unknown device, or a code
@@ -16,173 +17,148 @@
 import { IconSet } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, ToastKind } from "globals.slint";
-import { Btn, Field, FieldLabel, IconBtn, Dropdown } from "widgets.slint";
+import { State, Logic } from "globals.slint";
+import { Btn, Card, Field, FieldLabel, IconBtn, Dropdown } from "widgets.slint";
 import { ScrollView } from "std-widgets.slint";
 
 export component ConnectView inherits Rectangle {
-    // The form's width: about the old card's, whatever the window; a phone
-    // narrower than that keeps a gap-xl margin each side (review P3-40).
-    property <length> side: Math.max(Theme.gap-xl, (root.width - 360px) / 2);
+    background: Theme.bg-primary;
+    // The card is 400 px where it fits; a 375 pt phone is narrower, and
+    // keeps a margin each side instead (review P3-40).
+    property <length> side: Math.max(Theme.gap-md, (root.width - 400px) / 2);
+    /// The toasts that stay at the top of the window (main.slint): the
+    /// card centres in what is left below them.
+    in property <length> top-clearance;
 
     ScrollView {
         mouse-drag-pan-enabled: State.touch-host;
 
-        // One layout, no HorizontalLayout around it: centered across by
-        // its padding, so its wrapped lines report their full height
+        // Centered across by its padding, not by a HorizontalLayout, so
+        // the card's wrapped lines report their full height
         // (SESSION-GUIDE §4).
         VerticalLayout {
             alignment: center;
-            padding-top: Theme.gap-xl;
-            padding-bottom: Theme.gap-xl;
+            padding-top: root.top-clearance + Theme.gap-md;
+            padding-bottom: Theme.gap-md;
             padding-left: root.side;
             padding-right: root.side;
-            spacing: Theme.gap-md;
 
-            Text {
-                text: "baucord";
-                color: Theme.text-primary;
-                font-size: Theme.font-title;
-                font-weight: 700;
-                horizontal-alignment: center;
-            }
-            Text {
-                text: Tr.app-tagline;
-                color: Theme.text-secondary;
-                font-size: Theme.font-sm;
-                horizontal-alignment: center;
-            }
+            Card {
+                VerticalLayout {
+                    padding: Theme.gap-xl;
+                    spacing: Theme.gap-md;
 
-            // Notice line — reserved height so the form never jumps;
-            // colored by the toast's register (a reconnect countdown is
-            // not an error).
-            Text {
-                text: State.error-text;
-                color: State.toast-kind == ToastKind.error ? Theme.danger
-                    : State.toast-kind == ToastKind.warning ? Theme.warning
-                    : State.toast-kind == ToastKind.success ? Theme.success
-                    : Theme.text-secondary;
-                font-size: Theme.font-sm;
-                horizontal-alignment: center;
-                wrap: word-wrap;
-                // Its whole height, wrapped: a window shorter than the
-                // form squeezes the column to its minimum heights.
-                min-height: Math.max(18px, self.preferred-height);
-            }
+                    Text {
+                        text: "baucord";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-title;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: Tr.app-tagline;
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-sm;
+                        horizontal-alignment: center;
+                    }
+                    // Where the notice line used to be: room between
+                    // the title and the form.
+                    Rectangle { height: Theme.gap-xs; }
 
-            FieldLabel { text: Tr.nickname; }
-            nick := Field {
-                text <=> State.nickname;
-                accepted => { Logic.connect-clicked(); }
-            }
+                    FieldLabel { text: Tr.nickname; }
+                    nick := Field {
+                        text <=> State.nickname;
+                        accepted => { Logic.connect-clicked(); }
+                    }
 
-            FieldLabel { text: Tr.settings-server; }
-            HorizontalLayout {
-                spacing: Theme.gap-sm;
-                Dropdown {
-                    horizontal-stretch: 1;
-                    options: State.server-names;
-                    current <=> State.server-index;
-                    selected(i) => { Logic.connect-server-selected(i); }
+                    FieldLabel { text: Tr.settings-server; }
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Dropdown {
+                            horizontal-stretch: 1;
+                            options: State.server-names;
+                            current <=> State.server-index;
+                            selected(i) => { Logic.connect-server-selected(i); }
+                        }
+                        IconBtn {
+                            size: 36px;
+                            icon: IconSet.Pencil;
+                            tooltip: Tr.server-manage;
+                            clicked => { Logic.edit-servers(); }
+                        }
+                    }
+
+                    // The server wants an invite code: ask for it here, then
+                    // Connect retries with it.
+                    if State.invite-prompt : VerticalLayout {
+                        spacing: Theme.gap-sm;
+                        Text {
+                            text: State.invite-prompt-text;
+                            color: Theme.warning;
+                            font-size: Theme.font-sm;
+                            wrap: word-wrap;
+                            min-height: self.preferred-height;
+                        }
+                        FieldLabel { text: Tr.invite-code; }
+                        Field {
+                            text <=> State.invite-code;
+                            placeholder: Tr.invite-code-placeholder;
+                            accepted => { Logic.connect-clicked(); }
+                        }
+                    }
+
+                    Btn {
+                        text: Tr.connect;
+                        accent: true;
+                        height: 42px;
+                        clicked => { Logic.connect-clicked(); }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.gap-sm;
+                        Btn { text: Tr.settings; clicked => { Logic.open-settings(); } }
+                        if State.can-quit : Btn { text: Tr.quit; clicked => { Logic.quit(); } }
+                    }
+
+                    // Connecting is agreeing to the terms (1.2): said once, small,
+                    // with the whole line a way to read them. One line where it
+                    // fits; on a narrow phone the link drops to a second line
+                    // instead of running past the card's edge (360 dp is
+                    // narrower than the sentence; review P3-40).
+                    Rectangle {
+                        property <length> line-width: terms-notice.preferred-width + 3px + terms-link.preferred-width;
+                        property <bool> stacked: self.line-width > self.width;
+                        // A little taller than the text: a finger's worth to tap.
+                        height: (self.stacked ? terms-notice.preferred-height + terms-link.preferred-height
+                            : terms-notice.preferred-height) + 10px;
+                        terms-notice := Text {
+                            x: parent.stacked ? (parent.width - self.width) / 2 : (parent.width - parent.line-width) / 2;
+                            y: 5px;
+                            width: self.preferred-width;
+                            height: self.preferred-height;
+                            text: Tr.terms-notice;
+                            color: Theme.text-muted;
+                            font-size: Theme.font-xs;
+                        }
+                        terms-link := Text {
+                            x: parent.stacked ? (parent.width - self.width) / 2 : terms-notice.x + terms-notice.width + 3px;
+                            y: parent.stacked ? terms-notice.y + terms-notice.height : 5px;
+                            width: self.preferred-width;
+                            height: self.preferred-height;
+                            text: Tr.terms-link;
+                            color: terms-touch.has-hover ? Theme.accent-text : Theme.text-secondary;
+                            font-size: Theme.font-xs;
+                            font-weight: 600;
+                            animate color { duration: 120ms; }
+                        }
+                        terms-touch := TouchArea {
+                            x: Math.min(terms-notice.x, terms-link.x);
+                            width: parent.stacked ? Math.max(terms-notice.width, terms-link.width) : parent.line-width;
+                            mouse-cursor: pointer;
+                            clicked => { Logic.link-clicked(State.terms-url); }
+                        }
+                    }
                 }
-                IconBtn {
-                    size: 36px;
-                    icon: IconSet.Pencil;
-                    tooltip: Tr.server-manage;
-                    clicked => { Logic.edit-servers(); }
-                }
-            }
-
-            // The server wants an invite code: ask for it here, then
-            // Connect retries with it.
-            if State.invite-prompt : VerticalLayout {
-                spacing: Theme.gap-sm;
-                Text {
-                    text: State.invite-prompt-text;
-                    color: Theme.warning;
-                    font-size: Theme.font-sm;
-                    wrap: word-wrap;
-                    min-height: self.preferred-height;
-                }
-                FieldLabel { text: Tr.invite-code; }
-                Field {
-                    text <=> State.invite-code;
-                    placeholder: Tr.invite-code-placeholder;
-                    accepted => { Logic.connect-clicked(); }
-                }
-            }
-
-            // A verdict that stays until the next attempt.
-            if State.connect-notice != "" : Text {
-                text: State.connect-notice;
-                color: Theme.danger;
-                font-size: Theme.font-sm;
-                horizontal-alignment: center;
-                wrap: word-wrap;
-                min-height: self.preferred-height;
-            }
-
-            Btn {
-                text: Tr.connect;
-                accent: true;
-                height: 42px;
-                clicked => { Logic.connect-clicked(); }
-            }
-
-            HorizontalLayout {
-                spacing: Theme.gap-sm;
-                Btn { text: Tr.settings; clicked => { Logic.open-settings(); } }
-                if State.can-quit : Btn { text: Tr.quit; clicked => { Logic.quit(); } }
-            }
-
-            // Connecting is agreeing to the terms (1.2): said once, small,
-            // with the whole line a way to read them. One line where it
-            // fits; on a narrow phone the link drops to a second line
-            // instead of running past the card's edge (360 dp is
-            // narrower than the sentence; review P3-40).
-            Rectangle {
-                property <length> line-width: terms-notice.preferred-width + 3px + terms-link.preferred-width;
-                property <bool> stacked: self.line-width > self.width;
-                // A little taller than the text: a finger's worth to tap.
-                height: (self.stacked ? terms-notice.preferred-height + terms-link.preferred-height
-                    : terms-notice.preferred-height) + 10px;
-                terms-notice := Text {
-                    x: parent.stacked ? (parent.width - self.width) / 2 : (parent.width - parent.line-width) / 2;
-                    y: 5px;
-                    width: self.preferred-width;
-                    height: self.preferred-height;
-                    text: Tr.terms-notice;
-                    color: Theme.text-muted;
-                    font-size: Theme.font-xs;
-                }
-                terms-link := Text {
-                    x: parent.stacked ? (parent.width - self.width) / 2 : terms-notice.x + terms-notice.width + 3px;
-                    y: parent.stacked ? terms-notice.y + terms-notice.height : 5px;
-                    width: self.preferred-width;
-                    height: self.preferred-height;
-                    text: Tr.terms-link;
-                    color: terms-touch.has-hover ? Theme.accent-text : Theme.text-secondary;
-                    font-size: Theme.font-xs;
-                    font-weight: 600;
-                    animate color { duration: 120ms; }
-                }
-                terms-touch := TouchArea {
-                    x: Math.min(terms-notice.x, terms-link.x);
-                    width: parent.stacked ? Math.max(terms-notice.width, terms-link.width) : parent.line-width;
-                    mouse-cursor: pointer;
-                    clicked => { Logic.link-clicked(State.terms-url); }
-                }
-            }
-
-            // "Saved device isn't connected" — the fix (Settings) sits
-            // just above it, past the terms line.
-            Text {
-                text: State.device-warning;
-                color: Theme.warning;
-                font-size: Theme.font-sm;
-                horizontal-alignment: center;
-                wrap: word-wrap;
-                min-height: Math.max(16px, self.preferred-height);
             }
         }
     }

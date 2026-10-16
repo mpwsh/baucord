@@ -7,7 +7,7 @@
 
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
-import { MenuEntry, State } from "globals.slint";
+import { MenuEntry, State, ToastKind } from "globals.slint";
 import { ListView, ScrollView } from "std-widgets.slint";
 
 // ── Tooltips ────────────────────────────────────────────────────────────
@@ -625,6 +625,65 @@ export component Sep inherits Rectangle {
 export component Card inherits Rectangle {
     border-radius: Theme.radius-lg;
     background: Theme.bg-secondary;
+}
+
+/// A notice at the top of the window, in one register per kind: the
+/// glyph and the border carry the color, the message stays in primary
+/// text so it reads on the tint. Nothing shows (and it takes no height)
+/// while `text` is empty. The caller places it and caps its width; its
+/// height is its own, so a stack of them can sit one under another.
+export component Toast inherits Rectangle {
+    in property <string> text;
+    in property <ToastKind> kind;
+    /// The widest the message may get before it wraps.
+    in property <length> max-text-width;
+    /// A pointer over it, for a toast that does something on a click.
+    in property <bool> clickable: true;
+    callback clicked;
+    property <color> tone: root.kind == ToastKind.error ? Theme.danger
+        : root.kind == ToastKind.warning ? Theme.warning
+        : root.kind == ToastKind.success ? Theme.success
+        : Theme.accent-text;
+
+    visible: root.text != "";
+    preferred-width: row.preferred-width + 2 * Theme.gap-md;
+    height: root.text == "" ? 0 : row.preferred-height + 2 * Theme.gap-sm + 4px;
+    border-radius: Theme.radius-md;
+    background: Theme.bg-tertiary;
+    border-width: 1px;
+    border-color: root.tone.with-alpha(0.6);
+    drop-shadow-color: #00000066;
+    drop-shadow-blur: 12px;
+    drop-shadow-offset-y: 4px;
+
+    row := HorizontalLayout {
+        padding-left: Theme.gap-md;
+        padding-right: Theme.gap-md;
+        spacing: Theme.gap-sm;
+        Rectangle {
+            width: 16px;
+            IconDisplay {
+                icon: root.kind == ToastKind.error ? IconSet.CircleX
+                    : root.kind == ToastKind.warning ? IconSet.TriangleAlert
+                    : root.kind == ToastKind.success ? IconSet.CircleCheck
+                    : IconSet.Info;
+                size: 16px;
+                stroke: root.tone;
+            }
+        }
+        Text {
+            text: root.text;
+            color: Theme.text-primary;
+            font-size: Theme.font-body;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            max-width: root.max-text-width;
+        }
+    }
+    TouchArea {
+        mouse-cursor: root.clickable ? pointer : default;
+        clicked => { root.clicked(); }
+    }
 }
 
 /// A dialog over the window: the scrim, a card in the middle of it, and

@@ -252,12 +252,16 @@ Play music in another app first, at a steady volume.
 ### 1.5 The window, the chat, the dialogs
 
 - [ ] **new** — on the connect screen, maximise the window and drag it
-  down to its smallest: the background fills it edge to edge, the form
-  stays centred, and at the smallest height it scrolls with the wheel
-  instead of cutting off its top and bottom.
+  down to its smallest: the card stays centred, and at the smallest
+  height it scrolls with the wheel instead of cutting off its top and
+  bottom.
 - [ ] **new** — ban yourself from a test server (no reason, then
-  "spam" for 1 h) and connect: the line reads "…from this server
-  indefinitely: (no reason given)" / "…for 1 h: spam", spaced.
+  "spam" for 1 h) and connect: a red toast at the top reads "…from
+  this server indefinitely: (no reason given)" / "…for 1 h: spam",
+  spaced, and stays until the next Connect. Unplug the saved mic: a
+  yellow toast says so under it, a click opens Settings, and opening
+  Settings hides both. A dropped connection's toast goes away after
+  5 s or on a click.
 
 - [ ] **new** — "Start minimized" with auto-connect: after connecting,
   the window is still in the tray [P2-17].
@@ -602,10 +606,10 @@ agrees with it.
 - [ ] **new** — the connect and startup cards have a margin on both
   sides, and "By connecting you agree to the / terms and conditions"
   is two lines, both tappable [P3-40].
-- [ ] **new** — the connect screen's colour reaches under the status
-  bar and the navigation bar, with no band of another grey. Tap
-  Nickname: the keyboard comes up, the form can be dragged to reach
-  Connect and the device line, and nothing is hidden behind the keys.
+- [ ] **new** — with a saved mic missing, the connect screen's warning
+  is a toast under the status bar, not on it, and the card sits below
+  it. Tap Nickname: the keyboard comes up, the card can be dragged to
+  reach Connect, and nothing is hidden behind the keys.
 - [ ] **same** — every dialog: Back closes it; the channel-password
   field has the keyboard, what is typed arrives, the keyboard's Enter
   joins [P2-58].
