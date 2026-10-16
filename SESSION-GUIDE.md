@@ -31,8 +31,7 @@ Check with `which cargo` and `df -h /` first.
   media crates on the host (`apt-get` reaches the Ubuntu archive; the
   Docker repo 403s, ignore it): `apt-get update && apt-get install -y
   libasound2-dev libavcodec-dev libavformat-dev libavutil-dev
-  libswscale-dev libavfilter-dev libswresample-dev libavdevice-dev clang
-  libclang-dev libwayland-dev libxcb1-dev libxcb-randr0-dev
+  libswscale-dev clang libclang-dev libwayland-dev libxcb1-dev libxcb-randr0-dev
   libxcb-shm0-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev
   libspa-0.2-dev libegl-dev libgbm-dev libxkbcommon-dev libfontconfig-dev
   libxi-dev libx11-xcb-dev libxcursor-dev libssl-dev libudev-dev`

@@ -50,6 +50,12 @@ jobs:
       # mfx dispatch (the vpl switch came later) and is untested with our
       # static-md link; the runtime encoder probe handles its absence.
       # Re-add only with a full retest.
+      # vcpkg's default features also build avfilter, swresample and
+      # avdevice, which nothing links since review 2026-10 P3-38:
+      # harmless in the zip. Trimming them (`core,avcodec,avformat,
+      # swscale`, as readme.md does for local builds) is a new feature
+      # set: a new object name here and in release.yml, and a run of
+      # this workflow before the next release.
       - name: Build FFmpeg via vcpkg
         shell: pwsh
         run: C:\vcpkg\vcpkg.exe install ffmpeg[x264,gpl,nvcodec,amf]:x64-windows-static-md --recurse

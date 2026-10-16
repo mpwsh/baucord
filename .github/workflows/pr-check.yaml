@@ -67,7 +67,6 @@ jobs:
             clang libclang-dev \
             libasound2-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-            libavfilter-dev libswresample-dev \
             libpipewire-0.3-dev \
             libxcb1-dev libxrandr-dev libx11-dev libxext-dev libxcursor-dev \
             libxfixes-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-dev \
@@ -164,8 +163,7 @@ jobs:
             build-essential pkg-config cmake nasm python3 \
             clang libclang-dev \
             gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-            libavfilter-dev libswresample-dev
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
       - uses: actions/checkout@v7
       - name: Read the pinned Rust toolchain
         id: toolchain

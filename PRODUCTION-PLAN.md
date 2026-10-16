@@ -292,7 +292,10 @@ was fixed on 2026-10-16 (§7), with what only a device can confirm in
   7.1.2), the tarball is checked against `FFMPEG_SHA256` in
   `release.yml` — a digest computed from the HTTPS download that day,
   **not** checked against FFmpeg's PGP signature — and avfilter and
-  swresample are configured out. Left: `--disable-everything` plus only
+  swresample are configured out on Linux and macOS and linked nowhere
+  (Windows' prebuilt zip still carries them, unused, until the next
+  `build-ffmpeg-windows` run; readme.md's local command builds only what
+  is linked). Left: `--disable-everything` plus only
   what is used (also less attack surface), and the signature.
 - [ ] **LEG-4 [P1] H.264 patent licensing** for encoding/decoding on the
   desktop — a question for counsel, not code.

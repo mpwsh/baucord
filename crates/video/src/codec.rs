@@ -48,7 +48,8 @@
 //!
 //! # System requirements
 //!
-//! - **Windows (static):** `vcpkg install ffmpeg[x264,gpl]:x64-windows-static-md`
+//! - **Windows (static):** at the pinned vcpkg commit (readme.md),
+//!   `vcpkg install ffmpeg[core,avcodec,avformat,swscale,x264,gpl,nvcodec,amf]:x64-windows-static-md`
 //!   then set `VCPKG_ROOT`.
 //! - **Linux:** `apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev`
 //! - **macOS:** `brew install ffmpeg`

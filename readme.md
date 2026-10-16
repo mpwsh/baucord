@@ -126,12 +126,16 @@ git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
 cd C:\vcpkg
 git checkout 34823ada10080ddca99b60e85f80f55e18a44eea
 .\bootstrap-vcpkg.bat
-.\vcpkg.exe install ffmpeg[x264,gpl,nvcodec,amf]:x64-windows-static-md --recurse
+.\vcpkg.exe install ffmpeg[core,avcodec,avformat,swscale,x264,gpl,nvcodec,amf]:x64-windows-static-md --recurse
 ```
 
 The checkout pins vcpkg to its FFmpeg 7.1.2 port: `ffmpeg-next` 8 does
-not build against the FFmpeg that vcpkg's HEAD ships. `qsv` is left
-out on purpose, as in the release build.
+not build against the FFmpeg that vcpkg's HEAD ships. `core` and the
+three library features build only what baucord links: libavcodec,
+libavformat and libswscale (libavutil comes with any of them). Without
+`core`, vcpkg also builds libavfilter, libswresample and libavdevice,
+which nothing uses. `qsv` is left out on purpose, as in the release
+build.
 
 This can take 30+ minutes the first time — it's compiling x264 and the
 hardware codec bindings from source, not just fetching a binary.

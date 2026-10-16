@@ -177,7 +177,8 @@ and the release pipeline.
   test, the Settings meter, a room with nobody else).
 - FFmpeg 7.1.2 on every desktop, the Linux and macOS source checked
   against its SHA-256; the unused avfilter and swresample libraries are
-  no longer built or linked.
+  no longer linked, nor built on Linux and macOS (Windows' prebuilt
+  FFmpeg still contains them, unused, until it is next rebuilt).
 - The app reads its own CPU and memory figures directly on every
   platform (`sysinfo` is gone).
 - Release builds take `Cargo.lock` as written on every platform;
