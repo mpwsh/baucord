@@ -1557,6 +1557,13 @@ component SettingsContent inherits ScrollView {
     mouse-drag-pan-enabled: State.touch-host;
     VerticalLayout {
         padding: root.pad;
+        // The scroll view makes this layout at least as tall as the
+        // page. Without `start`, a page taller than the form (a
+        // maximized window) shared the difference out among the
+        // form's rows, nobody asking for it more than the rest: a
+        // label hundreds of pixels above its field. The admin page's
+        // scroll view does the same.
+        alignment: start;
         // Readable measure: the content column stops growing past
         // ~560px on a wide window.
         HorizontalLayout {

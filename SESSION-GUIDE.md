@@ -931,6 +931,11 @@ Memory-mode servers (persistence off) still use the legacy
   the layouts in its own definition: children passed in where it is
   used count as nothing and it never scrolls, so give it a layout of
   its own around `@children` (`NavScroll` in settings.slint, D73).
+  That layout is stretched to at least the scroll view's height, and a
+  `VerticalLayout` shares the spare height among rows that all have
+  the default stretch: a form's layout there needs `alignment: start`
+  (Settings and the admin page have it), or a maximized window puts
+  its labels hundreds of pixels above their fields (2026-10-16).
 - Interactions (drags, flicks, long-press) can't be screenshotted, but
   they can be driven headless: a scratch crate with `slint =
   { version = "=1.18.1", default-features = false, features = ["std",
