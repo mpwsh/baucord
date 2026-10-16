@@ -936,6 +936,14 @@ Memory-mode servers (persistence off) still use the legacy
   the default stretch: a form's layout there needs `alignment: start`
   (Settings and the admin page have it), or a maximized window puts
   its labels hundreds of pixels above their fields (2026-10-16).
+  Across, the content's minimum width decides: past the view's width
+  the scroll view grows a horizontal bar, and Settings' column stops
+  at 560 px whatever the window. Under Slint 1.18 a `Text` that
+  neither wraps nor elides is at least as wide as all of its text, a
+  word-wrapping one as its longest word: a long label wraps (Settings'
+  `Setting` does), a name elides. Measure with the "Text size"
+  setting at Larger (×1.3) in es-AR: Servers' identity label alone
+  took the form to 749 px before it wrapped (2026-10-16).
 - Interactions (drags, flicks, long-press) can't be screenshotted, but
   they can be driven headless: a scratch crate with `slint =
   { version = "=1.18.1", default-features = false, features = ["std",

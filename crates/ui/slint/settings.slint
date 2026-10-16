@@ -361,7 +361,12 @@ component Setting inherits VerticalLayout {
     in property <string> label;
     in property <string> hint;
     spacing: Theme.gap-xs;
-    FieldLabel { text: root.label; }
+    // Wraps: a label that cannot is as wide as its text at the least,
+    // and that minimum widens the whole form. The content column
+    // stops at 560 px whatever the window, so Servers' "Server
+    // identity (SHA256:…)" label in Spanish at the Large text size
+    // gave the page a horizontal scrollbar on any window.
+    FieldLabel { text: root.label; wrap: word-wrap; }
     @children
     if root.hint != "" : Hint { text: root.hint; }
 }
