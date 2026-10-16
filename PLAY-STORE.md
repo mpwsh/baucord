@@ -299,7 +299,7 @@ Types must match what the service does.
 In the lobby nothing holds the CPU: with the screen off the phone
 sleeps through its own 5 s keep-alive, and what keeps the session open
 is the server's PING every 20 s, which wakes it (ANDROID-SPEC.md D74;
-servers after 1.2.1). A 1.2.1 server sends a quiet session nothing, so
+servers from 1.3.0). A 1.2.1 server sends a quiet session nothing, so
 against one the session ends after 30 s with the screen off and the
 phone reconnects when it wakes — a DM meanwhile is not notified. The
 special use's text ("keeps the connection … open while they wait in

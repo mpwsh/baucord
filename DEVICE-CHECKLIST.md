@@ -551,7 +551,7 @@ agrees with it.
   it: the microphone opens without leaving the room.
 - [ ] **same** — a phone call during a room; ten minutes with the
   screen off; Wi-Fi to cellular and back [TST-4].
-- [ ] **new [10-16b]** — **against a server after 1.2.1**: unplugged,
+- [ ] **new [10-16b]** — **against a 1.3.0 server or newer**: unplugged,
   connected in the lobby, screen off for 5 minutes; then someone sends
   a DM. The notification comes within seconds, and the others did not
   see you leave and come back. (The server's PING every 20 s wakes the

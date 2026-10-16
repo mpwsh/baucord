@@ -4,7 +4,7 @@ What changed from one release to the next, for the people who run a
 baucord server and the people who use the apps. Releases before this
 file are summed up in SESSION-GUIDE.md §3 ("Shipped").
 
-## Unreleased
+## 1.3.0 (unreleased)
 
 The 2026-10 review, fixed whole: what costs while nothing happens,
 pictures and memory, Windows audio, Settings that save only when asked,

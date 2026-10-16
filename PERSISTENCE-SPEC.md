@@ -1063,7 +1063,7 @@ voice unaffected, writes counted as dropped".
     stored; a settings file with the test builds' `terms_version`
     still loads. A server's own rules go in its greeting.
 
-- **S2. The 2026-10 review on the server (after 1.2.1, decided
+- **S2. The 2026-10 review on the server (1.3.0, decided
   2026-10-16).** *Schema 7* (§2): the unused columns and the telemetry
   blobs dropped, one way — a backup taken before the upgrade is the
   way back (CHANGELOG). *Transfers* (§7): a bucket for pictures and one

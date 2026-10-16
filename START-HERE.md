@@ -3,12 +3,11 @@
 baucord is a voice, text and screen-sharing app in Rust: a self-hosted
 relay server (QUIC, no media mixing), a desktop client for Windows,
 macOS and Linux, and clients for Android and iPhone that run the same
-Rust engine and the same Slint UI. It is in daily use: 1.1.9 on every
-platform (1.2.1, the Play closed-testing release with the 2026-10-10
-review's fixes, is next), desktop
-users on the in-app updater, Android as a sideloaded APK and on Play's
-internal test, iPhone as an Ad Hoc build, the official server in
-Docker.
+Rust engine and the same Slint UI. It is in daily use: 1.2.1 is the
+latest release (2026-10-13; 1.3.0, with the 2026-10 review's fixes, is
+next, CHANGELOG.md), desktop users on the in-app updater, Android as a
+sideloaded APK and on Play's internal test, iPhone as an Ad Hoc build,
+the official server in Docker.
 
 This file is the way in. Read it first, then follow the reading order
 for the work at hand (§3). Everything else is linked from here.
@@ -149,8 +148,10 @@ The full list is SESSION-GUIDE §4; these break things when forgotten:
 
 ## 5. Where things stand (2026-10-09)
 
-- **Version 1.2.1** in the crates (released: 1.1.9; 1.2.1 carries the
-  fixes of the 2026-10-10 review, PRODUCTION-PLAN.md §2a); the crate map is
+- **Version 1.3.0** in the crates (released: 1.2.1, 2026-10-13, with
+  the fixes of the 2026-10-10 review; 1.3.0 carries Settings and the
+  admin panel as pages and the 2026-10 review's fixes, PRODUCTION-PLAN.md
+  §2a, CHANGELOG.md); the crate map is
   SESSION-GUIDE §2, the list of what it carries SESSION-GUIDE §3. 1.2
   adds what the stores require of a chat app — block, report, delete
   my account, the terms on the connect card (PERSISTENCE-SPEC §12 S1),
