@@ -152,11 +152,16 @@ export component MainWindow inherits Window {
         width: root.page-width;
         height: root.page-height;
     }
-    if State.phase == Phase.connect : ConnectView {
-        x: root.inset-left;
-        y: root.inset-top;
-        width: root.page-width;
-        height: root.page-height;
+    // The connect view's surface is the whole window, under the system
+    // bars and the keyboard too; its form keeps clear of them.
+    if State.phase == Phase.connect : Rectangle {
+        background: Theme.bg-secondary;
+        ConnectView {
+            x: root.inset-left;
+            y: root.inset-top;
+            width: root.page-width;
+            height: root.page-height;
+        }
     }
     // ── Wide and narrow (ANDROID-SPEC.md D26) ──────────────────────
     // Wide: the sidebar and the chat side by side, the edge between

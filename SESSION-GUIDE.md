@@ -777,6 +777,12 @@ Memory-mode servers (persistence off) still use the legacy
   is drawn over the rest. Give the box an explicit `height:
   <text>.preferred-height + padding`, as the chat's standing notice and
   the settings' Windows notice do.
+- **A `ScrollView` shorter than its layout squeezes the layout to its
+  minimum heights**, not its preferred ones: a wrapped `Text` with a
+  one-line `min-height` keeps one line and the next row is drawn over
+  the rest. Each wrapped line in such a form says `min-height:
+  self.preferred-height` (`connect.slint`, 2026-10-16: render it at
+  500×400, the window's minimum).
 - **The narrow (phone) layout renders only at a phone width:**
   `MainWindow` has `preferred-width`/`min-width`, so a fixture alone
   draws the wide layout. Copy the `.slint` tree, swap

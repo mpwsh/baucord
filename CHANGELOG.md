@@ -166,6 +166,11 @@ and the release pipeline.
 - Invite codes no longer appear whole in the app's log.
 - Changing the language updates the tray, the roster and the admin
   channel's name at once.
+- The connect screen fills the window instead of floating a card in
+  it; the form stays one centred column, and a window shorter than it
+  scrolls.
+- A ban says its length and reason with spaces between them ("…from
+  this server for 2 h: spam", not "…from this serverfor 2 hspam").
 
 ### Under the hood
 

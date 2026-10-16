@@ -2,9 +2,10 @@
 //
 // Nickname + the saved-server dropdown (which server to join, shown by
 // name; the pencil jumps to Settings → Servers), Connect,
-// Settings/Quit, the terms line, error + device-warning lines — as a centered rounded
-// card. Values live in State so they survive failed attempts and
-// reconnects.
+// Settings/Quit, the terms line, error + device-warning lines — one
+// centered column on a surface that fills the window (main.slint paints
+// it under the system bars too). A window shorter than the form scrolls.
+// Values live in State so they survive failed attempts and reconnects.
 //
 // The device key is the login; an invite code is only needed on the
 // first visit. When the server asks for one (unknown device, or a code
@@ -17,20 +18,25 @@ import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, ToastKind } from "globals.slint";
 import { Btn, Field, FieldLabel, IconBtn, Dropdown } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export component ConnectView inherits Rectangle {
-    background: Theme.bg-primary;
+    // The form's width: about the old card's, whatever the window; a phone
+    // narrower than that keeps a gap-xl margin each side (review P3-40).
+    property <length> side: Math.max(Theme.gap-xl, (root.width - 360px) / 2);
 
-    card := Rectangle {
-        // A 375 pt phone is narrower than the card: keep a margin
-        // there instead of running off both edges (review P3-40).
-        width: Math.min(400px, parent.width - 2 * Theme.gap-md);
-        height: layout.preferred-height;
-        border-radius: Theme.radius-lg;
-        background: Theme.bg-secondary;
+    ScrollView {
+        mouse-drag-pan-enabled: State.touch-host;
 
-        layout := VerticalLayout {
-            padding: Theme.gap-xl;
+        // One layout, no HorizontalLayout around it: centered across by
+        // its padding, so its wrapped lines report their full height
+        // (SESSION-GUIDE §4).
+        VerticalLayout {
+            alignment: center;
+            padding-top: Theme.gap-xl;
+            padding-bottom: Theme.gap-xl;
+            padding-left: root.side;
+            padding-right: root.side;
             spacing: Theme.gap-md;
 
             Text {
@@ -59,7 +65,9 @@ export component ConnectView inherits Rectangle {
                 font-size: Theme.font-sm;
                 horizontal-alignment: center;
                 wrap: word-wrap;
-                min-height: 18px;
+                // Its whole height, wrapped: a window shorter than the
+                // form squeezes the column to its minimum heights.
+                min-height: Math.max(18px, self.preferred-height);
             }
 
             FieldLabel { text: Tr.nickname; }
@@ -94,6 +102,7 @@ export component ConnectView inherits Rectangle {
                     color: Theme.warning;
                     font-size: Theme.font-sm;
                     wrap: word-wrap;
+                    min-height: self.preferred-height;
                 }
                 FieldLabel { text: Tr.invite-code; }
                 Field {
@@ -110,6 +119,7 @@ export component ConnectView inherits Rectangle {
                 font-size: Theme.font-sm;
                 horizontal-alignment: center;
                 wrap: word-wrap;
+                min-height: self.preferred-height;
             }
 
             Btn {
@@ -172,7 +182,7 @@ export component ConnectView inherits Rectangle {
                 font-size: Theme.font-sm;
                 horizontal-alignment: center;
                 wrap: word-wrap;
-                min-height: 16px;
+                min-height: Math.max(16px, self.preferred-height);
             }
         }
     }

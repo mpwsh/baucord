@@ -770,11 +770,13 @@ impl AppState {
                         t!("error-refused-rate-limited")
                     }
                     DisconnectKind::Refused(client::RefusedReason::Banned { until, reason }) => {
-                        let until = describe_until(*until);
+                        // "…from this server{ $until }{ $reason }": the
+                        // separators are ours, as for a restriction.
+                        let until = format!(" {}", describe_until(*until));
                         let reason = if reason.is_empty() {
-                            t!("reason-none")
+                            format!(": {}", t!("reason-none"))
                         } else {
-                            reason.clone()
+                            format!(": {reason}")
                         };
                         t!(
                             "error-banned",
@@ -797,9 +799,14 @@ impl AppState {
                             client::RemovedKind::Banned { .. } => "removed-banned",
                             client::RemovedKind::Replaced => "removed-replaced",
                         };
-                        let until = match kind {
-                            client::RemovedKind::Banned { until } => describe_until(*until),
-                            _ => String::new(),
+                        // "Banned by { $by }{ $until }{ $reason }" carries
+                        // no separators; the other kinds say ": " in the
+                        // catalog.
+                        let (until, reason) = match kind {
+                            client::RemovedKind::Banned { until } => {
+                                (format!(" {}", describe_until(*until)), format!(": {reason}"))
+                            }
+                            _ => (String::new(), reason),
                         };
                         t!(
                             key,
